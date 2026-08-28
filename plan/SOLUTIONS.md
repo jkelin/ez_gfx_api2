@@ -23,7 +23,6 @@ Migrate the original Odin/Vulkan `ez_gfx_api` into a Rust/Cargo implementation t
 - “Roughly maintain the original API” includes preserving the existing C/C# consumer path through a dedicated FFI package. If compatibility is explicitly dropped, P-002 can be simplified.
 - Supported hardware exposes sufficient modern bindless/indexing features. Devices below the declared capability floor receive an explicit unsupported error.
 - Slang, DXC/signing tools, and Apple Metal tools are available in compiler/build environments, not runtime deployments.
-- **Blocking:** the phrase “memory-allocator rust crate” does not identify a verifiable published package. P-004 is provisional until the exact package URL/name is confirmed.
 - No repository-specific performance baseline exists for P-001 through P-020; every selected design carries explicit measurement actions.
 
 ## P-001: Cargo workspace and delivery boundaries — Strict workspace boundary
@@ -34,7 +33,7 @@ Separate compiler, runtime, optional decoders, backends, and FFI so runtime appl
 
 ### Decision
 
-Use a virtual Cargo workspace with `ez-gfx-core` for API/graph/reflection types, `ez-gfx-runtime` for execution and precompiled-artifact loading, `ez-gfx-compiler` plus CLI for Slang, and `ez-gfx-ffi` for `cdylib`/`staticlib`. Keep backend and decoder native dependencies outside core. The runtime graph must not depend on the compiler package. Use resolver 2 or 3 according to the selected MSRV.
+Use a virtual Cargo workspace with `ez-gfx-core` for API/graph/reflection types, `ez-gfx-runtime` for execution and precompiled-artifact loading, `ez-gfx-compiler` with in-process `shader-slang`/slang-rs bindings, and `ez-gfx-ffi` for `cdylib`/`staticlib`. Keep backend and decoder native dependencies outside core. The runtime graph must not depend on the compiler package. Use resolver 2 or 3 according to the selected MSRV.
 
 ### Performance and tradeoffs
 
@@ -48,7 +47,7 @@ Runtime throughput is not expected to differ from a feature-gated monolith, but 
 
 - [Cargo feature unification](https://doc.rust-lang.org/stable/cargo/reference/features.html#feature-unification) shows features are additive and unioned.
 - [Cargo resolver v2](https://doc.rust-lang.org/stable/cargo/reference/resolver.html#feature-resolver-version-2) limits only specific unification contexts.
-- [Slang compilation](https://shader-slang.org/slang/user-guide/compiling) supports offline tooling.
+- [Slang in-process compilation API](https://shader-slang.org/docs/compilation-api/) and [shader-slang Rust bindings](https://crates.io/crates/shader-slang)
 - Original `TODO.md` requires precompiled shaders and optional KTX2 linkage.
 
 ### Assumptions, risks, and validation
@@ -118,7 +117,7 @@ Static dispatch removes virtual calls by construction, but its practical value a
 - Risks are false semantic equivalence, state translation errors, capability-tier gaps, queue/fence lifetime bugs, and divergence.
 - Before implementation, prove aliasing, bindless indexing, indirect drawing, timeline equivalents, dynamic rendering, and presentation in a capability spike for every backend; then benchmark identical recording workloads and binary sizes.
 
-## P-004: GPU memory allocation — Provisional `gpu-allocator`, blocked
+## P-004: GPU memory allocation — `gpu-allocator`
 
 ### Problem and required outcome
 
@@ -126,7 +125,7 @@ Replace VMA with a Rust allocator supporting dedicated/suballocated buffers, ima
 
 ### Decision
 
-Provisionally use `gpu-allocator` 0.28 behind the HAL allocation interface because its documentation covers Vulkan, D3D12, and Metal and exposes managed/dedicated allocations. Carry size, alignment, memory location, class, mapping, and retirement/alias lifetime through the interface. **Do not commit this dependency until the exact crate identity requested by the user is confirmed.**
+Use `gpu-allocator` 0.28 behind the HAL allocation interface. Its published package provides Vulkan, D3D12, and Metal implementations and managed/dedicated allocations. Carry size, alignment, memory location, class, mapping, and retirement/alias lifetime through the interface.
 
 ### Performance and tradeoffs
 
@@ -145,8 +144,7 @@ No comparable allocation-latency, fragmentation, peak-memory, or contention benc
 
 ### Assumptions, risks, and validation
 
-- **Blocking assumption:** the wording describes the Rust GPU allocator role and may mean `gpu-allocator`; if it names another package, this decision is invalid.
-- Obtain the exact package URL/name and verify version, license, maintenance, all three backend modules, and alias behavior.
+- Verify future upgrades against license, maintenance, all three backend modules, and alias behavior.
 - Replay representative buffer/image/staging/transient traces and record allocation latency distributions, committed/used bytes, fragmentation, coherency, contention, and alias correctness.
 
 ## P-005: Universal Slang compilation — Native multi-target Slang
@@ -157,7 +155,7 @@ Compile one Slang source and entry-point set to SPIR-V, DXIL, and Metal output w
 
 ### Decision
 
-The offline compiler creates native `SLANG_SPIRV`, `SLANG_DXIL`, and `SLANG_METAL`/`SLANG_METAL_LIB` targets. Extract target declarations and canonical interface metadata before optimization can erase intent; emit target blobs and metadata to P-006. Validate target-specific binding layouts instead of introducing another semantic compiler path.
+The offline compiler creates native `SLANG_SPIRV`, `SLANG_DXIL`, and `SLANG_METAL`/`SLANG_METAL_LIB` targets. DXIL variants target Shader Model 6.5: implemented binding uses explicit descriptor tables and root descriptors, so no Shader Model 6.6 direct-heap-indexing semantic is required. Extract target declarations and canonical interface metadata before optimization can erase intent; emit target blobs and metadata to P-006. Validate target-specific binding layouts instead of introducing another semantic compiler path.
 
 ### Performance and tradeoffs
 
@@ -656,7 +654,7 @@ One Slang source must render equivalently on Vulkan, DX12, and Metal without Sla
 
 ### Decision
 
-Use one documented source convention and stable, collision-safe semantic resource IDs, but retain complete target-native physical layouts from Slang reflection. `.ezshader` stores a canonical semantic resource graph plus target-indexed SPIR-V/DXIL/Metal binding, packing, entry, and specialization metadata. Runtime binds semantic IDs through the selected target layout; pipeline/viewport state normalizes coordinates where possible. Offline compilation rejects missing or incompatible target semantics.
+Use one documented source convention and stable, collision-safe semantic resource IDs, but retain complete target-native physical layouts from Slang reflection. `.ezshader` stores a canonical semantic resource graph plus target-indexed SPIR-V/DXIL/Metal binding, packing, entry, and specialization metadata. DXIL uses the lowest implemented semantic requirement, Shader Model 6.5, with explicit descriptor tables/root descriptors rather than Shader Model 6.6 direct heap indexing. Runtime binds semantic IDs through the selected target layout; pipeline/viewport state normalizes coordinates where possible. Offline compilation rejects missing or incompatible target semantics.
 
 ### Performance and tradeoffs
 
@@ -686,7 +684,7 @@ Rust/FFI callers need deterministic backend/adapter selection and an exact admis
 
 ### Decision
 
-Expose opaque stable adapter records, explicit selection, and a documented deterministic default. Admit one mandatory semantic profile mapped to native features and minimum capacities; probe format/usage separately. Reject missing requirements before manager creation with detailed diagnostics. Cache/golden keys use backend, stable device identity, driver, and profile schema; software adapters require explicit opt-in. Optional raw capabilities remain queryable but do not create semantic tiers.
+Expose opaque stable adapter records, explicit selection, and a documented deterministic default. Admit one mandatory semantic profile mapped to native features and minimum capacities; the shader-model floor is 6.5 because current DXIL semantics use explicit descriptor tables/root descriptors and no 6.6-only feature. Probe format/usage separately. Reject missing requirements before manager creation with detailed diagnostics. Cache/golden keys use backend, stable device identity, driver, and profile schema; software adapters require explicit opt-in. Optional raw capabilities remain queryable but do not create semantic tiers.
 
 ### Performance and tradeoffs
 

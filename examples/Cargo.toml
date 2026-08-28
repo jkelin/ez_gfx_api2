@@ -1,0 +1,17 @@
+[package]
+name = "ez-gfx-examples"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+blake3.workspace = true
+image.workspace = true
+ez-gfx-ffi = { path = "../crates/ez-gfx-ffi" }
+gltf = { version = "1.4", features = ["import", "extensions", "allow_empty_texture"] }
+imgui = "0.12"
+raw-window-handle = "0.6"
+winit = "0.30"
+

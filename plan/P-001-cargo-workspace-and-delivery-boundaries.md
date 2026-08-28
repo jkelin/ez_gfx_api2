@@ -34,7 +34,7 @@ Source evidence inspected: original `TODO.md` (precompiled shaders, optional KTX
 
 #### Architecture, integration, and applicability
 
-Use a virtual workspace with `resolver = "2"` (or `3` if the eventual MSRV permits it): `ez-gfx-core` owns API/graph/reflection types; `ez-gfx-runtime` consumes precompiled artifacts and selected backends; `ez-gfx-compiler` and its CLI own Slang; `ez-gfx-ffi` owns `cdylib`/`staticlib` exports; optional decoder/backend packages isolate native dependencies. The runtime dependency graph must not contain the compiler crate. This directly addresses the original runtime Slang session and unconditional Odin KTX import while preserving dependencies on P-002, P-003, P-005, and P-006.
+Use a virtual workspace with `resolver = "2"` (or `3` if the eventual MSRV permits it): `ez-gfx-core` owns API/graph/reflection types; `ez-gfx-runtime` consumes precompiled artifacts and selected backends; `ez-gfx-compiler` owns in-process `shader-slang`/slang-rs bindings and Apple postprocessing; `ez-gfx-ffi` owns `cdylib`/`staticlib` exports; optional decoder/backend packages isolate native dependencies. The runtime dependency graph must not contain the compiler crate. This directly addresses the original runtime Slang session and unconditional Odin KTX import while preserving dependencies on P-002, P-003, P-005, and P-006.
 
 #### Evidence, tradeoffs, and failure modes
 
@@ -45,7 +45,7 @@ Cargo workspaces share a lockfile/output directory, not features. Features are a
 - [Cargo workspaces](https://doc.rust-lang.org/stable/cargo/reference/workspaces.html)
 - [Cargo feature unification](https://doc.rust-lang.org/stable/cargo/reference/features.html#feature-unification)
 - [Cargo resolver v2 and native `links`](https://doc.rust-lang.org/stable/cargo/reference/resolver.html#feature-resolver-version-2)
-- [Slang compilation API and offline `slangc`](https://shader-slang.org/slang/user-guide/compiling)
+- [Slang compilation API and Rust bindings](https://shader-slang.org/docs/compilation-api/) and [shader-slang crate](https://crates.io/crates/shader-slang)
 - Original `TODO.md` lines 45-47 and 61-63; `src/ctx.odin`, `src/shader.odin`, and `src/texture_manager.odin`.
 
 ### S-P-001-single-package-feature-matrix

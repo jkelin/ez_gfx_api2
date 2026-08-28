@@ -1,0 +1,1 @@
+ez-gfx-api2 source packages are licensed under MIT OR Apache-2.0. Dependency license texts are supplied by Cargo metadata and must be included by release assembly before publication. Native compiler distributions retain their upstream licenses and notices.

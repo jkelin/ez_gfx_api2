@@ -16,7 +16,7 @@ Migrate the original Odin/Vulkan `ez_gfx_api` to Rust/Cargo while roughly preser
 - Original concepts and C/C# path remain recognizable where practical; exact ABI compatibility is a decision recorded by P-002.
 - External inputs and binary artifacts require validation; no panic crosses FFI.
 - OpenGL, DX11, software rasterizers, a custom shader DSL, and a custom window system are out of scope.
-- The exact requested `memory-allocator` package is unresolved; P-004 remains blocked until its identity and three-backend suitability are verified.
+- `gpu-allocator` 0.28 is the selected cross-backend Rust allocator.
 - Supported devices meet a declared capability floor or receive explicit unsupported errors.
 - Compiler/build environments may contain Slang, DXC/signing, and Apple tools; runtime deployments do not.
 - Measurements are workload- and environment-specific; unknown values remain unknown.
@@ -25,7 +25,7 @@ Migrate the original Odin/Vulkan `ez_gfx_api` to Rust/Cargo while roughly preser
 
 ### P-001: Cargo workspace and delivery boundaries — Strict workspace boundary
 
-A virtual workspace separates core types, runtime/artifact loading, offline compiler CLI, FFI, backend dependencies, and optional decoders. Runtime dependency audits prevent compiler leakage; feature resolution follows the selected MSRV.
+A virtual workspace separates core types, runtime/artifact loading, offline in-process Slang compiler bindings, FFI, backend dependencies, and optional decoders. Runtime dependency audits prevent compiler leakage; feature resolution follows the selected MSRV.
 
 ### P-002: Public API and C ABI bindings — Layered Rust facade and FFI
 
@@ -35,13 +35,13 @@ A safe Rust facade preserves recognizable resource/graph concepts. A dedicated F
 
 A narrow backend-neutral contract is implemented directly over Vulkan, DX12, and Metal bindings. Capability discovery and state lowering remain backend-local; concrete dispatch avoids hot-path trait-object dependence.
 
-### P-004: GPU memory allocation — Provisional `gpu-allocator`, blocked
+### P-004: GPU memory allocation — `gpu-allocator`
 
-A HAL allocation interface carries size, alignment, memory class, mapping, retirement, and alias lifetime. `gpu-allocator` is provisional only; the exact user-requested `memory-allocator` package must be verified before commitment.
+A HAL allocation interface carries size, alignment, memory class, mapping, retirement, and alias lifetime. `gpu-allocator` 0.28 supplies the Vulkan, DX12, and Metal implementations.
 
 ### P-005: Universal Slang compilation — Native multi-target Slang
 
-Offline Slang compilation emits native SPIR-V, DXIL, and Metal products plus canonical metadata. Target attributes are captured before optimization and validated per target.
+Offline Slang compilation through `shader-slang`/slang-rs emits native SPIR-V, DXIL, and Metal products plus canonical metadata. Target attributes are captured before optimization and validated per target.
 
 ### P-006: Precompiled shader container and reflection — Versioned sectioned bundle
 
@@ -77,7 +77,7 @@ Uploaded resources publish reachable completion tokens. Graph compilation coales
 
 ### P-014: Basis Universal and compressed textures — Feature-gated official transcoder wrapper
 
-An optional `basis-universal` wrapper handles universal `.basis`/KTX2 input and backend-supported BC/ASTC output; direct compressed payloads bypass transcoding. The exact allocator issue remains separate and unresolved in P-004.
+An optional `basis-universal` wrapper handles universal `.basis`/KTX2 input and backend-supported BC/ASTC output; direct compressed payloads bypass transcoding.
 
 ### P-015: Texture streaming and partial updates — Progressive mip streamer
 
@@ -105,11 +105,11 @@ A Vulkan vertical path proves contracts and an end-to-end snapshot first, follow
 
 ### P-021: Cross-backend shader execution semantics — Target-native layouts with canonical semantic ABI
 
-One Slang source uses stable semantic resource IDs and a documented source convention, while `.ezshader` retains complete target-native binding, packing, entry, and specialization layouts. Runtime never assumes identical physical slots or aggregate layouts.
+One Slang source uses stable semantic resource IDs and a documented source convention, while `.ezshader` retains complete target-native binding, packing, entry, and specialization layouts. Runtime never assumes identical physical slots or aggregate layouts. DXIL variants target Shader Model 6.5 and use explicit descriptor tables/root descriptors; no 6.6-only direct heap indexing is part of the semantic ABI.
 
 ### P-022: Backend, device, and capability admission — Single modern semantic floor
 
-Rust/FFI expose explicit adapter enumeration/selection and a deterministic default. One semantic capability floor maps to native features and limits; unsupported devices fail before manager creation. Cache and snapshot identity includes backend, stable device/driver identity, and profile schema.
+Rust/FFI expose explicit adapter enumeration/selection and a deterministic default. One semantic capability floor maps to native features and limits, including Shader Model 6.5 as the lowest model required by implemented DXIL semantics; unsupported devices fail before manager creation. Cache and snapshot identity includes backend, stable device/driver identity, and profile schema.
 
 ### P-023: Device loss and runtime recovery — Terminal lost runtime
 
@@ -158,7 +158,7 @@ Target-native release CI builds pinned sources and publishes separate runtime/FF
 
 ### Offline shader to runtime draw
 
-The compiler receives one Slang source and entries, assigns canonical semantic resource IDs, emits target-native layouts with SPIR-V/DXIL products, and invokes Apple tools for compatible metallib variants. It writes a bounded `.ezshader` whose execution sections, provenance, and digests are complete. Runtime validates and chooses the target section without Slang or source compilation; the host/package boundary applies its authenticity policy. Pipelines bind semantic IDs through target layouts, graph readiness becomes queue waits, and HAL records/submits. Compiler/legalization/tool/metadata failures prevent publication; malformed or incompatible artifacts fail before backend calls.
+The compiler receives one Slang source and entries, assigns canonical semantic resource IDs, emits target-native layouts with SPIR-V and Shader Model 6.5 DXIL products, and invokes Apple tools for compatible metallib variants. It writes a bounded `.ezshader` whose execution sections, provenance, and digests are complete. Runtime validates and chooses the target section without Slang or source compilation; the host/package boundary applies its authenticity policy. Pipelines bind semantic IDs through target layouts, graph readiness becomes queue waits, and HAL records/submits. Compiler/legalization/tool/metadata failures prevent publication; malformed or incompatible artifacts fail before backend calls.
 
 ### Asynchronous texture load
 
@@ -192,7 +192,7 @@ Realizes P-001 and workspace portions of P-029. Runtime cannot depend on Slang; 
 
 ### Interfaces and connections
 
-Provides package dependency/feature contracts, compiler CLI boundary, pinned lockfile/profile inputs, runtime-only dependency audits, and target matrix to release engineering and validation.
+Provides package dependency/feature contracts, compiler-binding boundary, pinned lockfile/profile inputs, runtime-only dependency audits, and target matrix to release engineering and validation.
 
 ### Data and persistence
 
@@ -208,7 +208,7 @@ Release CI consumes pinned source contracts; expert source builds remain possibl
 
 ### Failures and trust
 
-Feature unification/leakage, unsupported target graphs, optional decoder leakage, or unresolved P-004 allocator identity fail before release assembly. Runtime-only dependency-tree checks are mandatory.
+Feature unification/leakage, unsupported target graphs, or optional decoder leakage fail before release assembly. Runtime-only dependency-tree checks are mandatory.
 
 ## Component: Release engineering and distribution
 
@@ -238,7 +238,7 @@ Pinned sources build on declared hosts, are audited/signed, then installed in cl
 
 ### Failures and trust
 
-Wrong architecture, SDK drift, missing redistributables/notices, signature/notarization failure, stale provenance, compiler leakage, or unresolved P-004 blocks publication.
+Wrong architecture, SDK drift, missing redistributables/notices, signature/notarization failure, stale provenance, or compiler leakage blocks publication.
 
 ## Component: Public Rust API and FFI boundary
 
@@ -322,7 +322,7 @@ Reads source/includes/modules and writes artifact sections/products/provenance. 
 
 ### Technology
 
-Rust CLI around Slang, DXC where required, and Apple `metal`/link tools. Target-native physical layouts preserve stable logical semantic IDs.
+Rust bindings around in-process Slang, DXC where required, and Apple `metal`/link tools. Target-native physical layouts preserve stable logical semantic IDs.
 
 ### Lifecycle and performance
 
@@ -371,7 +371,7 @@ Own Rust allocator integration, dedicated/suballocated resources, mapping/cohere
 
 ### Problems and selected solutions
 
-Realizes P-004/P-023 and allocation portions of P-009/P-011/P-012/P-014. `gpu-allocator` remains provisional and blocked pending exact `memory-allocator` identity verification.
+Realizes P-004/P-023 and allocation portions of P-009/P-011/P-012/P-014. `gpu-allocator` 0.28 provides backend allocation behind the HAL contract.
 
 ### Interfaces and connections
 
@@ -383,7 +383,7 @@ Owns GPU heaps, metadata, mapped blocks, retirement queues, and alias ranges. St
 
 ### Technology
 
-Rust allocator package only after P-004 verification; HAL adapters support Vulkan/DX12/Metal and unified memory.
+`gpu-allocator` adapters support Vulkan, DX12, Metal, and unified memory.
 
 ### Lifecycle and performance
 
@@ -391,7 +391,7 @@ Pools start with a healthy device and retire by completion. On `Lost`, outstandi
 
 ### Failures and trust
 
-Unsupported classes, alignment/coherency errors, double ownership, premature reuse, or post-loss access fail closed. P-004 package/license/maintenance/backend/alias checks remain release prerequisites.
+Unsupported classes, alignment/coherency errors, double ownership, premature reuse, or post-loss access fail closed.
 
 
 ## Component: Render graph and hazard compiler
@@ -625,7 +625,7 @@ Resources flow API -> manager -> allocator/HAL; readiness flows transfer -> grap
 
 ### Validation and release policy
 
-All external inputs fail closed. Required adapter absence blocks cutover; explicitly optional exploratory profiles may skip. P-004 allocator identity remains blocked. ABI compatibility, semantic/capability floor, Metal matrix, tolerance, authenticity, signing/notarization, six examples, and every TODO disposition are release gates.
+All external inputs fail closed. Required adapter absence blocks cutover; explicitly optional exploratory profiles may skip. ABI compatibility, semantic/capability floor, Metal matrix, tolerance, authenticity, signing/notarization, six examples, and every TODO disposition are release gates.
 
 
 ## Coverage audit
@@ -654,10 +654,10 @@ Each retained problem is decision-sized, crosses existing component ownership, a
 
 ### Step 4 integration
 
-P-021 through P-029 are now integrated into the canonical component plan and flows. Ownership is explicit for semantic shader IDs versus target layouts/specialization, capability admission and its cache/test identity, terminal `Lost` fan-out and exactly-once outcomes, host-owned cache persistence/authenticity, Metal build/selection metadata, host-polled events, bounded local diagnostics, and native release products. P-004 remains blocked exactly as selected. A later recursive coverage pass is still required before claiming a fixed point.
+P-021 through P-029 are now integrated into the canonical component plan and flows. Ownership is explicit for semantic shader IDs versus target layouts/specialization, capability admission and its cache/test identity, terminal `Lost` fan-out and exactly-once outcomes, host-owned cache persistence/authenticity, Metal build/selection metadata, host-polled events, bounded local diagnostics, and native release products. P-004 is resolved by the selected allocator. A later recursive coverage pass is still required before claiming a fixed point.
 
 ### Coverage Pass 3 — recursive Step 1 after second Step 4
 
 The component-boundary, interface, end-to-end flow, mutable/durable storage, cache, bounded-queue, failure/trust, deployment, performance, and cross-component interaction audit reached a fixed point. Every prompt requirement and consequential cross-cutting choice is owned by P-001 through P-029 with a selected solution.
 
-No P-030 problem was created. Remaining specifics—exact semantic-profile limits, source-convention constants, queue capacities, Apple/target matrix entries, cache envelope fields, diagnostic payload bounds, benchmark thresholds, and test fixtures—are implementation or validation refinements inside P-021 through P-029, not new decision boundaries. P-004's allocator identity remains an explicit external blocker rather than a newly uncovered problem.
+No P-030 problem was created. Remaining specifics—exact semantic-profile limits, source-convention constants, queue capacities, Apple/target matrix entries, cache envelope fields, diagnostic payload bounds, benchmark thresholds, and test fixtures—are implementation or validation refinements inside P-021 through P-029, not new decision boundaries.

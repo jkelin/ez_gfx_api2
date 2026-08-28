@@ -1,0 +1,14 @@
+[package]
+name = "ez-gfx-backend-dx12"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ez-gfx-core.workspace = true
+ez-gfx-hal.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Security", "Win32_System_Threading"] }
+gpu-allocator = { workspace = true, features = ["std", "d3d12"] }

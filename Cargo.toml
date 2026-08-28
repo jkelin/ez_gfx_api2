@@ -1,0 +1,41 @@
+[workspace]
+members = [
+    "crates/ez-gfx-core",
+    "crates/ez-gfx-hal",
+    "crates/ez-gfx-runtime",
+    "crates/ez-gfx-compiler",
+    "crates/ez-gfx-artifact",
+    "crates/ez-gfx-assets",
+    "crates/ez-gfx-ffi",
+    "crates/ez-gfx-backend-vulkan",
+    "crates/ez-gfx-backend-dx12",
+    "crates/ez-gfx-backend-metal",
+    "examples",
+    "tools/xtask",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+ez-gfx-core = { path = "crates/ez-gfx-core" }
+ez-gfx-hal = { path = "crates/ez-gfx-hal" }
+ez-gfx-runtime = { path = "crates/ez-gfx-runtime" }
+ez-gfx-artifact = { path = "crates/ez-gfx-artifact" }
+ez-gfx-compiler = { path = "crates/ez-gfx-compiler" }
+blake3 = { version = "1.8.2", default-features = false, features = ["std", "pure"] }
+ash = { version = "0.38.0", default-features = false, features = ["loaded", "std"] }
+windows = { version = "0.62.2", default-features = false }
+objc2 = { version = "0.6.2", default-features = false, features = ["std"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = ["MTLDevice"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSString"] }
+gpu-allocator = { version = "0.28.0", default-features = false }
+image = { version = "0.25.10", default-features = false, features = ["bmp", "jpeg", "png", "tga"] }
+ktx2 = "0.5.0"
+basisu_c_sys = { version = "0.9.0", features = ["extra"] }
+dispatch2 = "0.3.1"
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["CAMetalLayer", "CALayer", "objc2-metal"] }

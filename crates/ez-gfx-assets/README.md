@@ -1,0 +1,3 @@
+# ez-gfx-assets
+
+Compiler-free texture asset validation and staging primitives. It parses direct KTX2 BC/ASTC levels, hands supported BasisLZ payloads to the optional `basis` transcoder, tracks mip residency, and provides bounded CPU/event queues. It emits validated payloads and host-polled outcomes without claiming GPU upload success.

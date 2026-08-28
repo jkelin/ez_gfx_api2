@@ -1,0 +1,9 @@
+[package]
+name = "ez-gfx-hal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ez-gfx-core.workspace = true

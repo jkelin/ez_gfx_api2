@@ -1,0 +1,41 @@
+[tasks.check]
+description = "Check the Rust workspace"
+run = "cargo check --workspace"
+
+[tasks.test]
+description = "Run the workspace test suite"
+run = "cargo test --workspace"
+
+[tasks.examples-build]
+description = "Build all migrated Rust examples"
+run = "cargo build -p ez-gfx-examples --bins"
+
+[tasks.examples-artifacts]
+description = "Compile checked-in universal example shader artifacts"
+run = "cargo run -p ez-gfx-compiler --bin ez-gfx-compile -- examples/assets/scene.json"
+
+[tasks.examples-smoke]
+description = "Run every host-compatible example API smoke"
+run = "cargo test -p ez-gfx-examples --test smoke"
+
+[tasks.example-1]
+run = "cargo run -p ez-gfx-examples --bin 01_triangle"
+
+[tasks.example-2]
+run = "cargo run -p ez-gfx-examples --bin 02_textured_cube"
+
+[tasks.example-3]
+run = "cargo run -p ez-gfx-examples --bin 03_compute_structured"
+
+[tasks.example-4]
+run = "cargo run -p ez-gfx-examples --bin 04_imgui"
+
+[tasks.example-5]
+run = "cargo run -p ez-gfx-examples --bin 05_helmet"
+
+[tasks.example-6]
+run = "cargo run -p ez-gfx-examples --bin 06_sponza_ktx2"
+
+[tasks.package]
+description = "Build and package runtime/compiler products; append target, version, and output arguments after --"
+run = "cargo run -p xtask -- package"
