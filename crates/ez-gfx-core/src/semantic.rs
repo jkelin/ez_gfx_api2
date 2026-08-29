@@ -125,10 +125,10 @@ impl SemanticGraph {
             if !names.insert(resource.name.clone()) {
                 return Err(SemanticError::DuplicateName);
             }
-            if let Some(existing) = ids.insert(resource.id, resource.name.clone()) {
-                if existing != resource.name {
-                    return Err(SemanticError::IdCollision(resource.id));
-                }
+            if let Some(existing) = ids.insert(resource.id, resource.name.clone())
+                && existing != resource.name
+            {
+                return Err(SemanticError::IdCollision(resource.id));
             }
         }
 

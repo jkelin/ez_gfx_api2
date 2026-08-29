@@ -62,7 +62,7 @@ fn capabilities(compression: CompressionSupport) -> AdapterCapabilities {
     AdapterCapabilities {
         bindless_sampled_textures: 8192,
         bindless_storage_resources: 2048,
-        bindless_samplers: 256,
+        bindless_samplers: 1024,
         max_indirect_draw_count: 65_535,
         shader_model: 0x0605,
         timeline_synchronization: true,
@@ -83,7 +83,7 @@ fn capability_floor_reports_every_missing_requirement() {
     let errors = SemanticProfile::V1.admit(&caps).unwrap_err();
     assert!(errors.contains(&CapabilityError::Limit {
         name: "bindless_sampled_textures",
-        required: 4096,
+        required: 1024,
         available: 2
     }));
     assert!(errors.contains(&CapabilityError::Limit {
@@ -93,6 +93,19 @@ fn capability_floor_reports_every_missing_requirement() {
     }));
     assert!(errors.contains(&CapabilityError::MissingFeature("timeline_synchronization")));
     assert!(errors.contains(&CapabilityError::MissingCompression));
+}
+
+#[test]
+fn sampled_texture_capacity_admits_exact_canonical_limit() {
+    let mut caps = capabilities(CompressionSupport::BC);
+    caps.bindless_sampled_textures = 1024;
+    assert!(SemanticProfile::V1.admit(&caps).is_ok());
+
+    caps.bindless_samplers = 1023;
+    assert!(SemanticProfile::V1.admit(&caps).is_err());
+
+    caps.bindless_sampled_textures = 1023;
+    assert!(SemanticProfile::V1.admit(&caps).is_err());
 }
 
 #[test]

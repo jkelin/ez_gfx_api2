@@ -113,3 +113,38 @@ fn dxil_register_namespaces_allow_srv_and_uav_at_the_same_index() {
         }),
     );
 }
+
+#[test]
+fn pipeline_layout_reads_canonical_texture_heap_and_depth_contract() {
+    let metadata = br#"{"reflections":[{"target":"Metallib","entry":"fragmentmain","stage":"Fragment","reflection":{"parameters":[],"texture_heap":{"binding_space":1,"binding_index":6,"capacity":1024,"argument_stride":2,"texture_argument_offset":0,"sampler_argument_offset":1},"depth_required":true}}]}"#;
+    let layout = ez_gfx_runtime::binding::PipelineLayout::parse(
+        metadata,
+        Backend::Metal,
+        "fragmentmain",
+        Stage::Fragment,
+    )
+    .unwrap();
+    assert!(layout.depth_required());
+    assert_eq!(
+        layout.texture_heap(),
+        Some(&ez_gfx_runtime::binding::TextureHeapLayout {
+            space: 1,
+            binding: 6,
+            capacity: 1024,
+            argument_stride: 2,
+            texture_argument_offset: 0,
+            sampler_argument_offset: 1,
+        })
+    );
+
+    let oversized = br#"{"reflections":[{"target":"Metallib","entry":"fragmentmain","stage":"Fragment","reflection":{"parameters":[],"texture_heap":{"binding_space":1,"binding_index":6,"capacity":1025,"argument_stride":2,"texture_argument_offset":0,"sampler_argument_offset":1}}}]}"#;
+    assert_eq!(
+        ez_gfx_runtime::binding::PipelineLayout::parse(
+            oversized,
+            Backend::Metal,
+            "fragmentmain",
+            Stage::Fragment,
+        ),
+        Err(BindingError::InvalidMetadata)
+    );
+}

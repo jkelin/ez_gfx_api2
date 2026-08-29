@@ -1,4 +1,5 @@
 use core::mem::{align_of, size_of};
+#[allow(unused_imports)]
 use ez_gfx_ffi::{
     EZ_GFX_ABI_VERSION, EzGfxBackendContextDesc, EzGfxContextDesc, EzGfxDiagnostic,
     EzGfxDrawIndexedCommand, EzGfxDynamicState, EzGfxHandleParts, EzGfxResult, EzGfxRuntimeRecord,
@@ -224,6 +225,54 @@ fn dx12_geometry_uploads_use_real_device_buffers_and_transfer_fence() {
     ez_gfx_vertex_heap_destroy(heap.as_ptr(), context);
     ez_gfx_index_heap_destroy(context);
     ez_gfx_context_destroy(context);
+}
+
+#[test]
+fn texture_descriptor_rejects_unsupported_pipeline_state_before_context_access() {
+    let pixels = [0_u8; 4];
+    let mut texture = 0;
+    let valid = EzGfxTextureDesc {
+        source_format: 1,
+        destination_format: 0,
+        width: 1,
+        height: 1,
+        mip_count: 1,
+        generate_mips: 0,
+        min_filter: 0,
+        mag_filter: 1,
+        max_anisotropy: 1.0,
+        address_mode_u: 0,
+        address_mode_v: 1,
+        address_mode_w: 0,
+        debug_label: core::ptr::null(),
+    };
+    for desc in [
+        EzGfxTextureDesc {
+            destination_format: 1,
+            ..valid
+        },
+        EzGfxTextureDesc {
+            min_filter: 2,
+            ..valid
+        },
+        EzGfxTextureDesc {
+            address_mode_u: 2,
+            ..valid
+        },
+        EzGfxTextureDesc {
+            max_anisotropy: 0.0,
+            ..valid
+        },
+        EzGfxTextureDesc {
+            max_anisotropy: f32::NAN,
+            ..valid
+        },
+    ] {
+        assert_eq!(
+            ez_gfx_texture_load(pixels.as_ptr(), pixels.len(), &desc, &mut texture, 0,),
+            EzGfxResult::InvalidArgument
+        );
+    }
 }
 
 #[cfg(windows)]

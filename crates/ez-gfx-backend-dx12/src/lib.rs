@@ -1,11 +1,12 @@
-use ez_gfx_core::Backend;
+use ez_gfx_core::{Backend, capability::MAX_BINDLESS_SAMPLED_TEXTURES};
 
 pub const BACKEND: Backend = Backend::Dx12;
 pub const SUPPORTED_ON_TARGET: bool = cfg!(windows);
+pub const TEXTURE_DESCRIPTOR_CAPACITY: u32 = MAX_BINDLESS_SAMPLED_TEXTURES;
 
 #[cfg(windows)]
 pub mod native {
-    use crate::BACKEND;
+    use crate::{BACKEND, TEXTURE_DESCRIPTOR_CAPACITY};
     use core::{ffi::c_void, ptr};
 
     use ez_gfx_core::capability::{
@@ -14,7 +15,8 @@ pub mod native {
     use ez_gfx_hal::{
         AllocationError, AllocationRequest, BlendMode, BufferTransfer, CompletionToken, CullMode,
         DynamicPipelineState, FrontFace, HalError, ImageMip, MemoryAllocator, MemoryClass,
-        PrimitiveTopology, QueueKind, ShaderBufferLayout, validate_rgba8_mips,
+        PrimitiveTopology, QueueKind, SamplerAddressMode, SamplerFilter, ShaderBufferLayout,
+        TextureSamplerDesc, validate_rgba8_mips,
     };
     use gpu_allocator::{
         MemoryLocation,
@@ -30,16 +32,20 @@ pub mod native {
     use windows::Win32::Graphics::Direct3D12::{
         D3D_ROOT_SIGNATURE_VERSION_1, D3D_SHADER_MODEL_6_5, D3D12_BLEND_DESC,
         D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_ONE, D3D12_BLEND_OP_ADD, D3D12_BLEND_SRC_ALPHA,
-        D3D12_BLEND_ZERO, D3D12_COLOR_WRITE_ENABLE_ALL, D3D12_COMMAND_SIGNATURE_DESC,
-        D3D12_COMPARISON_FUNC_ALWAYS, D3D12_COMPARISON_FUNC_LESS,
-        D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_CULL_MODE_BACK, D3D12_CULL_MODE_FRONT,
-        D3D12_CULL_MODE_NONE, D3D12_DEPTH_STENCIL_DESC, D3D12_DEPTH_STENCILOP_DESC,
-        D3D12_DEPTH_WRITE_MASK_ALL, D3D12_DESCRIPTOR_HEAP_DESC, D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+        D3D12_BLEND_ZERO, D3D12_CLEAR_FLAG_DEPTH, D3D12_CLEAR_VALUE, D3D12_CLEAR_VALUE_0,
+        D3D12_COLOR_WRITE_ENABLE_ALL, D3D12_COMMAND_SIGNATURE_DESC, D3D12_COMPARISON_FUNC_ALWAYS,
+        D3D12_COMPARISON_FUNC_LESS, D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_CULL_MODE_BACK,
+        D3D12_CULL_MODE_FRONT, D3D12_CULL_MODE_NONE, D3D12_DEPTH_STENCIL_DESC,
+        D3D12_DEPTH_STENCIL_VALUE, D3D12_DEPTH_STENCILOP_DESC, D3D12_DEPTH_WRITE_MASK_ALL,
+        D3D12_DESCRIPTOR_HEAP_DESC, D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-        D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, D3D12_DESCRIPTOR_RANGE,
+        D3D12_DESCRIPTOR_HEAP_TYPE_DSV, D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+        D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, D3D12_DESCRIPTOR_RANGE,
         D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,
         D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_FEATURE_DATA_SHADER_MODEL,
-        D3D12_FEATURE_SHADER_MODEL, D3D12_FILL_MODE_SOLID, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        D3D12_FEATURE_SHADER_MODEL, D3D12_FILL_MODE_SOLID, D3D12_FILTER_ANISOTROPIC,
+        D3D12_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT,
         D3D12_GRAPHICS_PIPELINE_STATE_DESC, D3D12_INDEX_BUFFER_VIEW, D3D12_INDIRECT_ARGUMENT_DESC,
         D3D12_INDIRECT_ARGUMENT_DESC_0, D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED,
         D3D12_LOGIC_OP_NOOP, D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE,
@@ -56,10 +62,10 @@ pub mod native {
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
         D3D12_ROOT_SIGNATURE_FLAG_NONE, D3D12_SAMPLER_DESC, D3D12_SHADER_BYTECODE,
         D3D12_SHADER_VISIBILITY_ALL, D3D12_STENCIL_OP_KEEP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-        D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
-        D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-        D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_VIEWPORT, D3D12SerializeRootSignature,
-        ID3D12CommandSignature, ID3D12DescriptorHeap, ID3D12PipelineState, ID3D12RootSignature,
+        D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_COPY_LOCATION,
+        D3D12_TEXTURE_COPY_LOCATION_0, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_VIEWPORT,
+        D3D12SerializeRootSignature, ID3D12CommandSignature, ID3D12DescriptorHeap,
+        ID3D12PipelineState, ID3D12RootSignature,
     };
     use windows::{
         Win32::{
@@ -71,16 +77,17 @@ pub mod native {
                     D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, D3D12_FEATURE_D3D12_OPTIONS,
                     D3D12_FEATURE_DATA_D3D12_OPTIONS, D3D12_FENCE_FLAG_NONE, D3D12_RANGE,
                     D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER,
+                    D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_NONE,
                     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                    D3D12CreateDevice, ID3D12CommandAllocator, ID3D12CommandList,
-                    ID3D12CommandQueue, ID3D12Device, ID3D12Fence, ID3D12GraphicsCommandList,
-                    ID3D12Resource,
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_GENERIC_READ,
+                    D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12CreateDevice, ID3D12CommandAllocator,
+                    ID3D12CommandList, ID3D12CommandQueue, ID3D12Device, ID3D12Fence,
+                    ID3D12GraphicsCommandList, ID3D12Resource,
                 },
                 Dxgi::{
                     Common::{
-                        DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_UINT,
+                        DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_UINT,
                         DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
                     },
                     CreateDXGIFactory1, DXGI_ADAPTER_FLAG3_SOFTWARE, DXGI_ERROR_NOT_FOUND,
@@ -134,6 +141,7 @@ pub mod native {
         topology: Option<D3D_PRIMITIVE_TOPOLOGY>,
         signature: Option<ID3D12CommandSignature>,
         buffer_writable: Vec<bool>,
+        depth_required: bool,
     }
 
     pub struct NativeTexture {
@@ -153,6 +161,12 @@ pub mod native {
         _list: ID3D12GraphicsCommandList,
     }
 
+    struct SurfaceDepth {
+        resource: ID3D12Resource,
+        allocation: Allocation,
+        heap: ID3D12DescriptorHeap,
+    }
+
     pub struct NativeSurface {
         window: usize,
         swapchain: Option<IDXGISwapChain4>,
@@ -161,6 +175,7 @@ pub mod native {
         width: u32,
         height: u32,
         presented: Vec<u8>,
+        depth: Option<SurfaceDepth>,
     }
 
     impl NativeSurface {
@@ -177,6 +192,7 @@ pub mod native {
                 buffers: Vec::new(),
                 rtv_heap: None,
                 presented: Vec::new(),
+                depth: None,
             })
         }
 
@@ -203,6 +219,7 @@ pub mod native {
         descriptors: ID3D12DescriptorHeap,
         descriptor_stride: u32,
         samplers: ID3D12DescriptorHeap,
+        sampler_stride: u32,
     }
 
     // SAFETY: D3D12/DXGI interfaces are agile and the event handle is process-wide; higher layers
@@ -266,7 +283,7 @@ pub mod native {
                 }
                 let capabilities = AdapterCapabilities {
                     bindless_sampled_textures: if options.ResourceBindingTier.0 >= 3 {
-                        1_000_000
+                        TEXTURE_DESCRIPTOR_CAPACITY
                     } else {
                         0
                     },
@@ -276,7 +293,7 @@ pub mod native {
                         0
                     },
                     bindless_samplers: if options.ResourceBindingTier.0 >= 3 {
-                        2048
+                        TEXTURE_DESCRIPTOR_CAPACITY
                     } else {
                         0
                     },
@@ -330,7 +347,7 @@ pub mod native {
                 let descriptors: ID3D12DescriptorHeap = unsafe {
                     device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                         Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                        NumDescriptors: 4096,
+                        NumDescriptors: TEXTURE_DESCRIPTOR_CAPACITY,
                         Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                         NodeMask: 0,
                     })
@@ -341,7 +358,7 @@ pub mod native {
                 let samplers: ID3D12DescriptorHeap = unsafe {
                     device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                         Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-                        NumDescriptors: 1024,
+                        NumDescriptors: TEXTURE_DESCRIPTOR_CAPACITY,
                         Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                         NodeMask: 0,
                     })
@@ -358,7 +375,7 @@ pub mod native {
                     ..Default::default()
                 };
                 let mut sampler = unsafe { samplers.GetCPUDescriptorHandleForHeapStart() };
-                for _ in 0..1024 {
+                for _ in 0..TEXTURE_DESCRIPTOR_CAPACITY {
                     unsafe { device.CreateSampler(&sampler_desc, sampler) };
                     sampler.ptr += sampler_stride;
                 }
@@ -376,6 +393,7 @@ pub mod native {
                     descriptors,
                     descriptor_stride,
                     samplers,
+                    sampler_stride: sampler_stride as u32,
                 });
             }
         }
@@ -470,6 +488,7 @@ pub mod native {
                 surface.height = height;
             } else if surface.width != width || surface.height != height {
                 self.wait_idle()?;
+                self.destroy_surface_depth(surface)?;
                 surface.buffers.clear();
                 surface.rtv_heap = None;
                 unsafe {
@@ -522,6 +541,128 @@ pub mod native {
             surface.rtv_heap = Some(heap);
             Ok(())
         }
+
+        fn ensure_surface_depth(&mut self, surface: &mut NativeSurface) -> Result<(), HalError> {
+            if surface.depth.is_some() {
+                return Ok(());
+            }
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Alignment: 0,
+                Width: u64::from(surface.width),
+                Height: surface.height,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_D32_FLOAT,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            };
+            let allocation_desc = AllocationCreateDesc::from_d3d12_resource_desc(
+                self.allocator
+                    .as_ref()
+                    .ok_or(HalError::NativeFailure)?
+                    .device(),
+                &desc,
+                "ez-gfx-depth",
+                MemoryLocation::GpuOnly,
+            );
+            let allocation = self
+                .allocator
+                .as_mut()
+                .ok_or(HalError::NativeFailure)?
+                .allocate(&allocation_desc)
+                .map_err(map_allocator_hal)?;
+            let clear = D3D12_CLEAR_VALUE {
+                Format: DXGI_FORMAT_D32_FLOAT,
+                Anonymous: D3D12_CLEAR_VALUE_0 {
+                    DepthStencil: D3D12_DEPTH_STENCIL_VALUE {
+                        Depth: 1.0,
+                        Stencil: 0,
+                    },
+                },
+            };
+            let mut resource = None;
+            if let Err(error) = unsafe {
+                self.device.CreatePlacedResource(
+                    allocation.heap(),
+                    allocation.offset(),
+                    &desc,
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                    Some(&clear),
+                    &mut resource,
+                )
+            } {
+                let _ = self
+                    .allocator
+                    .as_mut()
+                    .expect("allocator remains initialized")
+                    .free(allocation);
+                return Err(map_windows(error));
+            }
+            let Some(resource) = resource else {
+                let _ = self
+                    .allocator
+                    .as_mut()
+                    .expect("allocator remains initialized")
+                    .free(allocation);
+                return Err(HalError::NativeFailure);
+            };
+            let heap = match unsafe {
+                self.device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                        NumDescriptors: 1,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                        NodeMask: 0,
+                    })
+            } {
+                Ok(heap) => heap,
+                Err(error) => {
+                    drop(resource);
+                    let _ = self
+                        .allocator
+                        .as_mut()
+                        .expect("allocator remains initialized")
+                        .free(allocation);
+                    return Err(map_windows(error));
+                }
+            };
+            unsafe {
+                self.device.CreateDepthStencilView(
+                    &resource,
+                    None,
+                    heap.GetCPUDescriptorHandleForHeapStart(),
+                )
+            };
+            surface.depth = Some(SurfaceDepth {
+                resource,
+                allocation,
+                heap,
+            });
+            Ok(())
+        }
+
+        fn destroy_surface_depth(&mut self, surface: &mut NativeSurface) -> Result<(), HalError> {
+            let Some(depth) = surface.depth.take() else {
+                return Ok(());
+            };
+            drop(depth.resource);
+            drop(depth.heap);
+            self.allocator
+                .as_mut()
+                .ok_or(HalError::NativeFailure)?
+                .free(depth.allocation)
+                .map_err(map_allocator_hal)
+        }
+
+        pub fn destroy_surface(&mut self, mut surface: NativeSurface) {
+            let _ = self.wait_idle();
+            let _ = self.destroy_surface_depth(&mut surface);
+        }
         /// DXIL products remain owned until PSO creation; empty products are rejected at admission.
         pub fn create_shader(&self, products: &[&[u8]]) -> Result<NativeShader, HalError> {
             if products.is_empty() || products.iter().any(|product| product.is_empty()) {
@@ -532,7 +673,7 @@ pub mod native {
             })
         }
 
-        /// Reflected buffers use root SRV/UAVs; fixed 1,024-entry texture and sampler tables occupy the remaining roots.
+        /// Reflected buffers use root SRV/UAVs; separate texture and sampler tables occupy the remaining roots.
         fn create_root_signature(
             &self,
             layouts: &[ShaderBufferLayout],
@@ -546,16 +687,16 @@ pub mod native {
                 .ok_or(HalError::InvalidArgument)?;
             let texture_range = D3D12_DESCRIPTOR_RANGE {
                 RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-                NumDescriptors: 1024,
-                BaseShaderRegister: 1,
-                RegisterSpace: 0,
+                NumDescriptors: TEXTURE_DESCRIPTOR_CAPACITY,
+                BaseShaderRegister: 0,
+                RegisterSpace: 1,
                 OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
             };
             let sampler_range = D3D12_DESCRIPTOR_RANGE {
                 RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,
-                NumDescriptors: 1024,
+                NumDescriptors: TEXTURE_DESCRIPTOR_CAPACITY,
                 BaseShaderRegister: 0,
-                RegisterSpace: 0,
+                RegisterSpace: 1,
                 OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
             };
             let mut parameters = Vec::with_capacity(descriptor_count + 3);
@@ -672,6 +813,7 @@ pub mod native {
                 topology: None,
                 signature: None,
                 buffer_writable,
+                depth_required: false,
             })
         }
 
@@ -681,6 +823,7 @@ pub mod native {
             vertex_index: usize,
             fragment_index: usize,
             state: DynamicPipelineState,
+            depth_required: bool,
             layouts: &[ShaderBufferLayout],
         ) -> Result<NativePipeline, HalError> {
             let vertex = shader
@@ -762,7 +905,7 @@ pub mod native {
                 StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS,
             };
             let depth_stencil = D3D12_DEPTH_STENCIL_DESC {
-                DepthEnable: false.into(),
+                DepthEnable: depth_required.into(),
                 DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
                 DepthFunc: D3D12_COMPARISON_FUNC_LESS,
                 StencilEnable: false.into(),
@@ -790,6 +933,11 @@ pub mod native {
                 PrimitiveTopologyType: topology_type,
                 NumRenderTargets: 1,
                 RTVFormats: formats,
+                DSVFormat: if depth_required {
+                    DXGI_FORMAT_D32_FLOAT
+                } else {
+                    DXGI_FORMAT_UNKNOWN
+                },
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
                     Quality: 0,
@@ -820,6 +968,7 @@ pub mod native {
                 topology: Some(topology),
                 signature,
                 buffer_writable,
+                depth_required,
             })
         }
 
@@ -931,7 +1080,26 @@ pub mod native {
                 .signature
                 .as_ref()
                 .ok_or(HalError::InvalidArgument)?;
+            let index_size = u32::try_from(index_buffer.allocation.size())
+                .map_err(|_| HalError::InvalidArgument)?;
+            let binding_addresses = bindings
+                .iter()
+                .zip(&pipeline.buffer_writable)
+                .map(|(binding, writable)| {
+                    if binding.writable != *writable
+                        || binding.offset >= binding.allocation.allocation.size()
+                    {
+                        return Err(HalError::InvalidArgument);
+                    }
+                    unsafe { binding.allocation.resource.GetGPUVirtualAddress() }
+                        .checked_add(binding.offset)
+                        .ok_or(HalError::InvalidArgument)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             self.ensure_swapchain(surface, width, height)?;
+            if pipeline.depth_required {
+                self.ensure_surface_depth(surface)?;
+            }
             let swapchain = surface
                 .swapchain
                 .as_ref()
@@ -950,7 +1118,26 @@ pub mod native {
             } as usize;
             let mut rtv = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
             rtv.ptr += image_index * stride;
+            let dsv = surface
+                .depth
+                .as_ref()
+                .filter(|_| pipeline.depth_required)
+                .map(|depth| unsafe { depth.heap.GetCPUDescriptorHandleForHeapStart() });
 
+            let allocator: ID3D12CommandAllocator = unsafe {
+                self.device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+            }
+            .map_err(map_windows)?;
+            let list: ID3D12GraphicsCommandList = unsafe {
+                self.device.CreateCommandList(
+                    0,
+                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &allocator,
+                    &pipeline.state,
+                )
+            }
+            .map_err(map_windows)?;
             let readback = if capture_presented {
                 let back_buffer_desc = unsafe { back_buffer.GetDesc() };
                 let mut footprint = Default::default();
@@ -979,21 +1166,6 @@ pub mod native {
             } else {
                 None
             };
-
-            let allocator: ID3D12CommandAllocator = unsafe {
-                self.device
-                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-            }
-            .map_err(map_windows)?;
-            let list: ID3D12GraphicsCommandList = unsafe {
-                self.device.CreateCommandList(
-                    0,
-                    D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    &allocator,
-                    &pipeline.state,
-                )
-            }
-            .map_err(map_windows)?;
             let to_target = D3D12_RESOURCE_TRANSITION_BARRIER {
                 pResource: core::mem::ManuallyDrop::new(Some(back_buffer.clone())),
                 Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
@@ -1016,8 +1188,7 @@ pub mod native {
             };
             let index_view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: unsafe { index_buffer.resource.GetGPUVirtualAddress() },
-                SizeInBytes: u32::try_from(index_buffer.allocation.size())
-                    .map_err(|_| HalError::InvalidArgument)?,
+                SizeInBytes: index_size,
                 Format: DXGI_FORMAT_R32_UINT,
             };
             unsafe {
@@ -1030,8 +1201,16 @@ pub mod native {
                 }]);
                 list.RSSetViewports(&[viewport]);
                 list.RSSetScissorRects(&[scissor]);
-                list.OMSetRenderTargets(1, Some(&rtv), false, None);
-                list.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0], None);
+                list.OMSetRenderTargets(
+                    1,
+                    Some(&rtv),
+                    false,
+                    dsv.as_ref().map(|handle| handle as *const _),
+                );
+                if let Some(dsv) = dsv {
+                    list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
+                }
+                list.ClearRenderTargetView(rtv, &[0.1, 0.1, 0.1, 1.0], None);
                 list.SetGraphicsRootSignature(&pipeline.root);
                 list.SetDescriptorHeaps(&[
                     Some(self.descriptors.clone()),
@@ -1046,24 +1225,15 @@ pub mod native {
                     table + 1,
                     self.samplers.GetGPUDescriptorHandleForHeapStart(),
                 );
-                for (index, (binding, writable)) in
-                    bindings.iter().zip(&pipeline.buffer_writable).enumerate()
+                for (index, (address, writable)) in binding_addresses
+                    .iter()
+                    .zip(&pipeline.buffer_writable)
+                    .enumerate()
                 {
-                    if binding.writable != *writable
-                        || binding.offset >= binding.allocation.allocation.size()
-                    {
-                        return Err(HalError::InvalidArgument);
-                    }
-                    let address = binding
-                        .allocation
-                        .resource
-                        .GetGPUVirtualAddress()
-                        .checked_add(binding.offset)
-                        .ok_or(HalError::InvalidArgument)?;
                     if *writable {
-                        list.SetGraphicsRootUnorderedAccessView(index as u32 + 1, address);
+                        list.SetGraphicsRootUnorderedAccessView(index as u32 + 1, *address);
                     } else {
-                        list.SetGraphicsRootShaderResourceView(index as u32 + 1, address);
+                        list.SetGraphicsRootShaderResourceView(index as u32 + 1, *address);
                     }
                 }
                 if !push_constants.is_empty() {
@@ -1139,33 +1309,83 @@ pub mod native {
                         },
                     }]);
                 }
-                list.Close().map_err(map_windows)?;
-                self.queue
-                    .ExecuteCommandLists(&[Some(list.cast().map_err(map_windows)?)]);
-                swapchain
-                    .Present(1, DXGI_PRESENT(0))
-                    .ok()
-                    .map_err(map_windows)?;
+                if let Err(error) = list.Close() {
+                    if let Some((_, _, allocation)) = readback {
+                        let _ = self.free(allocation);
+                    }
+                    return Err(map_windows(error));
+                }
+                let command = match list.cast() {
+                    Ok(command) => command,
+                    Err(error) => {
+                        if let Some((_, _, allocation)) = readback {
+                            let _ = self.free(allocation);
+                        }
+                        return Err(map_windows(error));
+                    }
+                };
+                self.queue.ExecuteCommandLists(&[Some(command)]);
+                if let Err(error) = swapchain.Present(1, DXGI_PRESENT(0)).ok() {
+                    let _ = self.wait_idle();
+                    if let Some((_, _, allocation)) = readback {
+                        let _ = self.free(allocation);
+                    }
+                    return Err(map_windows(error));
+                }
             }
-            self.wait_idle()?;
+            if let Err(error) = self.wait_idle() {
+                if let Some((_, _, allocation)) = readback {
+                    let _ = self.free(allocation);
+                }
+                return Err(error);
+            }
             let Some((footprint, total, mut readback)) = readback else {
                 return Ok(());
             };
-            self.invalidate(&mut readback, 0, total)
-                .map_err(|_| HalError::NativeFailure)?;
-            let source = self
-                .mapped_slice(&readback)
-                .map_err(|_| HalError::NativeFailure)?;
-            surface
-                .presented
-                .resize(width as usize * height as usize * 4, 0);
-            for row in 0..height as usize {
-                let source_start = row * footprint.Footprint.RowPitch as usize;
-                let destination_start = row * width as usize * 4;
-                surface.presented[destination_start..destination_start + width as usize * 4]
-                    .copy_from_slice(&source[source_start..source_start + width as usize * 4]);
+            let captured = (|| {
+                self.invalidate(&mut readback, 0, total)
+                    .map_err(|_| HalError::NativeFailure)?;
+                let source = self
+                    .mapped_slice(&readback)
+                    .map_err(|_| HalError::NativeFailure)?;
+                surface
+                    .presented
+                    .resize(width as usize * height as usize * 4, 0);
+                for row in 0..height as usize {
+                    let source_start = row * footprint.Footprint.RowPitch as usize;
+                    let destination_start = row * width as usize * 4;
+                    surface.presented[destination_start..destination_start + width as usize * 4]
+                        .copy_from_slice(&source[source_start..source_start + width as usize * 4]);
+                }
+                Ok(())
+            })();
+            let freed = self.free(readback).map_err(|_| HalError::NativeFailure);
+            match (captured, freed) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), _) | (_, Err(error)) => Err(error),
             }
-            self.free(readback).map_err(|_| HalError::NativeFailure)
+        }
+        fn destroy_unpublished_texture(
+            &mut self,
+            resource: ID3D12Resource,
+            allocation: Allocation,
+            upload: Option<NativeAllocation>,
+            wait_for_queue: bool,
+        ) {
+            if wait_for_queue && self.wait_idle().is_ok() {
+                let completed = unsafe { self.fence.GetCompletedValue() };
+                self.pending_copies
+                    .retain(|copy| copy.completion.value > completed);
+            }
+            if let Some(upload) = upload {
+                let _ = self.free(upload);
+            }
+            drop(resource);
+            let _ = self
+                .allocator
+                .as_mut()
+                .expect("allocator remains initialized")
+                .free(allocation);
         }
 
         /// Creates an RGBA8 mip chain and submits each level under a distinct fence value.
@@ -1173,9 +1393,10 @@ pub mod native {
             &mut self,
             mips: &[ImageMip<'_>],
             binding: u32,
+            sampler_desc: TextureSamplerDesc,
         ) -> Result<(NativeTexture, Vec<CompletionToken>), AllocationError> {
             validate_rgba8_mips(mips).map_err(|_| AllocationError::ZeroSize)?;
-            if binding >= 4096 {
+            if binding >= TEXTURE_DESCRIPTOR_CAPACITY {
                 return Err(AllocationError::ZeroSize);
             }
             let width = mips[0].width;
@@ -1230,7 +1451,17 @@ pub mod native {
                     .free(allocation);
                 return Err(map_allocation_windows(error));
             }
-            let resource = resource.ok_or(AllocationError::NativeFailure)?;
+            let resource = match resource {
+                Some(resource) => resource,
+                None => {
+                    let _ = self
+                        .allocator
+                        .as_mut()
+                        .expect("allocator remains initialized")
+                        .free(allocation);
+                    return Err(AllocationError::NativeFailure);
+                }
+            };
             let mut footprints = vec![Default::default(); mips.len()];
             let mut row_counts = vec![0_u32; mips.len()];
             let mut row_sizes = vec![0_u64; mips.len()];
@@ -1247,11 +1478,22 @@ pub mod native {
                     Some(&mut upload_size),
                 );
             }
-            let mut upload = self.allocate(
-                AllocationRequest::new(upload_size, 256, MemoryClass::Upload, true, None)
-                    .map_err(|_| AllocationError::ZeroSize)?,
-            )?;
-            {
+            let upload_request =
+                match AllocationRequest::new(upload_size, 256, MemoryClass::Upload, true, None) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        self.destroy_unpublished_texture(resource, allocation, None, false);
+                        return Err(AllocationError::ZeroSize);
+                    }
+                };
+            let mut upload = match self.allocate(upload_request) {
+                Ok(upload) => upload,
+                Err(error) => {
+                    self.destroy_unpublished_texture(resource, allocation, None, false);
+                    return Err(error);
+                }
+            };
+            let populated = (|| {
                 let target = self.mapped_slice_mut(&mut upload)?;
                 for (mip, footprint) in mips.iter().zip(&footprints) {
                     let row_bytes = mip.width as usize * 4;
@@ -1263,81 +1505,143 @@ pub mod native {
                             .copy_from_slice(&mip.bytes[source_start..source_start + row_bytes]);
                     }
                 }
+                self.flush(&mut upload, 0, upload_size)
+            })();
+            if let Err(error) = populated {
+                self.destroy_unpublished_texture(resource, allocation, Some(upload), false);
+                return Err(error);
             }
-            self.flush(&mut upload, 0, upload_size)?;
-            let mut completions = Vec::with_capacity(mips.len());
-            for (level, footprint) in footprints.into_iter().enumerate() {
-                let allocator: ID3D12CommandAllocator = unsafe {
-                    self.device
-                        .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+            let mut queue_touched = false;
+            let submitted = (|| {
+                let mut completions = Vec::with_capacity(mips.len());
+                for (level, footprint) in footprints.into_iter().enumerate() {
+                    let allocator: ID3D12CommandAllocator = unsafe {
+                        self.device
+                            .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    }
+                    .map_err(map_allocation_windows)?;
+                    let list: ID3D12GraphicsCommandList = unsafe {
+                        self.device.CreateCommandList(
+                            0,
+                            D3D12_COMMAND_LIST_TYPE_DIRECT,
+                            &allocator,
+                            None,
+                        )
+                    }
+                    .map_err(map_allocation_windows)?;
+                    let source = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: core::mem::ManuallyDrop::new(Some(upload.resource.clone())),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            PlacedFootprint: footprint,
+                        },
+                    };
+                    let destination = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: core::mem::ManuallyDrop::new(Some(resource.clone())),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            SubresourceIndex: level as u32,
+                        },
+                    };
+                    unsafe { list.CopyTextureRegion(&destination, 0, 0, 0, &source, None) };
+                    let transition = D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: core::mem::ManuallyDrop::new(Some(resource.clone())),
+                        Subresource: level as u32,
+                        StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
+                        StateAfter: D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    };
+                    let barrier = D3D12_RESOURCE_BARRIER {
+                        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                            Transition: core::mem::ManuallyDrop::new(transition),
+                        },
+                    };
+                    unsafe {
+                        list.ResourceBarrier(&[barrier]);
+                        list.Close()
+                    }
+                    .map_err(map_allocation_windows)?;
+                    let command: ID3D12CommandList = list.cast().map_err(map_allocation_windows)?;
+                    unsafe { self.queue.ExecuteCommandLists(&[Some(command)]) };
+                    queue_touched = true;
+                    let value = self.next_fence;
+                    self.next_fence = value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
+                    unsafe { self.queue.Signal(&self.fence, value) }
+                        .map_err(map_allocation_windows)?;
+                    let completion = CompletionToken::new(QueueKind::Transfer, value)
+                        .map_err(|_| AllocationError::NativeFailure)?;
+                    self.pending_copies.push(PendingCopy {
+                        completion,
+                        _allocator: allocator,
+                        _list: list,
+                    });
+                    completions.push(completion);
                 }
-                .map_err(map_allocation_windows)?;
-                let list: ID3D12GraphicsCommandList = unsafe {
-                    self.device.CreateCommandList(
-                        0,
-                        D3D12_COMMAND_LIST_TYPE_DIRECT,
-                        &allocator,
-                        None,
-                    )
+                Ok::<_, AllocationError>(completions)
+            })();
+            let completions = match submitted {
+                Ok(completions) => completions,
+                Err(error) => {
+                    self.destroy_unpublished_texture(
+                        resource,
+                        allocation,
+                        Some(upload),
+                        queue_touched,
+                    );
+                    return Err(error);
                 }
-                .map_err(map_allocation_windows)?;
-                let source = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: core::mem::ManuallyDrop::new(Some(upload.resource.clone())),
-                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                        PlacedFootprint: footprint,
-                    },
-                };
-                let destination = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: core::mem::ManuallyDrop::new(Some(resource.clone())),
-                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                        SubresourceIndex: level as u32,
-                    },
-                };
-                unsafe { list.CopyTextureRegion(&destination, 0, 0, 0, &source, None) };
-                let transition = D3D12_RESOURCE_TRANSITION_BARRIER {
-                    pResource: core::mem::ManuallyDrop::new(Some(resource.clone())),
-                    Subresource: level as u32,
-                    StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
-                    StateAfter: D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                };
-                let barrier = D3D12_RESOURCE_BARRIER {
-                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                        Transition: core::mem::ManuallyDrop::new(transition),
-                    },
-                };
-                unsafe {
-                    list.ResourceBarrier(&[barrier]);
-                    list.Close()
-                }
-                .map_err(map_allocation_windows)?;
-                let command: ID3D12CommandList = list.cast().map_err(map_allocation_windows)?;
-                unsafe { self.queue.ExecuteCommandLists(&[Some(command)]) };
-                let value = self.next_fence;
-                self.next_fence = value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
-                unsafe { self.queue.Signal(&self.fence, value) }.map_err(map_allocation_windows)?;
-                let completion = CompletionToken::new(QueueKind::Transfer, value)
-                    .map_err(|_| AllocationError::NativeFailure)?;
-                self.pending_copies.push(PendingCopy {
-                    completion,
-                    _allocator: allocator,
-                    _list: list,
-                });
-                completions.push(completion);
+            };
+            if let Err(error) = self.wait_idle().map_err(map_hal_allocation) {
+                self.destroy_unpublished_texture(resource, allocation, Some(upload), true);
+                return Err(error);
             }
-            self.retire(
-                upload,
-                *completions.last().ok_or(AllocationError::NativeFailure)?,
-            )?;
+            self.pending_copies
+                .retain(|copy| copy.completion.value > unsafe { self.fence.GetCompletedValue() });
+            if let Err(error) = self.free(upload) {
+                self.destroy_unpublished_texture(resource, allocation, None, false);
+                return Err(error);
+            }
             let mut handle = unsafe { self.descriptors.GetCPUDescriptorHandleForHeapStart() };
             handle.ptr += binding as usize * self.descriptor_stride as usize;
             unsafe {
                 self.device
                     .CreateShaderResourceView(&resource, None, handle)
             };
+            let filter = if sampler_desc.max_anisotropy > 1.0 {
+                D3D12_FILTER_ANISOTROPIC
+            } else {
+                match (sampler_desc.min_filter, sampler_desc.mag_filter) {
+                    (SamplerFilter::Nearest, SamplerFilter::Nearest) => {
+                        D3D12_FILTER_MIN_MAG_MIP_POINT
+                    }
+                    (SamplerFilter::Nearest, SamplerFilter::Linear) => {
+                        D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT
+                    }
+                    (SamplerFilter::Linear, SamplerFilter::Nearest) => {
+                        D3D12_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR
+                    }
+                    (SamplerFilter::Linear, SamplerFilter::Linear) => {
+                        D3D12_FILTER_MIN_MAG_MIP_LINEAR
+                    }
+                }
+            };
+            let address = |mode| match mode {
+                SamplerAddressMode::Clamp => D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                SamplerAddressMode::Repeat => D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+            };
+            let sampler = D3D12_SAMPLER_DESC {
+                Filter: filter,
+                AddressU: address(sampler_desc.address_u),
+                AddressV: address(sampler_desc.address_v),
+                AddressW: address(sampler_desc.address_w),
+                MaxAnisotropy: sampler_desc.max_anisotropy as u32,
+                MaxLOD: f32::MAX,
+                ..Default::default()
+            };
+            let mut sampler_handle = unsafe { self.samplers.GetCPUDescriptorHandleForHeapStart() };
+            sampler_handle.ptr += binding as usize * self.sampler_stride as usize;
+            unsafe { self.device.CreateSampler(&sampler, sampler_handle) };
             Ok((
                 NativeTexture {
                     resource,
@@ -1772,6 +2076,14 @@ pub mod native {
         Ok(())
     }
 
+    fn map_hal_allocation(error: HalError) -> AllocationError {
+        match error {
+            HalError::OutOfMemory => AllocationError::OutOfMemory,
+            HalError::DeviceLost => AllocationError::DeviceLost,
+            _ => AllocationError::NativeFailure,
+        }
+    }
+
     fn map_windows(_: windows::core::Error) -> HalError {
         HalError::NativeFailure
     }
@@ -1786,6 +2098,13 @@ pub mod native {
         match error {
             gpu_allocator::AllocationError::OutOfMemory => AllocationError::OutOfMemory,
             _ => AllocationError::NativeFailure,
+        }
+    }
+
+    fn map_allocator_hal(error: gpu_allocator::AllocationError) -> HalError {
+        match error {
+            gpu_allocator::AllocationError::OutOfMemory => HalError::OutOfMemory,
+            _ => HalError::NativeFailure,
         }
     }
 

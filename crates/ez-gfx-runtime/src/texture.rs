@@ -481,6 +481,29 @@ impl TextureRegistry {
         }
     }
 
+    /// Rolls back an unexposed allocation/upload without publishing an unload event.
+    pub fn cancel_upload(&mut self, texture: TextureId) -> Result<(), TextureError> {
+        let entry = self
+            .slots
+            .get_mut(texture.slot as usize)
+            .ok_or(TextureError::NotFound)?;
+        if entry.generation != texture.generation
+            || !matches!(
+                entry.state,
+                Some(TextureState::Allocated | TextureState::Uploading { .. })
+            )
+        {
+            return Err(TextureError::InvalidState);
+        }
+        entry.state = None;
+        entry.generation = entry
+            .generation
+            .checked_add(1)
+            .ok_or(TextureError::GenerationExhausted)?;
+        self.free.push(texture.slot);
+        Ok(())
+    }
+
     pub fn unload(&mut self, texture: TextureId) -> Result<(), TextureError> {
         let entry = self
             .slots

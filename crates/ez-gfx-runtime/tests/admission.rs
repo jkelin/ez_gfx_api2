@@ -14,7 +14,7 @@ fn adapter(id: u8, class: AdapterClass, sampled: u32) -> AdapterInfo {
         AdapterCapabilities {
             bindless_sampled_textures: sampled,
             bindless_storage_resources: 1024,
-            bindless_samplers: 256,
+            bindless_samplers: 1024,
             max_indirect_draw_count: 65_535,
             shader_model: 0x0605,
             timeline_synchronization: true,

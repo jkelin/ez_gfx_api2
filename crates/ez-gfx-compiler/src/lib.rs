@@ -5,12 +5,42 @@ use ez_gfx_core::{Backend, SemanticError, SemanticGraph, TargetLayout};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 type CanonicalParameter = (String, Option<String>, Option<String>);
 type CanonicalParameters = BTreeMap<(String, Stage), Vec<CanonicalParameter>>;
+
+static INVOCATION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct InvocationDirectory(PathBuf);
+
+impl InvocationDirectory {
+    fn create(parent: &Path) -> Result<Self, CompilerError> {
+        fs::create_dir_all(parent).map_err(CompilerError::Io)?;
+        for _ in 0..1024 {
+            let counter = INVOCATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(".ez-gfx-compile-{}-{counter}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(CompilerError::Io(error)),
+            }
+        }
+        Err(CompilerError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "cannot reserve compiler invocation directory",
+        )))
+    }
+}
+
+impl Drop for InvocationDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompilationContractError {
@@ -208,6 +238,12 @@ pub fn compile(
     use shader_slang::Downcast;
     request.validate()?;
     let version = config.validate_tool()?;
+    let invocation_dir = request
+        .targets
+        .iter()
+        .any(|target| target.target == Target::Metallib)
+        .then(|| InvocationDirectory::create(&request.output_dir))
+        .transpose()?;
     let module_name = request
         .source
         .file_stem()
@@ -314,16 +350,31 @@ pub fn compile(
                 let name = parameter.name()?.to_owned();
                 let layout = parameter.type_layout();
                 let variable = parameter.variable()?;
-                let attribute =
-                    variable
-                        .user_attributes()
-                        .find_map(|attribute| match attribute.name() {
-                            "StructuredBuffer" => Some(("structured", attribute)),
-                            "IndirectBuffer" => Some(("indirect", attribute)),
-                            "ColorTarget" | "DepthTarget" => Some(("render_target", attribute)),
-                            _ => None,
-                        });
-                let (api_kind, semantic_name) = match attribute {
+                let mut api_attribute = None;
+                let mut texture_heap_capacity = None;
+                let mut depth_required = false;
+                for attribute in variable.user_attributes() {
+                    match attribute.name() {
+                        "StructuredBuffer" => api_attribute = Some(("structured", attribute)),
+                        "IndirectBuffer" => api_attribute = Some(("indirect", attribute)),
+                        "ColorTarget" | "DepthTarget" => {
+                            api_attribute = Some(("render_target", attribute))
+                        }
+                        "BindlessTextureHeap" if attribute.argument_count() == 1 => {
+                            texture_heap_capacity = Some(
+                                attribute
+                                    .argument_value_int(0)
+                                    .and_then(|value| u32::try_from(value).ok())
+                                    .unwrap_or(0),
+                            );
+                        }
+                        "DepthPipeline" if attribute.argument_count() == 0 => {
+                            depth_required = true;
+                        }
+                        _ => {}
+                    }
+                }
+                let (api_kind, semantic_name) = match api_attribute {
                     Some((kind, attribute)) if attribute.argument_count() == 1 => (
                         Some(kind.to_owned()),
                         attribute.argument_value_string(0).map(str::to_owned),
@@ -352,6 +403,8 @@ pub fn compile(
                     api_kind,
                     parameter.binding_index(),
                     parameter.binding_space(),
+                    texture_heap_capacity,
+                    depth_required,
                 ))
             })
             .collect();
@@ -378,7 +431,35 @@ pub fn compile(
         } else {
             canonical_parameters.insert(key, canonical_view);
         }
-        let reflection = serde_json::json!({"entry": target.entry_point, "stage": format!("{:?}", target.stage), "profile": target.profile, "parameters": parameters.iter().map(|(name,kind,category,shape,access,semantic_name,api_kind,binding_index,binding_space)| serde_json::json!({"name":name,"kind":kind,"category":category,"resource_shape":shape,"resource_access":access,"semantic_name":semantic_name,"api_kind":api_kind,"binding_index":binding_index,"binding_space":binding_space,"descriptor_count":if api_kind.as_deref() == Some("indirect") { 2 } else { 1 }})).collect::<Vec<_>>()});
+        let mut heaps = parameters
+            .iter()
+            .filter_map(|parameter| parameter.9.map(|capacity| (parameter, capacity)));
+        if let Some((_, capacity)) = heaps.clone().next()
+            && (capacity == 0 || capacity > 1024)
+        {
+            return Err(CompilerError::Native(format!(
+                "invalid bindless texture heap capacity: {}",
+                target.entry_point
+            )));
+        }
+        let texture_heap = heaps.next().map(|(parameter, capacity)| {
+            serde_json::json!({
+                "binding_space": parameter.8,
+                "binding_index": parameter.7,
+                "capacity": capacity,
+                "argument_stride": 2,
+                "texture_argument_offset": 0,
+                "sampler_argument_offset": 1,
+            })
+        });
+        if heaps.next().is_some() {
+            return Err(CompilerError::Native(format!(
+                "multiple bindless texture heaps: {}",
+                target.entry_point
+            )));
+        }
+        let depth_required = parameters.iter().any(|parameter| parameter.10);
+        let reflection = serde_json::json!({"entry": target.entry_point, "stage": format!("{:?}", target.stage), "profile": target.profile, "parameters": parameters.iter().map(|(name,kind,category,shape,access,semantic_name,api_kind,binding_index,binding_space,_,_)| serde_json::json!({"name":name,"kind":kind,"category":category,"resource_shape":shape,"resource_access":access,"semantic_name":semantic_name,"api_kind":api_kind,"binding_index":binding_index,"binding_space":binding_space,"descriptor_count":1})).collect::<Vec<_>>(), "texture_heap": texture_heap, "depth_required": depth_required});
         reflections.push(serde_json::json!({"target": format!("{:?}", target.target), "entry": target.entry_point, "stage": format!("{:?}", target.stage), "profile": target.profile, "reflection": reflection}));
         let blob = linked
             .entry_point_code(index as i64, index as i64)
@@ -390,10 +471,12 @@ pub fn compile(
                     "xcrun (macOS only)".into(),
                 ));
             }
-            fs::create_dir_all(&request.output_dir).map_err(CompilerError::Io)?;
-            let stem = format!("{}-{}", target.entry_point, index);
-            let msl = request.output_dir.join(format!("{stem}.tmp.metal"));
-            let metallib = request.output_dir.join(format!("{stem}.metallib"));
+            let invocation_dir = invocation_dir
+                .as_ref()
+                .ok_or(CompilerError::InvalidRequest("Metal output directory"))?;
+            let stem = format!("{}-{index}", target.entry_point);
+            let msl = invocation_dir.0.join(format!("{stem}.metal"));
+            let metallib = invocation_dir.0.join(format!("{stem}.metallib"));
             fs::write(&msl, &bytes).map_err(CompilerError::Io)?;
             let result = build_metallib(msl.clone(), metallib.clone());
             let _ = fs::remove_file(&msl);

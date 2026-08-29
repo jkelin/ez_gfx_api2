@@ -1,16 +1,19 @@
 use std::ffi::{CStr, CString};
 
 use ash::{Entry, Instance, khr, vk};
+
 use ez_gfx_core::{
     Backend,
     capability::{
-        AdapterCapabilities, AdapterClass, AdapterInfo, CompressionSupport, SemanticProfile,
+        AdapterCapabilities, AdapterClass, AdapterInfo, CompressionSupport,
+        MAX_BINDLESS_SAMPLED_TEXTURES, SemanticProfile,
     },
 };
 use ez_gfx_hal::{
     AllocationError, AllocationRequest, BlendMode, BufferTransfer, CompletionToken, CullMode,
     DynamicPipelineState, FrontFace, HalError, ImageMip, MemoryAllocator, MemoryClass,
-    PrimitiveTopology, QueueKind, ShaderBufferLayout, validate_rgba8_mips,
+    PrimitiveTopology, QueueKind, SamplerAddressMode, SamplerFilter, ShaderBufferLayout,
+    TextureSamplerDesc, validate_rgba8_mips,
 };
 use gpu_allocator::{
     MemoryLocation,
@@ -18,6 +21,61 @@ use gpu_allocator::{
 };
 
 pub const BACKEND: Backend = Backend::Vulkan;
+pub const TEXTURE_DESCRIPTOR_SET: u32 = 1;
+pub const TEXTURE_DESCRIPTOR_BINDING: u32 = 0;
+pub const SAMPLER_DESCRIPTOR_BINDING: u32 = 1;
+pub const TEXTURE_DESCRIPTOR_CAPACITY: u32 = MAX_BINDLESS_SAMPLED_TEXTURES;
+
+fn texture_descriptor_layout_bindings() -> [vk::DescriptorSetLayoutBinding<'static>; 2] {
+    [
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(TEXTURE_DESCRIPTOR_BINDING)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .descriptor_count(TEXTURE_DESCRIPTOR_CAPACITY)
+            .stage_flags(vk::ShaderStageFlags::ALL),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(SAMPLER_DESCRIPTOR_BINDING)
+            .descriptor_type(vk::DescriptorType::SAMPLER)
+            .descriptor_count(TEXTURE_DESCRIPTOR_CAPACITY)
+            .stage_flags(vk::ShaderStageFlags::ALL),
+    ]
+}
+
+fn paired_texture_capacity(limits: &vk::PhysicalDeviceDescriptorIndexingProperties<'_>) -> u32 {
+    limits
+        .max_descriptor_set_update_after_bind_sampled_images
+        .min(limits.max_descriptor_set_update_after_bind_samplers)
+        .min(limits.max_per_stage_descriptor_update_after_bind_sampled_images)
+        .min(limits.max_per_stage_descriptor_update_after_bind_samplers)
+        .min(limits.max_per_stage_update_after_bind_resources / 2)
+        .min(limits.max_update_after_bind_descriptors_in_all_pools / 2)
+        .min(TEXTURE_DESCRIPTOR_CAPACITY)
+}
+
+fn sampler_create_info(desc: TextureSamplerDesc, mip_count: u32) -> vk::SamplerCreateInfo<'static> {
+    let filter = |value| match value {
+        SamplerFilter::Nearest => vk::Filter::NEAREST,
+        SamplerFilter::Linear => vk::Filter::LINEAR,
+    };
+    let address = |value| match value {
+        SamplerAddressMode::Clamp => vk::SamplerAddressMode::CLAMP_TO_EDGE,
+        SamplerAddressMode::Repeat => vk::SamplerAddressMode::REPEAT,
+    };
+
+    vk::SamplerCreateInfo::default()
+        .min_filter(filter(desc.min_filter))
+        .mag_filter(filter(desc.mag_filter))
+        .mipmap_mode(match desc.min_filter {
+            SamplerFilter::Nearest => vk::SamplerMipmapMode::NEAREST,
+            SamplerFilter::Linear => vk::SamplerMipmapMode::LINEAR,
+        })
+        .address_mode_u(address(desc.address_u))
+        .address_mode_v(address(desc.address_v))
+        .address_mode_w(address(desc.address_w))
+        .anisotropy_enable(desc.max_anisotropy > 1.0)
+        .max_anisotropy(desc.max_anisotropy)
+        .max_lod(mip_count as f32)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SurfacePlatform {
@@ -56,6 +114,7 @@ pub struct NativeGraphicsPipelineDesc<'a> {
     pub fragment_index: usize,
     pub state: DynamicPipelineState,
     pub layouts: &'a [ShaderBufferLayout],
+    pub depth_required: bool,
 }
 
 pub struct NativeDrawIndexed<'a> {
@@ -77,6 +136,7 @@ pub struct NativeTexture {
     image: vk::Image,
     view: vk::ImageView,
     allocation: Allocation,
+    sampler: vk::Sampler,
     pub binding: u32,
 }
 
@@ -87,7 +147,16 @@ pub struct NativePipeline {
     public_descriptor_layout: vk::DescriptorSetLayout,
     buffer_writable: Vec<bool>,
     buffer_bindings: Vec<u32>,
+    depth_required: bool,
 }
+
+struct DepthTarget {
+    image: vk::Image,
+    view: vk::ImageView,
+    allocation: Allocation,
+    extent: vk::Extent2D,
+}
+
 struct RetiredAllocation {
     allocation: NativeAllocation,
     completion: CompletionToken,
@@ -102,6 +171,61 @@ struct DeviceProbe {
     multi_draw: bool,
 }
 
+struct PendingDevice {
+    device: Option<ash::Device>,
+    allocator: Option<Allocator>,
+    command_pool: Option<vk::CommandPool>,
+    timeline: Option<vk::Semaphore>,
+    descriptor_layout: Option<vk::DescriptorSetLayout>,
+    descriptor_pool: Option<vk::DescriptorPool>,
+    swapchain_loader: Option<khr::swapchain::Device>,
+    image_available: Option<vk::Semaphore>,
+}
+
+impl PendingDevice {
+    fn new(device: ash::Device) -> Self {
+        Self {
+            device: Some(device),
+            allocator: None,
+            command_pool: None,
+            timeline: None,
+            descriptor_layout: None,
+            descriptor_pool: None,
+            swapchain_loader: None,
+            image_available: None,
+        }
+    }
+}
+
+impl Drop for PendingDevice {
+    fn drop(&mut self) {
+        let Some(device) = self.device.take() else {
+            return;
+        };
+        unsafe {
+            if let Some(semaphore) = self.image_available.take() {
+                device.destroy_semaphore(semaphore, None);
+            }
+            if let Some(pool) = self.descriptor_pool.take() {
+                device.destroy_descriptor_pool(pool, None);
+            }
+            if let Some(layout) = self.descriptor_layout.take() {
+                device.destroy_descriptor_set_layout(layout, None);
+            }
+            if let Some(pool) = self.command_pool.take() {
+                device.destroy_command_pool(pool, None);
+            }
+            if let Some(semaphore) = self.timeline.take() {
+                device.destroy_semaphore(semaphore, None);
+            }
+        }
+        self.swapchain_loader.take();
+        drop(self.allocator.take());
+        unsafe { device.destroy_device(None) };
+    }
+}
+
+#[allow(dead_code)]
 pub struct NativeContext {
     entry: Entry,
     instance: Instance,
@@ -119,13 +243,14 @@ pub struct NativeContext {
     texture_descriptor_pool: Option<vk::DescriptorPool>,
     texture_descriptor_layout: Option<vk::DescriptorSetLayout>,
     texture_descriptor_set: Option<vk::DescriptorSet>,
-    texture_sampler: Option<vk::Sampler>,
+    sampler_anisotropy: bool,
     swapchain_loader: Option<khr::swapchain::Device>,
     swapchain: Option<vk::SwapchainKHR>,
     swapchain_views: Vec<vk::ImageView>,
     swapchain_format: vk::Format,
     swapchain_extent: vk::Extent2D,
     image_available: Option<vk::Semaphore>,
+    depth_target: Option<DepthTarget>,
 }
 
 impl NativeContext {
@@ -195,13 +320,14 @@ impl NativeContext {
             texture_descriptor_pool: None,
             texture_descriptor_layout: None,
             texture_descriptor_set: None,
-            texture_sampler: None,
+            sampler_anisotropy: false,
             swapchain_loader: None,
             swapchain: None,
             swapchain_views: Vec::new(),
             swapchain_format: vk::Format::UNDEFINED,
             swapchain_extent: vk::Extent2D::default(),
             image_available: None,
+            depth_target: None,
         };
         context.init_device(None)?;
         Ok(context)
@@ -310,9 +436,11 @@ impl NativeContext {
                     .synchronization2(features13.synchronization2 != 0);
                 let mut enabled11 =
                     vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
+                let core_features = unsafe { self.instance.get_physical_device_features(physical) };
                 let enabled_core = vk::PhysicalDeviceFeatures::default()
                     .vertex_pipeline_stores_and_atomics(vertex_storage)
-                    .multi_draw_indirect(multi_draw);
+                    .multi_draw_indirect(multi_draw)
+                    .sampler_anisotropy(core_features.sampler_anisotropy != 0);
                 let swapchain_extensions = [khr::swapchain::NAME.as_ptr()];
                 let enabled_extensions = swapchain_extensions.as_slice();
                 let create = vk::DeviceCreateInfo::default()
@@ -325,68 +453,95 @@ impl NativeContext {
                 // SAFETY: the physical device and queue family were queried from this live instance.
                 let device = unsafe { self.instance.create_device(physical, &create, None) }
                     .map_err(map_vk)?;
+                let mut pending = PendingDevice::new(device);
+                let device = pending
+                    .device
+                    .as_ref()
+                    .expect("pending device is initialized");
                 // SAFETY: queue zero was requested from `queue_family` above.
                 let graphics_queue = unsafe { device.get_device_queue(queue_family, 0) };
-                let allocator = Allocator::new(&AllocatorCreateDesc {
-                    instance: self.instance.clone(),
-                    device: device.clone(),
-                    physical_device: physical,
-                    debug_settings: Default::default(),
-                    buffer_device_address: true,
-                    allocation_sizes: Default::default(),
-                })
-                .map_err(map_allocator_hal)?;
-                let command_pool = unsafe {
-                    device.create_command_pool(
-                        &vk::CommandPoolCreateInfo::default()
-                            .queue_family_index(queue_family)
-                            .flags(vk::CommandPoolCreateFlags::TRANSIENT),
-                        None,
-                    )
-                }
-                .map_err(map_vk)?;
+                pending.allocator = Some(
+                    Allocator::new(&AllocatorCreateDesc {
+                        instance: self.instance.clone(),
+                        device: device.clone(),
+                        physical_device: physical,
+                        debug_settings: Default::default(),
+                        buffer_device_address: true,
+                        allocation_sizes: Default::default(),
+                    })
+                    .map_err(map_allocator_hal)?,
+                );
+                pending.command_pool = Some(
+                    unsafe {
+                        device.create_command_pool(
+                            &vk::CommandPoolCreateInfo::default()
+                                .queue_family_index(queue_family)
+                                .flags(vk::CommandPoolCreateFlags::TRANSIENT),
+                            None,
+                        )
+                    }
+                    .map_err(map_vk)?,
+                );
                 let mut timeline = vk::SemaphoreTypeCreateInfo::default()
                     .semaphore_type(vk::SemaphoreType::TIMELINE)
                     .initial_value(0);
-                let timeline_semaphore = unsafe {
-                    device.create_semaphore(
-                        &vk::SemaphoreCreateInfo::default().push_next(&mut timeline),
-                        None,
-                    )
-                }
-                .map_err(map_vk)?;
-                let binding = vk::DescriptorSetLayoutBinding::default()
-                    .binding(0)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .descriptor_count(4096)
-                    .stage_flags(vk::ShaderStageFlags::ALL);
-                let binding_flags = [vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                    | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND];
+                pending.timeline = Some(
+                    unsafe {
+                        device.create_semaphore(
+                            &vk::SemaphoreCreateInfo::default().push_next(&mut timeline),
+                            None,
+                        )
+                    }
+                    .map_err(map_vk)?,
+                );
+                let bindings = texture_descriptor_layout_bindings();
+                let binding_flags = [
+                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                ];
                 let mut binding_info = vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
                     .binding_flags(&binding_flags);
-                let descriptor_layout = unsafe {
-                    device.create_descriptor_set_layout(
-                        &vk::DescriptorSetLayoutCreateInfo::default()
-                            .bindings(core::slice::from_ref(&binding))
-                            .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
-                            .push_next(&mut binding_info),
-                        None,
-                    )
-                }
-                .map_err(map_vk)?;
-                let descriptor_pool = unsafe {
-                    device.create_descriptor_pool(
-                        &vk::DescriptorPoolCreateInfo::default()
-                            .max_sets(1)
-                            .pool_sizes(&[vk::DescriptorPoolSize {
-                                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                                descriptor_count: 4096,
-                            }])
-                            .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
-                        None,
-                    )
-                }
-                .map_err(map_vk)?;
+                pending.descriptor_layout = Some(
+                    unsafe {
+                        device.create_descriptor_set_layout(
+                            &vk::DescriptorSetLayoutCreateInfo::default()
+                                .bindings(&bindings)
+                                .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
+                                .push_next(&mut binding_info),
+                            None,
+                        )
+                    }
+                    .map_err(map_vk)?,
+                );
+                let descriptor_layout = pending
+                    .descriptor_layout
+                    .expect("descriptor layout was created");
+                pending.descriptor_pool = Some(
+                    unsafe {
+                        device.create_descriptor_pool(
+                            &vk::DescriptorPoolCreateInfo::default()
+                                .max_sets(1)
+                                .pool_sizes(&[
+                                    vk::DescriptorPoolSize {
+                                        ty: vk::DescriptorType::SAMPLED_IMAGE,
+                                        descriptor_count: TEXTURE_DESCRIPTOR_CAPACITY,
+                                    },
+                                    vk::DescriptorPoolSize {
+                                        ty: vk::DescriptorType::SAMPLER,
+                                        descriptor_count: TEXTURE_DESCRIPTOR_CAPACITY,
+                                    },
+                                ])
+                                .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
+                            None,
+                        )
+                    }
+                    .map_err(map_vk)?,
+                );
+                let descriptor_pool = pending
+                    .descriptor_pool
+                    .expect("descriptor pool was created");
                 let descriptor_set = unsafe {
                     device.allocate_descriptor_sets(
                         &vk::DescriptorSetAllocateInfo::default()
@@ -395,37 +550,26 @@ impl NativeContext {
                     )
                 }
                 .map_err(map_vk)?[0];
-                let sampler = unsafe {
-                    device.create_sampler(
-                        &vk::SamplerCreateInfo::default()
-                            .mag_filter(vk::Filter::LINEAR)
-                            .min_filter(vk::Filter::LINEAR)
-                            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-                            .address_mode_u(vk::SamplerAddressMode::REPEAT)
-                            .address_mode_v(vk::SamplerAddressMode::REPEAT)
-                            .address_mode_w(vk::SamplerAddressMode::REPEAT),
-                        None,
-                    )
-                }
-                .map_err(map_vk)?;
-                let swapchain_loader = khr::swapchain::Device::new(&self.instance, &device);
-                let image_available =
+                pending.swapchain_loader =
+                    Some(khr::swapchain::Device::new(&self.instance, device));
+                pending.image_available = Some(
                     unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
-                        .map_err(map_vk)?;
+                        .map_err(map_vk)?,
+                );
                 self.physical_device = Some(physical);
                 self.adapter_info = Some(adapter.clone());
                 self.graphics_queue_family = Some(queue_family);
                 self.graphics_queue = Some(graphics_queue);
-                self.allocator = Some(allocator);
-                self.device = Some(device);
-                self.transfer_timeline = Some(timeline_semaphore);
-                self.transfer_command_pool = Some(command_pool);
-                self.texture_descriptor_pool = Some(descriptor_pool);
-                self.texture_descriptor_layout = Some(descriptor_layout);
+                self.allocator = pending.allocator.take();
+                self.sampler_anisotropy = core_features.sampler_anisotropy != 0;
+                self.device = pending.device.take();
+                self.transfer_timeline = pending.timeline.take();
+                self.transfer_command_pool = pending.command_pool.take();
+                self.texture_descriptor_pool = pending.descriptor_pool.take();
+                self.texture_descriptor_layout = pending.descriptor_layout.take();
                 self.texture_descriptor_set = Some(descriptor_set);
-                self.texture_sampler = Some(sampler);
-                self.swapchain_loader = Some(swapchain_loader);
-                self.image_available = Some(image_available);
+                self.swapchain_loader = pending.swapchain_loader.take();
+                self.image_available = pending.image_available.take();
                 return Ok(adapter);
             }
         }
@@ -437,8 +581,9 @@ impl NativeContext {
     }
 
     pub fn destroy_surface(&mut self, surface: NativeSurface) {
+        let _ = self.wait_idle();
+        let _ = self.destroy_depth_target();
         if let Some(device) = self.device.as_ref() {
-            let _ = unsafe { device.device_wait_idle() };
             for view in self.swapchain_views.drain(..) {
                 unsafe { device.destroy_image_view(view, None) };
             }
@@ -522,9 +667,10 @@ impl NativeContext {
         requested_width: u32,
         requested_height: u32,
     ) -> Result<(), HalError> {
-        let device = self.device.as_ref().ok_or(HalError::NotReady)?;
+        self.wait_idle()?;
+        self.destroy_depth_target().map_err(map_allocation_hal)?;
         let physical = self.physical_device.ok_or(HalError::NotReady)?;
-        unsafe { device.device_wait_idle() }.map_err(map_vk)?;
+        let device = self.device.as_ref().ok_or(HalError::NotReady)?;
         let capabilities = unsafe {
             self.surface_loader
                 .get_physical_device_surface_capabilities(physical, surface.handle)
@@ -632,6 +778,112 @@ impl NativeContext {
         self.swapchain_format = chosen.format;
         self.swapchain_extent = extent;
         Ok(())
+    }
+
+    fn ensure_depth_target(&mut self, extent: vk::Extent2D) -> Result<(), HalError> {
+        if self
+            .depth_target
+            .as_ref()
+            .is_some_and(|target| target.extent == extent)
+        {
+            return Ok(());
+        }
+        self.wait_idle()?;
+        self.destroy_depth_target().map_err(map_allocation_hal)?;
+        let device = self.device.as_ref().ok_or(HalError::NotReady)?.clone();
+        let create = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::D32_SFLOAT)
+            .extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { device.create_image(&create, None) }.map_err(map_vk)?;
+        let requirements = unsafe { device.get_image_memory_requirements(image) };
+        let allocation = match self.allocator.as_mut().ok_or(HalError::NotReady)?.allocate(
+            &AllocationCreateDesc {
+                name: "ez-gfx-depth",
+                requirements,
+                location: MemoryLocation::GpuOnly,
+                linear: false,
+                allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+            },
+        ) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                unsafe { device.destroy_image(image, None) };
+                return Err(map_allocation_hal(map_allocator(error)));
+            }
+        };
+        if let Err(error) =
+            unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset()) }
+        {
+            let _ = self
+                .allocator
+                .as_mut()
+                .expect("allocator remains initialized")
+                .free(allocation);
+            unsafe { device.destroy_image(image, None) };
+            return Err(map_vk(error));
+        }
+        let view = match unsafe {
+            device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(vk::Format::D32_SFLOAT)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::DEPTH,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    }),
+                None,
+            )
+        } {
+            Ok(view) => view,
+            Err(error) => {
+                unsafe { device.destroy_image(image, None) };
+                let _ = self
+                    .allocator
+                    .as_mut()
+                    .expect("allocator remains initialized")
+                    .free(allocation);
+                return Err(map_vk(error));
+            }
+        };
+        self.depth_target = Some(DepthTarget {
+            image,
+            view,
+            allocation,
+            extent,
+        });
+        Ok(())
+    }
+
+    fn destroy_depth_target(&mut self) -> Result<(), AllocationError> {
+        let Some(target) = self.depth_target.take() else {
+            return Ok(());
+        };
+        let device = self.device.as_ref().ok_or(AllocationError::NativeFailure)?;
+        unsafe {
+            device.destroy_image_view(target.view, None);
+            device.destroy_image(target.image, None);
+        }
+        self.allocator
+            .as_mut()
+            .ok_or(AllocationError::NativeFailure)?
+            .free(target.allocation)
+            .map_err(map_allocator)
     }
     /// Creates validated SPIR-V shader modules; each product must be nonempty and word-aligned.
     pub fn create_shader(&self, products: &[&[u8]]) -> Result<NativeShader, HalError> {
@@ -773,6 +1025,7 @@ impl NativeContext {
                 public_descriptor_layout,
                 buffer_writable,
                 buffer_bindings,
+                depth_required: false,
             }),
             Err((_, error)) => {
                 unsafe {
@@ -804,6 +1057,7 @@ impl NativeContext {
             fragment_index,
             state,
             layouts,
+            depth_required,
         } = desc;
         let device = self.device.as_ref().ok_or(HalError::NotReady)?;
         if self.swapchain_format == vk::Format::UNDEFINED {
@@ -874,10 +1128,19 @@ impl NativeContext {
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let color = vk::PipelineColorBlendStateCreateInfo::default()
             .attachments(core::slice::from_ref(&blend));
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(depth_required)
+            .depth_write_enable(depth_required)
+            .depth_compare_op(vk::CompareOp::LESS);
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         let mut rendering = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(core::slice::from_ref(&self.swapchain_format));
+            .color_attachment_formats(core::slice::from_ref(&self.swapchain_format))
+            .depth_attachment_format(if depth_required {
+                vk::Format::D32_SFLOAT
+            } else {
+                vk::Format::UNDEFINED
+            });
         let create = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
@@ -885,6 +1148,7 @@ impl NativeContext {
             .viewport_state(&viewport)
             .rasterization_state(&raster)
             .multisample_state(&multisample)
+            .depth_stencil_state(&depth_stencil)
             .color_blend_state(&color)
             .dynamic_state(&dynamic)
             .layout(layout)
@@ -899,6 +1163,7 @@ impl NativeContext {
                 public_descriptor_layout,
                 buffer_writable,
                 buffer_bindings,
+                depth_required,
             }),
             Err((_, error)) => {
                 unsafe {
@@ -1022,6 +1287,26 @@ impl NativeContext {
         {
             return Err(HalError::InvalidArgument);
         }
+        if self.swapchain.is_none()
+            || self.swapchain_extent.width != width
+            || self.swapchain_extent.height != height
+        {
+            self.recreate_swapchain(surface, width, height)?;
+        }
+        if pipeline.depth_required {
+            self.ensure_depth_target(self.swapchain_extent)?;
+        }
+        let device = self.device.as_ref().ok_or(HalError::NotReady)?.clone();
+        let loader = self
+            .swapchain_loader
+            .as_ref()
+            .ok_or(HalError::NotReady)?
+            .clone();
+        let swapchain = self.swapchain.ok_or(HalError::NotReady)?;
+        let available = self.image_available.ok_or(HalError::NotReady)?;
+        let pool = self.transfer_command_pool.ok_or(HalError::NotReady)?;
+        let queue = self.graphics_queue.ok_or(HalError::NotReady)?;
+        let texture_set = self.texture_descriptor_set.ok_or(HalError::NotReady)?;
         let capture = if capture_presented {
             let size = u64::from(width)
                 .checked_mul(u64::from(height))
@@ -1037,239 +1322,332 @@ impl NativeContext {
         } else {
             None
         };
-        let (public_pool, public_set) = self.create_public_descriptor_set(pipeline, bindings)?;
-        if self.swapchain.is_none()
-            || self.swapchain_extent.width != width
-            || self.swapchain_extent.height != height
+        let (public_pool, public_set) = match self.create_public_descriptor_set(pipeline, bindings)
         {
-            self.recreate_swapchain(surface, width, height)?;
-        }
-        let device = self.device.as_ref().ok_or(HalError::NotReady)?;
-        let loader = self.swapchain_loader.as_ref().ok_or(HalError::NotReady)?;
-        let swapchain = self.swapchain.ok_or(HalError::NotReady)?;
-        let available = self.image_available.ok_or(HalError::NotReady)?;
-        let (image_index, _) =
-            unsafe { loader.acquire_next_image(swapchain, u64::MAX, available, vk::Fence::null()) }
-                .map_err(map_vk)?;
-        let images = unsafe { loader.get_swapchain_images(swapchain) }.map_err(map_vk)?;
-        let image = *images
-            .get(image_index as usize)
-            .ok_or(HalError::NativeFailure)?;
-        let finished =
-            unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
-                .map_err(map_vk)?;
-        let pool = self.transfer_command_pool.ok_or(HalError::NotReady)?;
-        let command = unsafe {
-            device.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-        }
-        .map_err(map_vk)?[0];
-        unsafe {
-            device
-                .begin_command_buffer(
-                    command,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            Ok(public) => public,
+            Err(error) => {
+                if let Some((_, capture)) = capture {
+                    let _ = self.free(capture);
+                }
+                return Err(error);
+            }
+        };
+        let mut finished = None;
+        let mut command = None;
+        let mut submitted = false;
+        let rendered = (|| {
+            let (image_index, _) = unsafe {
+                loader.acquire_next_image(swapchain, u64::MAX, available, vk::Fence::null())
+            }
+            .map_err(map_vk)?;
+            let images = unsafe { loader.get_swapchain_images(swapchain) }.map_err(map_vk)?;
+            let image = *images
+                .get(image_index as usize)
+                .ok_or(HalError::NativeFailure)?;
+            let finished_handle =
+                unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
+                    .map_err(map_vk)?;
+            finished = Some(finished_handle);
+            let command_handle = unsafe {
+                device.allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
                 )
-                .map_err(map_vk)?;
-            let range = vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            };
-            let to_color = vk::ImageMemoryBarrier::default()
-                .image(image)
-                .subresource_range(range)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
-            device.cmd_pipeline_barrier(
-                command,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_color],
-            );
-            let attachment = vk::RenderingAttachmentInfo::default()
-                .image_view(self.swapchain_views[image_index as usize])
-                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE)
-                .clear_value(vk::ClearValue {
-                    color: vk::ClearColorValue {
-                        float32: [0.0, 0.0, 0.0, 1.0],
-                    },
-                });
-            device.cmd_begin_rendering(
-                command,
-                &vk::RenderingInfo::default()
+            }
+            .map_err(map_vk)?[0];
+            command = Some(command_handle);
+            let finished = finished_handle;
+            let command = command_handle;
+            unsafe {
+                device
+                    .begin_command_buffer(
+                        command,
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )
+                    .map_err(map_vk)?;
+                let range = vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                let to_color = vk::ImageMemoryBarrier::default()
+                    .image(image)
+                    .subresource_range(range)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+                device.cmd_pipeline_barrier(
+                    command,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_color],
+                );
+                if let Some(depth) = self
+                    .depth_target
+                    .as_ref()
+                    .filter(|_| pipeline.depth_required)
+                {
+                    let depth_range = vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::DEPTH,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    };
+                    let to_depth = vk::ImageMemoryBarrier::default()
+                        .image(depth.image)
+                        .subresource_range(depth_range)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                        .dst_access_mask(
+                            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+                                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                        );
+                    device.cmd_pipeline_barrier(
+                        command,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                            | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_depth],
+                    );
+                }
+                let attachment = vk::RenderingAttachmentInfo::default()
+                    .image_view(self.swapchain_views[image_index as usize])
+                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .load_op(vk::AttachmentLoadOp::CLEAR)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .clear_value(vk::ClearValue {
+                        color: vk::ClearColorValue {
+                            float32: [0.1, 0.1, 0.1, 1.0],
+                        },
+                    });
+                let depth_attachment = self
+                    .depth_target
+                    .as_ref()
+                    .filter(|_| pipeline.depth_required)
+                    .map(|depth| {
+                        vk::RenderingAttachmentInfo::default()
+                            .image_view(depth.view)
+                            .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                            .load_op(vk::AttachmentLoadOp::CLEAR)
+                            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                            .clear_value(vk::ClearValue {
+                                depth_stencil: vk::ClearDepthStencilValue {
+                                    depth: 1.0,
+                                    stencil: 0,
+                                },
+                            })
+                    });
+                let mut rendering = vk::RenderingInfo::default()
                     .render_area(vk::Rect2D {
                         offset: vk::Offset2D::default(),
                         extent: self.swapchain_extent,
                     })
                     .layer_count(1)
-                    .color_attachments(core::slice::from_ref(&attachment)),
-            );
-            device.cmd_bind_pipeline(command, vk::PipelineBindPoint::GRAPHICS, pipeline.pipeline);
-            let sets = [
-                public_set,
-                self.texture_descriptor_set.ok_or(HalError::NotReady)?,
-            ];
-            device.cmd_bind_descriptor_sets(
-                command,
-                vk::PipelineBindPoint::GRAPHICS,
-                pipeline.layout,
-                0,
-                &sets,
-                &[],
-            );
-            device.cmd_set_viewport(
-                command,
-                0,
-                &[vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: width as f32,
-                    height: height as f32,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
-                }],
-            );
-            device.cmd_set_scissor(
-                command,
-                0,
-                &[vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: self.swapchain_extent,
-                }],
-            );
-            device.cmd_bind_index_buffer(command, index_buffer.buffer, 0, vk::IndexType::UINT32);
-            if !push_constants.is_empty() {
-                device.cmd_push_constants(
+                    .color_attachments(core::slice::from_ref(&attachment));
+                if let Some(depth) = depth_attachment.as_ref() {
+                    rendering = rendering.depth_attachment(depth);
+                }
+                device.cmd_begin_rendering(command, &rendering);
+                device.cmd_bind_pipeline(
                     command,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline.pipeline,
+                );
+                let sets = [public_set, texture_set];
+                device.cmd_bind_descriptor_sets(
+                    command,
+                    vk::PipelineBindPoint::GRAPHICS,
                     pipeline.layout,
-                    vk::ShaderStageFlags::ALL,
                     0,
-                    push_constants,
+                    &sets,
+                    &[],
                 );
+                device.cmd_set_viewport(
+                    command,
+                    0,
+                    &[vk::Viewport {
+                        x: 0.0,
+                        y: 0.0,
+                        width: width as f32,
+                        height: height as f32,
+                        min_depth: 0.0,
+                        max_depth: 1.0,
+                    }],
+                );
+                device.cmd_set_scissor(
+                    command,
+                    0,
+                    &[vk::Rect2D {
+                        offset: vk::Offset2D::default(),
+                        extent: self.swapchain_extent,
+                    }],
+                );
+                device.cmd_bind_index_buffer(
+                    command,
+                    index_buffer.buffer,
+                    0,
+                    vk::IndexType::UINT32,
+                );
+                if !push_constants.is_empty() {
+                    device.cmd_push_constants(
+                        command,
+                        pipeline.layout,
+                        vk::ShaderStageFlags::ALL,
+                        0,
+                        push_constants,
+                    );
+                }
+                device.cmd_draw_indexed_indirect(
+                    command,
+                    indirect_buffer.buffer,
+                    0,
+                    draw_count,
+                    20,
+                );
+                device.cmd_end_rendering(command);
+                if let Some((_, capture)) = &capture {
+                    let to_copy = vk::ImageMemoryBarrier::default()
+                        .image(image)
+                        .subresource_range(range)
+                        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+                    device.cmd_pipeline_barrier(
+                        command,
+                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_copy],
+                    );
+                    let copy = vk::BufferImageCopy::default()
+                        .image_subresource(vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        })
+                        .image_extent(vk::Extent3D {
+                            width,
+                            height,
+                            depth: 1,
+                        });
+                    device.cmd_copy_image_to_buffer(
+                        command,
+                        image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        capture.buffer,
+                        core::slice::from_ref(&copy),
+                    );
+                    let to_present = vk::ImageMemoryBarrier::default()
+                        .image(image)
+                        .subresource_range(range)
+                        .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                        .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                        .src_access_mask(vk::AccessFlags::TRANSFER_READ);
+                    device.cmd_pipeline_barrier(
+                        command,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_present],
+                    );
+                } else {
+                    let to_present = vk::ImageMemoryBarrier::default()
+                        .image(image)
+                        .subresource_range(range)
+                        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+                    device.cmd_pipeline_barrier(
+                        command,
+                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_present],
+                    );
+                }
+                device.end_command_buffer(command).map_err(map_vk)?;
+                let wait_stage = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+                let submit = vk::SubmitInfo::default()
+                    .wait_semaphores(core::slice::from_ref(&available))
+                    .wait_dst_stage_mask(&wait_stage)
+                    .command_buffers(core::slice::from_ref(&command))
+                    .signal_semaphores(core::slice::from_ref(&finished));
+                let queue = self.graphics_queue.ok_or(HalError::NotReady)?;
+                device
+                    .queue_submit(queue, &[submit], vk::Fence::null())
+                    .map_err(map_vk)?;
+                submitted = true;
+                let present = vk::PresentInfoKHR::default()
+                    .wait_semaphores(core::slice::from_ref(&finished))
+                    .swapchains(core::slice::from_ref(&swapchain))
+                    .image_indices(core::slice::from_ref(&image_index));
+                loader.queue_present(queue, &present).map_err(map_vk)?;
+                device.queue_wait_idle(queue).map_err(map_vk)?;
             }
-            device.cmd_draw_indexed_indirect(command, indirect_buffer.buffer, 0, draw_count, 20);
-            device.cmd_end_rendering(command);
-            if let Some((_, capture)) = &capture {
-                let to_copy = vk::ImageMemoryBarrier::default()
-                    .image(image)
-                    .subresource_range(range)
-                    .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-                device.cmd_pipeline_barrier(
-                    command,
-                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[to_copy],
-                );
-                let copy = vk::BufferImageCopy::default()
-                    .image_subresource(vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: 0,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    })
-                    .image_extent(vk::Extent3D {
-                        width,
-                        height,
-                        depth: 1,
-                    });
-                device.cmd_copy_image_to_buffer(
-                    command,
-                    image,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    capture.buffer,
-                    core::slice::from_ref(&copy),
-                );
-                let to_present = vk::ImageMemoryBarrier::default()
-                    .image(image)
-                    .subresource_range(range)
-                    .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                    .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                    .src_access_mask(vk::AccessFlags::TRANSFER_READ);
-                device.cmd_pipeline_barrier(
-                    command,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[to_present],
-                );
-            } else {
-                let to_present = vk::ImageMemoryBarrier::default()
-                    .image(image)
-                    .subresource_range(range)
-                    .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
-                device.cmd_pipeline_barrier(
-                    command,
-                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[to_present],
-                );
+            Ok::<_, HalError>(())
+        })();
+        if submitted && rendered.is_err() {
+            let _ = unsafe { device.queue_wait_idle(queue) };
+        }
+        unsafe {
+            if let Some(command) = command {
+                device.free_command_buffers(pool, &[command]);
             }
-            device.end_command_buffer(command).map_err(map_vk)?;
-            let wait_stage = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-            let submit = vk::SubmitInfo::default()
-                .wait_semaphores(core::slice::from_ref(&available))
-                .wait_dst_stage_mask(&wait_stage)
-                .command_buffers(core::slice::from_ref(&command))
-                .signal_semaphores(core::slice::from_ref(&finished));
-            let queue = self.graphics_queue.ok_or(HalError::NotReady)?;
-            device
-                .queue_submit(queue, &[submit], vk::Fence::null())
-                .map_err(map_vk)?;
-            let present = vk::PresentInfoKHR::default()
-                .wait_semaphores(core::slice::from_ref(&finished))
-                .swapchains(core::slice::from_ref(&swapchain))
-                .image_indices(core::slice::from_ref(&image_index));
-            loader.queue_present(queue, &present).map_err(map_vk)?;
-            device.queue_wait_idle(queue).map_err(map_vk)?;
-            device.free_command_buffers(pool, &[command]);
-            device.destroy_semaphore(finished, None);
+            if let Some(finished) = finished {
+                device.destroy_semaphore(finished, None);
+            }
             device.destroy_descriptor_pool(public_pool, None);
+        }
+        if let Err(error) = rendered {
+            if let Some((_, capture)) = capture {
+                let _ = self.free(capture);
+            }
+            return Err(error);
         }
         let Some((capture_size, mut capture)) = capture else {
             return Ok(());
         };
-        self.invalidate(&mut capture, 0, capture_size)
-            .map_err(map_allocation_hal)?;
-        surface.presented_rgba8 = self.mapped_slice(&capture).map_err(map_allocation_hal)?
-            [..capture_size as usize]
-            .to_vec();
-        if matches!(
-            self.swapchain_format,
-            vk::Format::B8G8R8A8_SRGB | vk::Format::B8G8R8A8_UNORM
-        ) {
-            for pixel in surface.presented_rgba8.chunks_exact_mut(4) {
-                pixel.swap(0, 2);
+        let captured = (|| {
+            self.invalidate(&mut capture, 0, capture_size)
+                .map_err(map_allocation_hal)?;
+            surface.presented_rgba8 = self.mapped_slice(&capture).map_err(map_allocation_hal)?
+                [..capture_size as usize]
+                .to_vec();
+            if matches!(
+                self.swapchain_format,
+                vk::Format::B8G8R8A8_SRGB | vk::Format::B8G8R8A8_UNORM
+            ) {
+                for pixel in surface.presented_rgba8.chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
+                }
             }
+            Ok(())
+        })();
+        let freed = self.free(capture).map_err(map_allocation_hal);
+        match (captured, freed) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), _) | (_, Err(error)) => Err(error),
         }
-        self.free(capture).map_err(map_allocation_hal)?;
-        Ok(())
     }
 
     /// Dispatches a validated compute grid and waits before the transient pipeline may be destroyed.
@@ -1346,16 +1724,52 @@ impl NativeContext {
         Ok(())
     }
 
+    fn destroy_unpublished_texture(
+        &mut self,
+        device: &ash::Device,
+        image: vk::Image,
+        view: Option<vk::ImageView>,
+        sampler: Option<vk::Sampler>,
+        allocation: Allocation,
+    ) {
+        unsafe {
+            if let Some(sampler) = sampler {
+                device.destroy_sampler(sampler, None);
+            }
+            if let Some(view) = view {
+                device.destroy_image_view(view, None);
+            }
+            device.destroy_image(image, None);
+        }
+        if let Some(allocator) = self.allocator.as_mut() {
+            let _ = allocator.free(allocation);
+        }
+    }
+
     /// Creates an RGBA8 mip chain and submits each level under a distinct timeline value.
     pub fn create_texture_rgba8(
         &mut self,
         mips: &[ImageMip<'_>],
         binding: u32,
+        sampler_desc: TextureSamplerDesc,
     ) -> Result<(NativeTexture, Vec<CompletionToken>), AllocationError> {
         validate_rgba8_mips(mips).map_err(|_| AllocationError::ZeroSize)?;
-        if binding >= 4096 {
+        if binding >= TEXTURE_DESCRIPTOR_CAPACITY {
             return Err(AllocationError::ZeroSize);
         }
+        if sampler_desc.max_anisotropy > 1.0 && !self.sampler_anisotropy {
+            return Err(AllocationError::NativeFailure);
+        }
+        let descriptor_set = self
+            .texture_descriptor_set
+            .ok_or(AllocationError::NativeFailure)?;
+        let pool = self
+            .transfer_command_pool
+            .ok_or(AllocationError::NativeFailure)?;
+        let queue = self.graphics_queue.ok_or(AllocationError::NativeFailure)?;
+        let semaphore = self
+            .transfer_timeline
+            .ok_or(AllocationError::NativeFailure)?;
         let width = mips[0].width;
         let height = mips[0].height;
         let mip_count = u32::try_from(mips.len()).map_err(|_| AllocationError::NativeFailure)?;
@@ -1363,6 +1777,11 @@ impl NativeContext {
             .iter()
             .try_fold(0_u64, |sum, mip| sum.checked_add(mip.bytes.len() as u64))
             .ok_or(AllocationError::NativeFailure)?;
+        let upload_request = AllocationRequest::new(total, 4, MemoryClass::Upload, true, None)
+            .map_err(|_| AllocationError::ZeroSize)?;
+        if self.allocator.is_none() {
+            return Err(AllocationError::NativeFailure);
+        }
         let device = self
             .device
             .as_ref()
@@ -1389,7 +1808,7 @@ impl NativeContext {
         let allocation = match self
             .allocator
             .as_mut()
-            .ok_or(AllocationError::NativeFailure)?
+            .expect("allocator checked before image creation")
             .allocate(&AllocationCreateDesc {
                 name: "ez-gfx-texture",
                 requirements,
@@ -1406,15 +1825,15 @@ impl NativeContext {
         if let Err(error) =
             unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset()) }
         {
+            unsafe { device.destroy_image(image, None) };
             let _ = self
                 .allocator
                 .as_mut()
                 .expect("allocator initialized")
                 .free(allocation);
-            unsafe { device.destroy_image(image, None) };
             return Err(map_allocation_vk(map_vk(error)));
         }
-        let view = unsafe {
+        let view = match unsafe {
             device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
                     .image(image)
@@ -1429,155 +1848,202 @@ impl NativeContext {
                     }),
                 None,
             )
-        }
-        .map_err(|error| map_allocation_vk(map_vk(error)))?;
-        let mut upload = self.allocate(
-            AllocationRequest::new(total, 4, MemoryClass::Upload, true, None)
-                .map_err(|_| AllocationError::ZeroSize)?,
-        )?;
-        let target = self.mapped_slice_mut(&mut upload)?;
-        let mut offset = 0_usize;
-        for mip in mips {
-            target[offset..offset + mip.bytes.len()].copy_from_slice(mip.bytes);
-            offset += mip.bytes.len();
-        }
-        self.flush(&mut upload, 0, total)?;
-        let pool = self
-            .transfer_command_pool
-            .ok_or(AllocationError::NativeFailure)?;
-        let queue = self.graphics_queue.ok_or(AllocationError::NativeFailure)?;
-        let semaphore = self
-            .transfer_timeline
-            .ok_or(AllocationError::NativeFailure)?;
-        let mut completions = Vec::with_capacity(mips.len());
-        let mut source_offset = 0_u64;
-        for (level, mip) in mips.iter().enumerate() {
-            let command = unsafe {
-                device.allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
-                )
+        } {
+            Ok(view) => view,
+            Err(error) => {
+                self.destroy_unpublished_texture(&device, image, None, None, allocation);
+                return Err(map_allocation_vk(map_vk(error)));
             }
-            .map_err(|error| map_allocation_vk(map_vk(error)))?[0];
-            unsafe {
-                device.begin_command_buffer(
-                    command,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )
+        };
+        let sampler_info = sampler_create_info(sampler_desc, mip_count);
+        let sampler = match unsafe { device.create_sampler(&sampler_info, None) } {
+            Ok(sampler) => sampler,
+            Err(error) => {
+                self.destroy_unpublished_texture(&device, image, Some(view), None, allocation);
+                return Err(map_allocation_vk(map_vk(error)));
             }
-            .map_err(|error| map_allocation_vk(map_vk(error)))?;
-            let range = vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: level as u32,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            };
-            let to_copy = vk::ImageMemoryBarrier::default()
-                .image(image)
-                .subresource_range(range)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-            unsafe {
-                device.cmd_pipeline_barrier(
-                    command,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    core::slice::from_ref(&to_copy),
-                )
-            };
-            let region = vk::BufferImageCopy::default()
-                .buffer_offset(source_offset)
-                .image_subresource(vk::ImageSubresourceLayers {
+        };
+        let mut upload = match self.allocate(upload_request) {
+            Ok(upload) => upload,
+            Err(error) => {
+                self.destroy_unpublished_texture(
+                    &device,
+                    image,
+                    Some(view),
+                    Some(sampler),
+                    allocation,
+                );
+                return Err(error);
+            }
+        };
+        let mut commands = Vec::with_capacity(mips.len());
+        let submitted = (|| {
+            let target = self.mapped_slice_mut(&mut upload)?;
+            let mut offset = 0_usize;
+            for mip in mips {
+                target[offset..offset + mip.bytes.len()].copy_from_slice(mip.bytes);
+                offset += mip.bytes.len();
+            }
+            self.flush(&mut upload, 0, total)?;
+
+            let mut completions = Vec::with_capacity(mips.len());
+            let mut source_offset = 0_u64;
+            for (level, mip) in mips.iter().enumerate() {
+                let command = unsafe {
+                    device.allocate_command_buffers(
+                        &vk::CommandBufferAllocateInfo::default()
+                            .command_pool(pool)
+                            .level(vk::CommandBufferLevel::PRIMARY)
+                            .command_buffer_count(1),
+                    )
+                }
+                .map_err(|error| map_allocation_vk(map_vk(error)))?[0];
+                commands.push(command);
+                unsafe {
+                    device.begin_command_buffer(
+                        command,
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )
+                }
+                .map_err(|error| map_allocation_vk(map_vk(error)))?;
+                let range = vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: level as u32,
+                    base_mip_level: level as u32,
+                    level_count: 1,
                     base_array_layer: 0,
                     layer_count: 1,
-                })
-                .image_extent(vk::Extent3D {
-                    width: mip.width,
-                    height: mip.height,
-                    depth: 1,
-                });
-            unsafe {
-                device.cmd_copy_buffer_to_image(
-                    command,
-                    upload.buffer,
-                    image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    core::slice::from_ref(&region),
-                )
-            };
-            let to_shader = vk::ImageMemoryBarrier::default()
-                .image(image)
-                .subresource_range(range)
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ);
-            unsafe {
-                device.cmd_pipeline_barrier(
-                    command,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::ALL_GRAPHICS | vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    core::slice::from_ref(&to_shader),
+                };
+                let to_copy = vk::ImageMemoryBarrier::default()
+                    .image(image)
+                    .subresource_range(range)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+                unsafe {
+                    device.cmd_pipeline_barrier(
+                        command,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        core::slice::from_ref(&to_copy),
+                    )
+                };
+                let region = vk::BufferImageCopy::default()
+                    .buffer_offset(source_offset)
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: level as u32,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_extent(vk::Extent3D {
+                        width: mip.width,
+                        height: mip.height,
+                        depth: 1,
+                    });
+                unsafe {
+                    device.cmd_copy_buffer_to_image(
+                        command,
+                        upload.buffer,
+                        image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        core::slice::from_ref(&region),
+                    )
+                };
+                let to_shader = vk::ImageMemoryBarrier::default()
+                    .image(image)
+                    .subresource_range(range)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ);
+                unsafe {
+                    device.cmd_pipeline_barrier(
+                        command,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::ALL_GRAPHICS
+                            | vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        core::slice::from_ref(&to_shader),
+                    );
+                    device.end_command_buffer(command)
+                }
+                .map_err(|error| map_allocation_vk(map_vk(error)))?;
+                let value = self.next_transfer_value;
+                self.next_transfer_value =
+                    value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
+                let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
+                    .signal_semaphore_values(core::slice::from_ref(&value));
+                let submit = vk::SubmitInfo::default()
+                    .command_buffers(core::slice::from_ref(&command))
+                    .signal_semaphores(core::slice::from_ref(&semaphore))
+                    .push_next(&mut timeline);
+                unsafe {
+                    device.queue_submit(queue, core::slice::from_ref(&submit), vk::Fence::null())
+                }
+                .map_err(|error| map_allocation_vk(map_vk(error)))?;
+                completions.push(
+                    CompletionToken::new(QueueKind::Transfer, value)
+                        .map_err(|_| AllocationError::NativeFailure)?,
                 );
-                device.end_command_buffer(command)
+                source_offset += mip.bytes.len() as u64;
             }
-            .map_err(|error| map_allocation_vk(map_vk(error)))?;
-            let value = self.next_transfer_value;
-            self.next_transfer_value =
-                value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
-            let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
-                .signal_semaphore_values(core::slice::from_ref(&value));
-            let submit = vk::SubmitInfo::default()
-                .command_buffers(core::slice::from_ref(&command))
-                .signal_semaphores(core::slice::from_ref(&semaphore))
-                .push_next(&mut timeline);
-            unsafe {
-                device.queue_submit(queue, core::slice::from_ref(&submit), vk::Fence::null())
-            }
-            .map_err(|error| map_allocation_vk(map_vk(error)))?;
-            completions.push(
-                CompletionToken::new(QueueKind::Transfer, value)
-                    .map_err(|_| AllocationError::NativeFailure)?,
-            );
-            source_offset += mip.bytes.len() as u64;
+            unsafe { device.queue_wait_idle(queue) }
+                .map_err(|error| map_allocation_vk(map_vk(error)))?;
+            Ok(completions)
+        })();
+        if submitted.is_err() {
+            let _ = unsafe { device.queue_wait_idle(queue) };
         }
-        self.retire(
-            upload,
-            *completions.last().ok_or(AllocationError::NativeFailure)?,
-        )?;
-        let descriptor = vk::DescriptorImageInfo::default()
-            .sampler(self.texture_sampler.ok_or(AllocationError::NativeFailure)?)
+        if !commands.is_empty() {
+            unsafe { device.free_command_buffers(pool, &commands) };
+        }
+        let upload_freed = self.free(upload);
+        let completions = match (submitted, upload_freed) {
+            (Ok(completions), Ok(())) => completions,
+            (Err(error), _) | (_, Err(error)) => {
+                let _ = self.wait_idle();
+                self.destroy_unpublished_texture(
+                    &device,
+                    image,
+                    Some(view),
+                    Some(sampler),
+                    allocation,
+                );
+                return Err(error);
+            }
+        };
+        let image_descriptor = vk::DescriptorImageInfo::default()
             .image_view(view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-        let write = vk::WriteDescriptorSet::default()
-            .dst_set(
-                self.texture_descriptor_set
-                    .ok_or(AllocationError::NativeFailure)?,
-            )
-            .dst_binding(0)
-            .dst_array_element(binding)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(core::slice::from_ref(&descriptor));
-        unsafe { device.update_descriptor_sets(core::slice::from_ref(&write), &[]) };
+        let sampler_descriptor = vk::DescriptorImageInfo::default().sampler(sampler);
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(TEXTURE_DESCRIPTOR_BINDING)
+                .dst_array_element(binding)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(core::slice::from_ref(&image_descriptor)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(SAMPLER_DESCRIPTOR_BINDING)
+                .dst_array_element(binding)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(core::slice::from_ref(&sampler_descriptor)),
+        ];
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
         Ok((
             NativeTexture {
                 image,
                 view,
                 allocation,
                 binding,
+                sampler,
             },
             completions,
         ))
@@ -1587,6 +2053,7 @@ impl NativeContext {
         let device = self.device.as_ref().ok_or(AllocationError::NativeFailure)?;
         unsafe {
             device.destroy_image_view(texture.view, None);
+            device.destroy_sampler(texture.sampler, None);
             device.destroy_image(texture.image, None)
         };
         self.allocator
@@ -1612,128 +2079,142 @@ impl NativeContext {
             .as_ref()
             .ok_or(AllocationError::NativeFailure)?
             .clone();
+        let pool = self
+            .transfer_command_pool
+            .ok_or(AllocationError::NativeFailure)?;
+        let semaphore = self
+            .transfer_timeline
+            .ok_or(AllocationError::NativeFailure)?;
+        let queue = self.graphics_queue.ok_or(AllocationError::NativeFailure)?;
+        let value = self.next_transfer_value;
+        let next_value = value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
         let mut readback = self.allocate(
             AllocationRequest::new(size, 4, MemoryClass::Readback, true, None)
                 .map_err(|_| AllocationError::ZeroSize)?,
         )?;
-        let command = unsafe {
+        let command = match unsafe {
             device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(
-                        self.transfer_command_pool
-                            .ok_or(AllocationError::NativeFailure)?,
-                    )
+                    .command_pool(pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
                     .command_buffer_count(1),
             )
-        }
-        .map_err(|error| map_allocation_vk(map_vk(error)))?[0];
-        unsafe {
-            device.begin_command_buffer(
-                command,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-        }
-        .map_err(|error| map_allocation_vk(map_vk(error)))?;
-        let range = vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
+        } {
+            Ok(commands) => commands[0],
+            Err(error) => {
+                let _ = self.free(readback);
+                return Err(map_allocation_vk(map_vk(error)));
+            }
         };
-        let to_copy = vk::ImageMemoryBarrier::default()
-            .image(texture.image)
-            .subresource_range(range)
-            .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .src_access_mask(vk::AccessFlags::SHADER_READ)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-        unsafe {
-            device.cmd_pipeline_barrier(
-                command,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                core::slice::from_ref(&to_copy),
-            )
-        };
-        let region = vk::BufferImageCopy::default()
-            .image_subresource(vk::ImageSubresourceLayers {
+        let mut submitted = false;
+        let result = (|| {
+            unsafe {
+                device.begin_command_buffer(
+                    command,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+            }
+            .map_err(|error| map_allocation_vk(map_vk(error)))?;
+            let range = vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
+                base_mip_level: 0,
+                level_count: 1,
                 base_array_layer: 0,
                 layer_count: 1,
-            })
-            .image_extent(vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            });
-        unsafe {
-            device.cmd_copy_image_to_buffer(
-                command,
-                texture.image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                readback.buffer,
-                core::slice::from_ref(&region),
-            )
-        };
-        let to_shader = vk::ImageMemoryBarrier::default()
-            .image(texture.image)
-            .subresource_range(range)
-            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .src_access_mask(vk::AccessFlags::TRANSFER_READ)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ);
-        unsafe {
-            device.cmd_pipeline_barrier(
-                command,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                core::slice::from_ref(&to_shader),
-            );
-            device.end_command_buffer(command)
+            };
+            let to_copy = vk::ImageMemoryBarrier::default()
+                .image(texture.image)
+                .subresource_range(range)
+                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::SHADER_READ)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    command,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    core::slice::from_ref(&to_copy),
+                )
+            };
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                });
+            unsafe {
+                device.cmd_copy_image_to_buffer(
+                    command,
+                    texture.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    readback.buffer,
+                    core::slice::from_ref(&region),
+                )
+            };
+            let to_shader = vk::ImageMemoryBarrier::default()
+                .image(texture.image)
+                .subresource_range(range)
+                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    command,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    core::slice::from_ref(&to_shader),
+                );
+                device.end_command_buffer(command)
+            }
+            .map_err(|error| map_allocation_vk(map_vk(error)))?;
+            let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
+                .signal_semaphore_values(core::slice::from_ref(&value));
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(core::slice::from_ref(&command))
+                .signal_semaphores(core::slice::from_ref(&semaphore))
+                .push_next(&mut timeline);
+            unsafe {
+                device.queue_submit(queue, core::slice::from_ref(&submit), vk::Fence::null())
+            }
+            .map_err(|error| map_allocation_vk(map_vk(error)))?;
+            submitted = true;
+            self.next_transfer_value = next_value;
+            unsafe {
+                device.wait_semaphores(
+                    &vk::SemaphoreWaitInfo::default()
+                        .semaphores(core::slice::from_ref(&semaphore))
+                        .values(core::slice::from_ref(&value)),
+                    u64::MAX,
+                )
+            }
+            .map_err(|error| map_allocation_vk(map_vk(error)))?;
+            self.invalidate(&mut readback, 0, size)?;
+            Ok(self.mapped_slice(&readback)?[..size as usize].to_vec())
+        })();
+        if submitted && result.is_err() {
+            let _ = unsafe { device.queue_wait_idle(queue) };
         }
-        .map_err(|error| map_allocation_vk(map_vk(error)))?;
-        let value = self.next_transfer_value;
-        self.next_transfer_value = value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
-        let semaphore = self
-            .transfer_timeline
-            .ok_or(AllocationError::NativeFailure)?;
-        let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
-            .signal_semaphore_values(core::slice::from_ref(&value));
-        let submit = vk::SubmitInfo::default()
-            .command_buffers(core::slice::from_ref(&command))
-            .signal_semaphores(core::slice::from_ref(&semaphore))
-            .push_next(&mut timeline);
-        unsafe {
-            device.queue_submit(
-                self.graphics_queue.ok_or(AllocationError::NativeFailure)?,
-                core::slice::from_ref(&submit),
-                vk::Fence::null(),
-            )
+        unsafe { device.free_command_buffers(pool, &[command]) };
+        let freed = self.free(readback);
+        match (result, freed) {
+            (Ok(pixels), Ok(())) => Ok(pixels),
+            (Err(error), _) | (_, Err(error)) => Err(error),
         }
-        .map_err(|error| map_allocation_vk(map_vk(error)))?;
-        unsafe {
-            device.wait_semaphores(
-                &vk::SemaphoreWaitInfo::default()
-                    .semaphores(core::slice::from_ref(&semaphore))
-                    .values(core::slice::from_ref(&value)),
-                u64::MAX,
-            )
-        }
-        .map_err(|error| map_allocation_vk(map_vk(error)))?;
-        self.invalidate(&mut readback, 0, size)?;
-        let pixels = self.mapped_slice(&readback)?[..size as usize].to_vec();
-        self.free(readback)?;
-        Ok(pixels)
     }
 
     fn probe_device(
@@ -1800,6 +2281,12 @@ impl NativeContext {
                 compression,
             )
         };
+        if features12.descriptor_indexing == 0
+            || features12.descriptor_binding_partially_bound == 0
+            || features12.descriptor_binding_sampled_image_update_after_bind == 0
+        {
+            return Ok(None);
+        }
         let properties = unsafe { self.instance.get_physical_device_properties(physical) };
         let mut id = vk::PhysicalDeviceIDProperties::default();
         let mut indexing = vk::PhysicalDeviceDescriptorIndexingProperties::default();
@@ -1821,11 +2308,11 @@ impl NativeContext {
         };
         let limits = properties.limits;
         let caps = AdapterCapabilities {
-            bindless_sampled_textures: indexing.max_descriptor_set_update_after_bind_sampled_images,
+            bindless_sampled_textures: paired_texture_capacity(&indexing),
             bindless_storage_resources: indexing
                 .max_descriptor_set_update_after_bind_storage_buffers
                 .max(indexing.max_descriptor_set_update_after_bind_storage_images),
-            bindless_samplers: indexing.max_descriptor_set_update_after_bind_samplers,
+            bindless_samplers: paired_texture_capacity(&indexing),
             max_indirect_draw_count: limits.max_draw_indirect_count,
             shader_model: 0x0605,
             timeline_synchronization: features12.timeline_semaphore != 0,
@@ -2158,6 +2645,7 @@ impl Drop for NativeContext {
                 let _ = device.device_wait_idle();
             }
         }
+        let _ = self.destroy_depth_target();
         while let Some(retired) = self.retired.pop() {
             let _ = self.free(retired.allocation);
         }
@@ -2173,9 +2661,6 @@ impl Drop for NativeContext {
             }
             if let Some(semaphore) = self.image_available.take() {
                 unsafe { device.destroy_semaphore(semaphore, None) };
-            }
-            if let Some(sampler) = self.texture_sampler.take() {
-                unsafe { device.destroy_sampler(sampler, None) };
             }
             if let Some(pool) = self.texture_descriptor_pool.take() {
                 unsafe { device.destroy_descriptor_pool(pool, None) };
@@ -2210,5 +2695,67 @@ fn map_vk(error: vk::Result) -> HalError {
         | vk::Result::ERROR_FEATURE_NOT_PRESENT
         | vk::Result::ERROR_INCOMPATIBLE_DRIVER => HalError::Unsupported,
         _ => HalError::NativeFailure,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn texture_heap_layout_matches_slang_bindless_contract() {
+        let [texture, sampler] = texture_descriptor_layout_bindings();
+
+        assert_eq!(TEXTURE_DESCRIPTOR_SET, 1);
+        assert_eq!(texture.binding, TEXTURE_DESCRIPTOR_BINDING);
+        assert_eq!(texture.descriptor_type, vk::DescriptorType::SAMPLED_IMAGE);
+        assert_eq!(texture.descriptor_count, TEXTURE_DESCRIPTOR_CAPACITY);
+        assert_eq!(texture.stage_flags, vk::ShaderStageFlags::ALL);
+        assert_eq!(sampler.binding, SAMPLER_DESCRIPTOR_BINDING);
+        assert_eq!(sampler.descriptor_type, vk::DescriptorType::SAMPLER);
+        assert_eq!(sampler.descriptor_count, TEXTURE_DESCRIPTOR_CAPACITY);
+        assert_eq!(sampler.stage_flags, vk::ShaderStageFlags::ALL);
+    }
+
+    #[test]
+    fn paired_texture_capacity_honors_every_update_after_bind_limit() {
+        let mut limits = vk::PhysicalDeviceDescriptorIndexingProperties {
+            max_update_after_bind_descriptors_in_all_pools: 2048,
+            max_per_stage_descriptor_update_after_bind_samplers: 1024,
+            max_per_stage_descriptor_update_after_bind_sampled_images: 1024,
+            max_per_stage_update_after_bind_resources: 2048,
+            max_descriptor_set_update_after_bind_samplers: 1024,
+            max_descriptor_set_update_after_bind_sampled_images: 1024,
+            ..Default::default()
+        };
+
+        assert_eq!(paired_texture_capacity(&limits), 1024);
+        limits.max_per_stage_update_after_bind_resources = 2046;
+        assert_eq!(paired_texture_capacity(&limits), 1023);
+    }
+
+    #[test]
+    fn sampler_state_preserves_filter_address_and_mip_configuration() {
+        let info = sampler_create_info(
+            TextureSamplerDesc {
+                min_filter: SamplerFilter::Linear,
+                mag_filter: SamplerFilter::Nearest,
+                max_anisotropy: 16.0,
+                address_u: SamplerAddressMode::Repeat,
+                address_v: SamplerAddressMode::Clamp,
+                address_w: SamplerAddressMode::Repeat,
+            },
+            5,
+        );
+
+        assert_eq!(info.min_filter, vk::Filter::LINEAR);
+        assert_eq!(info.mag_filter, vk::Filter::NEAREST);
+        assert_eq!(info.mipmap_mode, vk::SamplerMipmapMode::LINEAR);
+        assert_eq!(info.address_mode_u, vk::SamplerAddressMode::REPEAT);
+        assert_eq!(info.address_mode_v, vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        assert_eq!(info.address_mode_w, vk::SamplerAddressMode::REPEAT);
+        assert_eq!(info.anisotropy_enable, vk::TRUE);
+        assert_eq!(info.max_anisotropy, 16.0);
+        assert_eq!(info.max_lod, 5.0);
     }
 }

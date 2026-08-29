@@ -33,9 +33,10 @@ windows = { version = "0.62.2", default-features = false }
 objc2 = { version = "0.6.2", default-features = false, features = ["std"] }
 objc2-metal = { version = "0.3.2", default-features = false, features = ["MTLDevice"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSString"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false }
 gpu-allocator = { version = "0.28.0", default-features = false }
 image = { version = "0.25.10", default-features = false, features = ["bmp", "jpeg", "png", "tga"] }
 ktx2 = "0.5.0"
 basisu_c_sys = { version = "0.9.0", features = ["extra"] }
 dispatch2 = "0.3.1"
-objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["CAMetalLayer", "CALayer", "objc2-metal"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["CAMetalLayer", "CALayer", "objc2-core-foundation", "objc2-metal"] }

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ez_gfx_artifact::Stage;
-use ez_gfx_core::Backend;
+use ez_gfx_core::{Backend, capability::MAX_BINDLESS_SAMPLED_TEXTURES};
 use serde::Deserialize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +58,68 @@ pub struct ReflectedBindings {
     requirements: Vec<BindingRequirement>,
 }
 
+pub const MAX_TEXTURE_HEAP_CAPACITY: u32 = MAX_BINDLESS_SAMPLED_TEXTURES;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TextureHeapLayout {
+    pub space: u32,
+    pub binding: u32,
+    pub capacity: u32,
+    pub argument_stride: u32,
+    pub texture_argument_offset: u32,
+    pub sampler_argument_offset: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PipelineLayout {
+    texture_heap: Option<TextureHeapLayout>,
+    depth_required: bool,
+}
+
+impl PipelineLayout {
+    pub fn parse(
+        metadata: &[u8],
+        backend: Backend,
+        entry: &str,
+        stage: Stage,
+    ) -> Result<Self, BindingError> {
+        let reflection = matching_reflection(metadata, backend, entry, stage)?;
+        let texture_heap = reflection
+            .reflection
+            .texture_heap
+            .map(|heap| TextureHeapLayout {
+                space: heap.binding_space,
+                binding: heap.binding_index,
+                capacity: heap.capacity,
+                argument_stride: heap.argument_stride,
+                texture_argument_offset: heap.texture_argument_offset,
+                sampler_argument_offset: heap.sampler_argument_offset,
+            });
+        if let Some(heap) = texture_heap
+            && (heap.capacity == 0
+                || heap.capacity > MAX_TEXTURE_HEAP_CAPACITY
+                || heap.argument_stride == 0
+                || heap.texture_argument_offset >= heap.argument_stride
+                || heap.sampler_argument_offset >= heap.argument_stride
+                || heap.texture_argument_offset == heap.sampler_argument_offset)
+        {
+            return Err(BindingError::InvalidMetadata);
+        }
+        Ok(Self {
+            texture_heap,
+            depth_required: reflection.reflection.depth_required,
+        })
+    }
+
+    pub const fn texture_heap(&self) -> Option<&TextureHeapLayout> {
+        self.texture_heap.as_ref()
+    }
+
+    pub const fn depth_required(&self) -> bool {
+        self.depth_required
+    }
+}
+
 impl ReflectedBindings {
     /// Metadata must contain exactly one reflection for the requested target/entry/stage; DXIL keeps SRV and UAV register namespaces distinct.
     pub fn parse(
@@ -66,24 +128,7 @@ impl ReflectedBindings {
         entry: &str,
         stage: Stage,
     ) -> Result<Self, BindingError> {
-        if entry.is_empty() || entry.len() > 1024 || entry.as_bytes().contains(&0) {
-            return Err(BindingError::InvalidMetadata);
-        }
-        let envelope: MetadataEnvelope =
-            serde_json::from_slice(metadata).map_err(|_| BindingError::InvalidMetadata)?;
-        let target = match backend {
-            Backend::Vulkan => "Spirv",
-            Backend::Dx12 => "Dxil",
-            Backend::Metal => "Metallib",
-        };
-        let stage = stage_name(stage);
-        let mut matches = envelope.reflections.into_iter().filter(|reflection| {
-            reflection.target == target && reflection.entry == entry && reflection.stage == stage
-        });
-        let reflection = matches.next().ok_or(BindingError::MissingReflection)?;
-        if matches.next().is_some() {
-            return Err(BindingError::AmbiguousReflection);
-        }
+        let reflection = matching_reflection(metadata, backend, entry, stage)?;
 
         let mut names = BTreeSet::new();
         let mut slots = BTreeSet::new();
@@ -242,6 +287,20 @@ struct TargetReflection {
 struct Reflection {
     #[serde(default)]
     parameters: Vec<Parameter>,
+    #[serde(default)]
+    texture_heap: Option<TextureHeapMetadata>,
+    #[serde(default)]
+    depth_required: bool,
+}
+
+#[derive(Deserialize)]
+struct TextureHeapMetadata {
+    binding_space: u32,
+    binding_index: u32,
+    capacity: u32,
+    argument_stride: u32,
+    texture_argument_offset: u32,
+    sampler_argument_offset: u32,
 }
 
 #[derive(Deserialize)]
@@ -268,6 +327,33 @@ fn parse_kind(value: String) -> Option<BindingKind> {
         "render_target" => Some(BindingKind::RenderTarget),
         _ => None,
     }
+}
+
+fn matching_reflection(
+    metadata: &[u8],
+    backend: Backend,
+    entry: &str,
+    stage: Stage,
+) -> Result<TargetReflection, BindingError> {
+    if entry.is_empty() || entry.len() > 1024 || entry.as_bytes().contains(&0) {
+        return Err(BindingError::InvalidMetadata);
+    }
+    let envelope: MetadataEnvelope =
+        serde_json::from_slice(metadata).map_err(|_| BindingError::InvalidMetadata)?;
+    let target = match backend {
+        Backend::Vulkan => "Spirv",
+        Backend::Dx12 => "Dxil",
+        Backend::Metal => "Metallib",
+    };
+    let stage = stage_name(stage);
+    let mut matches = envelope.reflections.into_iter().filter(|reflection| {
+        reflection.target == target && reflection.entry == entry && reflection.stage == stage
+    });
+    let reflection = matches.next().ok_or(BindingError::MissingReflection)?;
+    if matches.next().is_some() {
+        return Err(BindingError::AmbiguousReflection);
+    }
+    Ok(reflection)
 }
 
 const fn stage_name(stage: Stage) -> &'static str {

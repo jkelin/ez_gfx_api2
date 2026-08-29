@@ -3,6 +3,7 @@ use core::fmt;
 use crate::Backend;
 
 pub const CAPABILITY_PROFILE_SCHEMA_VERSION: u32 = 1;
+pub const MAX_BINDLESS_SAMPLED_TEXTURES: u32 = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(transparent)]
@@ -57,7 +58,7 @@ impl SemanticProfile {
         require_limit(
             &mut errors,
             "bindless_sampled_textures",
-            4096,
+            MAX_BINDLESS_SAMPLED_TEXTURES,
             capabilities.bindless_sampled_textures,
         );
         require_limit(
@@ -69,7 +70,7 @@ impl SemanticProfile {
         require_limit(
             &mut errors,
             "bindless_samplers",
-            256,
+            MAX_BINDLESS_SAMPLED_TEXTURES,
             capabilities.bindless_samplers,
         );
         require_limit(

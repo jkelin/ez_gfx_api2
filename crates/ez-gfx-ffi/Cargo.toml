@@ -23,3 +23,9 @@ ez-gfx-backend-metal = { path = "../ez-gfx-backend-metal" }
 
 [dev-dependencies]
 ez-gfx-compiler.workspace = true
+
+[target.'cfg(target_vendor = "apple")'.dev-dependencies]
+objc2.workspace = true
+objc2-core-foundation.workspace = true
+objc2-metal = { workspace = true, features = ["MTLTypes"] }
+objc2-quartz-core.workspace = true

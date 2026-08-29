@@ -170,3 +170,15 @@ fn residency_binding_and_events_follow_upload_completion() {
     );
     assert_eq!(registry.binding_index(texture), Err(TextureError::NotFound));
 }
+
+#[test]
+fn cancel_upload_reuses_binding_without_emitting_public_events() {
+    let mut registry = TextureRegistry::new(1, 1).unwrap();
+    let failed = registry.begin_upload().unwrap();
+    registry.cancel_upload(failed).unwrap();
+    assert!(registry.drain_events().is_empty());
+
+    let replacement = registry.begin_upload().unwrap();
+    assert_ne!(replacement, failed);
+    assert_eq!(registry.begin_upload(), Err(TextureError::CapacityExceeded));
+}

@@ -12,7 +12,7 @@ run = "cargo build -p ez-gfx-examples --bins"
 
 [tasks.examples-artifacts]
 description = "Compile checked-in universal example shader artifacts"
-run = "cargo run -p ez-gfx-compiler --bin ez-gfx-compile -- examples/assets/scene.json"
+run = "cargo run -p ez-gfx-compiler --bin ez-gfx-compile -- examples/01_triangle/01_triangle.json && cargo run -p ez-gfx-compiler --bin ez-gfx-compile -- examples/02_textured_cube/02_textured_cube.json && cargo run -p ez-gfx-compiler --bin ez-gfx-compile -- examples/03_compute_structured/03_compute_structured.json && cargo run -p ez-gfx-compiler --bin ez-gfx-compile -- examples/04_imgui/04_imgui.json && cargo run -p ez-gfx-compiler --bin ez-gfx-compile -- examples/05_helmet/05_helmet.json && cargo run -p ez-gfx-compiler --bin ez-gfx-compile -- examples/06_sponza_ktx2/06_sponza_ktx2.json"
 
 [tasks.examples-smoke]
 description = "Run every host-compatible example API smoke"

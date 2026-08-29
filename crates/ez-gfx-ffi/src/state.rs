@@ -70,12 +70,14 @@ struct ShaderRecord {
     graphics: Option<(usize, String, usize, String)>,
     compute: Option<(usize, String)>,
     runtime: ez_gfx_runtime::shader::RuntimeShader,
+    graphics_layout: Option<ez_gfx_runtime::binding::PipelineLayout>,
 }
 
 enum PendingPipeline {
     Graphics {
         shader: u64,
-        commands: Vec<DrawIndexedCommand>,
+        indirect: u64,
+        draw_count: u32,
         bindings: Vec<ez_gfx_runtime::binding::PublicBinding>,
         layout: ez_gfx_runtime::binding::ReflectedBindings,
         state: DynamicPipelineState,
@@ -128,7 +130,6 @@ struct FfiContext {
     index_heap: Option<GeometryAllocation>,
     staging: Vec<StagingAllocation>,
     frame: FrameRecorder,
-    frame_indirect: Option<NativeAllocation>,
     last_readback: Vec<u8>,
     frame_readback_texture: Option<u64>,
     active_surface: Option<u64>,
@@ -204,14 +205,16 @@ pub fn create_context(options: ContextOptions) -> Result<PackedHandle, EzGfxResu
         shaders: HashMap::new(),
         textures: HashMap::new(),
         indirects: HashMap::new(),
-        texture_registry: TextureRegistry::new(4096, 4096)
-            .map_err(|_| EzGfxResult::NativeFailure)?,
+        texture_registry: TextureRegistry::new(
+            ez_gfx_runtime::binding::MAX_TEXTURE_HEAP_CAPACITY,
+            ez_gfx_runtime::binding::MAX_TEXTURE_HEAP_CAPACITY,
+        )
+        .map_err(|_| EzGfxResult::NativeFailure)?,
         geometry: GeometryManager::new(),
         vertex_heaps: HashMap::new(),
         index_heap: None,
         staging: Vec::new(),
         frame: FrameRecorder::new(1024).map_err(|_| EzGfxResult::NativeFailure)?,
-        frame_indirect: None,
         last_readback: Vec::new(),
         frame_readback_texture: None,
         active_surface: None,
@@ -314,9 +317,6 @@ pub fn destroy_context(context: u64) {
     if let Some(heap) = owned.index_heap.take() {
         let _ = free_native_allocation(&mut owned.native, heap.allocation);
     }
-    if let Some(indirect) = owned.frame_indirect.take() {
-        let _ = free_native_allocation(&mut owned.native, indirect);
-    }
     for staging in owned.staging.drain(..) {
         let _ = free_native_allocation(&mut owned.native, staging.allocation);
     }
@@ -344,9 +344,10 @@ pub fn create_surface(context: u64, options: SurfaceOptions) -> Result<PackedHan
                 NativeSurface::Dx12(Dx12Surface::new(options.window as *mut _).map_err(map_hal)?)
             }
             #[cfg(target_vendor = "apple")]
-            NativeContext::Metal(_) => {
-                NativeSurface::Metal(MetalSurface::new(options.window as *mut _).map_err(map_hal)?)
-            }
+            NativeContext::Metal(_) => NativeSurface::Metal(
+                MetalSurface::new(options.window as *mut _, options.cache_presented_snapshots)
+                    .map_err(map_hal)?,
+            ),
         };
         let handle = match context.identity.insert(ResourceKind::Surface) {
             Ok(handle) => handle,
@@ -512,8 +513,15 @@ pub fn present(context: u64) -> EzGfxResult {
 }
 
 fn destroy_native_surface(context: &mut NativeContext, surface: NativeSurface) {
-    if let (NativeContext::Vulkan(context), NativeSurface::Vulkan(surface)) = (context, surface) {
-        context.destroy_surface(surface);
+    match (context, surface) {
+        (NativeContext::Vulkan(context), NativeSurface::Vulkan(surface)) => {
+            context.destroy_surface(surface);
+        }
+        #[cfg(windows)]
+        (NativeContext::Dx12(context), NativeSurface::Dx12(surface)) => {
+            context.destroy_surface(surface);
+        }
+        _ => {}
     }
 }
 
@@ -795,10 +803,20 @@ pub fn acquire_indirect(context: u64, capacity: u32) -> Result<PackedHandle, EzG
             .map_err(map_lifecycle)?;
         let buffer =
             IndexedIndirectBuffer::new(capacity).map_err(|_| EzGfxResult::InvalidArgument)?;
-        let handle = context
-            .identity
-            .insert(ResourceKind::Indirect)
-            .map_err(map_lifecycle)?;
+        let size = u64::from(capacity)
+            .checked_mul(20)
+            .ok_or(EzGfxResult::InvalidArgument)?;
+        let request = AllocationRequest::new(size, 4, MemoryClass::Device, false, None)
+            .map_err(|_| EzGfxResult::InvalidArgument)?;
+        let allocation = allocate_native(&mut context.native, request).map_err(map_allocation)?;
+        let handle = match context.identity.insert(ResourceKind::Indirect) {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = free_native_allocation(&mut context.native, allocation);
+                return Err(map_lifecycle(error));
+            }
+        };
+        context.allocations.insert(handle.get(), (size, allocation));
         context.indirects.insert(handle.get(), buffer);
         Ok(handle)
     })
@@ -821,7 +839,26 @@ pub fn write_indirect(
             .get_mut(&indirect)
             .ok_or(EzGfxResult::InvalidContext)?
             .write(index, command)
-            .map_err(|_| EzGfxResult::InvalidArgument)
+            .map_err(|_| EzGfxResult::InvalidArgument)?;
+        let mut bytes = Vec::with_capacity(20);
+        bytes.extend_from_slice(&command.index_count.to_le_bytes());
+        bytes.extend_from_slice(&command.instance_count.to_le_bytes());
+        bytes.extend_from_slice(&command.first_index.to_le_bytes());
+        bytes.extend_from_slice(&command.vertex_offset.to_le_bytes());
+        bytes.extend_from_slice(&command.first_instance.to_le_bytes());
+        let (_, allocation) = context
+            .allocations
+            .get(&indirect)
+            .ok_or(EzGfxResult::InvalidContext)?;
+        stage_upload(
+            &mut context.native,
+            &mut context.staging,
+            allocation,
+            u64::from(index) * 20,
+            &bytes,
+        )
+        .map(|_| ())
+        .map_err(map_allocation)
     }))
 }
 
@@ -855,7 +892,11 @@ pub fn release_indirect(context: u64, indirect: u64) {
             .indirects
             .remove(&indirect)
             .ok_or(EzGfxResult::InvalidContext)?;
-        Ok(())
+        let (_, allocation) = context
+            .allocations
+            .remove(&indirect)
+            .ok_or(EzGfxResult::InvalidContext)?;
+        free_native_allocation(&mut context.native, allocation).map_err(map_allocation)
     });
 }
 pub fn write_structured(context: u64, structured: u64, bytes: &[u8]) -> EzGfxResult {
@@ -934,6 +975,18 @@ pub fn load_shader(
             .compute_product()
             .ok()
             .map(|product| (product.0, product.2.to_owned()));
+        let graphics_layout = graphics
+            .as_ref()
+            .map(|graphics| {
+                ez_gfx_runtime::binding::PipelineLayout::parse(
+                    shader.metadata(),
+                    context.options.backend,
+                    &graphics.3,
+                    ez_gfx_artifact::Stage::Fragment,
+                )
+            })
+            .transpose()
+            .map_err(|_| EzGfxResult::InvalidArgument)?;
         if graphics.is_none() && compute.is_none() {
             return Err(EzGfxResult::InvalidArgument);
         }
@@ -968,6 +1021,7 @@ pub fn load_shader(
                 graphics,
                 compute,
                 runtime: shader,
+                graphics_layout,
             },
         );
         Ok(handle)
@@ -1010,11 +1064,19 @@ fn destroy_native_shader(context: &mut NativeContext, shader: NativeShader) {
     }
 }
 
+pub struct TextureConfig {
+    pub width: u32,
+    pub height: u32,
+    pub mip_count: u32,
+    pub sampler: ez_gfx_hal::TextureSamplerDesc,
+}
+
 pub fn load_texture(
     context: u64,
     source: TextureSource,
     bytes: &[u8],
     generate: bool,
+    config: TextureConfig,
 ) -> Result<PackedHandle, EzGfxResult> {
     let decoded = TextureDecoder::decode(source, bytes)
         .and_then(|texture| {
@@ -1025,6 +1087,12 @@ pub fn load_texture(
             }
         })
         .map_err(map_texture)?;
+    if (config.width != 0 && decoded.width != config.width)
+        || (config.height != 0 && decoded.height != config.height)
+        || (config.mip_count != 0 && decoded.mip_count != config.mip_count)
+    {
+        return Err(EzGfxResult::InvalidArgument);
+    }
     let mips = decoded
         .mips
         .iter()
@@ -1043,42 +1111,60 @@ pub fn load_texture(
             .texture_registry
             .begin_upload()
             .map_err(map_texture)?;
-        let binding = context
-            .texture_registry
-            .reserved_binding(texture)
-            .map_err(map_texture)?;
-        let (native, completions) = match &mut context.native {
+        let binding = match context.texture_registry.reserved_binding(texture) {
+            Ok(binding) => binding,
+            Err(error) => {
+                let _ = context.texture_registry.cancel_upload(texture);
+                return Err(map_texture(error));
+            }
+        };
+        let created = match &mut context.native {
             NativeContext::Vulkan(native) => native
-                .create_texture_rgba8(&mips, binding)
+                .create_texture_rgba8(&mips, binding, config.sampler)
                 .map(|(texture, tokens)| (NativeTexture::Vulkan(texture), tokens)),
             #[cfg(windows)]
             NativeContext::Dx12(native) => native
-                .create_texture_rgba8(&mips, binding)
+                .create_texture_rgba8(&mips, binding, config.sampler)
                 .map(|(texture, tokens)| (NativeTexture::Dx12(texture), tokens)),
             #[cfg(target_vendor = "apple")]
             NativeContext::Metal(native) => native
-                .create_texture_rgba8(&mips, binding)
+                .create_texture_rgba8(&mips, binding, config.sampler)
                 .map(|(texture, tokens)| (NativeTexture::Metal(texture), tokens)),
-        }
-        .map_err(map_allocation)?;
+        };
+        let (native, completions) = match created {
+            Ok(created) => created,
+            Err(error) => {
+                let _ = context.texture_registry.cancel_upload(texture);
+                return Err(map_allocation(error));
+            }
+        };
         let mut completions = completions.into_iter();
-        context
-            .texture_registry
-            .mark_submitted(
-                texture,
-                completions.next().ok_or(EzGfxResult::NativeFailure)?,
-            )
-            .map_err(map_texture)?;
-        for (index, completion) in completions.enumerate() {
-            context
-                .texture_registry
-                .mark_mips_submitted(texture, index as u32 + 2, completion)
-                .map_err(map_texture)?;
+        let submitted = completions
+            .next()
+            .ok_or(EzGfxResult::NativeFailure)
+            .and_then(|completion| {
+                context
+                    .texture_registry
+                    .mark_submitted(texture, completion)
+                    .map_err(map_texture)
+            })
+            .and_then(|()| {
+                for (index, completion) in completions.enumerate() {
+                    context
+                        .texture_registry
+                        .mark_mips_submitted(texture, index as u32 + 2, completion)
+                        .map_err(map_texture)?;
+                }
+                Ok(())
+            });
+        if let Err(error) = submitted {
+            rollback_texture_upload(context, texture, native)?;
+            return Err(error);
         }
         let handle = match context.identity.insert(ResourceKind::Texture) {
             Ok(handle) => handle,
             Err(error) => {
-                let _ = destroy_native_texture(&mut context.native, native);
+                rollback_texture_upload(context, texture, native)?;
                 return Err(map_lifecycle(error));
             }
         };
@@ -1096,6 +1182,20 @@ pub fn load_texture(
         context.observability.push_event(record);
         Ok(handle)
     })
+}
+
+fn rollback_texture_upload(
+    context: &mut FfiContext,
+    texture: TextureId,
+    native: NativeTexture,
+) -> Result<(), EzGfxResult> {
+    let idle = wait_native_idle(&mut context.native).map_err(map_hal);
+    let destroyed = destroy_native_texture(&mut context.native, native).map_err(map_allocation);
+    let canceled = context
+        .texture_registry
+        .cancel_upload(texture)
+        .map_err(map_texture);
+    idle.and(destroyed).and(canceled)
 }
 
 pub fn texture_binding(context: u64, texture: u64) -> Result<u32, EzGfxResult> {
@@ -1283,19 +1383,20 @@ pub fn render_add_graphics(
         layout
             .validate(bindings)
             .map_err(|_| EzGfxResult::InvalidArgument)?;
-        let commands = context
+        let draw_count = context
             .indirects
             .get(&indirect)
             .ok_or(EzGfxResult::InvalidContext)?
-            .commands()
-            .to_vec();
-        if commands.is_empty() || push_constants.len() > 128 || push_constants.len() % 4 != 0 {
+            .draw_count();
+        if draw_count == 0 || push_constants.len() > 128 || !push_constants.len().is_multiple_of(4)
+        {
             return Err(EzGfxResult::InvalidArgument);
         }
         context.frame.mark_work_enqueued().map_err(map_frame)?;
         context.pending_pipelines.push(PendingPipeline::Graphics {
             shader,
-            commands,
+            indirect,
+            draw_count,
             bindings: bindings.to_vec(),
             layout,
             state,
@@ -1326,7 +1427,10 @@ pub fn render_add_compute(
             .compute
             .as_ref()
             .ok_or(EzGfxResult::InvalidArgument)?;
-        if groups.contains(&0) || push_constants.len() > 128 || push_constants.len() % 4 != 0 {
+        if groups.contains(&0)
+            || push_constants.len() > 128
+            || !push_constants.len().is_multiple_of(4)
+        {
             return Err(EzGfxResult::InvalidArgument);
         }
         let layout = record
@@ -1377,9 +1481,7 @@ pub fn frame_submit(context: u64) -> EzGfxResult {
     result_status(with_context_mut(context, |context| {
         let result = (|| {
             let _submission = context.frame.submit().map_err(map_frame)?;
-            if let Some(old) = context.frame_indirect.take() {
-                free_native_allocation(&mut context.native, old).map_err(map_allocation)?;
-            }
+            wait_native_idle(&mut context.native).map_err(map_hal)?;
             let work = core::mem::take(&mut context.pending_pipelines);
             for pipeline in work {
                 match pipeline {
@@ -1415,49 +1517,18 @@ pub fn frame_submit(context: u64) -> EzGfxResult {
                     }
                     PendingPipeline::Graphics {
                         shader,
-                        commands,
+                        indirect,
+                        draw_count,
                         bindings,
                         layout,
                         state,
                         push_constants,
                     } => {
-                        if let Some(old) = context.frame_indirect.take() {
-                            free_native_allocation(&mut context.native, old)
-                                .map_err(map_allocation)?;
-                        }
-                        let mut bytes = Vec::with_capacity(commands.len() * 20);
-                        for command in &commands {
-                            bytes.extend_from_slice(&command.index_count.to_le_bytes());
-                            bytes.extend_from_slice(&command.instance_count.to_le_bytes());
-                            bytes.extend_from_slice(&command.first_index.to_le_bytes());
-                            bytes.extend_from_slice(&command.vertex_offset.to_le_bytes());
-                            bytes.extend_from_slice(&command.first_instance.to_le_bytes());
-                        }
-                        let allocation = allocate_native(
-                            &mut context.native,
-                            AllocationRequest::new(
-                                bytes.len() as u64,
-                                4,
-                                MemoryClass::Device,
-                                false,
-                                None,
-                            )
-                            .map_err(|_| EzGfxResult::InvalidArgument)?,
-                        )
-                        .map_err(map_allocation)?;
-                        if let Err(error) = stage_upload(
-                            &mut context.native,
-                            &mut context.staging,
-                            &allocation,
-                            0,
-                            &bytes,
-                        ) {
-                            let _ = free_native_allocation(&mut context.native, allocation);
-                            return Err(map_allocation(error));
-                        }
-                        wait_native_idle(&mut context.native).map_err(map_hal)?;
-                        context.frame_indirect = Some(allocation);
-                        let indirect = context.frame_indirect.as_ref().expect("just assigned");
+                        let indirect = &context
+                            .allocations
+                            .get(&indirect)
+                            .ok_or(EzGfxResult::InvalidContext)?
+                            .1;
                         let index = &context
                             .index_heap
                             .as_ref()
@@ -1491,15 +1562,20 @@ pub fn frame_submit(context: u64) -> EzGfxResult {
                                 surface: &mut surface.native,
                                 shader: &record.native,
                                 graphics,
+                                pipeline_layout: record
+                                    .graphics_layout
+                                    .as_ref()
+                                    .ok_or(EzGfxResult::InvalidArgument)?,
                                 state,
                                 index,
                                 indirect,
-                                draw_count: commands.len() as u32,
+                                draw_count,
                                 push_constants: &push_constants,
                                 extent,
                                 capture_presented,
                                 layout: &layout,
                                 bindings: &bindings,
+                                textures: &context.textures,
                             },
                         );
                         if result.is_ok() && surface.state.snapshot_cache() {
@@ -1510,7 +1586,7 @@ pub fn frame_submit(context: u64) -> EzGfxResult {
                                 #[cfg(windows)]
                                 NativeSurface::Dx12(surface) => surface.presented_rgba8().to_vec(),
                                 #[cfg(target_vendor = "apple")]
-                                NativeSurface::Metal(_) => Vec::new(),
+                                NativeSurface::Metal(surface) => surface.presented_rgba8().to_vec(),
                             };
                         }
                         context.surfaces.insert(surface_handle, surface);
@@ -1619,6 +1695,7 @@ struct GraphicsExecution<'a> {
     surface: &'a mut NativeSurface,
     shader: &'a NativeShader,
     graphics: &'a (usize, String, usize, String),
+    pipeline_layout: &'a ez_gfx_runtime::binding::PipelineLayout,
     state: DynamicPipelineState,
     index: &'a NativeAllocation,
     indirect: &'a NativeAllocation,
@@ -1628,6 +1705,7 @@ struct GraphicsExecution<'a> {
     capture_presented: bool,
     layout: &'a ez_gfx_runtime::binding::ReflectedBindings,
     bindings: &'a [ez_gfx_runtime::binding::PublicBinding],
+    textures: &'a HashMap<u64, (TextureId, NativeTexture, u32, u32, u32)>,
 }
 
 fn execute_compute(
@@ -1684,6 +1762,7 @@ fn execute_graphics(
         surface,
         shader,
         graphics,
+        pipeline_layout,
         state,
         index,
         indirect,
@@ -1693,8 +1772,12 @@ fn execute_graphics(
         capture_presented,
         layout,
         bindings,
+        textures,
     } = request;
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = textures;
     let layouts = native_layouts(layout)?;
+    let depth_required = pipeline_layout.depth_required();
     match (context, surface, shader, index, indirect) {
         (
             NativeContext::Vulkan(context),
@@ -1711,6 +1794,7 @@ fn execute_graphics(
                     vertex_index: graphics.0,
                     fragment_index: graphics.2,
                     state,
+                    depth_required,
                     layouts: &layouts,
                 },
             )?;
@@ -1740,8 +1824,14 @@ fn execute_graphics(
             NativeAllocation::Dx12(indirect),
         ) => {
             let native_bindings = dx12_bindings(layout, bindings, allocations)?;
-            let pipeline = context
-                .create_graphics_pipeline(shader, graphics.0, graphics.2, state, &layouts)?;
+            let pipeline = context.create_graphics_pipeline(
+                shader,
+                graphics.0,
+                graphics.2,
+                state,
+                depth_required,
+                &layouts,
+            )?;
             context.draw_indexed_present(
                 surface,
                 ez_gfx_backend_dx12::native::NativeDrawIndexed {
@@ -1766,10 +1856,31 @@ fn execute_graphics(
             NativeAllocation::Metal(indirect),
         ) => {
             let native_bindings = metal_bindings(layout, bindings, allocations)?;
+            let native_textures = textures
+                .values()
+                .filter_map(|(_, texture, _, _, _)| match texture {
+                    NativeTexture::Metal(texture) => Some(texture),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
             context.draw_indexed_shader(
                 surface,
                 shader,
                 graphics,
+                depth_required,
+                pipeline_layout
+                    .texture_heap()
+                    .map(|layout| {
+                        ez_gfx_hal::ShaderTextureHeapLayout::new(
+                            layout.space,
+                            layout.binding,
+                            layout.capacity,
+                            layout.argument_stride,
+                            layout.texture_argument_offset,
+                            layout.sampler_argument_offset,
+                        )
+                    })
+                    .transpose()?,
                 state,
                 index,
                 indirect,
@@ -1777,6 +1888,8 @@ fn execute_graphics(
                 push_constants,
                 extent,
                 &native_bindings,
+                &native_textures,
+                capture_presented,
             )
         }
         _ => Err(HalError::InvalidArgument),
@@ -1812,6 +1925,7 @@ fn vulkan_bindings<'a>(
             .ok_or(HalError::InvalidArgument)?;
         match public.resource {
             ez_gfx_runtime::binding::ResourceIdentity::Structured(handle)
+            | ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle)
                 if requirement.descriptor_count == 1 =>
             {
                 let (size, allocation) =
@@ -1846,6 +1960,7 @@ fn metal_bindings<'a>(
             .ok_or(HalError::InvalidArgument)?;
         match public.resource {
             ez_gfx_runtime::binding::ResourceIdentity::Structured(handle)
+            | ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle)
                 if requirement.descriptor_count == 1 =>
             {
                 let (_, allocation) = allocations.get(&handle).ok_or(HalError::InvalidArgument)?;
@@ -1878,6 +1993,7 @@ fn dx12_bindings<'a>(
             .ok_or(HalError::InvalidArgument)?;
         match public.resource {
             ez_gfx_runtime::binding::ResourceIdentity::Structured(handle)
+            | ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle)
                 if requirement.descriptor_count == 1 =>
             {
                 let (_, allocation) = allocations.get(&handle).ok_or(HalError::InvalidArgument)?;

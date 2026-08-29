@@ -104,6 +104,68 @@ impl ShaderBufferLayout {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShaderTextureHeapLayout {
+    pub space: u32,
+    pub binding: u32,
+    pub capacity: u32,
+    pub argument_stride: u32,
+    pub texture_argument_offset: u32,
+    pub sampler_argument_offset: u32,
+}
+
+impl ShaderTextureHeapLayout {
+    /// Texture heaps use one bounded interleaved texture/sampler argument array.
+    pub fn new(
+        space: u32,
+        binding: u32,
+        capacity: u32,
+        argument_stride: u32,
+        texture_argument_offset: u32,
+        sampler_argument_offset: u32,
+    ) -> Result<Self, HalError> {
+        if capacity == 0
+            || capacity > 1024
+            || argument_stride == 0
+            || texture_argument_offset >= argument_stride
+            || sampler_argument_offset >= argument_stride
+            || texture_argument_offset == sampler_argument_offset
+        {
+            return Err(HalError::InvalidArgument);
+        }
+        Ok(Self {
+            space,
+            binding,
+            capacity,
+            argument_stride,
+            texture_argument_offset,
+            sampler_argument_offset,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SamplerFilter {
+    Nearest,
+    Linear,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SamplerAddressMode {
+    Clamp,
+    Repeat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextureSamplerDesc {
+    pub min_filter: SamplerFilter,
+    pub mag_filter: SamplerFilter,
+    pub max_anisotropy: f32,
+    pub address_u: SamplerAddressMode,
+    pub address_v: SamplerAddressMode,
+    pub address_w: SamplerAddressMode,
+}
+
 /// Backend-owned allocator seam. Native implementations derive physical requirements, while this
 /// contract makes mapping, cache visibility, immediate free, and timeline retirement explicit.
 pub trait MemoryAllocator {

@@ -382,14 +382,14 @@ impl FrameGraph {
         let mut first = BTreeSet::new();
         for node in order {
             for access in &self.nodes[node.0 as usize].accesses {
-                if first.insert(access.resource) {
-                    if let Some(token) = self.resources[access.resource.0 as usize].ready {
-                        waits.push(QueueWait {
-                            node: *node,
-                            source: None,
-                            external: Some(token),
-                        });
-                    }
+                if first.insert(access.resource)
+                    && let Some(token) = self.resources[access.resource.0 as usize].ready
+                {
+                    waits.push(QueueWait {
+                        node: *node,
+                        source: None,
+                        external: Some(token),
+                    });
                 }
             }
         }
@@ -469,10 +469,10 @@ impl FrameGraph {
             {
                 continue;
             }
-            if let Some(state) = states.first().map(|(_, state)| *state) {
-                if states.iter().all(|(_, candidate)| *candidate == state) {
-                    history.insert(resource, state);
-                }
+            if let Some(state) = states.first().map(|(_, state)| *state)
+                && states.iter().all(|(_, candidate)| *candidate == state)
+            {
+                history.insert(resource, state);
             }
         }
         (transitions, history)

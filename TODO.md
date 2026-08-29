@@ -9,23 +9,23 @@
 - KTX2/Basis decoding, progressive texture residency, bounded streaming/events/diagnostics, six migrated examples, external PNG comparison, runtime/compiler package isolation, and canonical plan updates are present.
 - `cargo clippy --workspace --all-targets -- -D warnings` passed before the final `cargo fmt --all`.
 
+## Verification status
+
+- Six standalone programs own their host setup, `ApplicationHandler`, scene, required helpers, shader inputs, and artifacts; no shared Rust example tree or library target remains.
+- All six one-frame Metal Validation runs pass with zero diagnostics and zero dropped observations.
+- `cargo build -p ez-gfx-examples --bins` passes; the seven-test examples smoke passes 7/7.
+- Example snapshots were regenerated and verified.
+- Full workspace `cargo clippy --workspace --all-targets -- -D warnings` passed, followed by `cargo fmt --all`.
+
 ## Remaining verification
 
-The priority stop cancelled these post-format checks before completion. Run them unchanged:
-
 ```text
-cargo test -p ez-gfx-examples --test smoke -- --nocapture
-cargo test -p ez-gfx-ffi --test abi dx12_frame_uploads_indirect_compiles_graph_and_reads_back_texture -- --exact --nocapture
-cargo check -p ez-gfx-ffi --target aarch64-apple-darwin
 cargo run -p xtask -- package x86_64-pc-windows-msvc 0.1.0 target/package-smoke
+  blocked: the x86_64-pc-windows-msvc Rust target is not installed
+
+DX12 native target execution/type-check
+  unavailable: this macOS Homebrew Rust host cannot execute or type-check the native Windows DX12 target
 ```
-
-No final-tree failure is known. Before the final refactors/format, the snapshot suite passed 2/2, the exact DX12 readback test passed, the Metal backend crate cross-checked for `aarch64-apple-darwin`, and package isolation completed.
-
-## Platform gaps
-
-- Metal was compile-checked only; no Apple host was available for device, metallib, CAMetalLayer, presentation, or readback execution.
-- Vulkan and DX12 were exercised locally; other adapters/drivers remain unobserved.
 
 ## Constraints
 

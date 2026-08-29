@@ -172,3 +172,60 @@ void main(uint3 id: SV_DispatchThreadID) { values[id.x] += 1; }
     }
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn concurrent_metallib_compiles_isolate_temporary_outputs() {
+    if shader_slang::GlobalSession::new().is_none() {
+        return;
+    }
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root =
+        std::env::temp_dir().join(format!("ez-gfx-concurrent-{}-{unique}", std::process::id()));
+    let output = root.join("out");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = root.join("shader.slang");
+    std::fs::write(
+        &source,
+        r#"[shader("compute")]
+[numthreads(1,1,1)]
+void main(uint3 id: SV_DispatchThreadID) {}
+"#,
+    )
+    .unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let threads = (0..2)
+        .map(|_| {
+            let source = source.clone();
+            let output = output.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let request = CompilationRequest::new(
+                    source,
+                    output,
+                    vec![
+                        TargetRequest::new(Target::Spirv, Stage::Compute, "main", "spirv_1_5")
+                            .unwrap(),
+                        TargetRequest::new(Target::Dxil, Stage::Compute, "main", "sm_6_5").unwrap(),
+                        TargetRequest::new(Target::Metallib, Stage::Compute, "main", "metal_3_0")
+                            .unwrap(),
+                    ],
+                );
+                barrier.wait();
+                ez_gfx_compiler::compile(&CompilerConfig::new(""), &request)
+                    .unwrap()
+                    .execution_digest()
+            })
+        })
+        .collect::<Vec<_>>();
+    let digests = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(digests[0], digests[1]);
+    assert_eq!(std::fs::read_dir(&output).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(root);
+}

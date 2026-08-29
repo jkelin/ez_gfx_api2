@@ -68,10 +68,10 @@ impl Region {
             || height == 0
             || x.checked_add(width).ok_or(AssetError::Overflow)? > tw
             || y.checked_add(height).ok_or(AssetError::Overflow)? > th
-            || x % 4 != 0
-            || y % 4 != 0
-            || (width % 4 != 0 && x + width != tw)
-            || (height % 4 != 0 && y + height != th)
+            || !x.is_multiple_of(4)
+            || !y.is_multiple_of(4)
+            || (!width.is_multiple_of(4) && x + width != tw)
+            || (!height.is_multiple_of(4) && y + height != th)
         {
             return Err(AssetError::InvalidRegion);
         }

@@ -243,7 +243,17 @@ pub extern "C" fn ez_gfx_texture_load(
             return EzGfxResult::InvalidArgument;
         }
         let desc = unsafe { desc.read() };
-        if desc.generate_mips > 1 {
+        if desc.generate_mips > 1
+            || desc.destination_format != 0
+            || desc.min_filter > 1
+            || desc.mag_filter > 1
+            || desc.address_mode_u > 1
+            || desc.address_mode_v > 1
+            || desc.address_mode_w > 1
+            || !desc.max_anisotropy.is_finite()
+            || !(1.0..=16.0).contains(&desc.max_anisotropy)
+            || (!desc.debug_label.is_null() && read_c_string(desc.debug_label).is_err())
+        {
             return EzGfxResult::InvalidArgument;
         }
         let source = match desc.source_format {
@@ -263,7 +273,28 @@ pub extern "C" fn ez_gfx_texture_load(
             _ => return EzGfxResult::InvalidArgument,
         };
         let bytes = unsafe { core::slice::from_raw_parts(data, data_size) };
-        match state::load_texture(context, source, bytes, desc.generate_mips != 0) {
+        let filter = |value| match value {
+            0 => ez_gfx_hal::SamplerFilter::Nearest,
+            _ => ez_gfx_hal::SamplerFilter::Linear,
+        };
+        let address = |value| match value {
+            0 => ez_gfx_hal::SamplerAddressMode::Clamp,
+            _ => ez_gfx_hal::SamplerAddressMode::Repeat,
+        };
+        let config = state::TextureConfig {
+            width: desc.width,
+            height: desc.height,
+            mip_count: desc.mip_count,
+            sampler: ez_gfx_hal::TextureSamplerDesc {
+                min_filter: filter(desc.min_filter),
+                mag_filter: filter(desc.mag_filter),
+                max_anisotropy: desc.max_anisotropy,
+                address_u: address(desc.address_mode_u),
+                address_v: address(desc.address_mode_v),
+                address_w: address(desc.address_mode_w),
+            },
+        };
+        match state::load_texture(context, source, bytes, desc.generate_mips != 0, config) {
             Ok(texture) => {
                 unsafe { out_texture.write(texture.get()) };
                 EzGfxResult::Ok
@@ -409,7 +440,7 @@ pub extern "C" fn ez_gfx_render_add_vertex_pipeline(
         if binding_count > 16
             || binding_count != 0 && bindings.is_null()
             || push_constant_size > 128
-            || push_constant_size % 4 != 0
+            || !push_constant_size.is_multiple_of(4)
             || push_constant_size != 0 && push_constants.is_null()
         {
             return EzGfxResult::InvalidArgument;
@@ -465,7 +496,7 @@ pub extern "C" fn ez_gfx_render_add_compute_pipeline(
         if binding_count > 16
             || binding_count != 0 && bindings.is_null()
             || push_constant_size > 128
-            || push_constant_size % 4 != 0
+            || !push_constant_size.is_multiple_of(4)
             || push_constant_size != 0 && push_constants.is_null()
         {
             return EzGfxResult::InvalidArgument;

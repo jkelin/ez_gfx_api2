@@ -1,22 +1,24 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use ez_gfx_core::Backend;
+use ez_gfx_core::{Backend, capability::MAX_BINDLESS_SAMPLED_TEXTURES};
 
 pub const BACKEND: Backend = Backend::Metal;
 pub const SUPPORTED_ON_TARGET: bool = cfg!(target_vendor = "apple");
+pub const TEXTURE_DESCRIPTOR_CAPACITY: u32 = MAX_BINDLESS_SAMPLED_TEXTURES;
 
 #[cfg(target_vendor = "apple")]
 pub mod native {
     use core::ffi::c_void;
 
-    use crate::BACKEND;
+    use crate::{BACKEND, TEXTURE_DESCRIPTOR_CAPACITY};
     use ez_gfx_core::capability::{
         AdapterCapabilities, AdapterClass, AdapterInfo, CompressionSupport, SemanticProfile,
     };
     use ez_gfx_hal::{
         AllocationError, AllocationRequest, BlendMode, BufferTransfer, CompletionToken, CullMode,
         DynamicPipelineState, FrontFace, HalError, ImageMip, MemoryAllocator, MemoryClass,
-        PrimitiveTopology, QueueKind, validate_rgba8_mips,
+        PrimitiveTopology, QueueKind, SamplerAddressMode, SamplerFilter, ShaderTextureHeapLayout,
+        TextureSamplerDesc, validate_rgba8_mips,
     };
     use gpu_allocator::{
         MemoryLocation,
@@ -25,12 +27,16 @@ pub mod native {
     use objc2::{rc::Retained, runtime::ProtocolObject};
     use objc2_foundation::NSString;
     use objc2_metal::{
-        MTLArgumentBuffersTier, MTLBlendFactor, MTLBlitCommandEncoder, MTLBuffer, MTLClearColor,
-        MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-        MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLCullMode, MTLDevice, MTLHeap,
-        MTLIndexType, MTLLibrary, MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType,
-        MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineDescriptor, MTLSize,
-        MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLWinding,
+        MTLArgumentBuffersTier, MTLArgumentEncoder, MTLBlendFactor, MTLBlitCommandEncoder,
+        MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
+        MTLCommandQueue, MTLCompareFunction, MTLComputeCommandEncoder, MTLComputePipelineState,
+        MTLCreateSystemDefaultDevice, MTLCullMode, MTLDepthStencilDescriptor, MTLDevice,
+        MTLFunction, MTLHeap, MTLIndexType, MTLLibrary, MTLLoadAction, MTLOrigin, MTLPixelFormat,
+        MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
+        MTLRenderPipelineDescriptor, MTLRenderStages, MTLResource, MTLResourceOptions,
+        MTLResourceUsage, MTLSamplerAddressMode, MTLSamplerDescriptor, MTLSamplerMinMagFilter,
+        MTLSamplerState, MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor,
+        MTLTextureUsage, MTLWinding,
     };
     use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
@@ -51,12 +57,19 @@ pub mod native {
     pub struct NativeTexture {
         texture: Retained<ProtocolObject<dyn MTLTexture>>,
         allocation: Allocation,
+        sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
         pub binding: u32,
     }
 
     pub struct NativePipeline {
         state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     }
+
+    // SAFETY: Metal resources and immutable libraries support cross-thread use. Higher layers
+    // serialize mutation and destruction, so these owners are never accessed concurrently.
+    unsafe impl Send for NativeAllocation {}
+    unsafe impl Send for NativeShader {}
+    unsafe impl Send for NativeTexture {}
 
     struct RetiredAllocation {
         allocation: NativeAllocation,
@@ -65,16 +78,28 @@ pub mod native {
 
     pub struct NativeSurface {
         layer: usize,
+        presented_rgba8: Vec<u8>,
     }
     impl NativeSurface {
         /// The CAMetalLayer pointer is borrowed; this crate never releases the host's layer.
-        pub fn new(layer: *mut c_void) -> Result<Self, HalError> {
+        pub fn new(layer: *mut c_void, capture_presented: bool) -> Result<Self, HalError> {
             if layer.is_null() {
                 return Err(HalError::InvalidArgument);
             }
+            // Capture needs shader-readable drawable textures; set this before nextDrawable.
+            if capture_presented {
+                let layer = unsafe { &*(layer as *const CAMetalLayer) };
+                layer.setFramebufferOnly(false);
+            }
             Ok(Self {
                 layer: layer as usize,
+                presented_rgba8: Vec::new(),
             })
+        }
+
+        /// Empty before the first cached presentation; successful captures replace the full frame.
+        pub fn presented_rgba8(&self) -> &[u8] {
+            &self.presented_rgba8
         }
     }
 
@@ -88,21 +113,30 @@ pub mod native {
         completed_transfer_value: u64,
     }
 
+    // SAFETY: Metal devices and command queues support cross-thread use. Higher layers serialize
+    // context mutation and enforce frame-recording thread affinity.
+    unsafe impl Send for NativeContext {}
+
     impl NativeContext {
         pub fn create_default() -> Result<Self, HalError> {
             let device = MTLCreateSystemDefaultDevice().ok_or(HalError::Unsupported)?;
             let queue = device.newCommandQueue().ok_or(HalError::NativeFailure)?;
             let tier_two = device.argumentBuffersSupport() == MTLArgumentBuffersTier::Tier2;
+            let sampler_capacity =
+                u32::try_from(device.maxArgumentBufferSamplerCount()).unwrap_or(u32::MAX);
             let compression = if device.supportsBCTextureCompression() {
                 CompressionSupport::BC
             } else {
                 CompressionSupport::ASTC
             };
             let capabilities = AdapterCapabilities {
-                bindless_sampled_textures: if tier_two { 4096 } else { 0 },
+                bindless_sampled_textures: if tier_two {
+                    TEXTURE_DESCRIPTOR_CAPACITY.min(sampler_capacity)
+                } else {
+                    0
+                },
                 bindless_storage_resources: if tier_two { 1024 } else { 0 },
-                bindless_samplers: u32::try_from(device.maxArgumentBufferSamplerCount())
-                    .unwrap_or(u32::MAX),
+                bindless_samplers: sampler_capacity,
                 max_indirect_draw_count: u32::MAX,
                 shader_model: 0x0605,
                 timeline_synchronization: true,
@@ -247,10 +281,9 @@ pub mod native {
             }
             if let Some(bytes) =
                 core::ptr::NonNull::new(push_constants.as_ptr() as *mut core::ffi::c_void)
+                && !push_constants.is_empty()
             {
-                if !push_constants.is_empty() {
-                    unsafe { encoder.setBytes_length_atIndex(bytes, push_constants.len(), 0) };
-                }
+                unsafe { encoder.setBytes_length_atIndex(bytes, push_constants.len(), 0) };
             }
             encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
@@ -267,6 +300,9 @@ pub mod native {
             encoder.endEncoding();
             command.commit();
             command.waitUntilCompleted();
+            if command.status() != MTLCommandBufferStatus::Completed || command.error().is_some() {
+                return Err(HalError::NativeFailure);
+            }
             Ok(())
         }
         /// Creates an RGBA8 mip chain and publishes one completion value per uploaded level.
@@ -285,11 +321,14 @@ pub mod native {
         }
 
         /// Compiles an exact metallib graphics pair, executes indexed-indirect draws, and presents the drawable.
+        #[allow(clippy::too_many_arguments)]
         pub fn draw_indexed_shader(
-            &self,
-            surface: &NativeSurface,
+            &mut self,
+            surface: &mut NativeSurface,
             shader: &NativeShader,
             graphics: &(usize, String, usize, String),
+            depth_required: bool,
+            texture_heap: Option<ShaderTextureHeapLayout>,
             state: DynamicPipelineState,
             index: &NativeAllocation,
             indirect: &NativeAllocation,
@@ -297,12 +336,14 @@ pub mod native {
             push_constants: &[u8],
             extent: (u32, u32),
             bindings: &[NativeBufferBinding<'_>],
+            textures: &[&NativeTexture],
+            capture_presented: bool,
         ) -> Result<(), HalError> {
             if draw_count == 0
                 || extent.0 == 0
                 || extent.1 == 0
                 || push_constants.len() > 128
-                || push_constants.len() % 4 != 0
+                || !push_constants.len().is_multiple_of(4)
             {
                 return Err(HalError::InvalidArgument);
             }
@@ -332,6 +373,10 @@ pub mod native {
             descriptor.setFragmentFunction(Some(&fragment));
             let color = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
             color.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+            let depth_enabled = depth_required;
+            if depth_enabled {
+                descriptor.setDepthAttachmentPixelFormat(MTLPixelFormat::Depth32Float);
+            }
             if state.blend == BlendMode::Alpha {
                 color.setBlendingEnabled(true);
                 color.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
@@ -349,25 +394,70 @@ pub mod native {
                 PrimitiveTopology::TriangleStrip => MTLPrimitiveType::TriangleStrip,
                 PrimitiveTopology::TriangleFan => return Err(HalError::Unsupported),
             };
+            // SAFETY: the host owns this live CAMetalLayer until surface destruction completes.
             let layer = unsafe { &*(surface.layer as *const CAMetalLayer) };
             layer.setDevice(Some(&self.device));
+            layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
             let drawable = layer.nextDrawable().ok_or(HalError::NotReady)?;
+            let drawable_texture = drawable.texture();
+            // Drawable size can diverge from the logical surface after a scale/resize.
+            if drawable_texture.width() != extent.0 as usize
+                || drawable_texture.height() != extent.1 as usize
+            {
+                return Err(HalError::NotReady);
+            }
+            let depth = if depth_enabled {
+                let depth_descriptor = unsafe {
+                    MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                        MTLPixelFormat::Depth32Float,
+                        extent.0 as usize,
+                        extent.1 as usize,
+                        false,
+                    )
+                };
+                depth_descriptor.setStorageMode(MTLStorageMode::Private);
+                depth_descriptor.setUsage(MTLTextureUsage::RenderTarget);
+                let texture = self
+                    .device
+                    .newTextureWithDescriptor(&depth_descriptor)
+                    .ok_or(HalError::NativeFailure)?;
+                let descriptor = MTLDepthStencilDescriptor::new();
+                descriptor.setDepthCompareFunction(MTLCompareFunction::Less);
+                descriptor.setDepthWriteEnabled(true);
+                let state = self
+                    .device
+                    .newDepthStencilStateWithDescriptor(&descriptor)
+                    .ok_or(HalError::NativeFailure)?;
+                Some((texture, state))
+            } else {
+                None
+            };
             let pass = MTLRenderPassDescriptor::renderPassDescriptor();
             let attachment = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
-            attachment.setTexture(Some(&drawable.texture()));
+            attachment.setTexture(Some(&drawable_texture));
             attachment.setLoadAction(MTLLoadAction::Clear);
             attachment.setStoreAction(MTLStoreAction::Store);
             attachment.setClearColor(MTLClearColor {
-                red: 0.0,
-                green: 0.0,
-                blue: 0.0,
+                red: 0.1,
+                green: 0.1,
+                blue: 0.1,
                 alpha: 1.0,
             });
+            if let Some((depth_texture, _)) = depth.as_ref() {
+                let depth_attachment = pass.depthAttachment();
+                depth_attachment.setTexture(Some(depth_texture));
+                depth_attachment.setLoadAction(MTLLoadAction::Clear);
+                depth_attachment.setStoreAction(MTLStoreAction::DontCare);
+                depth_attachment.setClearDepth(1.0);
+            }
             let command = self.queue.commandBuffer().ok_or(HalError::NativeFailure)?;
             let encoder = command
                 .renderCommandEncoderWithDescriptor(&pass)
                 .ok_or(HalError::NativeFailure)?;
             encoder.setRenderPipelineState(&pipeline);
+            if let Some((_, depth_state)) = depth.as_ref() {
+                encoder.setDepthStencilState(Some(depth_state));
+            }
             encoder.setCullMode(match state.cull {
                 CullMode::None => MTLCullMode::None,
                 CullMode::Front => MTLCullMode::Front,
@@ -394,12 +484,56 @@ pub mod native {
                     );
                 }
             }
-            if let Some(bytes) = core::ptr::NonNull::new(push_constants.as_ptr() as *mut c_void) {
-                if !push_constants.is_empty() {
-                    unsafe {
-                        encoder.setVertexBytes_length_atIndex(bytes, push_constants.len(), 0);
-                        encoder.setFragmentBytes_length_atIndex(bytes, push_constants.len(), 0);
+            let _argument_buffer = if let Some(heap) = texture_heap {
+                let argument_encoder =
+                    unsafe { fragment.newArgumentEncoderWithBufferIndex(heap.binding as usize) };
+                let buffer = self
+                    .device
+                    .newBufferWithLength_options(
+                        argument_encoder.encodedLength(),
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or(HalError::NativeFailure)?;
+                unsafe { argument_encoder.setArgumentBuffer_offset(Some(&buffer), 0) };
+                for texture in textures {
+                    if texture.binding >= heap.capacity {
+                        return Err(HalError::InvalidArgument);
                     }
+                    let texture_index = texture.binding as usize * heap.argument_stride as usize
+                        + heap.texture_argument_offset as usize;
+                    let sampler_index = texture.binding as usize * heap.argument_stride as usize
+                        + heap.sampler_argument_offset as usize;
+                    unsafe {
+                        argument_encoder.setTexture_atIndex(Some(&texture.texture), texture_index);
+                        argument_encoder
+                            .setSamplerState_atIndex(Some(&texture.sampler), sampler_index);
+                        let resource = <ProtocolObject<dyn MTLTexture> as AsRef<
+                            ProtocolObject<dyn MTLResource>,
+                        >>::as_ref(&*texture.texture);
+                        encoder.useResource_usage_stages(
+                            resource,
+                            MTLResourceUsage::Read,
+                            MTLRenderStages::Fragment,
+                        );
+                    }
+                }
+                unsafe {
+                    encoder.setFragmentBuffer_offset_atIndex(
+                        Some(&buffer),
+                        0,
+                        heap.binding as usize,
+                    )
+                };
+                Some(buffer)
+            } else {
+                None
+            };
+            if let Some(bytes) = core::ptr::NonNull::new(push_constants.as_ptr() as *mut c_void)
+                && !push_constants.is_empty()
+            {
+                unsafe {
+                    encoder.setVertexBytes_length_atIndex(bytes, push_constants.len(), 0);
+                    encoder.setFragmentBytes_length_atIndex(bytes, push_constants.len(), 0);
                 }
             }
             for command_index in 0..draw_count {
@@ -408,12 +542,122 @@ pub mod native {
                 };
             }
             encoder.endEncoding();
+
+            let mut capture = if capture_presented {
+                // Metal texture-to-buffer copies require 256-byte rows; every product is checked.
+                let tight_row = u64::from(extent.0)
+                    .checked_mul(4)
+                    .ok_or(HalError::InvalidArgument)?;
+                let row_stride = tight_row
+                    .checked_add(255)
+                    .map(|value| value & !255)
+                    .ok_or(HalError::InvalidArgument)?;
+                let size = row_stride
+                    .checked_mul(u64::from(extent.1))
+                    .ok_or(HalError::InvalidArgument)?;
+                let allocation = self
+                    .allocate(
+                        AllocationRequest::new(size, 256, MemoryClass::Readback, true, None)
+                            .map_err(|_| HalError::InvalidArgument)?,
+                    )
+                    .map_err(|_| HalError::NativeFailure)?;
+                Some((allocation, tight_row, row_stride, size))
+            } else {
+                None
+            };
+            if let Some((readback, _, row_stride, size)) = capture.as_ref() {
+                let Some(blit) = command.blitCommandEncoder() else {
+                    let (readback, _, _, _) = capture.take().expect("capture exists");
+                    self.free(readback).map_err(|_| HalError::NativeFailure)?;
+                    return Err(HalError::NativeFailure);
+                };
+                unsafe {
+                    blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+                        &drawable_texture,
+                        0,
+                        0,
+                        MTLOrigin { x: 0, y: 0, z: 0 },
+                        MTLSize {
+                            width: extent.0 as usize,
+                            height: extent.1 as usize,
+                            depth: 1,
+                        },
+                        &readback.buffer,
+                        0,
+                        *row_stride as usize,
+                        *size as usize,
+                    );
+                    blit.endEncoding();
+                }
+            }
+
             let drawable_ref = <ProtocolObject<dyn CAMetalDrawable> as AsRef<
                 ProtocolObject<dyn objc2_metal::MTLDrawable>,
             >>::as_ref(&*drawable);
             command.presentDrawable(drawable_ref);
             command.commit();
             command.waitUntilCompleted();
+            if command.status() != MTLCommandBufferStatus::Completed || command.error().is_some() {
+                if let Some((readback, _, _, _)) = capture {
+                    self.free(readback).map_err(|_| HalError::NativeFailure)?;
+                }
+                return Err(HalError::NativeFailure);
+            }
+
+            if let Some((mut readback, tight_row, row_stride, size)) = capture {
+                if self.invalidate(&mut readback, 0, size).is_err() {
+                    self.free(readback).map_err(|_| HalError::NativeFailure)?;
+                    return Err(HalError::NativeFailure);
+                }
+                // Checked arithmetic and row slicing keep malformed extents from panicking.
+                let packed_size = match tight_row
+                    .checked_mul(u64::from(extent.1))
+                    .and_then(|value| usize::try_from(value).ok())
+                {
+                    Some(value) => value,
+                    None => {
+                        self.free(readback).map_err(|_| HalError::NativeFailure)?;
+                        return Err(HalError::InvalidArgument);
+                    }
+                };
+                let source = match self.mapped_slice(&readback) {
+                    Ok(source) => source,
+                    Err(_) => {
+                        self.free(readback).map_err(|_| HalError::NativeFailure)?;
+                        return Err(HalError::NativeFailure);
+                    }
+                };
+                let mut packed = Vec::with_capacity(packed_size);
+                for row in 0..extent.1 as usize {
+                    let start = match row.checked_mul(row_stride as usize) {
+                        Some(value) => value,
+                        None => {
+                            self.free(readback).map_err(|_| HalError::NativeFailure)?;
+                            return Err(HalError::InvalidArgument);
+                        }
+                    };
+                    let end = match start.checked_add(tight_row as usize) {
+                        Some(value) => value,
+                        None => {
+                            self.free(readback).map_err(|_| HalError::NativeFailure)?;
+                            return Err(HalError::InvalidArgument);
+                        }
+                    };
+                    let row = match source.get(start..end) {
+                        Some(row) => row,
+                        None => {
+                            self.free(readback).map_err(|_| HalError::NativeFailure)?;
+                            return Err(HalError::NativeFailure);
+                        }
+                    };
+                    packed.extend_from_slice(row);
+                }
+                for pixel in packed.chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
+                }
+                self.free(readback).map_err(|_| HalError::NativeFailure)?;
+                surface.presented_rgba8 = packed;
+            }
             Ok(())
         }
 
@@ -421,9 +665,10 @@ pub mod native {
             &mut self,
             mips: &[ImageMip<'_>],
             binding: u32,
+            sampler_desc: TextureSamplerDesc,
         ) -> Result<(NativeTexture, Vec<CompletionToken>), AllocationError> {
             validate_rgba8_mips(mips).map_err(|_| AllocationError::ZeroSize)?;
-            if binding >= 4096 {
+            if binding >= TEXTURE_DESCRIPTOR_CAPACITY {
                 return Err(AllocationError::ZeroSize);
             }
             let width = mips[0].width;
@@ -438,6 +683,8 @@ pub mod native {
                 )
             };
             unsafe { desc.setMipmapLevelCount(mips.len()) };
+            desc.setUsage(MTLTextureUsage::ShaderRead);
+            desc.setStorageMode(MTLStorageMode::Private);
             let allocation_desc =
                 AllocationCreateDesc::texture(&self.device, "ez-gfx-texture", &desc);
             let allocation = self
@@ -446,52 +693,109 @@ pub mod native {
                 .ok_or(AllocationError::NativeFailure)?
                 .allocate(&allocation_desc)
                 .map_err(map_allocator)?;
-            let texture = unsafe {
+            let texture = match unsafe {
                 allocation
                     .heap()
                     .newTextureWithDescriptor_offset(&desc, allocation.offset() as usize)
-            }
-            .ok_or(AllocationError::OutOfMemory)?;
-            let mut completions = Vec::with_capacity(mips.len());
-            for (level, mip) in mips.iter().enumerate() {
-                let size = mip.bytes.len() as u64;
-                let mut upload = self.allocate(
-                    AllocationRequest::new(size, 4, MemoryClass::Upload, true, None)
-                        .map_err(|_| AllocationError::ZeroSize)?,
-                )?;
-                self.mapped_slice_mut(&mut upload)?[..mip.bytes.len()].copy_from_slice(mip.bytes);
-                self.flush(&mut upload, 0, size)?;
-                let command = self
-                    .queue
-                    .commandBuffer()
-                    .ok_or(AllocationError::NativeFailure)?;
-                let blit = command
-                    .blitCommandEncoder()
-                    .ok_or(AllocationError::NativeFailure)?;
-                unsafe {
-                    blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(&upload.buffer, 0, mip.width as usize * 4, size as usize, MTLSize { width: mip.width as usize, height: mip.height as usize, depth: 1 }, &texture, 0, level, MTLOrigin { x: 0, y: 0, z: 0 });
-                    blit.endEncoding();
+            } {
+                Some(texture) => texture,
+                None => {
+                    self.allocator
+                        .as_mut()
+                        .ok_or(AllocationError::NativeFailure)?
+                        .free(&allocation)
+                        .map_err(map_allocator)?;
+                    return Err(AllocationError::OutOfMemory);
                 }
-                command.commit();
-                let value = self.next_transfer_value;
-                self.next_transfer_value =
-                    value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
-                command.waitUntilCompleted();
-                self.completed_transfer_value = value;
-                completions.push(
-                    CompletionToken::new(QueueKind::Transfer, value)
-                        .map_err(|_| AllocationError::NativeFailure)?,
-                );
-                self.free(upload)?;
+            };
+            let uploaded = (|| {
+                let sampler_descriptor = MTLSamplerDescriptor::new();
+                sampler_descriptor.setMinFilter(match sampler_desc.min_filter {
+                    SamplerFilter::Nearest => MTLSamplerMinMagFilter::Nearest,
+                    SamplerFilter::Linear => MTLSamplerMinMagFilter::Linear,
+                });
+                sampler_descriptor.setMagFilter(match sampler_desc.mag_filter {
+                    SamplerFilter::Nearest => MTLSamplerMinMagFilter::Nearest,
+                    SamplerFilter::Linear => MTLSamplerMinMagFilter::Linear,
+                });
+                let address = |mode| match mode {
+                    SamplerAddressMode::Clamp => MTLSamplerAddressMode::ClampToEdge,
+                    SamplerAddressMode::Repeat => MTLSamplerAddressMode::Repeat,
+                };
+                sampler_descriptor.setSAddressMode(address(sampler_desc.address_u));
+                sampler_descriptor.setTAddressMode(address(sampler_desc.address_v));
+                sampler_descriptor.setRAddressMode(address(sampler_desc.address_w));
+                sampler_descriptor.setMaxAnisotropy(sampler_desc.max_anisotropy as usize);
+                sampler_descriptor.setSupportArgumentBuffers(true);
+                let sampler = self
+                    .device
+                    .newSamplerStateWithDescriptor(&sampler_descriptor)
+                    .ok_or(AllocationError::NativeFailure)?;
+                let mut completions = Vec::with_capacity(mips.len());
+                for (level, mip) in mips.iter().enumerate() {
+                    let size = mip.bytes.len() as u64;
+                    let mut upload = self.allocate(
+                        AllocationRequest::new(size, 4, MemoryClass::Upload, true, None)
+                            .map_err(|_| AllocationError::ZeroSize)?,
+                    )?;
+                    let submitted = (|| {
+                        self.mapped_slice_mut(&mut upload)?[..mip.bytes.len()]
+                            .copy_from_slice(mip.bytes);
+                        self.flush(&mut upload, 0, size)?;
+                        let command = self
+                            .queue
+                            .commandBuffer()
+                            .ok_or(AllocationError::NativeFailure)?;
+                        let blit = command
+                            .blitCommandEncoder()
+                            .ok_or(AllocationError::NativeFailure)?;
+                        unsafe {
+                            blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(&upload.buffer, 0, mip.width as usize * 4, size as usize, MTLSize { width: mip.width as usize, height: mip.height as usize, depth: 1 }, &texture, 0, level, MTLOrigin { x: 0, y: 0, z: 0 });
+                            blit.endEncoding();
+                        }
+                        command.commit();
+                        let value = self.next_transfer_value;
+                        self.next_transfer_value =
+                            value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
+                        command.waitUntilCompleted();
+                        if command.status() != MTLCommandBufferStatus::Completed
+                            || command.error().is_some()
+                        {
+                            return Err(AllocationError::NativeFailure);
+                        }
+                        self.completed_transfer_value = value;
+                        CompletionToken::new(QueueKind::Transfer, value)
+                            .map_err(|_| AllocationError::NativeFailure)
+                    })();
+                    let freed = self.free(upload);
+                    let completion = match (submitted, freed) {
+                        (Ok(completion), Ok(())) => completion,
+                        (Err(error), _) | (_, Err(error)) => return Err(error),
+                    };
+                    completions.push(completion);
+                }
+                Ok((sampler, completions))
+            })();
+            match uploaded {
+                Ok((sampler, completions)) => Ok((
+                    NativeTexture {
+                        texture,
+                        allocation,
+                        sampler,
+                        binding,
+                    },
+                    completions,
+                )),
+                Err(error) => {
+                    drop(texture);
+                    self.allocator
+                        .as_mut()
+                        .ok_or(AllocationError::NativeFailure)?
+                        .free(&allocation)
+                        .map_err(map_allocator)?;
+                    Err(error)
+                }
             }
-            Ok((
-                NativeTexture {
-                    texture,
-                    allocation,
-                    binding,
-                },
-                completions,
-            ))
         }
 
         /// Copies a private RGBA8 texture into shared CPU-visible storage and returns packed rows.
@@ -512,23 +816,32 @@ pub mod native {
                 AllocationRequest::new(size, 4, MemoryClass::Readback, true, None)
                     .map_err(|_| AllocationError::ZeroSize)?,
             )?;
-            let command = self
-                .queue
-                .commandBuffer()
-                .ok_or(AllocationError::NativeFailure)?;
-            let blit = command
-                .blitCommandEncoder()
-                .ok_or(AllocationError::NativeFailure)?;
-            unsafe {
-                blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(&texture.texture, 0, 0, MTLOrigin { x: 0, y: 0, z: 0 }, MTLSize { width: width as usize, height: height as usize, depth: 1 }, &readback.buffer, 0, width as usize * 4, size as usize);
-                blit.endEncoding();
+            let result = (|| {
+                let command = self
+                    .queue
+                    .commandBuffer()
+                    .ok_or(AllocationError::NativeFailure)?;
+                let blit = command
+                    .blitCommandEncoder()
+                    .ok_or(AllocationError::NativeFailure)?;
+                unsafe {
+                    blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(&texture.texture, 0, 0, MTLOrigin { x: 0, y: 0, z: 0 }, MTLSize { width: width as usize, height: height as usize, depth: 1 }, &readback.buffer, 0, width as usize * 4, size as usize);
+                    blit.endEncoding();
+                }
+                command.commit();
+                command.waitUntilCompleted();
+                if command.status() != MTLCommandBufferStatus::Completed
+                    || command.error().is_some()
+                {
+                    return Err(AllocationError::NativeFailure);
+                }
+                self.invalidate(&mut readback, 0, size)?;
+                Ok(self.mapped_slice(&readback)?[..size as usize].to_vec())
+            })();
+            match (result, self.free(readback)) {
+                (Ok(pixels), Ok(())) => Ok(pixels),
+                (Err(error), _) | (_, Err(error)) => Err(error),
             }
-            command.commit();
-            command.waitUntilCompleted();
-            self.invalidate(&mut readback, 0, size)?;
-            let pixels = self.mapped_slice(&readback)?[..size as usize].to_vec();
-            self.free(readback)?;
-            Ok(pixels)
         }
 
         /// Acquires and presents one drawable from the borrowed CAMetalLayer; zero extent is minimized.
