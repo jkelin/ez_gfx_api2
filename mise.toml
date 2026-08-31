@@ -2,6 +2,10 @@
 description = "Check the Rust workspace"
 run = "cargo check --workspace"
 
+[tasks.lint]
+description = "Run strict Clippy checks across the workspace"
+run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
+
 [tasks.test]
 description = "Run the workspace test suite"
 run = "cargo test --workspace"

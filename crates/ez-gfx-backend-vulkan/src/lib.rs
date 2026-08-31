@@ -2998,12 +2998,32 @@ impl BufferTransfer for NativeContext {
 fn vulkan_state(
     state: ResourceState,
 ) -> (vk::PipelineStageFlags, vk::AccessFlags, vk::ImageLayout) {
-    let stage = match state.stage {
+    let shader_stage = match state.stage {
         ShaderStage::None => vk::PipelineStageFlags::ALL_COMMANDS,
         ShaderStage::Vertex => vk::PipelineStageFlags::VERTEX_SHADER,
         ShaderStage::Fragment => vk::PipelineStageFlags::FRAGMENT_SHADER,
         ShaderStage::Compute => vk::PipelineStageFlags::COMPUTE_SHADER,
         ShaderStage::AllGraphics => vk::PipelineStageFlags::ALL_GRAPHICS,
+    };
+    let stage = match state.access {
+        ResourceAccess::IndexRead => vk::PipelineStageFlags::VERTEX_INPUT,
+        ResourceAccess::IndirectRead => vk::PipelineStageFlags::DRAW_INDIRECT,
+        ResourceAccess::IndirectStorageRead | ResourceAccess::IndirectStorageReadWrite => {
+            vk::PipelineStageFlags::DRAW_INDIRECT | shader_stage
+        }
+        ResourceAccess::ColorAttachmentWrite => vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        ResourceAccess::DepthStencilRead | ResourceAccess::DepthStencilWrite => {
+            vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
+        }
+        ResourceAccess::TransferRead | ResourceAccess::TransferWrite => {
+            vk::PipelineStageFlags::TRANSFER
+        }
+        ResourceAccess::Present => vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+        ResourceAccess::SampledRead
+        | ResourceAccess::StorageRead
+        | ResourceAccess::StorageWrite
+        | ResourceAccess::StorageReadWrite => shader_stage,
     };
     let (access, layout) = match state.access {
         ResourceAccess::SampledRead => (
@@ -3187,6 +3207,45 @@ mod tests {
         assert_eq!(paired_texture_capacity(&limits), 1024);
         limits.max_per_stage_update_after_bind_resources = 2046;
         assert_eq!(paired_texture_capacity(&limits), 1023);
+    }
+    #[test]
+    fn resource_access_selects_compatible_pipeline_stages() {
+        let cases = [
+            (
+                ResourceAccess::IndexRead,
+                vk::PipelineStageFlags::VERTEX_INPUT,
+            ),
+            (
+                ResourceAccess::IndirectRead,
+                vk::PipelineStageFlags::DRAW_INDIRECT,
+            ),
+            (
+                ResourceAccess::ColorAttachmentWrite,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            ),
+            (
+                ResourceAccess::DepthStencilWrite,
+                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+            ),
+            (
+                ResourceAccess::TransferRead,
+                vk::PipelineStageFlags::TRANSFER,
+            ),
+            (
+                ResourceAccess::Present,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            ),
+        ];
+
+        for (access, expected) in cases {
+            let (stage, _, _) = vulkan_state(ResourceState {
+                queue: QueueKind::Graphics,
+                stage: ShaderStage::Fragment,
+                access,
+            });
+            assert_eq!(stage, expected, "{access:?}");
+        }
     }
 
     #[test]

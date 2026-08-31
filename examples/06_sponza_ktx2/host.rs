@@ -63,6 +63,8 @@ impl HostSurface {
     }
 
     pub fn resize(&self, width: u32, height: u32) {
+        #[cfg(not(target_vendor = "apple"))]
+        let _ = (width, height);
         #[cfg(target_vendor = "apple")]
         self.metal_layer
             .setDrawableSize(objc2_core_foundation::CGSize {

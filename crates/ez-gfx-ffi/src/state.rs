@@ -1989,6 +1989,12 @@ fn execute_vulkan_frame_plan(
     let mut pipelines: Vec<Option<ez_gfx_backend_vulkan::NativePipeline>> =
         (0..payloads.len()).map(|_| None).collect();
     let execution = (|| -> Result<Vec<Vec<u8>>, EzGfxResult> {
+        if let Some(surface) = native_surface.as_deref() {
+            native
+                .prepare_surface(surface, extent.0, extent.1)
+                .map_err(map_hal)?;
+        }
+
         for (node_index, payload) in payloads.iter().enumerate() {
             let pipeline = match payload {
                 ExecutableNode::Compute { shader, layout, .. } => {

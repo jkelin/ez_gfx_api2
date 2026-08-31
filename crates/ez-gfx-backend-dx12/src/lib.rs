@@ -94,8 +94,8 @@ pub mod native {
                 },
                 Dxgi::{
                     Common::{
-                        DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_UINT,
-                        DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+                        DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
+                        DXGI_FORMAT_R32_UINT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
                     },
                     CreateDXGIFactory1, DXGI_ADAPTER_FLAG3_SOFTWARE, DXGI_ERROR_NOT_FOUND,
                     DXGI_ERROR_UNSUPPORTED, DXGI_PRESENT, DXGI_SCALING_STRETCH,
@@ -648,7 +648,7 @@ pub mod native {
                     .free(allocation);
                 return Err(HalError::NativeFailure);
             };
-            let heap = match unsafe {
+            let heap: ID3D12DescriptorHeap = match unsafe {
                 self.device
                     .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                         Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
@@ -1784,7 +1784,7 @@ pub mod native {
                 }
             }
             if capture_presented && let Some(pixels) = outputs.last() {
-                surface.presented = pixels.clone();
+                surface.ok_or(HalError::InvalidArgument)?.presented = pixels.clone();
             }
             Ok(outputs)
         }

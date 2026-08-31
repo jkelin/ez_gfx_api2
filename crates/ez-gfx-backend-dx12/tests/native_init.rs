@@ -39,7 +39,7 @@ fn rejects_a_null_hwnd_before_swapchain_creation() {
 #[cfg(windows)]
 #[test]
 fn uploads_each_texture_mip_under_a_distinct_fence() {
-    use ez_gfx_hal::ImageMip;
+    use ez_gfx_hal::{ImageMip, SamplerAddressMode, SamplerFilter, TextureSamplerDesc};
 
     let mut context = ez_gfx_backend_dx12::native::NativeContext::create_default(false)
         .expect("a D3D12 feature-level 12.1 hardware adapter is required");
@@ -60,6 +60,14 @@ fn uploads_each_texture_mip_under_a_distinct_fence() {
                 },
             ],
             0,
+            TextureSamplerDesc {
+                min_filter: SamplerFilter::Nearest,
+                mag_filter: SamplerFilter::Nearest,
+                max_anisotropy: 1.0,
+                address_u: SamplerAddressMode::Clamp,
+                address_v: SamplerAddressMode::Clamp,
+                address_w: SamplerAddressMode::Clamp,
+            },
         )
         .unwrap();
     assert_eq!(completions.len(), 2);
