@@ -25,6 +25,21 @@ run = "cargo test -p ez-gfx-examples --test smoke"
 [tasks.example-1]
 run = "cargo run -p ez-gfx-examples --bin 01_triangle"
 
+[tasks.example-1-vulkan]
+description = "Run 01_triangle with Vulkan"
+env = { EZ_GFX_BACKEND = "vulkan", VK_LOADER_LAYERS_DISABLE = "~implicit~" }
+run = "cargo run -p ez-gfx-examples --bin 01_triangle"
+
+[tasks.example-1-dx12]
+description = "Run 01_triangle with DirectX 12"
+env = { EZ_GFX_BACKEND = "dx12" }
+run = "cargo run -p ez-gfx-examples --bin 01_triangle"
+
+[tasks.example-1-metal]
+description = "Run 01_triangle with Metal"
+env = { EZ_GFX_BACKEND = "metal" }
+run = "cargo run -p ez-gfx-examples --bin 01_triangle"
+
 [tasks.example-1-benchmark]
 description = "Benchmark 01_triangle frame throughput on the default backend"
 env = { EZ_GFX_BACKEND = "vulkan", EZ_GFX_EXAMPLE_BENCHMARK = "1", EZ_GFX_EXAMPLE_BENCHMARK_WARMUP = "120", EZ_GFX_EXAMPLE_BENCHMARK_FRAMES = "600", VK_LOADER_LAYERS_DISABLE = "~implicit~" }

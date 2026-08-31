@@ -447,24 +447,35 @@ pub fn init_device(context: u64, surface: u64) -> EzGfxResult {
             .surfaces
             .get(&surface)
             .ok_or(EzGfxResult::InvalidContext)?;
-        let result = match (&mut context.native, &record.native) {
+        let first_initialization = context.active_surface.is_none();
+        let adapter = match (&mut context.native, &record.native) {
             (NativeContext::Vulkan(native), NativeSurface::Vulkan(surface)) => {
-                native.init_device(Some(surface)).map(|_| ())
+                native.init_device(Some(surface))
             }
             #[cfg(windows)]
             (NativeContext::Dx12(native), NativeSurface::Dx12(surface)) => {
-                native.init_device(surface).map(|_| ())
+                native.init_device(surface)
             }
             #[cfg(target_vendor = "apple")]
             (NativeContext::Metal(native), NativeSurface::Metal(surface)) => {
-                native.init_device(surface).map(|_| ())
+                native.init_device(surface)
             }
             _ => Err(HalError::InvalidArgument),
-        };
-        if result.is_ok() {
-            context.active_surface = Some(surface);
         }
-        result.map_err(|error| map_native_loss(&context.identity, error))
+        .map_err(|error| map_native_loss(&context.identity, error))?;
+        context.active_surface = Some(surface);
+        if first_initialization {
+            let backend = match adapter.backend() {
+                Backend::Vulkan => "Vulkan",
+                Backend::Dx12 => "DirectX 12",
+                Backend::Metal => "Metal",
+            };
+            eprintln!(
+                "ez-gfx: initialized GPU `{}` with {backend}",
+                adapter.name()
+            );
+        }
+        Ok(())
     }))
 }
 
