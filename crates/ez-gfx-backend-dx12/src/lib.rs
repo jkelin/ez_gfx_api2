@@ -14,13 +14,14 @@ pub mod native {
     };
     use ez_gfx_hal::{
         AllocationError, AllocationRequest, AttachmentLoadOp, AttachmentStoreOp, BlendMode,
-        BufferTransfer, CompletionToken, CullMode, DynamicPipelineState, ExecutionBarrier,
-        ExecutionPass, FrontFace, HalError, ImageMip, MemoryAllocator, MemoryClass,
-        PrimitiveTopology, QueueKind, ResourceAccess, SamplerAddressMode, SamplerFilter,
-        ShaderBufferLayout, TextureSamplerDesc, validate_rgba8_mips,
+        BufferTransfer, CompletionToken, CullMode, DEFAULT_ALLOCATION_BLOCK_POLICY,
+        DynamicPipelineState, ExecutionBarrier, ExecutionPass, FrontFace, HalError, ImageMip,
+        MemoryAllocator, MemoryClass, PrimitiveTopology, QueueKind, ResourceAccess,
+        SamplerAddressMode, SamplerFilter, ShaderBufferLayout, TextureSamplerDesc,
+        validate_rgba8_mips,
     };
     use gpu_allocator::{
-        MemoryLocation,
+        AllocationSizes, MemoryLocation,
         d3d12::{
             Allocation, AllocationCreateDesc, Allocator, AllocatorCreateDesc, ID3D12DeviceVersion,
         },
@@ -198,6 +199,26 @@ pub mod native {
         _list: ID3D12GraphicsCommandList,
     }
 
+    const FRAMES_IN_FLIGHT: usize = 3;
+
+    struct FrameSlot {
+        allocator: ID3D12CommandAllocator,
+        list: ID3D12GraphicsCommandList,
+        fence_value: u64,
+        garbage: Vec<NativeAllocation>,
+    }
+
+    enum DeferredResource {
+        Allocation(NativeAllocation),
+        Pipeline(NativePipeline),
+        Texture(NativeTexture),
+    }
+
+    struct DeferredNativeResource {
+        fence_value: u64,
+        resource: DeferredResource,
+    }
+
     struct SurfaceDepth {
         resource: ID3D12Resource,
         allocation: Allocation,
@@ -252,6 +273,9 @@ pub mod native {
         allocator: Option<Allocator>,
         retired: Vec<RetiredAllocation>,
         pending_copies: Vec<PendingCopy>,
+        frame_slots: Vec<FrameSlot>,
+        frame_cursor: usize,
+        deferred: Vec<DeferredNativeResource>,
         adapter_info: AdapterInfo,
         descriptors: ID3D12DescriptorHeap,
         descriptor_stride: u32,
@@ -376,7 +400,12 @@ pub mod native {
                 let allocator = Allocator::new(&AllocatorCreateDesc {
                     device: ID3D12DeviceVersion::Device(device.clone()),
                     debug_settings: Default::default(),
-                    allocation_sizes: Default::default(),
+                    allocation_sizes: AllocationSizes::new(
+                        DEFAULT_ALLOCATION_BLOCK_POLICY.initial_device,
+                        DEFAULT_ALLOCATION_BLOCK_POLICY.initial_host,
+                    )
+                    .with_max_device_memblock_size(DEFAULT_ALLOCATION_BLOCK_POLICY.maximum_device)
+                    .with_max_host_memblock_size(DEFAULT_ALLOCATION_BLOCK_POLICY.maximum_host),
                 })
                 .map_err(|_| {
                     windows::core::Error::from_hresult(windows::Win32::Foundation::E_OUTOFMEMORY)
@@ -416,6 +445,7 @@ pub mod native {
                     unsafe { device.CreateSampler(&sampler_desc, sampler) };
                     sampler.ptr += sampler_stride;
                 }
+                let frame_slots = create_frame_slots(&device)?;
                 return Ok(Self {
                     adapter,
                     device,
@@ -426,6 +456,9 @@ pub mod native {
                     allocator: Some(allocator),
                     retired: Vec::new(),
                     pending_copies: Vec::new(),
+                    frame_slots,
+                    frame_cursor: 0,
+                    deferred: Vec::new(),
                     adapter_info,
                     descriptors,
                     descriptor_stride,
@@ -459,7 +492,70 @@ pub mod native {
                     .map_err(map_windows)?;
                 unsafe { WaitForSingleObject(self.fence_event, INFINITE) };
             }
+            self.reclaim_deferred()
+                .map_err(|_| HalError::NativeFailure)?;
             Ok(())
+        }
+
+        fn defer_resource(&mut self, resource: DeferredResource) -> Result<(), AllocationError> {
+            let fence_value = self.next_fence.saturating_sub(1);
+            if fence_value == 0 || unsafe { self.fence.GetCompletedValue() } >= fence_value {
+                return self.destroy_deferred_now(resource);
+            }
+            self.deferred.push(DeferredNativeResource {
+                fence_value,
+                resource,
+            });
+            Ok(())
+        }
+
+        fn reclaim_deferred(&mut self) -> Result<(), AllocationError> {
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            let mut ready = Vec::new();
+            let mut index = 0;
+            while index < self.deferred.len() {
+                if self.deferred[index].fence_value <= completed {
+                    ready.push(self.deferred.swap_remove(index).resource);
+                } else {
+                    index += 1;
+                }
+            }
+            for resource in ready {
+                self.destroy_deferred_now(resource)?;
+            }
+            Ok(())
+        }
+
+        fn destroy_deferred_now(
+            &mut self,
+            resource: DeferredResource,
+        ) -> Result<(), AllocationError> {
+            match resource {
+                DeferredResource::Allocation(allocation) => {
+                    if allocation.mapped_address != 0 {
+                        let no_write = D3D12_RANGE { Begin: 0, End: 0 };
+                        unsafe { allocation.resource.Unmap(0, Some(&no_write)) };
+                    }
+                    drop(allocation.resource);
+                    self.allocator
+                        .as_mut()
+                        .ok_or(AllocationError::NativeFailure)?
+                        .free(allocation.allocation)
+                        .map_err(map_allocator)
+                }
+                DeferredResource::Pipeline(pipeline) => {
+                    drop(pipeline);
+                    Ok(())
+                }
+                DeferredResource::Texture(texture) => {
+                    drop(texture.resource);
+                    self.allocator
+                        .as_mut()
+                        .ok_or(AllocationError::NativeFailure)?
+                        .free(texture.allocation)
+                        .map_err(map_allocator)
+                }
+            }
         }
 
         /// Acquires the current flip-model back buffer and presents it; zero extent remains minimized.
@@ -1007,6 +1103,10 @@ pub mod native {
             })
         }
 
+        pub fn destroy_pipeline(&mut self, pipeline: NativePipeline) {
+            let _ = self.defer_resource(DeferredResource::Pipeline(pipeline));
+        }
+
         /// Records one immutable graph plan into one command list and presents after every action.
         pub fn execute_frame(
             &mut self,
@@ -1198,20 +1298,38 @@ pub mod native {
                 None => (None, None, None, None),
             };
 
-            let allocator: ID3D12CommandAllocator = unsafe {
-                self.device
-                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-            }
-            .map_err(map_windows)?;
-            let list: ID3D12GraphicsCommandList = unsafe {
-                self.device.CreateCommandList(
-                    0,
-                    D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    &allocator,
-                    None::<&ID3D12PipelineState>,
+            let slot_index = self.frame_cursor;
+            self.frame_cursor = (self.frame_cursor + 1) % FRAMES_IN_FLIGHT;
+            let (allocator, list, fence_value, garbage) = {
+                let slot = self
+                    .frame_slots
+                    .get_mut(slot_index)
+                    .ok_or(HalError::NotReady)?;
+                (
+                    slot.allocator.clone(),
+                    slot.list.clone(),
+                    slot.fence_value,
+                    core::mem::take(&mut slot.garbage),
                 )
+            };
+            if fence_value != 0 && unsafe { self.fence.GetCompletedValue() } < fence_value {
+                unsafe {
+                    self.fence
+                        .SetEventOnCompletion(fence_value, self.fence_event)
+                }
+                .map_err(map_windows)?;
+                unsafe { WaitForSingleObject(self.fence_event, INFINITE) };
             }
-            .map_err(map_windows)?;
+            self.reclaim_deferred()
+                .map_err(|_| HalError::NativeFailure)?;
+            for allocation in garbage {
+                self.free(allocation).map_err(|_| HalError::NativeFailure)?;
+            }
+            unsafe {
+                allocator.Reset().map_err(map_windows)?;
+                list.Reset(&allocator, None::<&ID3D12PipelineState>)
+                    .map_err(map_windows)?;
+            }
             let mut readbacks = Vec::new();
             for action in actions {
                 let resource = match action {
@@ -1691,45 +1809,48 @@ pub mod native {
                     return Err(map_windows(error));
                 }
             }
-            unsafe {
-                self.queue.ExecuteCommandLists(&[Some(command)]);
-                if presents
-                    && let Err(error) = swapchain
+            let mut frame_garbage = indirect_copies.into_iter().flatten().collect::<Vec<_>>();
+            unsafe { self.queue.ExecuteCommandLists(&[Some(command)]) };
+            let value = self.next_fence;
+            self.next_fence = value.checked_add(1).ok_or(HalError::NativeFailure)?;
+            unsafe { self.queue.Signal(&self.fence, value) }.map_err(map_windows)?;
+            self.frame_slots
+                .get_mut(slot_index)
+                .ok_or(HalError::NativeFailure)?
+                .fence_value = value;
+            let present_error = if presents {
+                unsafe {
+                    swapchain
                         .as_ref()
                         .ok_or(HalError::InvalidArgument)?
                         .Present(1, DXGI_PRESENT(0))
                         .ok()
-                {
-                    let _ = self.wait_idle();
-                    for (_, _, _, _, allocation) in readbacks {
-                        let _ = self.free(allocation);
-                    }
-                    for allocation in indirect_copies.into_iter().flatten() {
-                        let _ = self.free(allocation);
-                    }
-                    return Err(map_windows(error));
+                        .err()
                 }
+            } else {
+                None
+            };
+            if present_error.is_some() || !readbacks.is_empty() {
+                if unsafe { self.fence.GetCompletedValue() } < value {
+                    unsafe { self.fence.SetEventOnCompletion(value, self.fence_event) }
+                        .map_err(map_windows)?;
+                    unsafe { WaitForSingleObject(self.fence_event, INFINITE) };
+                }
+                for allocation in frame_garbage.drain(..) {
+                    self.free(allocation).map_err(|_| HalError::NativeFailure)?;
+                }
+            } else {
+                self.frame_slots
+                    .get_mut(slot_index)
+                    .ok_or(HalError::NativeFailure)?
+                    .garbage
+                    .append(&mut frame_garbage);
             }
-            if let Err(error) = self.wait_idle() {
+            if let Some(error) = present_error {
                 for (_, _, _, _, allocation) in readbacks {
                     let _ = self.free(allocation);
                 }
-                for allocation in indirect_copies.into_iter().flatten() {
-                    let _ = self.free(allocation);
-                }
-                return Err(error);
-            }
-            let mut cleanup_error = None;
-            for allocation in indirect_copies.into_iter().flatten() {
-                if self.free(allocation).is_err() {
-                    cleanup_error = Some(HalError::NativeFailure);
-                }
-            }
-            if let Some(error) = cleanup_error {
-                for (_, _, _, _, allocation) in readbacks {
-                    let _ = self.free(allocation);
-                }
-                return Err(error);
+                return Err(map_windows(error));
             }
 
             let mut outputs = Vec::with_capacity(readbacks.len());
@@ -2077,12 +2198,7 @@ pub mod native {
         }
 
         pub fn destroy_texture(&mut self, texture: NativeTexture) -> Result<(), AllocationError> {
-            drop(texture.resource);
-            self.allocator
-                .as_mut()
-                .ok_or(AllocationError::NativeFailure)?
-                .free(texture.allocation)
-                .map_err(map_allocator)
+            self.defer_resource(DeferredResource::Texture(texture))
         }
 
         /// Copies the shader-readable image through a GPU readback footprint and returns tightly packed RGBA8 rows.
@@ -2371,18 +2487,7 @@ pub mod native {
             Ok(())
         }
         fn free(&mut self, allocation: Self::Allocation) -> Result<(), AllocationError> {
-            if allocation.mapped_address != 0 {
-                let no_write = D3D12_RANGE { Begin: 0, End: 0 };
-                unsafe {
-                    allocation.resource.Unmap(0, Some(&no_write));
-                }
-            }
-            drop(allocation.resource);
-            self.allocator
-                .as_mut()
-                .ok_or(AllocationError::NativeFailure)?
-                .free(allocation.allocation)
-                .map_err(map_allocator)
+            self.defer_resource(DeferredResource::Allocation(allocation))
         }
 
         fn retire(
@@ -2614,6 +2719,30 @@ pub mod native {
             }
         }
         Ok(())
+    }
+
+    fn create_frame_slots(device: &ID3D12Device) -> windows::core::Result<Vec<FrameSlot>> {
+        let mut slots = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        for _ in 0..FRAMES_IN_FLIGHT {
+            let allocator =
+                unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }?;
+            let list: ID3D12GraphicsCommandList = unsafe {
+                device.CreateCommandList(
+                    0,
+                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &allocator,
+                    None::<&ID3D12PipelineState>,
+                )
+            }?;
+            unsafe { list.Close() }?;
+            slots.push(FrameSlot {
+                allocator,
+                list,
+                fence_value: 0,
+                garbage: Vec::new(),
+            });
+        }
+        Ok(slots)
     }
 
     impl Drop for NativeContext {

@@ -66,12 +66,6 @@ DX12 native target execution/type-check
 - **Impact:** Caller stalls and memory/bandwidth increase; native BC/ASTC upload, partial updates, eviction, and streaming control are unavailable.
 - **Acceptance:** Context validation precedes work; asynchronous mip/region uploads expose cancellation/completion; native block formats remain compressed through upload.
 
-### P1 — pipeline and descriptor caches are inert
-
-- **Status:** Missing integration.
-- **Evidence:** `crates/ez-gfx-runtime/src/cache.rs:8-185` only encodes/decodes an envelope; Vulkan passes `vk::PipelineCache::null()` at `crates/ez-gfx-backend-vulkan/src/lib.rs:1012-1019,1156-1158`; FFI creates/destroys pipelines per execution at `crates/ez-gfx-ffi/src/state.rs:1728-1733`.
-- **Impact:** Repeated frames recompile pipelines and recreate descriptor layouts.
-- **Acceptance:** Per-context cache keys include shader/interface/state/backend identity, native PSOs/layouts are reused, blobs persist safely, and invalidation tests cover device/profile changes.
 
 ### P1 — viewport and scissor are not part of the API
 
@@ -118,17 +112,16 @@ DX12 native target execution/type-check
 ### P2 — package and test coverage gaps
 
 - **Status:** Partial.
-- **Evidence:** `crates/ez-gfx-runtime/tests/{frame,frame_graph,render}.rs` cover retained graph execution, ordering, waits, transitions, pass coalescing, payload mapping, and failure boundaries. `crates/ez-gfx-ffi/tests/metal_present.rs` covers native separated-pass color/depth preservation and surface-free readback. `examples/tests/smoke.rs` covers all six binaries and snapshots. Target lifecycle, cache reuse, async FFI uploads, viewport variation, and non-macOS native execution remain uncovered.
+- **Evidence:** `crates/ez-gfx-runtime/tests/{frame,frame_graph,render}.rs` cover retained graph execution, ordering, waits, transitions, pass coalescing, payload mapping, and failure boundaries. `crates/ez-gfx-ffi/tests/metal_present.rs` covers native separated-pass color/depth preservation and surface-free readback. `examples/tests/smoke.rs` covers all six binaries and snapshots. Target lifecycle, async FFI uploads, viewport variation, and non-macOS native execution remain uncovered.
 - **Impact:** Core graph and active-surface multi-pass contracts have native Metal coverage; the remaining subsystems and platform matrix can still regress.
-- **Acceptance:** Add target/cache/upload/viewport regression suites, artifact freshness checks, and native Vulkan/DX12 CI/package smoke.
+- **Acceptance:** Add target/upload/viewport regression suites, artifact freshness checks, and native Vulkan/DX12 CI/package smoke.
 
 ## Ordered implementation sequence
 
 1. [Complete] Backend-neutral submission, transition, wait, pass, target, and completion-token interfaces.
 2. [Complete] Compiled-graph execution retained and consumed by `FrameRecorder`.
 3. Add the managed render-target manager, attachment views, resize/history, and multi-pass load/store behavior.
-4. Add pipeline and descriptor layout/set caches with device/profile/interface identity and safe retirement.
-5. Connect bounded workers to asynchronous uploads; add texture updates, mip streaming, and native compressed-format paths.
-6. Complete FFI APIs and enforce/document threading, destruction, ownership, and error propagation.
-7. [Current] Metal, Vulkan, and DX12 route frame plans through the common executor; platform conformance remains.
-8. Expand diagnostics, regression tests, artifact freshness checks, packaging checks, and performance benchmarks.
+4. Connect bounded workers to asynchronous uploads; add texture updates, mip streaming, and native compressed-format paths.
+5. Complete FFI APIs and enforce/document threading, destruction, ownership, and error propagation.
+6. [Current] Metal, Vulkan, and DX12 route frame plans through the common executor; platform conformance remains.
+7. Expand diagnostics, regression tests, artifact freshness checks, packaging checks, and performance benchmarks.

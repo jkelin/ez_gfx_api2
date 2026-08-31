@@ -649,6 +649,7 @@ dependencies = [
 name = "ez-gfx-ffi"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "ez-gfx-artifact",
  "ez-gfx-backend-dx12",
  "ez-gfx-backend-metal",

@@ -13,6 +13,7 @@ ez-gfx-core.workspace = true
 ez-gfx-hal.workspace = true
 ez-gfx-runtime.workspace = true
 ez-gfx-artifact.workspace = true
+blake3.workspace = true
 ez-gfx-backend-vulkan = { path = "../ez-gfx-backend-vulkan" }
 
 [target.'cfg(windows)'.dependencies]

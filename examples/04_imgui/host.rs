@@ -27,7 +27,7 @@ impl HostSurface {
                     platform: 0,
                     width,
                     height,
-                    cache_presented_snapshots: 1,
+                    cache_presented_snapshots: 0,
                 },
             });
         }
@@ -53,7 +53,7 @@ impl HostSurface {
                     platform: 2,
                     width,
                     height,
-                    cache_presented_snapshots: 1,
+                    cache_presented_snapshots: 0,
                 },
                 metal_layer: layer,
             });

@@ -11,13 +11,14 @@ use ez_gfx_core::{
 };
 use ez_gfx_hal::{
     AllocationError, AllocationRequest, AttachmentLoadOp, AttachmentStoreOp, BlendMode,
-    BufferTransfer, CompletionToken, CullMode, DynamicPipelineState, ExecutionBarrier,
-    ExecutionPass, FrontFace, HalError, ImageMip, MemoryAllocator, MemoryClass, PrimitiveTopology,
-    QueueKind, ResourceAccess, ResourceState, SamplerAddressMode, SamplerFilter,
-    ShaderBufferLayout, ShaderStage, TextureSamplerDesc, validate_rgba8_mips,
+    BufferTransfer, CompletionToken, CullMode, DEFAULT_ALLOCATION_BLOCK_POLICY,
+    DynamicPipelineState, ExecutionBarrier, ExecutionPass, FrontFace, HalError, ImageMip,
+    MemoryAllocator, MemoryClass, PrimitiveTopology, QueueKind, ResourceAccess, ResourceState,
+    SamplerAddressMode, SamplerFilter, ShaderBufferLayout, ShaderStage, TextureSamplerDesc,
+    validate_rgba8_mips,
 };
 use gpu_allocator::{
-    MemoryLocation,
+    AllocationSizes, MemoryLocation,
     vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc},
 };
 
@@ -192,6 +193,31 @@ struct RetiredAllocation {
     completion: CompletionToken,
 }
 
+enum DeferredResource {
+    Allocation(NativeAllocation),
+    Pipeline(NativePipeline),
+    Shader(NativeShader),
+    Texture(NativeTexture),
+}
+
+struct DeferredNativeResource {
+    pending_slots: u8,
+    resource: DeferredResource,
+}
+
+const FRAMES_IN_FLIGHT: usize = 3;
+const FRAME_DESCRIPTOR_SET_CAPACITY: u32 = 1024;
+
+struct FrameSlot {
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    image_available: vk::Semaphore,
+    render_finished: vk::Semaphore,
+    fence: vk::Fence,
+    descriptor_pool: vk::DescriptorPool,
+    in_flight: bool,
+}
+
 struct DeviceProbe {
     adapter: AdapterInfo,
     queue_family: u32,
@@ -265,6 +291,7 @@ pub struct NativeContext {
     device: Option<ash::Device>,
     allocator: Option<Allocator>,
     retired: Vec<RetiredAllocation>,
+    deferred: Vec<DeferredNativeResource>,
     graphics_queue: Option<vk::Queue>,
     graphics_queue_family: Option<u32>,
     transfer_timeline: Option<vk::Semaphore>,
@@ -280,6 +307,8 @@ pub struct NativeContext {
     swapchain_initialized: Vec<bool>,
     swapchain_format: vk::Format,
     swapchain_extent: vk::Extent2D,
+    frame_slots: Vec<FrameSlot>,
+    frame_cursor: usize,
     image_available: Option<vk::Semaphore>,
     depth_target: Option<DepthTarget>,
 }
@@ -344,6 +373,7 @@ impl NativeContext {
             allocator: None,
             retired: Vec::new(),
             graphics_queue: None,
+            deferred: Vec::new(),
             graphics_queue_family: None,
             transfer_timeline: None,
             transfer_command_pool: None,
@@ -358,6 +388,8 @@ impl NativeContext {
             swapchain_initialized: Vec::new(),
             swapchain_format: vk::Format::UNDEFINED,
             swapchain_extent: vk::Extent2D::default(),
+            frame_slots: Vec::new(),
+            frame_cursor: 0,
             image_available: None,
             depth_target: None,
         };
@@ -499,7 +531,14 @@ impl NativeContext {
                         physical_device: physical,
                         debug_settings: Default::default(),
                         buffer_device_address: true,
-                        allocation_sizes: Default::default(),
+                        allocation_sizes: AllocationSizes::new(
+                            DEFAULT_ALLOCATION_BLOCK_POLICY.initial_device,
+                            DEFAULT_ALLOCATION_BLOCK_POLICY.initial_host,
+                        )
+                        .with_max_device_memblock_size(
+                            DEFAULT_ALLOCATION_BLOCK_POLICY.maximum_device,
+                        )
+                        .with_max_host_memblock_size(DEFAULT_ALLOCATION_BLOCK_POLICY.maximum_host),
                     })
                     .map_err(map_allocator_hal)?,
                 );
@@ -588,6 +627,8 @@ impl NativeContext {
                     unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
                         .map_err(map_vk)?,
                 );
+                let frame_slots = create_frame_slots(device, queue_family)?;
+
                 self.physical_device = Some(physical);
                 self.adapter_info = Some(adapter.clone());
                 self.graphics_queue_family = Some(queue_family);
@@ -602,14 +643,117 @@ impl NativeContext {
                 self.texture_descriptor_set = Some(descriptor_set);
                 self.swapchain_loader = pending.swapchain_loader.take();
                 self.image_available = pending.image_available.take();
+                self.frame_slots = frame_slots;
                 return Ok(adapter);
             }
         }
         Err(HalError::Unsupported)
     }
-    pub fn wait_idle(&self) -> Result<(), HalError> {
-        let device = self.device.as_ref().ok_or(HalError::NotReady)?;
-        unsafe { device.device_wait_idle() }.map_err(map_vk)
+    pub fn wait_idle(&mut self) -> Result<(), HalError> {
+        let device = self.device.as_ref().ok_or(HalError::NotReady)?.clone();
+        unsafe { device.device_wait_idle() }.map_err(map_vk)?;
+        for slot in &mut self.frame_slots {
+            slot.in_flight = false;
+        }
+        let resources = self
+            .deferred
+            .drain(..)
+            .map(|item| item.resource)
+            .collect::<Vec<_>>();
+        for resource in resources {
+            self.destroy_deferred_now(resource)
+                .map_err(map_allocation_hal)?;
+        }
+        Ok(())
+    }
+
+    fn in_flight_mask(&self) -> u8 {
+        self.frame_slots
+            .iter()
+            .enumerate()
+            .fold(0_u8, |mask, (index, slot)| {
+                if slot.in_flight {
+                    mask | (1 << index)
+                } else {
+                    mask
+                }
+            })
+    }
+
+    fn defer_resource(&mut self, resource: DeferredResource) -> Result<(), AllocationError> {
+        let pending_slots = self.in_flight_mask();
+        if pending_slots == 0 {
+            return self.destroy_deferred_now(resource);
+        }
+        self.deferred.push(DeferredNativeResource {
+            pending_slots,
+            resource,
+        });
+        Ok(())
+    }
+
+    fn complete_frame_slot(&mut self, slot_index: usize) -> Result<(), AllocationError> {
+        let bit = 1_u8
+            .checked_shl(slot_index as u32)
+            .ok_or(AllocationError::NativeFailure)?;
+        let mut ready = Vec::new();
+        let mut index = 0;
+        while index < self.deferred.len() {
+            self.deferred[index].pending_slots &= !bit;
+            if self.deferred[index].pending_slots == 0 {
+                ready.push(self.deferred.swap_remove(index).resource);
+            } else {
+                index += 1;
+            }
+        }
+        for resource in ready {
+            self.destroy_deferred_now(resource)?;
+        }
+        Ok(())
+    }
+
+    fn destroy_deferred_now(&mut self, resource: DeferredResource) -> Result<(), AllocationError> {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or(AllocationError::NativeFailure)?
+            .clone();
+        match resource {
+            DeferredResource::Allocation(allocation) => {
+                unsafe { device.destroy_buffer(allocation.buffer, None) };
+                self.allocator
+                    .as_mut()
+                    .ok_or(AllocationError::NativeFailure)?
+                    .free(allocation.allocation)
+                    .map_err(map_allocator)
+            }
+            DeferredResource::Pipeline(pipeline) => {
+                unsafe {
+                    device.destroy_pipeline(pipeline.pipeline, None);
+                    device.destroy_pipeline_layout(pipeline.layout, None);
+                    device.destroy_descriptor_set_layout(pipeline.public_descriptor_layout, None);
+                }
+                Ok(())
+            }
+            DeferredResource::Shader(shader) => {
+                for module in shader.modules {
+                    unsafe { device.destroy_shader_module(module, None) };
+                }
+                Ok(())
+            }
+            DeferredResource::Texture(texture) => {
+                unsafe {
+                    device.destroy_image_view(texture.view, None);
+                    device.destroy_sampler(texture.sampler, None);
+                    device.destroy_image(texture.image, None);
+                }
+                self.allocator
+                    .as_mut()
+                    .ok_or(AllocationError::NativeFailure)?
+                    .free(texture.allocation)
+                    .map_err(map_allocator)
+            }
+        }
     }
 
     pub fn destroy_surface(&mut self, surface: NativeSurface) {
@@ -925,7 +1069,9 @@ impl NativeContext {
         let mut modules = Vec::with_capacity(products.len());
         for product in products {
             if product.is_empty() || product.len() % 4 != 0 {
-                self.destroy_shader(NativeShader { modules });
+                for module in modules.drain(..) {
+                    unsafe { device.destroy_shader_module(module, None) };
+                }
                 return Err(HalError::InvalidArgument);
             }
             let words = product
@@ -938,7 +1084,9 @@ impl NativeContext {
             } {
                 Ok(module) => modules.push(module),
                 Err(error) => {
-                    self.destroy_shader(NativeShader { modules });
+                    for module in modules.drain(..) {
+                        unsafe { device.destroy_shader_module(module, None) };
+                    }
                     return Err(map_vk(error));
                 }
             }
@@ -949,12 +1097,8 @@ impl NativeContext {
         Ok(NativeShader { modules })
     }
 
-    pub fn destroy_shader(&self, shader: NativeShader) {
-        if let Some(device) = self.device.as_ref() {
-            for module in shader.modules {
-                unsafe { device.destroy_shader_module(module, None) };
-            }
-        }
+    pub fn destroy_shader(&mut self, shader: NativeShader) {
+        let _ = self.defer_resource(DeferredResource::Shader(shader));
     }
 
     /// Reflected public buffers occupy descriptor set zero; the bindless texture table remains set one.
@@ -1069,14 +1213,8 @@ impl NativeContext {
         }
     }
 
-    pub fn destroy_pipeline(&self, pipeline: NativePipeline) {
-        if let Some(device) = self.device.as_ref() {
-            unsafe {
-                device.destroy_pipeline(pipeline.pipeline, None);
-                device.destroy_pipeline_layout(pipeline.layout, None);
-                device.destroy_descriptor_set_layout(pipeline.public_descriptor_layout, None)
-            };
-        }
+    pub fn destroy_pipeline(&mut self, pipeline: NativePipeline) {
+        let _ = self.defer_resource(DeferredResource::Pipeline(pipeline));
     }
     /// Creates a dynamic-rendering graphics pipeline from an exact vertex/fragment artifact pair.
     pub fn create_graphics_pipeline(
@@ -1207,38 +1345,22 @@ impl NativeContext {
 
     fn create_public_descriptor_set(
         &self,
+        pool: vk::DescriptorPool,
         pipeline: &NativePipeline,
         bindings: &[NativeBufferBinding<'_>],
-    ) -> Result<(vk::DescriptorPool, vk::DescriptorSet), HalError> {
+    ) -> Result<vk::DescriptorSet, HalError> {
         if bindings.len() != pipeline.buffer_writable.len() {
             return Err(HalError::InvalidArgument);
         }
         let device = self.device.as_ref().ok_or(HalError::NotReady)?;
-        let pool_size = vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(bindings.len().max(1) as u32);
-        let pool = unsafe {
-            device.create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(1)
-                    .pool_sizes(core::slice::from_ref(&pool_size)),
-                None,
-            )
-        }
-        .map_err(map_vk)?;
-        let set = match unsafe {
+        let set = unsafe {
             device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(pool)
                     .set_layouts(core::slice::from_ref(&pipeline.public_descriptor_layout)),
             )
-        } {
-            Ok(sets) => sets[0],
-            Err(error) => {
-                unsafe { device.destroy_descriptor_pool(pool, None) };
-                return Err(map_vk(error));
-            }
-        };
+        }
+        .map_err(map_vk)?[0];
         let mut infos = Vec::with_capacity(bindings.len());
         for (binding, writable) in bindings.iter().zip(&pipeline.buffer_writable) {
             if binding.writable != *writable
@@ -1248,7 +1370,6 @@ impl NativeContext {
                     .checked_add(binding.range)
                     .is_none_or(|end| end > binding.allocation.allocation.size())
             {
-                unsafe { device.destroy_descriptor_pool(pool, None) };
                 return Err(HalError::InvalidArgument);
             }
             infos.push(
@@ -1270,7 +1391,7 @@ impl NativeContext {
             })
             .collect::<Vec<_>>();
         unsafe { device.update_descriptor_sets(&writes, &[]) };
-        Ok((pool, set))
+        Ok(set)
     }
 
     /// Ensures target format and extent exist before a graphics pipeline is created.
@@ -1290,6 +1411,10 @@ impl NativeContext {
             self.recreate_swapchain(surface, width, height)?;
         }
         Ok(())
+    }
+
+    pub fn graphics_format_key(&self) -> u32 {
+        self.swapchain_format.as_raw() as u32
     }
 
     /// Records a complete graph frame into one command buffer and presents once after recording.
@@ -1462,12 +1587,41 @@ impl NativeContext {
         } else {
             vk::SwapchainKHR::null()
         };
-        let available = if uses_surface {
-            self.image_available.ok_or(HalError::NotReady)?
-        } else {
-            vk::Semaphore::null()
+        let slot_index = self.frame_cursor;
+        self.frame_cursor = (self.frame_cursor + 1) % FRAMES_IN_FLIGHT;
+        let completed_slot = {
+            let slot = self
+                .frame_slots
+                .get_mut(slot_index)
+                .ok_or(HalError::NotReady)?;
+            let completed = slot.in_flight;
+            if completed {
+                unsafe { device.wait_for_fences(&[slot.fence], true, u64::MAX) }.map_err(map_vk)?;
+                slot.in_flight = false;
+            }
+            unsafe {
+                device
+                    .reset_command_buffer(slot.command_buffer, vk::CommandBufferResetFlags::empty())
+                    .map_err(map_vk)?;
+                device
+                    .reset_descriptor_pool(
+                        slot.descriptor_pool,
+                        vk::DescriptorPoolResetFlags::empty(),
+                    )
+                    .map_err(map_vk)?;
+            }
+            completed
         };
-        let pool = self.transfer_command_pool.ok_or(HalError::NotReady)?;
+        if completed_slot {
+            self.complete_frame_slot(slot_index)
+                .map_err(map_allocation_hal)?;
+        }
+        let slot = self.frame_slots.get(slot_index).ok_or(HalError::NotReady)?;
+        let available = slot.image_available;
+        let finished_handle = slot.render_finished;
+        let command_handle = slot.command_buffer;
+        let descriptor_pool = slot.descriptor_pool;
+        let fence = slot.fence;
         let queue = self.graphics_queue.ok_or(HalError::NotReady)?;
         let texture_set = self.texture_descriptor_set.ok_or(HalError::NotReady)?;
 
@@ -1507,21 +1661,20 @@ impl NativeContext {
         for action in actions {
             let created = match action {
                 NativeFrameAction::Compute(dispatch) => self
-                    .create_public_descriptor_set(dispatch.pipeline, dispatch.bindings)
+                    .create_public_descriptor_set(
+                        descriptor_pool,
+                        dispatch.pipeline,
+                        dispatch.bindings,
+                    )
                     .map(Some),
                 NativeFrameAction::Graphics(draw) => self
-                    .create_public_descriptor_set(draw.pipeline, draw.bindings)
+                    .create_public_descriptor_set(descriptor_pool, draw.pipeline, draw.bindings)
                     .map(Some),
                 _ => Ok(None),
             };
             match created {
                 Ok(set) => public_sets.push(set),
                 Err(error) => {
-                    unsafe {
-                        for (pool, _) in public_sets.into_iter().flatten() {
-                            device.destroy_descriptor_pool(pool, None);
-                        }
-                    }
                     for (_, _, _, _, allocation) in readbacks {
                         let _ = self.free(allocation);
                     }
@@ -1530,53 +1683,18 @@ impl NativeContext {
             }
         }
 
-        let preflight = (|| {
-            let finished =
-                unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
-                    .map_err(map_vk)?;
-            let command = match unsafe {
-                device.allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
-                )
-            } {
-                Ok(commands) => commands[0],
-                Err(error) => {
-                    unsafe { device.destroy_semaphore(finished, None) };
-                    return Err(map_vk(error));
-                }
-            };
-            if let Err(error) = unsafe {
-                device.begin_command_buffer(
-                    command,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )
-            } {
-                unsafe {
-                    device.free_command_buffers(pool, &[command]);
-                    device.destroy_semaphore(finished, None);
-                }
-                return Err(map_vk(error));
+        if let Err(error) = unsafe {
+            device.begin_command_buffer(
+                command_handle,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+        } {
+            for (_, _, _, _, allocation) in readbacks {
+                let _ = self.free(allocation);
             }
-            Ok((finished, command))
-        })();
-        let (finished_handle, command_handle) = match preflight {
-            Ok(handles) => handles,
-            Err(error) => {
-                unsafe {
-                    for (pool, _) in public_sets.into_iter().flatten() {
-                        device.destroy_descriptor_pool(pool, None);
-                    }
-                }
-                for (_, _, _, _, allocation) in readbacks {
-                    let _ = self.free(allocation);
-                }
-                return Err(error);
-            }
-        };
+            return Err(map_vk(error));
+        }
         let mut acquired_image_index = None;
         let mut submitted = false;
         let mut readback_index = 0_usize;
@@ -1803,7 +1921,7 @@ impl NativeContext {
                         if pass_active || dispatch.groups.contains(&0) {
                             return Err(HalError::InvalidArgument);
                         }
-                        let (_, public) = public_sets[action_index]
+                        let public = public_sets[action_index]
                             .as_ref()
                             .ok_or(HalError::InvalidArgument)?;
                         device.cmd_bind_pipeline(
@@ -1839,7 +1957,7 @@ impl NativeContext {
                         if !pass_active {
                             return Err(HalError::InvalidArgument);
                         }
-                        let (_, public) = public_sets[action_index]
+                        let public = public_sets[action_index]
                             .as_ref()
                             .ok_or(HalError::InvalidArgument)?;
                         device.cmd_bind_pipeline(
@@ -2031,8 +2149,9 @@ impl NativeContext {
                     .command_buffers(core::slice::from_ref(&command_handle))
                     .signal_semaphores(core::slice::from_ref(&finished_handle))
                     .push_next(&mut timeline);
+                device.reset_fences(&[fence]).map_err(map_vk)?;
                 device
-                    .queue_submit(queue, &[submit], vk::Fence::null())
+                    .queue_submit(queue, &[submit], fence)
                     .map_err(map_vk)?;
                 submitted = true;
                 if presents {
@@ -2048,20 +2167,24 @@ impl NativeContext {
                         )
                         .map_err(map_vk)?;
                 }
-                device.queue_wait_idle(queue).map_err(map_vk)?;
             }
             Ok(())
         })();
 
-        if submitted && recorded.is_err() {
-            let _ = unsafe { device.queue_wait_idle(queue) };
+        if submitted {
+            self.frame_slots
+                .get_mut(slot_index)
+                .ok_or(HalError::NativeFailure)?
+                .in_flight = true;
         }
-        unsafe {
-            device.free_command_buffers(pool, &[command_handle]);
-            device.destroy_semaphore(finished_handle, None);
-            for (pool, _) in public_sets.into_iter().flatten() {
-                device.destroy_descriptor_pool(pool, None);
-            }
+        if submitted && (recorded.is_err() || !readbacks.is_empty()) {
+            unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }.map_err(map_vk)?;
+            self.frame_slots
+                .get_mut(slot_index)
+                .ok_or(HalError::NativeFailure)?
+                .in_flight = false;
+            self.complete_frame_slot(slot_index)
+                .map_err(map_allocation_hal)?;
         }
         if let Err(error) = recorded {
             if acquired_image_index.is_some()
@@ -2444,17 +2567,7 @@ impl NativeContext {
     }
 
     pub fn destroy_texture(&mut self, texture: NativeTexture) -> Result<(), AllocationError> {
-        let device = self.device.as_ref().ok_or(AllocationError::NativeFailure)?;
-        unsafe {
-            device.destroy_image_view(texture.view, None);
-            device.destroy_sampler(texture.sampler, None);
-            device.destroy_image(texture.image, None)
-        };
-        self.allocator
-            .as_mut()
-            .ok_or(AllocationError::NativeFailure)?
-            .free(texture.allocation)
-            .map_err(map_allocator)
+        self.defer_resource(DeferredResource::Texture(texture))
     }
 
     /// Copies a shader-readable image to host-visible memory and returns tightly packed RGBA8 pixels.
@@ -2876,13 +2989,7 @@ impl MemoryAllocator for NativeContext {
     }
 
     fn free(&mut self, allocation: Self::Allocation) -> Result<(), AllocationError> {
-        let device = self.device.as_ref().ok_or(AllocationError::NativeFailure)?;
-        unsafe { device.destroy_buffer(allocation.buffer, None) };
-        self.allocator
-            .as_mut()
-            .ok_or(AllocationError::NativeFailure)?
-            .free(allocation.allocation)
-            .map_err(map_allocator)
+        self.defer_resource(DeferredResource::Allocation(allocation))
     }
 
     fn retire(
@@ -3120,12 +3227,26 @@ impl Drop for NativeContext {
                 let _ = device.device_wait_idle();
             }
         }
+        for slot in &mut self.frame_slots {
+            slot.in_flight = false;
+        }
+        let deferred = self
+            .deferred
+            .drain(..)
+            .map(|item| item.resource)
+            .collect::<Vec<_>>();
+        for resource in deferred {
+            let _ = self.destroy_deferred_now(resource);
+        }
         let _ = self.destroy_depth_target();
         while let Some(retired) = self.retired.pop() {
             let _ = self.free(retired.allocation);
         }
         drop(self.allocator.take());
         if let Some(device) = self.device.take() {
+            for slot in self.frame_slots.drain(..) {
+                destroy_frame_slot(&device, slot);
+            }
             for view in self.swapchain_views.drain(..) {
                 unsafe { device.destroy_image_view(view, None) };
             }
@@ -3156,6 +3277,116 @@ impl Drop for NativeContext {
         }
         // SAFETY: every child owned by the context is destroyed before the instance.
         unsafe { self.instance.destroy_instance(None) };
+    }
+}
+
+fn create_frame_slots(device: &ash::Device, queue_family: u32) -> Result<Vec<FrameSlot>, HalError> {
+    let mut slots = Vec::with_capacity(FRAMES_IN_FLIGHT);
+    for _ in 0..FRAMES_IN_FLIGHT {
+        match create_frame_slot(device, queue_family) {
+            Ok(slot) => slots.push(slot),
+            Err(error) => {
+                for slot in slots.drain(..) {
+                    destroy_frame_slot(device, slot);
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(slots)
+}
+
+fn create_frame_slot(device: &ash::Device, queue_family: u32) -> Result<FrameSlot, HalError> {
+    let pool = unsafe {
+        device.create_command_pool(
+            &vk::CommandPoolCreateInfo::default()
+                .queue_family_index(queue_family)
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+            None,
+        )
+    }
+    .map_err(map_vk)?;
+    let created = (|| {
+        let command = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .map_err(map_vk)?[0];
+        let available =
+            unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
+                .map_err(map_vk)?;
+        let finished =
+            match unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) } {
+                Ok(value) => value,
+                Err(error) => {
+                    unsafe { device.destroy_semaphore(available, None) };
+                    return Err(map_vk(error));
+                }
+            };
+        let fence = match unsafe {
+            device.create_fence(
+                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                None,
+            )
+        } {
+            Ok(value) => value,
+            Err(error) => {
+                unsafe {
+                    device.destroy_semaphore(finished, None);
+                    device.destroy_semaphore(available, None);
+                }
+                return Err(map_vk(error));
+            }
+        };
+        let descriptor_pool = match unsafe {
+            device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(FRAME_DESCRIPTOR_SET_CAPACITY)
+                    .pool_sizes(core::slice::from_ref(
+                        &vk::DescriptorPoolSize::default()
+                            .ty(vk::DescriptorType::STORAGE_BUFFER)
+                            .descriptor_count(FRAME_DESCRIPTOR_SET_CAPACITY * 4),
+                    )),
+                None,
+            )
+        } {
+            Ok(value) => value,
+            Err(error) => {
+                unsafe {
+                    device.destroy_fence(fence, None);
+                    device.destroy_semaphore(finished, None);
+                    device.destroy_semaphore(available, None);
+                }
+                return Err(map_vk(error));
+            }
+        };
+        Ok(FrameSlot {
+            command_pool: pool,
+            command_buffer: command,
+            image_available: available,
+            render_finished: finished,
+            fence,
+            descriptor_pool,
+            in_flight: false,
+        })
+    })();
+    if created.is_err() {
+        unsafe { device.destroy_command_pool(pool, None) };
+    }
+    created
+}
+
+fn destroy_frame_slot(device: &ash::Device, slot: FrameSlot) {
+    unsafe {
+        device.destroy_descriptor_pool(slot.descriptor_pool, None);
+        device.destroy_fence(slot.fence, None);
+        device.destroy_semaphore(slot.render_finished, None);
+        device.destroy_semaphore(slot.image_available, None);
+        device.destroy_command_pool(slot.command_pool, None);
     }
 }
 

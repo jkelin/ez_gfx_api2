@@ -3,6 +3,60 @@
 use core::fmt;
 use ez_gfx_core::capability::AdapterInfo;
 
+const ALLOCATION_BLOCK_ALIGNMENT: u64 = 4 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AllocationBlockPolicy {
+    pub initial_device: u64,
+    pub maximum_device: u64,
+    pub initial_host: u64,
+    pub maximum_host: u64,
+}
+
+impl AllocationBlockPolicy {
+    pub const fn new(
+        initial_device: u64,
+        maximum_device: u64,
+        initial_host: u64,
+        maximum_host: u64,
+    ) -> Result<Self, AllocationBlockPolicyError> {
+        // gpu-allocator accepts only 4 MiB block increments; reject instead of allowing it to clamp.
+        if initial_device == 0 || maximum_device == 0 || initial_host == 0 || maximum_host == 0 {
+            return Err(AllocationBlockPolicyError::ZeroSize);
+        }
+        if !initial_device.is_multiple_of(ALLOCATION_BLOCK_ALIGNMENT)
+            || !maximum_device.is_multiple_of(ALLOCATION_BLOCK_ALIGNMENT)
+            || !initial_host.is_multiple_of(ALLOCATION_BLOCK_ALIGNMENT)
+            || !maximum_host.is_multiple_of(ALLOCATION_BLOCK_ALIGNMENT)
+        {
+            return Err(AllocationBlockPolicyError::InvalidAlignment);
+        }
+        if initial_device > maximum_device || initial_host > maximum_host {
+            return Err(AllocationBlockPolicyError::InvalidRange);
+        }
+        Ok(Self {
+            initial_device,
+            maximum_device,
+            initial_host,
+            maximum_host,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AllocationBlockPolicyError {
+    ZeroSize,
+    InvalidAlignment,
+    InvalidRange,
+}
+
+pub const DEFAULT_ALLOCATION_BLOCK_POLICY: AllocationBlockPolicy = AllocationBlockPolicy {
+    initial_device: 16 * 1024 * 1024,
+    maximum_device: 256 * 1024 * 1024,
+    initial_host: 8 * 1024 * 1024,
+    maximum_host: 64 * 1024 * 1024,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryClass {
     Device,
@@ -19,7 +73,6 @@ pub struct AllocationRequest {
     pub mapped: bool,
     pub alias_class: Option<u64>,
 }
-
 impl AllocationRequest {
     /// Alignment must be a nonzero power of two; alias classes are transient-only.
     pub fn new(
@@ -73,7 +126,7 @@ impl fmt::Display for AllocationError {
     }
 }
 impl std::error::Error for AllocationError {}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ShaderBufferLayout {
     pub space: u32,
     pub binding: u32,
@@ -104,7 +157,7 @@ impl ShaderBufferLayout {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ShaderTextureHeapLayout {
     pub space: u32,
     pub binding: u32,
@@ -144,13 +197,13 @@ impl ShaderTextureHeapLayout {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SamplerFilter {
     Nearest,
     Linear,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SamplerAddressMode {
     Clamp,
     Repeat,
@@ -324,18 +377,18 @@ pub fn validate_rgba8_mips(mips: &[ImageMip<'_>]) -> Result<(), ContractError> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum CullMode {
     None,
     Front,
     Back,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FrontFace {
     CounterClockwise,
     Clockwise,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PrimitiveTopology {
     TriangleList,
     PointList,
@@ -344,13 +397,13 @@ pub enum PrimitiveTopology {
     TriangleStrip,
     TriangleFan,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum BlendMode {
     None,
     Alpha,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct DynamicPipelineState {
     pub cull: CullMode,
     pub front_face: FrontFace,

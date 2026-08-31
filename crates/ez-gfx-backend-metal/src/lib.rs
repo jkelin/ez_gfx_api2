@@ -6,23 +6,98 @@ pub const BACKEND: Backend = Backend::Metal;
 pub const SUPPORTED_ON_TARGET: bool = cfg!(target_vendor = "apple");
 pub const TEXTURE_DESCRIPTOR_CAPACITY: u32 = MAX_BINDLESS_SAMPLED_TEXTURES;
 
+#[cfg(any(test, target_vendor = "apple"))]
+mod frame_slots {
+    pub(super) const FRAMES_IN_FLIGHT: usize = 3;
+
+    #[derive(Debug, Default)]
+    pub(super) struct FrameSlotTracker {
+        cursor: usize,
+        occupied: [bool; FRAMES_IN_FLIGHT],
+    }
+
+    impl FrameSlotTracker {
+        /// A wrapped slot must be completed before reuse; an unused slot needs no wait.
+        pub(super) fn acquire(&mut self) -> (usize, bool) {
+            let slot = self.cursor;
+            self.cursor = (self.cursor + 1) % FRAMES_IN_FLIGHT;
+            (slot, self.occupied[slot])
+        }
+
+        pub(super) fn mark_submitted(&mut self, slot: usize) {
+            self.occupied[slot] = true;
+        }
+
+        pub(super) fn mark_completed(&mut self, slot: usize) {
+            self.occupied[slot] = false;
+        }
+
+        pub(super) fn in_flight_mask(&self) -> u8 {
+            self.occupied
+                .iter()
+                .enumerate()
+                .fold(0, |mask, (slot, occupied)| {
+                    mask | (u8::from(*occupied) << slot)
+                })
+        }
+    }
+
+    pub(super) fn complete_deferred_slot(mask: &mut u8, slot: usize) -> bool {
+        *mask &= !(1 << slot);
+        *mask == 0
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn waits_only_after_three_outstanding_submissions() {
+            let mut tracker = FrameSlotTracker::default();
+
+            for expected in 0..FRAMES_IN_FLIGHT {
+                assert_eq!(tracker.acquire(), (expected, false));
+                tracker.mark_submitted(expected);
+            }
+
+            assert_eq!(tracker.acquire(), (0, true));
+            tracker.mark_completed(0);
+            assert_eq!(tracker.in_flight_mask(), 0b110);
+        }
+
+        #[test]
+        fn deferred_resource_completes_after_every_referencing_slot() {
+            let mut mask = 0b101;
+
+            assert!(!complete_deferred_slot(&mut mask, 0));
+            assert_eq!(mask, 0b100);
+            assert!(complete_deferred_slot(&mut mask, 2));
+        }
+    }
+}
+
 #[cfg(target_vendor = "apple")]
 pub mod native {
     use core::ffi::c_void;
 
-    use crate::{BACKEND, TEXTURE_DESCRIPTOR_CAPACITY};
+    use crate::{
+        BACKEND, TEXTURE_DESCRIPTOR_CAPACITY,
+        frame_slots::{FRAMES_IN_FLIGHT, FrameSlotTracker, complete_deferred_slot},
+    };
     use ez_gfx_core::capability::{
         AdapterCapabilities, AdapterClass, AdapterInfo, CompressionSupport, SemanticProfile,
     };
+
+    const MAX_ARGUMENT_BUFFERS_PER_SLOT: usize = 1024;
     use ez_gfx_hal::{
         AllocationError, AllocationRequest, AttachmentLoadOp, AttachmentStoreOp, BlendMode,
-        BufferTransfer, CompletionToken, CullMode, DynamicPipelineState, ExecutionBarrier,
-        ExecutionPass, FrontFace, HalError, ImageMip, MemoryAllocator, MemoryClass,
-        PrimitiveTopology, QueueKind, SamplerAddressMode, SamplerFilter, ShaderTextureHeapLayout,
-        TextureSamplerDesc, validate_rgba8_mips,
+        BufferTransfer, CompletionToken, CullMode, DEFAULT_ALLOCATION_BLOCK_POLICY,
+        DynamicPipelineState, ExecutionBarrier, ExecutionPass, FrontFace, HalError, ImageMip,
+        MemoryAllocator, MemoryClass, PrimitiveTopology, QueueKind, SamplerAddressMode,
+        SamplerFilter, ShaderTextureHeapLayout, TextureSamplerDesc, validate_rgba8_mips,
     };
     use gpu_allocator::{
-        MemoryLocation,
+        AllocationSizes, MemoryLocation,
         metal::{Allocation, AllocationCreateDesc, Allocator, AllocatorCreateDesc},
     };
     use objc2::{rc::Retained, runtime::ProtocolObject};
@@ -53,8 +128,7 @@ pub mod native {
     }
 
     pub struct NativeGraphicsDraw<'a> {
-        pub shader: &'a NativeShader,
-        pub graphics: &'a (usize, String, usize, String),
+        pub pipeline: &'a NativePipeline,
         pub depth_required: bool,
         pub texture_heap: Option<ShaderTextureHeapLayout>,
         pub state: DynamicPipelineState,
@@ -67,9 +141,7 @@ pub mod native {
     }
 
     pub struct NativeComputeDispatch<'a> {
-        pub shader: &'a NativeShader,
-        pub product_index: usize,
-        pub entry: &'a str,
+        pub pipeline: &'a NativePipeline,
         pub groups: [u32; 3],
         pub push_constants: &'a [u8],
         pub bindings: &'a [NativeBufferBinding<'a>],
@@ -110,28 +182,39 @@ pub mod native {
         pub binding: u32,
     }
 
-    pub struct NativePipeline {
-        state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub enum NativePipeline {
+        Compute {
+            state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        },
+        Graphics {
+            state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+            argument_encoder: Option<Retained<ProtocolObject<dyn MTLArgumentEncoder>>>,
+        },
     }
-
     // SAFETY: Metal resources and immutable libraries support cross-thread use. Higher layers
     // serialize mutation and destruction, so these owners are never accessed concurrently.
     unsafe impl Send for NativeAllocation {}
     unsafe impl Send for NativeShader {}
     unsafe impl Send for NativeTexture {}
+    unsafe impl Send for NativePipeline {}
     unsafe impl Send for NativeSurface {}
-    type PreparedGraphics = (
-        Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-        Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
-    );
+    struct FrameSlot {
+        command: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+        argument_buffers: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    }
 
-    enum PreparedFrameAction {
-        None,
-        Compute(NativePipeline),
-        Graphics {
-            pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-            argument_buffer: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
-        },
+    enum DeferredResource {
+        Allocation(NativeAllocation),
+        Pipeline(NativePipeline),
+        Depth(SurfaceDepth),
+        Shader(NativeShader),
+        Surface(NativeSurface),
+        Texture(NativeTexture),
+    }
+
+    struct DeferredNativeResource {
+        pending_slots: u8,
+        resource: DeferredResource,
     }
 
     struct RetiredAllocation {
@@ -179,6 +262,9 @@ pub mod native {
         queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
         allocator: Option<Allocator>,
         retired: Vec<RetiredAllocation>,
+        frame_slots: Vec<FrameSlot>,
+        frame_tracker: FrameSlotTracker,
+        deferred: Vec<DeferredNativeResource>,
         adapter: AdapterInfo,
         next_transfer_value: u64,
         completed_transfer_value: u64,
@@ -236,7 +322,12 @@ pub mod native {
             let allocator = Allocator::new(&AllocatorCreateDesc {
                 device: device.clone(),
                 debug_settings: Default::default(),
-                allocation_sizes: Default::default(),
+                allocation_sizes: AllocationSizes::new(
+                    DEFAULT_ALLOCATION_BLOCK_POLICY.initial_device,
+                    DEFAULT_ALLOCATION_BLOCK_POLICY.initial_host,
+                )
+                .with_max_device_memblock_size(DEFAULT_ALLOCATION_BLOCK_POLICY.maximum_device)
+                .with_max_host_memblock_size(DEFAULT_ALLOCATION_BLOCK_POLICY.maximum_host),
                 create_residency_set: false,
             })
             .map_err(map_allocator_hal)?;
@@ -245,6 +336,14 @@ pub mod native {
                 queue,
                 allocator: Some(allocator),
                 retired: Vec::new(),
+                frame_slots: (0..FRAMES_IN_FLIGHT)
+                    .map(|_| FrameSlot {
+                        command: None,
+                        argument_buffers: Vec::new(),
+                    })
+                    .collect(),
+                frame_tracker: FrameSlotTracker::default(),
+                deferred: Vec::new(),
                 adapter,
                 next_transfer_value: 1,
                 completed_transfer_value: 0,
@@ -262,18 +361,112 @@ pub mod native {
             Ok(self.adapter.clone())
         }
 
-        pub fn wait_idle(&self) -> Result<(), HalError> {
+        pub fn wait_idle(&mut self) -> Result<(), HalError> {
             let command = self.queue.commandBuffer().ok_or(HalError::NativeFailure)?;
             command.commit();
             command.waitUntilCompleted();
-            if command.status() != MTLCommandBufferStatus::Completed || command.error().is_some() {
+            let failed =
+                command.status() != MTLCommandBufferStatus::Completed || command.error().is_some();
+            for slot in 0..self.frame_slots.len() {
+                self.frame_slots[slot].command = None;
+                self.frame_tracker.mark_completed(slot);
+            }
+            let deferred = self
+                .deferred
+                .drain(..)
+                .map(|item| item.resource)
+                .collect::<Vec<_>>();
+            for resource in deferred {
+                self.destroy_deferred_now(resource)
+                    .map_err(map_allocation_hal)?;
+            }
+            if failed {
                 return Err(HalError::NativeFailure);
             }
             Ok(())
         }
 
+        fn complete_frame_slot(&mut self, slot: usize) -> Result<(), HalError> {
+            let failed = if let Some(command) = self.frame_slots[slot].command.take() {
+                command.waitUntilCompleted();
+                command.status() != MTLCommandBufferStatus::Completed || command.error().is_some()
+            } else {
+                false
+            };
+            self.frame_tracker.mark_completed(slot);
+
+            let mut index = 0;
+            while index < self.deferred.len() {
+                if complete_deferred_slot(&mut self.deferred[index].pending_slots, slot) {
+                    let resource = self.deferred.swap_remove(index).resource;
+                    self.destroy_deferred_now(resource)
+                        .map_err(map_allocation_hal)?;
+                } else {
+                    index += 1;
+                }
+            }
+            if failed {
+                return Err(HalError::NativeFailure);
+            }
+            Ok(())
+        }
+
+        fn defer_resource(&mut self, resource: DeferredResource) -> Result<(), AllocationError> {
+            let pending_slots = self.frame_tracker.in_flight_mask();
+            if pending_slots == 0 {
+                self.destroy_deferred_now(resource)
+            } else {
+                self.deferred.push(DeferredNativeResource {
+                    pending_slots,
+                    resource,
+                });
+                Ok(())
+            }
+        }
+
+        fn destroy_deferred_now(
+            &mut self,
+            resource: DeferredResource,
+        ) -> Result<(), AllocationError> {
+            match resource {
+                DeferredResource::Allocation(allocation) => {
+                    drop(allocation.buffer);
+                    self.allocator
+                        .as_mut()
+                        .ok_or(AllocationError::NativeFailure)?
+                        .free(&allocation.allocation)
+                        .map_err(map_allocator)
+                }
+                DeferredResource::Texture(texture) => {
+                    drop(texture.texture);
+                    drop(texture.sampler);
+                    self.allocator
+                        .as_mut()
+                        .ok_or(AllocationError::NativeFailure)?
+                        .free(&texture.allocation)
+                        .map_err(map_allocator)
+                }
+                DeferredResource::Pipeline(pipeline) => {
+                    drop(pipeline);
+                    Ok(())
+                }
+                DeferredResource::Depth(depth) => {
+                    drop(depth);
+                    Ok(())
+                }
+                DeferredResource::Shader(shader) => {
+                    drop(shader.libraries);
+                    Ok(())
+                }
+                DeferredResource::Surface(surface) => {
+                    drop(surface);
+                    Ok(())
+                }
+            }
+        }
+
         fn ensure_surface_depth(
-            &self,
+            &mut self,
             surface: &mut NativeSurface,
             extent: (u32, u32),
         ) -> Result<(), HalError> {
@@ -305,11 +498,15 @@ pub mod native {
                 .device
                 .newDepthStencilStateWithDescriptor(&state_descriptor)
                 .ok_or(HalError::NativeFailure)?;
-            surface.depth = Some(SurfaceDepth {
+            let depth = SurfaceDepth {
                 texture,
                 state,
                 extent,
-            });
+            };
+            if let Some(stale) = surface.depth.replace(depth) {
+                self.defer_resource(DeferredResource::Depth(stale))
+                    .map_err(map_allocation_hal)?;
+            }
             Ok(())
         }
 
@@ -337,8 +534,8 @@ pub mod native {
             Ok(NativeShader { libraries })
         }
 
-        pub fn destroy_shader(&self, shader: NativeShader) {
-            drop(shader.libraries);
+        pub fn destroy_shader(&mut self, shader: NativeShader) {
+            let _ = self.defer_resource(DeferredResource::Shader(shader));
         }
 
         /// Resolves a named function from a precompiled metallib and creates its compute PSO.
@@ -355,21 +552,82 @@ pub mod native {
                 .libraries
                 .get(product_index)
                 .ok_or(HalError::InvalidArgument)?;
-            let name = NSString::from_str(entry);
             let function = library
-                .newFunctionWithName(&name)
+                .newFunctionWithName(&NSString::from_str(entry))
                 .ok_or(HalError::InvalidArgument)?;
             let state = self
                 .device
                 .newComputePipelineStateWithFunction_error(&function)
                 .map_err(|_| HalError::NativeFailure)?;
-            Ok(NativePipeline { state })
+            Ok(NativePipeline::Compute { state })
         }
 
-        fn prepare_graphics_draw(
+        pub fn create_graphics_pipeline(
             &self,
+            shader: &NativeShader,
+            graphics: &(usize, String, usize, String),
+            state: DynamicPipelineState,
+            depth_required: bool,
+            texture_heap: Option<ShaderTextureHeapLayout>,
+        ) -> Result<NativePipeline, HalError> {
+            if graphics.1.is_empty()
+                || graphics.1.as_bytes().contains(&0)
+                || graphics.3.is_empty()
+                || graphics.3.as_bytes().contains(&0)
+                || state.topology == PrimitiveTopology::TriangleFan
+            {
+                return Err(HalError::InvalidArgument);
+            }
+            let vertex_library = shader
+                .libraries
+                .get(graphics.0)
+                .ok_or(HalError::InvalidArgument)?;
+            let fragment_library = shader
+                .libraries
+                .get(graphics.2)
+                .ok_or(HalError::InvalidArgument)?;
+            let vertex = vertex_library
+                .newFunctionWithName(&NSString::from_str(&graphics.1))
+                .ok_or(HalError::InvalidArgument)?;
+            let fragment = fragment_library
+                .newFunctionWithName(&NSString::from_str(&graphics.3))
+                .ok_or(HalError::InvalidArgument)?;
+            let descriptor = MTLRenderPipelineDescriptor::new();
+            descriptor.setVertexFunction(Some(&vertex));
+            descriptor.setFragmentFunction(Some(&fragment));
+            let color = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
+            color.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+            if depth_required {
+                descriptor.setDepthAttachmentPixelFormat(MTLPixelFormat::Depth32Float);
+            }
+            if state.blend == BlendMode::Alpha {
+                color.setBlendingEnabled(true);
+                color.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
+                color.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+            }
+            let pipeline = self
+                .device
+                .newRenderPipelineStateWithDescriptor_error(&descriptor)
+                .map_err(|_| HalError::NativeFailure)?;
+            let argument_encoder = texture_heap.map(|heap| unsafe {
+                fragment.newArgumentEncoderWithBufferIndex(heap.binding as usize)
+            });
+            Ok(NativePipeline::Graphics {
+                state: pipeline,
+                argument_encoder,
+            })
+        }
+
+        pub fn destroy_pipeline(&mut self, pipeline: NativePipeline) {
+            let _ = self.defer_resource(DeferredResource::Pipeline(pipeline));
+        }
+
+        fn prepare_argument_buffer(
+            &mut self,
+            slot: usize,
             draw: &NativeGraphicsDraw<'_>,
-        ) -> Result<PreparedGraphics, HalError> {
+            argument_index: usize,
+        ) -> Result<Option<usize>, HalError> {
             if draw.draw_count == 0
                 || draw.push_constants.len() > 128
                 || !draw.push_constants.len().is_multiple_of(4)
@@ -381,72 +639,63 @@ pub mod native {
             {
                 return Err(HalError::InvalidArgument);
             }
-            let vertex_library = draw
-                .shader
-                .libraries
-                .get(draw.graphics.0)
-                .ok_or(HalError::InvalidArgument)?;
-            let fragment_library = draw
-                .shader
-                .libraries
-                .get(draw.graphics.2)
-                .ok_or(HalError::InvalidArgument)?;
-            let vertex = vertex_library
-                .newFunctionWithName(&NSString::from_str(&draw.graphics.1))
-                .ok_or(HalError::InvalidArgument)?;
-            let fragment = fragment_library
-                .newFunctionWithName(&NSString::from_str(&draw.graphics.3))
-                .ok_or(HalError::InvalidArgument)?;
-            let descriptor = MTLRenderPipelineDescriptor::new();
-            descriptor.setVertexFunction(Some(&vertex));
-            descriptor.setFragmentFunction(Some(&fragment));
-            let color = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
-            color.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
-            if draw.depth_required {
-                descriptor.setDepthAttachmentPixelFormat(MTLPixelFormat::Depth32Float);
-            }
-            if draw.state.blend == BlendMode::Alpha {
-                color.setBlendingEnabled(true);
-                color.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
-                color.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
-            }
-            let pipeline = self
-                .device
-                .newRenderPipelineStateWithDescriptor_error(&descriptor)
-                .map_err(|_| HalError::NativeFailure)?;
-            let argument_buffer = if let Some(heap) = draw.texture_heap {
-                if draw
-                    .textures
-                    .iter()
-                    .any(|texture| texture.binding >= heap.capacity)
-                {
-                    return Err(HalError::InvalidArgument);
-                }
-                let encoder =
-                    unsafe { fragment.newArgumentEncoderWithBufferIndex(heap.binding as usize) };
-                let buffer = self
-                    .device
-                    .newBufferWithLength_options(
-                        encoder.encodedLength(),
-                        MTLResourceOptions::StorageModeShared,
-                    )
-                    .ok_or(HalError::NativeFailure)?;
-                unsafe { encoder.setArgumentBuffer_offset(Some(&buffer), 0) };
-                for texture in draw.textures {
-                    let texture_index = texture.binding as usize * heap.argument_stride as usize
-                        + heap.texture_argument_offset as usize;
-                    let sampler_index = texture.binding as usize * heap.argument_stride as usize
-                        + heap.sampler_argument_offset as usize;
-                    unsafe {
-                        encoder.setTexture_atIndex(Some(&texture.texture), texture_index);
-                        encoder.setSamplerState_atIndex(Some(&texture.sampler), sampler_index);
-                    }
-                }
-                Some(buffer)
-            } else {
-                None
+            let NativePipeline::Graphics {
+                argument_encoder, ..
+            } = draw.pipeline
+            else {
+                return Err(HalError::InvalidArgument);
             };
-            Ok((pipeline, argument_buffer))
+            let Some(heap) = draw.texture_heap else {
+                return if argument_encoder.is_none() {
+                    Ok(None)
+                } else {
+                    Err(HalError::InvalidArgument)
+                };
+            };
+            if argument_index >= MAX_ARGUMENT_BUFFERS_PER_SLOT {
+                return Err(HalError::OutOfMemory);
+            }
+            let encoder = argument_encoder.as_ref().ok_or(HalError::InvalidArgument)?;
+            if draw
+                .textures
+                .iter()
+                .any(|texture| texture.binding >= heap.capacity)
+            {
+                return Err(HalError::InvalidArgument);
+            }
+            let required = encoder.encodedLength();
+            let slot = self
+                .frame_slots
+                .get_mut(slot)
+                .ok_or(HalError::NativeFailure)?;
+            if argument_index == slot.argument_buffers.len() {
+                slot.argument_buffers.push(
+                    self.device
+                        .newBufferWithLength_options(
+                            required,
+                            MTLResourceOptions::StorageModeShared,
+                        )
+                        .ok_or(HalError::NativeFailure)?,
+                );
+            } else if slot.argument_buffers[argument_index].length() < required {
+                slot.argument_buffers[argument_index] = self
+                    .device
+                    .newBufferWithLength_options(required, MTLResourceOptions::StorageModeShared)
+                    .ok_or(HalError::NativeFailure)?;
+            }
+            let buffer = &slot.argument_buffers[argument_index];
+            unsafe { encoder.setArgumentBuffer_offset(Some(buffer), 0) };
+            for texture in draw.textures {
+                let texture_index = texture.binding as usize * heap.argument_stride as usize
+                    + heap.texture_argument_offset as usize;
+                let sampler_index = texture.binding as usize * heap.argument_stride as usize
+                    + heap.sampler_argument_offset as usize;
+                unsafe {
+                    encoder.setTexture_atIndex(Some(&texture.texture), texture_index);
+                    encoder.setSamplerState_atIndex(Some(&texture.sampler), sampler_index);
+                }
+            }
+            Ok(Some(argument_index))
         }
 
         fn allocate_frame_readback(
@@ -526,7 +775,12 @@ pub mod native {
                     extent,
                 )?;
             }
-            let mut prepared = Vec::with_capacity(actions.len());
+            let (slot_index, must_wait) = self.frame_tracker.acquire();
+            if must_wait {
+                self.complete_frame_slot(slot_index)?;
+            }
+            let mut prepared_arguments = Vec::with_capacity(actions.len());
+            let mut argument_count = 0;
             let mut readbacks = Vec::new();
             let mut pass_active = false;
             let mut saw_present = false;
@@ -538,7 +792,7 @@ pub mod native {
                     return Err(HalError::InvalidArgument);
                 }
                 let item = match action {
-                    NativeFrameAction::Wait(_) => Ok(PreparedFrameAction::None),
+                    NativeFrameAction::Wait(_) => Ok(None),
                     NativeFrameAction::Barrier { barrier, resource } => {
                         let valid = match resource {
                             NativeFrameResource::Buffer(allocation) => {
@@ -556,7 +810,7 @@ pub mod native {
                         if pass_active || !valid {
                             Err(HalError::InvalidArgument)
                         } else {
-                            Ok(PreparedFrameAction::None)
+                            Ok(None)
                         }
                     }
                     NativeFrameAction::BeginPass(pass) => {
@@ -573,7 +827,7 @@ pub mod native {
                             Err(HalError::InvalidArgument)
                         } else {
                             pass_active = true;
-                            Ok(PreparedFrameAction::None)
+                            Ok(None)
                         }
                     }
                     NativeFrameAction::Compute(dispatch) => {
@@ -584,15 +838,11 @@ pub mod native {
                             || dispatch.bindings.iter().any(|binding| {
                                 binding.offset as u64 >= binding.allocation.allocation.size()
                             })
+                            || !matches!(dispatch.pipeline, NativePipeline::Compute { .. })
                         {
                             Err(HalError::InvalidArgument)
                         } else {
-                            self.create_compute_pipeline(
-                                dispatch.shader,
-                                dispatch.product_index,
-                                dispatch.entry,
-                            )
-                            .map(PreparedFrameAction::Compute)
+                            Ok(None)
                         }
                     }
                     NativeFrameAction::Graphics(draw) => {
@@ -604,13 +854,12 @@ pub mod native {
                         {
                             Err(HalError::InvalidArgument)
                         } else {
-                            self.prepare_graphics_draw(draw)
-                                .map(
-                                    |(pipeline, argument_buffer)| PreparedFrameAction::Graphics {
-                                        pipeline,
-                                        argument_buffer,
-                                    },
-                                )
+                            self.prepare_argument_buffer(slot_index, draw, argument_count)
+                                .inspect(|prepared| {
+                                    if prepared.is_some() {
+                                        argument_count += 1;
+                                    }
+                                })
                         }
                     }
                     NativeFrameAction::TextureReadback { width, height, .. } => {
@@ -620,7 +869,7 @@ pub mod native {
                             self.allocate_frame_readback(*width, *height)
                                 .map(|readback| {
                                     readbacks.push(readback);
-                                    PreparedFrameAction::None
+                                    None
                                 })
                         }
                     }
@@ -629,7 +878,7 @@ pub mod native {
                             Err(HalError::InvalidArgument)
                         } else {
                             pass_active = false;
-                            Ok(PreparedFrameAction::None)
+                            Ok(None)
                         }
                     }
                     NativeFrameAction::Present => {
@@ -648,12 +897,12 @@ pub mod native {
                                     }
                                 }
                             }
-                            Ok(PreparedFrameAction::None)
+                            Ok(None)
                         }
                     }
                 };
                 match item {
-                    Ok(item) => prepared.push(item),
+                    Ok(item) => prepared_arguments.push(item),
                     Err(error) => {
                         for (allocation, _, _, _, _) in readbacks {
                             let _ = self.free(allocation);
@@ -816,14 +1065,13 @@ pub mod native {
                             {
                                 return Err(HalError::InvalidArgument);
                             }
-                            let PreparedFrameAction::Compute(pipeline) = &prepared[action_index]
-                            else {
+                            let NativePipeline::Compute { state } = dispatch.pipeline else {
                                 return Err(HalError::InvalidArgument);
                             };
                             let encoder = command
                                 .computeCommandEncoder()
                                 .ok_or(HalError::NativeFailure)?;
-                            encoder.setComputePipelineState(&pipeline.state);
+                            encoder.setComputePipelineState(state);
                             for binding in dispatch.bindings {
                                 if binding.offset as u64 >= binding.allocation.allocation.size() {
                                     return Err(HalError::InvalidArgument);
@@ -865,14 +1113,16 @@ pub mod native {
                         NativeFrameAction::Graphics(draw) => {
                             let encoder =
                                 render_encoder.as_ref().ok_or(HalError::InvalidArgument)?;
-                            let PreparedFrameAction::Graphics {
-                                pipeline,
-                                argument_buffer,
-                            } = &prepared[action_index]
+                            let NativePipeline::Graphics {
+                                state,
+                                argument_encoder: _,
+                            } = draw.pipeline
                             else {
                                 return Err(HalError::InvalidArgument);
                             };
-                            encoder.setRenderPipelineState(pipeline);
+                            let argument_buffer = prepared_arguments[action_index]
+                                .map(|index| &self.frame_slots[slot_index].argument_buffers[index]);
+                            encoder.setRenderPipelineState(state);
                             if draw.depth_required {
                                 let depth = surface
                                     .as_ref()
@@ -914,8 +1164,7 @@ pub mod native {
                                     );
                                 }
                             }
-                            if let (Some(heap), Some(buffer)) =
-                                (draw.texture_heap, argument_buffer.as_ref())
+                            if let (Some(heap), Some(buffer)) = (draw.texture_heap, argument_buffer)
                             {
                                 for texture in draw.textures {
                                     let resource = <ProtocolObject<dyn MTLTexture> as AsRef<
@@ -1067,6 +1316,11 @@ pub mod native {
                 return Err(error);
             }
             command.commit();
+            if readbacks.is_empty() {
+                self.frame_slots[slot_index].command = Some(command);
+                self.frame_tracker.mark_submitted(slot_index);
+                return Ok(None);
+            }
             command.waitUntilCompleted();
             if command.status() != MTLCommandBufferStatus::Completed || command.error().is_some() {
                 for (allocation, _, _, _, _) in readbacks {
@@ -1309,13 +1563,17 @@ pub mod native {
 
         /// Acquires and presents one drawable from the borrowed CAMetalLayer; zero extent is minimized.
         pub fn acquire_present(
-            &self,
+            &mut self,
             surface: &NativeSurface,
             width: u32,
             height: u32,
         ) -> Result<(), HalError> {
             if width == 0 || height == 0 {
                 return Err(HalError::NotReady);
+            }
+            let (slot, must_wait) = self.frame_tracker.acquire();
+            if must_wait {
+                self.complete_frame_slot(slot)?;
             }
             // SAFETY: the host promises that the opaque platform handle is a live CAMetalLayer.
             let layer = unsafe { &*(surface.layer as *const CAMetalLayer) };
@@ -1327,16 +1585,18 @@ pub mod native {
             >>::as_ref(&*drawable);
             command.presentDrawable(drawable);
             command.commit();
+
+            self.frame_slots[slot].command = Some(command);
+            self.frame_tracker.mark_submitted(slot);
             Ok(())
         }
 
+        pub fn destroy_surface(&mut self, surface: NativeSurface) {
+            let _ = self.defer_resource(DeferredResource::Surface(surface));
+        }
+
         pub fn destroy_texture(&mut self, texture: NativeTexture) -> Result<(), AllocationError> {
-            drop(texture.texture);
-            self.allocator
-                .as_mut()
-                .ok_or(AllocationError::NativeFailure)?
-                .free(&texture.allocation)
-                .map_err(map_allocator)
+            self.defer_resource(DeferredResource::Texture(texture))
         }
     }
 
@@ -1445,12 +1705,7 @@ pub mod native {
         }
 
         fn free(&mut self, allocation: Self::Allocation) -> Result<(), AllocationError> {
-            drop(allocation.buffer);
-            self.allocator
-                .as_mut()
-                .ok_or(AllocationError::NativeFailure)?
-                .free(&allocation.allocation)
-                .map_err(map_allocator)
+            self.defer_resource(DeferredResource::Allocation(allocation))
         }
 
         fn retire(

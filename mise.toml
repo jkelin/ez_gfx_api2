@@ -25,6 +25,11 @@ run = "cargo test -p ez-gfx-examples --test smoke"
 [tasks.example-1]
 run = "cargo run -p ez-gfx-examples --bin 01_triangle"
 
+[tasks.example-1-benchmark]
+description = "Benchmark 01_triangle frame throughput on the default backend"
+env = { EZ_GFX_BACKEND = "vulkan", EZ_GFX_EXAMPLE_BENCHMARK = "1", EZ_GFX_EXAMPLE_BENCHMARK_WARMUP = "120", EZ_GFX_EXAMPLE_BENCHMARK_FRAMES = "600", VK_LOADER_LAYERS_DISABLE = "~implicit~" }
+run = "cargo run -p ez-gfx-examples --release --bin 01_triangle"
+
 [tasks.example-2]
 run = "cargo run -p ez-gfx-examples --bin 02_textured_cube"
 

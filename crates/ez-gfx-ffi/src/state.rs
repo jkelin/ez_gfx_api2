@@ -72,8 +72,56 @@ enum NativeShader {
     Metal(ez_gfx_backend_metal::native::NativeShader),
 }
 
+enum NativePipeline {
+    Vulkan(ez_gfx_backend_vulkan::NativePipeline),
+    #[cfg(windows)]
+    Dx12(ez_gfx_backend_dx12::native::NativePipeline),
+    #[cfg(target_vendor = "apple")]
+    Metal(ez_gfx_backend_metal::native::NativePipeline),
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum PipelineKey {
+    Compute {
+        backend: Backend,
+        shader: u64,
+        shader_digest: [u8; 32],
+        product: usize,
+        entry: String,
+        layouts: Vec<ez_gfx_hal::ShaderBufferLayout>,
+    },
+    Graphics {
+        backend: Backend,
+        shader: u64,
+        shader_digest: [u8; 32],
+        vertex_product: usize,
+        vertex_entry: String,
+        fragment_product: usize,
+        fragment_entry: String,
+        layouts: Vec<ez_gfx_hal::ShaderBufferLayout>,
+        texture_heap: Option<ez_gfx_hal::ShaderTextureHeapLayout>,
+        state: DynamicPipelineState,
+        depth_required: bool,
+        color_format: u32,
+        depth_format: u32,
+        sample_count: u8,
+    },
+}
+
+impl PipelineKey {
+    fn shader(&self) -> u64 {
+        // Both variants always carry their owning generational shader handle.
+        match self {
+            Self::Compute { shader, .. } | Self::Graphics { shader, .. } => *shader,
+        }
+    }
+}
+
+const MAX_PIPELINE_CACHE_ENTRIES: usize = 1024;
+
 struct ShaderRecord {
     native: NativeShader,
+    digest: [u8; 32],
     graphics: Option<(usize, String, usize, String)>,
     compute: Option<(usize, String)>,
     runtime: ez_gfx_runtime::shader::RuntimeShader,
@@ -122,6 +170,8 @@ struct FfiContext {
     shaders: HashMap<u64, ShaderRecord>,
     indirects: HashMap<u64, IndexedIndirectBuffer>,
     textures: HashMap<u64, (TextureId, NativeTexture, u32, u32, u32)>,
+    pipelines: HashMap<PipelineKey, NativePipeline>,
+    graphics_format: Option<u32>,
     texture_registry: TextureRegistry,
     texture_ready: HashMap<u64, CompletionToken>,
     geometry: GeometryManager,
@@ -207,6 +257,8 @@ pub fn create_context(options: ContextOptions) -> Result<PackedHandle, EzGfxResu
         allocations: HashMap::new(),
         shaders: HashMap::new(),
         textures: HashMap::new(),
+        pipelines: HashMap::new(),
+        graphics_format: None,
         indirects: HashMap::new(),
         texture_registry: TextureRegistry::new(
             ez_gfx_runtime::binding::MAX_TEXTURE_HEAP_CAPACITY,
@@ -309,6 +361,9 @@ pub fn destroy_context(context: u64) {
     let _ = wait_native_idle(&mut owned.native);
     for (_, surface) in owned.surfaces.drain() {
         destroy_native_surface(&mut owned.native, surface.native);
+    }
+    for (_, pipeline) in owned.pipelines.drain() {
+        destroy_native_pipeline(&mut owned.native, pipeline);
     }
     for (_, shader) in owned.shaders.drain() {
         destroy_native_shader(&mut owned.native, shader.native);
@@ -531,6 +586,10 @@ fn destroy_native_surface(context: &mut NativeContext, surface: NativeSurface) {
         }
         #[cfg(windows)]
         (NativeContext::Dx12(context), NativeSurface::Dx12(surface)) => {
+            context.destroy_surface(surface);
+        }
+        #[cfg(target_vendor = "apple")]
+        (NativeContext::Metal(context), NativeSurface::Metal(surface)) => {
             context.destroy_surface(surface);
         }
         _ => {}
@@ -970,6 +1029,7 @@ pub fn load_shader(
             .identity
             .check_thread_and_health()
             .map_err(map_lifecycle)?;
+        let digest = *blake3::hash(artifact).as_bytes();
         let shader = ez_gfx_runtime::shader::RuntimeShader::load(
             artifact,
             context.options.backend,
@@ -1032,6 +1092,7 @@ pub fn load_shader(
             handle.get(),
             ShaderRecord {
                 native,
+                digest,
                 graphics,
                 compute,
                 runtime: shader,
@@ -1052,6 +1113,14 @@ pub fn destroy_shader(context: u64, shader: u64) {
             .identity
             .remove(handle, ResourceKind::Shader)
             .map_err(map_lifecycle)?;
+        let stale = context
+            .pipelines
+            .extract_if(|key, _| key.shader() == shader)
+            .map(|(_, pipeline)| pipeline)
+            .collect::<Vec<_>>();
+        for pipeline in stale {
+            destroy_native_pipeline(&mut context.native, pipeline);
+        }
         let native = context
             .shaders
             .remove(&shader)
@@ -1073,6 +1142,23 @@ fn destroy_native_shader(context: &mut NativeContext, shader: NativeShader) {
         #[cfg(target_vendor = "apple")]
         (NativeContext::Metal(context), NativeShader::Metal(shader)) => {
             context.destroy_shader(shader)
+        }
+        _ => {}
+    }
+}
+
+fn destroy_native_pipeline(context: &mut NativeContext, pipeline: NativePipeline) {
+    match (context, pipeline) {
+        (NativeContext::Vulkan(context), NativePipeline::Vulkan(pipeline)) => {
+            context.destroy_pipeline(pipeline)
+        }
+        #[cfg(windows)]
+        (NativeContext::Dx12(context), NativePipeline::Dx12(pipeline)) => {
+            context.destroy_pipeline(pipeline)
+        }
+        #[cfg(target_vendor = "apple")]
+        (NativeContext::Metal(context), NativePipeline::Metal(pipeline)) => {
+            context.destroy_pipeline(pipeline)
         }
         _ => {}
     }
@@ -1986,17 +2072,35 @@ fn execute_vulkan_frame_plan(
         return Err(EzGfxResult::NativeFailure);
     };
 
-    let mut pipelines: Vec<Option<ez_gfx_backend_vulkan::NativePipeline>> =
-        (0..payloads.len()).map(|_| None).collect();
+    let mut pipeline_keys: Vec<Option<PipelineKey>> = (0..payloads.len()).map(|_| None).collect();
     let execution = (|| -> Result<Vec<Vec<u8>>, EzGfxResult> {
         if let Some(surface) = native_surface.as_deref() {
             native
                 .prepare_surface(surface, extent.0, extent.1)
                 .map_err(map_hal)?;
+            let format = native.graphics_format_key();
+            if context
+                .graphics_format
+                .is_some_and(|cached| cached != format)
+            {
+                // Old-format graphics pipelines remain valid native objects but cannot be reused.
+                let stale = context
+                    .pipelines
+                    .extract_if(|key, _| matches!(key, PipelineKey::Graphics { .. }))
+                    .map(|(_, pipeline)| pipeline)
+                    .collect::<Vec<_>>();
+                for pipeline in stale {
+                    let NativePipeline::Vulkan(pipeline) = pipeline else {
+                        return Err(EzGfxResult::NativeFailure);
+                    };
+                    native.destroy_pipeline(pipeline);
+                }
+            }
+            context.graphics_format = Some(format);
         }
 
         for (node_index, payload) in payloads.iter().enumerate() {
-            let pipeline = match payload {
+            let (key, pipeline) = match payload {
                 ExecutableNode::Compute { shader, layout, .. } => {
                     let record = context
                         .shaders
@@ -2006,13 +2110,33 @@ fn execute_vulkan_frame_plan(
                         .compute
                         .as_ref()
                         .ok_or(EzGfxResult::InvalidArgument)?;
-                    let NativeShader::Vulkan(shader) = &record.native else {
+                    let NativeShader::Vulkan(native_shader) = &record.native else {
                         return Err(EzGfxResult::NativeFailure);
                     };
                     let layouts = native_layouts(layout).map_err(map_hal)?;
-                    native
-                        .create_compute_pipeline(shader, compute.0, &compute.1, &layouts)
-                        .map_err(map_hal)?
+                    let key = PipelineKey::Compute {
+                        backend: Backend::Vulkan,
+                        shader: *shader,
+                        shader_digest: record.digest,
+                        product: compute.0,
+                        entry: compute.1.clone(),
+                        layouts: pipeline_layout_key(&layouts),
+                    };
+                    let pipeline = if context.pipelines.contains_key(&key) {
+                        None
+                    } else {
+                        Some(NativePipeline::Vulkan(
+                            native
+                                .create_compute_pipeline(
+                                    native_shader,
+                                    compute.0,
+                                    &compute.1,
+                                    &layouts,
+                                )
+                                .map_err(map_hal)?,
+                        ))
+                    };
+                    (key, pipeline)
                 }
                 ExecutableNode::Graphics {
                     shader,
@@ -2029,26 +2153,67 @@ fn execute_vulkan_frame_plan(
                         .graphics
                         .as_ref()
                         .ok_or(EzGfxResult::InvalidArgument)?;
-                    let NativeShader::Vulkan(shader) = &record.native else {
+                    let NativeShader::Vulkan(native_shader) = &record.native else {
                         return Err(EzGfxResult::NativeFailure);
                     };
                     let layouts = native_layouts(layout).map_err(map_hal)?;
-                    native
-                        .create_graphics_pipeline(
-                            shader,
-                            ez_gfx_backend_vulkan::NativeGraphicsPipelineDesc {
-                                vertex_index: graphics.0,
-                                fragment_index: graphics.2,
-                                state: *state,
-                                depth_required: pipeline_layout.depth_required(),
-                                layouts: &layouts,
-                            },
-                        )
-                        .map_err(map_hal)?
+                    let depth_required = pipeline_layout.depth_required();
+                    let key = PipelineKey::Graphics {
+                        backend: Backend::Vulkan,
+                        shader: *shader,
+                        shader_digest: record.digest,
+                        vertex_product: graphics.0,
+                        vertex_entry: graphics.1.clone(),
+                        fragment_product: graphics.2,
+                        fragment_entry: graphics.3.clone(),
+                        texture_heap: None,
+                        layouts: pipeline_layout_key(&layouts),
+                        state: *state,
+                        depth_required,
+                        color_format: native.graphics_format_key(),
+                        depth_format: u32::from(depth_required),
+                        sample_count: 1,
+                    };
+                    let pipeline = if context.pipelines.contains_key(&key) {
+                        None
+                    } else {
+                        Some(NativePipeline::Vulkan(
+                            native
+                                .create_graphics_pipeline(
+                                    native_shader,
+                                    ez_gfx_backend_vulkan::NativeGraphicsPipelineDesc {
+                                        vertex_index: graphics.0,
+                                        fragment_index: graphics.2,
+                                        state: *state,
+                                        depth_required,
+                                        layouts: &layouts,
+                                    },
+                                )
+                                .map_err(map_hal)?,
+                        ))
+                    };
+                    (key, pipeline)
                 }
                 ExecutableNode::TextureReadback { .. } | ExecutableNode::Present { .. } => continue,
             };
-            pipelines[node_index] = Some(pipeline);
+            if let Some(pipeline) = pipeline {
+                if context.pipelines.len() == MAX_PIPELINE_CACHE_ENTRIES {
+                    native.wait_idle().map_err(map_hal)?;
+                    let stale = context
+                        .pipelines
+                        .drain()
+                        .map(|(_, value)| value)
+                        .collect::<Vec<_>>();
+                    for stale_pipeline in stale {
+                        let NativePipeline::Vulkan(stale_pipeline) = stale_pipeline else {
+                            return Err(EzGfxResult::NativeFailure);
+                        };
+                        native.destroy_pipeline(stale_pipeline);
+                    }
+                }
+                context.pipelines.insert(key.clone(), pipeline);
+            }
+            pipeline_keys[node_index] = Some(key);
         }
 
         let binding_sets = payloads
@@ -2131,16 +2296,26 @@ fn execute_vulkan_frame_plan(
                             groups,
                             push_constants,
                             ..
-                        } => actions.push(ez_gfx_backend_vulkan::NativeFrameAction::Compute(
-                            ez_gfx_backend_vulkan::NativeComputeDispatch {
-                                pipeline: pipelines[index_node]
-                                    .as_ref()
-                                    .ok_or(EzGfxResult::InvalidArgument)?,
-                                groups: *groups,
-                                push_constants,
-                                bindings: &binding_sets[index_node],
-                            },
-                        )),
+                        } => {
+                            let key = pipeline_keys[index_node]
+                                .as_ref()
+                                .ok_or(EzGfxResult::InvalidArgument)?;
+                            let NativePipeline::Vulkan(pipeline) = context
+                                .pipelines
+                                .get(key)
+                                .ok_or(EzGfxResult::NativeFailure)?
+                            else {
+                                return Err(EzGfxResult::NativeFailure);
+                            };
+                            actions.push(ez_gfx_backend_vulkan::NativeFrameAction::Compute(
+                                ez_gfx_backend_vulkan::NativeComputeDispatch {
+                                    pipeline,
+                                    groups: *groups,
+                                    push_constants,
+                                    bindings: &binding_sets[index_node],
+                                },
+                            ));
+                        }
                         ExecutableNode::Graphics {
                             indirect,
                             draw_count,
@@ -2155,13 +2330,21 @@ fn execute_vulkan_frame_plan(
                             else {
                                 return Err(EzGfxResult::NativeFailure);
                             };
+                            let key = pipeline_keys[index_node]
+                                .as_ref()
+                                .ok_or(EzGfxResult::InvalidArgument)?;
+                            let NativePipeline::Vulkan(pipeline) = context
+                                .pipelines
+                                .get(key)
+                                .ok_or(EzGfxResult::NativeFailure)?
+                            else {
+                                return Err(EzGfxResult::NativeFailure);
+                            };
                             actions.push(ez_gfx_backend_vulkan::NativeFrameAction::Graphics(
                                 ez_gfx_backend_vulkan::NativeDrawIndexed {
                                     width: extent.0,
                                     height: extent.1,
-                                    pipeline: pipelines[index_node]
-                                        .as_ref()
-                                        .ok_or(EzGfxResult::InvalidArgument)?,
+                                    pipeline,
                                     index_buffer: index.ok_or(EzGfxResult::NotReady)?,
                                     indirect_buffer: indirect,
                                     draw_count: *draw_count,
@@ -2209,9 +2392,7 @@ fn execute_vulkan_frame_plan(
         drop(actions);
         result
     })();
-    for pipeline in pipelines.into_iter().flatten() {
-        native.destroy_pipeline(pipeline);
-    }
+
     let outcome = match execution {
         Ok(outputs) => {
             let texture_readbacks = payloads
@@ -2306,10 +2487,10 @@ fn execute_dx12_frame_plan(
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut pipelines: Vec<Option<ez_gfx_backend_dx12::native::NativePipeline>> =
+        let mut pipeline_keys: Vec<Option<PipelineKey>> =
             (0..payloads.len()).map(|_| None).collect();
         for (node_index, payload) in payloads.iter().enumerate() {
-            let pipeline = match payload {
+            let (key, pipeline) = match payload {
                 ExecutableNode::Compute { shader, layout, .. } => {
                     let record = context
                         .shaders
@@ -2319,13 +2500,28 @@ fn execute_dx12_frame_plan(
                         .compute
                         .as_ref()
                         .ok_or(EzGfxResult::InvalidArgument)?;
-                    let NativeShader::Dx12(shader) = &record.native else {
+                    let NativeShader::Dx12(native_shader) = &record.native else {
                         return Err(EzGfxResult::NativeFailure);
                     };
                     let layouts = native_layouts(layout).map_err(map_hal)?;
-                    native
-                        .create_compute_pipeline(shader, compute.0, &layouts)
-                        .map_err(map_hal)?
+                    let key = PipelineKey::Compute {
+                        backend: Backend::Dx12,
+                        shader: *shader,
+                        shader_digest: record.digest,
+                        product: compute.0,
+                        entry: compute.1.clone(),
+                        layouts: pipeline_layout_key(&layouts),
+                    };
+                    let pipeline = if context.pipelines.contains_key(&key) {
+                        None
+                    } else {
+                        Some(NativePipeline::Dx12(
+                            native
+                                .create_compute_pipeline(native_shader, compute.0, &layouts)
+                                .map_err(map_hal)?,
+                        ))
+                    };
+                    (key, pipeline)
                 }
                 ExecutableNode::Graphics {
                     shader,
@@ -2342,26 +2538,57 @@ fn execute_dx12_frame_plan(
                         .graphics
                         .as_ref()
                         .ok_or(EzGfxResult::InvalidArgument)?;
-                    let NativeShader::Dx12(shader) = &record.native else {
+                    let NativeShader::Dx12(native_shader) = &record.native else {
                         return Err(EzGfxResult::NativeFailure);
                     };
                     let layouts = native_layouts(layout).map_err(map_hal)?;
-                    native
-                        .create_graphics_pipeline(
-                            shader,
-                            graphics.0,
-                            graphics.2,
-                            *state,
-                            pipeline_layout.depth_required(),
-                            &layouts,
-                        )
-                        .map_err(map_hal)?
+                    let depth_required = pipeline_layout.depth_required();
+                    let key = PipelineKey::Graphics {
+                        backend: Backend::Dx12,
+                        shader: *shader,
+                        shader_digest: record.digest,
+                        vertex_product: graphics.0,
+                        vertex_entry: graphics.1.clone(),
+                        fragment_product: graphics.2,
+                        fragment_entry: graphics.3.clone(),
+                        texture_heap: None,
+                        layouts: pipeline_layout_key(&layouts),
+                        state: *state,
+                        depth_required,
+                        color_format: 28,
+                        depth_format: if depth_required { 40 } else { 0 },
+                        sample_count: 1,
+                    };
+                    let pipeline = if context.pipelines.contains_key(&key) {
+                        None
+                    } else {
+                        Some(NativePipeline::Dx12(
+                            native
+                                .create_graphics_pipeline(
+                                    native_shader,
+                                    graphics.0,
+                                    graphics.2,
+                                    *state,
+                                    depth_required,
+                                    &layouts,
+                                )
+                                .map_err(map_hal)?,
+                        ))
+                    };
+                    (key, pipeline)
                 }
                 ExecutableNode::TextureReadback { .. } | ExecutableNode::Present { .. } => {
                     continue;
                 }
             };
-            pipelines[node_index] = Some(pipeline);
+            if let Some(pipeline) = pipeline {
+                if context.pipelines.len() == MAX_PIPELINE_CACHE_ENTRIES {
+                    native.wait_idle().map_err(map_hal)?;
+                    context.pipelines.clear();
+                }
+                context.pipelines.insert(key.clone(), pipeline);
+            }
+            pipeline_keys[node_index] = Some(key);
         }
 
         let mut actions = Vec::with_capacity(plan.actions.len());
@@ -2431,16 +2658,26 @@ fn execute_dx12_frame_plan(
                             groups,
                             push_constants,
                             ..
-                        } => actions.push(ez_gfx_backend_dx12::native::NativeFrameAction::Compute(
-                            ez_gfx_backend_dx12::native::NativeComputeDispatch {
-                                pipeline: pipelines[index_node]
-                                    .as_ref()
-                                    .ok_or(EzGfxResult::InvalidArgument)?,
-                                groups: *groups,
-                                push_constants,
-                                bindings: &binding_sets[index_node],
-                            },
-                        )),
+                        } => {
+                            let key = pipeline_keys[index_node]
+                                .as_ref()
+                                .ok_or(EzGfxResult::InvalidArgument)?;
+                            let NativePipeline::Dx12(pipeline) = context
+                                .pipelines
+                                .get(key)
+                                .ok_or(EzGfxResult::NativeFailure)?
+                            else {
+                                return Err(EzGfxResult::NativeFailure);
+                            };
+                            actions.push(ez_gfx_backend_dx12::native::NativeFrameAction::Compute(
+                                ez_gfx_backend_dx12::native::NativeComputeDispatch {
+                                    pipeline,
+                                    groups: *groups,
+                                    push_constants,
+                                    bindings: &binding_sets[index_node],
+                                },
+                            ));
+                        }
                         ExecutableNode::Graphics {
                             indirect,
                             draw_count,
@@ -2455,13 +2692,21 @@ fn execute_dx12_frame_plan(
                             else {
                                 return Err(EzGfxResult::NativeFailure);
                             };
+                            let key = pipeline_keys[index_node]
+                                .as_ref()
+                                .ok_or(EzGfxResult::InvalidArgument)?;
+                            let NativePipeline::Dx12(pipeline) = context
+                                .pipelines
+                                .get(key)
+                                .ok_or(EzGfxResult::NativeFailure)?
+                            else {
+                                return Err(EzGfxResult::NativeFailure);
+                            };
                             actions.push(ez_gfx_backend_dx12::native::NativeFrameAction::Graphics(
                                 ez_gfx_backend_dx12::native::NativeDrawIndexed {
                                     width: extent.0,
                                     height: extent.1,
-                                    pipeline: pipelines[index_node]
-                                        .as_ref()
-                                        .ok_or(EzGfxResult::InvalidArgument)?,
+                                    pipeline,
                                     index_buffer: index.ok_or(EzGfxResult::NotReady)?,
                                     indirect_buffer: indirect,
                                     draw_count: *draw_count,
@@ -2591,6 +2836,135 @@ fn execute_metal_frame_plan(
         None => None,
     };
 
+    let NativeContext::Metal(native) = &mut context.native else {
+        return Err(EzGfxResult::NativeFailure);
+    };
+    let mut pipeline_keys = vec![None; payloads.len()];
+    let mut texture_heaps = vec![None; payloads.len()];
+    for (node_index, payload) in payloads.iter().enumerate() {
+        let (key, pipeline) = match payload {
+            ExecutableNode::Compute { shader, layout, .. } => {
+                let record = context
+                    .shaders
+                    .get(shader)
+                    .ok_or(EzGfxResult::InvalidContext)?;
+                let compute = record
+                    .compute
+                    .as_ref()
+                    .ok_or(EzGfxResult::InvalidArgument)?;
+                let NativeShader::Metal(native_shader) = &record.native else {
+                    return Err(EzGfxResult::NativeFailure);
+                };
+                let layouts = native_layouts(layout).map_err(map_hal)?;
+                let key = PipelineKey::Compute {
+                    backend: Backend::Metal,
+                    shader: *shader,
+                    shader_digest: record.digest,
+                    product: compute.0,
+                    entry: compute.1.clone(),
+                    layouts: pipeline_layout_key(&layouts),
+                };
+                let pipeline = if context.pipelines.contains_key(&key) {
+                    None
+                } else {
+                    Some(NativePipeline::Metal(
+                        native
+                            .create_compute_pipeline(native_shader, compute.0, &compute.1)
+                            .map_err(map_hal)?,
+                    ))
+                };
+                (key, pipeline)
+            }
+            ExecutableNode::Graphics {
+                shader,
+                layout,
+                pipeline_layout,
+                state,
+                ..
+            } => {
+                let record = context
+                    .shaders
+                    .get(shader)
+                    .ok_or(EzGfxResult::InvalidContext)?;
+                let graphics = record
+                    .graphics
+                    .as_ref()
+                    .ok_or(EzGfxResult::InvalidArgument)?;
+                let NativeShader::Metal(native_shader) = &record.native else {
+                    return Err(EzGfxResult::NativeFailure);
+                };
+                let layouts = native_layouts(layout).map_err(map_hal)?;
+                let texture_heap = pipeline_layout
+                    .texture_heap()
+                    .map(|layout| {
+                        ez_gfx_hal::ShaderTextureHeapLayout::new(
+                            layout.space,
+                            layout.binding,
+                            layout.capacity,
+                            layout.argument_stride,
+                            layout.texture_argument_offset,
+                            layout.sampler_argument_offset,
+                        )
+                    })
+                    .transpose()
+                    .map_err(map_hal)?;
+                let depth_required = pipeline_layout.depth_required();
+                let key = PipelineKey::Graphics {
+                    backend: Backend::Metal,
+                    shader: *shader,
+                    shader_digest: record.digest,
+                    vertex_product: graphics.0,
+                    vertex_entry: graphics.1.clone(),
+                    fragment_product: graphics.2,
+                    fragment_entry: graphics.3.clone(),
+                    layouts: pipeline_layout_key(&layouts),
+                    texture_heap,
+                    state: *state,
+                    depth_required,
+                    color_format: 80,
+                    depth_format: if depth_required { 252 } else { 0 },
+                    sample_count: 1,
+                };
+                let pipeline = if context.pipelines.contains_key(&key) {
+                    None
+                } else {
+                    Some(NativePipeline::Metal(
+                        native
+                            .create_graphics_pipeline(
+                                native_shader,
+                                graphics,
+                                *state,
+                                depth_required,
+                                texture_heap,
+                            )
+                            .map_err(map_hal)?,
+                    ))
+                };
+                texture_heaps[node_index] = texture_heap;
+                (key, pipeline)
+            }
+            ExecutableNode::TextureReadback { .. } | ExecutableNode::Present { .. } => continue,
+        };
+        if let Some(pipeline) = pipeline {
+            if context.pipelines.len() == MAX_PIPELINE_CACHE_ENTRIES {
+                native.wait_idle().map_err(map_hal)?;
+                let stale = context
+                    .pipelines
+                    .drain()
+                    .map(|(_, pipeline)| pipeline)
+                    .collect::<Vec<_>>();
+                for pipeline in stale {
+                    let NativePipeline::Metal(pipeline) = pipeline else {
+                        return Err(EzGfxResult::NativeFailure);
+                    };
+                    native.destroy_pipeline(pipeline);
+                }
+            }
+            context.pipelines.insert(key.clone(), pipeline);
+        }
+        pipeline_keys[node_index] = Some(key);
+    }
+
     let mut actions = Vec::with_capacity(plan.actions.len());
     for action in &plan.actions {
         match action {
@@ -2655,24 +3029,21 @@ fn execute_metal_frame_plan(
                     .ok_or(EzGfxResult::InvalidArgument)?;
                 match payload {
                     ExecutableNode::Graphics {
-                        shader,
                         indirect,
                         draw_count,
-                        layout: _,
                         pipeline_layout,
                         state,
                         push_constants,
                         ..
                     } => {
-                        let record = context
-                            .shaders
-                            .get(shader)
-                            .ok_or(EzGfxResult::InvalidContext)?;
-                        let graphics = record
-                            .graphics
+                        let key = pipeline_keys[index_node]
                             .as_ref()
                             .ok_or(EzGfxResult::InvalidArgument)?;
-                        let NativeShader::Metal(shader) = &record.native else {
+                        let NativePipeline::Metal(pipeline) = context
+                            .pipelines
+                            .get(key)
+                            .ok_or(EzGfxResult::NativeFailure)?
+                        else {
                             return Err(EzGfxResult::NativeFailure);
                         };
                         let NativeAllocation::Metal(indirect) = &context
@@ -2683,24 +3054,10 @@ fn execute_metal_frame_plan(
                         else {
                             return Err(EzGfxResult::NativeFailure);
                         };
-                        let texture_heap = pipeline_layout
-                            .texture_heap()
-                            .map(|layout| {
-                                ez_gfx_hal::ShaderTextureHeapLayout::new(
-                                    layout.space,
-                                    layout.binding,
-                                    layout.capacity,
-                                    layout.argument_stride,
-                                    layout.texture_argument_offset,
-                                    layout.sampler_argument_offset,
-                                )
-                            })
-                            .transpose()
-                            .map_err(map_hal)?;
+                        let texture_heap = texture_heaps[index_node];
                         actions.push(ez_gfx_backend_metal::native::NativeFrameAction::Graphics(
                             ez_gfx_backend_metal::native::NativeGraphicsDraw {
-                                shader,
-                                graphics,
+                                pipeline,
                                 depth_required: pipeline_layout.depth_required(),
                                 texture_heap,
                                 state: *state,
@@ -2714,27 +3071,23 @@ fn execute_metal_frame_plan(
                         ));
                     }
                     ExecutableNode::Compute {
-                        shader,
                         groups,
                         push_constants,
                         ..
                     } => {
-                        let record = context
-                            .shaders
-                            .get(shader)
-                            .ok_or(EzGfxResult::InvalidContext)?;
-                        let (product, entry) = record
-                            .compute
+                        let key = pipeline_keys[index_node]
                             .as_ref()
                             .ok_or(EzGfxResult::InvalidArgument)?;
-                        let NativeShader::Metal(shader) = &record.native else {
+                        let NativePipeline::Metal(pipeline) = context
+                            .pipelines
+                            .get(key)
+                            .ok_or(EzGfxResult::NativeFailure)?
+                        else {
                             return Err(EzGfxResult::NativeFailure);
                         };
                         actions.push(ez_gfx_backend_metal::native::NativeFrameAction::Compute(
                             ez_gfx_backend_metal::native::NativeComputeDispatch {
-                                shader,
-                                product_index: *product,
-                                entry,
+                                pipeline,
                                 groups: *groups,
                                 push_constants,
                                 bindings: &binding_sets[index_node],
@@ -2852,6 +3205,22 @@ fn native_layouts(
             )
         })
         .collect()
+}
+
+fn pipeline_layout_key(
+    layouts: &[ez_gfx_hal::ShaderBufferLayout],
+) -> Vec<ez_gfx_hal::ShaderBufferLayout> {
+    // Reflection order is not semantic; physical descriptor coordinates define interface identity.
+    let mut key = layouts.to_vec();
+    key.sort_unstable_by_key(|layout| {
+        (
+            layout.space,
+            layout.binding,
+            layout.descriptor_count,
+            layout.writable,
+        )
+    });
+    key
 }
 
 fn vulkan_bindings<'a>(
@@ -3118,5 +3487,64 @@ fn map_hal(error: HalError) -> EzGfxResult {
         HalError::NotReady => EzGfxResult::NotReady,
         HalError::DeviceLost => EzGfxResult::DeviceLost,
         HalError::OutOfMemory | HalError::NativeFailure => EzGfxResult::NativeFailure,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[test]
+    fn pipeline_layout_keys_ignore_reflection_order() {
+        let first = ez_gfx_hal::ShaderBufferLayout::new(0, 3, 1, false).unwrap();
+        let second = ez_gfx_hal::ShaderBufferLayout::new(0, 1, 2, true).unwrap();
+
+        assert_eq!(
+            pipeline_layout_key(&[first, second]),
+            pipeline_layout_key(&[second, first])
+        );
+    }
+
+    #[test]
+    fn graphics_pipeline_keys_include_state_attachment_and_texture_interface() {
+        let state = DynamicPipelineState::from_abi(2, 0, 0, 0).unwrap();
+        let key = PipelineKey::Graphics {
+            backend: Backend::Vulkan,
+            shader: 7,
+            shader_digest: [1; 32],
+            vertex_product: 0,
+            vertex_entry: "vertexmain".to_owned(),
+            fragment_product: 1,
+            fragment_entry: "fragmentmain".to_owned(),
+            texture_heap: None,
+            layouts: Vec::new(),
+            state,
+            depth_required: false,
+            color_format: 44,
+            depth_format: 0,
+            sample_count: 1,
+        };
+        let mut changed_state = key.clone();
+        let PipelineKey::Graphics { state, .. } = &mut changed_state else {
+            unreachable!()
+        };
+        state.blend = ez_gfx_hal::BlendMode::Alpha;
+        let mut changed_format = key.clone();
+        let PipelineKey::Graphics { color_format, .. } = &mut changed_format else {
+            unreachable!()
+        };
+        *color_format = 50;
+        let mut changed_heap = key.clone();
+        let PipelineKey::Graphics { texture_heap, .. } = &mut changed_heap else {
+            unreachable!()
+        };
+        *texture_heap = Some(ez_gfx_hal::ShaderTextureHeapLayout::new(0, 4, 16, 2, 0, 1).unwrap());
+
+        assert_eq!(
+            HashSet::from([key, changed_state, changed_format, changed_heap]).len(),
+            4
+        );
     }
 }

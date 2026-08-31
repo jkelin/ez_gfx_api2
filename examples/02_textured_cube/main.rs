@@ -11,7 +11,7 @@ use ez_gfx_ffi::{
     ez_gfx_context_create_backend, ez_gfx_context_destroy, ez_gfx_context_init_device,
     ez_gfx_context_wait_idle, ez_gfx_finish_render, ez_gfx_frame_readback, ez_gfx_poll_diagnostic,
     ez_gfx_poll_runtime_event, ez_gfx_surface_create, ez_gfx_surface_destroy,
-    ez_gfx_surface_resize,
+    ez_gfx_surface_resize, ez_gfx_surface_set_snapshot_cache,
 };
 use winit::{
     application::ApplicationHandler,
@@ -251,8 +251,26 @@ impl ApplicationHandler for App {
             return self.fail(event_loop, "macOS example host requires Metal backend");
         }
         let context_desc = EzGfxBackendContextDesc {
-            enable_debug: 1,
-            enable_validation: 1,
+            enable_debug: match std::env::var("EZ_GFX_EXAMPLE_DEBUG").ok().as_deref() {
+                None | Some("0") => 0,
+                Some("1") => 1,
+                Some(value) => {
+                    return self.fail(
+                        event_loop,
+                        format!("EZ_GFX_EXAMPLE_DEBUG must be 0 or 1, got `{value}`"),
+                    );
+                }
+            },
+            enable_validation: match std::env::var("EZ_GFX_EXAMPLE_VALIDATION").ok().as_deref() {
+                None | Some("0") => 0,
+                Some("1") => 1,
+                Some(value) => {
+                    return self.fail(
+                        event_loop,
+                        format!("EZ_GFX_EXAMPLE_VALIDATION must be 0 or 1, got `{value}`"),
+                    );
+                }
+            },
             surface_platform: host.desc.platform,
             backend,
         };
@@ -351,6 +369,17 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                let terminal_frame = self
+                    .frame_limit
+                    .is_some_and(|limit| self.frames.saturating_add(1) >= limit);
+                if terminal_frame {
+                    if let Err(error) = status(
+                        ez_gfx_surface_set_snapshot_cache(self.surface, 1, self.context),
+                        "enable terminal snapshot cache",
+                    ) {
+                        return self.fail(event_loop, error);
+                    }
+                }
                 let delta_seconds = self.last_frame.elapsed().as_secs_f32();
                 self.last_frame = Instant::now();
                 let result = self

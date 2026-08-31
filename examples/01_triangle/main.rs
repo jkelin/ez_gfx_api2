@@ -11,7 +11,7 @@ use ez_gfx_ffi::{
     ez_gfx_context_create_backend, ez_gfx_context_destroy, ez_gfx_context_init_device,
     ez_gfx_context_wait_idle, ez_gfx_finish_render, ez_gfx_frame_readback, ez_gfx_poll_diagnostic,
     ez_gfx_poll_runtime_event, ez_gfx_surface_create, ez_gfx_surface_destroy,
-    ez_gfx_surface_resize,
+    ez_gfx_surface_resize, ez_gfx_surface_set_snapshot_cache,
 };
 use winit::{
     application::ApplicationHandler,
@@ -39,6 +39,56 @@ fn parse_backend(value: Option<&str>) -> Result<(u8, &'static str), String> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BenchmarkConfig {
+    warmup_frames: u32,
+    measured_frames: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BenchmarkReport {
+    pub warmup_frames: u32,
+    pub measured_frames: u32,
+    pub elapsed_ns: u128,
+}
+
+fn parse_positive_env(value: Option<&str>, name: &str, default: u32) -> Result<u32, String> {
+    // Zero and malformed values are rejected so a benchmark cannot silently measure nothing.
+    let value = value.unwrap_or("");
+    if value.is_empty() {
+        return Ok(default);
+    }
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| format!("{name} must be a positive integer"))?;
+    (parsed > 0)
+        .then_some(parsed)
+        .ok_or_else(|| format!("{name} must be positive"))
+}
+
+fn parse_benchmark(
+    enabled: Option<&str>,
+    warmup: Option<&str>,
+    measured: Option<&str>,
+) -> Result<Option<BenchmarkConfig>, String> {
+    if enabled != Some("1") {
+        return Ok(None);
+    }
+    Ok(Some(BenchmarkConfig {
+        warmup_frames: parse_positive_env(warmup, "EZ_GFX_EXAMPLE_BENCHMARK_WARMUP", 120)?,
+        measured_frames: parse_positive_env(measured, "EZ_GFX_EXAMPLE_BENCHMARK_FRAMES", 600)?,
+    }))
+}
+
+fn benchmark_frame_limit(config: BenchmarkConfig) -> Result<u32, String> {
+    // The extra frame is deliberately outside timing so readback cannot affect throughput.
+    config
+        .warmup_frames
+        .checked_add(config.measured_frames)
+        .and_then(|frames| frames.checked_add(1))
+        .ok_or_else(|| "benchmark frame counts exceed u32 limit".to_owned())
+}
+
 #[derive(Debug)]
 pub struct PresentedReport {
     pub width: u32,
@@ -48,10 +98,18 @@ pub struct PresentedReport {
     pub runtime_events: u32,
     pub diagnostics: u32,
     pub dropped_observations: u64,
+    pub benchmark: Option<BenchmarkReport>,
 }
 
 /// The default is interactive; a positive limit produces a deterministic automation run.
 pub fn run_example(frame_limit: Option<u32>) -> Result<Option<PresentedReport>, String> {
+    run_example_with_benchmark(frame_limit, None)
+}
+
+fn run_example_with_benchmark(
+    frame_limit: Option<u32>,
+    benchmark: Option<BenchmarkConfig>,
+) -> Result<Option<PresentedReport>, String> {
     if frame_limit == Some(0) {
         return Err("frame limit must be positive".to_owned());
     }
@@ -61,7 +119,7 @@ pub fn run_example(frame_limit: Option<u32>) -> Result<Option<PresentedReport>, 
     }
     let event_loop = EventLoop::new().map_err(|error| error.to_string())?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(frame_limit);
+    let mut app = App::new(frame_limit, benchmark);
     event_loop
         .run_app(&mut app)
         .map_err(|error| error.to_string())?;
@@ -74,6 +132,9 @@ pub fn run_example(frame_limit: Option<u32>) -> Result<Option<PresentedReport>, 
 
 struct App {
     frame_limit: Option<u32>,
+    benchmark: Option<BenchmarkConfig>,
+    benchmark_started: Option<Instant>,
+    benchmark_report: Option<BenchmarkReport>,
     window: Option<Window>,
     host: Option<HostSurface>,
     resources: Option<Triangle>,
@@ -89,10 +150,13 @@ struct App {
 
 impl App {
     // Before resumed there are no native resources; cleanup therefore remains idempotent.
-    fn new(frame_limit: Option<u32>) -> Self {
+    fn new(frame_limit: Option<u32>, benchmark: Option<BenchmarkConfig>) -> Self {
         Self {
             host: None,
             frame_limit,
+            benchmark,
+            benchmark_started: None,
+            benchmark_report: None,
             window: None,
             context: 0,
             surface: 0,
@@ -251,8 +315,26 @@ impl ApplicationHandler for App {
             return self.fail(event_loop, "macOS example host requires Metal backend");
         }
         let context_desc = EzGfxBackendContextDesc {
-            enable_debug: 1,
-            enable_validation: 1,
+            enable_debug: match std::env::var("EZ_GFX_EXAMPLE_DEBUG").ok().as_deref() {
+                None | Some("0") => 0,
+                Some("1") => 1,
+                Some(value) => {
+                    return self.fail(
+                        event_loop,
+                        format!("EZ_GFX_EXAMPLE_DEBUG must be 0 or 1, got `{value}`"),
+                    );
+                }
+            },
+            enable_validation: match std::env::var("EZ_GFX_EXAMPLE_VALIDATION").ok().as_deref() {
+                None | Some("0") => 0,
+                Some("1") => 1,
+                Some(value) => {
+                    return self.fail(
+                        event_loop,
+                        format!("EZ_GFX_EXAMPLE_VALIDATION must be 0 or 1, got `{value}`"),
+                    );
+                }
+            },
             surface_platform: host.desc.platform,
             backend,
         };
@@ -351,6 +433,22 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                if let Some(config) = self.benchmark
+                    && self.frames == config.warmup_frames
+                {
+                    self.benchmark_started = Some(Instant::now());
+                }
+                let terminal_frame = self
+                    .frame_limit
+                    .is_some_and(|limit| self.frames.saturating_add(1) >= limit);
+                if terminal_frame {
+                    if let Err(error) = status(
+                        ez_gfx_surface_set_snapshot_cache(self.surface, 1, self.context),
+                        "enable terminal snapshot cache",
+                    ) {
+                        return self.fail(event_loop, error);
+                    }
+                }
                 let delta_seconds = self.last_frame.elapsed().as_secs_f32();
                 self.last_frame = Instant::now();
                 let result = self
@@ -377,6 +475,20 @@ impl ApplicationHandler for App {
                     return self.fail(event_loop, error);
                 }
                 self.frames += 1;
+                if let Some(config) = self.benchmark
+                    && self.frames == config.warmup_frames + config.measured_frames
+                {
+                    let elapsed_ns = self
+                        .benchmark_started
+                        .expect("benchmark start set before measured frames")
+                        .elapsed()
+                        .as_nanos();
+                    self.benchmark_report = Some(BenchmarkReport {
+                        warmup_frames: config.warmup_frames,
+                        measured_frames: config.measured_frames,
+                        elapsed_ns,
+                    });
+                }
                 if self.frame_limit.is_some_and(|limit| self.frames >= limit) {
                     match self.capture().and_then(|rgba8| {
                         self.drain_observability()
@@ -391,6 +503,7 @@ impl ApplicationHandler for App {
                                 runtime_events,
                                 diagnostics,
                                 dropped_observations,
+                                benchmark: self.benchmark_report,
                             })
                         }
                         Err(error) => self.error = Some(error),
@@ -435,7 +548,29 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let report = run_example(frame_limit).unwrap_or_else(|error| {
+    let benchmark = match parse_benchmark(
+        std::env::var("EZ_GFX_EXAMPLE_BENCHMARK").ok().as_deref(),
+        std::env::var("EZ_GFX_EXAMPLE_BENCHMARK_WARMUP")
+            .ok()
+            .as_deref(),
+        std::env::var("EZ_GFX_EXAMPLE_BENCHMARK_FRAMES")
+            .ok()
+            .as_deref(),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
+    let frame_limit = match benchmark {
+        Some(config) => Some(benchmark_frame_limit(config).unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(2);
+        })),
+        None => frame_limit,
+    };
+    let report = run_example_with_benchmark(frame_limit, benchmark).unwrap_or_else(|error| {
         eprintln!("example failed: {error}");
         std::process::exit(1)
     });
@@ -472,12 +607,52 @@ fn main() {
                 report.dropped_observations
             );
         }
+        if let Some(benchmark) = report.benchmark {
+            let frame_time_ns = benchmark.elapsed_ns as f64 / f64::from(benchmark.measured_frames);
+            let fps = 1_000_000_000.0 / frame_time_ns;
+            let backend = std::env::var("EZ_GFX_BACKEND").unwrap_or_else(|_| "vulkan".to_owned());
+            println!(
+                "{{\"benchmark\":\"01_triangle\",\"backend\":\"{backend}\",\"warmup_frames\":{},\"measured_frames\":{},\"elapsed_ns\":{},\"frame_time_ns\":{frame_time_ns:.3},\"fps\":{fps:.3}}}",
+                benchmark.warmup_frames, benchmark.measured_frames, benchmark.elapsed_ns,
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_backend;
+    use super::{BenchmarkConfig, benchmark_frame_limit, parse_backend, parse_benchmark};
+
+    #[test]
+    fn benchmark_arguments_default_and_validate() {
+        assert_eq!(
+            parse_benchmark(Some("1"), None, None)
+                .unwrap()
+                .map(|config| (config.warmup_frames, config.measured_frames)),
+            Some((120, 600))
+        );
+        assert!(parse_benchmark(Some("1"), Some("0"), Some("2")).is_err());
+        assert!(parse_benchmark(Some("1"), Some("bad"), Some("2")).is_err());
+        assert_eq!(parse_benchmark(Some("0"), Some("bad"), None).unwrap(), None);
+    }
+
+    #[test]
+    fn benchmark_limit_includes_capture_frame_and_checks_overflow() {
+        assert_eq!(
+            benchmark_frame_limit(BenchmarkConfig {
+                warmup_frames: 2,
+                measured_frames: 3,
+            }),
+            Ok(6)
+        );
+        assert!(
+            benchmark_frame_limit(BenchmarkConfig {
+                warmup_frames: u32::MAX,
+                measured_frames: 1,
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn backend_selection_defaults_and_validates() {

@@ -1,5 +1,6 @@
 use ez_gfx_hal::{
-    AllocationError, AllocationRequest, BufferRange, ImageSubresources, MemoryClass, QueueKind,
+    AllocationBlockPolicy, AllocationBlockPolicyError, AllocationError, AllocationRequest,
+    BufferRange, DEFAULT_ALLOCATION_BLOCK_POLICY, ImageSubresources, MemoryClass, QueueKind,
     ResourceAccess, ResourceState, ShaderStage,
 };
 
@@ -23,6 +24,28 @@ fn allocation_request_validates_size_alignment_mapping_and_alias_lifetime() {
     );
     assert!(AllocationRequest::new(64, 16, MemoryClass::Upload, true, None).is_ok());
     assert!(AllocationRequest::new(64, 16, MemoryClass::Transient, false, Some(7)).is_ok());
+}
+
+#[test]
+fn allocation_block_policy_validates_boundaries_and_exposes_bounded_growth() {
+    const MIB: u64 = 1024 * 1024;
+
+    assert_eq!(
+        DEFAULT_ALLOCATION_BLOCK_POLICY,
+        AllocationBlockPolicy::new(16 * MIB, 256 * MIB, 8 * MIB, 64 * MIB).unwrap()
+    );
+    assert_eq!(
+        AllocationBlockPolicy::new(0, 256 * MIB, 8 * MIB, 64 * MIB),
+        Err(AllocationBlockPolicyError::ZeroSize)
+    );
+    assert_eq!(
+        AllocationBlockPolicy::new(6 * MIB, 256 * MIB, 8 * MIB, 64 * MIB),
+        Err(AllocationBlockPolicyError::InvalidAlignment)
+    );
+    assert_eq!(
+        AllocationBlockPolicy::new(32 * MIB, 16 * MIB, 8 * MIB, 64 * MIB),
+        Err(AllocationBlockPolicyError::InvalidRange)
+    );
 }
 
 #[test]
