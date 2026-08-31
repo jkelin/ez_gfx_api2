@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 use std::ffi::CString;
 
 use ez_gfx_artifact::{Stage, Target};
@@ -9,6 +11,7 @@ use ez_gfx_ffi::{
     ez_gfx_shader_destroy, ez_gfx_shader_load_artifact, ez_gfx_structured_acquire,
     ez_gfx_structured_release, ez_gfx_structured_write,
 };
+#[cfg(windows)]
 #[test]
 fn vulkan_compiles_binds_and_executes_compute_pipeline() {
     run_compute_pipeline(1);

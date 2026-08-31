@@ -13,10 +13,11 @@ pub mod native {
         AdapterCapabilities, AdapterClass, AdapterInfo, CompressionSupport, SemanticProfile,
     };
     use ez_gfx_hal::{
-        AllocationError, AllocationRequest, BlendMode, BufferTransfer, CompletionToken, CullMode,
-        DynamicPipelineState, FrontFace, HalError, ImageMip, MemoryAllocator, MemoryClass,
-        PrimitiveTopology, QueueKind, SamplerAddressMode, SamplerFilter, ShaderBufferLayout,
-        TextureSamplerDesc, validate_rgba8_mips,
+        AllocationError, AllocationRequest, AttachmentLoadOp, AttachmentStoreOp, BlendMode,
+        BufferTransfer, CompletionToken, CullMode, DynamicPipelineState, ExecutionBarrier,
+        ExecutionPass, FrontFace, HalError, ImageMip, MemoryAllocator, MemoryClass,
+        PrimitiveTopology, QueueKind, ResourceAccess, SamplerAddressMode, SamplerFilter,
+        ShaderBufferLayout, TextureSamplerDesc, validate_rgba8_mips,
     };
     use gpu_allocator::{
         MemoryLocation,
@@ -53,17 +54,23 @@ pub mod native {
         D3D12_RASTERIZER_DESC, D3D12_RENDER_TARGET_BLEND_DESC, D3D12_RESOURCE_BARRIER,
         D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
         D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-        D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-        D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET,
-        D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_ROOT_CONSTANTS, D3D12_ROOT_DESCRIPTOR,
-        D3D12_ROOT_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0,
-        D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-        D3D12_ROOT_PARAMETER_TYPE_SRV, D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_ROOT_SIGNATURE_DESC,
+        D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_READ,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_INDEX_BUFFER,
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT,
+        D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATES, D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_RESOURCE_UAV_BARRIER,
+        D3D12_ROOT_CONSTANTS, D3D12_ROOT_DESCRIPTOR, D3D12_ROOT_DESCRIPTOR_TABLE,
+        D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER_TYPE_SRV,
+        D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_ROOT_SIGNATURE_DESC,
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
         D3D12_ROOT_SIGNATURE_FLAG_NONE, D3D12_SAMPLER_DESC, D3D12_SHADER_BYTECODE,
         D3D12_SHADER_VISIBILITY_ALL, D3D12_STENCIL_OP_KEEP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
         D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_COPY_LOCATION,
-        D3D12_TEXTURE_COPY_LOCATION_0, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_VIEWPORT,
+        D3D12_TEXTURE_COPY_LOCATION_0, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_VIEWPORT,
         D3D12SerializeRootSignature, ID3D12CommandSignature, ID3D12DescriptorHeap,
         ID3D12PipelineState, ID3D12RootSignature,
     };
@@ -80,10 +87,10 @@ pub mod native {
                     D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_NONE,
                     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_GENERIC_READ,
-                    D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12CreateDevice, ID3D12CommandAllocator,
-                    ID3D12CommandList, ID3D12CommandQueue, ID3D12Device, ID3D12Fence,
-                    ID3D12GraphicsCommandList, ID3D12Resource,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    D3D12CreateDevice, ID3D12CommandAllocator, ID3D12CommandList,
+                    ID3D12CommandQueue, ID3D12Device, ID3D12Fence, ID3D12GraphicsCommandList,
+                    ID3D12Resource,
                 },
                 Dxgi::{
                     Common::{
@@ -122,7 +129,38 @@ pub mod native {
         pub draw_count: u32,
         pub push_constants: &'a [u8],
         pub bindings: &'a [NativeBufferBinding<'a>],
-        pub capture_presented: bool,
+    }
+
+    pub struct NativeComputeDispatch<'a> {
+        pub pipeline: &'a NativePipeline,
+        pub groups: [u32; 3],
+        pub push_constants: &'a [u8],
+        pub bindings: &'a [NativeBufferBinding<'a>],
+    }
+
+    pub enum NativeFrameResource<'a> {
+        Buffer(&'a NativeAllocation),
+        Texture(&'a NativeTexture),
+        Surface,
+        Depth,
+    }
+
+    pub enum NativeFrameAction<'a> {
+        Wait(CompletionToken),
+        Barrier {
+            barrier: ExecutionBarrier,
+            resource: NativeFrameResource<'a>,
+        },
+        BeginPass(&'a ExecutionPass),
+        Compute(NativeComputeDispatch<'a>),
+        Graphics(NativeDrawIndexed<'a>),
+        TextureReadback {
+            texture: &'a NativeTexture,
+            width: u32,
+            height: u32,
+        },
+        EndPass,
+        Present,
     }
 
     pub struct NativeShader {
@@ -141,7 +179,6 @@ pub mod native {
         topology: Option<D3D_PRIMITIVE_TOPOLOGY>,
         signature: Option<ID3D12CommandSignature>,
         buffer_writable: Vec<bool>,
-        depth_required: bool,
     }
 
     pub struct NativeTexture {
@@ -813,7 +850,6 @@ pub mod native {
                 topology: None,
                 signature: None,
                 buffer_writable,
-                depth_required: false,
             })
         }
 
@@ -968,161 +1004,199 @@ pub mod native {
                 topology: Some(topology),
                 signature,
                 buffer_writable,
-                depth_required,
             })
         }
 
-        /// Dispatches a validated compute grid and waits before transient PSO destruction.
-        pub fn dispatch_compute(
+        /// Records one immutable graph plan into one command list and presents after every action.
+        pub fn execute_frame(
             &mut self,
-            pipeline: &NativePipeline,
-            groups: [u32; 3],
-            push_constants: &[u8],
-            bindings: &[NativeBufferBinding<'_>],
-        ) -> Result<(), HalError> {
-            if groups.contains(&0)
-                || push_constants.len() > 128
-                || push_constants.len() % 4 != 0
-                || bindings.len() != pipeline.buffer_writable.len()
-            {
+            surface: Option<(&mut NativeSurface, (u32, u32))>,
+            actions: &[NativeFrameAction<'_>],
+            capture_presented: bool,
+        ) -> Result<Vec<Vec<u8>>, HalError> {
+            if actions.is_empty() {
                 return Err(HalError::InvalidArgument);
             }
-            let allocator: ID3D12CommandAllocator = unsafe {
-                self.device
-                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-            }
-            .map_err(map_windows)?;
-            let list: ID3D12GraphicsCommandList = unsafe {
-                self.device.CreateCommandList(
-                    0,
-                    D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    &allocator,
-                    &pipeline.state,
-                )
-            }
-            .map_err(map_windows)?;
-            unsafe {
-                list.SetComputeRootSignature(&pipeline.root);
-                list.SetDescriptorHeaps(&[
-                    Some(self.descriptors.clone()),
-                    Some(self.samplers.clone()),
-                ]);
-                let table = pipeline.buffer_writable.len() as u32 + 1;
-                list.SetComputeRootDescriptorTable(
-                    table,
-                    self.descriptors.GetGPUDescriptorHandleForHeapStart(),
-                );
-                list.SetComputeRootDescriptorTable(
-                    table + 1,
-                    self.samplers.GetGPUDescriptorHandleForHeapStart(),
-                );
-                if !push_constants.is_empty() {
-                    list.SetComputeRoot32BitConstants(
-                        0,
-                        push_constants.len() as u32 / 4,
-                        push_constants.as_ptr().cast(),
-                        0,
-                    );
+            let (mut surface, extent) = match surface {
+                Some((surface, extent)) if extent.0 != 0 && extent.1 != 0 => {
+                    (Some(surface), extent)
                 }
-                for (index, (binding, writable)) in
-                    bindings.iter().zip(&pipeline.buffer_writable).enumerate()
-                {
-                    if binding.writable != *writable
-                        || binding.offset >= binding.allocation.allocation.size()
-                    {
-                        return Err(HalError::InvalidArgument);
-                    }
-                    let address = binding
-                        .allocation
-                        .resource
-                        .GetGPUVirtualAddress()
-                        .checked_add(binding.offset)
-                        .ok_or(HalError::InvalidArgument)?;
-                    if *writable {
-                        list.SetComputeRootUnorderedAccessView(index as u32 + 1, address);
-                    } else {
-                        list.SetComputeRootShaderResourceView(index as u32 + 1, address);
-                    }
-                }
-                list.Dispatch(groups[0], groups[1], groups[2]);
-                list.Close().map_err(map_windows)?;
-                self.queue
-                    .ExecuteCommandLists(&[Some(list.cast().map_err(map_windows)?)]);
-            }
-            self.wait_idle()
-        }
-        /// Snapshot-disabled frames avoid readback allocation and copying; enabled frames cache tightly packed RGBA8.
-        pub fn draw_indexed_present(
-            &mut self,
-            surface: &mut NativeSurface,
-            request: NativeDrawIndexed<'_>,
-        ) -> Result<(), HalError> {
-            let NativeDrawIndexed {
-                width,
-                height,
-                pipeline,
-                index_buffer,
-                indirect_buffer,
-                draw_count,
-                push_constants,
-                bindings,
-                capture_presented,
-            } = request;
-            if draw_count == 0
-                || push_constants.len() > 128
-                || push_constants.len() % 4 != 0
-                || bindings.len() != pipeline.buffer_writable.len()
-            {
-                return Err(HalError::InvalidArgument);
-            }
-            let topology = pipeline.topology.ok_or(HalError::InvalidArgument)?;
-            let signature = pipeline
-                .signature
-                .as_ref()
-                .ok_or(HalError::InvalidArgument)?;
-            let index_size = u32::try_from(index_buffer.allocation.size())
-                .map_err(|_| HalError::InvalidArgument)?;
-            let binding_addresses = bindings
+                Some(_) => return Err(HalError::InvalidArgument),
+                None => (None, (0, 0)),
+            };
+            let present_count = actions
                 .iter()
-                .zip(&pipeline.buffer_writable)
-                .map(|(binding, writable)| {
-                    if binding.writable != *writable
-                        || binding.offset >= binding.allocation.allocation.size()
-                    {
-                        return Err(HalError::InvalidArgument);
+                .filter(|action| matches!(action, NativeFrameAction::Present))
+                .count();
+            let presents = present_count == 1;
+            let uses_surface = actions.iter().any(|action| {
+                matches!(
+                    action,
+                    NativeFrameAction::BeginPass(_)
+                        | NativeFrameAction::Graphics(_)
+                        | NativeFrameAction::Present
+                        | NativeFrameAction::Barrier {
+                            resource: NativeFrameResource::Surface | NativeFrameResource::Depth,
+                            ..
+                        }
+                )
+            });
+            if present_count > 1
+                || uses_surface && surface.is_none()
+                || (uses_surface || capture_presented) && !presents
+            {
+                return Err(HalError::InvalidArgument);
+            }
+            let external_waits = actions
+                .iter()
+                .filter_map(|action| match action {
+                    NativeFrameAction::Wait(token) if token.queue == QueueKind::Transfer => {
+                        Some(Ok(token.value))
                     }
-                    unsafe { binding.allocation.resource.GetGPUVirtualAddress() }
-                        .checked_add(binding.offset)
-                        .ok_or(HalError::InvalidArgument)
+                    NativeFrameAction::Wait(_) => Some(Err(HalError::InvalidArgument)),
+                    _ => None,
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            self.ensure_swapchain(surface, width, height)?;
-            if pipeline.depth_required {
-                self.ensure_surface_depth(surface)?;
+            let mut pass_active = false;
+            let mut saw_present = false;
+            for action in actions {
+                if saw_present {
+                    return Err(HalError::InvalidArgument);
+                }
+                match action {
+                    NativeFrameAction::Wait(_) | NativeFrameAction::Barrier { .. } => {}
+                    NativeFrameAction::BeginPass(pass) => {
+                        if pass_active
+                            || pass.colors.len() != 1
+                            || pass.samples != 1
+                            || pass.area[0]
+                                .checked_add(pass.area[2])
+                                .is_none_or(|end| end > extent.0)
+                            || pass.area[1]
+                                .checked_add(pass.area[3])
+                                .is_none_or(|end| end > extent.1)
+                        {
+                            return Err(HalError::InvalidArgument);
+                        }
+                        pass_active = true;
+                    }
+                    NativeFrameAction::Compute(dispatch) => {
+                        if pass_active
+                            || dispatch.groups.contains(&0)
+                            || dispatch.push_constants.len() > 128
+                            || !dispatch.push_constants.len().is_multiple_of(4)
+                            || dispatch.bindings.len() != dispatch.pipeline.buffer_writable.len()
+                            || dispatch
+                                .bindings
+                                .iter()
+                                .zip(&dispatch.pipeline.buffer_writable)
+                                .any(|(binding, writable)| {
+                                    binding.writable != *writable
+                                        || binding.offset >= binding.allocation.allocation.size()
+                                })
+                        {
+                            return Err(HalError::InvalidArgument);
+                        }
+                    }
+                    NativeFrameAction::Graphics(draw) => {
+                        let indirect_size = u64::from(draw.draw_count)
+                            .checked_mul(20)
+                            .ok_or(HalError::InvalidArgument)?;
+                        if !pass_active
+                            || draw.draw_count == 0
+                            || draw.push_constants.len() > 128
+                            || !draw.push_constants.len().is_multiple_of(4)
+                            || draw.bindings.len() != draw.pipeline.buffer_writable.len()
+                            || draw.pipeline.topology.is_none()
+                            || draw.pipeline.signature.is_none()
+                            || draw.index_buffer.allocation.size() > u64::from(u32::MAX)
+                            || draw.indirect_buffer.allocation.size() < indirect_size
+                            || draw
+                                .bindings
+                                .iter()
+                                .zip(&draw.pipeline.buffer_writable)
+                                .any(|(binding, writable)| {
+                                    binding.writable != *writable
+                                        || binding.offset >= binding.allocation.allocation.size()
+                                })
+                        {
+                            return Err(HalError::InvalidArgument);
+                        }
+                    }
+                    NativeFrameAction::TextureReadback { width, height, .. } => {
+                        if pass_active || *width == 0 || *height == 0 {
+                            return Err(HalError::InvalidArgument);
+                        }
+                    }
+                    NativeFrameAction::EndPass => {
+                        if !pass_active {
+                            return Err(HalError::InvalidArgument);
+                        }
+                        pass_active = false;
+                    }
+                    NativeFrameAction::Present => {
+                        if pass_active {
+                            return Err(HalError::InvalidArgument);
+                        }
+                        saw_present = true;
+                    }
+                }
             }
-            let swapchain = surface
-                .swapchain
+            if pass_active {
+                return Err(HalError::InvalidArgument);
+            }
+            if uses_surface {
+                self.ensure_swapchain(
+                    surface.as_deref_mut().ok_or(HalError::InvalidArgument)?,
+                    extent.0,
+                    extent.1,
+                )?;
+            }
+            if actions.iter().any(|action| {
+                matches!(
+                    action,
+                    NativeFrameAction::BeginPass(pass) if pass.depth.is_some()
+                )
+            }) {
+                self.ensure_surface_depth(
+                    surface.as_deref_mut().ok_or(HalError::InvalidArgument)?,
+                )?;
+            }
+
+            let surface_resources = surface
                 .as_ref()
-                .ok_or(HalError::NotReady)?
-                .clone();
-            let image_index = unsafe { swapchain.GetCurrentBackBufferIndex() } as usize;
-            let back_buffer = surface
-                .buffers
-                .get(image_index)
-                .ok_or(HalError::NativeFailure)?
-                .clone();
-            let heap = surface.rtv_heap.as_ref().ok_or(HalError::NativeFailure)?;
-            let stride = unsafe {
-                self.device
-                    .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
-            } as usize;
-            let mut rtv = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
-            rtv.ptr += image_index * stride;
-            let dsv = surface
-                .depth
-                .as_ref()
-                .filter(|_| pipeline.depth_required)
-                .map(|depth| unsafe { depth.heap.GetCPUDescriptorHandleForHeapStart() });
+                .map(|surface| {
+                    let swapchain = surface
+                        .swapchain
+                        .as_ref()
+                        .ok_or(HalError::NotReady)?
+                        .clone();
+                    let image_index = unsafe { swapchain.GetCurrentBackBufferIndex() } as usize;
+                    let back_buffer = surface
+                        .buffers
+                        .get(image_index)
+                        .ok_or(HalError::NativeFailure)?
+                        .clone();
+                    let heap = surface.rtv_heap.as_ref().ok_or(HalError::NativeFailure)?;
+                    let stride = unsafe {
+                        self.device
+                            .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
+                    } as usize;
+                    let mut rtv = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+                    rtv.ptr += image_index * stride;
+                    let dsv = surface
+                        .depth
+                        .as_ref()
+                        .map(|depth| unsafe { depth.heap.GetCPUDescriptorHandleForHeapStart() });
+                    Ok((swapchain, back_buffer, rtv, dsv))
+                })
+                .transpose()?;
+            let (swapchain, back_buffer, rtv, dsv) = match surface_resources {
+                Some((swapchain, back_buffer, rtv, dsv)) => {
+                    (Some(swapchain), Some(back_buffer), Some(rtv), dsv)
+                }
+                None => (None, None, None, None),
+            };
 
             let allocator: ID3D12CommandAllocator = unsafe {
                 self.device
@@ -1134,19 +1208,30 @@ pub mod native {
                     0,
                     D3D12_COMMAND_LIST_TYPE_DIRECT,
                     &allocator,
-                    &pipeline.state,
+                    None::<&ID3D12PipelineState>,
                 )
             }
             .map_err(map_windows)?;
-            let readback = if capture_presented {
-                let back_buffer_desc = unsafe { back_buffer.GetDesc() };
+            let mut readbacks = Vec::new();
+            for action in actions {
+                let resource = match action {
+                    NativeFrameAction::TextureReadback { texture, .. } => {
+                        Some(texture.resource.clone())
+                    }
+                    NativeFrameAction::Present if capture_presented => back_buffer.clone(),
+                    _ => None,
+                };
+                let Some(resource) = resource else {
+                    continue;
+                };
+                let desc = unsafe { resource.GetDesc() };
                 let mut footprint = Default::default();
                 let mut rows = 0;
                 let mut row_size = 0;
                 let mut total = 0;
                 unsafe {
                     self.device.GetCopyableFootprints(
-                        &back_buffer_desc,
+                        &desc,
                         0,
                         1,
                         0,
@@ -1156,215 +1241,554 @@ pub mod native {
                         Some(&mut total),
                     );
                 }
-                let allocation = self
-                    .allocate(
-                        AllocationRequest::new(total, 256, MemoryClass::Readback, true, None)
-                            .map_err(|_| HalError::InvalidArgument)?,
-                    )
-                    .map_err(|_| HalError::NativeFailure)?;
-                Some((footprint, total, allocation))
-            } else {
-                None
-            };
-            let to_target = D3D12_RESOURCE_TRANSITION_BARRIER {
-                pResource: core::mem::ManuallyDrop::new(Some(back_buffer.clone())),
-                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                StateBefore: D3D12_RESOURCE_STATE_PRESENT,
-                StateAfter: D3D12_RESOURCE_STATE_RENDER_TARGET,
-            };
+                let request =
+                    match AllocationRequest::new(total, 256, MemoryClass::Readback, true, None) {
+                        Ok(request) => request,
+                        Err(_) => {
+                            for (_, _, _, _, allocation) in readbacks {
+                                let _ = self.free(allocation);
+                            }
+                            return Err(HalError::InvalidArgument);
+                        }
+                    };
+                let allocation = match self.allocate(request) {
+                    Ok(allocation) => allocation,
+                    Err(_) => {
+                        for (_, _, _, _, allocation) in readbacks {
+                            let _ = self.free(allocation);
+                        }
+                        return Err(HalError::NativeFailure);
+                    }
+                };
+                let dimensions = match action {
+                    NativeFrameAction::TextureReadback { width, height, .. } => (*width, *height),
+                    NativeFrameAction::Present => extent,
+                    _ => unreachable!(),
+                };
+                readbacks.push((dimensions.0, dimensions.1, footprint, total, allocation));
+            }
+            let mut indirect_copies: Vec<Option<NativeAllocation>> =
+                (0..actions.len()).map(|_| None).collect();
+            for (action_index, action) in actions.iter().enumerate() {
+                let NativeFrameAction::Graphics(draw) = action else {
+                    continue;
+                };
+                let indirect_raw = windows::core::Interface::as_raw(&draw.indirect_buffer.resource);
+                if !draw.bindings.iter().any(|binding| {
+                    windows::core::Interface::as_raw(&binding.allocation.resource) == indirect_raw
+                }) {
+                    continue;
+                }
+                let request = match AllocationRequest::new(
+                    draw.indirect_buffer.allocation.size(),
+                    16,
+                    MemoryClass::Device,
+                    false,
+                    None,
+                ) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        for (_, _, _, _, allocation) in readbacks {
+                            let _ = self.free(allocation);
+                        }
+                        for allocation in indirect_copies.into_iter().flatten() {
+                            let _ = self.free(allocation);
+                        }
+                        return Err(HalError::InvalidArgument);
+                    }
+                };
+                indirect_copies[action_index] = match self.allocate(request) {
+                    Ok(allocation) => Some(allocation),
+                    Err(_) => {
+                        for (_, _, _, _, allocation) in readbacks {
+                            let _ = self.free(allocation);
+                        }
+                        for allocation in indirect_copies.into_iter().flatten() {
+                            let _ = self.free(allocation);
+                        }
+                        return Err(HalError::NativeFailure);
+                    }
+                };
+            }
+
+            let descriptor_heap = self.descriptors.clone();
+            let sampler_heap = self.samplers.clone();
             let viewport = D3D12_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
-                Width: width as f32,
-                Height: height as f32,
+                Width: extent.0 as f32,
+                Height: extent.1 as f32,
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
             };
             let scissor = RECT {
                 left: 0,
                 top: 0,
-                right: width as i32,
-                bottom: height as i32,
+                right: extent.0 as i32,
+                bottom: extent.1 as i32,
             };
-            let index_view = D3D12_INDEX_BUFFER_VIEW {
-                BufferLocation: unsafe { index_buffer.resource.GetGPUVirtualAddress() },
-                SizeInBytes: index_size,
-                Format: DXGI_FORMAT_R32_UINT,
-            };
-            unsafe {
-                list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                        Transition: core::mem::ManuallyDrop::new(to_target),
-                    },
-                }]);
-                list.RSSetViewports(&[viewport]);
-                list.RSSetScissorRects(&[scissor]);
-                list.OMSetRenderTargets(
-                    1,
-                    Some(&rtv),
-                    false,
-                    dsv.as_ref().map(|handle| handle as *const _),
-                );
-                if let Some(dsv) = dsv {
-                    list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
+            let mut pass_active = false;
+            let mut discard_store = false;
+            let mut discard_depth = false;
+            let mut readback_index = 0_usize;
+            let encoded = (|| {
+                unsafe {
+                    list.SetDescriptorHeaps(&[
+                        Some(descriptor_heap.clone()),
+                        Some(sampler_heap.clone()),
+                    ]);
+                    list.RSSetViewports(&[viewport]);
+                    list.RSSetScissorRects(&[scissor]);
                 }
-                list.ClearRenderTargetView(rtv, &[0.1, 0.1, 0.1, 1.0], None);
-                list.SetGraphicsRootSignature(&pipeline.root);
-                list.SetDescriptorHeaps(&[
-                    Some(self.descriptors.clone()),
-                    Some(self.samplers.clone()),
-                ]);
-                let table = pipeline.buffer_writable.len() as u32 + 1;
-                list.SetGraphicsRootDescriptorTable(
-                    table,
-                    self.descriptors.GetGPUDescriptorHandleForHeapStart(),
-                );
-                list.SetGraphicsRootDescriptorTable(
-                    table + 1,
-                    self.samplers.GetGPUDescriptorHandleForHeapStart(),
-                );
-                for (index, (address, writable)) in binding_addresses
-                    .iter()
-                    .zip(&pipeline.buffer_writable)
-                    .enumerate()
-                {
-                    if *writable {
-                        list.SetGraphicsRootUnorderedAccessView(index as u32 + 1, *address);
-                    } else {
-                        list.SetGraphicsRootShaderResourceView(index as u32 + 1, *address);
+                for (action_index, action) in actions.iter().enumerate() {
+                    match action {
+                        NativeFrameAction::Wait(_) => {}
+                        NativeFrameAction::Barrier { barrier, resource } => {
+                            let native = match resource {
+                                NativeFrameResource::Buffer(allocation) => {
+                                    allocation.resource.clone()
+                                }
+                                NativeFrameResource::Texture(texture) => texture.resource.clone(),
+                                NativeFrameResource::Surface => back_buffer
+                                    .as_ref()
+                                    .ok_or(HalError::InvalidArgument)?
+                                    .clone(),
+                                NativeFrameResource::Depth => surface
+                                    .as_ref()
+                                    .and_then(|surface| surface.depth.as_ref())
+                                    .ok_or(HalError::NotReady)?
+                                    .resource
+                                    .clone(),
+                            };
+                            let before = barrier
+                                .before
+                                .map(|state| dx12_resource_state(state.access))
+                                .unwrap_or(D3D12_RESOURCE_STATE_COMMON);
+                            let after = dx12_resource_state(barrier.after.access);
+                            unsafe {
+                                if before == after && after == D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                                {
+                                    list.ResourceBarrier(&[uav_barrier(native)]);
+                                } else if before != after {
+                                    list.ResourceBarrier(&[transition_barrier(
+                                        native, before, after,
+                                    )]);
+                                }
+                            }
+                        }
+                        NativeFrameAction::BeginPass(pass) => {
+                            if pass_active
+                                || pass.colors.len() != 1
+                                || pass.samples != 1
+                                || pass.area[0]
+                                    .checked_add(pass.area[2])
+                                    .is_none_or(|end| end > extent.0)
+                                || pass.area[1]
+                                    .checked_add(pass.area[3])
+                                    .is_none_or(|end| end > extent.1)
+                            {
+                                return Err(HalError::InvalidArgument);
+                            }
+                            let rtv = rtv.ok_or(HalError::InvalidArgument)?;
+                            unsafe {
+                                list.OMSetRenderTargets(
+                                    1,
+                                    Some(&rtv),
+                                    false,
+                                    pass.depth
+                                        .and(dsv)
+                                        .as_ref()
+                                        .map(|handle| handle as *const _),
+                                );
+                                match pass.load {
+                                    AttachmentLoadOp::Load => {}
+                                    AttachmentLoadOp::Clear => {
+                                        list.ClearRenderTargetView(
+                                            rtv,
+                                            &[0.1, 0.1, 0.1, 1.0],
+                                            None,
+                                        );
+                                        if let Some(dsv) = pass.depth.and(dsv) {
+                                            list.ClearDepthStencilView(
+                                                dsv,
+                                                D3D12_CLEAR_FLAG_DEPTH,
+                                                1.0,
+                                                0,
+                                                None,
+                                            );
+                                        }
+                                    }
+                                    AttachmentLoadOp::Discard => {
+                                        list.DiscardResource(
+                                            back_buffer
+                                                .as_ref()
+                                                .ok_or(HalError::InvalidArgument)?,
+                                            None,
+                                        );
+                                        if pass.depth.is_some()
+                                            && let Some(depth) = surface
+                                                .as_ref()
+                                                .and_then(|surface| surface.depth.as_ref())
+                                        {
+                                            list.DiscardResource(&depth.resource, None);
+                                        }
+                                    }
+                                }
+                            }
+                            discard_store = pass.store == AttachmentStoreOp::Discard;
+                            discard_depth = pass.depth.is_some();
+                            pass_active = true;
+                        }
+                        NativeFrameAction::Compute(dispatch) => {
+                            if pass_active {
+                                return Err(HalError::InvalidArgument);
+                            }
+                            let pipeline = dispatch.pipeline;
+                            unsafe {
+                                list.SetPipelineState(&pipeline.state);
+                                list.SetComputeRootSignature(&pipeline.root);
+                                let table = pipeline.buffer_writable.len() as u32 + 1;
+                                list.SetComputeRootDescriptorTable(
+                                    table,
+                                    descriptor_heap.GetGPUDescriptorHandleForHeapStart(),
+                                );
+                                list.SetComputeRootDescriptorTable(
+                                    table + 1,
+                                    sampler_heap.GetGPUDescriptorHandleForHeapStart(),
+                                );
+                                bind_dx12_compute_buffers(&list, pipeline, dispatch.bindings)?;
+                                if !dispatch.push_constants.is_empty() {
+                                    list.SetComputeRoot32BitConstants(
+                                        0,
+                                        dispatch.push_constants.len() as u32 / 4,
+                                        dispatch.push_constants.as_ptr().cast(),
+                                        0,
+                                    );
+                                }
+                                list.Dispatch(
+                                    dispatch.groups[0],
+                                    dispatch.groups[1],
+                                    dispatch.groups[2],
+                                );
+                            }
+                        }
+                        NativeFrameAction::Graphics(draw) => {
+                            if !pass_active {
+                                return Err(HalError::InvalidArgument);
+                            }
+                            let pipeline = draw.pipeline;
+                            let topology = pipeline.topology.ok_or(HalError::InvalidArgument)?;
+                            let signature = pipeline
+                                .signature
+                                .as_ref()
+                                .ok_or(HalError::InvalidArgument)?;
+                            let index_size = u32::try_from(draw.index_buffer.allocation.size())
+                                .map_err(|_| HalError::InvalidArgument)?;
+                            let index_view = D3D12_INDEX_BUFFER_VIEW {
+                                BufferLocation: unsafe {
+                                    draw.index_buffer.resource.GetGPUVirtualAddress()
+                                },
+                                SizeInBytes: index_size,
+                                Format: DXGI_FORMAT_R32_UINT,
+                            };
+                            let indirect_resource =
+                                if let Some(copy) = indirect_copies[action_index].as_ref() {
+                                    let indirect_raw = windows::core::Interface::as_raw(
+                                        &draw.indirect_buffer.resource,
+                                    );
+                                    let binding = draw
+                                        .bindings
+                                        .iter()
+                                        .find(|binding| {
+                                            windows::core::Interface::as_raw(
+                                                &binding.allocation.resource,
+                                            ) == indirect_raw
+                                        })
+                                        .ok_or(HalError::InvalidArgument)?;
+                                    let shader_state = if binding.writable {
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                                    } else {
+                                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                            | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                                    };
+                                    unsafe {
+                                        list.ResourceBarrier(&[
+                                            transition_barrier(
+                                                draw.indirect_buffer.resource.clone(),
+                                                shader_state,
+                                                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                            ),
+                                            transition_barrier(
+                                                copy.resource.clone(),
+                                                D3D12_RESOURCE_STATE_COMMON,
+                                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                            ),
+                                        ]);
+                                        list.CopyBufferRegion(
+                                            &copy.resource,
+                                            0,
+                                            &draw.indirect_buffer.resource,
+                                            0,
+                                            draw.indirect_buffer.allocation.size(),
+                                        );
+                                        list.ResourceBarrier(&[
+                                            transition_barrier(
+                                                draw.indirect_buffer.resource.clone(),
+                                                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                shader_state,
+                                            ),
+                                            transition_barrier(
+                                                copy.resource.clone(),
+                                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                                            ),
+                                        ]);
+                                    }
+                                    &copy.resource
+                                } else {
+                                    &draw.indirect_buffer.resource
+                                };
+                            unsafe {
+                                list.SetPipelineState(&pipeline.state);
+                                list.SetGraphicsRootSignature(&pipeline.root);
+                                let table = pipeline.buffer_writable.len() as u32 + 1;
+                                list.SetGraphicsRootDescriptorTable(
+                                    table,
+                                    descriptor_heap.GetGPUDescriptorHandleForHeapStart(),
+                                );
+                                list.SetGraphicsRootDescriptorTable(
+                                    table + 1,
+                                    sampler_heap.GetGPUDescriptorHandleForHeapStart(),
+                                );
+                                bind_dx12_graphics_buffers(&list, pipeline, draw.bindings)?;
+                                if !draw.push_constants.is_empty() {
+                                    list.SetGraphicsRoot32BitConstants(
+                                        0,
+                                        draw.push_constants.len() as u32 / 4,
+                                        draw.push_constants.as_ptr().cast(),
+                                        0,
+                                    );
+                                }
+                                list.IASetPrimitiveTopology(topology);
+                                list.IASetIndexBuffer(Some(&index_view));
+                                list.ExecuteIndirect(
+                                    signature,
+                                    draw.draw_count,
+                                    indirect_resource,
+                                    0,
+                                    None,
+                                    0,
+                                );
+                            }
+                        }
+                        NativeFrameAction::TextureReadback { texture, .. } => {
+                            if pass_active {
+                                return Err(HalError::InvalidArgument);
+                            }
+                            let (_, _, footprint, _, readback) = readbacks
+                                .get(readback_index)
+                                .ok_or(HalError::InvalidArgument)?;
+                            unsafe {
+                                copy_texture_to_readback(
+                                    &list,
+                                    &texture.resource,
+                                    &readback.resource,
+                                    *footprint,
+                                );
+                            }
+                            readback_index += 1;
+                        }
+                        NativeFrameAction::EndPass => {
+                            if !pass_active {
+                                return Err(HalError::InvalidArgument);
+                            }
+                            if discard_store {
+                                unsafe {
+                                    list.DiscardResource(
+                                        back_buffer.as_ref().ok_or(HalError::InvalidArgument)?,
+                                        None,
+                                    );
+                                    if discard_depth
+                                        && let Some(depth) = surface
+                                            .as_ref()
+                                            .and_then(|surface| surface.depth.as_ref())
+                                    {
+                                        list.DiscardResource(&depth.resource, None);
+                                    }
+                                }
+                            }
+                            pass_active = false;
+                            discard_store = false;
+                            discard_depth = false;
+                        }
+                        NativeFrameAction::Present => {
+                            if pass_active {
+                                return Err(HalError::InvalidArgument);
+                            }
+                            if capture_presented {
+                                let (_, _, footprint, _, readback) = readbacks
+                                    .get(readback_index)
+                                    .ok_or(HalError::InvalidArgument)?;
+                                unsafe {
+                                    let back_buffer =
+                                        back_buffer.as_ref().ok_or(HalError::InvalidArgument)?;
+                                    list.ResourceBarrier(&[transition_barrier(
+                                        back_buffer.clone(),
+                                        D3D12_RESOURCE_STATE_PRESENT,
+                                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                    )]);
+                                    copy_texture_to_readback(
+                                        &list,
+                                        back_buffer,
+                                        &readback.resource,
+                                        *footprint,
+                                    );
+                                    list.ResourceBarrier(&[transition_barrier(
+                                        back_buffer.clone(),
+                                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                        D3D12_RESOURCE_STATE_PRESENT,
+                                    )]);
+                                }
+                                readback_index += 1;
+                            }
+                        }
                     }
                 }
-                if !push_constants.is_empty() {
-                    list.SetGraphicsRoot32BitConstants(
-                        0,
-                        push_constants.len() as u32 / 4,
-                        push_constants.as_ptr().cast(),
-                        0,
-                    );
+                if pass_active {
+                    return Err(HalError::InvalidArgument);
                 }
-                list.IASetPrimitiveTopology(topology);
-                list.IASetIndexBuffer(Some(&index_view));
-                list.ExecuteIndirect(signature, draw_count, &indirect_buffer.resource, 0, None, 0);
+                unsafe { list.Close().map_err(map_windows) }
+            })();
+            if let Err(error) = encoded {
+                for (_, _, _, _, allocation) in readbacks {
+                    let _ = self.free(allocation);
+                }
+                for allocation in indirect_copies.into_iter().flatten() {
+                    let _ = self.free(allocation);
+                }
+                return Err(error);
             }
-
-            unsafe {
-                if let Some((footprint, _, readback)) = &readback {
-                    let to_copy = D3D12_RESOURCE_TRANSITION_BARRIER {
-                        pResource: core::mem::ManuallyDrop::new(Some(back_buffer.clone())),
-                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                        StateBefore: D3D12_RESOURCE_STATE_RENDER_TARGET,
-                        StateAfter:
-                            windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    };
-                    let source = D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: core::mem::ManuallyDrop::new(Some(back_buffer.clone())),
-                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                            SubresourceIndex: 0,
-                        },
-                    };
-                    let destination = D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: core::mem::ManuallyDrop::new(Some(readback.resource.clone())),
-                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                            PlacedFootprint: *footprint,
-                        },
-                    };
-                    let to_present = D3D12_RESOURCE_TRANSITION_BARRIER {
-                        pResource: core::mem::ManuallyDrop::new(Some(back_buffer)),
-                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                        StateBefore:
-                            windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COPY_SOURCE,
-                        StateAfter: D3D12_RESOURCE_STATE_PRESENT,
-                    };
-                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                            Transition: core::mem::ManuallyDrop::new(to_copy),
-                        },
-                    }]);
-                    list.CopyTextureRegion(&destination, 0, 0, 0, &source, None);
-                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                            Transition: core::mem::ManuallyDrop::new(to_present),
-                        },
-                    }]);
-                } else {
-                    let to_present = D3D12_RESOURCE_TRANSITION_BARRIER {
-                        pResource: core::mem::ManuallyDrop::new(Some(back_buffer)),
-                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                        StateBefore: D3D12_RESOURCE_STATE_RENDER_TARGET,
-                        StateAfter: D3D12_RESOURCE_STATE_PRESENT,
-                    };
-                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                            Transition: core::mem::ManuallyDrop::new(to_present),
-                        },
-                    }]);
-                }
-                if let Err(error) = list.Close() {
-                    if let Some((_, _, allocation)) = readback {
+            let command: ID3D12CommandList = match list.cast() {
+                Ok(command) => command,
+                Err(error) => {
+                    for (_, _, _, _, allocation) in readbacks {
+                        let _ = self.free(allocation);
+                    }
+                    for allocation in indirect_copies.into_iter().flatten() {
                         let _ = self.free(allocation);
                     }
                     return Err(map_windows(error));
                 }
-                let command = match list.cast() {
-                    Ok(command) => command,
-                    Err(error) => {
-                        if let Some((_, _, allocation)) = readback {
-                            let _ = self.free(allocation);
-                        }
-                        return Err(map_windows(error));
+            };
+            for value in external_waits {
+                if let Err(error) = unsafe { self.queue.Wait(&self.fence, value) } {
+                    for (_, _, _, _, allocation) in readbacks {
+                        let _ = self.free(allocation);
                     }
-                };
+                    for allocation in indirect_copies.into_iter().flatten() {
+                        let _ = self.free(allocation);
+                    }
+                    return Err(map_windows(error));
+                }
+            }
+            unsafe {
                 self.queue.ExecuteCommandLists(&[Some(command)]);
-                if let Err(error) = swapchain.Present(1, DXGI_PRESENT(0)).ok() {
+                if presents
+                    && let Err(error) = swapchain
+                        .as_ref()
+                        .ok_or(HalError::InvalidArgument)?
+                        .Present(1, DXGI_PRESENT(0))
+                        .ok()
+                {
                     let _ = self.wait_idle();
-                    if let Some((_, _, allocation)) = readback {
+                    for (_, _, _, _, allocation) in readbacks {
+                        let _ = self.free(allocation);
+                    }
+                    for allocation in indirect_copies.into_iter().flatten() {
                         let _ = self.free(allocation);
                     }
                     return Err(map_windows(error));
                 }
             }
             if let Err(error) = self.wait_idle() {
-                if let Some((_, _, allocation)) = readback {
+                for (_, _, _, _, allocation) in readbacks {
+                    let _ = self.free(allocation);
+                }
+                for allocation in indirect_copies.into_iter().flatten() {
                     let _ = self.free(allocation);
                 }
                 return Err(error);
             }
-            let Some((footprint, total, mut readback)) = readback else {
-                return Ok(());
-            };
-            let captured = (|| {
-                self.invalidate(&mut readback, 0, total)
-                    .map_err(|_| HalError::NativeFailure)?;
-                let source = self
-                    .mapped_slice(&readback)
-                    .map_err(|_| HalError::NativeFailure)?;
-                surface
-                    .presented
-                    .resize(width as usize * height as usize * 4, 0);
-                for row in 0..height as usize {
-                    let source_start = row * footprint.Footprint.RowPitch as usize;
-                    let destination_start = row * width as usize * 4;
-                    surface.presented[destination_start..destination_start + width as usize * 4]
-                        .copy_from_slice(&source[source_start..source_start + width as usize * 4]);
+            let mut cleanup_error = None;
+            for allocation in indirect_copies.into_iter().flatten() {
+                if self.free(allocation).is_err() {
+                    cleanup_error = Some(HalError::NativeFailure);
                 }
-                Ok(())
-            })();
-            let freed = self.free(readback).map_err(|_| HalError::NativeFailure);
-            match (captured, freed) {
-                (Ok(()), Ok(())) => Ok(()),
-                (Err(error), _) | (_, Err(error)) => Err(error),
             }
+            if let Some(error) = cleanup_error {
+                for (_, _, _, _, allocation) in readbacks {
+                    let _ = self.free(allocation);
+                }
+                return Err(error);
+            }
+
+            let mut outputs = Vec::with_capacity(readbacks.len());
+            let mut remaining = readbacks.into_iter();
+            while let Some((width, height, footprint, total, mut readback)) = remaining.next() {
+                let output = (|| {
+                    self.invalidate(&mut readback, 0, total)
+                        .map_err(|_| HalError::NativeFailure)?;
+                    let source = self
+                        .mapped_slice(&readback)
+                        .map_err(|_| HalError::NativeFailure)?;
+                    let row_bytes = (width as usize)
+                        .checked_mul(4)
+                        .ok_or(HalError::InvalidArgument)?;
+                    let pixel_bytes = row_bytes
+                        .checked_mul(height as usize)
+                        .ok_or(HalError::InvalidArgument)?;
+                    let mut pixels = vec![0; pixel_bytes];
+                    for row in 0..height as usize {
+                        let source_start = row
+                            .checked_mul(footprint.Footprint.RowPitch as usize)
+                            .ok_or(HalError::InvalidArgument)?;
+                        let source_end = source_start
+                            .checked_add(row_bytes)
+                            .ok_or(HalError::InvalidArgument)?;
+                        let destination_start = row
+                            .checked_mul(row_bytes)
+                            .ok_or(HalError::InvalidArgument)?;
+                        let destination_end = destination_start
+                            .checked_add(row_bytes)
+                            .ok_or(HalError::InvalidArgument)?;
+                        pixels
+                            .get_mut(destination_start..destination_end)
+                            .ok_or(HalError::NativeFailure)?
+                            .copy_from_slice(
+                                source
+                                    .get(source_start..source_end)
+                                    .ok_or(HalError::NativeFailure)?,
+                            );
+                    }
+                    Ok(pixels)
+                })();
+                let freed = self.free(readback).map_err(|_| HalError::NativeFailure);
+                match (output, freed) {
+                    (Ok(pixels), Ok(())) => outputs.push(pixels),
+                    (Err(error), _) | (_, Err(error)) => {
+                        for (_, _, _, _, allocation) in remaining {
+                            let _ = self.free(allocation);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            if capture_presented && let Some(pixels) = outputs.last() {
+                surface.presented = pixels.clone();
+            }
+            Ok(outputs)
         }
+
         fn destroy_unpublished_texture(
             &mut self,
             resource: ID3D12Resource,
@@ -2047,6 +2471,151 @@ pub mod native {
             Ok(value)
         }
     }
+    fn dx12_resource_state(access: ResourceAccess) -> D3D12_RESOURCE_STATES {
+        match access {
+            ResourceAccess::SampledRead | ResourceAccess::StorageRead => {
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                    | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+            }
+            ResourceAccess::StorageWrite | ResourceAccess::StorageReadWrite => {
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+            }
+            ResourceAccess::IndexRead => D3D12_RESOURCE_STATE_INDEX_BUFFER,
+            ResourceAccess::IndirectRead => D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            ResourceAccess::IndirectStorageRead => {
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                    | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+            }
+            ResourceAccess::IndirectStorageReadWrite => D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            ResourceAccess::ColorAttachmentWrite => D3D12_RESOURCE_STATE_RENDER_TARGET,
+            ResourceAccess::DepthStencilRead => D3D12_RESOURCE_STATE_DEPTH_READ,
+            ResourceAccess::DepthStencilWrite => D3D12_RESOURCE_STATE_DEPTH_WRITE,
+            ResourceAccess::TransferRead => D3D12_RESOURCE_STATE_COPY_SOURCE,
+            ResourceAccess::TransferWrite => D3D12_RESOURCE_STATE_COPY_DEST,
+            ResourceAccess::Present => D3D12_RESOURCE_STATE_PRESENT,
+        }
+    }
+
+    fn transition_barrier(
+        resource: ID3D12Resource,
+        before: D3D12_RESOURCE_STATES,
+        after: D3D12_RESOURCE_STATES,
+    ) -> D3D12_RESOURCE_BARRIER {
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: core::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: core::mem::ManuallyDrop::new(Some(resource)),
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: before,
+                    StateAfter: after,
+                }),
+            },
+        }
+    }
+
+    fn uav_barrier(resource: ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: core::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: core::mem::ManuallyDrop::new(Some(resource)),
+                }),
+            },
+        }
+    }
+
+    unsafe fn copy_texture_to_readback(
+        list: &ID3D12GraphicsCommandList,
+        source: &ID3D12Resource,
+        destination: &ID3D12Resource,
+        footprint: windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    ) {
+        let source = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: core::mem::ManuallyDrop::new(Some(source.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        let destination = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: core::mem::ManuallyDrop::new(Some(destination.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: footprint,
+            },
+        };
+        unsafe {
+            list.CopyTextureRegion(&destination, 0, 0, 0, &source, None);
+        }
+    }
+
+    unsafe fn bind_dx12_compute_buffers(
+        list: &ID3D12GraphicsCommandList,
+        pipeline: &NativePipeline,
+        bindings: &[NativeBufferBinding<'_>],
+    ) -> Result<(), HalError> {
+        for (index, (binding, writable)) in
+            bindings.iter().zip(&pipeline.buffer_writable).enumerate()
+        {
+            if binding.writable != *writable
+                || binding.offset >= binding.allocation.allocation.size()
+            {
+                return Err(HalError::InvalidArgument);
+            }
+            let address = unsafe {
+                binding
+                    .allocation
+                    .resource
+                    .GetGPUVirtualAddress()
+                    .checked_add(binding.offset)
+            }
+            .ok_or(HalError::InvalidArgument)?;
+            unsafe {
+                if *writable {
+                    list.SetComputeRootUnorderedAccessView(index as u32 + 1, address);
+                } else {
+                    list.SetComputeRootShaderResourceView(index as u32 + 1, address);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    unsafe fn bind_dx12_graphics_buffers(
+        list: &ID3D12GraphicsCommandList,
+        pipeline: &NativePipeline,
+        bindings: &[NativeBufferBinding<'_>],
+    ) -> Result<(), HalError> {
+        for (index, (binding, writable)) in
+            bindings.iter().zip(&pipeline.buffer_writable).enumerate()
+        {
+            if binding.writable != *writable
+                || binding.offset >= binding.allocation.allocation.size()
+            {
+                return Err(HalError::InvalidArgument);
+            }
+            let address = unsafe {
+                binding
+                    .allocation
+                    .resource
+                    .GetGPUVirtualAddress()
+                    .checked_add(binding.offset)
+            }
+            .ok_or(HalError::InvalidArgument)?;
+            unsafe {
+                if *writable {
+                    list.SetGraphicsRootUnorderedAccessView(index as u32 + 1, address);
+                } else {
+                    list.SetGraphicsRootShaderResourceView(index as u32 + 1, address);
+                }
+            }
+        }
+        Ok(())
+    }
+
     impl Drop for NativeContext {
         fn drop(&mut self) {
             let _ = self.wait_idle();

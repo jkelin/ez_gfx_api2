@@ -1,3 +1,4 @@
+#[cfg(windows)]
 #[test]
 fn creates_vulkan_13_instance() {
     let _context = ez_gfx_backend_vulkan::NativeContext::create(

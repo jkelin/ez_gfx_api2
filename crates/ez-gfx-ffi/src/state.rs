@@ -16,16 +16,23 @@ use ez_gfx_core::{
     handle::{GenerationalArena, HandleParts, LocalHandle, PackedHandle},
 };
 use ez_gfx_hal::{
-    AllocationRequest, BufferTransfer, CompletionToken, DynamicPipelineState, HalError, ImageMip,
-    MemoryAllocator, MemoryClass,
+    AllocationRequest, BufferRange, BufferTransfer, CompletionToken, DynamicPipelineState,
+    ExecutionAction, FrameExecutionBackend, FrameExecutionPlan, HalError, ImageMip,
+    MemoryAllocator, MemoryClass, QueueKind, ResourceAccess, ResourceState, ShaderStage,
 };
+use ez_gfx_runtime::render::{ExecutionError, execute_compiled_graph};
 use ez_gfx_runtime::{
     ContextIdentity, ContextOptions, LifecycleError, ResourceKind, SurfaceOptions, SurfacePlatform,
     SurfaceState,
-    frame::FrameRecorder,
+    frame::{ExecutableNode, FrameRecorder},
     geometry::{GeometryError, GeometryManager},
+    graph::{
+        Access, ImageRange, LoadOp, NodeDesc, PassInfo, ResourceDesc, ResourceId, ResourceLifetime,
+        StoreOp,
+    },
     indirect::{DrawIndexedCommand, IndexedIndirectBuffer},
     observability::{DiagnosticLevel, Observability, RuntimePhase, RuntimeRecord, RuntimeStatus},
+    target::Format,
     texture::{
         TextureDecoder, TextureError, TextureId, TextureRegistry, TextureSource, generate_mips,
     },
@@ -73,25 +80,6 @@ struct ShaderRecord {
     graphics_layout: Option<ez_gfx_runtime::binding::PipelineLayout>,
 }
 
-enum PendingPipeline {
-    Graphics {
-        shader: u64,
-        indirect: u64,
-        draw_count: u32,
-        bindings: Vec<ez_gfx_runtime::binding::PublicBinding>,
-        layout: ez_gfx_runtime::binding::ReflectedBindings,
-        state: DynamicPipelineState,
-        push_constants: Vec<u8>,
-    },
-    Compute {
-        shader: u64,
-        groups: [u32; 3],
-        bindings: Vec<ez_gfx_runtime::binding::PublicBinding>,
-        layout: ez_gfx_runtime::binding::ReflectedBindings,
-        push_constants: Vec<u8>,
-    },
-}
-
 enum NativeTexture {
     Vulkan(ez_gfx_backend_vulkan::NativeTexture),
     #[cfg(windows)]
@@ -108,12 +96,22 @@ struct SurfaceRecord {
 struct GeometryAllocation {
     allocation: NativeAllocation,
     ready: Option<CompletionToken>,
+    size: u64,
 }
 
 struct StagingAllocation {
     capacity: u64,
     allocation: NativeAllocation,
     retirement: Option<CompletionToken>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameNativeResource {
+    Buffer(u64),
+    Texture(u64),
+    Surface(u64),
+    Depth,
+    Index,
 }
 struct FfiContext {
     identity: ContextIdentity,
@@ -125,15 +123,20 @@ struct FfiContext {
     indirects: HashMap<u64, IndexedIndirectBuffer>,
     textures: HashMap<u64, (TextureId, NativeTexture, u32, u32, u32)>,
     texture_registry: TextureRegistry,
+    texture_ready: HashMap<u64, CompletionToken>,
     geometry: GeometryManager,
     vertex_heaps: HashMap<String, GeometryAllocation>,
     index_heap: Option<GeometryAllocation>,
     staging: Vec<StagingAllocation>,
     frame: FrameRecorder,
+    frame_resources: HashMap<u64, ResourceId>,
+    frame_native_resources: HashMap<ResourceId, FrameNativeResource>,
+    frame_index: Option<ResourceId>,
+    frame_surface: Option<ResourceId>,
+    frame_depth: Option<ResourceId>,
+    frame_has_graphics: bool,
     last_readback: Vec<u8>,
-    frame_readback_texture: Option<u64>,
     active_surface: Option<u64>,
-    pending_pipelines: Vec<PendingPipeline>,
     frame_presented: bool,
     observability: Observability,
 }
@@ -210,15 +213,20 @@ pub fn create_context(options: ContextOptions) -> Result<PackedHandle, EzGfxResu
             ez_gfx_runtime::binding::MAX_TEXTURE_HEAP_CAPACITY,
         )
         .map_err(|_| EzGfxResult::NativeFailure)?,
+        texture_ready: HashMap::new(),
         geometry: GeometryManager::new(),
         vertex_heaps: HashMap::new(),
         index_heap: None,
         staging: Vec::new(),
         frame: FrameRecorder::new(1024).map_err(|_| EzGfxResult::NativeFailure)?,
+        frame_resources: HashMap::new(),
+        frame_native_resources: HashMap::new(),
+        frame_index: None,
+        frame_surface: None,
+        frame_depth: None,
+        frame_has_graphics: false,
         last_readback: Vec::new(),
-        frame_readback_texture: None,
         active_surface: None,
-        pending_pipelines: Vec::new(),
         frame_presented: false,
         observability: Observability::new(1024, 256).map_err(|_| EzGfxResult::NativeFailure)?,
     });
@@ -471,8 +479,12 @@ pub fn begin_render(context: u64, surface: u64) -> EzGfxResult {
             return Err(EzGfxResult::NotReady);
         }
         context.active_surface = Some(surface);
-        context.pending_pipelines.clear();
-        context.frame_readback_texture = None;
+        context.frame_resources.clear();
+        context.frame_native_resources.clear();
+        context.frame_index = None;
+        context.frame_surface = None;
+        context.frame_depth = None;
+        context.frame_has_graphics = false;
         context.last_readback.clear();
         context.frame_presented = false;
         context.frame.begin().map_err(map_frame)
@@ -540,6 +552,7 @@ pub fn create_vertex_heap(context: u64, name: &str, capacity: u64, stride: u64) 
                     GeometryAllocation {
                         allocation,
                         ready: None,
+                        size: capacity,
                     },
                 );
                 Ok(())
@@ -579,6 +592,7 @@ pub fn create_index_heap(context: u64, capacity: u64) -> EzGfxResult {
                 context.index_heap = Some(GeometryAllocation {
                     allocation,
                     ready: None,
+                    size: capacity,
                 });
                 Ok(())
             }
@@ -1138,6 +1152,10 @@ pub fn load_texture(
                 return Err(map_allocation(error));
             }
         };
+        let ready = completions
+            .last()
+            .copied()
+            .ok_or(EzGfxResult::NativeFailure)?;
         let mut completions = completions.into_iter();
         let submitted = completions
             .next()
@@ -1178,6 +1196,7 @@ pub fn load_texture(
                 decoded.mip_count,
             ),
         );
+        context.texture_ready.insert(handle.get(), ready);
         let record = runtime_record(context, handle.get(), RuntimePhase::Upload, EzGfxResult::Ok);
         context.observability.push_event(record);
         Ok(handle)
@@ -1269,6 +1288,7 @@ pub fn unload_texture(context: u64, texture: u64) {
             .textures
             .remove(&texture)
             .ok_or(EzGfxResult::InvalidContext)?;
+        context.texture_ready.remove(&texture);
         context.texture_registry.unload(id).map_err(map_texture)?;
         destroy_native_texture(&mut context.native, allocation).map_err(map_allocation)
     });
@@ -1280,13 +1300,242 @@ pub fn frame_begin(context: u64) -> EzGfxResult {
             .identity
             .check_thread_and_health()
             .map_err(map_lifecycle)?;
-        context.pending_pipelines.clear();
         context.frame.begin().map_err(map_frame)?;
-        context.frame_readback_texture = None;
+        context.frame_resources.clear();
+        context.frame_native_resources.clear();
+        context.frame_index = None;
+        context.frame_surface = None;
+        context.frame_depth = None;
+        context.frame_has_graphics = false;
         context.last_readback.clear();
         context.frame_presented = false;
         Ok(())
     }))
+}
+
+fn intern_buffer_resource(
+    context: &mut FfiContext,
+    handle: u64,
+) -> Result<ResourceId, EzGfxResult> {
+    if let Some(resource) = context.frame_resources.get(&handle) {
+        return Ok(*resource);
+    }
+    let size = context
+        .allocations
+        .get(&handle)
+        .map(|(size, _)| *size)
+        .ok_or(EzGfxResult::InvalidContext)?;
+    let desc = ResourceDesc::buffer(size, 4, ResourceLifetime::External)
+        .map_err(|_| EzGfxResult::InvalidArgument)?;
+    let resource = context.frame.add_resource(desc).map_err(map_frame)?;
+    let initial = ResourceState::new(
+        QueueKind::Transfer,
+        ShaderStage::None,
+        ResourceAccess::TransferWrite,
+    )
+    .map_err(|_| EzGfxResult::InvalidArgument)?;
+    context
+        .frame
+        .set_resource_initial_state(resource, initial)
+        .map_err(map_frame)?;
+    context.frame_resources.insert(handle, resource);
+    context
+        .frame_native_resources
+        .insert(resource, FrameNativeResource::Buffer(handle));
+    Ok(resource)
+}
+
+fn intern_surface_resource(context: &mut FfiContext) -> Result<ResourceId, EzGfxResult> {
+    if let Some(resource) = context.frame_surface {
+        return Ok(resource);
+    }
+    let surface = context.active_surface.ok_or(EzGfxResult::NotReady)?;
+    let (width, height) = context
+        .surfaces
+        .get(&surface)
+        .and_then(|surface| surface.state.extent())
+        .ok_or(EzGfxResult::NotReady)?;
+    let desc = ResourceDesc::image(
+        width,
+        height,
+        1,
+        1,
+        Format::Bgra8Srgb,
+        1,
+        ResourceLifetime::External,
+    )
+    .map_err(|_| EzGfxResult::InvalidArgument)?;
+    let resource = context.frame.add_resource(desc).map_err(map_frame)?;
+    let present = ResourceState::new(
+        QueueKind::Graphics,
+        ShaderStage::None,
+        ResourceAccess::Present,
+    )
+    .map_err(|_| EzGfxResult::InvalidArgument)?;
+    context
+        .frame
+        .set_resource_initial_state(resource, present)
+        .map_err(map_frame)?;
+    context.frame_surface = Some(resource);
+    context
+        .frame_native_resources
+        .insert(resource, FrameNativeResource::Surface(surface));
+    Ok(resource)
+}
+
+fn intern_depth_resource(context: &mut FfiContext) -> Result<ResourceId, EzGfxResult> {
+    if let Some(resource) = context.frame_depth {
+        return Ok(resource);
+    }
+    let surface = context.active_surface.ok_or(EzGfxResult::NotReady)?;
+    let (width, height) = context
+        .surfaces
+        .get(&surface)
+        .and_then(|surface| surface.state.extent())
+        .ok_or(EzGfxResult::NotReady)?;
+    let desc = ResourceDesc::image(
+        width,
+        height,
+        1,
+        1,
+        Format::Depth32Float,
+        1,
+        ResourceLifetime::Transient,
+    )
+    .map_err(|_| EzGfxResult::InvalidArgument)?;
+    let resource = context.frame.add_resource(desc).map_err(map_frame)?;
+    context.frame_depth = Some(resource);
+    context
+        .frame_native_resources
+        .insert(resource, FrameNativeResource::Depth);
+    Ok(resource)
+}
+
+fn intern_index_resource(context: &mut FfiContext) -> Result<ResourceId, EzGfxResult> {
+    if let Some(resource) = context.frame_index {
+        return Ok(resource);
+    }
+    let heap = context.index_heap.as_ref().ok_or(EzGfxResult::NotReady)?;
+    let size = heap.size;
+    let desc = ResourceDesc::buffer(size, 4, ResourceLifetime::External)
+        .map_err(|_| EzGfxResult::InvalidArgument)?;
+    let resource = context.frame.add_resource(desc).map_err(map_frame)?;
+    let initial = ResourceState::new(
+        QueueKind::Transfer,
+        ShaderStage::None,
+        ResourceAccess::TransferWrite,
+    )
+    .map_err(|_| EzGfxResult::InvalidArgument)?;
+    context
+        .frame
+        .set_resource_initial_state(resource, initial)
+        .map_err(map_frame)?;
+    if let Some(ready) = heap.ready {
+        context
+            .frame
+            .set_resource_ready(resource, ready)
+            .map_err(map_frame)?;
+    }
+    context.frame_index = Some(resource);
+    context
+        .frame_native_resources
+        .insert(resource, FrameNativeResource::Index);
+    Ok(resource)
+}
+
+fn add_binding_accesses(
+    context: &mut FfiContext,
+    mut node: NodeDesc,
+    layout: &ez_gfx_runtime::binding::ReflectedBindings,
+    bindings: &[ez_gfx_runtime::binding::PublicBinding],
+    queue: QueueKind,
+    stage: ShaderStage,
+    combined_indirect: Option<u64>,
+) -> Result<NodeDesc, EzGfxResult> {
+    for requirement in layout.requirements() {
+        let binding = bindings
+            .iter()
+            .find(|binding| binding.name == requirement.name)
+            .ok_or(EzGfxResult::InvalidArgument)?;
+        let handle = match binding.resource {
+            ez_gfx_runtime::binding::ResourceIdentity::Structured(handle)
+            | ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle) => handle,
+            ez_gfx_runtime::binding::ResourceIdentity::RenderTarget(_) => {
+                return Err(EzGfxResult::Unsupported);
+            }
+        };
+        if combined_indirect == Some(handle) {
+            continue;
+        }
+        let size = context
+            .allocations
+            .get(&handle)
+            .map(|(size, _)| *size)
+            .ok_or(EzGfxResult::InvalidContext)?;
+        let resource = intern_buffer_resource(context, handle)?;
+        let writable = requirement.writable;
+        let state = ResourceState::new(
+            queue,
+            stage,
+            if writable {
+                ResourceAccess::StorageReadWrite
+            } else {
+                ResourceAccess::StorageRead
+            },
+        )
+        .map_err(|_| EzGfxResult::InvalidArgument)?;
+        node = node.access(Access::buffer(
+            resource,
+            BufferRange::new(0, size).map_err(|_| EzGfxResult::InvalidArgument)?,
+            state,
+        ));
+    }
+    Ok(node)
+}
+
+fn intern_texture_resource(
+    context: &mut FfiContext,
+    texture: u64,
+) -> Result<ResourceId, EzGfxResult> {
+    if let Some(resource) = context.frame_resources.get(&texture) {
+        return Ok(*resource);
+    }
+    let (_, _, width, height, _) = context
+        .textures
+        .get(&texture)
+        .ok_or(EzGfxResult::InvalidContext)?;
+    let desc = ResourceDesc::image(
+        *width,
+        *height,
+        1,
+        1,
+        Format::Rgba8Unorm,
+        1,
+        ResourceLifetime::External,
+    )
+    .map_err(|_| EzGfxResult::InvalidArgument)?;
+    let resource = context.frame.add_resource(desc).map_err(map_frame)?;
+    let sampled = ResourceState::new(
+        QueueKind::Graphics,
+        ShaderStage::Fragment,
+        ResourceAccess::SampledRead,
+    )
+    .map_err(|_| EzGfxResult::InvalidArgument)?;
+    context
+        .frame
+        .set_resource_initial_state(resource, sampled)
+        .map_err(map_frame)?;
+    if let Some(ready) = context.texture_ready.get(&texture).copied() {
+        context
+            .frame
+            .set_resource_ready(resource, ready)
+            .map_err(map_frame)?;
+    }
+    context.frame_resources.insert(texture, resource);
+    context
+        .frame_native_resources
+        .insert(resource, FrameNativeResource::Texture(texture));
+    Ok(resource)
 }
 
 pub fn frame_enqueue_readback(context: u64, texture: u64) -> EzGfxResult {
@@ -1296,47 +1545,22 @@ pub fn frame_enqueue_readback(context: u64, texture: u64) -> EzGfxResult {
             .identity
             .resolve(handle, ResourceKind::Texture)
             .map_err(map_lifecycle)?;
-        let (_, _, width, height, _) = context
-            .textures
-            .get(&texture)
-            .ok_or(EzGfxResult::InvalidContext)?;
-        let mut graph = ez_gfx_runtime::graph::FrameGraph::new();
-        let resource = graph
-            .add_resource(
-                ez_gfx_runtime::graph::ResourceDesc::image(
-                    *width,
-                    *height,
-                    1,
-                    1,
-                    ez_gfx_runtime::target::Format::Rgba8Unorm,
-                    1,
-                    ez_gfx_runtime::graph::ResourceLifetime::External,
-                )
-                .map_err(|_| EzGfxResult::InvalidArgument)?,
-            )
-            .map_err(|_| EzGfxResult::InvalidArgument)?;
-        let range = ez_gfx_runtime::graph::ImageRange::all(1, 1)
-            .map_err(|_| EzGfxResult::InvalidArgument)?;
-        let state = ez_gfx_hal::ResourceState::new(
-            ez_gfx_hal::QueueKind::Transfer,
-            ez_gfx_hal::ShaderStage::None,
-            ez_gfx_hal::ResourceAccess::TransferRead,
+        let resource = intern_texture_resource(context, texture)?;
+        let range = ImageRange::all(1, 1).map_err(|_| EzGfxResult::InvalidArgument)?;
+        let state = ResourceState::new(
+            QueueKind::Transfer,
+            ShaderStage::None,
+            ResourceAccess::TransferRead,
         )
         .map_err(|_| EzGfxResult::InvalidArgument)?;
-        graph
-            .add_node(
-                ez_gfx_runtime::graph::NodeDesc::new(
-                    "texture-readback",
-                    ez_gfx_hal::QueueKind::Transfer,
-                )
-                .access(ez_gfx_runtime::graph::Access::image(resource, range, state)),
-            )
-            .map_err(|_| EzGfxResult::InvalidArgument)?;
         context
             .frame
-            .enqueue(graph.compile().map_err(|_| EzGfxResult::InvalidArgument)?)
+            .record_node(
+                NodeDesc::new("texture-readback", QueueKind::Transfer)
+                    .access(Access::image(resource, range, state)),
+                ExecutableNode::TextureReadback { texture },
+            )
             .map_err(map_frame)?;
-        context.frame_readback_texture = Some(texture);
         Ok(())
     }))
 }
@@ -1392,16 +1616,150 @@ pub fn render_add_graphics(
         {
             return Err(EzGfxResult::InvalidArgument);
         }
-        context.frame.mark_work_enqueued().map_err(map_frame)?;
-        context.pending_pipelines.push(PendingPipeline::Graphics {
-            shader,
-            indirect,
-            draw_count,
-            bindings: bindings.to_vec(),
-            layout,
-            state,
-            push_constants: push_constants.to_vec(),
+        let pipeline_layout = *record
+            .graphics_layout
+            .as_ref()
+            .ok_or(EzGfxResult::InvalidArgument)?;
+        let surface = intern_surface_resource(context)?;
+        let depth = if pipeline_layout.depth_required() {
+            Some(intern_depth_resource(context)?)
+        } else {
+            None
+        };
+        let (width, height) = context
+            .active_surface
+            .and_then(|surface| context.surfaces.get(&surface))
+            .and_then(|surface| surface.state.extent())
+            .ok_or(EzGfxResult::NotReady)?;
+        let load = if context.frame_has_graphics {
+            LoadOp::Load
+        } else {
+            LoadOp::Clear
+        };
+        let pass = PassInfo::new(
+            vec![surface],
+            depth,
+            [0, 0, width, height],
+            1,
+            load,
+            StoreOp::Store,
+        )
+        .map_err(|_| EzGfxResult::InvalidArgument)?;
+        let color_state = ResourceState::new(
+            QueueKind::Graphics,
+            ShaderStage::Fragment,
+            ResourceAccess::ColorAttachmentWrite,
+        )
+        .map_err(|_| EzGfxResult::InvalidArgument)?;
+        let mut node = NodeDesc::new("graphics", QueueKind::Graphics)
+            .access(Access::image(
+                surface,
+                ImageRange::all(1, 1).map_err(|_| EzGfxResult::InvalidArgument)?,
+                color_state,
+            ))
+            .pass(pass);
+        if let Some(depth) = depth {
+            let depth_state = ResourceState::new(
+                QueueKind::Graphics,
+                ShaderStage::Fragment,
+                ResourceAccess::DepthStencilWrite,
+            )
+            .map_err(|_| EzGfxResult::InvalidArgument)?;
+            node = node.access(Access::image(
+                depth,
+                ImageRange::all(1, 1).map_err(|_| EzGfxResult::InvalidArgument)?,
+                depth_state,
+            ));
+        }
+        let index_resource = intern_index_resource(context)?;
+        let index_size = context
+            .index_heap
+            .as_ref()
+            .ok_or(EzGfxResult::NotReady)?
+            .size;
+        let index_state = ResourceState::new(
+            QueueKind::Graphics,
+            ShaderStage::AllGraphics,
+            ResourceAccess::IndexRead,
+        )
+        .map_err(|_| EzGfxResult::InvalidArgument)?;
+        node = node.access(Access::buffer(
+            index_resource,
+            BufferRange::new(0, index_size).map_err(|_| EzGfxResult::InvalidArgument)?,
+            index_state,
+        ));
+        let indirect_binding = layout.requirements().iter().find_map(|requirement| {
+            let binding = bindings
+                .iter()
+                .find(|binding| binding.name == requirement.name)?;
+            matches!(
+                binding.resource,
+                ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle) if handle == indirect
+            )
+            .then_some(requirement.writable)
         });
+        let indirect_size = context
+            .allocations
+            .get(&indirect)
+            .map(|(size, _)| *size)
+            .ok_or(EzGfxResult::InvalidContext)?;
+        let indirect_resource = intern_buffer_resource(context, indirect)?;
+        let indirect_state = ResourceState::new(
+            QueueKind::Graphics,
+            ShaderStage::AllGraphics,
+            match indirect_binding {
+                Some(true) => ResourceAccess::IndirectStorageReadWrite,
+                Some(false) => ResourceAccess::IndirectStorageRead,
+                None => ResourceAccess::IndirectRead,
+            },
+        )
+        .map_err(|_| EzGfxResult::InvalidArgument)?;
+        node = node.access(Access::buffer(
+            indirect_resource,
+            BufferRange::new(0, indirect_size).map_err(|_| EzGfxResult::InvalidArgument)?,
+            indirect_state,
+        ));
+        node = add_binding_accesses(
+            context,
+            node,
+            &layout,
+            bindings,
+            QueueKind::Graphics,
+            ShaderStage::AllGraphics,
+            Some(indirect),
+        )?;
+        let texture_handles: Vec<_> = context.textures.keys().copied().collect();
+        for texture in texture_handles {
+            let resource = intern_texture_resource(context, texture)?;
+            let sampled = ResourceState::new(
+                QueueKind::Graphics,
+                ShaderStage::Fragment,
+                ResourceAccess::SampledRead,
+            )
+            .map_err(|_| EzGfxResult::InvalidArgument)?;
+            node = node.access(Access::image(
+                resource,
+                ImageRange::all(1, 1).map_err(|_| EzGfxResult::InvalidArgument)?,
+                sampled,
+            ));
+        }
+        context
+            .frame
+            .record_node(
+                node,
+                ExecutableNode::Graphics {
+                    shader,
+                    indirect,
+                    draw_count,
+                    bindings: bindings.to_vec(),
+                    layout,
+                    pipeline_layout,
+                    state,
+                    push_constants: push_constants.to_vec(),
+                },
+            )
+            .map_err(map_frame)?;
+        context.frame_has_graphics = true;
         Ok(())
     }))
 }
@@ -1440,14 +1798,28 @@ pub fn render_add_compute(
         layout
             .validate(bindings)
             .map_err(|_| EzGfxResult::InvalidArgument)?;
-        context.frame.mark_work_enqueued().map_err(map_frame)?;
-        context.pending_pipelines.push(PendingPipeline::Compute {
-            shader,
-            groups,
-            bindings: bindings.to_vec(),
-            layout,
-            push_constants: push_constants.to_vec(),
-        });
+        let node = add_binding_accesses(
+            context,
+            NodeDesc::new("compute", QueueKind::Compute),
+            &layout,
+            bindings,
+            QueueKind::Compute,
+            ShaderStage::Compute,
+            None,
+        )?;
+        context
+            .frame
+            .record_node(
+                node,
+                ExecutableNode::Compute {
+                    shader,
+                    groups,
+                    bindings: bindings.to_vec(),
+                    layout,
+                    push_constants: push_constants.to_vec(),
+                },
+            )
+            .map_err(map_frame)?;
         Ok(())
     }))
 }
@@ -1480,148 +1852,38 @@ fn validate_binding_handles(
 pub fn frame_submit(context: u64) -> EzGfxResult {
     result_status(with_context_mut(context, |context| {
         let result = (|| {
-            let _submission = context.frame.submit().map_err(map_frame)?;
-            wait_native_idle(&mut context.native).map_err(map_hal)?;
-            let work = core::mem::take(&mut context.pending_pipelines);
-            for pipeline in work {
-                match pipeline {
-                    PendingPipeline::Compute {
-                        shader,
-                        groups,
-                        bindings,
-                        layout,
-                        push_constants,
-                    } => {
-                        let record = context
-                            .shaders
-                            .get(&shader)
-                            .ok_or(EzGfxResult::InvalidContext)?;
-                        let (product, entry) = record
-                            .compute
-                            .as_ref()
-                            .ok_or(EzGfxResult::InvalidArgument)?;
-                        execute_compute(
-                            &mut context.native,
-                            &context.allocations,
-                            ComputeExecution {
-                                shader: &record.native,
-                                product: *product,
-                                entry,
-                                groups,
-                                push_constants: &push_constants,
-                                layout: &layout,
-                                bindings: &bindings,
-                            },
-                        )
-                        .map_err(map_hal)?;
-                    }
-                    PendingPipeline::Graphics {
-                        shader,
-                        indirect,
-                        draw_count,
-                        bindings,
-                        layout,
-                        state,
-                        push_constants,
-                    } => {
-                        let indirect = &context
-                            .allocations
-                            .get(&indirect)
-                            .ok_or(EzGfxResult::InvalidContext)?
-                            .1;
-                        let index = &context
-                            .index_heap
-                            .as_ref()
-                            .ok_or(EzGfxResult::NotReady)?
-                            .allocation;
-                        let surface_handle = context.active_surface.ok_or(EzGfxResult::NotReady)?;
-                        let extent = context
-                            .surfaces
-                            .get(&surface_handle)
-                            .ok_or(EzGfxResult::InvalidContext)?
-                            .state
-                            .extent()
-                            .ok_or(EzGfxResult::NotReady)?;
-                        let record = context
-                            .shaders
-                            .get(&shader)
-                            .ok_or(EzGfxResult::InvalidContext)?;
-                        let graphics = record
-                            .graphics
-                            .as_ref()
-                            .ok_or(EzGfxResult::InvalidArgument)?;
-                        let mut surface = context
-                            .surfaces
-                            .remove(&surface_handle)
-                            .expect("validated above");
-                        let capture_presented = surface.state.snapshot_cache();
-                        let result = execute_graphics(
-                            &mut context.native,
-                            &context.allocations,
-                            GraphicsExecution {
-                                surface: &mut surface.native,
-                                shader: &record.native,
-                                graphics,
-                                pipeline_layout: record
-                                    .graphics_layout
-                                    .as_ref()
-                                    .ok_or(EzGfxResult::InvalidArgument)?,
-                                state,
-                                index,
-                                indirect,
-                                draw_count,
-                                push_constants: &push_constants,
-                                extent,
-                                capture_presented,
-                                layout: &layout,
-                                bindings: &bindings,
-                                textures: &context.textures,
-                            },
-                        );
-                        if result.is_ok() && surface.state.snapshot_cache() {
-                            context.last_readback = match &surface.native {
-                                NativeSurface::Vulkan(surface) => {
-                                    surface.presented_rgba8().to_vec()
-                                }
-                                #[cfg(windows)]
-                                NativeSurface::Dx12(surface) => surface.presented_rgba8().to_vec(),
-                                #[cfg(target_vendor = "apple")]
-                                NativeSurface::Metal(surface) => surface.presented_rgba8().to_vec(),
-                            };
-                        }
-                        context.surfaces.insert(surface_handle, surface);
-                        result.map_err(map_hal)?;
-                        context.frame_presented = true;
-                    }
-                }
+            if context.frame_has_graphics {
+                let surface = context.active_surface.ok_or(EzGfxResult::NotReady)?;
+                let resource = context.frame_surface.ok_or(EzGfxResult::NotReady)?;
+                let present = ResourceState::new(
+                    QueueKind::Graphics,
+                    ShaderStage::None,
+                    ResourceAccess::Present,
+                )
+                .map_err(|_| EzGfxResult::InvalidArgument)?;
+                context
+                    .frame
+                    .record_node(
+                        NodeDesc::new("present", QueueKind::Graphics).access(Access::image(
+                            resource,
+                            ImageRange::all(1, 1).map_err(|_| EzGfxResult::InvalidArgument)?,
+                            present,
+                        )),
+                        ExecutableNode::Present { surface },
+                    )
+                    .map_err(map_frame)?;
             }
-            if let Some(texture) = context.frame_readback_texture {
-                let (_, native_texture, width, height, _) = context
-                    .textures
-                    .get(&texture)
-                    .ok_or(EzGfxResult::InvalidContext)?;
-                context.last_readback = match (&mut context.native, native_texture) {
-                    (NativeContext::Vulkan(native), NativeTexture::Vulkan(texture)) => {
-                        native.readback_texture_rgba8(texture, *width, *height)
-                    }
-                    #[cfg(windows)]
-                    (NativeContext::Dx12(native), NativeTexture::Dx12(texture)) => {
-                        native.readback_texture_rgba8(texture, *width, *height)
-                    }
-                    #[cfg(target_vendor = "apple")]
-                    (NativeContext::Metal(native), NativeTexture::Metal(texture)) => {
-                        native.readback_texture_rgba8(texture, *width, *height)
-                    }
-                    _ => return Err(EzGfxResult::NativeFailure),
-                }
-                .map_err(map_allocation)?;
-            }
-            context.frame.finish().map_err(map_frame)?;
-            let record = runtime_record(context, 0, RuntimePhase::Submit, EzGfxResult::Ok);
-            context.observability.push_event(record);
+            let submission = context.frame.submit().map_err(map_frame)?;
+            let mut adapter = NativeFrameAdapter { context };
+            execute_compiled_graph(&submission.graph, &submission.nodes, &mut adapter)
+                .map_err(map_execution)?;
+            adapter.context.frame.finish().map_err(map_frame)?;
+            let record = runtime_record(adapter.context, 0, RuntimePhase::Submit, EzGfxResult::Ok);
+            adapter.context.observability.push_event(record);
             Ok(())
         })();
         if let Err(status) = result {
+            context.frame.abort();
             let record = runtime_record(context, 0, RuntimePhase::Submit, status);
             context
                 .observability
@@ -1638,6 +1900,894 @@ pub fn frame_readback(context: u64) -> Result<Vec<u8>, EzGfxResult> {
         }
         Ok(context.last_readback.clone())
     })
+}
+
+fn map_execution(error: ExecutionError<EzGfxResult>) -> EzGfxResult {
+    match error {
+        ExecutionError::Backend(error) => error,
+        ExecutionError::MissingPayload { .. }
+        | ExecutionError::UnexpectedPayloads
+        | ExecutionError::InvalidCompiledRange => EzGfxResult::InvalidArgument,
+    }
+}
+
+struct NativeFrameAdapter<'a> {
+    context: &'a mut FfiContext,
+}
+
+impl FrameExecutionBackend<ExecutableNode> for NativeFrameAdapter<'_> {
+    type Error = EzGfxResult;
+
+    fn execute(
+        &mut self,
+        plan: &FrameExecutionPlan,
+        payloads: &[ExecutableNode],
+    ) -> Result<(), Self::Error> {
+        if matches!(self.context.native, NativeContext::Vulkan(_)) {
+            return execute_vulkan_frame_plan(self.context, plan, payloads);
+        }
+        #[cfg(windows)]
+        if matches!(self.context.native, NativeContext::Dx12(_)) {
+            return execute_dx12_frame_plan(self.context, plan, payloads);
+        }
+        #[cfg(target_vendor = "apple")]
+        if matches!(self.context.native, NativeContext::Metal(_)) {
+            return execute_metal_frame_plan(self.context, plan, payloads);
+        }
+        Err(EzGfxResult::NativeFailure)
+    }
+}
+fn execute_vulkan_frame_plan(
+    context: &mut FfiContext,
+    plan: &FrameExecutionPlan,
+    payloads: &[ExecutableNode],
+) -> Result<(), EzGfxResult> {
+    let surface_handle = payloads.iter().find_map(|payload| match payload {
+        ExecutableNode::Present { surface } => Some(*surface),
+        _ => None,
+    });
+    let mut surface = surface_handle
+        .map(|handle| {
+            context
+                .surfaces
+                .remove(&handle)
+                .ok_or(EzGfxResult::InvalidContext)
+        })
+        .transpose()?;
+    let extent = surface
+        .as_ref()
+        .and_then(|surface| surface.state.extent())
+        .unwrap_or((0, 0));
+    let capture = surface
+        .as_ref()
+        .is_some_and(|surface| surface.state.snapshot_cache());
+
+    let index = match context.index_heap.as_ref().map(|heap| &heap.allocation) {
+        Some(NativeAllocation::Vulkan(index)) => Some(index),
+        Some(_) => return Err(EzGfxResult::NativeFailure),
+        None => None,
+    };
+    if surface
+        .as_ref()
+        .is_some_and(|surface| !matches!(surface.native, NativeSurface::Vulkan(_)))
+    {
+        if let (Some(handle), Some(surface)) = (surface_handle, surface) {
+            context.surfaces.insert(handle, surface);
+        }
+        return Err(EzGfxResult::NativeFailure);
+    }
+    let mut native_surface = surface.as_mut().map(|surface| {
+        let NativeSurface::Vulkan(surface) = &mut surface.native else {
+            unreachable!("surface variant validated");
+        };
+        surface
+    });
+    let NativeContext::Vulkan(native) = &mut context.native else {
+        return Err(EzGfxResult::NativeFailure);
+    };
+
+    let mut pipelines: Vec<Option<ez_gfx_backend_vulkan::NativePipeline>> =
+        (0..payloads.len()).map(|_| None).collect();
+    let execution = (|| -> Result<Vec<Vec<u8>>, EzGfxResult> {
+        for (node_index, payload) in payloads.iter().enumerate() {
+            let pipeline = match payload {
+                ExecutableNode::Compute { shader, layout, .. } => {
+                    let record = context
+                        .shaders
+                        .get(shader)
+                        .ok_or(EzGfxResult::InvalidContext)?;
+                    let compute = record
+                        .compute
+                        .as_ref()
+                        .ok_or(EzGfxResult::InvalidArgument)?;
+                    let NativeShader::Vulkan(shader) = &record.native else {
+                        return Err(EzGfxResult::NativeFailure);
+                    };
+                    let layouts = native_layouts(layout).map_err(map_hal)?;
+                    native
+                        .create_compute_pipeline(shader, compute.0, &compute.1, &layouts)
+                        .map_err(map_hal)?
+                }
+                ExecutableNode::Graphics {
+                    shader,
+                    layout,
+                    pipeline_layout,
+                    state,
+                    ..
+                } => {
+                    let record = context
+                        .shaders
+                        .get(shader)
+                        .ok_or(EzGfxResult::InvalidContext)?;
+                    let graphics = record
+                        .graphics
+                        .as_ref()
+                        .ok_or(EzGfxResult::InvalidArgument)?;
+                    let NativeShader::Vulkan(shader) = &record.native else {
+                        return Err(EzGfxResult::NativeFailure);
+                    };
+                    let layouts = native_layouts(layout).map_err(map_hal)?;
+                    native
+                        .create_graphics_pipeline(
+                            shader,
+                            ez_gfx_backend_vulkan::NativeGraphicsPipelineDesc {
+                                vertex_index: graphics.0,
+                                fragment_index: graphics.2,
+                                state: *state,
+                                depth_required: pipeline_layout.depth_required(),
+                                layouts: &layouts,
+                            },
+                        )
+                        .map_err(map_hal)?
+                }
+                ExecutableNode::TextureReadback { .. } | ExecutableNode::Present { .. } => continue,
+            };
+            pipelines[node_index] = Some(pipeline);
+        }
+
+        let binding_sets = payloads
+            .iter()
+            .map(|payload| match payload {
+                ExecutableNode::Compute {
+                    layout, bindings, ..
+                }
+                | ExecutableNode::Graphics {
+                    layout, bindings, ..
+                } => vulkan_bindings(layout, bindings, &context.allocations).map_err(map_hal),
+                ExecutableNode::TextureReadback { .. } | ExecutableNode::Present { .. } => {
+                    Ok(Vec::new())
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut actions = Vec::with_capacity(plan.actions.len());
+        for action in &plan.actions {
+            match action {
+                ExecutionAction::Wait(wait) => {
+                    if let Some(token) = wait.external {
+                        actions.push(ez_gfx_backend_vulkan::NativeFrameAction::Wait(token));
+                    }
+                }
+                ExecutionAction::Barrier(barrier) => {
+                    let resource = context
+                        .frame_native_resources
+                        .get(&ResourceId::from_index(barrier.resource))
+                        .ok_or(EzGfxResult::InvalidArgument)?;
+                    let resource = match *resource {
+                        FrameNativeResource::Buffer(handle) => {
+                            let NativeAllocation::Vulkan(allocation) = &context
+                                .allocations
+                                .get(&handle)
+                                .ok_or(EzGfxResult::InvalidContext)?
+                                .1
+                            else {
+                                return Err(EzGfxResult::NativeFailure);
+                            };
+                            ez_gfx_backend_vulkan::NativeFrameResource::Buffer(allocation)
+                        }
+                        FrameNativeResource::Texture(handle) => {
+                            let (_, NativeTexture::Vulkan(texture), _, _, _) = context
+                                .textures
+                                .get(&handle)
+                                .ok_or(EzGfxResult::InvalidContext)?
+                            else {
+                                return Err(EzGfxResult::NativeFailure);
+                            };
+                            ez_gfx_backend_vulkan::NativeFrameResource::Texture(texture)
+                        }
+                        FrameNativeResource::Surface(_) => {
+                            ez_gfx_backend_vulkan::NativeFrameResource::Surface
+                        }
+                        FrameNativeResource::Depth => {
+                            ez_gfx_backend_vulkan::NativeFrameResource::Depth
+                        }
+                        FrameNativeResource::Index => {
+                            ez_gfx_backend_vulkan::NativeFrameResource::Buffer(
+                                index.ok_or(EzGfxResult::NotReady)?,
+                            )
+                        }
+                    };
+                    actions.push(ez_gfx_backend_vulkan::NativeFrameAction::Barrier {
+                        barrier: *barrier,
+                        resource,
+                    });
+                }
+                ExecutionAction::BeginPass(pass) => {
+                    actions.push(ez_gfx_backend_vulkan::NativeFrameAction::BeginPass(pass));
+                }
+                ExecutionAction::ExecuteNode(node) => {
+                    let index_node = *node as usize;
+                    let payload = payloads
+                        .get(index_node)
+                        .ok_or(EzGfxResult::InvalidArgument)?;
+                    match payload {
+                        ExecutableNode::Compute {
+                            groups,
+                            push_constants,
+                            ..
+                        } => actions.push(ez_gfx_backend_vulkan::NativeFrameAction::Compute(
+                            ez_gfx_backend_vulkan::NativeComputeDispatch {
+                                pipeline: pipelines[index_node]
+                                    .as_ref()
+                                    .ok_or(EzGfxResult::InvalidArgument)?,
+                                groups: *groups,
+                                push_constants,
+                                bindings: &binding_sets[index_node],
+                            },
+                        )),
+                        ExecutableNode::Graphics {
+                            indirect,
+                            draw_count,
+                            push_constants,
+                            ..
+                        } => {
+                            let NativeAllocation::Vulkan(indirect) = &context
+                                .allocations
+                                .get(indirect)
+                                .ok_or(EzGfxResult::InvalidContext)?
+                                .1
+                            else {
+                                return Err(EzGfxResult::NativeFailure);
+                            };
+                            actions.push(ez_gfx_backend_vulkan::NativeFrameAction::Graphics(
+                                ez_gfx_backend_vulkan::NativeDrawIndexed {
+                                    width: extent.0,
+                                    height: extent.1,
+                                    pipeline: pipelines[index_node]
+                                        .as_ref()
+                                        .ok_or(EzGfxResult::InvalidArgument)?,
+                                    index_buffer: index.ok_or(EzGfxResult::NotReady)?,
+                                    indirect_buffer: indirect,
+                                    draw_count: *draw_count,
+                                    push_constants,
+                                    bindings: &binding_sets[index_node],
+                                },
+                            ));
+                        }
+                        ExecutableNode::TextureReadback { texture } => {
+                            let (_, NativeTexture::Vulkan(texture), width, height, _) = context
+                                .textures
+                                .get(texture)
+                                .ok_or(EzGfxResult::InvalidContext)?
+                            else {
+                                return Err(EzGfxResult::NativeFailure);
+                            };
+                            actions.push(
+                                ez_gfx_backend_vulkan::NativeFrameAction::TextureReadback {
+                                    texture,
+                                    width: *width,
+                                    height: *height,
+                                },
+                            );
+                        }
+                        ExecutableNode::Present { .. } => {
+                            actions.push(ez_gfx_backend_vulkan::NativeFrameAction::Present);
+                        }
+                    }
+                }
+                ExecutionAction::EndPass => {
+                    actions.push(ez_gfx_backend_vulkan::NativeFrameAction::EndPass);
+                }
+            }
+        }
+
+        let result = native
+            .execute_frame(
+                native_surface
+                    .as_deref_mut()
+                    .map(|surface| (surface, extent)),
+                &actions,
+                capture,
+            )
+            .map_err(map_hal);
+        drop(actions);
+        result
+    })();
+    for pipeline in pipelines.into_iter().flatten() {
+        native.destroy_pipeline(pipeline);
+    }
+    let outcome = match execution {
+        Ok(outputs) => {
+            let texture_readbacks = payloads
+                .iter()
+                .filter(|payload| matches!(payload, ExecutableNode::TextureReadback { .. }))
+                .count();
+            if texture_readbacks != 0 {
+                let Some(readback) = outputs.get(texture_readbacks - 1) else {
+                    if let (Some(handle), Some(surface)) = (surface_handle, surface) {
+                        context.surfaces.insert(handle, surface);
+                    }
+                    return Err(EzGfxResult::NativeFailure);
+                };
+                context.last_readback = readback.clone();
+            }
+            if capture && let Some(native_surface) = native_surface.as_deref() {
+                context.last_readback = native_surface.presented_rgba8().to_vec();
+            }
+            context.frame_presented = payloads
+                .iter()
+                .any(|payload| matches!(payload, ExecutableNode::Present { .. }));
+            Ok(())
+        }
+        Err(error) => Err(error),
+    };
+    if let (Some(handle), Some(surface)) = (surface_handle, surface) {
+        context.surfaces.insert(handle, surface);
+    }
+    outcome
+}
+#[cfg(windows)]
+fn execute_dx12_frame_plan(
+    context: &mut FfiContext,
+    plan: &FrameExecutionPlan,
+    payloads: &[ExecutableNode],
+) -> Result<(), EzGfxResult> {
+    let surface_handle = payloads.iter().find_map(|payload| match payload {
+        ExecutableNode::Present { surface } => Some(*surface),
+        _ => None,
+    });
+    let mut surface = surface_handle
+        .map(|handle| {
+            context
+                .surfaces
+                .remove(&handle)
+                .ok_or(EzGfxResult::InvalidContext)
+        })
+        .transpose()?;
+    let extent = surface
+        .as_ref()
+        .and_then(|surface| surface.state.extent())
+        .unwrap_or((0, 0));
+    let capture = surface
+        .as_ref()
+        .is_some_and(|surface| surface.state.snapshot_cache());
+    let index = match context.index_heap.as_ref().map(|heap| &heap.allocation) {
+        Some(NativeAllocation::Dx12(index)) => Some(index),
+        Some(_) => return Err(EzGfxResult::NativeFailure),
+        None => None,
+    };
+    if surface
+        .as_ref()
+        .is_some_and(|surface| !matches!(surface.native, NativeSurface::Dx12(_)))
+    {
+        if let (Some(handle), Some(surface)) = (surface_handle, surface) {
+            context.surfaces.insert(handle, surface);
+        }
+        return Err(EzGfxResult::NativeFailure);
+    }
+    let mut native_surface = surface.as_mut().map(|surface| {
+        let NativeSurface::Dx12(surface) = &mut surface.native else {
+            unreachable!("surface variant validated");
+        };
+        surface
+    });
+    let NativeContext::Dx12(native) = &mut context.native else {
+        return Err(EzGfxResult::NativeFailure);
+    };
+
+    let execution = (|| -> Result<Vec<Vec<u8>>, EzGfxResult> {
+        let binding_sets = payloads
+            .iter()
+            .map(|payload| match payload {
+                ExecutableNode::Compute {
+                    layout, bindings, ..
+                }
+                | ExecutableNode::Graphics {
+                    layout, bindings, ..
+                } => dx12_bindings(layout, bindings, &context.allocations).map_err(map_hal),
+                ExecutableNode::TextureReadback { .. } | ExecutableNode::Present { .. } => {
+                    Ok(Vec::new())
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut pipelines: Vec<Option<ez_gfx_backend_dx12::native::NativePipeline>> =
+            (0..payloads.len()).map(|_| None).collect();
+        for (node_index, payload) in payloads.iter().enumerate() {
+            let pipeline = match payload {
+                ExecutableNode::Compute { shader, layout, .. } => {
+                    let record = context
+                        .shaders
+                        .get(shader)
+                        .ok_or(EzGfxResult::InvalidContext)?;
+                    let compute = record
+                        .compute
+                        .as_ref()
+                        .ok_or(EzGfxResult::InvalidArgument)?;
+                    let NativeShader::Dx12(shader) = &record.native else {
+                        return Err(EzGfxResult::NativeFailure);
+                    };
+                    let layouts = native_layouts(layout).map_err(map_hal)?;
+                    native
+                        .create_compute_pipeline(shader, compute.0, &layouts)
+                        .map_err(map_hal)?
+                }
+                ExecutableNode::Graphics {
+                    shader,
+                    layout,
+                    pipeline_layout,
+                    state,
+                    ..
+                } => {
+                    let record = context
+                        .shaders
+                        .get(shader)
+                        .ok_or(EzGfxResult::InvalidContext)?;
+                    let graphics = record
+                        .graphics
+                        .as_ref()
+                        .ok_or(EzGfxResult::InvalidArgument)?;
+                    let NativeShader::Dx12(shader) = &record.native else {
+                        return Err(EzGfxResult::NativeFailure);
+                    };
+                    let layouts = native_layouts(layout).map_err(map_hal)?;
+                    native
+                        .create_graphics_pipeline(
+                            shader,
+                            graphics.0,
+                            graphics.2,
+                            *state,
+                            pipeline_layout.depth_required(),
+                            &layouts,
+                        )
+                        .map_err(map_hal)?
+                }
+                ExecutableNode::TextureReadback { .. } | ExecutableNode::Present { .. } => {
+                    continue;
+                }
+            };
+            pipelines[node_index] = Some(pipeline);
+        }
+
+        let mut actions = Vec::with_capacity(plan.actions.len());
+        for action in &plan.actions {
+            match action {
+                ExecutionAction::Wait(wait) => {
+                    if let Some(token) = wait.external {
+                        actions.push(ez_gfx_backend_dx12::native::NativeFrameAction::Wait(token));
+                    }
+                }
+                ExecutionAction::Barrier(barrier) => {
+                    let resource = context
+                        .frame_native_resources
+                        .get(&ResourceId::from_index(barrier.resource))
+                        .ok_or(EzGfxResult::InvalidArgument)?;
+                    let resource = match *resource {
+                        FrameNativeResource::Buffer(handle) => {
+                            let NativeAllocation::Dx12(allocation) = &context
+                                .allocations
+                                .get(&handle)
+                                .ok_or(EzGfxResult::InvalidContext)?
+                                .1
+                            else {
+                                return Err(EzGfxResult::NativeFailure);
+                            };
+                            ez_gfx_backend_dx12::native::NativeFrameResource::Buffer(allocation)
+                        }
+                        FrameNativeResource::Texture(handle) => {
+                            let (_, NativeTexture::Dx12(texture), _, _, _) = context
+                                .textures
+                                .get(&handle)
+                                .ok_or(EzGfxResult::InvalidContext)?
+                            else {
+                                return Err(EzGfxResult::NativeFailure);
+                            };
+                            ez_gfx_backend_dx12::native::NativeFrameResource::Texture(texture)
+                        }
+                        FrameNativeResource::Surface(_) => {
+                            ez_gfx_backend_dx12::native::NativeFrameResource::Surface
+                        }
+                        FrameNativeResource::Depth => {
+                            ez_gfx_backend_dx12::native::NativeFrameResource::Depth
+                        }
+                        FrameNativeResource::Index => {
+                            ez_gfx_backend_dx12::native::NativeFrameResource::Buffer(
+                                index.ok_or(EzGfxResult::NotReady)?,
+                            )
+                        }
+                    };
+                    actions.push(ez_gfx_backend_dx12::native::NativeFrameAction::Barrier {
+                        barrier: *barrier,
+                        resource,
+                    });
+                }
+                ExecutionAction::BeginPass(pass) => {
+                    actions.push(ez_gfx_backend_dx12::native::NativeFrameAction::BeginPass(
+                        pass,
+                    ));
+                }
+                ExecutionAction::ExecuteNode(node) => {
+                    let index_node = *node as usize;
+                    match payloads
+                        .get(index_node)
+                        .ok_or(EzGfxResult::InvalidArgument)?
+                    {
+                        ExecutableNode::Compute {
+                            groups,
+                            push_constants,
+                            ..
+                        } => actions.push(ez_gfx_backend_dx12::native::NativeFrameAction::Compute(
+                            ez_gfx_backend_dx12::native::NativeComputeDispatch {
+                                pipeline: pipelines[index_node]
+                                    .as_ref()
+                                    .ok_or(EzGfxResult::InvalidArgument)?,
+                                groups: *groups,
+                                push_constants,
+                                bindings: &binding_sets[index_node],
+                            },
+                        )),
+                        ExecutableNode::Graphics {
+                            indirect,
+                            draw_count,
+                            push_constants,
+                            ..
+                        } => {
+                            let NativeAllocation::Dx12(indirect) = &context
+                                .allocations
+                                .get(indirect)
+                                .ok_or(EzGfxResult::InvalidContext)?
+                                .1
+                            else {
+                                return Err(EzGfxResult::NativeFailure);
+                            };
+                            actions.push(ez_gfx_backend_dx12::native::NativeFrameAction::Graphics(
+                                ez_gfx_backend_dx12::native::NativeDrawIndexed {
+                                    width: extent.0,
+                                    height: extent.1,
+                                    pipeline: pipelines[index_node]
+                                        .as_ref()
+                                        .ok_or(EzGfxResult::InvalidArgument)?,
+                                    index_buffer: index.ok_or(EzGfxResult::NotReady)?,
+                                    indirect_buffer: indirect,
+                                    draw_count: *draw_count,
+                                    push_constants,
+                                    bindings: &binding_sets[index_node],
+                                },
+                            ));
+                        }
+                        ExecutableNode::TextureReadback { texture } => {
+                            let (_, NativeTexture::Dx12(texture), width, height, _) = context
+                                .textures
+                                .get(texture)
+                                .ok_or(EzGfxResult::InvalidContext)?
+                            else {
+                                return Err(EzGfxResult::NativeFailure);
+                            };
+                            actions.push(
+                                ez_gfx_backend_dx12::native::NativeFrameAction::TextureReadback {
+                                    texture,
+                                    width: *width,
+                                    height: *height,
+                                },
+                            );
+                        }
+                        ExecutableNode::Present { .. } => {
+                            actions.push(ez_gfx_backend_dx12::native::NativeFrameAction::Present);
+                        }
+                    }
+                }
+                ExecutionAction::EndPass => {
+                    actions.push(ez_gfx_backend_dx12::native::NativeFrameAction::EndPass);
+                }
+            }
+        }
+        native
+            .execute_frame(
+                native_surface
+                    .as_deref_mut()
+                    .map(|surface| (surface, extent)),
+                &actions,
+                capture,
+            )
+            .map_err(map_hal)
+    })();
+
+    let outcome = match execution {
+        Ok(outputs) => {
+            let texture_readbacks = payloads
+                .iter()
+                .filter(|payload| matches!(payload, ExecutableNode::TextureReadback { .. }))
+                .count();
+            if texture_readbacks != 0 {
+                let Some(readback) = outputs.get(texture_readbacks - 1) else {
+                    if let (Some(handle), Some(surface)) = (surface_handle, surface) {
+                        context.surfaces.insert(handle, surface);
+                    }
+                    return Err(EzGfxResult::NativeFailure);
+                };
+                context.last_readback = readback.clone();
+            }
+            if capture && let Some(native_surface) = native_surface.as_deref() {
+                context.last_readback = native_surface.presented_rgba8().to_vec();
+            }
+            context.frame_presented = payloads
+                .iter()
+                .any(|payload| matches!(payload, ExecutableNode::Present { .. }));
+            Ok(())
+        }
+        Err(error) => Err(error),
+    };
+    if let (Some(handle), Some(surface)) = (surface_handle, surface) {
+        context.surfaces.insert(handle, surface);
+    }
+    outcome
+}
+
+#[cfg(target_vendor = "apple")]
+fn execute_metal_frame_plan(
+    context: &mut FfiContext,
+    plan: &FrameExecutionPlan,
+    payloads: &[ExecutableNode],
+) -> Result<(), EzGfxResult> {
+    let surface_handle = payloads.iter().find_map(|payload| match payload {
+        ExecutableNode::Present { surface } => Some(*surface),
+        _ => None,
+    });
+    let mut surface = surface_handle
+        .map(|handle| {
+            context
+                .surfaces
+                .remove(&handle)
+                .ok_or(EzGfxResult::InvalidContext)
+        })
+        .transpose()?;
+    let extent = surface
+        .as_ref()
+        .and_then(|surface| surface.state.extent())
+        .unwrap_or((0, 0));
+    let capture = surface
+        .as_ref()
+        .is_some_and(|surface| surface.state.snapshot_cache());
+
+    let mut binding_sets = Vec::with_capacity(payloads.len());
+    for payload in payloads {
+        let bindings = match payload {
+            ExecutableNode::Graphics {
+                layout, bindings, ..
+            }
+            | ExecutableNode::Compute {
+                layout, bindings, ..
+            } => metal_bindings(layout, bindings, &context.allocations).map_err(map_hal)?,
+            ExecutableNode::TextureReadback { .. } | ExecutableNode::Present { .. } => Vec::new(),
+        };
+        binding_sets.push(bindings);
+    }
+    let native_textures: Vec<_> = context
+        .textures
+        .values()
+        .map(|(_, texture, _, _, _)| match texture {
+            NativeTexture::Metal(texture) => Ok(texture),
+            _ => Err(EzGfxResult::NativeFailure),
+        })
+        .collect::<Result<_, _>>()?;
+    let index = match context.index_heap.as_ref().map(|heap| &heap.allocation) {
+        Some(NativeAllocation::Metal(index)) => Some(index),
+        Some(_) => return Err(EzGfxResult::NativeFailure),
+        None => None,
+    };
+
+    let mut actions = Vec::with_capacity(plan.actions.len());
+    for action in &plan.actions {
+        match action {
+            ExecutionAction::Wait(wait) => {
+                if let Some(token) = wait.external {
+                    actions.push(ez_gfx_backend_metal::native::NativeFrameAction::Wait(token));
+                }
+            }
+            ExecutionAction::Barrier(barrier) => {
+                let resource = context
+                    .frame_native_resources
+                    .get(&ResourceId::from_index(barrier.resource))
+                    .ok_or(EzGfxResult::InvalidArgument)?;
+                let resource = match *resource {
+                    FrameNativeResource::Buffer(handle) => {
+                        let NativeAllocation::Metal(allocation) = &context
+                            .allocations
+                            .get(&handle)
+                            .ok_or(EzGfxResult::InvalidContext)?
+                            .1
+                        else {
+                            return Err(EzGfxResult::NativeFailure);
+                        };
+                        ez_gfx_backend_metal::native::NativeFrameResource::Buffer(allocation)
+                    }
+                    FrameNativeResource::Texture(handle) => {
+                        let (_, NativeTexture::Metal(texture), _, _, _) = context
+                            .textures
+                            .get(&handle)
+                            .ok_or(EzGfxResult::InvalidContext)?
+                        else {
+                            return Err(EzGfxResult::NativeFailure);
+                        };
+                        ez_gfx_backend_metal::native::NativeFrameResource::Texture(texture)
+                    }
+                    FrameNativeResource::Surface(_) => {
+                        ez_gfx_backend_metal::native::NativeFrameResource::Surface
+                    }
+                    FrameNativeResource::Depth => {
+                        ez_gfx_backend_metal::native::NativeFrameResource::Depth
+                    }
+                    FrameNativeResource::Index => {
+                        ez_gfx_backend_metal::native::NativeFrameResource::Buffer(
+                            index.ok_or(EzGfxResult::NotReady)?,
+                        )
+                    }
+                };
+                actions.push(ez_gfx_backend_metal::native::NativeFrameAction::Barrier {
+                    barrier: *barrier,
+                    resource,
+                });
+            }
+            ExecutionAction::BeginPass(pass) => {
+                actions.push(ez_gfx_backend_metal::native::NativeFrameAction::BeginPass(
+                    pass,
+                ));
+            }
+            ExecutionAction::ExecuteNode(node) => {
+                let index_node = *node as usize;
+                let payload = payloads
+                    .get(index_node)
+                    .ok_or(EzGfxResult::InvalidArgument)?;
+                match payload {
+                    ExecutableNode::Graphics {
+                        shader,
+                        indirect,
+                        draw_count,
+                        layout: _,
+                        pipeline_layout,
+                        state,
+                        push_constants,
+                        ..
+                    } => {
+                        let record = context
+                            .shaders
+                            .get(shader)
+                            .ok_or(EzGfxResult::InvalidContext)?;
+                        let graphics = record
+                            .graphics
+                            .as_ref()
+                            .ok_or(EzGfxResult::InvalidArgument)?;
+                        let NativeShader::Metal(shader) = &record.native else {
+                            return Err(EzGfxResult::NativeFailure);
+                        };
+                        let NativeAllocation::Metal(indirect) = &context
+                            .allocations
+                            .get(indirect)
+                            .ok_or(EzGfxResult::InvalidContext)?
+                            .1
+                        else {
+                            return Err(EzGfxResult::NativeFailure);
+                        };
+                        let texture_heap = pipeline_layout
+                            .texture_heap()
+                            .map(|layout| {
+                                ez_gfx_hal::ShaderTextureHeapLayout::new(
+                                    layout.space,
+                                    layout.binding,
+                                    layout.capacity,
+                                    layout.argument_stride,
+                                    layout.texture_argument_offset,
+                                    layout.sampler_argument_offset,
+                                )
+                            })
+                            .transpose()
+                            .map_err(map_hal)?;
+                        actions.push(ez_gfx_backend_metal::native::NativeFrameAction::Graphics(
+                            ez_gfx_backend_metal::native::NativeGraphicsDraw {
+                                shader,
+                                graphics,
+                                depth_required: pipeline_layout.depth_required(),
+                                texture_heap,
+                                state: *state,
+                                index: index.ok_or(EzGfxResult::NotReady)?,
+                                indirect,
+                                draw_count: *draw_count,
+                                push_constants,
+                                bindings: &binding_sets[index_node],
+                                textures: &native_textures,
+                            },
+                        ));
+                    }
+                    ExecutableNode::Compute {
+                        shader,
+                        groups,
+                        push_constants,
+                        ..
+                    } => {
+                        let record = context
+                            .shaders
+                            .get(shader)
+                            .ok_or(EzGfxResult::InvalidContext)?;
+                        let (product, entry) = record
+                            .compute
+                            .as_ref()
+                            .ok_or(EzGfxResult::InvalidArgument)?;
+                        let NativeShader::Metal(shader) = &record.native else {
+                            return Err(EzGfxResult::NativeFailure);
+                        };
+                        actions.push(ez_gfx_backend_metal::native::NativeFrameAction::Compute(
+                            ez_gfx_backend_metal::native::NativeComputeDispatch {
+                                shader,
+                                product_index: *product,
+                                entry,
+                                groups: *groups,
+                                push_constants,
+                                bindings: &binding_sets[index_node],
+                            },
+                        ));
+                    }
+                    ExecutableNode::TextureReadback { texture } => {
+                        let (_, NativeTexture::Metal(texture), width, height, _) = context
+                            .textures
+                            .get(texture)
+                            .ok_or(EzGfxResult::InvalidContext)?
+                        else {
+                            return Err(EzGfxResult::NativeFailure);
+                        };
+                        actions.push(
+                            ez_gfx_backend_metal::native::NativeFrameAction::TextureReadback {
+                                texture,
+                                width: *width,
+                                height: *height,
+                            },
+                        );
+                    }
+                    ExecutableNode::Present { surface } => {
+                        if Some(*surface) != surface_handle {
+                            return Err(EzGfxResult::InvalidArgument);
+                        }
+                        actions.push(ez_gfx_backend_metal::native::NativeFrameAction::Present);
+                    }
+                }
+            }
+            ExecutionAction::EndPass => {
+                actions.push(ez_gfx_backend_metal::native::NativeFrameAction::EndPass);
+            }
+        }
+    }
+
+    let result = match (
+        &mut context.native,
+        surface.as_mut().map(|surface| &mut surface.native),
+    ) {
+        (NativeContext::Metal(native), Some(NativeSurface::Metal(surface))) => native
+            .execute_frame(Some((surface, extent)), &actions, capture)
+            .map_err(map_hal),
+        (NativeContext::Metal(native), None) => {
+            native.execute_frame(None, &actions, false).map_err(map_hal)
+        }
+        _ => Err(EzGfxResult::NativeFailure),
+    };
+    if let Ok(Some(readback)) = &result {
+        context.last_readback = readback.clone();
+    }
+    if let (Some(handle), Some(surface)) = (surface_handle, surface) {
+        context.surfaces.insert(handle, surface);
+    }
+    result?;
+    context.frame_presented = payloads
+        .iter()
+        .any(|payload| matches!(payload, ExecutableNode::Present { .. }));
+    Ok(())
 }
 
 fn map_frame(error: ez_gfx_runtime::frame::FrameError) -> EzGfxResult {
@@ -1681,220 +2831,6 @@ fn destroy_native_texture(
     }
 }
 
-struct ComputeExecution<'a> {
-    shader: &'a NativeShader,
-    product: usize,
-    entry: &'a str,
-    groups: [u32; 3],
-    push_constants: &'a [u8],
-    layout: &'a ez_gfx_runtime::binding::ReflectedBindings,
-    bindings: &'a [ez_gfx_runtime::binding::PublicBinding],
-}
-
-struct GraphicsExecution<'a> {
-    surface: &'a mut NativeSurface,
-    shader: &'a NativeShader,
-    graphics: &'a (usize, String, usize, String),
-    pipeline_layout: &'a ez_gfx_runtime::binding::PipelineLayout,
-    state: DynamicPipelineState,
-    index: &'a NativeAllocation,
-    indirect: &'a NativeAllocation,
-    draw_count: u32,
-    push_constants: &'a [u8],
-    extent: (u32, u32),
-    capture_presented: bool,
-    layout: &'a ez_gfx_runtime::binding::ReflectedBindings,
-    bindings: &'a [ez_gfx_runtime::binding::PublicBinding],
-    textures: &'a HashMap<u64, (TextureId, NativeTexture, u32, u32, u32)>,
-}
-
-fn execute_compute(
-    context: &mut NativeContext,
-    allocations: &HashMap<u64, (u64, NativeAllocation)>,
-    request: ComputeExecution<'_>,
-) -> Result<(), HalError> {
-    let ComputeExecution {
-        shader,
-        product,
-        entry,
-        groups,
-        push_constants,
-        layout,
-        bindings,
-    } = request;
-    let layouts = native_layouts(layout)?;
-    match (context, shader) {
-        (NativeContext::Vulkan(context), NativeShader::Vulkan(shader)) => {
-            let native_bindings = vulkan_bindings(layout, bindings, allocations)?;
-            let pipeline = context.create_compute_pipeline(shader, product, entry, &layouts)?;
-            let result =
-                context.dispatch_compute(&pipeline, groups, push_constants, &native_bindings);
-            context.destroy_pipeline(pipeline);
-            result
-        }
-        #[cfg(windows)]
-        (NativeContext::Dx12(context), NativeShader::Dx12(shader)) => {
-            let native_bindings = dx12_bindings(layout, bindings, allocations)?;
-            let pipeline = context.create_compute_pipeline(shader, product, &layouts)?;
-            context.dispatch_compute(&pipeline, groups, push_constants, &native_bindings)
-        }
-        #[cfg(target_vendor = "apple")]
-        (NativeContext::Metal(context), NativeShader::Metal(shader)) => {
-            let native_bindings = metal_bindings(layout, bindings, allocations)?;
-            context.dispatch_compute_shader(
-                shader,
-                product,
-                entry,
-                groups,
-                push_constants,
-                &native_bindings,
-            )
-        }
-        _ => Err(HalError::InvalidArgument),
-    }
-}
-fn execute_graphics(
-    context: &mut NativeContext,
-    allocations: &HashMap<u64, (u64, NativeAllocation)>,
-    request: GraphicsExecution<'_>,
-) -> Result<(), HalError> {
-    let GraphicsExecution {
-        surface,
-        shader,
-        graphics,
-        pipeline_layout,
-        state,
-        index,
-        indirect,
-        draw_count,
-        push_constants,
-        extent,
-        capture_presented,
-        layout,
-        bindings,
-        textures,
-    } = request;
-    #[cfg(not(target_vendor = "apple"))]
-    let _ = textures;
-    let layouts = native_layouts(layout)?;
-    let depth_required = pipeline_layout.depth_required();
-    match (context, surface, shader, index, indirect) {
-        (
-            NativeContext::Vulkan(context),
-            NativeSurface::Vulkan(surface),
-            NativeShader::Vulkan(shader),
-            NativeAllocation::Vulkan(index),
-            NativeAllocation::Vulkan(indirect),
-        ) => {
-            context.prepare_surface(surface, extent.0, extent.1)?;
-            let native_bindings = vulkan_bindings(layout, bindings, allocations)?;
-            let pipeline = context.create_graphics_pipeline(
-                shader,
-                ez_gfx_backend_vulkan::NativeGraphicsPipelineDesc {
-                    vertex_index: graphics.0,
-                    fragment_index: graphics.2,
-                    state,
-                    depth_required,
-                    layouts: &layouts,
-                },
-            )?;
-            let result = context.draw_indexed_present(
-                surface,
-                ez_gfx_backend_vulkan::NativeDrawIndexed {
-                    width: extent.0,
-                    height: extent.1,
-                    pipeline: &pipeline,
-                    index_buffer: index,
-                    indirect_buffer: indirect,
-                    draw_count,
-                    push_constants,
-                    bindings: &native_bindings,
-                    capture_presented,
-                },
-            );
-            context.destroy_pipeline(pipeline);
-            result
-        }
-        #[cfg(windows)]
-        (
-            NativeContext::Dx12(context),
-            NativeSurface::Dx12(surface),
-            NativeShader::Dx12(shader),
-            NativeAllocation::Dx12(index),
-            NativeAllocation::Dx12(indirect),
-        ) => {
-            let native_bindings = dx12_bindings(layout, bindings, allocations)?;
-            let pipeline = context.create_graphics_pipeline(
-                shader,
-                graphics.0,
-                graphics.2,
-                state,
-                depth_required,
-                &layouts,
-            )?;
-            context.draw_indexed_present(
-                surface,
-                ez_gfx_backend_dx12::native::NativeDrawIndexed {
-                    width: extent.0,
-                    height: extent.1,
-                    pipeline: &pipeline,
-                    index_buffer: index,
-                    indirect_buffer: indirect,
-                    draw_count,
-                    push_constants,
-                    bindings: &native_bindings,
-                    capture_presented,
-                },
-            )
-        }
-        #[cfg(target_vendor = "apple")]
-        (
-            NativeContext::Metal(context),
-            NativeSurface::Metal(surface),
-            NativeShader::Metal(shader),
-            NativeAllocation::Metal(index),
-            NativeAllocation::Metal(indirect),
-        ) => {
-            let native_bindings = metal_bindings(layout, bindings, allocations)?;
-            let native_textures = textures
-                .values()
-                .filter_map(|(_, texture, _, _, _)| match texture {
-                    NativeTexture::Metal(texture) => Some(texture),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            context.draw_indexed_shader(
-                surface,
-                shader,
-                graphics,
-                depth_required,
-                pipeline_layout
-                    .texture_heap()
-                    .map(|layout| {
-                        ez_gfx_hal::ShaderTextureHeapLayout::new(
-                            layout.space,
-                            layout.binding,
-                            layout.capacity,
-                            layout.argument_stride,
-                            layout.texture_argument_offset,
-                            layout.sampler_argument_offset,
-                        )
-                    })
-                    .transpose()?,
-                state,
-                index,
-                indirect,
-                draw_count,
-                push_constants,
-                extent,
-                &native_bindings,
-                &native_textures,
-                capture_presented,
-            )
-        }
-        _ => Err(HalError::InvalidArgument),
-    }
-}
 fn native_layouts(
     layout: &ez_gfx_runtime::binding::ReflectedBindings,
 ) -> Result<Vec<ez_gfx_hal::ShaderBufferLayout>, HalError> {

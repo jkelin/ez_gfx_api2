@@ -108,6 +108,7 @@ fn context_creation_rejects_boundary_inputs_before_native_calls() {
     assert_eq!(context, 99);
 }
 
+#[cfg(windows)]
 #[test]
 fn context_lifecycle_admits_a_real_vulkan_device_and_invalidates_destroyed_handle() {
     let desc = EzGfxContextDesc {

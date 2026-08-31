@@ -10,10 +10,11 @@ use ez_gfx_core::{
     },
 };
 use ez_gfx_hal::{
-    AllocationError, AllocationRequest, BlendMode, BufferTransfer, CompletionToken, CullMode,
-    DynamicPipelineState, FrontFace, HalError, ImageMip, MemoryAllocator, MemoryClass,
-    PrimitiveTopology, QueueKind, SamplerAddressMode, SamplerFilter, ShaderBufferLayout,
-    TextureSamplerDesc, validate_rgba8_mips,
+    AllocationError, AllocationRequest, AttachmentLoadOp, AttachmentStoreOp, BlendMode,
+    BufferTransfer, CompletionToken, CullMode, DynamicPipelineState, ExecutionBarrier,
+    ExecutionPass, FrontFace, HalError, ImageMip, MemoryAllocator, MemoryClass, PrimitiveTopology,
+    QueueKind, ResourceAccess, ResourceState, SamplerAddressMode, SamplerFilter,
+    ShaderBufferLayout, ShaderStage, TextureSamplerDesc, validate_rgba8_mips,
 };
 use gpu_allocator::{
     MemoryLocation,
@@ -126,7 +127,38 @@ pub struct NativeDrawIndexed<'a> {
     pub draw_count: u32,
     pub push_constants: &'a [u8],
     pub bindings: &'a [NativeBufferBinding<'a>],
-    pub capture_presented: bool,
+}
+
+pub struct NativeComputeDispatch<'a> {
+    pub pipeline: &'a NativePipeline,
+    pub groups: [u32; 3],
+    pub push_constants: &'a [u8],
+    pub bindings: &'a [NativeBufferBinding<'a>],
+}
+
+pub enum NativeFrameResource<'a> {
+    Buffer(&'a NativeAllocation),
+    Texture(&'a NativeTexture),
+    Surface,
+    Depth,
+}
+
+pub enum NativeFrameAction<'a> {
+    Wait(CompletionToken),
+    Barrier {
+        barrier: ExecutionBarrier,
+        resource: NativeFrameResource<'a>,
+    },
+    BeginPass(&'a ExecutionPass),
+    Compute(NativeComputeDispatch<'a>),
+    Graphics(NativeDrawIndexed<'a>),
+    TextureReadback {
+        texture: &'a NativeTexture,
+        width: u32,
+        height: u32,
+    },
+    EndPass,
+    Present,
 }
 
 pub struct NativeShader {
@@ -143,11 +175,9 @@ pub struct NativeTexture {
 pub struct NativePipeline {
     pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
-    bind_point: vk::PipelineBindPoint,
     public_descriptor_layout: vk::DescriptorSetLayout,
     buffer_writable: Vec<bool>,
     buffer_bindings: Vec<u32>,
-    depth_required: bool,
 }
 
 struct DepthTarget {
@@ -247,6 +277,7 @@ pub struct NativeContext {
     swapchain_loader: Option<khr::swapchain::Device>,
     swapchain: Option<vk::SwapchainKHR>,
     swapchain_views: Vec<vk::ImageView>,
+    swapchain_initialized: Vec<bool>,
     swapchain_format: vk::Format,
     swapchain_extent: vk::Extent2D,
     image_available: Option<vk::Semaphore>,
@@ -324,6 +355,7 @@ impl NativeContext {
             swapchain_loader: None,
             swapchain: None,
             swapchain_views: Vec::new(),
+            swapchain_initialized: Vec::new(),
             swapchain_format: vk::Format::UNDEFINED,
             swapchain_extent: vk::Extent2D::default(),
             image_available: None,
@@ -594,6 +626,7 @@ impl NativeContext {
             unsafe { loader.destroy_swapchain(swapchain, None) };
         }
         self.swapchain_format = vk::Format::UNDEFINED;
+        self.swapchain_initialized.clear();
         self.swapchain_extent = vk::Extent2D::default();
         // SAFETY: the host window is still live and no swapchain references this surface.
         unsafe { self.surface_loader.destroy_surface(surface.handle, None) };
@@ -775,6 +808,7 @@ impl NativeContext {
         }
         self.swapchain = Some(swapchain);
         self.swapchain_views = views;
+        self.swapchain_initialized = vec![false; self.swapchain_views.len()];
         self.swapchain_format = chosen.format;
         self.swapchain_extent = extent;
         Ok(())
@@ -1021,11 +1055,9 @@ impl NativeContext {
             Ok(pipelines) => Ok(NativePipeline {
                 pipeline: pipelines[0],
                 layout,
-                bind_point: vk::PipelineBindPoint::COMPUTE,
                 public_descriptor_layout,
                 buffer_writable,
                 buffer_bindings,
-                depth_required: false,
             }),
             Err((_, error)) => {
                 unsafe {
@@ -1159,11 +1191,9 @@ impl NativeContext {
             Ok(pipelines) => Ok(NativePipeline {
                 pipeline: pipelines[0],
                 layout,
-                bind_point: vk::PipelineBindPoint::GRAPHICS,
                 public_descriptor_layout,
                 buffer_writable,
                 buffer_bindings,
-                depth_required,
             }),
             Err((_, error)) => {
                 unsafe {
@@ -1262,466 +1292,830 @@ impl NativeContext {
         Ok(())
     }
 
-    /// Executes indexed indirect draws, optionally captures the rendered image, then presents it.
-    pub fn draw_indexed_present(
+    /// Records a complete graph frame into one command buffer and presents once after recording.
+    pub fn execute_frame(
         &mut self,
-        surface: &mut NativeSurface,
-        request: NativeDrawIndexed<'_>,
-    ) -> Result<(), HalError> {
-        let NativeDrawIndexed {
-            width,
-            height,
-            pipeline,
-            index_buffer,
-            indirect_buffer,
-            draw_count,
-            push_constants,
-            bindings,
-            capture_presented,
-        } = request;
-        if pipeline.bind_point != vk::PipelineBindPoint::GRAPHICS
-            || width == 0
-            || height == 0
-            || draw_count == 0
-            || push_constants.len() > 128
+        surface: Option<(&mut NativeSurface, (u32, u32))>,
+        actions: &[NativeFrameAction<'_>],
+        capture_presented: bool,
+    ) -> Result<Vec<Vec<u8>>, HalError> {
+        if actions.is_empty() {
+            return Err(HalError::InvalidArgument);
+        }
+        let (mut surface, extent) = match surface {
+            Some((surface, extent)) if extent.0 != 0 && extent.1 != 0 => (Some(surface), extent),
+            Some(_) => return Err(HalError::InvalidArgument),
+            None => (None, (0, 0)),
+        };
+        let present_count = actions
+            .iter()
+            .filter(|action| matches!(action, NativeFrameAction::Present))
+            .count();
+        let presents = present_count == 1;
+        let uses_surface = actions.iter().any(|action| {
+            matches!(
+                action,
+                NativeFrameAction::BeginPass(_)
+                    | NativeFrameAction::Graphics(_)
+                    | NativeFrameAction::Present
+                    | NativeFrameAction::Barrier {
+                        resource: NativeFrameResource::Surface | NativeFrameResource::Depth,
+                        ..
+                    }
+            )
+        });
+        if present_count > 1
+            || uses_surface && surface.is_none()
+            || (uses_surface || capture_presented) && !presents
         {
             return Err(HalError::InvalidArgument);
         }
-        if self.swapchain.is_none()
-            || self.swapchain_extent.width != width
-            || self.swapchain_extent.height != height
-        {
-            self.recreate_swapchain(surface, width, height)?;
+        let external_wait = actions
+            .iter()
+            .filter_map(|action| match action {
+                NativeFrameAction::Wait(token) if token.queue == QueueKind::Transfer => {
+                    Some(Ok(token.value))
+                }
+                NativeFrameAction::Wait(_) => Some(Err(HalError::InvalidArgument)),
+                _ => None,
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .max();
+        let mut pass_active = false;
+        let mut saw_present = false;
+        for action in actions {
+            if saw_present {
+                return Err(HalError::InvalidArgument);
+            }
+            match action {
+                NativeFrameAction::Wait(_) => {}
+                NativeFrameAction::Barrier { barrier, resource } => {
+                    match (resource, barrier.range) {
+                        (
+                            NativeFrameResource::Buffer(allocation),
+                            ez_gfx_hal::ExecutionRange::Buffer(range),
+                        ) if range
+                            .offset
+                            .checked_add(range.size)
+                            .is_some_and(|end| end <= allocation.allocation.size()) => {}
+                        (
+                            NativeFrameResource::Texture(_)
+                            | NativeFrameResource::Surface
+                            | NativeFrameResource::Depth,
+                            ez_gfx_hal::ExecutionRange::Image(_),
+                        ) => {}
+                        _ => return Err(HalError::InvalidArgument),
+                    }
+                }
+                NativeFrameAction::BeginPass(pass) => {
+                    if pass_active
+                        || pass.colors.len() != 1
+                        || pass.samples != 1
+                        || pass.area[0]
+                            .checked_add(pass.area[2])
+                            .is_none_or(|end| end > extent.0)
+                        || pass.area[1]
+                            .checked_add(pass.area[3])
+                            .is_none_or(|end| end > extent.1)
+                    {
+                        return Err(HalError::InvalidArgument);
+                    }
+                    pass_active = true;
+                }
+                NativeFrameAction::Compute(dispatch) => {
+                    if pass_active
+                        || dispatch.groups.contains(&0)
+                        || dispatch.push_constants.len() > 128
+                        || !dispatch.push_constants.len().is_multiple_of(4)
+                    {
+                        return Err(HalError::InvalidArgument);
+                    }
+                }
+                NativeFrameAction::Graphics(draw) => {
+                    let indirect_size = u64::from(draw.draw_count)
+                        .checked_mul(20)
+                        .ok_or(HalError::InvalidArgument)?;
+                    if !pass_active
+                        || draw.width == 0
+                        || draw.height == 0
+                        || draw.width > extent.0
+                        || draw.height > extent.1
+                        || draw.draw_count == 0
+                        || draw.indirect_buffer.allocation.size() < indirect_size
+                        || draw.push_constants.len() > 128
+                        || !draw.push_constants.len().is_multiple_of(4)
+                    {
+                        return Err(HalError::InvalidArgument);
+                    }
+                }
+                NativeFrameAction::TextureReadback { width, height, .. } => {
+                    if pass_active || *width == 0 || *height == 0 {
+                        return Err(HalError::InvalidArgument);
+                    }
+                }
+                NativeFrameAction::EndPass => {
+                    if !pass_active {
+                        return Err(HalError::InvalidArgument);
+                    }
+                    pass_active = false;
+                }
+                NativeFrameAction::Present => {
+                    if pass_active {
+                        return Err(HalError::InvalidArgument);
+                    }
+                    saw_present = true;
+                }
+            }
         }
-        if pipeline.depth_required {
+        if pass_active {
+            return Err(HalError::InvalidArgument);
+        }
+        if uses_surface {
+            self.prepare_surface(
+                surface.as_deref_mut().ok_or(HalError::InvalidArgument)?,
+                extent.0,
+                extent.1,
+            )?;
+        }
+        if actions.iter().any(|action| {
+            matches!(
+                action,
+                NativeFrameAction::BeginPass(pass) if pass.depth.is_some()
+            )
+        }) {
             self.ensure_depth_target(self.swapchain_extent)?;
         }
         let device = self.device.as_ref().ok_or(HalError::NotReady)?.clone();
-        let loader = self
-            .swapchain_loader
-            .as_ref()
-            .ok_or(HalError::NotReady)?
-            .clone();
-        let swapchain = self.swapchain.ok_or(HalError::NotReady)?;
-        let available = self.image_available.ok_or(HalError::NotReady)?;
-        let pool = self.transfer_command_pool.ok_or(HalError::NotReady)?;
-        let queue = self.graphics_queue.ok_or(HalError::NotReady)?;
-        let texture_set = self.texture_descriptor_set.ok_or(HalError::NotReady)?;
-        let capture = if capture_presented {
-            let size = u64::from(width)
-                .checked_mul(u64::from(height))
-                .and_then(|value| value.checked_mul(4))
-                .ok_or(HalError::InvalidArgument)?;
-            let allocation = self
-                .allocate(
-                    AllocationRequest::new(size, 4, MemoryClass::Readback, true, None)
-                        .map_err(|_| HalError::InvalidArgument)?,
-                )
-                .map_err(map_allocation_hal)?;
-            Some((size, allocation))
+        let loader = if uses_surface {
+            Some(
+                self.swapchain_loader
+                    .as_ref()
+                    .ok_or(HalError::NotReady)?
+                    .clone(),
+            )
         } else {
             None
         };
-        let (public_pool, public_set) = match self.create_public_descriptor_set(pipeline, bindings)
-        {
-            Ok(public) => public,
-            Err(error) => {
-                if let Some((_, capture)) = capture {
-                    let _ = self.free(capture);
-                }
-                return Err(error);
-            }
+        let swapchain = if uses_surface {
+            self.swapchain.ok_or(HalError::NotReady)?
+        } else {
+            vk::SwapchainKHR::null()
         };
-        let mut finished = None;
-        let mut command = None;
-        let mut submitted = false;
-        let rendered = (|| {
-            let (image_index, _) = unsafe {
-                loader.acquire_next_image(swapchain, u64::MAX, available, vk::Fence::null())
+        let available = if uses_surface {
+            self.image_available.ok_or(HalError::NotReady)?
+        } else {
+            vk::Semaphore::null()
+        };
+        let pool = self.transfer_command_pool.ok_or(HalError::NotReady)?;
+        let queue = self.graphics_queue.ok_or(HalError::NotReady)?;
+        let texture_set = self.texture_descriptor_set.ok_or(HalError::NotReady)?;
+
+        let mut readbacks = Vec::new();
+        for action in actions {
+            let dimensions = match action {
+                NativeFrameAction::TextureReadback { width, height, .. } => {
+                    Some((*width, *height, false))
+                }
+                NativeFrameAction::Present if capture_presented => Some((extent.0, extent.1, true)),
+                _ => None,
+            };
+            if let Some((width, height, surface_readback)) = dimensions {
+                let created = (|| {
+                    let size = u64::from(width)
+                        .checked_mul(u64::from(height))
+                        .and_then(|value| value.checked_mul(4))
+                        .ok_or(HalError::InvalidArgument)?;
+                    let request =
+                        AllocationRequest::new(size, 4, MemoryClass::Readback, true, None)
+                            .map_err(|_| HalError::InvalidArgument)?;
+                    let allocation = self.allocate(request).map_err(map_allocation_hal)?;
+                    Ok((width, height, size, surface_readback, allocation))
+                })();
+                match created {
+                    Ok(readback) => readbacks.push(readback),
+                    Err(error) => {
+                        for (_, _, _, _, allocation) in readbacks {
+                            let _ = self.free(allocation);
+                        }
+                        return Err(error);
+                    }
+                }
             }
-            .map_err(map_vk)?;
-            let images = unsafe { loader.get_swapchain_images(swapchain) }.map_err(map_vk)?;
-            let image = *images
-                .get(image_index as usize)
-                .ok_or(HalError::NativeFailure)?;
-            let finished_handle =
+        }
+        let mut public_sets = Vec::with_capacity(actions.len());
+        for action in actions {
+            let created = match action {
+                NativeFrameAction::Compute(dispatch) => self
+                    .create_public_descriptor_set(dispatch.pipeline, dispatch.bindings)
+                    .map(Some),
+                NativeFrameAction::Graphics(draw) => self
+                    .create_public_descriptor_set(draw.pipeline, draw.bindings)
+                    .map(Some),
+                _ => Ok(None),
+            };
+            match created {
+                Ok(set) => public_sets.push(set),
+                Err(error) => {
+                    unsafe {
+                        for (pool, _) in public_sets.into_iter().flatten() {
+                            device.destroy_descriptor_pool(pool, None);
+                        }
+                    }
+                    for (_, _, _, _, allocation) in readbacks {
+                        let _ = self.free(allocation);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        let preflight = (|| {
+            let finished =
                 unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
                     .map_err(map_vk)?;
-            finished = Some(finished_handle);
-            let command_handle = unsafe {
+            let command = match unsafe {
                 device.allocate_command_buffers(
                     &vk::CommandBufferAllocateInfo::default()
                         .command_pool(pool)
                         .level(vk::CommandBufferLevel::PRIMARY)
                         .command_buffer_count(1),
                 )
-            }
-            .map_err(map_vk)?[0];
-            command = Some(command_handle);
-            let finished = finished_handle;
-            let command = command_handle;
-            unsafe {
-                device
-                    .begin_command_buffer(
-                        command,
-                        &vk::CommandBufferBeginInfo::default()
-                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                    )
-                    .map_err(map_vk)?;
-                let range = vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                };
-                let to_color = vk::ImageMemoryBarrier::default()
-                    .image(image)
-                    .subresource_range(range)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
-                device.cmd_pipeline_barrier(
-                    command,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[to_color],
-                );
-                if let Some(depth) = self
-                    .depth_target
-                    .as_ref()
-                    .filter(|_| pipeline.depth_required)
-                {
-                    let depth_range = vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::DEPTH,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    };
-                    let to_depth = vk::ImageMemoryBarrier::default()
-                        .image(depth.image)
-                        .subresource_range(depth_range)
-                        .old_layout(vk::ImageLayout::UNDEFINED)
-                        .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-                        .dst_access_mask(
-                            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
-                                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                        );
-                    device.cmd_pipeline_barrier(
-                        command,
-                        vk::PipelineStageFlags::TOP_OF_PIPE,
-                        vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-                            | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
-                        vk::DependencyFlags::empty(),
-                        &[],
-                        &[],
-                        &[to_depth],
-                    );
+            } {
+                Ok(commands) => commands[0],
+                Err(error) => {
+                    unsafe { device.destroy_semaphore(finished, None) };
+                    return Err(map_vk(error));
                 }
-                let attachment = vk::RenderingAttachmentInfo::default()
-                    .image_view(self.swapchain_views[image_index as usize])
-                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
-                    .store_op(vk::AttachmentStoreOp::STORE)
-                    .clear_value(vk::ClearValue {
-                        color: vk::ClearColorValue {
-                            float32: [0.1, 0.1, 0.1, 1.0],
-                        },
-                    });
-                let depth_attachment = self
-                    .depth_target
-                    .as_ref()
-                    .filter(|_| pipeline.depth_required)
-                    .map(|depth| {
-                        vk::RenderingAttachmentInfo::default()
-                            .image_view(depth.view)
-                            .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-                            .load_op(vk::AttachmentLoadOp::CLEAR)
-                            .store_op(vk::AttachmentStoreOp::DONT_CARE)
-                            .clear_value(vk::ClearValue {
-                                depth_stencil: vk::ClearDepthStencilValue {
-                                    depth: 1.0,
-                                    stencil: 0,
-                                },
-                            })
-                    });
-                let mut rendering = vk::RenderingInfo::default()
-                    .render_area(vk::Rect2D {
-                        offset: vk::Offset2D::default(),
-                        extent: self.swapchain_extent,
-                    })
-                    .layer_count(1)
-                    .color_attachments(core::slice::from_ref(&attachment));
-                if let Some(depth) = depth_attachment.as_ref() {
-                    rendering = rendering.depth_attachment(depth);
-                }
-                device.cmd_begin_rendering(command, &rendering);
-                device.cmd_bind_pipeline(
-                    command,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipeline.pipeline,
-                );
-                let sets = [public_set, texture_set];
-                device.cmd_bind_descriptor_sets(
-                    command,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipeline.layout,
-                    0,
-                    &sets,
-                    &[],
-                );
-                device.cmd_set_viewport(
-                    command,
-                    0,
-                    &[vk::Viewport {
-                        x: 0.0,
-                        y: 0.0,
-                        width: width as f32,
-                        height: height as f32,
-                        min_depth: 0.0,
-                        max_depth: 1.0,
-                    }],
-                );
-                device.cmd_set_scissor(
-                    command,
-                    0,
-                    &[vk::Rect2D {
-                        offset: vk::Offset2D::default(),
-                        extent: self.swapchain_extent,
-                    }],
-                );
-                device.cmd_bind_index_buffer(
-                    command,
-                    index_buffer.buffer,
-                    0,
-                    vk::IndexType::UINT32,
-                );
-                if !push_constants.is_empty() {
-                    device.cmd_push_constants(
-                        command,
-                        pipeline.layout,
-                        vk::ShaderStageFlags::ALL,
-                        0,
-                        push_constants,
-                    );
-                }
-                device.cmd_draw_indexed_indirect(
-                    command,
-                    indirect_buffer.buffer,
-                    0,
-                    draw_count,
-                    20,
-                );
-                device.cmd_end_rendering(command);
-                if let Some((_, capture)) = &capture {
-                    let to_copy = vk::ImageMemoryBarrier::default()
-                        .image(image)
-                        .subresource_range(range)
-                        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-                    device.cmd_pipeline_barrier(
-                        command,
-                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::DependencyFlags::empty(),
-                        &[],
-                        &[],
-                        &[to_copy],
-                    );
-                    let copy = vk::BufferImageCopy::default()
-                        .image_subresource(vk::ImageSubresourceLayers {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            mip_level: 0,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        })
-                        .image_extent(vk::Extent3D {
-                            width,
-                            height,
-                            depth: 1,
-                        });
-                    device.cmd_copy_image_to_buffer(
-                        command,
-                        image,
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        capture.buffer,
-                        core::slice::from_ref(&copy),
-                    );
-                    let to_present = vk::ImageMemoryBarrier::default()
-                        .image(image)
-                        .subresource_range(range)
-                        .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                        .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                        .src_access_mask(vk::AccessFlags::TRANSFER_READ);
-                    device.cmd_pipeline_barrier(
-                        command,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                        vk::DependencyFlags::empty(),
-                        &[],
-                        &[],
-                        &[to_present],
-                    );
-                } else {
-                    let to_present = vk::ImageMemoryBarrier::default()
-                        .image(image)
-                        .subresource_range(range)
-                        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                        .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
-                    device.cmd_pipeline_barrier(
-                        command,
-                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                        vk::DependencyFlags::empty(),
-                        &[],
-                        &[],
-                        &[to_present],
-                    );
-                }
-                device.end_command_buffer(command).map_err(map_vk)?;
-                let wait_stage = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-                let submit = vk::SubmitInfo::default()
-                    .wait_semaphores(core::slice::from_ref(&available))
-                    .wait_dst_stage_mask(&wait_stage)
-                    .command_buffers(core::slice::from_ref(&command))
-                    .signal_semaphores(core::slice::from_ref(&finished));
-                let queue = self.graphics_queue.ok_or(HalError::NotReady)?;
-                device
-                    .queue_submit(queue, &[submit], vk::Fence::null())
-                    .map_err(map_vk)?;
-                submitted = true;
-                let present = vk::PresentInfoKHR::default()
-                    .wait_semaphores(core::slice::from_ref(&finished))
-                    .swapchains(core::slice::from_ref(&swapchain))
-                    .image_indices(core::slice::from_ref(&image_index));
-                loader.queue_present(queue, &present).map_err(map_vk)?;
-                device.queue_wait_idle(queue).map_err(map_vk)?;
-            }
-            Ok::<_, HalError>(())
-        })();
-        if submitted && rendered.is_err() {
-            let _ = unsafe { device.queue_wait_idle(queue) };
-        }
-        unsafe {
-            if let Some(command) = command {
-                device.free_command_buffers(pool, &[command]);
-            }
-            if let Some(finished) = finished {
-                device.destroy_semaphore(finished, None);
-            }
-            device.destroy_descriptor_pool(public_pool, None);
-        }
-        if let Err(error) = rendered {
-            if let Some((_, capture)) = capture {
-                let _ = self.free(capture);
-            }
-            return Err(error);
-        }
-        let Some((capture_size, mut capture)) = capture else {
-            return Ok(());
-        };
-        let captured = (|| {
-            self.invalidate(&mut capture, 0, capture_size)
-                .map_err(map_allocation_hal)?;
-            surface.presented_rgba8 = self.mapped_slice(&capture).map_err(map_allocation_hal)?
-                [..capture_size as usize]
-                .to_vec();
-            if matches!(
-                self.swapchain_format,
-                vk::Format::B8G8R8A8_SRGB | vk::Format::B8G8R8A8_UNORM
-            ) {
-                for pixel in surface.presented_rgba8.chunks_exact_mut(4) {
-                    pixel.swap(0, 2);
-                }
-            }
-            Ok(())
-        })();
-        let freed = self.free(capture).map_err(map_allocation_hal);
-        match (captured, freed) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), _) | (_, Err(error)) => Err(error),
-        }
-    }
-
-    /// Dispatches a validated compute grid and waits before the transient pipeline may be destroyed.
-    pub fn dispatch_compute(
-        &self,
-        pipeline: &NativePipeline,
-        groups: [u32; 3],
-        push_constants: &[u8],
-        bindings: &[NativeBufferBinding<'_>],
-    ) -> Result<(), HalError> {
-        if pipeline.bind_point != vk::PipelineBindPoint::COMPUTE
-            || groups.contains(&0)
-            || push_constants.len() > 128
-        {
-            return Err(HalError::InvalidArgument);
-        }
-        let (public_pool, public_set) = self.create_public_descriptor_set(pipeline, bindings)?;
-        let device = self.device.as_ref().ok_or(HalError::NotReady)?;
-        let pool = self.transfer_command_pool.ok_or(HalError::NotReady)?;
-        let command = unsafe {
-            device.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-        }
-        .map_err(map_vk)?[0];
-        unsafe {
-            device
-                .begin_command_buffer(
+            };
+            if let Err(error) = unsafe {
+                device.begin_command_buffer(
                     command,
                     &vk::CommandBufferBeginInfo::default()
                         .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                 )
-                .map_err(map_vk)?;
-            device.cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, pipeline.pipeline);
-            let sets = [
-                public_set,
-                self.texture_descriptor_set.ok_or(HalError::NotReady)?,
-            ];
-            device.cmd_bind_descriptor_sets(
-                command,
-                vk::PipelineBindPoint::COMPUTE,
-                pipeline.layout,
-                0,
-                &sets,
-                &[],
-            );
-            if !push_constants.is_empty() {
-                device.cmd_push_constants(
-                    command,
-                    pipeline.layout,
-                    vk::ShaderStageFlags::ALL,
-                    0,
-                    push_constants,
-                );
+            } {
+                unsafe {
+                    device.free_command_buffers(pool, &[command]);
+                    device.destroy_semaphore(finished, None);
+                }
+                return Err(map_vk(error));
             }
-            device.cmd_dispatch(command, groups[0], groups[1], groups[2]);
-            device.end_command_buffer(command).map_err(map_vk)?;
-            device
-                .queue_submit(
-                    self.graphics_queue.ok_or(HalError::NotReady)?,
-                    &[vk::SubmitInfo::default().command_buffers(core::slice::from_ref(&command))],
-                    vk::Fence::null(),
-                )
+            Ok((finished, command))
+        })();
+        let (finished_handle, command_handle) = match preflight {
+            Ok(handles) => handles,
+            Err(error) => {
+                unsafe {
+                    for (pool, _) in public_sets.into_iter().flatten() {
+                        device.destroy_descriptor_pool(pool, None);
+                    }
+                }
+                for (_, _, _, _, allocation) in readbacks {
+                    let _ = self.free(allocation);
+                }
+                return Err(error);
+            }
+        };
+        let mut acquired_image_index = None;
+        let mut submitted = false;
+        let mut readback_index = 0_usize;
+        let recorded = (|| {
+            let (image_index, surface_image) = if uses_surface {
+                let loader = loader.as_ref().ok_or(HalError::InvalidArgument)?;
+                let (image_index, _) = unsafe {
+                    loader.acquire_next_image(swapchain, u64::MAX, available, vk::Fence::null())
+                }
                 .map_err(map_vk)?;
-            device
-                .queue_wait_idle(self.graphics_queue.ok_or(HalError::NotReady)?)
-                .map_err(map_vk)?;
-            device.free_command_buffers(pool, &[command]);
+                acquired_image_index = Some(image_index);
+                let images = unsafe { loader.get_swapchain_images(swapchain) }.map_err(map_vk)?;
+                let image = *images
+                    .get(image_index as usize)
+                    .ok_or(HalError::NativeFailure)?;
+                (image_index, image)
+            } else {
+                (u32::MAX, vk::Image::null())
+            };
+            let mut pass_active = false;
+            for (action_index, action) in actions.iter().enumerate() {
+                match action {
+                    NativeFrameAction::Wait(_) => {}
+                    NativeFrameAction::Barrier { barrier, resource } => unsafe {
+                        let (src_stage, src_access, old_layout) =
+                            barrier.before.map(vulkan_state).unwrap_or((
+                                vk::PipelineStageFlags::TOP_OF_PIPE,
+                                vk::AccessFlags::empty(),
+                                vk::ImageLayout::UNDEFINED,
+                            ));
+                        let (dst_stage, dst_access, new_layout) = vulkan_state(barrier.after);
+                        match resource {
+                            NativeFrameResource::Buffer(allocation) => {
+                                let range = match barrier.range {
+                                    ez_gfx_hal::ExecutionRange::Buffer(range) => range,
+                                    _ => return Err(HalError::InvalidArgument),
+                                };
+                                let buffer = vk::BufferMemoryBarrier::default()
+                                    .src_access_mask(src_access)
+                                    .dst_access_mask(dst_access)
+                                    .buffer(allocation.buffer)
+                                    .offset(range.offset)
+                                    .size(range.size);
+                                device.cmd_pipeline_barrier(
+                                    command_handle,
+                                    src_stage,
+                                    dst_stage,
+                                    vk::DependencyFlags::empty(),
+                                    &[],
+                                    core::slice::from_ref(&buffer),
+                                    &[],
+                                );
+                            }
+                            NativeFrameResource::Texture(texture) => {
+                                let range = match barrier.range {
+                                    ez_gfx_hal::ExecutionRange::Image(range) => range,
+                                    _ => return Err(HalError::InvalidArgument),
+                                };
+                                let image = vk::ImageMemoryBarrier::default()
+                                    .src_access_mask(src_access)
+                                    .dst_access_mask(dst_access)
+                                    .old_layout(old_layout)
+                                    .new_layout(new_layout)
+                                    .image(texture.image)
+                                    .subresource_range(vk::ImageSubresourceRange {
+                                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                                        base_mip_level: range.first_mip,
+                                        level_count: range.mip_count,
+                                        base_array_layer: range.first_layer,
+                                        layer_count: range.layer_count,
+                                    });
+                                device.cmd_pipeline_barrier(
+                                    command_handle,
+                                    src_stage,
+                                    dst_stage,
+                                    vk::DependencyFlags::empty(),
+                                    &[],
+                                    &[],
+                                    core::slice::from_ref(&image),
+                                );
+                            }
+                            NativeFrameResource::Surface => {
+                                let first_present = barrier
+                                    .before
+                                    .is_some_and(|state| state.access == ResourceAccess::Present)
+                                    && !self
+                                        .swapchain_initialized
+                                        .get(image_index as usize)
+                                        .copied()
+                                        .ok_or(HalError::NativeFailure)?;
+                                let image = vk::ImageMemoryBarrier::default()
+                                    .src_access_mask(if first_present {
+                                        vk::AccessFlags::empty()
+                                    } else {
+                                        src_access
+                                    })
+                                    .dst_access_mask(dst_access)
+                                    .old_layout(if first_present {
+                                        vk::ImageLayout::UNDEFINED
+                                    } else {
+                                        old_layout
+                                    })
+                                    .new_layout(new_layout)
+                                    .image(surface_image)
+                                    .subresource_range(vk::ImageSubresourceRange {
+                                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                                        base_mip_level: 0,
+                                        level_count: 1,
+                                        base_array_layer: 0,
+                                        layer_count: 1,
+                                    });
+                                device.cmd_pipeline_barrier(
+                                    command_handle,
+                                    if first_present {
+                                        vk::PipelineStageFlags::TOP_OF_PIPE
+                                    } else {
+                                        src_stage
+                                    },
+                                    dst_stage,
+                                    vk::DependencyFlags::empty(),
+                                    &[],
+                                    &[],
+                                    core::slice::from_ref(&image),
+                                );
+                            }
+                            NativeFrameResource::Depth => {
+                                let depth = self.depth_target.as_ref().ok_or(HalError::NotReady)?;
+                                let image = vk::ImageMemoryBarrier::default()
+                                    .src_access_mask(src_access)
+                                    .dst_access_mask(dst_access)
+                                    .old_layout(old_layout)
+                                    .new_layout(new_layout)
+                                    .image(depth.image)
+                                    .subresource_range(vk::ImageSubresourceRange {
+                                        aspect_mask: vk::ImageAspectFlags::DEPTH,
+                                        base_mip_level: 0,
+                                        level_count: 1,
+                                        base_array_layer: 0,
+                                        layer_count: 1,
+                                    });
+                                device.cmd_pipeline_barrier(
+                                    command_handle,
+                                    src_stage,
+                                    dst_stage,
+                                    vk::DependencyFlags::empty(),
+                                    &[],
+                                    &[],
+                                    core::slice::from_ref(&image),
+                                );
+                            }
+                        }
+                    },
+                    NativeFrameAction::BeginPass(pass) => unsafe {
+                        if pass_active
+                            || pass.colors.len() != 1
+                            || pass.samples != 1
+                            || pass.area[0]
+                                .checked_add(pass.area[2])
+                                .is_none_or(|end| end > extent.0)
+                            || pass.area[1]
+                                .checked_add(pass.area[3])
+                                .is_none_or(|end| end > extent.1)
+                        {
+                            return Err(HalError::InvalidArgument);
+                        }
+                        let color = vk::RenderingAttachmentInfo::default()
+                            .image_view(self.swapchain_views[image_index as usize])
+                            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                            .load_op(match pass.load {
+                                AttachmentLoadOp::Load => vk::AttachmentLoadOp::LOAD,
+                                AttachmentLoadOp::Clear => vk::AttachmentLoadOp::CLEAR,
+                                AttachmentLoadOp::Discard => vk::AttachmentLoadOp::DONT_CARE,
+                            })
+                            .store_op(match pass.store {
+                                AttachmentStoreOp::Store => vk::AttachmentStoreOp::STORE,
+                                AttachmentStoreOp::Discard => vk::AttachmentStoreOp::DONT_CARE,
+                            })
+                            .clear_value(vk::ClearValue {
+                                color: vk::ClearColorValue {
+                                    float32: [0.1, 0.1, 0.1, 1.0],
+                                },
+                            });
+                        let depth = pass.depth.map(|_| {
+                            let target = self.depth_target.as_ref().expect("preflighted depth");
+                            vk::RenderingAttachmentInfo::default()
+                                .image_view(target.view)
+                                .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                                .load_op(match pass.load {
+                                    AttachmentLoadOp::Load => vk::AttachmentLoadOp::LOAD,
+                                    AttachmentLoadOp::Clear => vk::AttachmentLoadOp::CLEAR,
+                                    AttachmentLoadOp::Discard => vk::AttachmentLoadOp::DONT_CARE,
+                                })
+                                .store_op(match pass.store {
+                                    AttachmentStoreOp::Store => vk::AttachmentStoreOp::STORE,
+                                    AttachmentStoreOp::Discard => vk::AttachmentStoreOp::DONT_CARE,
+                                })
+                                .clear_value(vk::ClearValue {
+                                    depth_stencil: vk::ClearDepthStencilValue {
+                                        depth: 1.0,
+                                        stencil: 0,
+                                    },
+                                })
+                        });
+                        let mut rendering = vk::RenderingInfo::default()
+                            .render_area(vk::Rect2D {
+                                offset: vk::Offset2D {
+                                    x: pass.area[0] as i32,
+                                    y: pass.area[1] as i32,
+                                },
+                                extent: vk::Extent2D {
+                                    width: pass.area[2],
+                                    height: pass.area[3],
+                                },
+                            })
+                            .layer_count(1)
+                            .color_attachments(core::slice::from_ref(&color));
+                        if let Some(depth) = depth.as_ref() {
+                            rendering = rendering.depth_attachment(depth);
+                        }
+                        device.cmd_begin_rendering(command_handle, &rendering);
+                        pass_active = true;
+                    },
+                    NativeFrameAction::Compute(dispatch) => unsafe {
+                        if pass_active || dispatch.groups.contains(&0) {
+                            return Err(HalError::InvalidArgument);
+                        }
+                        let (_, public) = public_sets[action_index]
+                            .as_ref()
+                            .ok_or(HalError::InvalidArgument)?;
+                        device.cmd_bind_pipeline(
+                            command_handle,
+                            vk::PipelineBindPoint::COMPUTE,
+                            dispatch.pipeline.pipeline,
+                        );
+                        device.cmd_bind_descriptor_sets(
+                            command_handle,
+                            vk::PipelineBindPoint::COMPUTE,
+                            dispatch.pipeline.layout,
+                            0,
+                            &[*public, texture_set],
+                            &[],
+                        );
+                        if !dispatch.push_constants.is_empty() {
+                            device.cmd_push_constants(
+                                command_handle,
+                                dispatch.pipeline.layout,
+                                vk::ShaderStageFlags::ALL,
+                                0,
+                                dispatch.push_constants,
+                            );
+                        }
+                        device.cmd_dispatch(
+                            command_handle,
+                            dispatch.groups[0],
+                            dispatch.groups[1],
+                            dispatch.groups[2],
+                        );
+                    },
+                    NativeFrameAction::Graphics(draw) => unsafe {
+                        if !pass_active {
+                            return Err(HalError::InvalidArgument);
+                        }
+                        let (_, public) = public_sets[action_index]
+                            .as_ref()
+                            .ok_or(HalError::InvalidArgument)?;
+                        device.cmd_bind_pipeline(
+                            command_handle,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            draw.pipeline.pipeline,
+                        );
+                        device.cmd_bind_descriptor_sets(
+                            command_handle,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            draw.pipeline.layout,
+                            0,
+                            &[*public, texture_set],
+                            &[],
+                        );
+                        device.cmd_set_viewport(
+                            command_handle,
+                            0,
+                            &[vk::Viewport {
+                                x: 0.0,
+                                y: 0.0,
+                                width: draw.width as f32,
+                                height: draw.height as f32,
+                                min_depth: 0.0,
+                                max_depth: 1.0,
+                            }],
+                        );
+                        device.cmd_set_scissor(
+                            command_handle,
+                            0,
+                            &[vk::Rect2D {
+                                offset: vk::Offset2D::default(),
+                                extent: self.swapchain_extent,
+                            }],
+                        );
+                        device.cmd_bind_index_buffer(
+                            command_handle,
+                            draw.index_buffer.buffer,
+                            0,
+                            vk::IndexType::UINT32,
+                        );
+                        if !draw.push_constants.is_empty() {
+                            device.cmd_push_constants(
+                                command_handle,
+                                draw.pipeline.layout,
+                                vk::ShaderStageFlags::ALL,
+                                0,
+                                draw.push_constants,
+                            );
+                        }
+                        device.cmd_draw_indexed_indirect(
+                            command_handle,
+                            draw.indirect_buffer.buffer,
+                            0,
+                            draw.draw_count,
+                            20,
+                        );
+                    },
+                    NativeFrameAction::TextureReadback { texture, .. } => unsafe {
+                        if pass_active {
+                            return Err(HalError::InvalidArgument);
+                        }
+                        let (width, height, _, _, allocation) = readbacks
+                            .get(readback_index)
+                            .ok_or(HalError::InvalidArgument)?;
+                        device.cmd_copy_image_to_buffer(
+                            command_handle,
+                            texture.image,
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                            allocation.buffer,
+                            &[vk::BufferImageCopy::default()
+                                .image_subresource(vk::ImageSubresourceLayers {
+                                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                                    mip_level: 0,
+                                    base_array_layer: 0,
+                                    layer_count: 1,
+                                })
+                                .image_extent(vk::Extent3D {
+                                    width: *width,
+                                    height: *height,
+                                    depth: 1,
+                                })],
+                        );
+                        readback_index += 1;
+                    },
+                    NativeFrameAction::EndPass => unsafe {
+                        if !pass_active {
+                            return Err(HalError::InvalidArgument);
+                        }
+                        device.cmd_end_rendering(command_handle);
+                        pass_active = false;
+                    },
+                    NativeFrameAction::Present => unsafe {
+                        if pass_active {
+                            return Err(HalError::InvalidArgument);
+                        }
+                        if capture_presented {
+                            let (width, height, _, _, allocation) =
+                                readbacks
+                                    .get(readback_index)
+                                    .ok_or(HalError::InvalidArgument)?;
+                            let range = vk::ImageSubresourceRange {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                base_mip_level: 0,
+                                level_count: 1,
+                                base_array_layer: 0,
+                                layer_count: 1,
+                            };
+                            let to_copy = vk::ImageMemoryBarrier::default()
+                                .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                                .src_access_mask(vk::AccessFlags::empty())
+                                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                                .image(surface_image)
+                                .subresource_range(range);
+                            device.cmd_pipeline_barrier(
+                                command_handle,
+                                vk::PipelineStageFlags::ALL_COMMANDS,
+                                vk::PipelineStageFlags::TRANSFER,
+                                vk::DependencyFlags::empty(),
+                                &[],
+                                &[],
+                                core::slice::from_ref(&to_copy),
+                            );
+                            device.cmd_copy_image_to_buffer(
+                                command_handle,
+                                surface_image,
+                                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                                allocation.buffer,
+                                &[vk::BufferImageCopy::default()
+                                    .image_subresource(vk::ImageSubresourceLayers {
+                                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                                        mip_level: 0,
+                                        base_array_layer: 0,
+                                        layer_count: 1,
+                                    })
+                                    .image_extent(vk::Extent3D {
+                                        width: *width,
+                                        height: *height,
+                                        depth: 1,
+                                    })],
+                            );
+                            let to_present = vk::ImageMemoryBarrier::default()
+                                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                                .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                                .dst_access_mask(vk::AccessFlags::empty())
+                                .image(surface_image)
+                                .subresource_range(range);
+                            device.cmd_pipeline_barrier(
+                                command_handle,
+                                vk::PipelineStageFlags::TRANSFER,
+                                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                                vk::DependencyFlags::empty(),
+                                &[],
+                                &[],
+                                core::slice::from_ref(&to_present),
+                            );
+                            readback_index += 1;
+                        }
+                    },
+                }
+            }
+            if pass_active {
+                return Err(HalError::InvalidArgument);
+            }
+            unsafe {
+                device.end_command_buffer(command_handle).map_err(map_vk)?;
+                let mut wait_semaphores = Vec::with_capacity(2);
+                let mut wait_values = Vec::with_capacity(2);
+                let mut wait_stages = Vec::with_capacity(2);
+                if uses_surface {
+                    wait_semaphores.push(available);
+                    wait_values.push(0);
+                    wait_stages.push(vk::PipelineStageFlags::ALL_COMMANDS);
+                }
+                if let Some(value) = external_wait {
+                    wait_semaphores.push(self.transfer_timeline.ok_or(HalError::NotReady)?);
+                    wait_values.push(value);
+                    wait_stages.push(vk::PipelineStageFlags::ALL_COMMANDS);
+                }
+                let signal_values = [0_u64];
+                let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
+                    .wait_semaphore_values(&wait_values)
+                    .signal_semaphore_values(&signal_values);
+                let submit = vk::SubmitInfo::default()
+                    .wait_semaphores(&wait_semaphores)
+                    .wait_dst_stage_mask(&wait_stages)
+                    .command_buffers(core::slice::from_ref(&command_handle))
+                    .signal_semaphores(core::slice::from_ref(&finished_handle))
+                    .push_next(&mut timeline);
+                device
+                    .queue_submit(queue, &[submit], vk::Fence::null())
+                    .map_err(map_vk)?;
+                submitted = true;
+                if presents {
+                    loader
+                        .as_ref()
+                        .ok_or(HalError::InvalidArgument)?
+                        .queue_present(
+                            queue,
+                            &vk::PresentInfoKHR::default()
+                                .wait_semaphores(core::slice::from_ref(&finished_handle))
+                                .swapchains(core::slice::from_ref(&swapchain))
+                                .image_indices(core::slice::from_ref(&image_index)),
+                        )
+                        .map_err(map_vk)?;
+                }
+                device.queue_wait_idle(queue).map_err(map_vk)?;
+            }
+            Ok(())
+        })();
+
+        if submitted && recorded.is_err() {
+            let _ = unsafe { device.queue_wait_idle(queue) };
         }
-        unsafe { device.destroy_descriptor_pool(public_pool, None) };
-        Ok(())
+        unsafe {
+            device.free_command_buffers(pool, &[command_handle]);
+            device.destroy_semaphore(finished_handle, None);
+            for (pool, _) in public_sets.into_iter().flatten() {
+                device.destroy_descriptor_pool(pool, None);
+            }
+        }
+        if let Err(error) = recorded {
+            if acquired_image_index.is_some()
+                && let Some(surface) = surface.as_deref_mut()
+            {
+                let _ = self.recreate_swapchain(surface, extent.0, extent.1);
+            }
+            for (_, _, _, _, allocation) in readbacks {
+                let _ = self.free(allocation);
+            }
+            return Err(error);
+        }
+        if let Some(image_index) = acquired_image_index {
+            *self
+                .swapchain_initialized
+                .get_mut(image_index as usize)
+                .ok_or(HalError::NativeFailure)? = true;
+        }
+        let mut outputs = Vec::with_capacity(readbacks.len());
+        let mut remaining = readbacks.into_iter();
+        while let Some((_, _, size, surface_readback, mut allocation)) = remaining.next() {
+            let copied = (|| {
+                self.invalidate(&mut allocation, 0, size)
+                    .map_err(map_allocation_hal)?;
+                Ok(
+                    self.mapped_slice(&allocation).map_err(map_allocation_hal)?[..size as usize]
+                        .to_vec(),
+                )
+            })();
+            let freed = self.free(allocation).map_err(map_allocation_hal);
+            let mut pixels = match (copied, freed) {
+                (Ok(pixels), Ok(())) => pixels,
+                (Err(error), _) | (_, Err(error)) => {
+                    for (_, _, _, _, allocation) in remaining {
+                        let _ = self.free(allocation);
+                    }
+                    return Err(error);
+                }
+            };
+            if matches!(
+                self.swapchain_format,
+                vk::Format::B8G8R8A8_SRGB | vk::Format::B8G8R8A8_UNORM
+            ) && surface_readback
+            {
+                for pixel in pixels.chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
+                }
+            }
+            outputs.push(pixels);
+        }
+        if capture_presented && let Some(pixels) = outputs.last() {
+            surface.ok_or(HalError::InvalidArgument)?.presented_rgba8 = pixels.clone();
+        }
+        Ok(outputs)
     }
 
     fn destroy_unpublished_texture(
@@ -2146,6 +2540,7 @@ impl NativeContext {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     mip_level: 0,
                     base_array_layer: 0,
+
                     layer_count: 1,
                 })
                 .image_extent(vk::Extent3D {
@@ -2599,6 +2994,66 @@ impl BufferTransfer for NativeContext {
         }
         .map_err(|error| map_allocation_vk(map_vk(error)))
     }
+}
+fn vulkan_state(
+    state: ResourceState,
+) -> (vk::PipelineStageFlags, vk::AccessFlags, vk::ImageLayout) {
+    let stage = match state.stage {
+        ShaderStage::None => vk::PipelineStageFlags::ALL_COMMANDS,
+        ShaderStage::Vertex => vk::PipelineStageFlags::VERTEX_SHADER,
+        ShaderStage::Fragment => vk::PipelineStageFlags::FRAGMENT_SHADER,
+        ShaderStage::Compute => vk::PipelineStageFlags::COMPUTE_SHADER,
+        ShaderStage::AllGraphics => vk::PipelineStageFlags::ALL_GRAPHICS,
+    };
+    let (access, layout) = match state.access {
+        ResourceAccess::SampledRead => (
+            vk::AccessFlags::SHADER_READ,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        ),
+        ResourceAccess::StorageRead => (vk::AccessFlags::SHADER_READ, vk::ImageLayout::GENERAL),
+        ResourceAccess::StorageWrite => (vk::AccessFlags::SHADER_WRITE, vk::ImageLayout::GENERAL),
+        ResourceAccess::StorageReadWrite => (
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            vk::ImageLayout::GENERAL,
+        ),
+        ResourceAccess::IndexRead => (vk::AccessFlags::INDEX_READ, vk::ImageLayout::UNDEFINED),
+        ResourceAccess::IndirectRead => (
+            vk::AccessFlags::INDIRECT_COMMAND_READ,
+            vk::ImageLayout::UNDEFINED,
+        ),
+        ResourceAccess::IndirectStorageRead => (
+            vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
+            vk::ImageLayout::UNDEFINED,
+        ),
+        ResourceAccess::IndirectStorageReadWrite => (
+            vk::AccessFlags::INDIRECT_COMMAND_READ
+                | vk::AccessFlags::SHADER_READ
+                | vk::AccessFlags::SHADER_WRITE,
+            vk::ImageLayout::UNDEFINED,
+        ),
+        ResourceAccess::ColorAttachmentWrite => (
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        ),
+        ResourceAccess::DepthStencilRead => (
+            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ,
+            vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+        ),
+        ResourceAccess::DepthStencilWrite => (
+            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        ),
+        ResourceAccess::TransferRead => (
+            vk::AccessFlags::TRANSFER_READ,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        ),
+        ResourceAccess::TransferWrite => (
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        ),
+        ResourceAccess::Present => (vk::AccessFlags::empty(), vk::ImageLayout::PRESENT_SRC_KHR),
+    };
+    (stage, access, layout)
 }
 fn validate_allocation_range(length: u64, offset: u64, size: u64) -> Result<(), AllocationError> {
     if size == 0 || offset.checked_add(size).is_none_or(|end| end > length) {

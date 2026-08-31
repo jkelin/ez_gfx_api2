@@ -1,7 +1,9 @@
 use crate::{
-    graph::CompiledGraph,
+    binding::{PipelineLayout, PublicBinding, ReflectedBindings},
+    graph::{CompiledGraph, FrameGraph, GraphError, NodeDesc, NodeId, ResourceDesc, ResourceId},
     indirect::{DrawIndexedCommand, IndexedIndirectBuffer, IndirectError},
 };
+use ez_gfx_hal::{CompletionToken, DynamicPipelineState, ResourceState};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrameState {
@@ -10,22 +12,52 @@ pub enum FrameState {
     Submitted,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExecutableNode {
+    Graphics {
+        shader: u64,
+        indirect: u64,
+        draw_count: u32,
+        bindings: Vec<PublicBinding>,
+        layout: ReflectedBindings,
+        pipeline_layout: PipelineLayout,
+        state: DynamicPipelineState,
+        push_constants: Vec<u8>,
+    },
+    Compute {
+        shader: u64,
+        groups: [u32; 3],
+        bindings: Vec<PublicBinding>,
+        layout: ReflectedBindings,
+        push_constants: Vec<u8>,
+    },
+    TextureReadback {
+        texture: u64,
+    },
+    Present {
+        surface: u64,
+    },
+}
+
 pub struct FrameSubmission {
+    pub graph: CompiledGraph,
+    pub nodes: Vec<ExecutableNode>,
     pub commands: Vec<DrawIndexedCommand>,
 }
 
 pub struct FrameRecorder {
     state: FrameState,
     indirect: IndexedIndirectBuffer,
-    graph_enqueued: bool,
+    graph: FrameGraph,
+    nodes: Vec<ExecutableNode>,
 }
 impl FrameRecorder {
     pub fn new(indirect_capacity: u32) -> Result<Self, FrameError> {
         Ok(Self {
             state: FrameState::Idle,
             indirect: IndexedIndirectBuffer::new(indirect_capacity).map_err(map_indirect)?,
-            graph_enqueued: false,
+            graph: FrameGraph::new(),
+            nodes: Vec::new(),
         })
     }
 
@@ -38,7 +70,8 @@ impl FrameRecorder {
             return Err(FrameError::AlreadyRecording);
         }
         self.state = FrameState::Recording;
-        self.graph_enqueued = false;
+        self.graph = FrameGraph::new();
+        self.nodes.clear();
         self.indirect.set_draw_count(0).map_err(map_indirect)
     }
 
@@ -62,36 +95,74 @@ impl FrameRecorder {
             .map_err(map_indirect)
     }
 
-    /// The compiled graph is consumed because its ordering/barrier decision belongs to exactly one frame.
-    pub fn enqueue(&mut self, _graph: CompiledGraph) -> Result<(), FrameError> {
+    pub fn add_resource(&mut self, desc: ResourceDesc) -> Result<ResourceId, FrameError> {
         if self.state != FrameState::Recording {
             return Err(FrameError::NotRecording);
         }
-        if self.graph_enqueued {
-            return Err(FrameError::GraphAlreadyEnqueued);
-        }
-        self.graph_enqueued = true;
-        Ok(())
+        self.graph.add_resource(desc).map_err(FrameError::Graph)
     }
 
-    /// Marks backend-native work as the frame workload; repeated pipeline additions remain one submission.
-    pub fn mark_work_enqueued(&mut self) -> Result<(), FrameError> {
+    pub fn set_resource_ready(
+        &mut self,
+        resource: ResourceId,
+        completion: CompletionToken,
+    ) -> Result<(), FrameError> {
         if self.state != FrameState::Recording {
             return Err(FrameError::NotRecording);
         }
-        self.graph_enqueued = true;
-        Ok(())
+        self.graph
+            .set_resource_ready(resource, completion)
+            .map_err(FrameError::Graph)
+    }
+
+    pub fn set_resource_initial_state(
+        &mut self,
+        resource: ResourceId,
+        state: ResourceState,
+    ) -> Result<(), FrameError> {
+        if self.state != FrameState::Recording {
+            return Err(FrameError::NotRecording);
+        }
+        self.graph
+            .set_resource_initial_state(resource, state)
+            .map_err(FrameError::Graph)
+    }
+
+    /// Capacity is reserved before graph mutation, so a failed record never leaves an unpaired node.
+    pub fn record_node(
+        &mut self,
+        node: NodeDesc,
+        payload: ExecutableNode,
+    ) -> Result<NodeId, FrameError> {
+        if self.state != FrameState::Recording {
+            return Err(FrameError::NotRecording);
+        }
+        self.nodes
+            .try_reserve(1)
+            .map_err(|_| FrameError::CapacityExhausted)?;
+        let id = self.graph.add_node(node).map_err(FrameError::Graph)?;
+        if id.index() as usize != self.nodes.len() {
+            return Err(FrameError::NodePayloadMismatch);
+        }
+        self.nodes.push(payload);
+        Ok(id)
     }
 
     pub fn submit(&mut self) -> Result<FrameSubmission, FrameError> {
         if self.state != FrameState::Recording {
             return Err(FrameError::NotRecording);
         }
-        if !self.graph_enqueued {
+        if self.nodes.is_empty() {
             return Err(FrameError::MissingGraph);
+        }
+        let graph = self.graph.compile().map_err(FrameError::Graph)?;
+        if graph.order().len() != self.nodes.len() {
+            return Err(FrameError::NodePayloadMismatch);
         }
         self.state = FrameState::Submitted;
         Ok(FrameSubmission {
+            graph,
+            nodes: core::mem::take(&mut self.nodes),
             commands: self.indirect.commands().to_vec(),
         })
     }
@@ -101,7 +172,14 @@ impl FrameRecorder {
             return Err(FrameError::NotSubmitted);
         }
         self.state = FrameState::Idle;
+        self.graph = FrameGraph::new();
         Ok(())
+    }
+
+    pub fn abort(&mut self) {
+        self.state = FrameState::Idle;
+        self.graph = FrameGraph::new();
+        self.nodes.clear();
     }
 }
 
@@ -112,13 +190,15 @@ fn map_indirect(error: IndirectError) -> FrameError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FrameError {
     InvalidCapacity,
     AlreadyRecording,
     NotRecording,
-    GraphAlreadyEnqueued,
     MissingGraph,
     IndirectOutOfBounds,
     NotSubmitted,
+    CapacityExhausted,
+    NodePayloadMismatch,
+    Graph(GraphError),
 }

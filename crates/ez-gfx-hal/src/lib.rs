@@ -416,7 +416,10 @@ pub enum ResourceAccess {
     StorageRead,
     StorageWrite,
     StorageReadWrite,
+    IndexRead,
     IndirectRead,
+    IndirectStorageRead,
+    IndirectStorageReadWrite,
     ColorAttachmentWrite,
     DepthStencilRead,
     DepthStencilWrite,
@@ -512,4 +515,72 @@ pub trait Backend: Sized {
 
     fn enumerate_adapters() -> Result<Vec<AdapterInfo>, HalError>;
     fn create_device(adapter: &AdapterInfo) -> Result<Self::Device, HalError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionRange {
+    Buffer(BufferRange),
+    Image(ImageSubresources),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutionWait {
+    pub node: u32,
+    pub source: Option<u32>,
+    pub external: Option<CompletionToken>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutionBarrier {
+    pub node: u32,
+    pub resource: u32,
+    pub range: ExecutionRange,
+    pub before: Option<ResourceState>,
+    pub after: ResourceState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachmentLoadOp {
+    Load,
+    Clear,
+    Discard,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachmentStoreOp {
+    Store,
+    Discard,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionPass {
+    pub nodes: Vec<u32>,
+    pub colors: Vec<u32>,
+    pub depth: Option<u32>,
+    pub area: [u32; 4],
+    pub samples: u8,
+    pub load: AttachmentLoadOp,
+    pub store: AttachmentStoreOp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecutionAction {
+    Wait(ExecutionWait),
+    Barrier(ExecutionBarrier),
+    BeginPass(ExecutionPass),
+    ExecuteNode(u32),
+    EndPass,
+}
+
+/// Fully preflighted backend-neutral work. Native implementations record every action into one
+/// frame command stream and may present only after all recording succeeds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrameExecutionPlan {
+    pub actions: Vec<ExecutionAction>,
+}
+
+pub trait FrameExecutionBackend<P> {
+    type Error;
+
+    fn execute(&mut self, plan: &FrameExecutionPlan, payloads: &[P]) -> Result<(), Self::Error>;
 }

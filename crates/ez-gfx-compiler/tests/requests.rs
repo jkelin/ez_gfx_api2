@@ -82,6 +82,7 @@ fn native_binding_validation_does_not_use_executable_path() {
     ));
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn missing_apple_tool_is_typed() {
     let result = ez_gfx_compiler::build_metallib(

@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 use std::ffi::CString;
 
 use ez_gfx_ffi::{
@@ -6,6 +8,7 @@ use ez_gfx_ffi::{
     ez_gfx_texture_load, ez_gfx_texture_unload,
 };
 
+#[cfg(windows)]
 #[test]
 fn vulkan_reports_completed_progressive_mip_residency() {
     let context_desc = EzGfxBackendContextDesc {

@@ -8,6 +8,19 @@ pub use crate::target::{Format, LoadOp, StoreOp};
 pub struct ResourceId(u32);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NodeId(u32);
+impl ResourceId {
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+    pub const fn from_index(index: u32) -> Self {
+        Self(index)
+    }
+}
+impl NodeId {
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResourceLifetime {
@@ -186,6 +199,30 @@ impl PassInfo {
             store,
         })
     }
+
+    pub fn colors(&self) -> &[ResourceId] {
+        &self.colors
+    }
+
+    pub const fn depth(&self) -> Option<ResourceId> {
+        self.depth
+    }
+
+    pub const fn area(&self) -> [u32; 4] {
+        self.area
+    }
+
+    pub const fn samples(&self) -> u8 {
+        self.samples
+    }
+
+    pub const fn load(&self) -> LoadOp {
+        self.load
+    }
+
+    pub const fn store(&self) -> StoreOp {
+        self.store
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -231,6 +268,7 @@ pub struct FrameGraph {
 struct ResourceRecord {
     desc: ResourceDesc,
     ready: Option<CompletionToken>,
+    initial: Option<ResourceState>,
 }
 
 impl FrameGraph {
@@ -241,8 +279,26 @@ impl FrameGraph {
         let id = ResourceId(
             u32::try_from(self.resources.len()).map_err(|_| GraphError::CapacityExhausted)?,
         );
-        self.resources.push(ResourceRecord { desc, ready: None });
+        self.resources.push(ResourceRecord {
+            desc,
+            ready: None,
+            initial: None,
+        });
         Ok(id)
+    }
+
+    /// External and persistent resources must declare the state established before this frame.
+    pub fn set_resource_initial_state(
+        &mut self,
+        resource: ResourceId,
+        state: ResourceState,
+    ) -> Result<(), GraphError> {
+        let record = self.resource_mut(resource)?;
+        if record.desc.lifetime == ResourceLifetime::Transient {
+            return Err(GraphError::InvalidResource);
+        }
+        record.initial = Some(state);
+        Ok(())
     }
     pub fn set_resource_ready(
         &mut self,
@@ -290,9 +346,7 @@ impl FrameGraph {
             }
         }
         if let Some(pass) = &node.pass {
-            for attachment in pass.colors.iter().copied().chain(pass.depth) {
-                self.resource(attachment)?;
-            }
+            validate_pass(self, &node, pass)?;
         }
         node.dependencies.sort_unstable();
         node.dependencies.dedup();
@@ -330,6 +384,7 @@ impl FrameGraph {
         let mut edges = self.explicit_edges.clone();
         edges.extend(hazards.iter().map(|edge| (edge.from, edge.to)));
         let order = stable_topological(self.nodes.len(), &edges)?;
+        self.validate_transient_attachment_loads(&order)?;
         let positions: BTreeMap<_, _> = order
             .iter()
             .enumerate()
@@ -348,6 +403,36 @@ impl FrameGraph {
             aliases,
             history_states,
         })
+    }
+
+    fn validate_transient_attachment_loads(&self, order: &[NodeId]) -> Result<(), GraphError> {
+        let mut initialized = BTreeSet::new();
+        for node in order {
+            let node = &self.nodes[node.0 as usize];
+            if node
+                .pass
+                .as_ref()
+                .is_some_and(|pass| pass.load == LoadOp::Load)
+            {
+                let pass = node.pass.as_ref().expect("pass was checked");
+                for attachment in pass.colors.iter().copied().chain(pass.depth) {
+                    // Transient images have no preserved contents before the graph's first write.
+                    if self.resources[attachment.0 as usize].desc.lifetime
+                        == ResourceLifetime::Transient
+                        && !initialized.contains(&attachment)
+                    {
+                        return Err(GraphError::InvalidPass);
+                    }
+                }
+            }
+            initialized.extend(
+                node.accesses
+                    .iter()
+                    .filter(|access| is_write(access.state.access))
+                    .map(|access| access.resource),
+            );
+        }
+        Ok(())
     }
 
     fn build_hazards(&self) -> Vec<HazardEdge> {
@@ -414,6 +499,14 @@ impl FrameGraph {
     ) -> (Vec<Transition>, BTreeMap<ResourceId, ResourceState>) {
         let mut tracked: BTreeMap<ResourceId, Vec<(ResourceRange, ResourceState)>> =
             BTreeMap::new();
+        for (index, resource) in self.resources.iter().enumerate() {
+            if let Some(state) = resource.initial {
+                tracked.insert(
+                    ResourceId(index as u32),
+                    vec![(full_range(&resource.desc), state)],
+                );
+            }
+        }
         for (resource, state) in &self.history {
             tracked.entry(*resource).or_default().push((
                 full_range(&self.resources[resource.0 as usize].desc),
@@ -685,6 +778,7 @@ fn stable_topological(
         .map(|(index, _)| NodeId(index as u32))
         .collect();
     let mut order = Vec::with_capacity(count);
+
     while let Some(node) = ready.pop_first() {
         order.push(node);
         for next in &outgoing[node.0 as usize] {
@@ -705,6 +799,70 @@ fn stable_topological(
         });
     }
     Ok(order)
+}
+fn validate_pass(graph: &FrameGraph, node: &NodeDesc, pass: &PassInfo) -> Result<(), GraphError> {
+    if node.queue != QueueKind::Graphics {
+        return Err(GraphError::InvalidPass);
+    }
+    let area_end = [
+        pass.area[0]
+            .checked_add(pass.area[2])
+            .ok_or(GraphError::InvalidPass)?,
+        pass.area[1]
+            .checked_add(pass.area[3])
+            .ok_or(GraphError::InvalidPass)?,
+    ];
+    for (resource, depth) in pass
+        .colors
+        .iter()
+        .copied()
+        .map(|resource| (resource, false))
+        .chain(pass.depth.map(|resource| (resource, true)))
+    {
+        let record = graph.resource(resource)?;
+        let ResourceShape::Image {
+            width,
+            height,
+            mips: _,
+            layers: _,
+            format,
+            samples,
+        } = record.desc.shape
+        else {
+            return Err(GraphError::InvalidPass);
+        };
+        if samples != pass.samples
+            || area_end[0] > width
+            || area_end[1] > height
+            || depth != (format == Format::Depth32Float)
+        {
+            return Err(GraphError::InvalidPass);
+        }
+        let valid_access = node.accesses.iter().any(|access| {
+            access.resource == resource
+                && matches!(
+                    access.range,
+                    ResourceRange::Image(ImageRange {
+                        first_mip: 0,
+                        mip_count,
+                        first_layer: 0,
+                        layer_count,
+                    }) if mip_count > 0 && layer_count > 0
+                )
+                && if depth {
+                    matches!(
+                        access.state.access,
+                        ResourceAccess::DepthStencilRead | ResourceAccess::DepthStencilWrite
+                    )
+                } else {
+                    access.state.access == ResourceAccess::ColorAttachmentWrite
+                }
+        });
+        if !valid_access {
+            return Err(GraphError::InvalidPass);
+        }
+    }
+    Ok(())
 }
 
 fn validate_access(resource: &ResourceRecord, access: &Access) -> Result<(), GraphError> {
@@ -779,7 +937,6 @@ fn intersection(a: ResourceRange, b: ResourceRange) -> Option<ResourceRange> {
         _ => None,
     }
 }
-
 fn subtract(range: ResourceRange, cut: ResourceRange) -> Vec<ResourceRange> {
     let Some(overlap) = intersection(range, cut) else {
         return vec![range];
@@ -865,6 +1022,7 @@ fn is_write(access: ResourceAccess) -> bool {
         access,
         ResourceAccess::StorageWrite
             | ResourceAccess::StorageReadWrite
+            | ResourceAccess::IndirectStorageReadWrite
             | ResourceAccess::ColorAttachmentWrite
             | ResourceAccess::DepthStencilWrite
             | ResourceAccess::TransferWrite

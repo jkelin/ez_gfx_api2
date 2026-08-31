@@ -198,16 +198,55 @@ fn cross_queue_and_external_readiness_waits_are_explicit_and_history_survives() 
 }
 
 #[test]
+fn first_use_load_rejects_transient_attachments() {
+    for depth in [false, true] {
+        let mut graph = FrameGraph::new();
+        let format = if depth {
+            Format::Depth32Float
+        } else {
+            Format::Rgba8Unorm
+        };
+        let attachment = graph
+            .add_resource(
+                ResourceDesc::image(16, 16, 1, 1, format, 1, ResourceLifetime::Transient).unwrap(),
+            )
+            .unwrap();
+        let pass = PassInfo::new(
+            (!depth).then_some(attachment).into_iter().collect(),
+            depth.then_some(attachment),
+            [0, 0, 16, 16],
+            1,
+            LoadOp::Load,
+            StoreOp::Store,
+        )
+        .unwrap();
+        let access = if depth {
+            ResourceAccess::DepthStencilWrite
+        } else {
+            ResourceAccess::ColorAttachmentWrite
+        };
+        graph
+            .add_node(
+                NodeDesc::new("invalid-load", QueueKind::Graphics)
+                    .pass(pass)
+                    .access(Access::image(
+                        attachment,
+                        ImageRange::all(1, 1).unwrap(),
+                        state(QueueKind::Graphics, ShaderStage::Fragment, access),
+                    )),
+            )
+            .unwrap();
+
+        assert!(matches!(graph.compile(), Err(GraphError::InvalidPass)));
+    }
+}
+
+#[test]
 fn store_then_load_passes_merge_but_repeated_clear_and_transitions_do_not() {
     let write = state(
         QueueKind::Graphics,
         ShaderStage::Fragment,
         ResourceAccess::ColorAttachmentWrite,
-    );
-    let read = state(
-        QueueKind::Graphics,
-        ShaderStage::Fragment,
-        ResourceAccess::SampledRead,
     );
 
     let mut compatible = FrameGraph::new();
@@ -330,6 +369,14 @@ fn store_then_load_passes_merge_but_repeated_clear_and_transitions_do_not() {
             .unwrap(),
         )
         .unwrap();
+    let transition_buffer = transition
+        .add_resource(ResourceDesc::buffer(16, 4, ResourceLifetime::External).unwrap())
+        .unwrap();
+    let storage_read = state(
+        QueueKind::Graphics,
+        ShaderStage::Fragment,
+        ResourceAccess::StorageRead,
+    );
     let first = PassInfo::new(
         vec![attachment],
         None,
@@ -366,7 +413,12 @@ fn store_then_load_passes_merge_but_repeated_clear_and_transitions_do_not() {
                 .access(Access::image(
                     attachment,
                     ImageRange::all(1, 1).unwrap(),
-                    read,
+                    write,
+                ))
+                .access(Access::buffer(
+                    transition_buffer,
+                    BufferRange::new(0, 16).unwrap(),
+                    storage_read,
                 )),
         )
         .unwrap();
