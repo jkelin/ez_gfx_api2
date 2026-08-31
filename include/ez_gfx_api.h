@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define EZ_GFX_ABI_VERSION 17u
+#define EZ_GFX_ABI_VERSION 18u
 
 #if defined(__clang__)
 #  if __has_attribute(access)
@@ -232,7 +232,6 @@ enum {
  * @EzGfxCullMode_None: No face culling.
  * @EzGfxCullMode_Front: Cull front-facing primitives.
  * @EzGfxCullMode_Back: Cull back-facing primitives.
- * @EzGfxCullMode_FrontAndBack: Cull both front- and back-facing primitives.
  *
  * Pipeline cull mode.
  */
@@ -241,7 +240,6 @@ enum {
     EzGfxCullMode_None = 0,
     EzGfxCullMode_Front = 1,
     EzGfxCullMode_Back = 2,
-    EzGfxCullMode_FrontAndBack = 3,
 };
 
 /**
@@ -343,11 +341,6 @@ typedef struct EzGfxSurfaceDesc {
  *
  * Shader source and entry-point metadata.
  */
-typedef struct EzGfxShaderEntry {
- const char *entry;
- uint8_t stage;
- uint8_t _padding[7];
-} EzGfxShaderEntry;
 typedef struct EzGfxShaderDesc {
     const char * path;
     const char * vertex_entry;
@@ -578,7 +571,7 @@ EzGfxResult ez_gfx_surface_resize_pending(EzGfxSurface surface, int32_t * out_pe
 EzGfxResult ez_gfx_surface_set_snapshot_cache(EzGfxSurface surface, int32_t enabled, EzGfxContext context);
 
 /** Loads a validated precompiled shader artifact; runtime packages contain no compiler. */
-EzGfxResult ez_gfx_shader_load_artifact(const uint8_t *data, size_t data_size, const EzGfxShaderEntry *entries, size_t entry_count, EzGfxShader *out_shader, EzGfxContext context) EZ_GFX_ACCESS(read_only, 1, 2) EZ_GFX_ACCESS(read_only, 3, 4) EZ_GFX_ACCESS(write_only, 5);
+EzGfxResult ez_gfx_shader_load_artifact(const uint8_t *data, size_t data_size, EzGfxShader *out_shader, EzGfxContext context) EZ_GFX_ACCESS(read_only, 1, 2) EZ_GFX_ACCESS(write_only, 3);
 /** Destroys a shader and its backend-native modules/libraries. */
 void ez_gfx_shader_destroy(EzGfxShader shader, EzGfxContext context);
 /** Decodes validated image/KTX2 bytes, including BasisLZ ETC1S and UASTC payloads, then starts an asynchronous GPU upload. */
@@ -633,7 +626,7 @@ void ez_gfx_index_heap_destroy(EzGfxContext context);
 EzGfxResult ez_gfx_vertex_upload_indices(const void * data, uint32_t count, uint32_t * out_start_index, EzGfxContext context) EZ_GFX_ACCESS(read_only, 1, 2) EZ_GFX_ACCESS(write_only, 3);
 
 /** Uploads vertices through pooled staging and returns the first vertex. */
-EzGfxResult ez_gfx_vertex_upload(const char * heap_name, const void * data, uint32_t element_count, uint64_t element_size, uint32_t * out_start_index, EzGfxContext context) EZ_GFX_ACCESS(write_only, 5);
+EzGfxResult ez_gfx_vertex_upload(const char * heap_name, const void * data, uint32_t element_count, uint64_t element_size, uint32_t * out_start_index, EzGfxContext context) EZ_GFX_ACCESS(read_only, 2, 3) EZ_GFX_ACCESS(write_only, 5);
 
 /** Acquires a real mapped upload buffer owned by an initialized context. */
 EzGfxResult ez_gfx_structured_acquire(uint32_t element_size, uint32_t element_count, const char * debug_name, EzGfxStructuredBuffer * out_structured, EzGfxContext context) EZ_GFX_ACCESS(write_only, 4);

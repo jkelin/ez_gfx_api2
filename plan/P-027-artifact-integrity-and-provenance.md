@@ -2,7 +2,7 @@
 
 ## Problem
 
-Define the trust contract for `.ezshader` and related precompiled runtime inputs beyond structural parsing. P-006 records hashes and compiler identity, but no policy defines authenticity ownership, trusted provenance, key handling, or behavior for absent/invalid signatures.
+Define the trust contract for `.ezgfxshader` and related precompiled runtime inputs beyond structural parsing. P-006 records hashes and compiler identity, but no policy defines authenticity ownership, trusted provenance, key handling, or behavior for absent/invalid signatures.
 
 ## Prompt context
 
@@ -53,7 +53,7 @@ Small offline-capable runtime and simple key ownership. A compromised or careles
 
 #### Approach and integration
 
-Compiler signs the canonical `.ezshader` container or section manifest. Runtime accepts a configured trust store/key policy, verifies the signature before parsing execution sections, then validates schema and hashes. Offline deployments package public keys with the application.
+Compiler signs the canonical `.ezgfxshader` container or deployment manifest. Runtime accepts a configured trust store/key policy, verifies the signature before parsing execution data, then validates archive structure and hashes. Offline deployments package public keys with the application.
 
 #### Performance evidence
 

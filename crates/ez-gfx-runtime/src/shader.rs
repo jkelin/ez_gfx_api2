@@ -1,61 +1,87 @@
-use crate::binding::{BindingError, ReflectedBindings};
-use ez_gfx_artifact::{Artifact, ArtifactError, Stage, Target};
+use crate::binding::{
+    BindingError, PipelineLayout, ReflectedBindings, ValidatedStageReflection,
+    validate_stage_reflections,
+};
+use ez_gfx_artifact::{
+    AppleArchitecture, ApplePlatform, Artifact, ArtifactError, CompatibilityVersion,
+    MetalCompatibility, Stage, Target, TargetCompatibility,
+};
 use ez_gfx_core::{Backend, capability::SemanticProfile};
+use std::collections::BTreeSet;
 
-/// Identifies a selected shader by selection index, stage, and entry point.
+/// Identifies a selected shader by selection index, stage, and its artifact-owned entry point.
 pub type ShaderProduct<'a> = (usize, Stage, &'a str);
-/// Pairs the selected vertex and fragment shaders for graphics pipeline creation.
-pub type GraphicsPair<'a> = (ShaderProduct<'a>, ShaderProduct<'a>);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Specifies an entry point and stage to select from a shader artifact.
-pub struct ShaderRequest {
-    /// Names the shader entry point to select.
-    entry: String,
-    /// Specifies the shader stage to select.
-    stage: Stage,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Describes the Metal runtime compatibility boundary used for metallib admission.
+pub struct MetalEnvironment {
+    /// Running Apple platform.
+    pub platform: ApplePlatform,
+    /// Running CPU architecture.
+    pub architecture: AppleArchitecture,
+    /// Running operating-system version.
+    pub os: CompatibilityVersion,
+    /// Highest Metal language version accepted by this runtime.
+    pub max_language: CompatibilityVersion,
+    /// Highest metallib contract version accepted by this runtime.
+    pub max_library: CompatibilityVersion,
 }
-impl ShaderRequest {
-    /// Entry names are bounded UTF-8 without NUL because they enter native pipeline creation unchanged.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ShaderLoadError::InvalidRequest` if the entry point is empty, exceeds 16 KiB, or contains a NUL byte.
-    pub fn new(entry: impl Into<String>, stage: Stage) -> Result<Self, ShaderLoadError> {
-        let entry = entry.into();
-        if entry.is_empty() || entry.len() > 16 * 1024 || entry.as_bytes().contains(&0) {
-            return Err(ShaderLoadError::InvalidRequest);
-        }
-        Ok(Self { entry, stage })
+
+impl MetalEnvironment {
+    fn admits(self, compatibility: &MetalCompatibility) -> bool {
+        compatibility.platform == self.platform
+            && compatibility.architecture == self.architecture
+            && compatibility.minimum_os <= self.os
+            && compatibility.sdk >= compatibility.minimum_os
+            && compatibility.language <= self.max_language
+            && compatibility.library <= self.max_library
     }
 }
+/// Pairs the selected vertex and fragment shaders for graphics pipeline creation.
+pub type GraphicsPair<'a> = (ShaderProduct<'a>, ShaderProduct<'a>);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Holds a decoded artifact and the native shaders selected for one backend.
 pub struct RuntimeShader {
     /// Contains the decoded shader artifact.
     artifact: Artifact,
-    /// Records requested entry points, stages, and matching artifact indices.
-    selected: Vec<(String, Stage, usize)>,
-    /// Identifies the backend targeted by the selected native shaders.
-    backend: Backend,
+    /// Records selected stages and matching artifact indices.
+    selected: Vec<(Stage, usize)>,
+    /// Fully parsed reflection products for selected stages.
+    reflections: Vec<ValidatedStageReflection>,
 }
 
 impl RuntimeShader {
-    /// Decodes a bounded artifact and selects exact native products; no source, MSL, Slang, or JIT fallback exists.
+    /// Decodes an artifact and selects every compatible stage for the requested backend.
+    ///
+    /// Metal loads use the running macOS identity. Tests and embedding layers that already own a
+    /// platform identity can call [`Self::load_for_environment`] explicitly.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request list is empty, artifact decoding fails, a request is duplicated, or no artifact variant matches a request.
+    /// Returns an error before product exposure when decoding, compatibility selection, or
+    /// reflection validation fails.
     pub fn load(
         bytes: &[u8],
         backend: Backend,
         profile: SemanticProfile,
-        requests: &[ShaderRequest],
     ) -> Result<Self, ShaderLoadError> {
-        if requests.is_empty() {
-            return Err(ShaderLoadError::InvalidRequest);
-        }
+        let metal = host_metal_environment();
+        Self::load_for_environment(bytes, backend, profile, metal.as_ref())
+    }
+
+    /// Decodes an artifact and selects products compatible with an explicit Metal environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before product exposure when decoding, compatibility selection, or
+    /// reflection validation fails.
+    pub fn load_for_environment(
+        bytes: &[u8],
+        backend: Backend,
+        profile: SemanticProfile,
+        metal: Option<&MetalEnvironment>,
+    ) -> Result<Self, ShaderLoadError> {
         let artifact = Artifact::decode(bytes).map_err(ShaderLoadError::Artifact)?;
         let target = match backend {
             Backend::Vulkan => Target::Spirv,
@@ -63,71 +89,105 @@ impl RuntimeShader {
             Backend::Metal => Target::Metallib,
         };
         let profile = profile_label(profile);
-        let mut selected = Vec::with_capacity(requests.len());
-        for request in requests {
-            if selected
-                .iter()
-                .any(|(entry, stage, _)| entry == &request.entry && *stage == request.stage)
-            {
-                return Err(ShaderLoadError::DuplicateRequest);
-            }
+        let stages = artifact
+            .variants
+            .iter()
+            .map(|variant| variant.stage)
+            .collect::<BTreeSet<_>>();
+        let mut selected = Vec::with_capacity(stages.len());
+        for stage in stages {
             let index = artifact
                 .variants
                 .iter()
-                .position(|variant| {
-                    variant.target == target
-                        && variant.stage == request.stage
-                        && variant.entry_point == request.entry
-                        && variant.profile == profile
+                .enumerate()
+                .filter(|(_, variant)| {
+                    variant.target == target && variant.stage == stage && variant.profile == profile
                 })
-                .ok_or_else(|| ShaderLoadError::MissingProduct {
-                    entry: request.entry.clone(),
-                    stage: request.stage,
-                })?;
-            selected.push((request.entry.clone(), request.stage, index));
+                .filter(|(_, variant)| match (&variant.compatibility, backend) {
+                    (TargetCompatibility::Vulkan { .. }, Backend::Vulkan)
+                    | (TargetCompatibility::Dx12 { .. }, Backend::Dx12) => true,
+                    (
+                        TargetCompatibility::MetalLibrary {
+                            metal: compatibility,
+                        },
+                        Backend::Metal,
+                    ) => metal.is_some_and(|environment| environment.admits(compatibility)),
+                    _ => false,
+                })
+                .max_by_key(|(_, variant)| match &variant.compatibility {
+                    TargetCompatibility::MetalLibrary {
+                        metal: compatibility,
+                    } => (compatibility.minimum_os, compatibility.sdk),
+                    _ => (
+                        CompatibilityVersion::new(0, 0),
+                        CompatibilityVersion::new(0, 0),
+                    ),
+                })
+                .map(|(index, _)| index)
+                .ok_or(ShaderLoadError::MissingProduct { stage })?;
+            selected.push((stage, index));
         }
+        let reflection_keys = selected
+            .iter()
+            .map(|(stage, index)| (*stage, artifact.variants[*index].entry_point.as_str()))
+            .collect::<Vec<_>>();
+        let reflections = validate_stage_reflections(&artifact.metadata, backend, &reflection_keys)
+            .map_err(ShaderLoadError::Reflection)?;
         Ok(Self {
             artifact,
             selected,
-            backend,
+            reflections,
         })
     }
-
     /// Returns the artifact metadata used for shader reflection.
     pub fn metadata(&self) -> &[u8] {
         &self.artifact.metadata
     }
+
     /// Computes the artifact digest over execution-relevant contents.
     pub fn execution_digest(&self) -> [u8; 32] {
         self.artifact.execution_digest()
     }
-    /// Returns the selected native shader bytes for an entry point and stage.
-    pub fn product(&self, entry: &str, stage: Stage) -> Option<&[u8]> {
+
+    /// Returns the selected native shader bytes for a stage.
+    pub fn product(&self, stage: Stage) -> Option<&[u8]> {
         self.selected
             .iter()
-            .find(|(selected, selected_stage, _)| selected == entry && *selected_stage == stage)
-            .map(|(_, _, index)| self.artifact.variants[*index].bytes.as_slice())
+            .find(|(selected_stage, _)| *selected_stage == stage)
+            .map(|(_, index)| self.artifact.variants[*index].bytes.as_slice())
     }
-    /// Iterates over selected stages and native shader bytes in request order.
+
+    /// Iterates over selected stages and native shader bytes in stage order.
     pub fn products(&self) -> impl ExactSizeIterator<Item = (Stage, &[u8])> {
         self.selected
             .iter()
-            .map(|(_, stage, index)| (*stage, self.artifact.variants[*index].bytes.as_slice()))
+            .map(|(stage, index)| (*stage, self.artifact.variants[*index].bytes.as_slice()))
     }
-    /// Resolves the target-native physical layout for one selected stage; absent compiler reflection is rejected rather than treated as no bindings.
+
+    /// Returns the prevalidated physical bindings for one selected stage.
     ///
     /// # Errors
     ///
-    /// Returns `BindingError::MissingReflection` if the shader was not selected, or an error from parsing its reflected bindings.
-    pub fn bindings(&self, entry: &str, stage: Stage) -> Result<ReflectedBindings, BindingError> {
-        if !self
-            .selected
+    /// Returns `BindingError::MissingReflection` if the stage was not selected.
+    pub fn bindings(&self, stage: Stage) -> Result<ReflectedBindings, BindingError> {
+        self.reflections
             .iter()
-            .any(|(selected, selected_stage, _)| selected == entry && *selected_stage == stage)
-        {
-            return Err(BindingError::MissingReflection);
-        }
-        ReflectedBindings::parse(&self.artifact.metadata, self.backend, entry, stage)
+            .find(|reflection| reflection.stage() == stage)
+            .map(|reflection| reflection.bindings().clone())
+            .ok_or(BindingError::MissingReflection)
+    }
+
+    /// Returns the prevalidated pipeline layout for one selected stage.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BindingError::MissingReflection` if the stage was not selected.
+    pub fn pipeline_layout(&self, stage: Stage) -> Result<PipelineLayout, BindingError> {
+        self.reflections
+            .iter()
+            .find(|reflection| reflection.stage() == stage)
+            .map(|reflection| *reflection.pipeline_layout())
+            .ok_or(BindingError::MissingReflection)
     }
 
     /// Graphics pipelines require exactly one selected vertex product and one selected fragment product.
@@ -136,78 +196,101 @@ impl RuntimeShader {
     ///
     /// Returns `ShaderLoadError::InvalidStagePairing` unless exactly one vertex shader and one fragment shader are selected.
     pub fn graphics_pair(&self) -> Result<GraphicsPair<'_>, ShaderLoadError> {
-        let mut vertex = None;
-        let mut fragment = None;
-        for (product_index, (entry, stage, _)) in self.selected.iter().enumerate() {
-            match stage {
-                Stage::Vertex
-                    if vertex
-                        .replace((product_index, *stage, entry.as_str()))
-                        .is_some() =>
-                {
-                    return Err(ShaderLoadError::InvalidStagePairing);
-                }
-                Stage::Fragment
-                    if fragment
-                        .replace((product_index, *stage, entry.as_str()))
-                        .is_some() =>
-                {
-                    return Err(ShaderLoadError::InvalidStagePairing);
-                }
-                _ => {}
-            }
-        }
+        let vertex = self.shader_product(Stage::Vertex);
+        let fragment = self.shader_product(Stage::Fragment);
         vertex
             .zip(fragment)
             .ok_or(ShaderLoadError::InvalidStagePairing)
     }
 
-    /// Compute lookup accepts mixed artifacts but still requires exactly one selected compute product.
+    /// Compute lookup accepts mixed artifacts but requires a selected compute product.
     ///
     /// # Errors
     ///
-    /// Returns `ShaderLoadError::InvalidStagePairing` unless exactly one compute shader is selected.
-    pub fn compute_product(&self) -> Result<(usize, Stage, &str), ShaderLoadError> {
-        let mut compute = None;
-        for (product_index, (entry, stage, _)) in self.selected.iter().enumerate() {
-            if *stage != Stage::Compute {
-                continue;
-            }
-            if compute
-                .replace((product_index, *stage, entry.as_str()))
-                .is_some()
-            {
-                return Err(ShaderLoadError::InvalidStagePairing);
-            }
-        }
-        compute.ok_or(ShaderLoadError::InvalidStagePairing)
+    /// Returns `ShaderLoadError::InvalidStagePairing` unless a compute shader is selected.
+    pub fn compute_product(&self) -> Result<ShaderProduct<'_>, ShaderLoadError> {
+        self.shader_product(Stage::Compute)
+            .ok_or(ShaderLoadError::InvalidStagePairing)
+    }
+
+    fn shader_product(&self, stage: Stage) -> Option<ShaderProduct<'_>> {
+        self.selected
+            .iter()
+            .enumerate()
+            .find(|(_, (selected_stage, _))| *selected_stage == stage)
+            .map(|(product_index, (_, artifact_index))| {
+                (
+                    product_index,
+                    stage,
+                    self.artifact.variants[*artifact_index].entry_point.as_str(),
+                )
+            })
     }
 }
 
 /// Maps a semantic profile to its artifact profile label.
-fn profile_label(profile: SemanticProfile) -> &'static str {
+const fn profile_label(profile: SemanticProfile) -> &'static str {
     match profile {
         SemanticProfile::V1 => "ez-gfx-v1",
     }
 }
 
+#[cfg(target_os = "macos")]
+static HOST_METAL_ENVIRONMENT: std::sync::LazyLock<Option<MetalEnvironment>> =
+    std::sync::LazyLock::new(detect_host_metal_environment);
+
+#[cfg(target_os = "macos")]
+fn host_metal_environment() -> Option<MetalEnvironment> {
+    *HOST_METAL_ENVIRONMENT
+}
+
+#[cfg(target_os = "macos")]
+fn detect_host_metal_environment() -> Option<MetalEnvironment> {
+    // A missing or malformed host version fails closed instead of guessing compatibility.
+    let version = std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|version| {
+            let mut components = version.trim().split('.');
+            Some(CompatibilityVersion::new(
+                components.next()?.parse().ok()?,
+                components.next().unwrap_or("0").parse().ok()?,
+            ))
+        })?;
+    let architecture = match std::env::consts::ARCH {
+        "aarch64" => AppleArchitecture::Aarch64,
+        "x86_64" => AppleArchitecture::X86_64,
+        _ => return None,
+    };
+    Some(MetalEnvironment {
+        platform: ApplePlatform::MacOs,
+        architecture,
+        os: version,
+        max_language: CompatibilityVersion::new(3, 0),
+        max_library: CompatibilityVersion::new(1, 0),
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn host_metal_environment() -> Option<MetalEnvironment> {
+    None
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// Reports request validation, artifact decoding, and shader selection failures.
+/// Reports artifact decoding and shader selection failures.
 pub enum ShaderLoadError {
-    /// The request list or an entry-point name is invalid.
-    InvalidRequest,
-    /// The same entry point and stage were requested more than once.
-    DuplicateRequest,
     /// The shader artifact could not be decoded or validated.
     Artifact(ArtifactError),
-    /// No compiled shader matches the requested target, profile, entry point, and stage.
     /// A required compiled product is absent.
     MissingProduct {
-        /// Shader entry point.
-        entry: String,
         /// Shader stage.
         stage: Stage,
     },
+    /// Required reflection was missing, ambiguous, malformed, or semantically invalid.
+    Reflection(BindingError),
     /// The selected shaders do not form the required graphics or compute stage set.
     InvalidStagePairing,
 }

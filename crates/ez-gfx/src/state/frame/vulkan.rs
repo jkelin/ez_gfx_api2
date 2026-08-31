@@ -1,12 +1,13 @@
 use super::{
     Backend, ContextState, ExecutableNode, ExecutionAction, EzGfxResult, FrameExecutionPlan,
     FrameNativeResource, HashMap, MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext,
-    NativePipeline, NativeShader, NativeSurface, NativeTexture, NativeTextureMap, PipelineKey,
-    ResourceId, ShaderRecord, map_hal, native_layouts, pipeline_layout_key, vulkan_bindings,
+    NativePipeline, NativeShader, NativeSurface, NativeTexture, NativeTextureMap, PackedHandle,
+    PipelineKey, ResourceId, ShaderHandle, ShaderRecord, map_hal, native_layouts,
+    pipeline_layout_key, vulkan_bindings,
 };
 
 struct VulkanActionState<'a> {
-    allocations: &'a HashMap<u64, (u64, NativeAllocation)>,
+    allocations: &'a HashMap<PackedHandle, (u64, NativeAllocation)>,
     textures: &'a NativeTextureMap,
     pipelines: &'a HashMap<PipelineKey, NativePipeline>,
     resources: &'a HashMap<ResourceId, FrameNativeResource>,
@@ -48,7 +49,7 @@ fn prepare_vulkan_surface(
 // Unsupported shader variants fail without inserting a partial pipeline-cache entry.
 fn prepare_vulkan_pipelines(
     native: &mut ez_gfx_backend_vulkan::NativeContext,
-    shaders: &HashMap<u64, ShaderRecord>,
+    shaders: &HashMap<ShaderHandle, ShaderRecord>,
     pipelines: &mut HashMap<PipelineKey, NativePipeline>,
     payloads: &[ExecutableNode],
 ) -> Result<Vec<Option<PipelineKey>>, EzGfxResult> {
@@ -257,7 +258,7 @@ fn vulkan_actions<'a>(
                     } => {
                         let NativeAllocation::Vulkan(indirect) = &state
                             .allocations
-                            .get(indirect)
+                            .get(&indirect.packed())
                             .ok_or(EzGfxResult::InvalidContext)?
                             .1
                         else {

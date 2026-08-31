@@ -1,6 +1,6 @@
 use super::{
-    ContextState, EzGfxResult, ImageMip, NativeContext, NativeTexture, PackedHandle, ResourceKind,
-    RuntimePhase, TextureDecoder, TextureError, TextureId, TextureSource,
+    ContextHandle, ContextState, EzGfxResult, ImageMip, NativeContext, NativeTexture, ResourceKind,
+    RuntimePhase, TextureDecoder, TextureError, TextureHandle, TextureId, TextureSource,
     completed_transfer_native, destroy_native_texture, generate_mips, map_allocation, map_hal,
     map_lifecycle, map_texture, runtime_record, wait_native_idle, with_context_mut,
 };
@@ -23,12 +23,12 @@ pub struct TextureConfig {
 ///
 /// Returns an error for invalid input, decode failure, exhausted handles, or native texture failure.
 pub fn load_texture(
-    context: u64,
+    context: ContextHandle,
     source: TextureSource,
     bytes: &[u8],
     generate: bool,
     config: &TextureConfig,
-) -> Result<PackedHandle, EzGfxResult> {
+) -> Result<TextureHandle, EzGfxResult> {
     let decoded = TextureDecoder::decode(source, bytes)
         .and_then(|texture| {
             if generate {
@@ -127,8 +127,9 @@ pub fn load_texture(
                 return Err(map_lifecycle(error));
             }
         };
+        let typed = TextureHandle::from_packed(handle).map_err(|_| EzGfxResult::NativeFailure)?;
         context.textures.insert(
-            handle.get(),
+            typed,
             (
                 texture,
                 native,
@@ -137,10 +138,15 @@ pub fn load_texture(
                 decoded.mip_count,
             ),
         );
-        context.texture_ready.insert(handle.get(), ready);
-        let record = runtime_record(context, handle.get(), RuntimePhase::Upload, EzGfxResult::Ok);
+        context.texture_ready.insert(typed, ready);
+        let record = runtime_record(
+            context,
+            typed.into_raw(),
+            RuntimePhase::Upload,
+            EzGfxResult::Ok,
+        );
         context.observability.push_event(record);
-        Ok(handle)
+        Ok(typed)
     })
 }
 
@@ -163,13 +169,13 @@ pub(super) fn rollback_texture_upload(
 /// # Errors
 ///
 /// Returns an error when the context or texture handle is invalid or stale.
-pub fn texture_binding(context: u64, texture: u64) -> Result<u32, EzGfxResult> {
+pub fn texture_binding(context: ContextHandle, texture: TextureHandle) -> Result<u32, EzGfxResult> {
     with_context_mut(context, |context| {
         context
             .identity
             .check_thread_and_health()
             .map_err(map_lifecycle)?;
-        let handle = PackedHandle::from_raw(texture).map_err(|_| EzGfxResult::InvalidContext)?;
+        let handle = texture.packed();
         context
             .identity
             .resolve(handle, ResourceKind::Texture)
@@ -195,13 +201,16 @@ pub fn texture_binding(context: u64, texture: u64) -> Result<u32, EzGfxResult> {
 /// # Errors
 ///
 /// Returns an error when the context or texture handle is invalid or stale.
-pub fn texture_residency(context: u64, texture: u64) -> Result<(u32, u32), EzGfxResult> {
+pub fn texture_residency(
+    context: ContextHandle,
+    texture: TextureHandle,
+) -> Result<(u32, u32), EzGfxResult> {
     with_context_mut(context, |context| {
         context
             .identity
             .check_thread_and_health()
             .map_err(map_lifecycle)?;
-        let handle = PackedHandle::from_raw(texture).map_err(|_| EzGfxResult::InvalidContext)?;
+        let handle = texture.packed();
         context
             .identity
             .resolve(handle, ResourceKind::Texture)
@@ -225,13 +234,10 @@ pub fn texture_residency(context: u64, texture: u64) -> Result<(u32, u32), EzGfx
 }
 
 /// Unloads a texture.
-pub fn unload_texture(context: u64, texture: u64) {
-    if texture == 0 {
-        return;
-    }
+pub fn unload_texture(context: ContextHandle, texture: TextureHandle) {
     let _ = with_context_mut(context, |context| {
         wait_native_idle(&mut context.native).map_err(map_hal)?;
-        let handle = PackedHandle::from_raw(texture).map_err(|_| EzGfxResult::InvalidContext)?;
+        let handle = texture.packed();
         context
             .identity
             .remove(handle, ResourceKind::Texture)

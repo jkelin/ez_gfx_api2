@@ -1,4 +1,6 @@
-use super::math::{Mat4, from_gltf, identity, mul, transform_point};
+use super::math::{from_gltf, row_major};
+use anyhow::Context as _;
+use glam::{Mat4, Vec3};
 
 #[derive(Clone, Debug)]
 pub struct PrimitiveData {
@@ -40,7 +42,7 @@ pub struct MeshData {
 pub fn basic_primitives(
     mesh: &MeshData,
     uploaded_first_index: u32,
-) -> Result<Vec<BasicPrimitive>, String> {
+) -> anyhow::Result<Vec<BasicPrimitive>> {
     mesh.primitives
         .iter()
         .map(|primitive| {
@@ -48,30 +50,30 @@ pub fn basic_primitives(
                 first_index: primitive
                     .first_index
                     .checked_add(uploaded_first_index)
-                    .ok_or_else(|| "primitive index offset exceeds u32".to_owned())?,
+                    .ok_or_else(|| anyhow::anyhow!("primitive index offset exceeds u32"))?,
                 index_count: primitive.index_count,
                 vertex_offset: primitive.vertex_offset,
                 normal_offset: primitive.normal_offset,
-                transform: primitive.transform,
+                transform: row_major(primitive.transform),
             })
         })
         .collect()
 }
 
-pub fn load_geometry_glb(bytes: &[u8]) -> Result<MeshData, String> {
+pub fn load_geometry_glb(bytes: &[u8]) -> anyhow::Result<MeshData> {
     load_glb(bytes, false)
 }
 
-pub fn load_textured_glb(bytes: &[u8]) -> Result<MeshData, String> {
+pub fn load_textured_glb(bytes: &[u8]) -> anyhow::Result<MeshData> {
     load_glb(bytes, true)
 }
 
-fn load_glb(bytes: &[u8], textured: bool) -> Result<MeshData, String> {
-    let gltf = gltf::Gltf::from_slice(bytes).map_err(|error| format!("decode GLB: {error}"))?;
+fn load_glb(bytes: &[u8], textured: bool) -> anyhow::Result<MeshData> {
+    let gltf = gltf::Gltf::from_slice(bytes).context("decode GLB")?;
     let blob = gltf
         .blob
         .as_deref()
-        .ok_or_else(|| "GLB has no embedded binary buffer".to_owned())?;
+        .ok_or_else(|| anyhow::anyhow!("GLB has no embedded binary buffer"))?;
     let (images, image_map) = if textured {
         embedded_images(&gltf, blob)?
     } else {
@@ -94,18 +96,25 @@ fn load_glb(bytes: &[u8], textured: bool) -> Result<MeshData, String> {
         roots.extend(gltf.scenes().flat_map(|scene| scene.nodes()));
     }
     for node in roots {
-        append_node(node, identity(), blob, textured, &image_map, &mut result)?;
+        append_node(
+            node,
+            Mat4::IDENTITY,
+            blob,
+            textured,
+            &image_map,
+            &mut result,
+        )?;
     }
     if result.primitives.is_empty() || result.positions.is_empty() || result.indices.is_empty() {
-        return Err("GLB contains no indexed mesh primitives".to_owned());
+        anyhow::bail!("GLB contains no indexed mesh primitives");
     }
     normalize_scene(&mut result, 3.0)?;
     Ok(result)
 }
 
-fn normalize_scene(mesh: &mut MeshData, target_extent: f32) -> Result<(), String> {
-    let mut minimum = [f32::INFINITY; 3];
-    let mut maximum = [f32::NEG_INFINITY; 3];
+fn normalize_scene(mesh: &mut MeshData, target_extent: f32) -> anyhow::Result<()> {
+    let mut minimum = Vec3::splat(f32::INFINITY);
+    let mut maximum = Vec3::splat(f32::NEG_INFINITY);
 
     for (index, primitive) in mesh.primitives.iter().enumerate() {
         let end = mesh
@@ -113,56 +122,37 @@ fn normalize_scene(mesh: &mut MeshData, target_extent: f32) -> Result<(), String
             .get(index + 1)
             .map_or(mesh.positions.len(), |next| next.vertex_offset as usize);
         for position in &mesh.positions[primitive.vertex_offset as usize..end] {
-            let world =
-                transform_point(primitive.transform, [position[0], position[1], position[2]]);
-            for axis in 0..3 {
-                minimum[axis] = minimum[axis].min(world[axis]);
-                maximum[axis] = maximum[axis].max(world[axis]);
-            }
+            let world = primitive.transform.transform_point3(Vec3::new(
+                position[0],
+                position[1],
+                position[2],
+            ));
+            minimum = minimum.min(world);
+            maximum = maximum.max(world);
         }
     }
 
-    let extent = [
-        maximum[0] - minimum[0],
-        maximum[1] - minimum[1],
-        maximum[2] - minimum[2],
-    ];
-    let largest = extent.into_iter().fold(0.0_f32, f32::max);
+    let extent = maximum - minimum;
+    let largest = extent.max_element();
     // Empty, degenerate, or non-finite bounds cannot produce a stable camera-space scene.
     if !target_extent.is_finite()
         || target_extent <= 0.0
         || !largest.is_finite()
         || largest <= f32::EPSILON
     {
-        return Err("GLB mesh bounds cannot be normalized".to_owned());
+        anyhow::bail!("GLB mesh bounds cannot be normalized");
     }
 
     let scale = target_extent / largest;
-    let center = [
-        (minimum[0] + maximum[0]) * 0.5,
-        (minimum[1] + maximum[1]) * 0.5,
-        (minimum[2] + maximum[2]) * 0.5,
-    ];
-    let normalization = [
-        scale,
-        0.0,
-        0.0,
-        -center[0] * scale,
-        0.0,
-        scale,
-        0.0,
-        -center[1] * scale,
-        0.0,
-        0.0,
-        scale,
-        -center[2] * scale,
-        0.0,
-        0.0,
-        0.0,
-        1.0,
-    ];
+    let center = (minimum + maximum) * 0.5;
+    let normalization = Mat4::from_cols_array_2d(&[
+        [scale, 0.0, 0.0, 0.0],
+        [0.0, scale, 0.0, 0.0],
+        [0.0, 0.0, scale, 0.0],
+        [-center.x * scale, -center.y * scale, -center.z * scale, 1.0],
+    ]);
     for primitive in &mut mesh.primitives {
-        primitive.transform = mul(normalization, primitive.transform);
+        primitive.transform = normalization * primitive.transform;
     }
     Ok(())
 }
@@ -174,8 +164,8 @@ fn append_node(
     textured: bool,
     image_map: &[Option<usize>],
     result: &mut MeshData,
-) -> Result<(), String> {
-    let transform = mul(parent, from_gltf(node.transform().matrix()));
+) -> anyhow::Result<()> {
+    let transform = parent * from_gltf(node.transform().matrix());
     if let Some(mesh) = node.mesh() {
         for primitive in mesh.primitives() {
             append_primitive(primitive, transform, blob, textured, image_map, result)?;
@@ -194,17 +184,17 @@ fn append_primitive(
     textured: bool,
     image_map: &[Option<usize>],
     result: &mut MeshData,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     let reader = primitive.reader(|buffer| match buffer.source() {
         gltf::buffer::Source::Bin => Some(blob),
         gltf::buffer::Source::Uri(_) => None,
     });
     let positions = reader
         .read_positions()
-        .ok_or_else(|| "mesh primitive has no positions".to_owned())?
+        .ok_or_else(|| anyhow::anyhow!("mesh primitive has no positions"))?
         .collect::<Vec<_>>();
     if positions.is_empty() {
-        return Err("mesh primitive has no vertices".to_owned());
+        anyhow::bail!("mesh primitive has no vertices");
     }
     let normals = reader
         .read_normals()
@@ -227,19 +217,17 @@ fn append_primitive(
             .iter()
             .any(|index| *index as usize >= positions.len())
     {
-        return Err("mesh primitive contains invalid indices".to_owned());
+        anyhow::bail!("mesh primitive contains invalid indices");
     }
-    let vertex_offset = u32::try_from(result.positions.len())
-        .map_err(|_| "vertex offset exceeds ABI".to_owned())?;
-    let normal_offset =
-        u32::try_from(result.normals.len()).map_err(|_| "normal offset exceeds ABI".to_owned())?;
+    let vertex_offset =
+        u32::try_from(result.positions.len()).context("vertex offset exceeds ABI")?;
+    let normal_offset = u32::try_from(result.normals.len()).context("normal offset exceeds ABI")?;
     let uv_offset = if textured {
-        u32::try_from(result.uvs.len()).map_err(|_| "UV offset exceeds ABI".to_owned())?
+        u32::try_from(result.uvs.len()).context("UV offset exceeds ABI")?
     } else {
         0
     };
-    let first_index =
-        u32::try_from(result.indices.len()).map_err(|_| "index offset exceeds ABI".to_owned())?;
+    let first_index = u32::try_from(result.indices.len()).context("index offset exceeds ABI")?;
     result.positions.extend(
         positions
             .iter()
@@ -292,26 +280,30 @@ fn append_primitive(
 fn embedded_images(
     gltf: &gltf::Gltf,
     blob: &[u8],
-) -> Result<(Vec<ImageData>, Vec<Option<usize>>), String> {
+) -> anyhow::Result<(Vec<ImageData>, Vec<Option<usize>>)> {
     let mut images = Vec::new();
     let mut map = vec![None; gltf.images().len()];
     for image in gltf.images() {
         let gltf::image::Source::View { view, mime_type } = image.source() else {
-            return Err("external GLB image URIs are unsupported".to_owned());
+            anyhow::bail!("external GLB image URIs are unsupported");
         };
         let mime_type = match mime_type {
             "image/ktx2" => "image/ktx2",
             "image/png" => "image/png",
             "image/jpeg" => "image/jpeg",
-            _ => return Err(format!("unsupported embedded image format `{mime_type}`")),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "unsupported embedded image format `{mime_type}`"
+                ));
+            }
         };
         let end = view
             .offset()
             .checked_add(view.length())
-            .ok_or_else(|| "image range overflow".to_owned())?;
+            .ok_or_else(|| anyhow::anyhow!("image range overflow"))?;
         let bytes = blob
             .get(view.offset()..end)
-            .ok_or_else(|| "embedded image exceeds GLB buffer".to_owned())?;
+            .ok_or_else(|| anyhow::anyhow!("embedded image exceeds GLB buffer"))?;
         map[image.index()] = Some(images.len());
         images.push(ImageData {
             bytes: bytes.to_vec(),
@@ -340,21 +332,21 @@ mod tests {
                 vertex_offset: 11,
                 normal_offset: 13,
                 uv_offset: 17,
-                transform: identity(),
+                transform: Mat4::IDENTITY,
                 image: None,
             }],
             images: Vec::new(),
         };
 
         assert_eq!(
-            basic_primitives(&mesh, 5),
-            Ok(vec![BasicPrimitive {
+            basic_primitives(&mesh, 5).unwrap(),
+            vec![BasicPrimitive {
                 first_index: 12,
                 index_count: 9,
                 vertex_offset: 11,
                 normal_offset: 13,
-                transform: identity(),
-            }])
+                transform: Mat4::IDENTITY,
+            }]
         );
 
         mesh.primitives[0].first_index = u32::MAX;

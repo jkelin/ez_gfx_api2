@@ -1,8 +1,17 @@
 name: package
+
 on:
   workflow_dispatch:
   release:
     types: [published]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  VULKAN_SDK_VERSION: 1.4.341.1
+
 jobs:
   package:
     strategy:
@@ -18,13 +27,136 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.88.0
         with:
           targets: ${{ matrix.target }}
-      - name: Build packages
+      - name: Install pinned Vulkan SDK with Slang
+        uses: jakoch/install-vulkan-sdk-action@37effcfa045411f8bfbbda26df2fd1b3bf3436fa # v1.6.0
+        with:
+          vulkan_version: ${{ env.VULKAN_SDK_VERSION }}
+          cache: true
+      - name: Resolve package version
+        id: version
         shell: bash
-        run: bash scripts/package.sh "${{ matrix.target }}" "${GITHUB_REF_NAME#v}"
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          if [[ -z "$version" ]]; then
+            version="0.1.0"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "invalid package version: $version" >&2
+            exit 1
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+      - name: Build packages with xtask
+        shell: bash
+        run: >-
+          cargo run -p xtask -- package
+          "${{ matrix.target }}"
+          "${{ steps.version.outputs.value }}"
+          dist
+      - name: Smoke packages, manifests, and archives
+        id: package_paths
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          runtime="ez-gfx-runtime-${TARGET}-${VERSION}"
+          compiler="ez-gfx-compiler-${TARGET}-${VERSION}"
+          echo "runtime_dir=dist/${runtime}" >> "$GITHUB_OUTPUT"
+          echo "compiler_dir=dist/${compiler}" >> "$GITHUB_OUTPUT"
+          verify_manifest() {
+            local manifest="$1"
+            if [[ "$TARGET" == *windows* ]]; then
+              while IFS= read -r line; do
+                local expected="${line%%  *}"
+                local file="${line#*  }"
+                local actual
+                actual="$(sha256sum --binary -- "$file")"
+                actual="${actual%% *}"
+                if [[ "$actual" != "$expected" ]]; then
+                  echo "$file: FAILED" >&2
+                  return 1
+                fi
+                echo "$file: OK"
+              done < "$manifest"
+            else
+              sha256sum --check "$manifest"
+            fi
+          }
+          test -d "dist/${runtime}"
+          test -d "dist/${compiler}"
+
+          case "$TARGET" in
+            *windows*)
+              test -f "dist/${runtime}.zip"
+              test -f "dist/${compiler}.zip"
+              unzip -t "dist/${runtime}.zip"
+              unzip -t "dist/${compiler}.zip"
+              executable="ez-gfx-compile.exe"
+              ;;
+            *)
+              test -f "dist/${runtime}.tar.gz"
+              test -f "dist/${compiler}.tar.gz"
+              tar -tzf "dist/${runtime}.tar.gz"
+              tar -tzf "dist/${compiler}.tar.gz"
+              executable="ez-gfx-compile"
+              ;;
+          esac
+
+          (
+            cd "dist/${runtime}"
+            verify_manifest "manifest-${TARGET}-${VERSION}.sha256"
+          )
+          (
+            cd "dist/${compiler}"
+            verify_manifest "manifest-${TARGET}-${VERSION}.sha256"
+          )
+
+          case "$TARGET" in
+            *windows*)
+              PATH="$PWD/dist/${compiler}:$PATH" "dist/${compiler}/${executable}" --help
+              ;;
+            *linux*)
+              LD_LIBRARY_PATH="$PWD/dist/${compiler}:${LD_LIBRARY_PATH:-}" \
+                "dist/${compiler}/${executable}" --help
+              ;;
+            *apple-darwin)
+              DYLD_LIBRARY_PATH="$PWD/dist/${compiler}:${DYLD_LIBRARY_PATH:-}" \
+                "dist/${compiler}/${executable}" --help
+              ;;
+          esac
+      - name: Verify packaged C export parity
+        run: >-
+          cargo run -p xtask -- export-parity
+          "${{ steps.package_paths.outputs.runtime_dir }}"
+      - name: Build packaged C consumer (compile-only)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RUNTIME_DIR: ${{ steps.package_paths.outputs.runtime_dir }}
+          COMPILER_DIR: ${{ steps.package_paths.outputs.compiler_dir }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $runtime = (Resolve-Path $env:RUNTIME_DIR).Path
+          $compiler = (Resolve-Path $env:COMPILER_DIR).Path
+          $build = Join-Path $env:RUNNER_TEMP "ez-gfx-structured-cube-package"
+          $artifact = Join-Path $build "structured_cube.ezgfxshader"
+          cmake -S examples/c/structured_cube -B $build `
+            "-DEZ_GFX_INCLUDE_DIR=$runtime" `
+            "-DEZ_GFX_FFI_LIBRARY=$(Join-Path $runtime 'ez_gfx_ffi.dll.lib')" `
+            "-DEZ_GFX_FFI_DLL=$(Join-Path $runtime 'ez_gfx_ffi.dll')" `
+            "-DEZ_GFX_COMPILER=$(Join-Path $compiler 'ez-gfx-compile.exe')" `
+            "-DEZ_GFX_SHADER_ARTIFACT=$artifact"
+          cmake --build $build --config Release
       - uses: actions/upload-artifact@v4
         with:
           name: ez-gfx-${{ matrix.target }}
-          path: dist/*
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error

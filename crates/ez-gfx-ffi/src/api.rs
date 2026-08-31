@@ -103,21 +103,6 @@ pub struct EzGfxShaderDesc {
 }
 #[derive(Clone, Copy)]
 #[repr(C)]
-#[allow(
-    clippy::pub_underscore_fields,
-    reason = "Named public padding preserves ABI layout and zero-initialization for callers."
-)]
-/// Associates a shader entry-point name with a stage code.
-pub struct EzGfxShaderEntry {
-    /// Points to the NUL-terminated shader entry-point name.
-    pub entry: *const c_char,
-    /// Identifies the shader stage by its C ABI numeric code.
-    pub stage: u8,
-    /// Reserves bytes that keep the C ABI layout stable.
-    pub _padding: [u8; 7],
-}
-#[derive(Clone, Copy)]
-#[repr(C)]
 /// Describes texture dimensions, formats, mipmapping, sampling, and labeling.
 pub struct EzGfxTextureDesc {
     /// Identifies the source texel format by its C ABI numeric code.
@@ -256,4 +241,19 @@ pub struct EzGfxDiagnostic {
     pub level: u8,
     /// Reserves bytes that keep the C ABI layout stable.
     pub _padding: [u8; 7],
+}
+#[cfg(test)]
+mod tests {
+    use crate::{EzGfxResult, sampler_address_from_abi};
+    use ez_gfx::SamplerAddressMode;
+
+    #[test]
+    fn texture_address_discriminants_match_the_public_abi() {
+        assert_eq!(sampler_address_from_abi(0), Ok(SamplerAddressMode::Repeat));
+        assert_eq!(sampler_address_from_abi(1), Ok(SamplerAddressMode::Clamp));
+        assert_eq!(
+            sampler_address_from_abi(2),
+            Err(EzGfxResult::InvalidArgument)
+        );
+    }
 }

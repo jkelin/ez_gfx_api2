@@ -6,11 +6,10 @@ use std::ffi::CString;
 use ez_gfx_artifact::{Stage, Target};
 use ez_gfx_compiler::{CompilationRequest, CompilerConfig, CompilerError, TargetRequest};
 use ez_gfx_ffi::{
-    EzGfxBackendContextDesc, EzGfxBinding, EzGfxResult, EzGfxShaderEntry,
-    ez_gfx_context_create_backend, ez_gfx_context_destroy, ez_gfx_context_wait_idle,
-    ez_gfx_frame_begin, ez_gfx_frame_submit, ez_gfx_render_add_compute_pipeline,
-    ez_gfx_shader_destroy, ez_gfx_shader_load_artifact, ez_gfx_structured_acquire,
-    ez_gfx_structured_release, ez_gfx_structured_write,
+    EzGfxBackendContextDesc, EzGfxBinding, EzGfxResult, ez_gfx_context_create_backend,
+    ez_gfx_context_destroy, ez_gfx_context_wait_idle, ez_gfx_frame_begin, ez_gfx_frame_submit,
+    ez_gfx_render_add_compute_pipeline, ez_gfx_shader_destroy, ez_gfx_shader_load_artifact,
+    ez_gfx_structured_acquire, ez_gfx_structured_release, ez_gfx_structured_write,
 };
 #[cfg(windows)]
 #[test]
@@ -35,7 +34,6 @@ fn run_compute_pipeline(backend: u8) {
 struct StructuredBufferAttribute { string name; };
 
 [StructuredBuffer("values")]
-[[vk::binding(0, 0)]]
 RWStructuredBuffer<uint> values;
 
 [shader("compute")]
@@ -77,12 +75,6 @@ void main(uint3 id: SV_DispatchThreadID) { values[id.x] += 1; }
         EzGfxResult::Ok
     );
 
-    let entry_name = CString::new("main").unwrap();
-    let entry = EzGfxShaderEntry {
-        entry: entry_name.as_ptr(),
-        stage: 3,
-        _padding: [0; 7],
-    };
     let mut shader = 0;
     assert_eq!(
         {
@@ -91,8 +83,6 @@ void main(uint3 id: SV_DispatchThreadID) { values[id.x] += 1; }
                 ez_gfx_shader_load_artifact(
                     artifact.as_ptr(),
                     artifact.len(),
-                    &raw const entry,
-                    1,
                     &raw mut shader,
                     context,
                 )

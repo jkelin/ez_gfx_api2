@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
@@ -21,18 +22,18 @@ pub struct HostSurface {
 }
 
 impl HostSurface {
-    pub fn attach(window: &Window, width: u32, height: u32) -> Result<Self, String> {
+    pub fn attach(window: &Window, width: u32, height: u32) -> anyhow::Result<Self> {
         #[cfg(not(target_vendor = "apple"))]
         let _ = (width, height);
         let raw = window
             .window_handle()
-            .map_err(|error| format!("get native window handle: {error}"))?
+            .context("get native window handle")?
             .as_raw();
         #[cfg(windows)]
         if let RawWindowHandle::Win32(handle) = raw {
             let display = handle
                 .hinstance
-                .ok_or_else(|| "Win32 handle omitted its module instance".to_owned())?;
+                .ok_or_else(|| anyhow::anyhow!("Win32 handle omitted its module instance"))?;
             return Ok(Self {
                 descriptor: NativeSurface {
                     window: handle.hwnd.get() as usize,
@@ -66,7 +67,9 @@ impl HostSurface {
                 metal_layer: layer,
             });
         }
-        Err("unsupported native window handle for example host".to_owned())
+        Err(anyhow::anyhow!(
+            "unsupported native window handle for example host"
+        ))
     }
 
     pub const fn descriptor(&self) -> NativeSurface {

@@ -1,6 +1,17 @@
 use super::*;
 use std::collections::HashSet;
 
+fn shader() -> ShaderHandle {
+    ShaderHandle::from_packed(
+        PackedHandle::child(
+            LocalHandle::new(1, 1).unwrap(),
+            LocalHandle::new(7, 1).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
 #[test]
 fn pipeline_layout_keys_ignore_reflection_order() {
     let first = ez_gfx_hal::ShaderBufferLayout::new(0, 3, 1, false).unwrap();
@@ -17,7 +28,7 @@ fn graphics_pipeline_keys_include_state_attachment_and_texture_interface() {
     let state = DynamicPipelineState::from_abi(2, 0, 0, 0).unwrap();
     let key = PipelineKey::Graphics {
         backend: Backend::Vulkan,
-        shader: 7,
+        shader: shader(),
         shader_digest: [1; 32],
         vertex_product: 0,
         vertex_entry: "vertexmain".to_owned(),

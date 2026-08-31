@@ -1,7 +1,8 @@
 use super::{
-    AllocationRequest, ContextState, DrawIndexedCommand, EzGfxResult, IndexedIndirectBuffer,
-    MemoryClass, PackedHandle, ResourceKind, allocate_native, free_native_allocation,
-    map_allocation, map_lifecycle, result_status, stage_upload, with_context_mut,
+    AllocationRequest, ContextHandle, ContextState, DrawIndexedCommand, EzGfxResult,
+    IndexedIndirectBuffer, IndirectBufferHandle, MemoryClass, ResourceKind, StructuredBufferHandle,
+    allocate_native, free_native_allocation, map_allocation, map_lifecycle, result_status,
+    stage_upload, with_context_mut,
 };
 
 /// Allocates a structured upload buffer.
@@ -9,7 +10,10 @@ use super::{
 /// # Errors
 ///
 /// Returns an error for an invalid context, zero or excessive size, or native allocation failure.
-pub fn acquire_structured(context: u64, size: u64) -> Result<PackedHandle, EzGfxResult> {
+pub fn acquire_structured(
+    context: ContextHandle,
+    size: u64,
+) -> Result<StructuredBufferHandle, EzGfxResult> {
     with_context_mut(context, |context| {
         context
             .identity
@@ -25,8 +29,8 @@ pub fn acquire_structured(context: u64, size: u64) -> Result<PackedHandle, EzGfx
                 return Err(map_lifecycle(error));
             }
         };
-        context.allocations.insert(handle.get(), (size, allocation));
-        Ok(handle)
+        context.allocations.insert(handle, (size, allocation));
+        StructuredBufferHandle::from_packed(handle).map_err(|_| EzGfxResult::NativeFailure)
     })
 }
 
@@ -35,7 +39,10 @@ pub fn acquire_structured(context: u64, size: u64) -> Result<PackedHandle, EzGfx
 /// # Errors
 ///
 /// Returns an error for an invalid context or capacity, exhausted handles, or native allocation failure.
-pub fn acquire_indirect(context: u64, capacity: u32) -> Result<PackedHandle, EzGfxResult> {
+pub fn acquire_indirect(
+    context: ContextHandle,
+    capacity: u32,
+) -> Result<IndirectBufferHandle, EzGfxResult> {
     with_context_mut(context, |context| {
         context
             .identity
@@ -56,21 +63,23 @@ pub fn acquire_indirect(context: u64, capacity: u32) -> Result<PackedHandle, EzG
                 return Err(map_lifecycle(error));
             }
         };
-        context.allocations.insert(handle.get(), (size, allocation));
-        context.indirects.insert(handle.get(), buffer);
-        Ok(handle)
+        context.allocations.insert(handle, (size, allocation));
+        let typed =
+            IndirectBufferHandle::from_packed(handle).map_err(|_| EzGfxResult::NativeFailure)?;
+        context.indirects.insert(typed, buffer);
+        Ok(typed)
     })
 }
 
 /// Writes one indexed draw command.
 pub fn write_indirect(
-    context: u64,
-    indirect: u64,
+    context: ContextHandle,
+    indirect: IndirectBufferHandle,
     index: u32,
     command: DrawIndexedCommand,
 ) -> EzGfxResult {
     result_status(with_context_mut(context, |context| {
-        let handle = PackedHandle::from_raw(indirect).map_err(|_| EzGfxResult::InvalidContext)?;
+        let handle = indirect.packed();
         context
             .identity
             .resolve(handle, ResourceKind::Indirect)
@@ -89,7 +98,7 @@ pub fn write_indirect(
         bytes.extend_from_slice(&command.first_instance.to_le_bytes());
         let (_, allocation) = context
             .allocations
-            .get(&indirect)
+            .get(&handle)
             .ok_or(EzGfxResult::InvalidContext)?;
         stage_upload(
             &mut context.native,
@@ -104,9 +113,13 @@ pub fn write_indirect(
 }
 
 /// Publishes the active indirect draw count.
-pub fn set_indirect_count(context: u64, indirect: u64, count: u32) -> EzGfxResult {
+pub fn set_indirect_count(
+    context: ContextHandle,
+    indirect: IndirectBufferHandle,
+    count: u32,
+) -> EzGfxResult {
     result_status(with_context_mut(context, |context| {
-        let handle = PackedHandle::from_raw(indirect).map_err(|_| EzGfxResult::InvalidContext)?;
+        let handle = indirect.packed();
         context
             .identity
             .resolve(handle, ResourceKind::Indirect)
@@ -121,12 +134,9 @@ pub fn set_indirect_count(context: u64, indirect: u64, count: u32) -> EzGfxResul
 }
 
 /// Releases an indirect draw buffer.
-pub fn release_indirect(context: u64, indirect: u64) {
-    if indirect == 0 {
-        return;
-    }
+pub fn release_indirect(context: ContextHandle, indirect: IndirectBufferHandle) {
     let _ = with_context_mut(context, |context| {
-        let handle = PackedHandle::from_raw(indirect).map_err(|_| EzGfxResult::InvalidContext)?;
+        let handle = indirect.packed();
         context
             .identity
             .remove(handle, ResourceKind::Indirect)
@@ -137,19 +147,23 @@ pub fn release_indirect(context: u64, indirect: u64) {
             .ok_or(EzGfxResult::InvalidContext)?;
         let (_, allocation) = context
             .allocations
-            .remove(&indirect)
+            .remove(&handle)
             .ok_or(EzGfxResult::InvalidContext)?;
         free_native_allocation(&mut context.native, allocation).map_err(map_allocation)
     });
 }
 /// Uploads bytes to a structured buffer.
-pub fn write_structured(context: u64, structured: u64, bytes: &[u8]) -> EzGfxResult {
+pub fn write_structured(
+    context: ContextHandle,
+    structured: StructuredBufferHandle,
+    bytes: &[u8],
+) -> EzGfxResult {
     result_status(with_context_mut(context, |context| {
         context
             .identity
             .check_thread_and_health()
             .map_err(map_lifecycle)?;
-        let handle = PackedHandle::from_raw(structured).map_err(|_| EzGfxResult::InvalidContext)?;
+        let handle = structured.packed();
         context
             .identity
             .resolve(handle, ResourceKind::Structured)
@@ -161,7 +175,7 @@ pub fn write_structured(context: u64, structured: u64, bytes: &[u8]) -> EzGfxRes
             ..
         } = context;
         let (capacity, allocation) = allocations
-            .get(&structured)
+            .get(&handle)
             .ok_or(EzGfxResult::InvalidContext)?;
         if bytes.len() as u64 > *capacity {
             return Err(EzGfxResult::InvalidArgument);
@@ -173,19 +187,16 @@ pub fn write_structured(context: u64, structured: u64, bytes: &[u8]) -> EzGfxRes
 }
 
 /// Releases a structured buffer.
-pub fn release_structured(context: u64, structured: u64) {
-    if structured == 0 {
-        return;
-    }
+pub fn release_structured(context: ContextHandle, structured: StructuredBufferHandle) {
     let _ = with_context_mut(context, |context| {
-        let handle = PackedHandle::from_raw(structured).map_err(|_| EzGfxResult::InvalidContext)?;
+        let handle = structured.packed();
         context
             .identity
             .remove(handle, ResourceKind::Structured)
             .map_err(map_lifecycle)?;
         let (_, allocation) = context
             .allocations
-            .remove(&structured)
+            .remove(&handle)
             .ok_or(EzGfxResult::InvalidContext)?;
         free_native_allocation(&mut context.native, allocation).map_err(map_allocation)
     });

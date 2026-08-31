@@ -39,7 +39,7 @@ fn context_handle_and_child_layout_match_existing_packing() {
     let mut identity = ContextIdentity::new(LocalHandle::new(1, 2).unwrap()).unwrap();
     let child = identity.insert(ResourceKind::Texture).unwrap();
 
-    assert_eq!(identity.context_handle().get(), 2 | (2 << 20));
+    assert_eq!(identity.context_handle().into_raw(), 2 | (2 << 20));
     assert!(matches!(
         PackedHandle::from_raw(child.get())
             .unwrap()

@@ -5,16 +5,15 @@ use std::{ffi::CString, path::Path};
 
 use ez_gfx_artifact::{Artifact, Provenance, Stage, Target, TargetVariant};
 use ez_gfx_ffi::{
-    EzGfxBackendContextDesc, EzGfxDrawIndexedCommand, EzGfxResult, EzGfxShaderEntry,
-    EzGfxSurfaceDesc, EzGfxTextureDesc, ez_gfx_acquire_indirect, ez_gfx_begin_render,
-    ez_gfx_context_create_backend, ez_gfx_context_destroy, ez_gfx_context_init_device,
-    ez_gfx_context_wait_idle, ez_gfx_finish_render, ez_gfx_frame_begin, ez_gfx_frame_readback,
-    ez_gfx_frame_submit, ez_gfx_graph_enqueue_texture_readback, ez_gfx_index_heap_create,
-    ez_gfx_index_heap_destroy, ez_gfx_indirect_release, ez_gfx_indirect_set_draw_count,
-    ez_gfx_indirect_write_draw, ez_gfx_render_add_compute_pipeline,
-    ez_gfx_render_add_vertex_pipeline, ez_gfx_shader_destroy, ez_gfx_shader_load_artifact,
-    ez_gfx_surface_create, ez_gfx_surface_destroy, ez_gfx_texture_load, ez_gfx_texture_unload,
-    ez_gfx_vertex_upload_indices,
+    EzGfxBackendContextDesc, EzGfxDrawIndexedCommand, EzGfxResult, EzGfxSurfaceDesc,
+    EzGfxTextureDesc, ez_gfx_acquire_indirect, ez_gfx_begin_render, ez_gfx_context_create_backend,
+    ez_gfx_context_destroy, ez_gfx_context_init_device, ez_gfx_context_wait_idle,
+    ez_gfx_finish_render, ez_gfx_frame_begin, ez_gfx_frame_readback, ez_gfx_frame_submit,
+    ez_gfx_graph_enqueue_texture_readback, ez_gfx_index_heap_create, ez_gfx_index_heap_destroy,
+    ez_gfx_indirect_release, ez_gfx_indirect_set_draw_count, ez_gfx_indirect_write_draw,
+    ez_gfx_render_add_compute_pipeline, ez_gfx_render_add_vertex_pipeline, ez_gfx_shader_destroy,
+    ez_gfx_shader_load_artifact, ez_gfx_surface_create, ez_gfx_surface_destroy,
+    ez_gfx_texture_load, ez_gfx_texture_unload, ez_gfx_vertex_upload_indices,
 };
 use objc2::rc::Retained;
 use objc2_core_foundation::CGSize;
@@ -129,12 +128,6 @@ fn metal_compute_submits_without_a_surface() {
         surface_platform: 2,
         backend: 3,
     };
-    let entry_name = CString::new("computemain").unwrap();
-    let entry = EzGfxShaderEntry {
-        entry: entry_name.as_ptr(),
-        stage: 3,
-        _padding: [0; 7],
-    };
     let mut context = 0;
     let mut shader = 0;
 
@@ -149,14 +142,7 @@ fn metal_compute_submits_without_a_surface() {
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_shader_load_artifact(
-                    artifact.as_ptr(),
-                    artifact.len(),
-                    &entry,
-                    1,
-                    &mut shader,
-                    context,
-                )
+                ez_gfx_shader_load_artifact(artifact.as_ptr(), artifact.len(), &mut shader, context)
             }
         },
         EzGfxResult::Ok
@@ -232,39 +218,12 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
         EzGfxResult::Ok
     );
 
-    let vertex = CString::new("vertexmain").unwrap();
-    let fragment = CString::new("fragmentmain").unwrap();
-    let compute = CString::new("computemain").unwrap();
-    let entries = [
-        EzGfxShaderEntry {
-            entry: vertex.as_ptr(),
-            stage: 1,
-            _padding: [0; 7],
-        },
-        EzGfxShaderEntry {
-            entry: fragment.as_ptr(),
-            stage: 2,
-            _padding: [0; 7],
-        },
-        EzGfxShaderEntry {
-            entry: compute.as_ptr(),
-            stage: 3,
-            _padding: [0; 7],
-        },
-    ];
     let mut shader = 0;
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_shader_load_artifact(
-                    artifact.as_ptr(),
-                    artifact.len(),
-                    entries.as_ptr(),
-                    entries.len(),
-                    &mut shader,
-                    context,
-                )
+                ez_gfx_shader_load_artifact(artifact.as_ptr(), artifact.len(), &mut shader, context)
             }
         },
         EzGfxResult::Ok

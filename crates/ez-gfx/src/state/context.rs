@@ -1,14 +1,14 @@
 use super::{
-    AllocationRequest, Backend, CONTEXTS, CompletionToken, ContextIdentity, ContextOptions,
-    ContextState, DiagnosticLevel, Dx12Context, Dx12Surface, EzGfxResult, FrameRecorder,
-    GeometryAllocation, GeometryManager, HalError, HashMap, MemoryClass, NativeAllocation,
-    NativeContext, NativeSurface, Observability, PackedHandle, ResourceKind, RuntimePhase,
-    RuntimeRecord, RuntimeStatus, StagingAllocation, SurfaceOptions, SurfacePlatform,
-    SurfaceRecord, SurfaceState, TextureRegistry, VulkanContext, VulkanPlatform, allocate_native,
-    completed_transfer_native, context_local, copy_native, destroy_native_pipeline,
-    destroy_native_shader, destroy_native_texture, free_native_allocation, map_allocation,
-    map_frame, map_geometry, map_hal, map_lifecycle, map_native_loss, result_status,
-    wait_native_idle, with_context_mut, with_surface_mut, write_native,
+    AllocationRequest, Backend, CONTEXTS, CompletionToken, ContextHandle, ContextIdentity,
+    ContextOptions, ContextState, DiagnosticLevel, Dx12Context, Dx12Surface, EzGfxResult,
+    FrameRecorder, GeometryAllocation, GeometryManager, HalError, HashMap, MemoryClass,
+    NativeAllocation, NativeContext, NativeSurface, Observability, ResourceKind, RuntimePhase,
+    RuntimeRecord, RuntimeStatus, StagingAllocation, SurfaceHandle, SurfaceOptions,
+    SurfacePlatform, SurfaceRecord, SurfaceState, TextureRegistry, VulkanContext, VulkanPlatform,
+    allocate_native, completed_transfer_native, context_local, copy_native,
+    destroy_native_pipeline, destroy_native_shader, destroy_native_texture, free_native_allocation,
+    map_allocation, map_frame, map_geometry, map_hal, map_lifecycle, map_native_loss,
+    result_status, wait_native_idle, with_context_mut, with_surface_mut, write_native,
 };
 
 /// Creates a graphics context.
@@ -16,7 +16,7 @@ use super::{
 /// # Errors
 ///
 /// Returns an error when the backend/platform pair is unsupported or native context creation fails.
-pub fn create_context(options: ContextOptions) -> Result<PackedHandle, EzGfxResult> {
+pub fn create_context(options: ContextOptions) -> Result<ContextHandle, EzGfxResult> {
     let native = match options.backend {
         Backend::Vulkan if options.surface_platform == SurfacePlatform::Win32 => {
             NativeContext::Vulkan(Box::new(
@@ -138,7 +138,9 @@ type DiagnosticPoll = (Option<(DiagnosticLevel, RuntimeRecord)>, u64);
 /// # Errors
 ///
 /// Returns an error when the context handle is invalid or stale.
-pub fn poll_runtime_event(context: u64) -> Result<(Option<RuntimeRecord>, u64), EzGfxResult> {
+pub fn poll_runtime_event(
+    context: ContextHandle,
+) -> Result<(Option<RuntimeRecord>, u64), EzGfxResult> {
     with_context_mut(context, |context| Ok(context.observability.poll_event()))
 }
 
@@ -147,14 +149,14 @@ pub fn poll_runtime_event(context: u64) -> Result<(Option<RuntimeRecord>, u64), 
 /// # Errors
 ///
 /// Returns an error when the context handle is invalid or stale.
-pub fn poll_diagnostic(context: u64) -> Result<DiagnosticPoll, EzGfxResult> {
+pub fn poll_diagnostic(context: ContextHandle) -> Result<DiagnosticPoll, EzGfxResult> {
     with_context_mut(context, |context| {
         Ok(context.observability.poll_diagnostic())
     })
 }
 
 /// Waits for all context work to finish.
-pub fn wait_idle(context: u64) -> EzGfxResult {
+pub fn wait_idle(context: ContextHandle) -> EzGfxResult {
     result_status(with_context_mut(context, |context| {
         context
             .identity
@@ -172,10 +174,7 @@ pub fn wait_idle(context: u64) -> EzGfxResult {
 }
 
 /// Destroys a graphics context and its resources.
-pub fn destroy_context(context: u64) {
-    if context == 0 {
-        return;
-    }
+pub fn destroy_context(context: ContextHandle) {
     let Ok((local, _)) = context_local(context) else {
         return;
     };
@@ -229,7 +228,10 @@ pub fn destroy_context(context: u64) {
 /// # Errors
 ///
 /// Returns an error for an invalid context or surface options, exhausted handles, or native surface failure.
-pub fn create_surface(context: u64, options: SurfaceOptions) -> Result<PackedHandle, EzGfxResult> {
+pub fn create_surface(
+    context: ContextHandle,
+    options: SurfaceOptions,
+) -> Result<SurfaceHandle, EzGfxResult> {
     with_context_mut(context, |context| {
         context
             .identity
@@ -267,21 +269,22 @@ pub fn create_surface(context: u64, options: SurfaceOptions) -> Result<PackedHan
             options.cache_presented_snapshots,
         )
         .map_err(|_| EzGfxResult::InvalidArgument)?;
+        let handle = SurfaceHandle::from_packed(handle).map_err(|_| EzGfxResult::NativeFailure)?;
         context
             .surfaces
-            .insert(handle.get(), SurfaceRecord { native, state });
+            .insert(handle, SurfaceRecord { native, state });
         Ok(handle)
     })
 }
 
 /// Initializes a context device for a surface.
-pub fn init_device(context: u64, surface: u64) -> EzGfxResult {
+pub fn init_device(context: ContextHandle, surface: SurfaceHandle) -> EzGfxResult {
     result_status(with_context_mut(context, |context| {
         context
             .identity
             .check_thread_and_health()
             .map_err(map_lifecycle)?;
-        let handle = PackedHandle::from_raw(surface).map_err(|_| EzGfxResult::InvalidContext)?;
+        let handle = surface.packed();
         context
             .identity
             .resolve(handle, ResourceKind::Surface)
@@ -323,7 +326,12 @@ pub fn init_device(context: u64, surface: u64) -> EzGfxResult {
 }
 
 /// Requests a surface resize.
-pub fn resize_surface(context: u64, surface: u64, width: u32, height: u32) -> EzGfxResult {
+pub fn resize_surface(
+    context: ContextHandle,
+    surface: SurfaceHandle,
+    width: u32,
+    height: u32,
+) -> EzGfxResult {
     result_status(with_surface_mut(context, surface, |record| {
         record
             .state
@@ -339,7 +347,10 @@ pub fn resize_surface(context: u64, surface: u64, width: u32, height: u32) -> Ez
 /// # Errors
 ///
 /// Returns an error when either handle is invalid or the extent is not ready.
-pub fn surface_extent(context: u64, surface: u64) -> Result<(u32, u32), EzGfxResult> {
+pub fn surface_extent(
+    context: ContextHandle,
+    surface: SurfaceHandle,
+) -> Result<(u32, u32), EzGfxResult> {
     with_surface_mut(context, surface, |record| {
         record.state.extent().ok_or(EzGfxResult::NotReady)
     })
@@ -349,11 +360,18 @@ pub fn surface_extent(context: u64, surface: u64) -> Result<(u32, u32), EzGfxRes
 /// # Errors
 ///
 /// Returns an error when either handle is invalid or stale.
-pub fn surface_resize_pending(context: u64, surface: u64) -> Result<bool, EzGfxResult> {
+pub fn surface_resize_pending(
+    context: ContextHandle,
+    surface: SurfaceHandle,
+) -> Result<bool, EzGfxResult> {
     with_surface_mut(context, surface, |record| Ok(record.state.resize_pending()))
 }
 /// Enables or disables presented snapshot caching.
-pub fn set_snapshot_cache(context: u64, surface: u64, enabled: bool) -> EzGfxResult {
+pub fn set_snapshot_cache(
+    context: ContextHandle,
+    surface: SurfaceHandle,
+    enabled: bool,
+) -> EzGfxResult {
     result_status(with_surface_mut(context, surface, |record| {
         record.state.set_snapshot_cache(enabled);
         Ok(())
@@ -361,12 +379,9 @@ pub fn set_snapshot_cache(context: u64, surface: u64, enabled: bool) -> EzGfxRes
 }
 
 /// Destroys a presentation surface.
-pub fn destroy_surface(context: u64, surface: u64) {
-    if surface == 0 {
-        return;
-    }
+pub fn destroy_surface(context: ContextHandle, surface: SurfaceHandle) {
     let _ = with_context_mut(context, |context| {
-        let handle = PackedHandle::from_raw(surface).map_err(|_| EzGfxResult::InvalidContext)?;
+        let handle = surface.packed();
         context
             .identity
             .remove(handle, ResourceKind::Surface)
@@ -383,13 +398,13 @@ pub fn destroy_surface(context: u64, surface: u64) {
     });
 }
 /// Begins rendering to a surface.
-pub fn begin_render(context: u64, surface: u64) -> EzGfxResult {
+pub fn begin_render(context: ContextHandle, surface: SurfaceHandle) -> EzGfxResult {
     result_status(with_context_mut(context, |context| {
         context
             .identity
             .check_thread_and_health()
             .map_err(map_lifecycle)?;
-        let handle = PackedHandle::from_raw(surface).map_err(|_| EzGfxResult::InvalidContext)?;
+        let handle = surface.packed();
         context
             .identity
             .resolve(handle, ResourceKind::Surface)
@@ -415,7 +430,7 @@ pub fn begin_render(context: u64, surface: u64) -> EzGfxResult {
 }
 
 /// Presents the recorded frame.
-pub fn present(context: u64) -> EzGfxResult {
+pub fn present(context: ContextHandle) -> EzGfxResult {
     result_status(with_context_mut(context, |context| {
         if context.frame_presented {
             context.frame_presented = false;
@@ -466,7 +481,12 @@ pub(super) fn destroy_native_surface(context: &mut NativeContext, surface: Nativ
 }
 
 /// Creates a named vertex heap.
-pub fn create_vertex_heap(context: u64, name: &str, capacity: u64, stride: u64) -> EzGfxResult {
+pub fn create_vertex_heap(
+    context: ContextHandle,
+    name: &str,
+    capacity: u64,
+    stride: u64,
+) -> EzGfxResult {
     result_status(with_context_mut(context, |context| {
         context
             .geometry
@@ -495,7 +515,7 @@ pub fn create_vertex_heap(context: u64, name: &str, capacity: u64, stride: u64) 
 }
 
 /// Destroys a named vertex heap.
-pub fn destroy_vertex_heap(context: u64, name: &str) {
+pub fn destroy_vertex_heap(context: ContextHandle, name: &str) {
     let _ = with_context_mut(context, |context| {
         context
             .geometry
@@ -510,7 +530,7 @@ pub fn destroy_vertex_heap(context: u64, name: &str) {
 }
 
 /// Creates the context index heap.
-pub fn create_index_heap(context: u64, capacity: u64) -> EzGfxResult {
+pub fn create_index_heap(context: ContextHandle, capacity: u64) -> EzGfxResult {
     result_status(with_context_mut(context, |context| {
         context
             .geometry
@@ -536,7 +556,7 @@ pub fn create_index_heap(context: u64, capacity: u64) -> EzGfxResult {
 }
 
 /// Destroys the context index heap.
-pub fn destroy_index_heap(context: u64) {
+pub fn destroy_index_heap(context: ContextHandle) {
     let _ = with_context_mut(context, |context| {
         context.geometry.remove_index_heap().map_err(map_geometry)?;
         let heap = context
@@ -553,7 +573,7 @@ pub fn destroy_index_heap(context: u64) {
 ///
 /// Returns an error for invalid handles, sizes, ranges, capacity, or native upload failure.
 pub fn upload_vertices(
-    context: u64,
+    context: ContextHandle,
     name: &str,
     count: u32,
     element_size: u64,
@@ -603,7 +623,11 @@ pub fn upload_vertices(
 /// # Errors
 ///
 /// Returns an error for invalid handles, sizes, ranges, capacity, or native upload failure.
-pub fn upload_indices(context: u64, count: u32, bytes: &[u8]) -> Result<u32, EzGfxResult> {
+pub fn upload_indices(
+    context: ContextHandle,
+    count: u32,
+    bytes: &[u8],
+) -> Result<u32, EzGfxResult> {
     with_context_mut(context, |context| {
         let upload = context
             .geometry

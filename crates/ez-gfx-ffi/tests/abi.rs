@@ -1,20 +1,25 @@
 //! ABI layout, validation, lifecycle, and observability contract tests.
 
-use core::mem::{align_of, size_of};
+use core::{
+    ffi::{c_char, c_void},
+    mem::{align_of, offset_of, size_of},
+};
+use ez_gfx_ffi as ffi;
 #[allow(
     unused_imports,
     reason = "platform-specific tests consume different ABI symbols"
 )]
 use ez_gfx_ffi::{
-    EZ_GFX_ABI_VERSION, EzGfxBackendContextDesc, EzGfxContextDesc, EzGfxDiagnostic,
-    EzGfxDrawIndexedCommand, EzGfxDynamicState, EzGfxHandleParts, EzGfxResult, EzGfxRuntimeRecord,
-    EzGfxSurfaceDesc, EzGfxTextureDesc, ez_gfx_abi_version, ez_gfx_acquire_indirect,
-    ez_gfx_context_create, ez_gfx_context_create_backend, ez_gfx_context_destroy,
-    ez_gfx_context_wait_idle, ez_gfx_finish_render, ez_gfx_frame_begin, ez_gfx_frame_readback,
-    ez_gfx_frame_submit, ez_gfx_graph_enqueue_texture_readback, ez_gfx_handle_inspect,
-    ez_gfx_index_heap_create, ez_gfx_index_heap_destroy, ez_gfx_indirect_release,
-    ez_gfx_indirect_set_draw_count, ez_gfx_indirect_write_draw, ez_gfx_poll_diagnostic,
-    ez_gfx_poll_runtime_event, ez_gfx_semantic_id, ez_gfx_structured_acquire,
+    EZ_GFX_ABI_VERSION, EzGfxBackendContextDesc, EzGfxBinding, EzGfxByteBuffer, EzGfxContextDesc,
+    EzGfxDiagnostic, EzGfxDrawIndexedCommand, EzGfxDynamicState, EzGfxHandleParts, EzGfxResult,
+    EzGfxRuntimeRecord, EzGfxShaderDesc, EzGfxSurfaceDesc, EzGfxTextureDesc, EzGfxTextureError,
+    ez_gfx_abi_version, ez_gfx_acquire_indirect, ez_gfx_context_create,
+    ez_gfx_context_create_backend, ez_gfx_context_destroy, ez_gfx_context_wait_idle,
+    ez_gfx_finish_render, ez_gfx_frame_begin, ez_gfx_frame_readback, ez_gfx_frame_submit,
+    ez_gfx_graph_enqueue_texture_readback, ez_gfx_handle_inspect, ez_gfx_index_heap_create,
+    ez_gfx_index_heap_destroy, ez_gfx_indirect_release, ez_gfx_indirect_set_draw_count,
+    ez_gfx_indirect_write_draw, ez_gfx_poll_diagnostic, ez_gfx_poll_runtime_event,
+    ez_gfx_semantic_id, ez_gfx_shader_load_artifact, ez_gfx_structured_acquire,
     ez_gfx_structured_release, ez_gfx_structured_write, ez_gfx_texture_get_binding,
     ez_gfx_texture_get_residency, ez_gfx_texture_load, ez_gfx_texture_unload,
     ez_gfx_vertex_heap_create, ez_gfx_vertex_heap_destroy, ez_gfx_vertex_upload,
@@ -22,7 +27,7 @@ use ez_gfx_ffi::{
 };
 
 #[test]
-fn layouts_and_status_values_are_stable() {
+fn status_values_and_abi_version_are_stable() {
     assert_eq!(ez_gfx_abi_version(), EZ_GFX_ABI_VERSION);
     assert_eq!(EzGfxResult::Ok as u8, 0);
     assert_eq!(EzGfxResult::InvalidArgument as u8, 1);
@@ -30,17 +35,337 @@ fn layouts_and_status_values_are_stable() {
     assert_eq!(EzGfxResult::NativeFailure as u8, 3);
     assert_eq!(EzGfxResult::NotReady as u8, 4);
     assert_eq!(EzGfxResult::Unsupported as u8, 5);
-    assert_eq!(EZ_GFX_ABI_VERSION, 17);
-    assert_eq!(size_of::<EzGfxContextDesc>(), 3);
-    assert_eq!(size_of::<EzGfxBackendContextDesc>(), 4);
-    assert_eq!(size_of::<EzGfxDynamicState>(), 4);
-    assert_eq!(size_of::<EzGfxDrawIndexedCommand>(), 20);
-    assert!(size_of::<EzGfxSurfaceDesc>() >= 29);
-    assert_eq!(size_of::<EzGfxHandleParts>(), 20);
-    assert_eq!(align_of::<EzGfxHandleParts>(), 4);
-    assert_eq!(size_of::<EzGfxRuntimeRecord>(), 24);
-    assert_eq!(align_of::<EzGfxRuntimeRecord>(), 8);
-    assert_eq!(size_of::<EzGfxDiagnostic>(), 32);
+    assert_eq!(EzGfxResult::DeviceLost as u8, 6);
+    assert_eq!(
+        [
+            EzGfxTextureError::None as u8,
+            EzGfxTextureError::InvalidContext as u8,
+            EzGfxTextureError::InvalidArguments as u8,
+            EzGfxTextureError::UnsupportedFormat as u8,
+            EzGfxTextureError::OutOfTextureHandles as u8,
+            EzGfxTextureError::OutOfMemory as u8,
+            EzGfxTextureError::DecodeFailed as u8,
+            EzGfxTextureError::VulkanFailed as u8,
+            EzGfxTextureError::WorkerUnavailable as u8,
+            EzGfxTextureError::NotFound as u8,
+        ],
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    );
+    assert_eq!(EZ_GFX_ABI_VERSION, 18);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one contiguous test keeps every public C layout and field-offset assertion visible as a single ABI contract"
+)]
+fn layouts_are_stable() {
+    assert_eq!(
+        (
+            size_of::<EzGfxContextDesc>(),
+            align_of::<EzGfxContextDesc>()
+        ),
+        (3, 1)
+    );
+    assert_eq!(
+        [
+            offset_of!(EzGfxContextDesc, enable_debug),
+            offset_of!(EzGfxContextDesc, enable_validation),
+            offset_of!(EzGfxContextDesc, surface_platform)
+        ],
+        [0, 1, 2]
+    );
+    assert_eq!(
+        (
+            size_of::<EzGfxBackendContextDesc>(),
+            align_of::<EzGfxBackendContextDesc>()
+        ),
+        (4, 1)
+    );
+    assert_eq!(
+        [
+            offset_of!(EzGfxBackendContextDesc, enable_debug),
+            offset_of!(EzGfxBackendContextDesc, enable_validation),
+            offset_of!(EzGfxBackendContextDesc, surface_platform),
+            offset_of!(EzGfxBackendContextDesc, backend)
+        ],
+        [0, 1, 2, 3]
+    );
+    assert_eq!(
+        (
+            size_of::<EzGfxSurfaceDesc>(),
+            align_of::<EzGfxSurfaceDesc>()
+        ),
+        (32, 8)
+    );
+    assert_eq!(
+        [
+            offset_of!(EzGfxSurfaceDesc, window),
+            offset_of!(EzGfxSurfaceDesc, display),
+            offset_of!(EzGfxSurfaceDesc, platform),
+            offset_of!(EzGfxSurfaceDesc, width),
+            offset_of!(EzGfxSurfaceDesc, height),
+            offset_of!(EzGfxSurfaceDesc, cache_presented_snapshots)
+        ],
+        [0, 8, 16, 20, 24, 28]
+    );
+    assert_eq!(
+        (size_of::<EzGfxShaderDesc>(), align_of::<EzGfxShaderDesc>()),
+        (40, 8)
+    );
+    assert_eq!(
+        [
+            offset_of!(EzGfxShaderDesc, path),
+            offset_of!(EzGfxShaderDesc, vertex_entry),
+            offset_of!(EzGfxShaderDesc, fragment_entry),
+            offset_of!(EzGfxShaderDesc, compute_entry),
+            offset_of!(EzGfxShaderDesc, kind)
+        ],
+        [0, 8, 16, 24, 32]
+    );
+    assert_eq!(
+        (
+            size_of::<EzGfxTextureDesc>(),
+            align_of::<EzGfxTextureDesc>()
+        ),
+        (40, 8)
+    );
+    assert_eq!(
+        [
+            offset_of!(EzGfxTextureDesc, source_format),
+            offset_of!(EzGfxTextureDesc, destination_format),
+            offset_of!(EzGfxTextureDesc, width),
+            offset_of!(EzGfxTextureDesc, height),
+            offset_of!(EzGfxTextureDesc, mip_count),
+            offset_of!(EzGfxTextureDesc, generate_mips),
+            offset_of!(EzGfxTextureDesc, min_filter),
+            offset_of!(EzGfxTextureDesc, mag_filter),
+            offset_of!(EzGfxTextureDesc, max_anisotropy),
+            offset_of!(EzGfxTextureDesc, address_mode_u),
+            offset_of!(EzGfxTextureDesc, address_mode_v),
+            offset_of!(EzGfxTextureDesc, address_mode_w),
+            offset_of!(EzGfxTextureDesc, debug_label)
+        ],
+        [0, 1, 4, 8, 12, 16, 17, 18, 20, 24, 25, 26, 32]
+    );
+    assert_eq!(
+        (size_of::<EzGfxBinding>(), align_of::<EzGfxBinding>()),
+        (32, 8)
+    );
+    assert_eq!(
+        [
+            offset_of!(EzGfxBinding, name),
+            offset_of!(EzGfxBinding, structured),
+            offset_of!(EzGfxBinding, indirect),
+            offset_of!(EzGfxBinding, render_target)
+        ],
+        [0, 8, 16, 24]
+    );
+    assert_eq!(
+        (
+            size_of::<EzGfxDynamicState>(),
+            align_of::<EzGfxDynamicState>()
+        ),
+        (4, 1)
+    );
+    assert_eq!(
+        [
+            offset_of!(EzGfxDynamicState, cull_mode),
+            offset_of!(EzGfxDynamicState, front_face),
+            offset_of!(EzGfxDynamicState, primitive_type),
+            offset_of!(EzGfxDynamicState, blend_mode)
+        ],
+        [0, 1, 2, 3]
+    );
+    assert_eq!(
+        (
+            size_of::<EzGfxDrawIndexedCommand>(),
+            align_of::<EzGfxDrawIndexedCommand>()
+        ),
+        (20, 4)
+    );
+    assert_eq!(
+        [
+            offset_of!(EzGfxDrawIndexedCommand, index_count),
+            offset_of!(EzGfxDrawIndexedCommand, instance_count),
+            offset_of!(EzGfxDrawIndexedCommand, first_index),
+            offset_of!(EzGfxDrawIndexedCommand, vertex_offset),
+            offset_of!(EzGfxDrawIndexedCommand, first_instance)
+        ],
+        [0, 4, 8, 12, 16]
+    );
+    assert_eq!(
+        (size_of::<EzGfxByteBuffer>(), align_of::<EzGfxByteBuffer>()),
+        (16, 8)
+    );
+    assert_eq!(
+        [
+            offset_of!(EzGfxByteBuffer, length),
+            offset_of!(EzGfxByteBuffer, data)
+        ],
+        [0, 8]
+    );
+    assert_eq!(
+        (
+            size_of::<EzGfxRuntimeRecord>(),
+            align_of::<EzGfxRuntimeRecord>()
+        ),
+        (24, 8)
+    );
+    assert_eq!(
+        [
+            offset_of!(EzGfxRuntimeRecord, correlation_id),
+            offset_of!(EzGfxRuntimeRecord, resource),
+            offset_of!(EzGfxRuntimeRecord, backend),
+            offset_of!(EzGfxRuntimeRecord, phase),
+            offset_of!(EzGfxRuntimeRecord, status),
+            offset_of!(EzGfxRuntimeRecord, _padding)
+        ],
+        [0, 8, 16, 17, 18, 19]
+    );
+    assert_eq!(
+        (size_of::<EzGfxDiagnostic>(), align_of::<EzGfxDiagnostic>()),
+        (32, 8)
+    );
+    assert_eq!(
+        [
+            offset_of!(EzGfxDiagnostic, record),
+            offset_of!(EzGfxDiagnostic, level),
+            offset_of!(EzGfxDiagnostic, _padding)
+        ],
+        [0, 24, 25]
+    );
+    assert_eq!(
+        (
+            size_of::<EzGfxHandleParts>(),
+            align_of::<EzGfxHandleParts>()
+        ),
+        (20, 4)
+    );
+    assert_eq!(
+        [
+            offset_of!(EzGfxHandleParts, context_slot),
+            offset_of!(EzGfxHandleParts, context_generation),
+            offset_of!(EzGfxHandleParts, child_slot),
+            offset_of!(EzGfxHandleParts, child_generation),
+            offset_of!(EzGfxHandleParts, is_context),
+            offset_of!(EzGfxHandleParts, _padding)
+        ],
+        [0, 4, 8, 12, 16, 17]
+    );
+}
+
+#[test]
+fn all_public_export_signatures_are_stable() {
+    type Status = EzGfxResult;
+    type Handle = u64;
+
+    let _: extern "C" fn() -> u32 = ffi::ez_gfx_abi_version;
+    let _: unsafe extern "C" fn(*const EzGfxContextDesc, *mut Handle) -> Status =
+        ffi::ez_gfx_context_create;
+    let _: unsafe extern "C" fn(*const EzGfxBackendContextDesc, *mut Handle) -> Status =
+        ffi::ez_gfx_context_create_backend;
+    let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_context_wait_idle;
+    let _: extern "C" fn(Handle) = ffi::ez_gfx_context_destroy;
+    let _: unsafe extern "C" fn(*const EzGfxSurfaceDesc, *mut Handle, Handle) -> Status =
+        ffi::ez_gfx_surface_create;
+    let _: extern "C" fn(Handle, Handle) -> Status = ffi::ez_gfx_context_init_device;
+    let _: extern "C" fn(Handle, u32, u32, Handle) -> Status = ffi::ez_gfx_surface_resize;
+    let _: unsafe extern "C" fn(Handle, *mut u32, *mut u32, Handle) -> Status =
+        ffi::ez_gfx_surface_get_extent;
+    let _: unsafe extern "C" fn(Handle, *mut i32, Handle) -> Status =
+        ffi::ez_gfx_surface_resize_pending;
+    let _: extern "C" fn(Handle, i32, Handle) -> Status = ffi::ez_gfx_surface_set_snapshot_cache;
+    let _: unsafe extern "C" fn(*const u8, usize, *mut Handle, Handle) -> Status =
+        ffi::ez_gfx_shader_load_artifact;
+    let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_shader_destroy;
+    let _: unsafe extern "C" fn(
+        *const u8,
+        usize,
+        *const EzGfxTextureDesc,
+        *mut Handle,
+        Handle,
+    ) -> Status = ffi::ez_gfx_texture_load;
+    let _: unsafe extern "C" fn(Handle, *mut u32, Handle) -> Status =
+        ffi::ez_gfx_texture_get_binding;
+    let _: unsafe extern "C" fn(Handle, *mut u32, *mut u32, Handle) -> Status =
+        ffi::ez_gfx_texture_get_residency;
+    let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_texture_unload;
+    let _: extern "C" fn(Handle, Handle) -> Status = ffi::ez_gfx_begin_render;
+    let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_frame_begin;
+    let _: unsafe extern "C" fn(u32, *const c_char, *mut Handle, Handle) -> Status =
+        ffi::ez_gfx_acquire_indirect;
+    let _: unsafe extern "C" fn(Handle, u32, *const EzGfxDrawIndexedCommand, Handle) -> Status =
+        ffi::ez_gfx_indirect_write_draw;
+    let _: extern "C" fn(Handle, u32, Handle) -> Status = ffi::ez_gfx_indirect_set_draw_count;
+    let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_indirect_release;
+    let _: unsafe extern "C" fn(
+        Handle,
+        Handle,
+        *const EzGfxBinding,
+        u32,
+        *const EzGfxDynamicState,
+        *const c_void,
+        u32,
+        Handle,
+    ) -> Status = ffi::ez_gfx_render_add_vertex_pipeline;
+    let _: unsafe extern "C" fn(
+        Handle,
+        u32,
+        u32,
+        u32,
+        *const EzGfxBinding,
+        u32,
+        *const c_void,
+        u32,
+        Handle,
+    ) -> Status = ffi::ez_gfx_render_add_compute_pipeline;
+    let _: extern "C" fn(Handle, Handle) -> Status = ffi::ez_gfx_graph_enqueue_texture_readback;
+    let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_frame_submit;
+    let _: unsafe extern "C" fn(*mut EzGfxRuntimeRecord, *mut u8, *mut u64, Handle) -> Status =
+        ffi::ez_gfx_poll_runtime_event;
+    let _: unsafe extern "C" fn(*mut EzGfxDiagnostic, *mut u8, *mut u64, Handle) -> Status =
+        ffi::ez_gfx_poll_diagnostic;
+    let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_finish_render;
+    let _: unsafe extern "C" fn(*mut u8, usize, *mut usize, Handle) -> Status =
+        ffi::ez_gfx_frame_readback;
+    let _: unsafe extern "C" fn(*const c_char, u64, u64, Handle) -> Status =
+        ffi::ez_gfx_vertex_heap_create;
+    let _: unsafe extern "C" fn(*const c_char, Handle) = ffi::ez_gfx_vertex_heap_destroy;
+    let _: unsafe extern "C" fn(u64, *const c_char, Handle) -> Status =
+        ffi::ez_gfx_index_heap_create;
+    let _: extern "C" fn(Handle) = ffi::ez_gfx_index_heap_destroy;
+    let _: unsafe extern "C" fn(*const c_void, u32, *mut u32, Handle) -> Status =
+        ffi::ez_gfx_vertex_upload_indices;
+    let _: unsafe extern "C" fn(
+        *const c_char,
+        *const c_void,
+        u32,
+        u64,
+        *mut u32,
+        Handle,
+    ) -> Status = ffi::ez_gfx_vertex_upload;
+    let _: unsafe extern "C" fn(u32, u32, *const c_char, *mut Handle, Handle) -> Status =
+        ffi::ez_gfx_structured_acquire;
+    let _: unsafe extern "C" fn(Handle, *const c_void, u64, Handle) -> Status =
+        ffi::ez_gfx_structured_write;
+    let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_structured_release;
+    let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_surface_destroy;
+    let _: unsafe extern "C" fn(u64, *mut EzGfxHandleParts) -> Status = ffi::ez_gfx_handle_inspect;
+    let _: unsafe extern "C" fn(*const u8, usize, *mut u8) -> Status = ffi::ez_gfx_semantic_id;
+}
+
+#[test]
+fn shader_load_v18_signature_and_boundary_validation_are_stable() {
+    let _: unsafe extern "C" fn(*const u8, usize, *mut u64, u64) -> EzGfxResult =
+        ez_gfx_shader_load_artifact;
+    let mut shader = 99;
+    assert_eq!(
+        // SAFETY: Null data intentionally exercises checked rejection; output storage is live and aligned.
+        unsafe { ez_gfx_shader_load_artifact(core::ptr::null(), 1, &raw mut shader, 0) },
+        EzGfxResult::InvalidArgument
+    );
+    assert_eq!(shader, 99);
 }
 
 #[test]

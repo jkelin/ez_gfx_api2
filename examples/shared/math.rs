@@ -1,136 +1,89 @@
-pub type Mat4 = [f32; 16];
+use glam::{DVec2, Mat3, Mat4, Vec3};
 
-pub const fn identity() -> Mat4 {
-    [
-        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-    ]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClipY {
+    Vulkan,
+    Dx12,
+    Metal,
 }
 
-#[cfg(test)]
-pub fn translation(value: [f32; 3]) -> Mat4 {
-    let mut matrix = identity();
-    matrix[3] = value[0];
-    matrix[7] = value[1];
-    matrix[11] = value[2];
-    matrix
-}
-
-pub fn mul(left: Mat4, right: Mat4) -> Mat4 {
-    let mut result = [0.0; 16];
-    for row in 0..4 {
-        for column in 0..4 {
-            result[row * 4 + column] = (0..4)
-                .map(|index| left[row * 4 + index] * right[index * 4 + column])
-                .sum();
-        }
-    }
-    result
-}
-
-pub fn transform_point(matrix: Mat4, point: [f32; 3]) -> [f32; 3] {
-    [
-        matrix[0] * point[0] + matrix[1] * point[1] + matrix[2] * point[2] + matrix[3],
-        matrix[4] * point[0] + matrix[5] * point[1] + matrix[6] * point[2] + matrix[7],
-        matrix[8] * point[0] + matrix[9] * point[1] + matrix[10] * point[2] + matrix[11],
-    ]
-}
-
-pub fn from_gltf(matrix: [[f32; 4]; 4]) -> Mat4 {
-    let mut result = [0.0; 16];
-    for row in 0..4 {
-        for column in 0..4 {
-            result[row * 4 + column] = matrix[column][row];
-        }
-    }
-    result
-}
-
-pub fn perspective(fovy: f32, aspect: f32, near: f32, far: f32) -> Result<Mat4, String> {
-    // Projection boundaries must remain finite and ordered; invalid resize state is rejected by the runner.
-    if ![fovy, aspect, near, far]
-        .iter()
-        .all(|value| value.is_finite())
+pub fn perspective(
+    fovy: f32,
+    aspect: f32,
+    near: f32,
+    far: f32,
+    clip_y: ClipY,
+) -> anyhow::Result<Mat4> {
+    // Zero, reversed, non-finite, and half-turn projection bounds would produce infinities or inverted depth.
+    if ![fovy, aspect, near, far].into_iter().all(f32::is_finite)
         || fovy <= 0.0
         || fovy >= core::f32::consts::PI
         || aspect <= 0.0
         || near <= 0.0
         || far <= near
     {
-        return Err("invalid perspective parameters".to_owned());
+        anyhow::bail!("invalid perspective parameters");
     }
+
     let focal = 1.0 / (fovy * 0.5).tan();
-    // Metal's viewport convention already maps clip-space Y to the top-left drawable origin.
-    let vertical = if cfg!(target_vendor = "apple") {
-        focal
-    } else {
+    let vertical = if matches!(clip_y, ClipY::Vulkan | ClipY::Dx12) {
         -focal
+    } else {
+        focal
     };
-    Ok([
-        focal / aspect,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        vertical,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        far / (near - far),
-        (far * near) / (near - far),
-        0.0,
-        0.0,
-        -1.0,
-        0.0,
-    ])
+    let depth = far / (near - far);
+    let depth_offset = (far * near) / (near - far);
+
+    Ok(Mat4::from_cols_array_2d(&[
+        [focal / aspect, 0.0, 0.0, 0.0],
+        [0.0, vertical, 0.0, 0.0],
+        [0.0, 0.0, depth, -1.0],
+        [0.0, 0.0, depth_offset, 0.0],
+    ]))
 }
 
-pub fn look_at(eye: [f32; 3], target: [f32; 3], up: [f32; 3]) -> Result<Mat4, String> {
-    let forward = normalize(sub(target, eye))?;
-    let side = normalize(cross(forward, up))?;
-    let camera_up = cross(side, forward);
-    Ok([
-        side[0],
-        side[1],
-        side[2],
-        -dot(side, eye),
-        camera_up[0],
-        camera_up[1],
-        camera_up[2],
-        -dot(camera_up, eye),
-        -forward[0],
-        -forward[1],
-        -forward[2],
-        dot(forward, eye),
-        0.0,
-        0.0,
-        0.0,
-        1.0,
-    ])
-}
-
-fn sub(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
-    [left[0] - right[0], left[1] - right[1], left[2] - right[2]]
-}
-
-fn dot(left: [f32; 3], right: [f32; 3]) -> f32 {
-    left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
-}
-
-fn cross(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
-    [
-        left[1] * right[2] - left[2] * right[1],
-        left[2] * right[0] - left[0] * right[2],
-        left[0] * right[1] - left[1] * right[0],
-    ]
-}
-
-fn normalize(value: [f32; 3]) -> Result<[f32; 3], String> {
-    let length = dot(value, value).sqrt();
-    if !length.is_finite() || length <= f32::EPSILON {
-        return Err("cannot normalize a degenerate vector".to_owned());
+pub fn look_at(eye: Vec3, target: Vec3, up: Vec3) -> anyhow::Result<Mat4> {
+    let forward = target - eye;
+    // Coincident points, non-finite coordinates, and a parallel up vector do not define a camera basis.
+    if !eye.is_finite()
+        || !target.is_finite()
+        || !up.is_finite()
+        || forward.length_squared() <= f32::EPSILON * f32::EPSILON
+        || forward.cross(up).length_squared() <= f32::EPSILON * f32::EPSILON
+    {
+        anyhow::bail!("cannot construct a degenerate look-at matrix");
     }
-    Ok([value[0] / length, value[1] / length, value[2] / length])
+    let forward = forward / forward.length();
+    let side = forward.cross(up);
+    let side = side / side.length();
+    let camera_up = side.cross(forward);
+
+    Ok(Mat4::from_cols_array_2d(&[
+        [side.x, camera_up.x, -forward.x, 0.0],
+        [side.y, camera_up.y, -forward.y, 0.0],
+        [side.z, camera_up.z, -forward.z, 0.0],
+        [-side.dot(eye), -camera_up.dot(eye), forward.dot(eye), 1.0],
+    ]))
+}
+
+pub fn normal_transform(matrix: Mat4) -> anyhow::Result<Mat3> {
+    let linear = Mat3::from_mat4(matrix);
+    let determinant = linear.determinant();
+    // Singular and non-finite transforms have no inverse-transpose normal transform.
+    if !matrix.is_finite() || !determinant.is_finite() || determinant.abs() <= f32::EPSILON {
+        anyhow::bail!("cannot transform normals with a singular matrix");
+    }
+    Ok(linear.inverse().transpose())
+}
+
+pub fn from_gltf(matrix: [[f32; 4]; 4]) -> Mat4 {
+    // glTF and glam both expose column arrays, including translation in the fourth column.
+    Mat4::from_cols_array_2d(&matrix)
+}
+
+pub fn row_major(matrix: Mat4) -> Mat4 {
+    // A transposed glam matrix has row-major mathematical values in its contiguous column-major bytes.
+    matrix.transpose()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -138,12 +91,13 @@ pub struct OrbitCamera {
     pub yaw: f32,
     pub pitch: f32,
     pub distance: f32,
-    cursor: Option<[f64; 2]>,
+    cursor: Option<DVec2>,
     dragging: bool,
 }
 
 impl OrbitCamera {
     pub const fn new(yaw: f32, pitch: f32, distance: f32) -> Self {
+        // Inputs are retained exactly so callers can choose their initial orbit without hidden normalization.
         Self {
             yaw,
             pitch,
@@ -153,71 +107,187 @@ impl OrbitCamera {
         }
     }
 
-    pub fn cursor(&mut self, position: [f64; 2]) {
+    pub fn cursor(&mut self, position: DVec2) {
+        // The first cursor sample establishes a baseline; movement rotates only while dragging.
         if let Some(previous) = self.cursor
             && self.dragging
         {
-            self.rotate(position[0] - previous[0], position[1] - previous[1]);
+            let delta = position - previous;
+            self.rotate(delta.x, delta.y);
         }
         self.cursor = Some(position);
     }
 
     pub fn set_dragging(&mut self, dragging: bool) {
+        // Releasing preserves the last cursor position so the next press has no discontinuity.
         self.dragging = dragging;
     }
 
     pub fn rotate(&mut self, delta_x: f64, delta_y: f64) {
+        const MAX_PITCH: f32 = 80.0_f32.to_radians();
         let sensitivity = 0.18_f32.to_radians();
+        // Pitch stays away from the look-at pole; finite input from winit preserves an unconstrained yaw.
         self.yaw -= delta_x as f32 * sensitivity;
-        self.pitch = (self.pitch + delta_y as f32 * sensitivity)
-            .clamp((-80.0_f32).to_radians(), 80.0_f32.to_radians());
+        self.pitch = (self.pitch + delta_y as f32 * sensitivity).clamp(-MAX_PITCH, MAX_PITCH);
     }
 
     pub fn zoom(&mut self, lines: f32) {
+        // Extreme wheel deltas saturate at useful distances instead of reaching zero or infinity.
         self.distance = (self.distance * 0.85_f32.powf(lines)).clamp(0.1, 100.0);
     }
 
-    pub fn view(&self, target: [f32; 3]) -> Result<Mat4, String> {
+    pub fn view(&self, target: Vec3) -> anyhow::Result<Mat4> {
         let cos_pitch = self.pitch.cos();
-        let eye = [
-            target[0] + self.distance * self.yaw.sin() * cos_pitch,
-            target[1] + self.distance * self.pitch.sin(),
-            target[2] + self.distance * self.yaw.cos() * cos_pitch,
-        ];
-        look_at(eye, target, [0.0, 1.0, 0.0])
+        let eye = target
+            + Vec3::new(
+                self.distance * self.yaw.sin() * cos_pitch,
+                self.distance * self.pitch.sin(),
+                self.distance * self.yaw.cos() * cos_pitch,
+            );
+        // Invalid camera state propagates through look_at rather than uploading NaNs.
+        look_at(eye, target, Vec3::Y)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytemuck::bytes_of;
+    use glam::{Mat3, Mat4, Quat, Vec3};
 
-    #[test]
-    fn matrix_product_preserves_identity_and_translation() {
-        let translation = translation([2.0, -3.0, 4.0]);
-        assert_eq!(mul(identity(), translation), translation);
-        assert_eq!(mul(translation, identity()), translation);
-        assert_eq!(
-            transform_point(translation, [1.0, 2.0, 3.0]),
-            [3.0, -1.0, 7.0]
+    fn assert_approx(left: f32, right: f32) {
+        assert!((left - right).abs() <= 1.0e-5, "{left} != {right}");
+    }
+
+    fn assert_vec3_approx(left: Vec3, right: Vec3) {
+        assert!(
+            (left - right).abs().max_element() <= 1.0e-5,
+            "{left:?} != {right:?}"
         );
     }
 
     #[test]
-    fn perspective_and_look_at_reject_invalid_boundaries() {
-        assert!(perspective(0.0, 1.0, 0.1, 100.0).is_err());
-        assert!(perspective(1.0, 0.0, 0.1, 100.0).is_err());
-        assert!(perspective(1.0, 1.0, 1.0, 1.0).is_err());
-        assert!(look_at([0.0; 3], [0.0; 3], [0.0, 1.0, 0.0]).is_err());
+    fn perspective_preserves_backend_clip_y_and_zero_to_one_depth() {
+        for (clip_y, expected_y) in [
+            (ClipY::Vulkan, -1.0),
+            (ClipY::Dx12, -1.0),
+            (ClipY::Metal, 1.0),
+        ] {
+            let projection = perspective(90.0_f32.to_radians(), 1.0, 0.25, 100.0, clip_y).unwrap();
+            assert_eq!(projection.y_axis.y.signum(), expected_y);
+
+            let near = projection * Vec3::new(0.0, 0.0, -0.25).extend(1.0);
+            let far = projection * Vec3::new(0.0, 0.0, -100.0).extend(1.0);
+            assert_approx(near.z / near.w, 0.0);
+            assert_approx(far.z / far.w, 1.0);
+        }
     }
 
     #[test]
-    fn orbit_defaults_match_original_examples() {
-        let mut camera = OrbitCamera::new(35.0_f32.to_radians(), 22.0_f32.to_radians(), 5.0);
-        camera.rotate(100.0, -100.0);
-        assert!(camera.pitch <= 80.0_f32.to_radians());
-        camera.zoom(1000.0);
-        assert!(camera.distance >= 0.1);
-        assert!(camera.view([0.0; 3]).is_ok());
+    fn perspective_and_look_at_reject_degenerate_inputs() {
+        for arguments in [
+            [0.0, 1.0, 0.1, 100.0],
+            [f32::NAN, 1.0, 0.1, 100.0],
+            [1.0, 0.0, 0.1, 100.0],
+            [1.0, 1.0, 0.0, 100.0],
+            [1.0, 1.0, 1.0, 1.0],
+        ] {
+            assert!(
+                perspective(
+                    arguments[0],
+                    arguments[1],
+                    arguments[2],
+                    arguments[3],
+                    ClipY::Vulkan,
+                )
+                .is_err()
+            );
+        }
+        assert!(look_at(Vec3::ZERO, Vec3::ZERO, Vec3::Y).is_err());
+        assert!(look_at(Vec3::ZERO, -Vec3::Z, -Vec3::Z).is_err());
+    }
+
+    #[test]
+    fn look_at_and_orbit_camera_preserve_view_contract() {
+        let view = look_at(Vec3::new(0.0, 0.0, 5.0), Vec3::ZERO, Vec3::Y).unwrap();
+        assert_vec3_approx(view.transform_point3(Vec3::new(0.0, 0.0, 5.0)), Vec3::ZERO);
+        assert_vec3_approx(view.transform_point3(Vec3::ZERO), Vec3::new(0.0, 0.0, -5.0));
+
+        let mut camera = OrbitCamera::new(0.0, 0.0, 5.0);
+        assert_eq!(camera.view(Vec3::ZERO).unwrap(), view);
+        camera.rotate(0.0, 100_000.0);
+        assert_approx(camera.pitch, 80.0_f32.to_radians());
+        camera.zoom(f32::INFINITY);
+        assert_approx(camera.distance, 0.1);
+        camera.zoom(f32::NEG_INFINITY);
+        assert_approx(camera.distance, 100.0);
+    }
+
+    #[test]
+    fn glam_transforms_points_and_normals_without_translation_leakage() {
+        let transform = Mat4::from_scale_rotation_translation(
+            Vec3::new(2.0, 3.0, 4.0),
+            Quat::from_rotation_z(90.0_f32.to_radians()),
+            Vec3::new(5.0, 6.0, 7.0),
+        );
+        assert_vec3_approx(
+            transform.transform_point3(Vec3::new(1.0, 0.0, 0.0)),
+            Vec3::new(5.0, 8.0, 7.0),
+        );
+
+        let transformed = normal_transform(transform).unwrap() * Vec3::X;
+        assert_vec3_approx(transformed.normalize(), Vec3::Y);
+        assert!(normal_transform(Mat4::from_scale(Vec3::new(1.0, 0.0, 1.0))).is_err());
+        assert_eq!(Mat3::from_mat4(Mat4::IDENTITY), Mat3::IDENTITY);
+    }
+
+    #[test]
+    fn gltf_columns_convert_to_the_same_mathematical_transform() {
+        let gltf = [
+            [2.0, 0.0, 0.0, 0.0],
+            [0.0, 3.0, 0.0, 0.0],
+            [0.0, 0.0, 4.0, 0.0],
+            [5.0, 6.0, 7.0, 1.0],
+        ];
+        assert_vec3_approx(
+            from_gltf(gltf).transform_point3(Vec3::ONE),
+            Vec3::new(7.0, 9.0, 11.0),
+        );
+    }
+
+    #[test]
+    fn glam_operations_preserve_composition_and_point_transform_contracts() {
+        let left = Mat4::from_scale_rotation_translation(
+            Vec3::new(2.0, 3.0, 4.0),
+            Quat::from_rotation_x(0.37),
+            Vec3::new(5.0, 6.0, 7.0),
+        );
+        let right = Mat4::from_scale_rotation_translation(
+            Vec3::new(0.5, 0.25, 2.0),
+            Quat::from_rotation_y(-0.91),
+            Vec3::new(-2.0, 1.0, 3.0),
+        );
+        let point = Vec3::new(1.25, -2.5, 0.75);
+
+        let composed = left * right;
+        assert_vec3_approx(
+            composed.transform_point3(point),
+            left.transform_point3(right.transform_point3(point)),
+        );
+    }
+
+    #[test]
+    fn row_major_upload_bytes_match_slang_matrix_rows() {
+        let matrix = Mat4::from_cols_array(&[
+            1.0, 5.0, 9.0, 13.0, 2.0, 6.0, 10.0, 14.0, 3.0, 7.0, 11.0, 15.0, 4.0, 8.0, 12.0, 16.0,
+        ]);
+        let uploaded = row_major(matrix);
+        assert_eq!(
+            bytes_of(&uploaded),
+            bytemuck::cast_slice::<f32, u8>(&[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+                16.0,
+            ])
+        );
     }
 }

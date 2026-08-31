@@ -124,8 +124,12 @@ pub struct NativeDrawIndexed<'a> {
     pub pipeline: &'a NativePipeline,
     /// Buffer containing 32-bit indices.
     pub index_buffer: &'a NativeAllocation,
+    /// Logical byte length of the index resource.
+    pub index_size: u64,
     /// Buffer containing indexed indirect commands.
     pub indirect_buffer: &'a NativeAllocation,
+    /// Logical byte length of the indirect resource.
+    pub indirect_size: u64,
     /// Number of indirect commands to execute.
     pub draw_count: u32,
     /// Root-constant payload.

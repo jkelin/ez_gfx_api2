@@ -1,4 +1,5 @@
 use super::{FrameInput, HostSurface, NativeSurface, SceneInput, dispatch_window_input};
+use anyhow::Context as _;
 use std::time::Instant;
 use winit::{
     application::ApplicationHandler,
@@ -18,39 +19,37 @@ pub struct LifecycleConfig {
 pub trait LifecycleCallbacks {
     type Report;
     fn initialize(&mut self, surface: NativeSurface, width: u32, height: u32)
-    -> Result<(), String>;
-    fn resize(&mut self, width: u32, height: u32) -> Result<(), String>;
+    -> anyhow::Result<()>;
+    fn resize(&mut self, width: u32, height: u32) -> anyhow::Result<()>;
     fn input(&mut self, input: SceneInput);
     fn render(&mut self, frame: FrameInput, terminal: bool, frame_index: u32)
-    -> Result<(), String>;
-    fn capture(&mut self, width: u32, height: u32, frames: u32) -> Result<Self::Report, String>;
+    -> anyhow::Result<()>;
+    fn capture(&mut self, width: u32, height: u32, frames: u32) -> anyhow::Result<Self::Report>;
     fn shutdown(&mut self);
 }
 
 pub fn run<C: LifecycleCallbacks>(
     config: LifecycleConfig,
     callbacks: C,
-) -> Result<Option<C::Report>, String> {
+) -> anyhow::Result<Option<C::Report>> {
     if config.frame_limit == Some(0) {
-        return Err("frame limit must be positive".to_owned());
+        anyhow::bail!("frame limit must be positive");
     }
     if std::env::var_os("VK_LOADER_LAYERS_DISABLE").is_none() {
         // SAFETY: this executes before the event loop or graphics initialization begins.
         unsafe { std::env::set_var("VK_LOADER_LAYERS_DISABLE", "~implicit~") };
     }
-    let event_loop = EventLoop::new().map_err(|error| error.to_string())?;
+    let event_loop = EventLoop::new().context("create event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(config, callbacks);
-    let run_result = event_loop
-        .run_app(&mut app)
-        .map_err(|error| error.to_string());
+    let run_result = event_loop.run_app(&mut app).context("run event loop");
     finish_app(app, run_result)
 }
 
 fn finish_app<C: LifecycleCallbacks>(
     mut app: App<C>,
-    run_result: Result<(), String>,
-) -> Result<Option<C::Report>, String> {
+    run_result: anyhow::Result<()>,
+) -> anyhow::Result<Option<C::Report>> {
     app.callbacks.shutdown();
     run_result?;
     app.error.map_or(Ok(app.report), Err)
@@ -66,7 +65,7 @@ struct App<C: LifecycleCallbacks> {
     frames: u32,
     last_frame: Instant,
     report: Option<C::Report>,
-    error: Option<String>,
+    error: Option<anyhow::Error>,
 }
 
 impl<C: LifecycleCallbacks> App<C> {
@@ -84,8 +83,8 @@ impl<C: LifecycleCallbacks> App<C> {
             error: None,
         }
     }
-    fn fail(&mut self, event_loop: &ActiveEventLoop, error: impl Into<String>) {
-        self.error = Some(error.into());
+    fn fail(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
+        self.error = Some(error);
         event_loop.exit();
     }
 }
@@ -98,9 +97,12 @@ impl<C: LifecycleCallbacks> ApplicationHandler for App<C> {
         let attributes = Window::default_attributes()
             .with_title(self.config.title)
             .with_inner_size(PhysicalSize::new(self.config.width, self.config.height));
-        let window = match event_loop.create_window(attributes) {
+        let window = match event_loop
+            .create_window(attributes)
+            .context("create example window")
+        {
             Ok(window) => window,
-            Err(error) => return self.fail(event_loop, error.to_string()),
+            Err(error) => return self.fail(event_loop, error),
         };
         let host = match HostSurface::attach(&window, self.config.width, self.config.height) {
             Ok(host) => host,
@@ -181,11 +183,11 @@ mod tests {
             _surface: NativeSurface,
             _width: u32,
             _height: u32,
-        ) -> Result<(), String> {
+        ) -> anyhow::Result<()> {
             Ok(())
         }
 
-        fn resize(&mut self, _width: u32, _height: u32) -> Result<(), String> {
+        fn resize(&mut self, _width: u32, _height: u32) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -196,11 +198,11 @@ mod tests {
             _frame: FrameInput,
             _terminal: bool,
             _frame_index: u32,
-        ) -> Result<(), String> {
+        ) -> anyhow::Result<()> {
             Ok(())
         }
 
-        fn capture(&mut self, _width: u32, _height: u32, _frames: u32) -> Result<(), String> {
+        fn capture(&mut self, _width: u32, _height: u32, _frames: u32) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -225,9 +227,7 @@ mod tests {
     #[test]
     fn shutdown_runs_once_on_normal_and_event_loop_errors() {
         assert!(finish_app(app(), Ok(())).is_ok());
-        assert_eq!(
-            finish_app(app(), Err("event loop failed".to_owned())),
-            Err("event loop failed".to_owned())
-        );
+        let error = finish_app(app(), Err(anyhow::anyhow!("event loop failed"))).unwrap_err();
+        assert_eq!(error.to_string(), "event loop failed");
     }
 }

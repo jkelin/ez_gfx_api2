@@ -1,17 +1,23 @@
 # ez-gfx-api2
 
-Rust/Cargo migration of the original ez_gfx_api with Vulkan, Direct3D 12, and Metal backends; universal Slang shaders; compressed textures; and a compiler-free runtime.
+Rust/Cargo migration of the original `ez_gfx_api` with Vulkan, Direct3D 12, and Metal backends; backend-agnostic Slang shaders; compressed textures; and a compiler-free runtime.
 
-## Workspace flow
+## Architecture
 
-`ez-gfx-core` defines backend/compiler-neutral semantic IDs, layouts, handles, and capability contracts. `ez-gfx-hal` defines native-lowering boundaries. Backend crates implement HAL with `ash`, `windows`, and `objc2-metal`. `ez-gfx-compiler` uses `shader-slang`/slang-rs in-process bindings to compile one source to SPIR-V, DXIL, and Metal; Apple `xcrun metal` postprocesses MSL into metallib. It emits versioned `ez-gfx-artifact` bundles. `ez-gfx-runtime` loads those bundles without Slang or JIT compilation and decodes KTX2 UASTC and BasisLZ ETC1S through `basisu_c_sys`. `ez-gfx-assets` validates compressed texture payloads. [`ez-gfx`](crates/ez-gfx/README.md) owns the safe Rust resource, handle, frame, backend, and presentation implementation. [`ez-gfx-ffi`](crates/ez-gfx-ffi/README.md) only validates and converts C ABI inputs before delegating to `ez-gfx`.
+`ez-gfx-core` defines semantic IDs, layouts, capabilities, and packed generational handles. The safe [`ez-gfx`](crates/ez-gfx/README.md) interface exposes distinct context, surface, shader, texture, indirect-buffer, structured-buffer, and render-target handle types; only the C ABI represents them as opaque `uint64_t` values. `ez-gfx-hal` is the backend-neutral execution seam. Backend crates lower it through `ash`, `windows`, and `objc2-metal`. `ez-gfx-runtime` owns validated artifact loading, frame graphs, resource lifetimes, and KTX2/Basis decoding.
 
-Runtime dependencies must not include the compiler or Slang native libraries. Hosts own artifact authenticity, filesystem policy, and event polling. See `plan/COMPONENTS.md` and `plan/SOLUTIONS.md` for canonical decisions and validation gates.
+[`ez-gfx-compiler`](crates/ez-gfx-compiler/README.md) compiles the root [`ez_gfx_api.slang`](ez_gfx_api.slang) module and application shaders to SPIR-V 1.5, Shader Model 6.5 DXIL, and Metal products. It writes [`.ezgfxshader`](crates/ez-gfx-artifact/README.md) files: a fixed, versioned frame around one bytechecked `rkyv` payload, with bounded lengths, a BLAKE3 digest, provenance, reflection, exactly one entry point per stage, and target coverage validation. Runtime callers load a stage set without naming entry points. Runtime crates and packages contain no compiler, Slang, DXC, source compilation, JIT, or fallback path.
 
-## Tasks and examples
+## Build and examples
 
-Install [mise](https://mise.jdx.dev/) and run `mise tasks` for the portable build, test, example, and packaging commands. `mise run examples-smoke` exercises all six migrated Rust example paths; each example's `main.rs` is its complete renderer. `mise run example-3` runs one example. See `examples/README.md` for the original-source inventory and behavior mapping.
+Install [mise](https://mise.jdx.dev/) and run `mise tasks` for build, test, example, and packaging commands. Cargo's `examples/build.rs` compiles all six Rust shader manifests into private `OUT_DIR` artifacts; generated `.ezgfxshader` files are neither tracked nor included in runtime-only packages. `mise run examples-smoke` exercises the Rust scenes. See [`examples/README.md`](examples/README.md).
 
-Shared `examples/shared/host.rs` owns native raw-window attachment for every program. Win32 passes HWND/HINSTANCE to Vulkan or DX12. macOS attaches and retains a scale-aware CAMetalLayer, selects Metal, then releases the layer after surface destruction. Set `EZ_GFX_BACKEND` to `vulkan`, `dx12`, or (on macOS) `metal`; unsupported host/backend combinations fail at the boundary.
+The Win32 [`C structured-buffer cube`](examples/c/structured_cube/README.md) uses ABI v18 directly, compiles its shader during the CMake build, and supports Vulkan or DX12 on a capable local host. Its CI job builds and links the C11 program, then smokes Vulkan with SwiftShader. Hosted Windows DX12 remains compile-only because the runner does not guarantee a feature-level 12.1 adapter.
 
-`mise run package` packages the host target. Append `-- <target> <version> <output>` to override its defaults. The Rust `xtask` implementation replaces the former platform-specific shell scripts, verifies runtime/compiler isolation, requires native compiler libraries from `SLANG_DIR` or `VULKAN_SDK`, writes sorted SHA-256 manifests, and creates ZIP archives on Windows or `.tar.gz` archives elsewhere.
+Shared `examples/shared/host.rs` owns native window attachment. Win32 supplies HWND/HINSTANCE to Vulkan or DX12. macOS creates and retains a scale-aware `CAMetalLayer`. Set `EZ_GFX_BACKEND` to `vulkan`, `dx12`, or, on macOS, `metal`; unsupported host/backend combinations fail explicitly.
+
+## CI and packaging
+
+The quality matrix runs native Metal tests on macOS and Vulkan runtime tests on Windows with SwiftShader. Windows DX12 and Linux Vulkan compile backend/native tests but do not claim hosted graphics runtime coverage: DX12 lacks a guaranteed adapter, and the current Vulkan surface interface is Win32-only. Platform-neutral artifact, runtime, FFI, and example logic tests run separately.
+
+`mise run package` packages the host target. Append `-- <target> <version> <output>` to override defaults. `xtask` verifies the Rust runtime dependency tree and the packaged runtime's actual PE/ELF/Mach-O dynamic imports, rejects compiler executables and native Slang/DXC libraries anywhere in the runtime package, requires compiler libraries from `SLANG_DIR` or `VULKAN_SDK`, emits sorted SHA-256 manifests, and creates ZIP archives on Windows or `.tar.gz` archives elsewhere. Run `cargo run -p xtask -- export-parity <runtime-library-or-package-root>` to enforce that import/package isolation and compare the permanent C header and `bindings.xml` ABI declarations—version, complete function signatures and pointer metadata, handle widths, struct layouts, enum values, and managed fixed extents—then compare their public function set with the packaged PE, ELF, or Mach-O exports. The package workflow runs this command for Windows x64, Linux x64, and Apple Silicon.

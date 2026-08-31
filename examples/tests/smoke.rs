@@ -1,6 +1,7 @@
 //! Smoke tests for the migrated examples.
 #[path = "../shared/mod.rs"]
 mod shared;
+use anyhow::Context as _;
 use std::path::PathBuf;
 
 const BINARIES: [(&str, &str, &str, u32); 6] = [
@@ -47,7 +48,7 @@ fn target_backend() -> &'static str {
     "vulkan"
 }
 
-fn snapshot(binary: &str, file: &str) -> (String, image::RgbaImage) {
+fn snapshot(binary: &str, file: &str) -> anyhow::Result<(String, image::RgbaImage)> {
     let reference = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("snapshots")
         .join(file);
@@ -56,13 +57,13 @@ fn snapshot(binary: &str, file: &str) -> (String, image::RgbaImage) {
     command.env("MTL_DEBUG_LAYER", "1");
     let output = command
         .output()
-        .unwrap_or_else(|error| panic!("launch {binary}: {error}"));
+        .with_context(|| format!("launch {binary}"))?;
     assert!(
         output.status.success(),
         "{binary}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let report = String::from_utf8(output.stdout).expect("report must be UTF-8");
+    let report = String::from_utf8(output.stdout).context("report must be UTF-8")?;
     let fields = report.split_whitespace().collect::<Vec<_>>();
     assert_eq!(fields.len(), 8, "{binary}: {report:?}");
     assert_eq!(
@@ -76,7 +77,7 @@ fn snapshot(binary: &str, file: &str) -> (String, image::RgbaImage) {
     );
     assert_eq!(fields[7], "0", "{binary} dropped observations");
     let image = image::open(reference)
-        .expect("snapshot exists")
+        .context("open immutable snapshot")?
         .into_rgba8();
     assert_eq!(
         image.dimensions(),
@@ -88,7 +89,7 @@ fn snapshot(binary: &str, file: &str) -> (String, image::RgbaImage) {
         blake3::hash(image.as_raw()).to_string(),
         "{binary} report/image hash mismatch"
     );
-    (report, image)
+    Ok((report, image))
 }
 
 fn assert_semantics(name: &str, report: &str, image: &image::RgbaImage, min_events: u32) {
@@ -130,10 +131,11 @@ fn assert_semantics(name: &str, report: &str, image: &image::RgbaImage, min_even
 macro_rules! independent_scene_test {
     ($test:ident, $index:expr) => {
         #[test]
-        fn $test() {
+        fn $test() -> anyhow::Result<()> {
             let (name, file, binary, min_events) = BINARIES[$index];
-            let (report, image) = snapshot(binary, file);
+            let (report, image) = snapshot(binary, file)?;
             assert_semantics(name, &report, &image, min_events);
+            Ok(())
         }
     };
 }
@@ -146,10 +148,11 @@ independent_scene_test!(helmet_smoke, 4);
 independent_scene_test!(sponza_ktx2_smoke, 5);
 
 #[test]
-fn triangle_snapshot_is_deterministic_across_processes() {
+fn triangle_snapshot_is_deterministic_across_processes() -> anyhow::Result<()> {
     let (_, _, binary, _) = BINARIES[0];
     assert_eq!(
-        snapshot(binary, BINARIES[0].1).0,
-        snapshot(binary, BINARIES[0].1).0
+        snapshot(binary, BINARIES[0].1)?.0,
+        snapshot(binary, BINARIES[0].1)?.0
     );
+    Ok(())
 }

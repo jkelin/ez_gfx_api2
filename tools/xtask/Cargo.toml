@@ -7,6 +7,10 @@ license.workspace = true
 publish = false
 
 [dependencies]
+object = { version = "0.40", default-features = false, features = ["read", "std"] }
+quick-xml = "0.41"
+anyhow.workspace = true
+clap.workspace = true
 flate2 = "1.1"
 sha2 = "0.10"
 tar = "0.4"

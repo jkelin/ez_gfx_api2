@@ -1,7 +1,10 @@
 //! Runtime integration and contract tests.
 
 use ez_gfx_artifact::Stage;
-use ez_gfx_core::Backend;
+use ez_gfx_core::{
+    Backend,
+    handle::{IndirectBufferHandle, LocalHandle, PackedHandle, StructuredBufferHandle},
+};
 use ez_gfx_runtime::binding::{
     BindingError, BindingKind, PublicBinding, ReflectedBindings, ResourceIdentity,
 };
@@ -18,6 +21,28 @@ const METADATA: &[u8] = br#"{
     ]}}
   ]
 }"#;
+
+fn structured(slot: u32) -> StructuredBufferHandle {
+    StructuredBufferHandle::from_packed(
+        PackedHandle::child(
+            LocalHandle::new(1, 1).unwrap(),
+            LocalHandle::new(slot, 1).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+fn indirect(slot: u32) -> IndirectBufferHandle {
+    IndirectBufferHandle::from_packed(
+        PackedHandle::child(
+            LocalHandle::new(1, 1).unwrap(),
+            LocalHandle::new(slot, 1).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
 
 #[test]
 fn metadata_selects_exact_backend_entry_and_stage() {
@@ -39,11 +64,11 @@ fn public_bindings_are_exact_unique_and_kind_checked() {
     let valid = [
         PublicBinding {
             name: "draws".into(),
-            resource: ResourceIdentity::Indirect(9),
+            resource: ResourceIdentity::Indirect(indirect(9)),
         },
         PublicBinding {
             name: "instances".into(),
-            resource: ResourceIdentity::Structured(7),
+            resource: ResourceIdentity::Structured(structured(7)),
         },
     ];
     assert!(bindings.validate(&valid).is_ok());
@@ -59,7 +84,7 @@ fn public_bindings_are_exact_unique_and_kind_checked() {
         bindings.validate(&[
             PublicBinding {
                 name: "draws".into(),
-                resource: ResourceIdentity::Structured(9)
+                resource: ResourceIdentity::Structured(structured(9))
             },
             valid[1].clone()
         ]),
@@ -71,7 +96,7 @@ fn public_bindings_are_exact_unique_and_kind_checked() {
             valid[1].clone(),
             PublicBinding {
                 name: "extra".into(),
-                resource: ResourceIdentity::Structured(1)
+                resource: ResourceIdentity::Structured(structured(1))
             }
         ]),
         Err(BindingError::Unknown("extra".into()))

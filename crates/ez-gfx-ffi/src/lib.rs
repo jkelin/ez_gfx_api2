@@ -1,21 +1,41 @@
 //! C ABI for the ez-gfx runtime.
 
 mod api;
+mod identity;
 
 pub use api::*;
+pub use identity::*;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use ez_gfx::{
-    Backend, ContextOptions, DrawIndexedCommand, DynamicPipelineState, HandleParts, PackedHandle,
-    PublicBinding, ResourceIdentity, SamplerAddressMode, SamplerFilter, SemanticId, ShaderRequest,
-    Stage, SurfaceOptions, SurfacePlatform, TextureSamplerDesc, TextureSource,
+    Backend, ContextHandle, ContextOptions, DrawIndexedCommand, DynamicPipelineState,
+    IndirectBufferHandle, PublicBinding, RenderTargetHandle, ResourceIdentity, SamplerAddressMode,
+    SamplerFilter, ShaderHandle, StructuredBufferHandle, SurfaceHandle, SurfaceOptions,
+    SurfacePlatform, TextureHandle, TextureSamplerDesc, TextureSource,
 };
 
-/// Identifies C ABI revision 17 for compatibility checks.
-pub const EZ_GFX_ABI_VERSION: u32 = 17;
+/// Identifies C ABI revision 18 for compatibility checks.
+pub const EZ_GFX_ABI_VERSION: u32 = 18;
 /// Caps any caller-provided byte range at 16 MiB.
 pub const EZ_GFX_MAX_BOUNDARY_BYTES: usize = 16 * 1024 * 1024;
+
+macro_rules! try_handle {
+    ($type:ty, $raw:expr) => {
+        match <$type>::from_raw($raw) {
+            Ok(handle) => handle,
+            Err(_) => return EzGfxResult::InvalidContext,
+        }
+    };
+}
+// Unknown ABI bytes fail closed; zero and one retain the public Repeat/ClampToEdge ordering.
+fn sampler_address_from_abi(value: u8) -> Result<SamplerAddressMode, EzGfxResult> {
+    match value {
+        0 => Ok(SamplerAddressMode::Repeat),
+        1 => Ok(SamplerAddressMode::Clamp),
+        _ => Err(EzGfxResult::InvalidArgument),
+    }
+}
 
 #[unsafe(no_mangle)]
 /// Returns the C ABI revision supported by this library.
@@ -49,7 +69,7 @@ pub unsafe extern "C" fn ez_gfx_context_create(
         match ez_gfx::create_context(options) {
             Ok(handle) => {
                 // SAFETY: `out_context` is non-null, and the caller keeps writable, properly aligned storage for one `EzGfxContext` alive through this write.
-                unsafe { out_context.write(handle.get()) };
+                unsafe { out_context.write(handle.into_raw()) };
                 EzGfxResult::Ok
             }
             Err(status) => status,
@@ -90,7 +110,7 @@ pub unsafe extern "C" fn ez_gfx_context_create_backend(
         match ez_gfx::create_context(options) {
             Ok(handle) => {
                 // SAFETY: `out_context` is non-null, and the caller keeps writable, properly aligned storage for one `EzGfxContext` alive through this write.
-                unsafe { out_context.write(handle.get()) };
+                unsafe { out_context.write(handle.into_raw()) };
                 EzGfxResult::Ok
             }
             Err(status) => status,
@@ -101,12 +121,16 @@ pub unsafe extern "C" fn ez_gfx_context_create_backend(
 #[unsafe(no_mangle)]
 /// Waits until all work submitted through the graphics context is idle.
 pub extern "C" fn ez_gfx_context_wait_idle(context: EzGfxContext) -> EzGfxResult {
-    catch_status(|| ez_gfx::wait_idle(context))
+    catch_status(|| ez_gfx::wait_idle(try_handle!(ContextHandle, context)))
 }
 #[unsafe(no_mangle)]
 /// Destroys the graphics context and its owned runtime state.
 pub extern "C" fn ez_gfx_context_destroy(context: EzGfxContext) {
-    catch_void(|| ez_gfx::destroy_context(context));
+    catch_void(|| {
+        if let Ok(context) = ContextHandle::from_raw(context) {
+            ez_gfx::destroy_context(context);
+        }
+    });
 }
 
 #[unsafe(no_mangle)]
@@ -125,6 +149,7 @@ pub unsafe extern "C" fn ez_gfx_poll_runtime_event(
         if out_record.is_null() || out_present.is_null() || out_dropped.is_null() {
             return EzGfxResult::InvalidArgument;
         }
+        let context = try_handle!(ContextHandle, context);
         match ez_gfx::poll_runtime_event(context) {
             Ok((record, dropped)) => {
                 // SAFETY: All three output pointers are non-null; the caller keeps aligned writable storage for one value of each pointed-to type alive through these writes.
@@ -165,6 +190,7 @@ pub unsafe extern "C" fn ez_gfx_poll_diagnostic(
         if out_diagnostic.is_null() || out_present.is_null() || out_dropped.is_null() {
             return EzGfxResult::InvalidArgument;
         }
+        let context = try_handle!(ContextHandle, context);
         match ez_gfx::poll_diagnostic(context) {
             Ok((diagnostic, dropped)) => {
                 // SAFETY: All three output pointers are non-null; the caller keeps aligned writable storage for one value of each pointed-to type alive through these writes.
@@ -193,60 +219,34 @@ pub unsafe extern "C" fn ez_gfx_poll_diagnostic(
     })
 }
 
-/// Loads a compiler-produced shader artifact; no source compiler is linked into this runtime.
+/// Loads every stage from a compiler-produced shader artifact; no source compiler is linked into this runtime.
 #[unsafe(no_mangle)]
-/// Loads requested shader stages from a compiler-produced artifact and returns a shader handle.
 ///
 /// # Safety
 ///
-/// Non-null `data` must be readable for `data_size` bytes, non-null `entries` for `entry_count` aligned entries, and non-null `out_shader` writable for one aligned handle. Every non-null entry-point pointer must reference a NUL-terminated string for this call.
+/// Non-null `data` must be readable for `data_size` bytes, and non-null
+/// `out_shader` must be writable for one aligned handle.
 pub unsafe extern "C" fn ez_gfx_shader_load_artifact(
     data: *const u8,
     data_size: usize,
-    entries: *const EzGfxShaderEntry,
-    entry_count: usize,
     out_shader: *mut EzGfxShader,
     context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         if data.is_null()
-            || entries.is_null()
             || out_shader.is_null()
             || data_size == 0
             || data_size > EZ_GFX_MAX_BOUNDARY_BYTES
-            || entry_count == 0
-            || entry_count > 16
         {
             return EzGfxResult::InvalidArgument;
         }
-        // SAFETY: `data_size` is checked in `1..=EZ_GFX_MAX_BOUNDARY_BYTES`; the caller keeps `data` readable for that many `u8` values (alignment 1) through shader loading.
+        // SAFETY: `data_size` is checked in `1..=EZ_GFX_MAX_BOUNDARY_BYTES`; the caller keeps `data` readable for that many `u8` values through shader loading.
         let bytes = unsafe { core::slice::from_raw_parts(data, data_size) };
-        // SAFETY: `entry_count` is checked in `1..=16`; the caller keeps `entries` readable and aligned for that many `EzGfxShaderEntry` values through iteration.
-        let entries = unsafe { core::slice::from_raw_parts(entries, entry_count) };
-        let mut requests = Vec::with_capacity(entry_count);
-        for entry in entries {
-            let name = match read_c_string(entry.entry) {
-                Ok(name) => name,
-                Err(status) => return status,
-            };
-            let stage = match entry.stage {
-                1 => Stage::Vertex,
-                2 => Stage::Fragment,
-                3 => Stage::Compute,
-                4 => Stage::Geometry,
-                5 => Stage::TessellationControl,
-                6 => Stage::TessellationEvaluation,
-                _ => return EzGfxResult::InvalidArgument,
-            };
-            let Ok(request) = ShaderRequest::new(name, stage) else {
-                return EzGfxResult::InvalidArgument;
-            };
-            requests.push(request);
-        }
-        match ez_gfx::load_shader(context, bytes, &requests) {
+        let context = try_handle!(ContextHandle, context);
+        match ez_gfx::load_shader(context, bytes) {
             Ok(shader) => {
                 // SAFETY: `out_shader` is non-null, and the caller keeps writable, properly aligned storage for one `EzGfxShader` alive through this write.
-                unsafe { out_shader.write(shader.get()) };
+                unsafe { out_shader.write(shader.into_raw()) };
                 EzGfxResult::Ok
             }
             Err(status) => status,
@@ -257,7 +257,14 @@ pub unsafe extern "C" fn ez_gfx_shader_load_artifact(
 #[unsafe(no_mangle)]
 /// Destroys a shader previously loaded into the context.
 pub extern "C" fn ez_gfx_shader_destroy(shader: EzGfxShader, context: EzGfxContext) {
-    catch_void(|| ez_gfx::destroy_shader(context, shader));
+    catch_void(|| {
+        if let (Ok(context), Ok(shader)) = (
+            ContextHandle::from_raw(context),
+            ShaderHandle::from_raw(shader),
+        ) {
+            ez_gfx::destroy_shader(context, shader);
+        }
+    });
 }
 
 #[unsafe(no_mangle)]
@@ -288,9 +295,6 @@ pub unsafe extern "C" fn ez_gfx_texture_load(
             || desc.destination_format != 0
             || desc.min_filter > 1
             || desc.mag_filter > 1
-            || desc.address_mode_u > 1
-            || desc.address_mode_v > 1
-            || desc.address_mode_w > 1
             || !desc.max_anisotropy.is_finite()
             || !(1.0..=16.0).contains(&desc.max_anisotropy)
             || (!desc.debug_label.is_null() && read_c_string(desc.debug_label).is_err())
@@ -319,9 +323,12 @@ pub unsafe extern "C" fn ez_gfx_texture_load(
             0 => SamplerFilter::Nearest,
             _ => SamplerFilter::Linear,
         };
-        let address = |value| match value {
-            0 => SamplerAddressMode::Clamp,
-            _ => SamplerAddressMode::Repeat,
+        let [Ok(address_u), Ok(address_v), Ok(address_w)] = [
+            sampler_address_from_abi(desc.address_mode_u),
+            sampler_address_from_abi(desc.address_mode_v),
+            sampler_address_from_abi(desc.address_mode_w),
+        ] else {
+            return EzGfxResult::InvalidArgument;
         };
         let config = ez_gfx::TextureConfig {
             width: desc.width,
@@ -331,15 +338,16 @@ pub unsafe extern "C" fn ez_gfx_texture_load(
                 min_filter: filter(desc.min_filter),
                 mag_filter: filter(desc.mag_filter),
                 max_anisotropy: desc.max_anisotropy,
-                address_u: address(desc.address_mode_u),
-                address_v: address(desc.address_mode_v),
-                address_w: address(desc.address_mode_w),
+                address_u,
+                address_v,
+                address_w,
             },
         };
+        let context = try_handle!(ContextHandle, context);
         match ez_gfx::load_texture(context, source, bytes, desc.generate_mips != 0, &config) {
             Ok(texture) => {
                 // SAFETY: `out_texture` is non-null, and the caller keeps writable, properly aligned storage for one `EzGfxTexture` alive through this write.
-                unsafe { out_texture.write(texture.get()) };
+                unsafe { out_texture.write(texture.into_raw()) };
                 EzGfxResult::Ok
             }
             Err(status) => status,
@@ -362,6 +370,8 @@ pub unsafe extern "C" fn ez_gfx_texture_get_binding(
         if out_binding.is_null() {
             return EzGfxResult::InvalidArgument;
         }
+        let context = try_handle!(ContextHandle, context);
+        let texture = try_handle!(TextureHandle, texture);
         match ez_gfx::texture_binding(context, texture) {
             Ok(binding) => {
                 // SAFETY: `out_binding` is non-null, and the caller keeps writable, properly aligned storage for one `u32` alive through this write.
@@ -389,6 +399,8 @@ pub unsafe extern "C" fn ez_gfx_texture_get_residency(
         if out_resident_mips.is_null() || out_total_mips.is_null() {
             return EzGfxResult::InvalidArgument;
         }
+        let context = try_handle!(ContextHandle, context);
+        let texture = try_handle!(TextureHandle, texture);
         match ez_gfx::texture_residency(context, texture) {
             Ok((resident, total)) => {
                 // SAFETY: Both output pointers are non-null; the caller keeps aligned writable storage for one `u32` at each pointer alive through these writes.
@@ -406,19 +418,31 @@ pub unsafe extern "C" fn ez_gfx_texture_get_residency(
 #[unsafe(no_mangle)]
 /// Unloads a texture from the context.
 pub extern "C" fn ez_gfx_texture_unload(texture: EzGfxTexture, context: EzGfxContext) {
-    catch_void(|| ez_gfx::unload_texture(context, texture));
+    catch_void(|| {
+        if let (Ok(context), Ok(texture)) = (
+            ContextHandle::from_raw(context),
+            TextureHandle::from_raw(texture),
+        ) {
+            ez_gfx::unload_texture(context, texture);
+        }
+    });
 }
 
 #[unsafe(no_mangle)]
 /// Begins rendering to the specified surface.
 pub extern "C" fn ez_gfx_begin_render(surface: EzGfxSurface, context: EzGfxContext) -> EzGfxResult {
-    catch_status(|| ez_gfx::begin_render(context, surface))
+    catch_status(|| {
+        ez_gfx::begin_render(
+            try_handle!(ContextHandle, context),
+            try_handle!(SurfaceHandle, surface),
+        )
+    })
 }
 
 #[unsafe(no_mangle)]
 /// Begins recording a new frame for the context.
 pub extern "C" fn ez_gfx_frame_begin(context: EzGfxContext) -> EzGfxResult {
-    catch_status(|| ez_gfx::frame_begin(context))
+    catch_status(|| ez_gfx::frame_begin(try_handle!(ContextHandle, context)))
 }
 
 #[unsafe(no_mangle)]
@@ -437,10 +461,11 @@ pub unsafe extern "C" fn ez_gfx_acquire_indirect(
         if out_indirect.is_null() || read_c_string(debug_name).is_err() {
             return EzGfxResult::InvalidArgument;
         }
+        let context = try_handle!(ContextHandle, context);
         match ez_gfx::acquire_indirect(context, capacity) {
             Ok(handle) => {
                 // SAFETY: `out_indirect` is non-null, and the caller keeps writable, properly aligned storage for one `EzGfxIndirectBuffer` alive through this write.
-                unsafe { out_indirect.write(handle.get()) };
+                unsafe { out_indirect.write(handle.into_raw()) };
                 EzGfxResult::Ok
             }
             Err(status) => status,
@@ -466,6 +491,8 @@ pub unsafe extern "C" fn ez_gfx_indirect_write_draw(
         }
         // SAFETY: `command` is non-null, and the caller keeps readable, properly aligned storage for one `EzGfxDrawIndexedCommand` alive through this read.
         let command = unsafe { command.read() };
+        let context = try_handle!(ContextHandle, context);
+        let indirect = try_handle!(IndirectBufferHandle, indirect);
         ez_gfx::write_indirect(
             context,
             indirect,
@@ -488,13 +515,26 @@ pub extern "C" fn ez_gfx_indirect_set_draw_count(
     count: u32,
     context: EzGfxContext,
 ) -> EzGfxResult {
-    catch_status(|| ez_gfx::set_indirect_count(context, indirect, count))
+    catch_status(|| {
+        ez_gfx::set_indirect_count(
+            try_handle!(ContextHandle, context),
+            try_handle!(IndirectBufferHandle, indirect),
+            count,
+        )
+    })
 }
 
 #[unsafe(no_mangle)]
 /// Releases an indirect draw buffer.
 pub extern "C" fn ez_gfx_indirect_release(indirect: EzGfxIndirectBuffer, context: EzGfxContext) {
-    catch_void(|| ez_gfx::release_indirect(context, indirect));
+    catch_void(|| {
+        if let (Ok(context), Ok(indirect)) = (
+            ContextHandle::from_raw(context),
+            IndirectBufferHandle::from_raw(indirect),
+        ) {
+            ez_gfx::release_indirect(context, indirect);
+        }
+    });
 }
 
 #[unsafe(no_mangle)]
@@ -553,6 +593,9 @@ pub unsafe extern "C" fn ez_gfx_render_add_vertex_pipeline(
             Ok(value) => value,
             Err(status) => return status,
         };
+        let context = try_handle!(ContextHandle, context);
+        let shader = try_handle!(ShaderHandle, shader);
+        let indirect = try_handle!(IndirectBufferHandle, indirect);
         ez_gfx::render_add_graphics(context, shader, indirect, &bindings, state, push)
     })
 }
@@ -598,6 +641,8 @@ pub unsafe extern "C" fn ez_gfx_render_add_compute_pipeline(
             Ok(value) => value,
             Err(status) => return status,
         };
+        let context = try_handle!(ContextHandle, context);
+        let shader = try_handle!(ShaderHandle, shader);
         ez_gfx::render_add_compute(
             context,
             shader,
@@ -614,19 +659,24 @@ pub extern "C" fn ez_gfx_graph_enqueue_texture_readback(
     texture: EzGfxTexture,
     context: EzGfxContext,
 ) -> EzGfxResult {
-    catch_status(|| ez_gfx::frame_enqueue_readback(context, texture))
+    catch_status(|| {
+        ez_gfx::frame_enqueue_readback(
+            try_handle!(ContextHandle, context),
+            try_handle!(TextureHandle, texture),
+        )
+    })
 }
 
 #[unsafe(no_mangle)]
 /// Submits the recorded frame to the graphics backend.
 pub extern "C" fn ez_gfx_frame_submit(context: EzGfxContext) -> EzGfxResult {
-    catch_status(|| ez_gfx::frame_submit(context))
+    catch_status(|| ez_gfx::frame_submit(try_handle!(ContextHandle, context)))
 }
 
 #[unsafe(no_mangle)]
 /// Submits the recorded frame and presents its active surface; a failed submission is never followed by presentation.
 pub extern "C" fn ez_gfx_finish_render(context: EzGfxContext) -> EzGfxResult {
-    catch_status(|| ez_gfx::finish_render(context))
+    catch_status(|| ez_gfx::finish_render(try_handle!(ContextHandle, context)))
 }
 
 #[unsafe(no_mangle)]
@@ -648,6 +698,7 @@ pub unsafe extern "C" fn ez_gfx_frame_readback(
         {
             return EzGfxResult::InvalidArgument;
         }
+        let context = try_handle!(ContextHandle, context);
         let bytes = match ez_gfx::frame_readback(context) {
             Ok(bytes) => bytes,
             Err(status) => return status,
@@ -698,10 +749,11 @@ pub unsafe extern "C" fn ez_gfx_surface_create(
         ) else {
             return EzGfxResult::InvalidArgument;
         };
+        let context = try_handle!(ContextHandle, context);
         match ez_gfx::create_surface(context, options) {
             Ok(handle) => {
                 // SAFETY: `out_surface` is non-null, and the caller keeps writable, properly aligned storage for one `EzGfxSurface` alive through this write.
-                unsafe { out_surface.write(handle.get()) };
+                unsafe { out_surface.write(handle.into_raw()) };
                 EzGfxResult::Ok
             }
             Err(status) => status,
@@ -715,7 +767,12 @@ pub extern "C" fn ez_gfx_context_init_device(
     surface: EzGfxSurface,
     context: EzGfxContext,
 ) -> EzGfxResult {
-    catch_status(|| ez_gfx::init_device(context, surface))
+    catch_status(|| {
+        ez_gfx::init_device(
+            try_handle!(ContextHandle, context),
+            try_handle!(SurfaceHandle, surface),
+        )
+    })
 }
 #[unsafe(no_mangle)]
 /// Requests new pixel dimensions for a presentation surface.
@@ -725,7 +782,14 @@ pub extern "C" fn ez_gfx_surface_resize(
     height: u32,
     context: EzGfxContext,
 ) -> EzGfxResult {
-    catch_status(|| ez_gfx::resize_surface(context, surface, width, height))
+    catch_status(|| {
+        ez_gfx::resize_surface(
+            try_handle!(ContextHandle, context),
+            try_handle!(SurfaceHandle, surface),
+            width,
+            height,
+        )
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -744,6 +808,8 @@ pub unsafe extern "C" fn ez_gfx_surface_get_extent(
         if out_width.is_null() || out_height.is_null() {
             return EzGfxResult::InvalidArgument;
         }
+        let context = try_handle!(ContextHandle, context);
+        let surface = try_handle!(SurfaceHandle, surface);
         match ez_gfx::surface_extent(context, surface) {
             Ok((width, height)) => {
                 // SAFETY: Both output pointers are non-null; the caller keeps aligned writable storage for one `u32` at each pointer alive through these writes.
@@ -773,6 +839,8 @@ pub unsafe extern "C" fn ez_gfx_surface_resize_pending(
         if out_pending.is_null() {
             return EzGfxResult::InvalidArgument;
         }
+        let context = try_handle!(ContextHandle, context);
+        let surface = try_handle!(SurfaceHandle, surface);
         match ez_gfx::surface_resize_pending(context, surface) {
             Ok(pending) => {
                 // SAFETY: `out_pending` is non-null, and the caller keeps writable, properly aligned storage for one `i32` alive through this write.
@@ -793,17 +861,28 @@ pub extern "C" fn ez_gfx_surface_set_snapshot_cache(
     enabled: i32,
     context: EzGfxContext,
 ) -> EzGfxResult {
-    catch_status(|| match enabled {
-        0 => ez_gfx::set_snapshot_cache(context, surface, false),
-        1 => ez_gfx::set_snapshot_cache(context, surface, true),
-        _ => EzGfxResult::InvalidArgument,
+    catch_status(|| {
+        let context = try_handle!(ContextHandle, context);
+        let surface = try_handle!(SurfaceHandle, surface);
+        match enabled {
+            0 => ez_gfx::set_snapshot_cache(context, surface, false),
+            1 => ez_gfx::set_snapshot_cache(context, surface, true),
+            _ => EzGfxResult::InvalidArgument,
+        }
     })
 }
 
 #[unsafe(no_mangle)]
 /// Destroys a presentation surface owned by the context.
 pub extern "C" fn ez_gfx_surface_destroy(surface: EzGfxSurface, context: EzGfxContext) {
-    catch_void(|| ez_gfx::destroy_surface(context, surface));
+    catch_void(|| {
+        if let (Ok(context), Ok(surface)) = (
+            ContextHandle::from_raw(context),
+            SurfaceHandle::from_raw(surface),
+        ) {
+            ez_gfx::destroy_surface(context, surface);
+        }
+    });
 }
 
 #[unsafe(no_mangle)]
@@ -823,6 +902,7 @@ pub unsafe extern "C" fn ez_gfx_vertex_heap_create(
             Ok(name) => name,
             Err(status) => return status,
         };
+        let context = try_handle!(ContextHandle, context);
         ez_gfx::create_vertex_heap(context, &name, capacity, stride)
     })
 }
@@ -838,7 +918,7 @@ pub unsafe extern "C" fn ez_gfx_vertex_heap_destroy(
     context: EzGfxContext,
 ) {
     catch_void(|| {
-        if let Ok(name) = read_c_string(name) {
+        if let (Ok(name), Ok(context)) = (read_c_string(name), ContextHandle::from_raw(context)) {
             ez_gfx::destroy_vertex_heap(context, &name);
         }
     });
@@ -859,6 +939,7 @@ pub unsafe extern "C" fn ez_gfx_index_heap_create(
         if read_c_string(debug_name).is_err() {
             return EzGfxResult::InvalidArgument;
         }
+        let context = try_handle!(ContextHandle, context);
         ez_gfx::create_index_heap(context, capacity)
     })
 }
@@ -866,7 +947,11 @@ pub unsafe extern "C" fn ez_gfx_index_heap_create(
 #[unsafe(no_mangle)]
 /// Destroys the context's index heap.
 pub extern "C" fn ez_gfx_index_heap_destroy(context: EzGfxContext) {
-    catch_void(|| ez_gfx::destroy_index_heap(context));
+    catch_void(|| {
+        if let Ok(context) = ContextHandle::from_raw(context) {
+            ez_gfx::destroy_index_heap(context);
+        }
+    });
 }
 
 #[unsafe(no_mangle)]
@@ -891,6 +976,7 @@ pub unsafe extern "C" fn ez_gfx_vertex_upload_indices(
         }
         // SAFETY: `size` is the checked nonzero `count * 4` and does not exceed `EZ_GFX_MAX_BOUNDARY_BYTES`; the caller keeps `data` readable for that many alignment-1 bytes through the upload.
         let bytes = unsafe { core::slice::from_raw_parts(data.cast::<u8>(), size) };
+        let context = try_handle!(ContextHandle, context);
         match ez_gfx::upload_indices(context, count, bytes) {
             Ok(first) => {
                 // SAFETY: `out_start_index` is non-null, and the caller keeps writable, properly aligned storage for one `u32` alive through this write.
@@ -937,6 +1023,7 @@ pub unsafe extern "C" fn ez_gfx_vertex_upload(
         }
         // SAFETY: `size` is the checked nonzero `element_count * element_size` and does not exceed `EZ_GFX_MAX_BOUNDARY_BYTES`; the caller keeps `data` readable for that many alignment-1 bytes through the upload.
         let bytes = unsafe { core::slice::from_raw_parts(data.cast::<u8>(), size) };
+        let context = try_handle!(ContextHandle, context);
         match ez_gfx::upload_vertices(context, &name, element_count, element_size, bytes) {
             Ok(first) => {
                 // SAFETY: `out_start_index` is non-null, and the caller keeps writable, properly aligned storage for one `u32` alive through this write.
@@ -979,10 +1066,11 @@ pub unsafe extern "C" fn ez_gfx_structured_acquire(
             return EzGfxResult::InvalidArgument;
         }
         let size = u64::from(element_size) * u64::from(element_count);
+        let context = try_handle!(ContextHandle, context);
         match ez_gfx::acquire_structured(context, size) {
             Ok(handle) => {
                 // SAFETY: `out_structured` is non-null, and the caller keeps writable, properly aligned storage for one `EzGfxStructuredBuffer` alive through this write.
-                unsafe { out_structured.write(handle.get()) };
+                unsafe { out_structured.write(handle.into_raw()) };
                 EzGfxResult::Ok
             }
             Err(status) => status,
@@ -1015,6 +1103,8 @@ pub unsafe extern "C" fn ez_gfx_structured_write(
         }
         // SAFETY: `data` is non-null and `data_size` is checked against `isize::MAX` and the byte limit; the caller keeps that alignment-1 range readable through the structured write.
         let bytes = unsafe { core::slice::from_raw_parts(data.cast::<u8>(), data_size) };
+        let context = try_handle!(ContextHandle, context);
+        let structured = try_handle!(StructuredBufferHandle, structured);
         ez_gfx::write_structured(context, structured, bytes)
     })
 }
@@ -1025,81 +1115,14 @@ pub extern "C" fn ez_gfx_structured_release(
     structured: EzGfxStructuredBuffer,
     context: EzGfxContext,
 ) {
-    catch_void(|| ez_gfx::release_structured(context, structured));
-}
-
-/// Decodes a packed handle into its context and optional child slot generations.
-///
-/// # Safety
-///
-/// A non-null `out_parts` must address one writable, aligned handle description for this call.
-pub unsafe extern "C" fn ez_gfx_handle_inspect(
-    handle: u64,
-    out_parts: *mut EzGfxHandleParts,
-) -> EzGfxResult {
-    catch_status(|| {
-        if out_parts.is_null() {
-            return EzGfxResult::InvalidArgument;
+    catch_void(|| {
+        if let (Ok(context), Ok(structured)) = (
+            ContextHandle::from_raw(context),
+            StructuredBufferHandle::from_raw(structured),
+        ) {
+            ez_gfx::release_structured(context, structured);
         }
-        let Ok(parts) = PackedHandle::from_raw(handle).and_then(PackedHandle::parts) else {
-            return EzGfxResult::InvalidContext;
-        };
-        let abi = match parts {
-            HandleParts::Context(context) => EzGfxHandleParts {
-                context_slot: context.slot(),
-                context_generation: context.generation(),
-                child_slot: 0,
-                child_generation: 0,
-                is_context: 1,
-                _padding: [0; 3],
-            },
-            HandleParts::Child { owner, child } => EzGfxHandleParts {
-                context_slot: owner.slot(),
-                context_generation: owner.generation(),
-                child_slot: child.slot(),
-                child_generation: child.generation(),
-                is_context: 0,
-                _padding: [0; 3],
-            },
-        };
-        // SAFETY: `out_parts` is non-null, and the caller keeps writable, properly aligned storage for one `EzGfxHandleParts` alive through this write.
-        unsafe { out_parts.write(abi) };
-        EzGfxResult::Ok
-    })
-}
-
-/// Computes the fixed-size semantic identifier for a UTF-8 name.
-///
-/// # Safety
-///
-/// Non-null `name` must be readable for `length` bytes, and non-null `out_id` writable for 16 bytes, for this call.
-pub unsafe extern "C" fn ez_gfx_semantic_id(
-    name: *const u8,
-    length: usize,
-    out_id: *mut u8,
-) -> EzGfxResult {
-    catch_status(|| {
-        if out_id.is_null()
-            || name.is_null()
-            || length == 0
-            || length > EZ_GFX_MAX_BOUNDARY_BYTES
-            || length > isize::MAX as usize
-        {
-            return EzGfxResult::InvalidArgument;
-        }
-        // SAFETY: `length` is checked nonzero and within both the byte and `isize` limits; the caller keeps `name` readable for `length` `u8` values (alignment 1) through UTF-8 validation.
-        let bytes = unsafe { core::slice::from_raw_parts(name, length) };
-        let Ok(name) = core::str::from_utf8(bytes) else {
-            return EzGfxResult::InvalidArgument;
-        };
-        let id = match SemanticId::from_name(name) {
-            Ok(id) => id.bytes(),
-            Err(_) => return EzGfxResult::InvalidArgument,
-        };
-        // SAFETY: `out_id` is non-null, and the caller provides an alignment-1 writable range of `id.len()` bytes that is disjoint from the live local `id` storage through the copy.
-        unsafe { core::ptr::copy_nonoverlapping(id.as_ptr(), out_id, id.len()) };
-        EzGfxResult::Ok
-    })
+    });
 }
 
 fn catch_status(operation: impl FnOnce() -> EzGfxResult) -> EzGfxResult {
@@ -1140,9 +1163,18 @@ fn read_bindings(
             binding.indirect != 0,
             binding.render_target != 0,
         ) {
-            (true, false, false) => ResourceIdentity::Structured(binding.structured),
-            (false, true, false) => ResourceIdentity::Indirect(binding.indirect),
-            (false, false, true) => ResourceIdentity::RenderTarget(binding.render_target),
+            (true, false, false) => ResourceIdentity::Structured(
+                StructuredBufferHandle::from_raw(binding.structured)
+                    .map_err(|_| EzGfxResult::InvalidContext)?,
+            ),
+            (false, true, false) => ResourceIdentity::Indirect(
+                IndirectBufferHandle::from_raw(binding.indirect)
+                    .map_err(|_| EzGfxResult::InvalidContext)?,
+            ),
+            (false, false, true) => ResourceIdentity::RenderTarget(
+                RenderTargetHandle::from_raw(binding.render_target)
+                    .map_err(|_| EzGfxResult::InvalidContext)?,
+            ),
             _ => return Err(EzGfxResult::InvalidArgument),
         };
         bindings.push(PublicBinding { name, resource });

@@ -1,18 +1,19 @@
 use super::{
-    Access, Backend, BufferRange, ContextState, DiagnosticLevel, DynamicPipelineState,
-    ExecutableNode, ExecutionAction, ExecutionError, EzGfxResult, Format, FrameExecutionBackend,
-    FrameExecutionPlan, FrameNativeResource, HashMap, ImageRange, LoadOp,
-    MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext, NativePipeline, NativeShader,
-    NativeSurface, NativeTexture, NodeDesc, PackedHandle, PassInfo, PipelineKey, QueueKind,
-    ResourceAccess, ResourceDesc, ResourceId, ResourceKind, ResourceLifetime, ResourceState,
-    RuntimePhase, ShaderRecord, ShaderStage, StoreOp, TextureId, dx12_bindings,
-    execute_compiled_graph, map_frame, map_hal, map_lifecycle, native_layouts, pipeline_layout_key,
-    result_status, runtime_record, vulkan_bindings, with_context_mut,
+    Access, Backend, BufferRange, ContextHandle, ContextState, DiagnosticLevel,
+    DynamicPipelineState, ExecutableNode, ExecutionAction, ExecutionError, EzGfxResult, Format,
+    FrameExecutionBackend, FrameExecutionPlan, FrameNativeResource, HashMap, ImageRange,
+    IndirectBufferHandle, LoadOp, MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext,
+    NativePipeline, NativeShader, NativeSurface, NativeTexture, NodeDesc, PackedHandle, PassInfo,
+    PipelineKey, QueueKind, ResourceAccess, ResourceDesc, ResourceId, ResourceKind,
+    ResourceLifetime, ResourceState, RuntimePhase, ShaderHandle, ShaderRecord, ShaderStage,
+    StoreOp, TextureHandle, TextureId, dx12_bindings, execute_compiled_graph, map_frame, map_hal,
+    map_lifecycle, native_layouts, pipeline_layout_key, result_status, runtime_record,
+    vulkan_bindings, with_context_mut,
 };
-type NativeTextureMap = HashMap<u64, (TextureId, NativeTexture, u32, u32, u32)>;
+type NativeTextureMap = HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>;
 
 /// Begins frame recording.
-pub fn frame_begin(context: u64) -> EzGfxResult {
+pub fn frame_begin(context: ContextHandle) -> EzGfxResult {
     result_status(with_context_mut(context, |context| {
         context
             .identity
@@ -33,7 +34,7 @@ pub fn frame_begin(context: u64) -> EzGfxResult {
 
 fn intern_buffer_resource(
     context: &mut ContextState,
-    handle: u64,
+    handle: PackedHandle,
 ) -> Result<ResourceId, EzGfxResult> {
     if let Some(resource) = context.frame_resources.get(&handle) {
         return Ok(*resource);
@@ -180,7 +181,7 @@ fn add_binding_accesses(
     bindings: &[ez_gfx_runtime::binding::PublicBinding],
     queue: QueueKind,
     stage: ShaderStage,
-    combined_indirect: Option<u64>,
+    combined_indirect: Option<IndirectBufferHandle>,
 ) -> Result<NodeDesc, EzGfxResult> {
     for requirement in layout.requirements() {
         let binding = bindings
@@ -188,13 +189,13 @@ fn add_binding_accesses(
             .find(|binding| binding.name == requirement.name)
             .ok_or(EzGfxResult::InvalidArgument)?;
         let handle = match binding.resource {
-            ez_gfx_runtime::binding::ResourceIdentity::Structured(handle)
-            | ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle) => handle,
+            ez_gfx_runtime::binding::ResourceIdentity::Structured(handle) => handle.packed(),
+            ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle) => handle.packed(),
             ez_gfx_runtime::binding::ResourceIdentity::RenderTarget(_) => {
                 return Err(EzGfxResult::Unsupported);
             }
         };
-        if combined_indirect == Some(handle) {
+        if combined_indirect.is_some_and(|indirect| indirect.packed() == handle) {
             continue;
         }
         let size = context
@@ -225,9 +226,9 @@ fn add_binding_accesses(
 
 fn intern_texture_resource(
     context: &mut ContextState,
-    texture: u64,
+    texture: TextureHandle,
 ) -> Result<ResourceId, EzGfxResult> {
-    if let Some(resource) = context.frame_resources.get(&texture) {
+    if let Some(resource) = context.frame_resources.get(&texture.packed()) {
         return Ok(*resource);
     }
     let (_, _, width, height, _) = context
@@ -264,7 +265,7 @@ fn intern_texture_resource(
             .set_resource_ready(resource, ready)
             .map_err(|error| map_frame(&error))?;
     }
-    context.frame_resources.insert(texture, resource);
+    context.frame_resources.insert(texture.packed(), resource);
     context
         .frame_native_resources
         .insert(resource, FrameNativeResource::Texture(texture));
@@ -272,9 +273,9 @@ fn intern_texture_resource(
 }
 
 /// Enqueues texture readback in the current frame.
-pub fn frame_enqueue_readback(context: u64, texture: u64) -> EzGfxResult {
+pub fn frame_enqueue_readback(context: ContextHandle, texture: TextureHandle) -> EzGfxResult {
     result_status(with_context_mut(context, |context| {
-        let handle = PackedHandle::from_raw(texture).map_err(|_| EzGfxResult::InvalidContext)?;
+        let handle = texture.packed();
         context
             .identity
             .resolve(handle, ResourceKind::Texture)
@@ -303,7 +304,7 @@ fn graphics_node(
     context: &mut ContextState,
     layout: &ez_gfx_runtime::binding::ReflectedBindings,
     bindings: &[ez_gfx_runtime::binding::PublicBinding],
-    indirect: u64,
+    indirect: IndirectBufferHandle,
     pipeline_layout: ez_gfx_runtime::binding::PipelineLayout,
 ) -> Result<NodeDesc, EzGfxResult> {
     let surface = intern_surface_resource(context)?;
@@ -386,10 +387,10 @@ fn graphics_node(
     });
     let indirect_size = context
         .allocations
-        .get(&indirect)
+        .get(&indirect.packed())
         .map(|(size, _)| *size)
         .ok_or(EzGfxResult::InvalidContext)?;
-    let indirect_resource = intern_buffer_resource(context, indirect)?;
+    let indirect_resource = intern_buffer_resource(context, indirect.packed())?;
     let indirect_state = ResourceState::new(
         QueueKind::Graphics,
         ShaderStage::AllGraphics,
@@ -434,22 +435,20 @@ fn graphics_node(
 
 /// Records an indexed graphics operation.
 pub fn render_add_graphics(
-    context: u64,
-    shader: u64,
-    indirect: u64,
+    context: ContextHandle,
+    shader: ShaderHandle,
+    indirect: IndirectBufferHandle,
     bindings: &[ez_gfx_runtime::binding::PublicBinding],
     state: DynamicPipelineState,
     push_constants: &[u8],
 ) -> EzGfxResult {
     result_status(with_context_mut(context, |context| {
-        let shader_handle =
-            PackedHandle::from_raw(shader).map_err(|_| EzGfxResult::InvalidContext)?;
+        let shader_handle = shader.packed();
         context
             .identity
             .resolve(shader_handle, ResourceKind::Shader)
             .map_err(map_lifecycle)?;
-        let indirect_handle =
-            PackedHandle::from_raw(indirect).map_err(|_| EzGfxResult::InvalidContext)?;
+        let indirect_handle = indirect.packed();
         context
             .identity
             .resolve(indirect_handle, ResourceKind::Indirect)
@@ -459,17 +458,13 @@ pub fn render_add_graphics(
             .shaders
             .get(&shader)
             .ok_or(EzGfxResult::InvalidContext)?;
-        let graphics = record
-            .graphics
-            .as_ref()
-            .ok_or(EzGfxResult::InvalidArgument)?;
         let layout = record
             .runtime
-            .bindings(&graphics.1, ez_gfx_artifact::Stage::Vertex)
+            .bindings(ez_gfx_artifact::Stage::Vertex)
             .and_then(|vertex| {
                 record
                     .runtime
-                    .bindings(&graphics.3, ez_gfx_artifact::Stage::Fragment)
+                    .bindings(ez_gfx_artifact::Stage::Fragment)
                     .and_then(|fragment| vertex.merge(&fragment))
             })
             .map_err(|_| EzGfxResult::InvalidArgument)?;
@@ -512,14 +507,14 @@ pub fn render_add_graphics(
 }
 /// Records a compute dispatch.
 pub fn render_add_compute(
-    context: u64,
-    shader: u64,
+    context: ContextHandle,
+    shader: ShaderHandle,
     groups: [u32; 3],
     bindings: &[ez_gfx_runtime::binding::PublicBinding],
     push_constants: &[u8],
 ) -> EzGfxResult {
     result_status(with_context_mut(context, |context| {
-        let handle = PackedHandle::from_raw(shader).map_err(|_| EzGfxResult::InvalidContext)?;
+        let handle = shader.packed();
         context
             .identity
             .resolve(handle, ResourceKind::Shader)
@@ -529,10 +524,6 @@ pub fn render_add_compute(
             .shaders
             .get(&shader)
             .ok_or(EzGfxResult::InvalidContext)?;
-        let compute = record
-            .compute
-            .as_ref()
-            .ok_or(EzGfxResult::InvalidArgument)?;
         if groups.contains(&0)
             || push_constants.len() > 128
             || !push_constants.len().is_multiple_of(4)
@@ -541,7 +532,7 @@ pub fn render_add_compute(
         }
         let layout = record
             .runtime
-            .bindings(&compute.1, ez_gfx_artifact::Stage::Compute)
+            .bindings(ez_gfx_artifact::Stage::Compute)
             .map_err(|_| EzGfxResult::InvalidArgument)?;
         layout
             .validate(bindings)
@@ -577,18 +568,17 @@ fn validate_binding_handles(
     bindings: &[ez_gfx_runtime::binding::PublicBinding],
 ) -> Result<(), EzGfxResult> {
     for binding in bindings {
-        let (handle, kind) = match binding.resource {
+        let (packed, kind) = match binding.resource {
             ez_gfx_runtime::binding::ResourceIdentity::Structured(handle) => {
-                (handle, ResourceKind::Structured)
+                (handle.packed(), ResourceKind::Structured)
             }
             ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle) => {
-                (handle, ResourceKind::Indirect)
+                (handle.packed(), ResourceKind::Indirect)
             }
             ez_gfx_runtime::binding::ResourceIdentity::RenderTarget(handle) => {
-                (handle, ResourceKind::RenderTarget)
+                (handle.packed(), ResourceKind::RenderTarget)
             }
         };
-        let packed = PackedHandle::from_raw(handle).map_err(|_| EzGfxResult::InvalidContext)?;
         context
             .identity
             .resolve(packed, kind)
@@ -598,7 +588,7 @@ fn validate_binding_handles(
 }
 
 /// Submits the recorded frame.
-pub fn frame_submit(context: u64) -> EzGfxResult {
+pub fn frame_submit(context: ContextHandle) -> EzGfxResult {
     result_status(with_context_mut(context, |context| {
         let result = (|| {
             if context.frame_has_graphics {
@@ -651,7 +641,7 @@ pub fn frame_submit(context: u64) -> EzGfxResult {
 /// # Errors
 ///
 /// Returns an error when the context is invalid or no completed readback is available.
-pub fn frame_readback(context: u64) -> Result<Vec<u8>, EzGfxResult> {
+pub fn frame_readback(context: ContextHandle) -> Result<Vec<u8>, EzGfxResult> {
     with_context_mut(context, |context| {
         if context.last_readback.is_empty() {
             return Err(EzGfxResult::NotReady);

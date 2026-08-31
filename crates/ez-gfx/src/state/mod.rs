@@ -13,7 +13,10 @@ use ez_gfx_backend_vulkan::{
 };
 use ez_gfx_core::{
     Backend,
-    handle::{GenerationalArena, HandleParts, LocalHandle, PackedHandle},
+    handle::{
+        ContextHandle, GenerationalArena, HandleParts, IndirectBufferHandle, LocalHandle,
+        PackedHandle, ShaderHandle, StructuredBufferHandle, SurfaceHandle, TextureHandle,
+    },
 };
 use ez_gfx_hal::{
     AllocationRequest, BufferRange, BufferTransfer, CompletionToken, DynamicPipelineState,
@@ -84,7 +87,7 @@ enum NativePipeline {
 enum PipelineKey {
     Compute {
         backend: Backend,
-        shader: u64,
+        shader: ShaderHandle,
         shader_digest: [u8; 32],
         product: usize,
         entry: String,
@@ -92,7 +95,7 @@ enum PipelineKey {
     },
     Graphics {
         backend: Backend,
-        shader: u64,
+        shader: ShaderHandle,
         shader_digest: [u8; 32],
         vertex_product: usize,
         vertex_entry: String,
@@ -109,7 +112,7 @@ enum PipelineKey {
 }
 
 impl PipelineKey {
-    fn shader(&self) -> u64 {
+    fn shader(&self) -> ShaderHandle {
         // Both variants always carry their owning generational shader handle.
         match self {
             Self::Compute { shader, .. } | Self::Graphics { shader, .. } => *shader,
@@ -155,9 +158,9 @@ struct StagingAllocation {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FrameNativeResource {
-    Buffer(u64),
-    Texture(u64),
-    Surface(u64),
+    Buffer(PackedHandle),
+    Texture(TextureHandle),
+    Surface(SurfaceHandle),
     Depth,
     Index,
 }
@@ -165,28 +168,28 @@ struct ContextState {
     identity: ContextIdentity,
     options: ContextOptions,
     native: NativeContext,
-    surfaces: HashMap<u64, SurfaceRecord>,
-    allocations: HashMap<u64, (u64, NativeAllocation)>,
-    shaders: HashMap<u64, ShaderRecord>,
-    indirects: HashMap<u64, IndexedIndirectBuffer>,
-    textures: HashMap<u64, (TextureId, NativeTexture, u32, u32, u32)>,
+    surfaces: HashMap<SurfaceHandle, SurfaceRecord>,
+    allocations: HashMap<PackedHandle, (u64, NativeAllocation)>,
+    shaders: HashMap<ShaderHandle, ShaderRecord>,
+    indirects: HashMap<IndirectBufferHandle, IndexedIndirectBuffer>,
+    textures: HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>,
     pipelines: HashMap<PipelineKey, NativePipeline>,
     graphics_format: Option<u32>,
     texture_registry: TextureRegistry,
-    texture_ready: HashMap<u64, CompletionToken>,
+    texture_ready: HashMap<TextureHandle, CompletionToken>,
     geometry: GeometryManager,
     vertex_heaps: HashMap<String, GeometryAllocation>,
     index_heap: Option<GeometryAllocation>,
     staging: Vec<StagingAllocation>,
     frame: FrameRecorder,
-    frame_resources: HashMap<u64, ResourceId>,
+    frame_resources: HashMap<PackedHandle, ResourceId>,
     frame_native_resources: HashMap<ResourceId, FrameNativeResource>,
     frame_index: Option<ResourceId>,
     frame_surface: Option<ResourceId>,
     frame_depth: Option<ResourceId>,
     frame_has_graphics: bool,
     last_readback: Vec<u8>,
-    active_surface: Option<u64>,
+    active_surface: Option<SurfaceHandle>,
     frame_presented: bool,
     observability: Observability,
 }
@@ -215,8 +218,8 @@ pub use shader::*;
 pub use texture::*;
 
 fn with_surface_mut<T>(
-    context: u64,
-    surface: u64,
+    context: ContextHandle,
+    surface: SurfaceHandle,
     operation: impl FnOnce(&mut SurfaceRecord) -> Result<T, EzGfxResult>,
 ) -> Result<T, EzGfxResult> {
     with_context_mut(context, |context| {
@@ -224,7 +227,7 @@ fn with_surface_mut<T>(
             .identity
             .check_thread_and_health()
             .map_err(map_lifecycle)?;
-        let handle = PackedHandle::from_raw(surface).map_err(|_| EzGfxResult::InvalidContext)?;
+        let handle = surface.packed();
         context
             .identity
             .resolve(handle, ResourceKind::Surface)
@@ -238,10 +241,10 @@ fn with_surface_mut<T>(
     })
 }
 fn with_context_mut<T>(
-    raw: u64,
+    context: ContextHandle,
     operation: impl FnOnce(&mut ContextState) -> Result<T, EzGfxResult>,
 ) -> Result<T, EzGfxResult> {
-    let (local, _) = context_local(raw)?;
+    let (local, _) = context_local(context)?;
     let mut arena = CONTEXTS.lock().map_err(|_| EzGfxResult::NativeFailure)?;
     let context = arena
         .get_mut(local)
@@ -250,8 +253,8 @@ fn with_context_mut<T>(
         .ok_or(EzGfxResult::InvalidContext)?;
     operation(context)
 }
-fn context_local(raw: u64) -> Result<(LocalHandle, PackedHandle), EzGfxResult> {
-    let packed = PackedHandle::from_raw(raw).map_err(|_| EzGfxResult::InvalidContext)?;
+fn context_local(handle: ContextHandle) -> Result<(LocalHandle, PackedHandle), EzGfxResult> {
+    let packed = handle.packed();
 
     match packed.parts().map_err(|_| EzGfxResult::InvalidContext)? {
         HandleParts::Context(local) => Ok((local, packed)),

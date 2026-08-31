@@ -2,49 +2,37 @@
 
 #![forbid(unsafe_code)]
 use core::fmt;
-use ez_gfx_artifact::{Artifact, ArtifactError, Provenance, Stage, Target, TargetVariant};
+use ez_gfx_artifact::{
+    AppleArchitecture, ApplePlatform, Artifact, ArtifactError, CompatibilityVersion,
+    MetalCompatibility, Provenance, Stage, Target, TargetCompatibility, TargetVariant,
+};
 use ez_gfx_core::{Backend, SemanticError, SemanticGraph, TargetLayout};
+use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 type CanonicalParameter = (String, Option<String>, Option<String>);
 type CanonicalParameters = BTreeMap<(String, Stage), Vec<CanonicalParameter>>;
 
-static INVOCATION_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct InvocationDirectory(PathBuf);
+struct InvocationDirectory(tempfile::TempDir);
 
 impl InvocationDirectory {
+    /// Creates a uniquely named invocation directory that is removed on drop.
     ///
     /// # Errors
     ///
-    /// Returns an I/O error if the parent or invocation directory cannot be created, including after 1,024 name collisions.
+    /// Returns an I/O error if the parent or temporary directory cannot be created.
     fn create(parent: &Path) -> Result<Self, CompilerError> {
         fs::create_dir_all(parent).map_err(CompilerError::Io)?;
-        for _ in 0..1024 {
-            let counter = INVOCATION_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = parent.join(format!(".ez-gfx-compile-{}-{counter}", std::process::id()));
-            match fs::create_dir(&path) {
-                Ok(()) => return Ok(Self(path)),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(CompilerError::Io(error)),
-            }
-        }
-        Err(CompilerError::Io(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "cannot reserve compiler invocation directory",
-        )))
-    }
-}
-
-impl Drop for InvocationDirectory {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        tempfile::Builder::new()
+            .prefix(".ez-gfx-compile-")
+            .tempdir_in(parent)
+            .map(Self)
+            .map_err(CompilerError::Io)
     }
 }
 
@@ -165,6 +153,129 @@ impl TargetRequest {
         })
     }
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Selects whether a build emits portable MSL source or an Apple metallib.
+pub enum MetalOutput {
+    /// Produces MSL without requiring Apple tools.
+    Source,
+    /// Produces a metallib and requires the Apple `xcrun` toolchain.
+    Library,
+}
+
+#[derive(Clone, Debug)]
+/// Compiler configuration and request derived from one shader manifest.
+pub struct ShaderBuildPlan {
+    /// Compiler version and output-limit configuration.
+    pub config: CompilerConfig,
+    /// Fully resolved compilation request.
+    pub request: CompilationRequest,
+}
+
+#[derive(Deserialize)]
+struct ShaderManifest {
+    source: PathBuf,
+    output: PathBuf,
+    #[serde(default)]
+    required_version: String,
+    #[serde(default)]
+    include_dirs: Vec<PathBuf>,
+    #[serde(default)]
+    defines: Vec<String>,
+    #[serde(default)]
+    semantic_metadata: serde_json::Value,
+    #[serde(default)]
+    toolchain: String,
+    #[serde(default)]
+    apple_toolchain: String,
+    targets: Vec<ManifestTarget>,
+}
+
+#[derive(Deserialize)]
+struct ManifestTarget {
+    target: String,
+    stage: String,
+    entry: String,
+    profile: String,
+}
+
+/// Parses a shader manifest into a host-specific compilation plan.
+///
+/// Relative source and include paths are resolved from `workspace_root`; the
+/// manifest output path is validated but replaced by `output_dir`.
+///
+/// # Errors
+///
+/// Returns an error for malformed JSON, missing output names, unknown target or
+/// stage names, or invalid target requests.
+pub fn plan_manifest(
+    manifest: &[u8],
+    workspace_root: &Path,
+    output_dir: &Path,
+    metal: MetalOutput,
+) -> Result<ShaderBuildPlan, CompilerError> {
+    let manifest: ShaderManifest = serde_json::from_slice(manifest)
+        .map_err(|_| CompilerError::InvalidRequest("manifest JSON"))?;
+    if manifest.output.file_name().is_none() {
+        return Err(CompilerError::InvalidRequest("manifest output"));
+    }
+
+    let targets = manifest
+        .targets
+        .into_iter()
+        .map(|target| {
+            let format = match target.target.as_str() {
+                "spirv" => Target::Spirv,
+                "dxil" => Target::Dxil,
+                "msl" | "metallib" => match metal {
+                    MetalOutput::Source => Target::Msl,
+                    MetalOutput::Library => Target::Metallib,
+                },
+                _ => return Err(CompilerError::InvalidRequest("manifest target")),
+            };
+            let stage = match target.stage.as_str() {
+                "vertex" => Stage::Vertex,
+                "fragment" => Stage::Fragment,
+                "compute" => Stage::Compute,
+                "geometry" => Stage::Geometry,
+                "tess-control" => Stage::TessellationControl,
+                "tess-eval" => Stage::TessellationEvaluation,
+                _ => return Err(CompilerError::InvalidRequest("manifest stage")),
+            };
+            TargetRequest::new(format, stage, target.entry, target.profile)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut request = CompilationRequest::new(
+        resolve_manifest_path(workspace_root, &manifest.source),
+        output_dir.to_path_buf(),
+        targets,
+    );
+    request.include_dirs = manifest
+        .include_dirs
+        .iter()
+        .map(|path| resolve_manifest_path(workspace_root, path))
+        .collect();
+    request.defines = manifest.defines;
+    request.semantic_metadata = serde_json::to_vec(&manifest.semantic_metadata)
+        .map_err(|_| CompilerError::InvalidRequest("metadata JSON"))?;
+    request.toolchain = manifest.toolchain;
+    request.apple_toolchain = manifest.apple_toolchain;
+    request.release_complete = metal == MetalOutput::Library;
+
+    Ok(ShaderBuildPlan {
+        config: CompilerConfig::new(manifest.required_version),
+        request,
+    })
+}
+
+fn resolve_manifest_path(root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else if path == Path::new(".") {
+        root.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
 
 #[derive(Clone, Debug)]
 /// Inputs, target matrix, metadata, and provenance used to compile one shader source file.
@@ -233,11 +344,15 @@ impl CompilationRequest {
                 return Err(CompilerError::InvalidRequest("duplicate variant"));
             }
         }
-        let mut logical = BTreeSet::new();
-        for t in &self.targets {
-            logical.insert((t.entry_point.as_str(), t.stage));
+        let mut stages = BTreeMap::new();
+        for target in &self.targets {
+            if let Some(entry) = stages.insert(target.stage, target.entry_point.as_str())
+                && entry != target.entry_point
+            {
+                return Err(CompilerError::DuplicateStage(target.stage));
+            }
         }
-        for &(entry, stage) in &logical {
+        for (&stage, &entry) in &stages {
             for target in [Target::Spirv, Target::Dxil] {
                 if !self
                     .targets
@@ -478,6 +593,78 @@ fn collect_parameters<'a>(
     parameters
 }
 
+fn parse_compatibility_version(value: &str) -> Result<CompatibilityVersion, CompilerError> {
+    // Profiles may prefix the numeric version (`metal_3_0`); absent minor versions mean `.0`.
+    let value = value.trim();
+    let mut components = value.split(['.', '_']);
+    let major = components
+        .find_map(|component| component.parse::<u16>().ok())
+        .ok_or(CompilerError::InvalidRequest("compatibility version"))?;
+    let minor = components
+        .find_map(|component| component.parse::<u16>().ok())
+        .unwrap_or(0);
+    Ok(CompatibilityVersion::new(major, minor))
+}
+
+fn apple_tool_output(args: &[&str]) -> Result<String, CompilerError> {
+    let output = Command::new("xcrun")
+        .args(args)
+        .output()
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => CompilerError::AppleToolNotFound("xcrun".into()),
+            _ => CompilerError::Io(error),
+        })?;
+    if !output.status.success() {
+        return Err(CompilerError::ToolFailed(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim().to_owned())
+        .map_err(|_| CompilerError::InvalidRequest("Apple tool output"))
+}
+
+fn target_compatibility(
+    target: &TargetRequest,
+    request: &CompilationRequest,
+) -> Result<TargetCompatibility, CompilerError> {
+    if target.target != Target::Metallib {
+        return TargetCompatibility::portable(target.target).map_err(CompilerError::Artifact);
+    }
+    let architecture = match std::env::consts::ARCH {
+        "aarch64" => AppleArchitecture::Aarch64,
+        "x86_64" => AppleArchitecture::X86_64,
+        _ => return Err(CompilerError::InvalidRequest("Apple architecture")),
+    };
+    let sdk = parse_compatibility_version(&apple_tool_output(&[
+        "--sdk",
+        "macosx",
+        "--show-sdk-version",
+    ])?)?;
+    let minimum_os = std::env::var("MACOSX_DEPLOYMENT_TARGET")
+        .ok()
+        .map(|value| parse_compatibility_version(&value))
+        .transpose()?
+        .unwrap_or(sdk);
+    let language = parse_compatibility_version(&target.profile)?;
+    let toolchain = if request.apple_toolchain.is_empty() || request.apple_toolchain == "unknown" {
+        apple_tool_output(&["metal", "--version"])?
+    } else {
+        request.apple_toolchain.clone()
+    };
+    Ok(TargetCompatibility::MetalLibrary {
+        metal: MetalCompatibility {
+            platform: ApplePlatform::MacOs,
+            architecture,
+            minimum_os,
+            sdk,
+            language,
+            library: CompatibilityVersion::new(1, 0),
+            toolchain,
+        },
+    })
+}
+
 fn compile_targets(
     linked: &shader_slang::ComponentType,
     request: &CompilationRequest,
@@ -591,8 +778,8 @@ fn compile_targets(
             let invocation_dir =
                 invocation_dir.ok_or(CompilerError::InvalidRequest("Metal output directory"))?;
             let stem = format!("{}-{index}", target.entry_point);
-            let msl = invocation_dir.0.join(format!("{stem}.metal"));
-            let metallib = invocation_dir.0.join(format!("{stem}.metallib"));
+            let msl = invocation_dir.0.path().join(format!("{stem}.metal"));
+            let metallib = invocation_dir.0.path().join(format!("{stem}.metallib"));
             fs::write(&msl, &bytes).map_err(CompilerError::Io)?;
             let result = build_metallib(msl.clone(), metallib.clone());
             let _ = fs::remove_file(&msl);
@@ -611,6 +798,7 @@ fn compile_targets(
                 target.stage,
                 &target.entry_point,
                 "ez-gfx-v1",
+                target_compatibility(target, request)?,
                 bytes,
             )
             .map_err(CompilerError::Artifact)?,
@@ -672,6 +860,8 @@ fn run_apple(c: &mut Command) -> Result<(), CompilerError> {
 pub enum CompilerError {
     /// The compilation request is malformed or incomplete.
     InvalidRequest(&'static str),
+    /// One stage names more than one logical entry point.
+    DuplicateStage(Stage),
     /// A required compilation target was not requested.
     MissingTarget(Target),
     /// An entry point and stage lack output for a required target.
@@ -711,3 +901,25 @@ impl fmt::Display for CompilerError {
     }
 }
 impl std::error::Error for CompilerError {}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn compatibility_version_accepts_profiles_and_rejects_missing_numbers() {
+        assert_eq!(
+            parse_compatibility_version("metal_3_0").unwrap(),
+            CompatibilityVersion::new(3, 0)
+        );
+        assert_eq!(
+            parse_compatibility_version("15.2").unwrap(),
+            CompatibilityVersion::new(15, 2)
+        );
+        assert_eq!(
+            parse_compatibility_version("15").unwrap(),
+            CompatibilityVersion::new(15, 0)
+        );
+        assert!(parse_compatibility_version("metal").is_err());
+    }
+}

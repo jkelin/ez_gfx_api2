@@ -32,7 +32,7 @@ Source evidence: `TODO.md` ("Add precompiled shader modules with reflection meta
 
 #### Architecture, integration, and applicability
 
-Emit one `.ezshader` with a fixed little-endian header and bounded section table. Sections contain canonical reflection, per-target/per-entry SPIR-V, DXIL, MSL/metallib, compiler/toolchain identity, interface/source hashes, and optional debug data. Runtime validates then selects a target without linking Slang. Reflection carries target declarations independently of optimized bytecode.
+Emit one `.ezgfxshader` with a fixed little-endian frame around a bounded `rkyv` payload. The payload contains canonical reflection, stage-grouped target products, compiler/toolchain provenance, and one internal entry point per stage. Runtime verifies framing, digest, bytechecked archive structure, and semantic coverage before selecting a target without linking Slang.
 
 #### Evidence, tradeoffs, and failure modes
 
@@ -82,7 +82,7 @@ No candidate has comparable load-time, RSS, file-open, or artifact-size measurem
 
 | Rank | Candidate | Hard constraints | Startup/memory | Reliability/operations | Implementation cost | Evidence status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | Versioned sectioned bundle | Passes zero-Slang runtime and complete multi-target artifact | mmap/copy behavior and parse cost unknown | One hashable artifact; custom parser/versioning risk | Moderate custom format/tooling | Mature container patterns sourced |
+| 1 | Framed, validated `rkyv` | Passes zero-Slang runtime and complete multi-target artifact | Requires one bounded aligned validation copy | One hashable artifact; explicit format cutover | Small fixed frame plus maintained archive crate | Implemented and contract-tested |
 | 2 | Schema-generated bundle | Passes | Direct access claimed by tool, end-to-end benefit unknown | Generated evolution contract; verifier/tool dependency | Schema/codegen overhead | Format properties sourced; workload missing |
 | 3 | Manifest plus sidecars | Passes only with confined, hashed, atomic packaging | Extra file/parse cost unknown and incomparable | Highest partial-deployment/path risk | Easiest inspection and native-tool integration | Standards sourced; workload missing |
 
@@ -90,10 +90,10 @@ No candidate has comparable load-time, RSS, file-open, or artifact-size measurem
 
 **Selected: `S-P-006-versioned-sectioned-bundle`.**
 
-Define a fixed little-endian header and bounded section table for canonical reflection, target/entry blobs, compiler identity, interface/source hashes, and optional debug sections. Runtime owns only a defensive parser and backend loader; it never silently invokes Slang. Explicit target declarations remain authoritative even when bytecode reflection differs.
+Define a fixed 56-byte little-endian frame containing magic, format version, reserved flags, payload length, and BLAKE3 digest around one bounded `rkyv` payload. Format v3 bytechecks aligned bytes and validates archived collection, string, metadata, provenance, and variant ceilings before owned deserialization. Runtime then validates every required backend/stage reflection once, carries typed binding and pipeline-layout products, and rejects missing, ambiguous, malformed, conflicting, or invalid texture-heap data before native shader creation. It never silently invokes Slang.
 
-**Rejected:** sidecars are rejected because partial deployment and synchronization undermine a shipping asset boundary. FlatBuffers is not selected because its generated access model does not remove the need for an outer blob table, integrity checks, and semantic validation; it becomes viable if format-evolution tooling demonstrably outweighs the extra dependency.
+**Rejected:** sidecars remain rejected because partial deployment and synchronization undermine a shipping asset boundary. A custom section parser and generated schema pipeline add owned evolution machinery already covered by framed `rkyv`.
 
-**Assumptions and risks:** a custom schema can be kept small and versioned; hashes detect corruption, not authenticity. Parser bugs, integer overflow, stale reflection, and backend blob mismatch are critical risks. Performance is unknown.
+**Assumptions and risks:** format evolution uses explicit version cutovers; hashes detect corruption, not authenticity. Archive validation, integer bounds, stale reflection, and backend product mismatch remain critical.
 
 **Validation:** property/fuzz test truncated, overlapping, duplicated, oversized, unknown, and corrupted sections; round-trip compiler artifacts; reject incompatible required versions; load every target without Slang present; benchmark cold/warm load, opens, allocations, peak RSS, and artifact size on specified OS/storage.

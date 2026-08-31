@@ -20,6 +20,24 @@ fn request_requires_per_entry_backend_coverage() {
 }
 
 #[test]
+fn request_rejects_multiple_entry_points_for_one_stage() {
+    let request = CompilationRequest::new(
+        PathBuf::from("shader.slang"),
+        PathBuf::from("out"),
+        vec![
+            TargetRequest::new(Target::Spirv, Stage::Vertex, "first", "spirv_1_5").unwrap(),
+            TargetRequest::new(Target::Dxil, Stage::Vertex, "second", "sm_6_5").unwrap(),
+            TargetRequest::new(Target::Msl, Stage::Vertex, "first", "metal_3_0").unwrap(),
+        ],
+    );
+
+    assert!(matches!(
+        request.validate(),
+        Err(CompilerError::DuplicateStage(Stage::Vertex))
+    ));
+}
+
+#[test]
 fn release_request_requires_metallib_not_msl() {
     let request = CompilationRequest::new(
         PathBuf::from("shader.slang"),
@@ -107,7 +125,6 @@ fn in_process_compute_smoke_when_native_slang_is_available() {
 struct StructuredBufferAttribute { string name; };
 
 [StructuredBuffer("values")]
-[[vk::binding(2, 0)]]
 RWStructuredBuffer<uint> values;
 
 [shader("compute")]
@@ -150,7 +167,7 @@ void main(uint3 id: SV_DispatchThreadID) { values[id.x] += 1; }
                 .find(|parameter| parameter["semantic_name"] == "values")
                 .unwrap();
             assert_eq!(binding["api_kind"], "structured");
-            assert_eq!(binding["binding_index"], 2);
+            assert_eq!(binding["binding_index"], 0);
             let dxil = metadata["reflections"]
                 .as_array()
                 .unwrap()

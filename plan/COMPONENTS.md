@@ -43,9 +43,9 @@ A HAL allocation interface carries size, alignment, memory class, mapping, retir
 
 Offline Slang compilation through `shader-slang`/slang-rs emits native SPIR-V, DXIL, and Metal products plus canonical metadata. Target attributes are captured before optimization and validated per target.
 
-### P-006: Precompiled shader container and reflection — Versioned sectioned bundle
+### P-006: Precompiled shader container and reflection — Framed, validated `rkyv`
 
-A bounded, versioned `.ezshader` artifact stores reflection, target blobs, compiler identity, hashes, and optional debug sections. Runtime validates and loads it without JIT/compiler fallback.
+A bounded, versioned `.ezgfxshader` file uses a fixed little-endian frame around one bytechecked `rkyv` payload. It stores stage-grouped target products, reflection, compiler provenance, and an execution digest. Runtime validates and loads it without JIT/compiler fallback.
 
 ### P-007: Pipeline caching and descriptors — Global table plus frame-local arenas
 
@@ -105,7 +105,7 @@ A Vulkan vertical path proves contracts and an end-to-end snapshot first, follow
 
 ### P-021: Cross-backend shader execution semantics — Target-native layouts with canonical semantic ABI
 
-One Slang source uses stable semantic resource IDs and a documented source convention, while `.ezshader` retains complete target-native binding, packing, entry, and specialization layouts. Runtime never assumes identical physical slots or aggregate layouts. DXIL variants target Shader Model 6.5 and use explicit descriptor tables/root descriptors; no 6.6-only direct heap indexing is part of the semantic ABI.
+One root Slang module defines stable semantic resource declarations, while `.ezgfxshader` retains target-native products and reflection. Each stage owns exactly one internal entry point; callers load without naming it. Runtime never assumes identical physical slots or aggregate layouts. DXIL variants target Shader Model 6.5 and use explicit descriptor tables/root descriptors; no 6.6-only direct heap indexing is part of the semantic ABI.
 
 ### P-022: Backend, device, and capability admission — Single modern semantic floor
 
@@ -121,7 +121,7 @@ Runtime imports/exports bounded, validated, backend-specific cache envelopes. Ho
 
 ### P-025: Metal shader artifact production — Offline metallib variants
 
-Offline tooling converts Slang-generated MSL through Apple tools into metadata-qualified `.metallib` variants stored in `.ezshader`. Runtime deterministically selects and loads a compatible library without source compilation; Metal binary archives remain separate derived PSO caches.
+Offline tooling converts Slang-generated MSL through Apple tools into `.metallib` products stored in `.ezgfxshader`; non-Apple builds retain portable MSL for coverage. Runtime selects a compatible product without source compilation, and Metal binary archives remain separate derived PSO caches.
 
 ### P-026: Runtime threading and event delivery — Host-polled bounded event queue
 
@@ -158,7 +158,7 @@ Target-native release CI builds pinned sources and publishes separate runtime/FF
 
 ### Offline shader to runtime draw
 
-The compiler receives one Slang source and entries, assigns canonical semantic resource IDs, emits target-native layouts with SPIR-V and Shader Model 6.5 DXIL products, and invokes Apple tools for compatible metallib variants. It writes a bounded `.ezshader` whose execution sections, provenance, and digests are complete. Runtime validates and chooses the target section without Slang or source compilation; the host/package boundary applies its authenticity policy. Pipelines bind semantic IDs through target layouts, graph readiness becomes queue waits, and HAL records/submits. Compiler/legalization/tool/metadata failures prevent publication; malformed or incompatible artifacts fail before backend calls.
+The compiler receives a backend-agnostic Slang source importing the root shared module, assigns canonical semantic resource IDs, emits target-native SPIR-V and Shader Model 6.5 DXIL products, and invokes Apple tools for metallib on Apple hosts. It writes a bounded `.ezgfxshader` whose framed `rkyv` payload contains one entry point per stage, target products, reflection, provenance, and a BLAKE3 digest. Runtime bytechecks and semantically validates the payload before choosing backend/stage products without Slang or source compilation; the host/package boundary applies authenticity policy.
 
 ### Asynchronous texture load
 
@@ -336,7 +336,7 @@ Semantic-ID collision, cross-target type/access mismatch, specialization/packing
 
 ### Responsibility and boundary
 
-Own bounded `.ezshader` parsing, schema/digest/provenance validation, semantic-ID to target-layout resolution, PSO keys/native cache objects, stable bindless registry, frame descriptor arenas, and cache-envelope import/export. It owns no compiler execution, filesystem, authenticity keys, or graph scheduling.
+Own bounded `.ezgfxshader` framing, bytecheck/schema/digest/provenance validation, semantic-ID to target-layout resolution, PSO keys/native cache objects, stable bindless registry, frame descriptor arenas, and cache-envelope import/export. It owns no compiler execution, filesystem, authenticity keys, or graph scheduling.
 
 ### Problems and selected solutions
 
@@ -348,7 +348,7 @@ Validated artifact loader; canonical semantic graph -> selected target layout/PS
 
 ### Data and persistence
 
-`.ezshader` files and host cache blobs are externally durable, bounded inputs. Runtime owns read-only parsed artifacts, live PSOs/native cache objects, stable tables, and frame arenas. Hosts own authentication and cache storage/locking/quota/atomicity; no runtime cache filesystem exists.
+`.ezgfxshader` files and host cache blobs are externally durable, bounded inputs. Runtime owns validated artifact data, live PSOs/native cache objects, stable tables, and frame arenas. Hosts own authentication and cache storage/locking/quota/atomicity; no runtime cache filesystem exists.
 
 ### Technology
 

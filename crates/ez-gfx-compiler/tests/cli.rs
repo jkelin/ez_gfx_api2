@@ -14,7 +14,7 @@ fn cli_compiles_development_manifest_when_native_slang_exists() {
         "[shader(\"compute\")] [numthreads(1,1,1)] void main() {}",
     )
     .unwrap();
-    let output = root.join("shader.ezshader");
+    let output = root.join("shader.ezgfxshader");
     let manifest = root.join("manifest.json");
     let value = serde_json::json!({"source": source, "output": output, "development": true, "targets": [
         {"target":"spirv","stage":"compute","entry":"main","profile":"spirv_1_5"},
@@ -41,12 +41,37 @@ fn cli_compiles_development_manifest_when_native_slang_exists() {
 }
 
 #[test]
-fn cli_rejects_missing_manifest() {
+fn cli_help_describes_the_manifest_contract() {
     let result = Command::new(env!("CARGO_BIN_EXE_ez-gfx-compile"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.contains("Usage:") && stdout.contains("<MANIFEST>"));
+    assert!(stdout.contains("Shader compilation manifest"));
+}
+
+#[test]
+fn cli_rejects_missing_or_extra_manifest_arguments() {
+    for arguments in [vec![], vec!["first.json", "second.json"]] {
+        let result = Command::new(env!("CARGO_BIN_EXE_ez-gfx-compile"))
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("Usage:"));
+    }
+}
+
+#[test]
+fn cli_reports_manifest_read_context() {
+    let result = Command::new(env!("CARGO_BIN_EXE_ez-gfx-compile"))
+        .arg("does-not-exist.json")
         .output()
         .unwrap();
     assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("usage"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("read shader manifest"));
 }
 
 #[test]

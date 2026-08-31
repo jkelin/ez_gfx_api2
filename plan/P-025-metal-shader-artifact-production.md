@@ -2,7 +2,7 @@
 
 ## Problem
 
-Select the Metal product stored in `.ezshader`: MSL source, offline metallib variants, or both. The choice changes runtime compilation, Apple-tool requirements, compatibility, size, and fallback behavior.
+Select the Metal product stored in `.ezgfxshader`: MSL source, offline metallib variants, or both. The choice changes runtime compilation, Apple-tool requirements, compatibility, size, and fallback behavior.
 
 ## Prompt context
 
@@ -33,7 +33,7 @@ One Slang source targets Vulkan, DX12, and Metal. Shipping runtimes must not bun
 
 #### Approach and integration
 
-Slang emits MSL offline; the compiler product invokes Apple's `metal` compiler to IR and links one or more `.metallib` products. `.ezshader` sections carry metallib bytes plus SDK/platform, minimum OS, Metal language/compiler, architecture/variant, entry-point, and source/interface hashes. Runtime selects a compatible section and calls Metal library-from-data/URL APIs; it never compiles source. Metal binary archives remain a separate derived PSO cache owned by P-024.
+Slang emits MSL offline; the compiler product invokes Apple's `metal` compiler to IR and links one or more `.metallib` products. `.ezgfxshader` carries metallib bytes plus stage entry identity and compiler provenance. Runtime selects a compatible product and calls Metal library-from-data APIs; it never compiles source. Metal binary archives remain a separate derived PSO cache owned by P-024.
 
 Apple documents `metal -> .ir`, optional `metal-ar`, then `metal -> .metallib`; it also notes command-line Metal tools for Windows use the same options, though supported SDK/licensing/distribution must still be proven.
 
@@ -59,7 +59,7 @@ Fast predictable runtime and no source exposure, but tighter SDK/OS compatibilit
 
 #### Approach and integration
 
-Slang emits final, validated MSL and canonical reflection offline. `.ezshader` stores MSL, entry points, required Metal language/version/capabilities, hashes, and compile options. Runtime uses `MTLDevice` source-library creation, reports compiler diagnostics, then creates pipelines; it ships no Slang. P-024 may persist Metal binary archives to reduce later pipeline work.
+Slang emits final, validated MSL and canonical reflection offline. `.ezgfxshader` stores MSL, entry points, required Metal language/version/capabilities, hashes, and compile options. Runtime uses `MTLDevice` source-library creation, reports compiler diagnostics, then creates pipelines; it ships no Slang. P-024 may persist Metal binary archives to reduce later pipeline work.
 
 #### Constraint applicability
 
@@ -117,7 +117,9 @@ The Apple archive size example is not a comparable metallib benchmark and is not
 
 **Select S-P-025-offline-metallib: store Apple-toolchain-built metallib variants only.**
 
-Offline tooling asks Slang for MSL, compiles it to IR, and links `.metallib` products with Apple tools. `.ezshader` carries compatible variants and platform/SDK/minimum-OS/Metal-language/compiler/entry/interface metadata. Runtime deterministically selects and loads a compatible library; absence fails before pipeline creation. Metal binary archives remain derived PSO caches under P-024, not shader libraries.
+Offline tooling asks Slang for MSL and, on Apple hosts, compiles and links `.metallib` products. `.ezgfxshader` carries the Metal product with stage entry identity and provenance. Runtime deterministically selects and loads a compatible library; absence fails before pipeline creation. Non-Apple builds emit MSL for target coverage, not hosted Metal runtime. Metal binary archives remain derived PSO caches under P-024.
+
+**Implementation status:** Complete in artifact format v3. Each metallib records Apple platform, CPU architecture, minimum OS, build SDK, Metal language version, metallib contract version, and Apple toolchain identity. The compiler obtains SDK/toolchain inputs from `xcrun`, derives architecture and deployment minimum from the build environment, and emits explicit Vulkan SPIR-V and DX12 Shader Model contracts alongside Metal metadata. Runtime filters incompatible metallibs before reflection or native library creation and deterministically prefers the compatible product with the newest minimum OS and SDK. Missing compatibility fails closed; MSL remains development-only and is never a runtime fallback.
 
 Reject runtime MSL and hybrid fallback because they move shader compilation and related nondeterministic failure into shipping runtime, contrary to the strongest reading of the inherited precompiled-shader/compiler split. Reconsider only if Apple deployment coverage cannot be achieved with supported offline variants and the user explicitly permits Metal's runtime compiler while still excluding Slang.
 

@@ -1,7 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ez_gfx_artifact::Stage;
-use ez_gfx_core::{Backend, capability::MAX_BINDLESS_SAMPLED_TEXTURES};
+use ez_gfx_core::{
+    Backend,
+    capability::MAX_BINDLESS_SAMPLED_TEXTURES,
+    handle::{IndirectBufferHandle, RenderTargetHandle, StructuredBufferHandle},
+};
 use serde::Deserialize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -16,14 +20,14 @@ pub enum BindingKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// Associates an opaque runtime handle with its GPU resource kind.
+/// Associates a typed runtime handle with its GPU resource kind.
 pub enum ResourceIdentity {
     /// A structured buffer handle.
-    Structured(u64),
+    Structured(StructuredBufferHandle),
     /// An indirect-command buffer handle.
-    Indirect(u64),
+    Indirect(IndirectBufferHandle),
     /// A render-target handle.
-    RenderTarget(u64),
+    RenderTarget(RenderTargetHandle),
 }
 
 impl ResourceIdentity {
@@ -33,15 +37,6 @@ impl ResourceIdentity {
             Self::Structured(_) => BindingKind::Structured,
             Self::Indirect(_) => BindingKind::Indirect,
             Self::RenderTarget(_) => BindingKind::RenderTarget,
-        }
-    }
-
-    /// Returns the opaque runtime handle.
-    pub const fn handle(&self) -> u64 {
-        match *self {
-            Self::Structured(handle) | Self::Indirect(handle) | Self::RenderTarget(handle) => {
-                handle
-            }
         }
     }
 }
@@ -110,6 +105,31 @@ pub struct PipelineLayout {
     depth_required: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Carries one fully parsed and semantically validated stage reflection.
+pub struct ValidatedStageReflection {
+    stage: Stage,
+    bindings: ReflectedBindings,
+    pipeline_layout: PipelineLayout,
+}
+
+impl ValidatedStageReflection {
+    /// Returns the reflected stage.
+    pub const fn stage(&self) -> Stage {
+        self.stage
+    }
+
+    /// Returns validated named resource bindings.
+    pub const fn bindings(&self) -> &ReflectedBindings {
+        &self.bindings
+    }
+
+    /// Returns the validated pipeline layout.
+    pub const fn pipeline_layout(&self) -> &PipelineLayout {
+        &self.pipeline_layout
+    }
+}
+
 impl PipelineLayout {
     /// Parses and validates the pipeline layout for a backend entry point and stage.
     ///
@@ -123,17 +143,23 @@ impl PipelineLayout {
         stage: Stage,
     ) -> Result<Self, BindingError> {
         let reflection = matching_reflection(metadata, backend, entry, stage)?;
-        let texture_heap = reflection
-            .reflection
-            .texture_heap
-            .map(|heap| TextureHeapLayout {
-                space: heap.binding_space,
-                binding: heap.binding_index,
-                capacity: heap.capacity,
-                argument_stride: heap.argument_stride,
-                texture_argument_offset: heap.texture_argument_offset,
-                sampler_argument_offset: heap.sampler_argument_offset,
-            });
+        Self::from_reflection(&reflection)
+    }
+
+    fn from_reflection(reflection: &TargetReflection) -> Result<Self, BindingError> {
+        let texture_heap =
+            reflection
+                .reflection
+                .texture_heap
+                .as_ref()
+                .map(|heap| TextureHeapLayout {
+                    space: heap.binding_space,
+                    binding: heap.binding_index,
+                    capacity: heap.capacity,
+                    argument_stride: heap.argument_stride,
+                    texture_argument_offset: heap.texture_argument_offset,
+                    sampler_argument_offset: heap.sampler_argument_offset,
+                });
         if let Some(heap) = texture_heap
             && (heap.capacity == 0
                 || heap.capacity > MAX_TEXTURE_HEAP_CAPACITY
@@ -174,22 +200,31 @@ impl ReflectedBindings {
         stage: Stage,
     ) -> Result<Self, BindingError> {
         let reflection = matching_reflection(metadata, backend, entry, stage)?;
+        Self::from_reflection(&reflection, backend)
+    }
 
+    fn from_reflection(
+        reflection: &TargetReflection,
+        backend: Backend,
+    ) -> Result<Self, BindingError> {
         let mut names = BTreeSet::new();
         let mut slots = BTreeSet::new();
         let mut requirements = Vec::with_capacity(reflection.reflection.parameters.len());
-        for parameter in reflection.reflection.parameters {
-            let Some(name) = parameter.semantic_name else {
-                continue;
+        for parameter in &reflection.reflection.parameters {
+            let classified = match (&parameter.semantic_name, &parameter.api_kind) {
+                (None, None) => continue,
+                (Some(name), Some(kind)) => (name, kind),
+                _ => return Err(BindingError::InvalidMetadata),
             };
-            let Some(kind) = parameter.api_kind.as_deref().and_then(parse_kind) else {
-                continue;
+            let (name, kind) = classified;
+            let Some(kind) = parse_kind(kind) else {
+                return Err(BindingError::InvalidMetadata);
             };
             if name.is_empty() || name.len() > 255 || name.as_bytes().contains(&0) {
                 return Err(BindingError::InvalidMetadata);
             }
             if !names.insert(name.clone()) {
-                return Err(BindingError::Duplicate(name));
+                return Err(BindingError::Duplicate(name.clone()));
             }
             if parameter.descriptor_count == 0 || parameter.descriptor_count > 2 {
                 return Err(BindingError::InvalidMetadata);
@@ -214,7 +249,7 @@ impl ReflectedBindings {
                 }
             }
             requirements.push(BindingRequirement {
-                name,
+                name: name.clone(),
                 kind,
                 space: parameter.binding_space,
                 binding: parameter.binding_index,
@@ -308,6 +343,52 @@ impl ReflectedBindings {
             requirements,
         })
     }
+}
+
+/// Parses metadata once and validates exactly one reflection for every selected stage.
+///
+/// # Errors
+///
+/// Returns an error for malformed metadata, absent or ambiguous stage reflection, invalid
+/// bindings, invalid texture heaps, or conflicting graphics-stage resource layouts.
+pub fn validate_stage_reflections(
+    metadata: &[u8],
+    backend: Backend,
+    stages: &[(Stage, &str)],
+) -> Result<Vec<ValidatedStageReflection>, BindingError> {
+    let envelope: MetadataEnvelope =
+        serde_json::from_slice(metadata).map_err(|_| BindingError::InvalidMetadata)?;
+    let target = target_name(backend);
+    let mut validated = Vec::with_capacity(stages.len());
+    for &(stage, entry) in stages {
+        if entry.is_empty() || entry.len() > 1024 || entry.as_bytes().contains(&0) {
+            return Err(BindingError::InvalidMetadata);
+        }
+        let stage_name = stage_name(stage);
+        let mut matches = envelope.reflections.iter().filter(|reflection| {
+            reflection.target == target
+                && reflection.entry == entry
+                && reflection.stage == stage_name
+        });
+        let reflection = matches.next().ok_or(BindingError::MissingReflection)?;
+        if matches.next().is_some() {
+            return Err(BindingError::AmbiguousReflection);
+        }
+        validated.push(ValidatedStageReflection {
+            stage,
+            bindings: ReflectedBindings::from_reflection(reflection, backend)?,
+            pipeline_layout: PipelineLayout::from_reflection(reflection)?,
+        });
+    }
+
+    let vertex = validated.iter().find(|value| value.stage == Stage::Vertex);
+    let fragment = validated
+        .iter()
+        .find(|value| value.stage == Stage::Fragment);
+    if let (Some(vertex), Some(fragment)) = (vertex, fragment) {
+        vertex.bindings.merge(&fragment.bindings)?;
+    }
+    Ok(validated)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -415,11 +496,7 @@ fn matching_reflection(
     }
     let envelope: MetadataEnvelope =
         serde_json::from_slice(metadata).map_err(|_| BindingError::InvalidMetadata)?;
-    let target = match backend {
-        Backend::Vulkan => "Spirv",
-        Backend::Dx12 => "Dxil",
-        Backend::Metal => "Metallib",
-    };
+    let target = target_name(backend);
     let stage = stage_name(stage);
     let mut matches = envelope.reflections.into_iter().filter(|reflection| {
         reflection.target == target && reflection.entry == entry && reflection.stage == stage
@@ -429,6 +506,14 @@ fn matching_reflection(
         return Err(BindingError::AmbiguousReflection);
     }
     Ok(reflection)
+}
+
+const fn target_name(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Vulkan => "Spirv",
+        Backend::Dx12 => "Dxil",
+        Backend::Metal => "Metallib",
+    }
 }
 
 const fn stage_name(stage: Stage) -> &'static str {

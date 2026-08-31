@@ -4,7 +4,9 @@ use std::{
     thread::{self, ThreadId},
 };
 
-use ez_gfx_core::handle::{GenerationalArena, HandleError, HandleParts, LocalHandle, PackedHandle};
+use ez_gfx_core::handle::{
+    ContextHandle, GenerationalArena, HandleError, HandleParts, LocalHandle, PackedHandle,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -66,8 +68,11 @@ impl ContextIdentity {
     /// # Panics
     ///
     /// Panics only if the validated owner cannot be repacked as a context handle.
-    pub fn context_handle(&self) -> PackedHandle {
-        PackedHandle::context(self.owner).expect("owner was validated at construction")
+    pub fn context_handle(&self) -> ContextHandle {
+        ContextHandle::from_packed(
+            PackedHandle::context(self.owner).expect("owner was validated at construction"),
+        )
+        .expect("context packing preserves context shape")
     }
     /// Returns the current context health with acquire ordering.
     pub fn health(&self) -> ContextHealth {

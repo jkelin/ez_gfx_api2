@@ -1,10 +1,37 @@
 //! Binary artifact encoding and validation contract tests.
 use ez_gfx_artifact::{
-    Artifact, ArtifactError, MAX_ARTIFACT_BYTES, Provenance, Stage, Target, TargetVariant,
+    AppleArchitecture, ApplePlatform, Artifact, ArtifactError, CompatibilityVersion,
+    MAX_ARTIFACT_BYTES, MetalCompatibility, Provenance, Stage, Target, TargetCompatibility,
+    TargetVariant,
 };
 
+fn compatibility(target: Target) -> TargetCompatibility {
+    match target {
+        Target::Metallib => TargetCompatibility::MetalLibrary {
+            metal: MetalCompatibility {
+                platform: ApplePlatform::MacOs,
+                architecture: AppleArchitecture::Aarch64,
+                minimum_os: CompatibilityVersion::new(14, 0),
+                sdk: CompatibilityVersion::new(15, 0),
+                language: CompatibilityVersion::new(3, 0),
+                library: CompatibilityVersion::new(1, 0),
+                toolchain: "apple-clang-16".into(),
+            },
+        },
+        _ => TargetCompatibility::portable(target).unwrap(),
+    }
+}
+
 fn variant(target: Target, stage: Stage, entry: &str, profile: &str, bytes: u8) -> TargetVariant {
-    TargetVariant::new(target, stage, entry, profile, vec![bytes]).unwrap()
+    TargetVariant::new(
+        target,
+        stage,
+        entry,
+        profile,
+        compatibility(target),
+        vec![bytes],
+    )
+    .unwrap()
 }
 
 fn sample() -> Artifact {
@@ -25,6 +52,24 @@ fn round_trip_preserves_digest_and_variants() {
     let artifact = sample();
     let bytes = artifact.encode().unwrap();
     assert_eq!(Artifact::decode(&bytes).unwrap(), artifact);
+}
+
+#[test]
+fn artifact_allows_only_one_entry_point_per_stage() {
+    let variants = vec![
+        variant(Target::Spirv, Stage::Vertex, "vs_a", "spirv_1_5", 1),
+        variant(Target::Dxil, Stage::Vertex, "vs_b", "sm_6_5", 2),
+        variant(Target::Metallib, Stage::Vertex, "vs_a", "metallib_3_0", 3),
+    ];
+
+    assert!(matches!(
+        Artifact::new(
+            br"{}".to_vec(),
+            Provenance::new("s", "v", vec![], "t"),
+            variants
+        ),
+        Err(ArtifactError::DuplicateStage(Stage::Vertex))
+    ));
 }
 
 #[test]
@@ -74,7 +119,14 @@ fn rejects_duplicate_exact_variant_and_invalid_bounds() {
         Err(ArtifactError::DuplicateVariant)
     ));
     assert!(matches!(
-        TargetVariant::new(Target::Spirv, Stage::Vertex, "", "p", vec![1]),
+        TargetVariant::new(
+            Target::Spirv,
+            Stage::Vertex,
+            "",
+            "p",
+            compatibility(Target::Spirv),
+            vec![1],
+        ),
         Err(ArtifactError::InvalidEntryPoint)
     ));
     assert!(matches!(
@@ -84,37 +136,48 @@ fn rejects_duplicate_exact_variant_and_invalid_bounds() {
 }
 
 #[test]
-fn rejects_truncation_and_overlap() {
+fn framed_payload_rejects_truncation_version_length_and_invalid_archive() {
     let bytes = sample().encode().unwrap();
     assert!(matches!(
         Artifact::decode(&bytes[..bytes.len() - 1]),
         Err(ArtifactError::Truncated)
     ));
-    let mut overlap = bytes;
-    overlap[52..60].copy_from_slice(&0u64.to_le_bytes());
+
+    let mut wrong_version = bytes.clone();
+    wrong_version[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(matches!(
-        Artifact::decode(&overlap),
-        Err(ArtifactError::InvalidSection)
+        Artifact::decode(&wrong_version),
+        Err(ArtifactError::UnsupportedVersion(u32::MAX))
+    ));
+
+    let mut wrong_length = bytes.clone();
+    wrong_length[16..24].copy_from_slice(&0_u64.to_le_bytes());
+    assert!(matches!(
+        Artifact::decode(&wrong_length),
+        Err(ArtifactError::InvalidHeader)
+    ));
+
+    let mut invalid_archive = bytes;
+    invalid_archive[56..].fill(0xff);
+    let digest = blake3::hash(&invalid_archive[56..]);
+    invalid_archive[24..56].copy_from_slice(digest.as_bytes());
+    assert!(matches!(
+        Artifact::decode(&invalid_archive),
+        Err(ArtifactError::InvalidArchive)
     ));
 }
 
 #[test]
-fn digest_covers_metadata_and_provenance() {
+fn digest_covers_the_complete_archived_payload() {
     let original = sample().encode().unwrap();
-    for field in [0usize, 1usize] {
-        let mut bytes = original.clone();
-        let section = 52 + field * 16;
-        let offset = usize::try_from(u64::from_le_bytes(
-            bytes[section..section + 8].try_into().unwrap(),
-        ))
-        .unwrap();
-        bytes[offset + if field == 0 { 1 } else { 5 }] ^= 1;
-        assert!(matches!(
-            Artifact::decode(&bytes),
-            Err(ArtifactError::DigestMismatch)
-        ));
-    }
+    let mut bytes = original.clone();
+    bytes[56] ^= 1;
+    assert!(matches!(
+        Artifact::decode(&bytes),
+        Err(ArtifactError::DigestMismatch)
+    ));
+
     let mut changed = sample();
     changed.provenance.options.push("-g".into());
-    assert_ne!(changed.encode().unwrap()[20..52], original[20..52]);
+    assert_ne!(changed.encode().unwrap()[24..56], original[24..56]);
 }

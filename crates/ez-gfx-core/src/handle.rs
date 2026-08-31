@@ -22,6 +22,10 @@ pub enum HandleError {
     GenerationOutOfRange,
     /// Slot and generation fields form an invalid combination.
     Malformed,
+    /// A resource handle was supplied where a context handle was required.
+    ExpectedContext,
+    /// A context handle was supplied where a resource handle was required.
+    ExpectedResource,
     /// The handle generation no longer matches the arena slot.
     Stale,
     /// The arena cannot allocate another slot.
@@ -173,6 +177,106 @@ impl PackedHandle {
         }
     }
 }
+
+macro_rules! define_typed_handle {
+    ($name:ident, $expected:pat, $error:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+        #[repr(transparent)]
+        pub struct $name(PackedHandle);
+
+        impl $name {
+            /// Validates a raw packed value and its context/resource shape.
+            ///
+            /// # Errors
+            ///
+            /// Returns a handle decoding error for zero, malformed, or shape-mismatched values.
+            pub fn from_raw(raw: u64) -> Result<Self, HandleError> {
+                // Zero is rejected before a typed value can cross a safe interface.
+                Self::from_packed(PackedHandle::from_raw(raw)?)
+            }
+
+            /// Validates the context/resource shape of an already decoded packed handle.
+            ///
+            /// # Errors
+            ///
+            /// Returns an error when the packed handle has the wrong shape.
+            pub fn from_packed(handle: PackedHandle) -> Result<Self, HandleError> {
+                match handle.parts()? {
+                    $expected => Ok(Self(handle)),
+                    _ => Err(HandleError::$error),
+                }
+            }
+
+            /// Returns the validated packed representation for arena machinery.
+            pub const fn packed(self) -> PackedHandle {
+                self.0
+            }
+
+            /// Returns the nonzero C-compatible wire value.
+            pub const fn into_raw(self) -> u64 {
+                self.0.get()
+            }
+        }
+
+        impl From<$name> for PackedHandle {
+            fn from(handle: $name) -> Self {
+                handle.packed()
+            }
+        }
+
+        impl TryFrom<PackedHandle> for $name {
+            type Error = HandleError;
+
+            fn try_from(handle: PackedHandle) -> Result<Self, Self::Error> {
+                Self::from_packed(handle)
+            }
+        }
+    };
+}
+
+define_typed_handle!(
+    ContextHandle,
+    HandleParts::Context(_),
+    ExpectedContext,
+    "A validated graphics-context handle."
+);
+define_typed_handle!(
+    SurfaceHandle,
+    HandleParts::Child { .. },
+    ExpectedResource,
+    "A validated presentation-surface handle."
+);
+define_typed_handle!(
+    ShaderHandle,
+    HandleParts::Child { .. },
+    ExpectedResource,
+    "A validated shader handle."
+);
+define_typed_handle!(
+    IndirectBufferHandle,
+    HandleParts::Child { .. },
+    ExpectedResource,
+    "A validated indirect-command-buffer handle."
+);
+define_typed_handle!(
+    StructuredBufferHandle,
+    HandleParts::Child { .. },
+    ExpectedResource,
+    "A validated structured-buffer handle."
+);
+define_typed_handle!(
+    TextureHandle,
+    HandleParts::Child { .. },
+    ExpectedResource,
+    "A validated texture handle."
+);
+define_typed_handle!(
+    RenderTargetHandle,
+    HandleParts::Child { .. },
+    ExpectedResource,
+    "A validated render-target handle."
+);
 
 fn validate_local(
     handle: LocalHandle,

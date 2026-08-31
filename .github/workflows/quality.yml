@@ -4,26 +4,163 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  VULKAN_SDK_VERSION: 1.4.341.1
+
 jobs:
-  quality:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, windows-2025, macos-14]
-    runs-on: ${{ matrix.os }}
+  policy:
+    name: Policy and platform-neutral tests
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: clippy,rustfmt
-      - name: Install Vulkan build prerequisites
-        if: matrix.os == 'ubuntu-24.04'
-        run: sudo apt-get update && sudo apt-get install --yes libvulkan-dev
+      - name: Install pinned Vulkan SDK with Slang
+        uses: jakoch/install-vulkan-sdk-action@37effcfa045411f8bfbbda26df2fd1b3bf3436fa # v1.6.0
+        with:
+          vulkan_version: ${{ env.VULKAN_SDK_VERSION }}
+          cache: true
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run strict workspace Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Check tracked Rust source sizes
         run: cargo run -p xtask -- source-lines
-      - name: Run workspace tests
-        run: cargo test --workspace
+      - name: Run platform-neutral tests
+        run: >-
+          cargo test
+          -p ez-gfx-core
+          -p ez-gfx
+          -p ez-gfx-hal
+          -p ez-gfx-runtime
+          -p ez-gfx-artifact
+          -p ez-gfx-assets
+          -p ez-gfx-compiler
+          -p ez-gfx-ffi
+          -p xtask
+      - name: Test example logic and generated shader artifacts
+        run: |
+          cargo test -p ez-gfx-examples --bins
+          cargo test -p ez-gfx-examples --test shader_artifacts
+
+  backends:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux Vulkan (Lavapipe; native examples compile-only)
+            os: ubuntu-24.04
+            backend: vulkan-linux
+          - name: Windows Vulkan (SwiftShader native runtime)
+            os: windows-2025
+            backend: vulkan-windows
+          - name: Windows DX12 (unit tests; native examples compile-only)
+            os: windows-2025
+            backend: dx12
+          - name: macOS Metal (native runtime)
+            os: macos-14
+            backend: metal
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Install Linux Vulkan loader, tools, and Lavapipe
+        if: matrix.backend == 'vulkan-linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libvulkan-dev mesa-vulkan-drivers vulkan-tools
+      - name: Install pinned Vulkan SDK, Slang, and Windows software Vulkan
+        if: matrix.backend != 'vulkan-linux'
+        uses: jakoch/install-vulkan-sdk-action@37effcfa045411f8bfbbda26df2fd1b3bf3436fa # v1.6.0
+        with:
+          vulkan_version: ${{ env.VULKAN_SDK_VERSION }}
+          install_swiftshader: ${{ matrix.backend == 'vulkan-windows' }}
+          cache: true
+      - name: Compile ABI v18 header as C11 and C++17
+        shell: bash
+        run: |
+          printf '#include "ez_gfx_api.h"\nint main(void) { return EZ_GFX_ABI_VERSION == 18u ? 0 : 1; }\n' > "$RUNNER_TEMP/ez_gfx_header.c"
+          printf '#include "ez_gfx_api.h"\nstatic_assert(EZ_GFX_ABI_VERSION == 18u); int main() { return 0; }\n' > "$RUNNER_TEMP/ez_gfx_header.cpp"
+          clang -std=c11 -Werror -fsyntax-only -Iinclude "$RUNNER_TEMP/ez_gfx_header.c"
+          clang++ -std=c++17 -Werror -Wno-ignored-attributes -fsyntax-only -Iinclude "$RUNNER_TEMP/ez_gfx_header.cpp"
+
+
+      # The implementation currently exposes only Win32 Vulkan surfaces, so Linux
+      # proves Lavapipe availability but explicitly compiles, rather than faking, runtime coverage.
+      - name: Require Linux Lavapipe capability
+        if: matrix.backend == 'vulkan-linux'
+        env:
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        run: vulkaninfo --summary
+      - name: Test Linux Vulkan backend; compile unsupported native runtime suites
+        if: matrix.backend == 'vulkan-linux'
+        run: |
+          cargo test -p ez-gfx-backend-vulkan --lib
+          cargo test -p ez-gfx-backend-vulkan --test native_init --no-run
+          cargo test -p ez-gfx-examples --test smoke --no-run
+          cargo build -p ez-gfx-backend-vulkan
+
+      - name: Require Windows software Vulkan capability
+        if: matrix.backend == 'vulkan-windows'
+        env:
+          VK_DRIVER_FILES: C:\swiftshader\vk_swiftshader_icd.json
+        run: vulkaninfo --summary
+      - name: Test Windows Vulkan backend and native example scene suite
+        if: matrix.backend == 'vulkan-windows'
+        env:
+          VK_DRIVER_FILES: C:\swiftshader\vk_swiftshader_icd.json
+        run: |
+          cargo test -p ez-gfx-backend-vulkan --lib
+          cargo test -p ez-gfx-backend-vulkan --test native_init
+          cargo test -p ez-gfx-examples --test smoke -- --test-threads=1
+          cargo test -p ez-gfx-ffi --test pso_smoke --no-run
+          cargo test -p ez-gfx-ffi --test texture_residency --no-run
+          cargo build -p ez-gfx-backend-vulkan
+
+      # GitHub-hosted Windows runners do not guarantee a D3D12 feature-level 12.1
+      # adapter. Backend unit tests execute; native GPU and example suites compile only.
+      - name: Test DX12 units and boundary; compile unsupported native runtime suites
+        if: matrix.backend == 'dx12'
+        run: |
+          cargo test -p ez-gfx-backend-dx12 --lib
+          cargo test -p ez-gfx-backend-dx12 --test native_init rejects_a_null_hwnd_before_swapchain_creation -- --exact
+          cargo test -p ez-gfx-backend-dx12 --test native_init --no-run
+          cargo test -p ez-gfx-examples --test smoke --no-run
+          cargo test -p ez-gfx-ffi --test pso_smoke --no-run
+          cargo build -p ez-gfx-backend-dx12
+
+      - name: Test native Metal backend, FFI, and example scene suite
+        if: matrix.backend == 'metal'
+        run: |
+          cargo test -p ez-gfx-backend-metal --lib
+          cargo test -p ez-gfx-ffi --test metal_present
+          cargo test -p ez-gfx-examples --test smoke -- --test-threads=1
+          cargo build -p ez-gfx-backend-metal
+
+      - name: Build FFI
+        run: cargo build -p ez-gfx-ffi
+      - name: Build and link C structured cube
+        if: runner.os == 'Windows'
+        run: |
+          cargo build -p ez-gfx-compiler --bin ez-gfx-compile
+          cmake -S examples/c/structured_cube -B target/c-examples/structured_cube-build
+          cmake --build target/c-examples/structured_cube-build --config Debug
+      - name: Run C structured cube with SwiftShader
+        if: matrix.backend == 'vulkan-windows'
+        env:
+          VK_DRIVER_FILES: C:\swiftshader\vk_swiftshader_icd.json
+        shell: bash
+        run: |
+          target/c-examples/structured_cube-build/Debug/structured_cube.exe \
+            --backend vulkan \
+            --artifact target/c-examples/structured_cube-build/Debug/structured_cube.ezgfxshader \
+            --max-frames 1 \
+            --snapshot target/c-examples/structured-cube-vulkan.rgba
+          test "$(wc -c < target/c-examples/structured-cube-vulkan.rgba)" -eq 1228800

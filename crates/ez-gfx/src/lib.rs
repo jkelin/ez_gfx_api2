@@ -5,18 +5,20 @@ mod state;
 
 pub use api::*;
 pub use ez_gfx_artifact::Stage;
-pub use ez_gfx_core::handle::{HandleParts, PackedHandle};
+pub use ez_gfx_core::handle::{
+    ContextHandle, IndirectBufferHandle, RenderTargetHandle, ShaderHandle, StructuredBufferHandle,
+    SurfaceHandle, TextureHandle,
+};
 pub use ez_gfx_core::{Backend, SemanticId};
 pub use ez_gfx_hal::{DynamicPipelineState, SamplerAddressMode, SamplerFilter, TextureSamplerDesc};
 pub use ez_gfx_runtime::binding::{PublicBinding, ResourceIdentity};
 pub use ez_gfx_runtime::indirect::DrawIndexedCommand;
-pub use ez_gfx_runtime::shader::ShaderRequest;
 pub use ez_gfx_runtime::texture::TextureSource;
 pub use ez_gfx_runtime::{ContextOptions, SurfaceOptions, SurfacePlatform};
 pub use state::*;
 
 /// Submits the recorded frame and presents its active surface; a failed submission is never followed by presentation.
-pub fn finish_render(context: u64) -> EzGfxResult {
+pub fn finish_render(context: ContextHandle) -> EzGfxResult {
     submit_then_present(|| frame_submit(context), || present(context))
 }
 

@@ -1,23 +1,25 @@
 use super::{
     Backend, ContextState, ExecutableNode, ExecutionAction, EzGfxResult, FrameExecutionPlan,
     FrameNativeResource, HashMap, MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext,
-    NativePipeline, NativeShader, NativeSurface, NativeTexture, NativeTextureMap, PipelineKey,
-    ResourceId, ShaderRecord, dx12_bindings, map_hal, native_layouts, pipeline_layout_key,
+    NativePipeline, NativeShader, NativeSurface, NativeTexture, NativeTextureMap, PackedHandle,
+    PipelineKey, ResourceId, ShaderHandle, ShaderRecord, dx12_bindings, map_hal, native_layouts,
+    pipeline_layout_key,
 };
 
 struct DxActionState<'a> {
-    allocations: &'a HashMap<u64, (u64, NativeAllocation)>,
+    allocations: &'a HashMap<PackedHandle, (u64, NativeAllocation)>,
     textures: &'a NativeTextureMap,
     pipelines: &'a HashMap<PipelineKey, NativePipeline>,
     resources: &'a HashMap<ResourceId, FrameNativeResource>,
     index: Option<&'a ez_gfx_backend_dx12::native::NativeAllocation>,
+    index_size: u64,
     extent: (u32, u32),
 }
 
 // Unsupported shader variants fail without inserting a partial pipeline-cache entry.
 fn prepare_dx12_pipelines(
     native: &mut ez_gfx_backend_dx12::native::NativeContext,
-    shaders: &HashMap<u64, ShaderRecord>,
+    shaders: &HashMap<ShaderHandle, ShaderRecord>,
     pipelines: &mut HashMap<PipelineKey, NativePipeline>,
     payloads: &[ExecutableNode],
 ) -> Result<Vec<Option<PipelineKey>>, EzGfxResult> {
@@ -219,11 +221,10 @@ fn dx12_actions<'a>(
                         push_constants,
                         ..
                     } => {
-                        let NativeAllocation::Dx12(indirect) = &state
+                        let (indirect_size, NativeAllocation::Dx12(indirect)) = state
                             .allocations
-                            .get(indirect)
+                            .get(&indirect.packed())
                             .ok_or(EzGfxResult::InvalidContext)?
-                            .1
                         else {
                             return Err(EzGfxResult::NativeFailure);
                         };
@@ -241,7 +242,9 @@ fn dx12_actions<'a>(
                                 height: state.extent.1,
                                 pipeline,
                                 index_buffer: state.index.ok_or(EzGfxResult::NotReady)?,
+                                index_size: state.index_size,
                                 indirect_buffer: indirect,
+                                indirect_size: *indirect_size,
                                 draw_count: *draw_count,
                                 push_constants,
                                 bindings: &binding_sets[index_node],
@@ -302,10 +305,12 @@ pub(super) fn execute_dx12_frame_plan(
     let capture = surface
         .as_ref()
         .is_some_and(|surface| surface.state.snapshot_cache());
-    let index = match context.index_heap.as_ref().map(|heap| &heap.allocation) {
-        Some(NativeAllocation::Dx12(index)) => Some(index),
-        Some(_) => return Err(EzGfxResult::NativeFailure),
-        None => None,
+    let (index, index_size) = match context.index_heap.as_ref() {
+        Some(heap) => match &heap.allocation {
+            NativeAllocation::Dx12(index) => (Some(index), heap.size),
+            NativeAllocation::Vulkan(_) => return Err(EzGfxResult::NativeFailure),
+        },
+        None => (None, 0),
     };
     if surface
         .as_ref()
@@ -348,6 +353,7 @@ pub(super) fn execute_dx12_frame_plan(
         pipelines: &context.pipelines,
         resources: &context.frame_native_resources,
         index,
+        index_size,
         extent,
     };
     let actions = dx12_actions(&state, plan, payloads, &binding_sets, &pipeline_keys)?;

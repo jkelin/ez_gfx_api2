@@ -46,6 +46,7 @@ pub use lifecycle::{LifecycleCallbacks, LifecycleConfig, run};
 )]
 pub use observability::{ObservationCounts, drain_bounded};
 
+use anyhow::Context as _;
 use std::{ffi::OsString, path::Path, process::Command, time::Instant};
 /// Captured terminal frame and neutral observability totals.
 #[derive(Debug)]
@@ -134,7 +135,7 @@ pub struct ProgramReport {
 pub fn run_program(
     identity: &str,
     backend: &str,
-    run: impl FnOnce(Option<u32>, Option<BenchmarkConfig>) -> Result<Option<ProgramReport>, String>,
+    run: impl FnOnce(Option<u32>, Option<BenchmarkConfig>) -> anyhow::Result<Option<ProgramReport>>,
 ) {
     let requested_limit = max_frames_from_env().unwrap_or_else(|error| exit_config(error));
     let benchmark = benchmark_from_env().unwrap_or_else(|error| exit_config(error));
@@ -168,47 +169,47 @@ pub fn run_program(
     }
 }
 
-fn exit_config(error: String) -> ! {
+fn exit_config(error: anyhow::Error) -> ! {
     eprintln!("{error}");
     std::process::exit(2)
 }
 
 /// Reads an optional environment flag that accepts only `0` or `1`.
-pub fn env_flag(name: &str) -> Result<bool, String> {
+pub fn env_flag(name: &str) -> anyhow::Result<bool> {
     match std::env::var(name) {
         Ok(value) => parse_env_flag(name, Some(&value)),
         Err(std::env::VarError::NotPresent) => parse_env_flag(name, None),
-        Err(error) => Err(format!("{name}: {error}")),
+        Err(error) => Err(error).with_context(|| name.to_owned()),
     }
 }
 
-fn parse_env_flag(name: &str, value: Option<&str>) -> Result<bool, String> {
+fn parse_env_flag(name: &str, value: Option<&str>) -> anyhow::Result<bool> {
     match value {
         None | Some("0") => Ok(false),
         Some("1") => Ok(true),
-        Some(_) => Err(format!("{name} must be 0 or 1")),
+        Some(_) => Err(anyhow::anyhow!("{name} must be 0 or 1")),
     }
 }
 
 /// Reads the optional positive frame cap; malformed and zero values are errors.
-pub fn max_frames_from_env() -> Result<Option<u32>, String> {
+pub fn max_frames_from_env() -> anyhow::Result<Option<u32>> {
     match std::env::var("EZ_GFX_EXAMPLE_MAX_FRAMES") {
         Ok(value) => {
             let frames = value
                 .parse::<u32>()
-                .map_err(|_| "EZ_GFX_EXAMPLE_MAX_FRAMES must be a positive integer".to_owned())?;
+                .context("EZ_GFX_EXAMPLE_MAX_FRAMES must be a positive integer")?;
             if frames == 0 {
-                return Err("EZ_GFX_EXAMPLE_MAX_FRAMES must be positive".to_owned());
+                anyhow::bail!("EZ_GFX_EXAMPLE_MAX_FRAMES must be positive");
             }
             Ok(Some(frames))
         }
         Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(error) => Err(format!("EZ_GFX_EXAMPLE_MAX_FRAMES: {error}")),
+        Err(error) => Err(error).context("EZ_GFX_EXAMPLE_MAX_FRAMES"),
     }
 }
 
 /// Parses benchmark settings while preserving the historical defaults and opt-in flag.
-pub fn benchmark_from_env() -> Result<Option<BenchmarkConfig>, String> {
+pub fn benchmark_from_env() -> anyhow::Result<Option<BenchmarkConfig>> {
     if std::env::var("EZ_GFX_EXAMPLE_BENCHMARK").ok().as_deref() != Some("1") {
         return Ok(None);
     }
@@ -219,12 +220,12 @@ pub fn benchmark_from_env() -> Result<Option<BenchmarkConfig>, String> {
 }
 
 /// Includes one uncaptured terminal frame so the snapshot cache is populated outside timing.
-pub fn benchmark_frame_limit(config: BenchmarkConfig) -> Result<u32, String> {
+pub fn benchmark_frame_limit(config: BenchmarkConfig) -> anyhow::Result<u32> {
     config
         .warmup_frames
         .checked_add(config.measured_frames)
         .and_then(|frames| frames.checked_add(1))
-        .ok_or_else(|| "benchmark frame counts exceed u32 limit".to_owned())
+        .ok_or_else(|| anyhow::anyhow!("benchmark frame counts exceed u32 limit"))
 }
 
 /// Applies a captured RGBA frame to the optional snapshot path and report stream.
@@ -282,7 +283,7 @@ pub fn snapshot_command(binary: &str, path: &Path, backend: &str) -> Command {
     command
 }
 
-fn positive_env(name: &str, default: u32) -> Result<u32, String> {
+fn positive_env(name: &str, default: u32) -> anyhow::Result<u32> {
     // Empty means default; zero and malformed input must never silently measure no frames.
     let value = std::env::var(name).unwrap_or_default();
     if value.is_empty() {
@@ -290,10 +291,10 @@ fn positive_env(name: &str, default: u32) -> Result<u32, String> {
     }
     let parsed = value
         .parse::<u32>()
-        .map_err(|_| format!("{name} must be a positive integer"))?;
+        .with_context(|| format!("{name} must be a positive integer"))?;
     (parsed > 0)
         .then_some(parsed)
-        .ok_or_else(|| format!("{name} must be positive"))
+        .ok_or_else(|| anyhow::anyhow!("{name} must be positive"))
 }
 
 #[cfg(test)]
@@ -305,8 +306,9 @@ mod tests {
             benchmark_frame_limit(BenchmarkConfig {
                 warmup_frames: 2,
                 measured_frames: 3
-            }),
-            Ok(6)
+            })
+            .unwrap(),
+            6
         );
         assert!(
             benchmark_frame_limit(BenchmarkConfig {
@@ -319,13 +321,14 @@ mod tests {
 
     #[test]
     fn env_flags_accept_only_absent_zero_or_one() {
-        for (value, expected) in [
-            (None, Ok(false)),
-            (Some("0"), Ok(false)),
-            (Some("1"), Ok(true)),
-            (Some("true"), Err("FLAG must be 0 or 1".to_owned())),
-        ] {
-            assert_eq!(parse_env_flag("FLAG", value), expected);
+        for (value, expected) in [(None, false), (Some("0"), false), (Some("1"), true)] {
+            assert_eq!(parse_env_flag("FLAG", value).unwrap(), expected);
         }
+        assert_eq!(
+            parse_env_flag("FLAG", Some("true"))
+                .unwrap_err()
+                .to_string(),
+            "FLAG must be 0 or 1"
+        );
     }
 }

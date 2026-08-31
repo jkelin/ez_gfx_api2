@@ -1,8 +1,9 @@
+use anyhow::Context as _;
 use bytemuck::Pod;
 use std::mem::size_of_val;
 
-pub fn byte_len<T>(values: &[T]) -> Result<u64, String> {
-    u64::try_from(size_of_val(values)).map_err(|_| "value byte size exceeds u64".to_owned())
+pub fn byte_len<T>(values: &[T]) -> anyhow::Result<u64> {
+    u64::try_from(size_of_val(values)).context("value byte size exceeds u64")
 }
 
 pub fn slice_bytes<T: Pod>(values: &[T]) -> &[u8] {
@@ -23,7 +24,7 @@ mod tests {
         assert_pod::<u16>();
         assert_pod::<[f32; 4]>();
         assert!(slice_bytes::<u32>(&[]).is_empty());
-        assert_eq!(byte_len(&[1_u32, 2]), Ok(8));
+        assert_eq!(byte_len(&[1_u32, 2]).unwrap(), 8);
         assert_eq!(slice_bytes(&[0x0102_u16]), 0x0102_u16.to_ne_bytes());
         assert_eq!(bytes_of(&0x0102_u16), 0x0102_u16.to_ne_bytes());
     }

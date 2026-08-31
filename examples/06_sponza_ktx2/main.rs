@@ -20,17 +20,20 @@ mod renderer {
     use crate::shared;
     use crate::shared::{FrameInput, SceneInput};
     use crate::shared::{
-        math::{Mat4, OrbitCamera, mul, perspective},
+        math::{ClipY, OrbitCamera, perspective, row_major},
         mesh::load_textured_glb,
     };
+    use anyhow::Context as _;
     use ez_gfx::{
-        DynamicPipelineState, EzGfxResult, PublicBinding, ResourceIdentity, SamplerAddressMode,
-        SamplerFilter, ShaderRequest, Stage, TextureConfig, TextureSamplerDesc, TextureSource,
-        acquire_indirect, acquire_structured, create_index_heap, destroy_index_heap,
-        destroy_shader, load_shader, load_texture, release_indirect, release_structured,
-        render_add_compute, render_add_graphics, set_indirect_count, texture_binding,
-        unload_texture, upload_indices, write_structured,
+        ContextHandle, DynamicPipelineState, EzGfxResult, IndirectBufferHandle, PublicBinding,
+        ResourceIdentity, SamplerAddressMode, SamplerFilter, ShaderHandle, StructuredBufferHandle,
+        TextureConfig, TextureHandle, TextureSamplerDesc, TextureSource, acquire_indirect,
+        acquire_structured, create_index_heap, destroy_index_heap, destroy_shader, load_shader,
+        load_texture, release_indirect, release_structured, render_add_compute,
+        render_add_graphics, set_indirect_count, texture_binding, unload_texture, upload_indices,
+        write_structured,
     };
+    use glam::{DVec2, Mat4, Vec3};
 
     #[repr(C)]
     #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -52,15 +55,16 @@ mod renderer {
         padding: [u32; 3],
     }
     pub(super) struct ModelScene {
-        shader: u64,
-        positions: u64,
-        normals: u64,
-        uvs: u64,
-        primitives: u64,
-        indirect: u64,
-        textures: Vec<u64>,
+        shader: ShaderHandle,
+        positions: StructuredBufferHandle,
+        normals: StructuredBufferHandle,
+        uvs: StructuredBufferHandle,
+        primitives: StructuredBufferHandle,
+        indirect: IndirectBufferHandle,
+        textures: Vec<TextureHandle>,
         camera: OrbitCamera,
-        target: [f32; 3],
+        clip_y: ClipY,
+        target: Vec3,
         near: f32,
         far: f32,
         push: ScenePush,
@@ -73,18 +77,18 @@ mod renderer {
             clippy::too_many_lines,
             reason = "The example keeps every safe resource acquisition and failure cleanup visible in one linear flow."
         )]
-        pub(super) fn create(context: u64) -> Result<Self, String> {
+        pub(super) fn create(context: ContextHandle, clip_y: ClipY) -> anyhow::Result<Self> {
             let mesh = load_textured_glb(include_bytes!("../shared/assets/sponza.glb"))?;
-            let primitive_count = u32::try_from(mesh.primitives.len())
-                .map_err(|_| "primitive count exceeds ABI".to_owned())?;
+            let primitive_count =
+                u32::try_from(mesh.primitives.len()).context("primitive count exceeds ABI")?;
             let primitive_bytes = u64::from(primitive_count)
                 .checked_mul(
                     u64::try_from(std::mem::size_of::<PrimitiveTextured>())
-                        .map_err(|_| "primitive record size exceeds ABI".to_owned())?,
+                        .context("primitive record size exceeds ABI")?,
                 )
-                .ok_or_else(|| "primitive records size overflow".to_owned())?;
+                .ok_or_else(|| anyhow::anyhow!("primitive records size overflow"))?;
             if primitive_bytes > 16 * 1024 * 1024 {
-                return Err("primitive records exceed ABI boundary".to_owned());
+                anyhow::bail!("primitive records exceed ABI boundary");
             }
             let index_bytes = shared::byte_len(&mesh.indices)?;
             let positions_bytes = shared::byte_len(&mesh.positions)?;
@@ -102,14 +106,14 @@ mod renderer {
                 Ok(value) => value,
                 Err(error) => {
                     destroy_index_heap(context);
-                    return Err(format!("upload Sponza indices: {error:?}"));
+                    return Err(anyhow::anyhow!("{error:?}").context("upload Sponza indices"));
                 }
             };
             let positions = match acquire_structured(context, positions_bytes) {
-                Ok(handle) => handle.get(),
+                Ok(handle) => handle,
                 Err(error) => {
                     destroy_index_heap(context);
-                    return Err(format!("acquire positions: {error:?}"));
+                    return Err(anyhow::anyhow!("{error:?}").context("acquire positions"));
                 }
             };
             if let Err(error) = status(
@@ -121,11 +125,11 @@ mod renderer {
                 return Err(error);
             }
             let normals = match acquire_structured(context, normals_bytes) {
-                Ok(handle) => handle.get(),
+                Ok(handle) => handle,
                 Err(error) => {
                     release_structured(context, positions);
                     destroy_index_heap(context);
-                    return Err(format!("acquire normals: {error:?}"));
+                    return Err(anyhow::anyhow!("{error:?}").context("acquire normals"));
                 }
             };
             if let Err(error) = status(
@@ -138,12 +142,12 @@ mod renderer {
                 return Err(error);
             }
             let uvs = match acquire_structured(context, uvs_bytes) {
-                Ok(handle) => handle.get(),
+                Ok(handle) => handle,
                 Err(error) => {
                     release_structured(context, normals);
                     release_structured(context, positions);
                     destroy_index_heap(context);
-                    return Err(format!("acquire uvs: {error:?}"));
+                    return Err(anyhow::anyhow!("{error:?}").context("acquire uvs"));
                 }
             };
             if let Err(error) = status(
@@ -156,7 +160,7 @@ mod renderer {
                 destroy_index_heap(context);
                 return Err(error);
             }
-            let cleanup_base = |textures: Vec<u64>| {
+            let cleanup_base = |textures: Vec<TextureHandle>| {
                 for texture in textures {
                     unload_texture(context, texture);
                 }
@@ -189,17 +193,17 @@ mod renderer {
                 false,
                 &fallback_config,
             ) {
-                Ok(handle) => handle.get(),
+                Ok(handle) => handle,
                 Err(error) => {
                     cleanup_base(Vec::new());
-                    return Err(format!("load Sponza fallback: {error:?}"));
+                    return Err(anyhow::anyhow!("{error:?}").context("load Sponza fallback"));
                 }
             };
             let fallback_binding = match texture_binding(context, fallback) {
                 Ok(binding) => binding,
                 Err(error) => {
                     cleanup_base(vec![fallback]);
-                    return Err(format!("resolve fallback binding: {error:?}"));
+                    return Err(anyhow::anyhow!("{error:?}").context("resolve fallback binding"));
                 }
             };
             let mut textures = vec![fallback];
@@ -207,7 +211,7 @@ mod renderer {
             for image in &mesh.images {
                 if image.mime_type != "image/ktx2" {
                     cleanup_base(textures);
-                    return Err("Sponza base-color image is not KTX2".to_owned());
+                    anyhow::bail!("Sponza base-color image is not KTX2");
                 }
                 let config = TextureConfig {
                     width: 0,
@@ -220,10 +224,10 @@ mod renderer {
                 };
                 let texture =
                     match load_texture(context, TextureSource::Ktx2, &image.bytes, true, &config) {
-                        Ok(value) => value.get(),
+                        Ok(value) => value,
                         Err(error) => {
                             cleanup_base(textures);
-                            return Err(format!("load Sponza KTX2: {error:?}"));
+                            return Err(anyhow::anyhow!("{error:?}").context("load Sponza KTX2"));
                         }
                     };
                 let binding = match texture_binding(context, texture) {
@@ -231,7 +235,9 @@ mod renderer {
                     Err(error) => {
                         unload_texture(context, texture);
                         cleanup_base(textures);
-                        return Err(format!("resolve Sponza texture binding: {error:?}"));
+                        return Err(
+                            anyhow::anyhow!("{error:?}").context("resolve Sponza texture binding")
+                        );
                     }
                 };
                 image_bindings.push(binding);
@@ -251,14 +257,14 @@ mod renderer {
                         .and_then(|index| image_bindings.get(index).copied())
                         .unwrap_or(fallback_binding),
                     padding: [0; 2],
-                    transform: primitive.transform,
+                    transform: row_major(primitive.transform),
                 })
                 .collect::<Vec<_>>();
             let primitives = match acquire_structured(context, primitive_bytes) {
-                Ok(handle) => handle.get(),
+                Ok(handle) => handle,
                 Err(error) => {
                     cleanup_base(textures);
-                    return Err(format!("acquire primitives: {error:?}"));
+                    return Err(anyhow::anyhow!("{error:?}").context("acquire primitives"));
                 }
             };
             if let Err(error) = status(
@@ -276,11 +282,13 @@ mod renderer {
                 return Err(error);
             }
             let indirect = match acquire_indirect(context, primitive_count) {
-                Ok(handle) => handle.get(),
+                Ok(handle) => handle,
                 Err(error) => {
                     release_structured(context, primitives);
                     cleanup_base(textures);
-                    return Err(format!("acquire Sponza indirect commands: {error:?}"));
+                    return Err(
+                        anyhow::anyhow!("{error:?}").context("acquire Sponza indirect commands")
+                    );
                 }
             };
             if let Err(error) = status(
@@ -292,21 +300,18 @@ mod renderer {
                 cleanup_base(textures);
                 return Err(error);
             }
-            let requests = [
-                ShaderRequest::new("vertexmain", Stage::Vertex).unwrap(),
-                ShaderRequest::new("fragmentmain", Stage::Fragment).unwrap(),
-                ShaderRequest::new("computemain", Stage::Compute).unwrap(),
-            ];
-            let shader =
-                match load_shader(context, include_bytes!("06_sponza_ktx2.ezgfx"), &requests) {
-                    Ok(handle) => handle.get(),
-                    Err(error) => {
-                        release_indirect(context, indirect);
-                        release_structured(context, primitives);
-                        cleanup_base(textures);
-                        return Err(format!("load Sponza artifact: {error:?}"));
-                    }
-                };
+            let shader = match load_shader(
+                context,
+                include_bytes!(concat!(env!("OUT_DIR"), "/06_sponza_ktx2.ezgfxshader")),
+            ) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    release_indirect(context, indirect);
+                    release_structured(context, primitives);
+                    cleanup_base(textures);
+                    return Err(anyhow::anyhow!("{error:?}").context("load Sponza artifact"));
+                }
+            };
             Ok(Self {
                 shader,
                 positions,
@@ -316,11 +321,12 @@ mod renderer {
                 indirect,
                 textures,
                 camera: OrbitCamera::new(90.0_f32.to_radians(), 8.0_f32.to_radians(), 0.45),
-                target: [0.0, -0.32, 0.0],
+                clip_y,
+                target: Vec3::new(0.0, -0.32, 0.0),
                 near: 0.02,
                 far: 100.0,
                 push: ScenePush {
-                    mvp: [0.0; 16],
+                    mvp: Mat4::IDENTITY,
                     primitive_count,
                     padding: [0; 3],
                 },
@@ -353,25 +359,25 @@ mod renderer {
     impl ModelScene {
         pub(super) fn handle_input(&mut self, input: SceneInput) {
             match input {
-                SceneInput::CursorMoved { x, y } => self.camera.cursor([x, y]),
+                SceneInput::CursorMoved { x, y } => self.camera.cursor(DVec2::new(x, y)),
                 SceneInput::PrimaryButton(value) => self.camera.set_dragging(value),
                 SceneInput::ScrollLines(lines) => self.camera.zoom(lines),
                 _ => {}
             }
         }
-        pub(super) fn update(&mut self, frame: FrameInput) -> Result<(), String> {
-            self.push.mvp = mul(
+        pub(super) fn update(&mut self, frame: FrameInput) -> anyhow::Result<()> {
+            self.push.mvp = row_major(
                 perspective(
                     60.0_f32.to_radians(),
                     frame.width as f32 / frame.height as f32,
                     self.near,
                     self.far,
-                )?,
-                self.camera.view(self.target)?,
+                    self.clip_y,
+                )? * self.camera.view(self.target)?,
             );
             Ok(())
         }
-        pub(super) fn record(&mut self, context: u64) -> Result<(), String> {
+        pub(super) fn record(&mut self, context: ContextHandle) -> anyhow::Result<()> {
             let bindings = &self.bindings;
             status(
                 render_add_compute(
@@ -395,7 +401,7 @@ mod renderer {
                 "record Sponza graphics pipeline",
             )
         }
-        pub(super) fn destroy(self, context: u64) {
+        pub(super) fn destroy(self, context: ContextHandle) {
             for texture in self.textures {
                 unload_texture(context, texture);
             }
@@ -408,21 +414,22 @@ mod renderer {
             destroy_shader(context, self.shader);
         }
     }
-    fn status(result: EzGfxResult, operation: &str) -> Result<(), String> {
+    fn status(result: EzGfxResult, operation: &str) -> anyhow::Result<()> {
         match result {
             EzGfxResult::Ok => Ok(()),
-            error => Err(format!("{operation}: {error:?}")),
+            error => Err(anyhow::anyhow!("{error:?}").context(operation.to_owned())),
         }
     }
 }
 #[path = "../shared/mod.rs"]
 mod shared;
 
+use anyhow::Context as _;
 use ez_gfx::{
-    Backend, ContextOptions, EzGfxResult, SurfaceOptions, SurfacePlatform, begin_render,
-    create_context, create_surface, destroy_context, destroy_surface, finish_render,
-    frame_readback, init_device, poll_diagnostic, poll_runtime_event, resize_surface,
-    set_snapshot_cache, wait_idle,
+    Backend, ContextHandle, ContextOptions, EzGfxResult, SurfaceHandle, SurfaceOptions,
+    SurfacePlatform, begin_render, create_context, create_surface, destroy_context,
+    destroy_surface, finish_render, frame_readback, init_device, poll_diagnostic,
+    poll_runtime_event, resize_surface, set_snapshot_cache, wait_idle,
 };
 use renderer::ModelScene as ExampleScene;
 use shared::{
@@ -434,41 +441,50 @@ const HEIGHT: u32 = 480;
 
 struct Example {
     resources: Option<ExampleScene>,
-    context: u64,
-    surface: u64,
+    context: Option<ContextHandle>,
+    surface: Option<SurfaceHandle>,
     benchmark: shared::BenchmarkRunner,
 }
 
 impl Example {
-    const fn new(benchmark: Option<shared::BenchmarkConfig>) -> Self {
+    fn new(benchmark: Option<shared::BenchmarkConfig>) -> Self {
         Self {
             resources: None,
-            context: 0,
-            surface: 0,
+            context: None,
+            surface: None,
             benchmark: shared::BenchmarkRunner::new(benchmark),
         }
+    }
+
+    fn context(&self) -> ContextHandle {
+        self.context.expect("example context is initialized")
+    }
+
+    fn surface(&self) -> SurfaceHandle {
+        self.surface.expect("example surface is initialized")
     }
 }
 
 impl LifecycleCallbacks for Example {
     type Report = shared::ProgramReport;
 
-    fn initialize(&mut self, native: NativeSurface, width: u32, height: u32) -> Result<(), String> {
+    fn initialize(&mut self, native: NativeSurface, width: u32, height: u32) -> anyhow::Result<()> {
         let (backend, backend_name) = backend()?;
         let platform = match native.platform {
             NativePlatform::Win32 => SurfacePlatform::Win32,
             NativePlatform::MetalLayer => SurfacePlatform::MetalLayer,
         };
-        self.context = create_context(ContextOptions {
+        let context = create_context(ContextOptions {
             enable_debug: shared::env_flag("EZ_GFX_EXAMPLE_DEBUG")?,
             enable_validation: shared::env_flag("EZ_GFX_EXAMPLE_VALIDATION")?,
             surface_platform: platform,
             backend,
         })
-        .map_err(|error| format!("create {backend_name} context: {error:?}"))?
-        .get();
-        self.surface = create_surface(
-            self.context,
+        .map_err(|error| anyhow::anyhow!("{error:?}"))
+        .with_context(|| format!("create {backend_name} context"))?;
+        self.context = Some(context);
+        let surface = create_surface(
+            context,
             SurfaceOptions {
                 window: native.window,
                 display: native.display,
@@ -478,23 +494,24 @@ impl LifecycleCallbacks for Example {
                 cache_presented_snapshots: false,
             },
         )
-        .map_err(|error| format!("create {backend_name} surface: {error:?}"))?
-        .get();
+        .map_err(|error| anyhow::anyhow!("{error:?}"))
+        .with_context(|| format!("create {backend_name} surface"))?;
+        self.surface = Some(surface);
         status(
-            init_device(self.context, self.surface),
+            init_device(self.context(), self.surface()),
             &format!("initialize {backend_name} surface device"),
         )?;
         status(
-            resize_surface(self.context, self.surface, width, height),
+            resize_surface(self.context(), self.surface(), width, height),
             &format!("initialize {backend_name} swapchain"),
         )?;
-        self.resources = Some(ExampleScene::create(self.context)?);
+        self.resources = Some(ExampleScene::create(self.context(), clip_y(backend))?);
         Ok(())
     }
 
-    fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
+    fn resize(&mut self, width: u32, height: u32) -> anyhow::Result<()> {
         status(
-            resize_surface(self.context, self.surface, width, height),
+            resize_surface(self.context(), self.surface(), width, height),
             "resize presented surface",
         )
     }
@@ -510,25 +527,24 @@ impl LifecycleCallbacks for Example {
         frame: FrameInput,
         terminal: bool,
         frame_index: u32,
-    ) -> Result<(), String> {
+    ) -> anyhow::Result<()> {
         self.benchmark.begin_frame(frame_index);
+        let context = self.context();
+        let surface = self.surface();
         if terminal {
             status(
-                set_snapshot_cache(self.context, self.surface, true),
+                set_snapshot_cache(context, surface, true),
                 "enable terminal snapshot cache",
             )?;
         }
         let resources = self
             .resources
             .as_mut()
-            .ok_or_else(|| "example resources are unavailable".to_owned())?;
+            .ok_or_else(|| anyhow::anyhow!("example resources are unavailable"))?;
         resources.update(frame)?;
-        status(
-            begin_render(self.context, self.surface),
-            "begin presented frame",
-        )?;
-        resources.record(self.context)?;
-        status(finish_render(self.context), "submit and present example")?;
+        status(begin_render(context, surface), "begin presented frame")?;
+        resources.record(context)?;
+        status(finish_render(context), "submit and present example")?;
         self.benchmark.end_frame(frame_index.saturating_add(1));
         Ok(())
     }
@@ -538,20 +554,23 @@ impl LifecycleCallbacks for Example {
         width: u32,
         height: u32,
         frames: u32,
-    ) -> Result<shared::ProgramReport, String> {
-        let rgba8 = frame_readback(self.context)
-            .map_err(|error| format!("read presented snapshot: {error:?}"))?;
+    ) -> anyhow::Result<shared::ProgramReport> {
+        let rgba8 = frame_readback(self.context())
+            .map_err(|error| anyhow::anyhow!("{error:?}"))
+            .context("read presented snapshot")?;
         let counts = shared::drain_bounded(
             4096,
             || {
-                poll_runtime_event(self.context)
+                poll_runtime_event(self.context())
                     .map(|(record, dropped)| (record.is_some(), dropped))
-                    .map_err(|error| format!("poll runtime event: {error:?}"))
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))
+                    .context("poll runtime event")
             },
             || {
-                poll_diagnostic(self.context)
+                poll_diagnostic(self.context())
                     .map(|(record, dropped)| (record.is_some(), dropped))
-                    .map_err(|error| format!("poll diagnostic: {error:?}"))
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))
+                    .context("poll diagnostic")
             },
         )?;
         Ok(shared::ProgramReport {
@@ -569,26 +588,24 @@ impl LifecycleCallbacks for Example {
     }
 
     fn shutdown(&mut self) {
-        if self.context == 0 {
+        let Some(context) = self.context.take() else {
             return;
-        }
-        let _ = wait_idle(self.context);
+        };
+        let _ = wait_idle(context);
         if let Some(resources) = self.resources.take() {
-            resources.destroy(self.context);
+            resources.destroy(context);
         }
-        if self.surface != 0 {
-            destroy_surface(self.context, self.surface);
-            self.surface = 0;
+        if let Some(surface) = self.surface.take() {
+            destroy_surface(context, surface);
         }
-        destroy_context(self.context);
-        self.context = 0;
+        destroy_context(context);
     }
 }
 
 fn run_example_with_benchmark(
     frame_limit: Option<u32>,
     benchmark: Option<shared::BenchmarkConfig>,
-) -> Result<Option<shared::ProgramReport>, String> {
+) -> anyhow::Result<Option<shared::ProgramReport>> {
     shared::run(
         LifecycleConfig {
             width: WIDTH,
@@ -600,7 +617,16 @@ fn run_example_with_benchmark(
     )
 }
 
-fn backend() -> Result<(Backend, &'static str), String> {
+fn clip_y(backend: Backend) -> shared::math::ClipY {
+    // Every supported backend has an explicit clip-Y convention; no fallback can hide a new backend.
+    match backend {
+        Backend::Vulkan => shared::math::ClipY::Vulkan,
+        Backend::Dx12 => shared::math::ClipY::Dx12,
+        Backend::Metal => shared::math::ClipY::Metal,
+    }
+}
+
+fn backend() -> anyhow::Result<(Backend, &'static str)> {
     match std::env::var("EZ_GFX_BACKEND").ok().as_deref() {
         #[cfg(target_vendor = "apple")]
         None | Some("metal") => Ok((Backend::Metal, "Metal")),
@@ -608,14 +634,14 @@ fn backend() -> Result<(Backend, &'static str), String> {
         None | Some("vulkan") => Ok((Backend::Vulkan, "Vulkan")),
         #[cfg(windows)]
         Some("dx12") => Ok((Backend::Dx12, "DX12")),
-        Some(value) => Err(format!("unsupported EZ_GFX_BACKEND `{value}`")),
+        Some(value) => Err(anyhow::anyhow!("unsupported EZ_GFX_BACKEND `{value}`")),
     }
 }
 
-fn status(result: EzGfxResult, operation: &str) -> Result<(), String> {
+fn status(result: EzGfxResult, operation: &str) -> anyhow::Result<()> {
     match result {
         EzGfxResult::Ok => Ok(()),
-        error => Err(format!("{operation}: {error:?}")),
+        error => Err(anyhow::anyhow!("{error:?}").context(operation.to_owned())),
     }
 }
 
@@ -638,6 +664,6 @@ mod tests {
         #[cfg(target_vendor = "apple")]
         assert_eq!(backend(), Ok((Backend::Metal, "Metal")));
         #[cfg(not(target_vendor = "apple"))]
-        assert_eq!(backend(), Ok((Backend::Vulkan, "Vulkan")));
+        assert_eq!(backend().unwrap(), (Backend::Vulkan, "Vulkan"));
     }
 }

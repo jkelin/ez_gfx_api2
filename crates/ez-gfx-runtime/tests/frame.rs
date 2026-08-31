@@ -1,11 +1,23 @@
 //! Runtime integration and contract tests.
 
+use ez_gfx_core::handle::{LocalHandle, PackedHandle, TextureHandle};
 use ez_gfx_hal::{BufferRange, QueueKind, ResourceAccess, ResourceState};
 use ez_gfx_runtime::{
     frame::{ExecutableNode, FrameError, FrameRecorder, FrameState},
     graph::{Access, NodeDesc, ResourceDesc, ResourceLifetime},
     indirect::DrawIndexedCommand,
 };
+
+fn texture(slot: u32) -> TextureHandle {
+    TextureHandle::from_packed(
+        PackedHandle::child(
+            LocalHandle::new(1, 1).unwrap(),
+            LocalHandle::new(slot, 1).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
 
 #[test]
 fn frame_requires_ordered_begin_record_enqueue_submit_finish() {
@@ -39,7 +51,9 @@ fn frame_requires_ordered_begin_record_enqueue_submit_finish() {
                 )
                 .unwrap(),
             )),
-            ExecutableNode::TextureReadback { texture: 7 },
+            ExecutableNode::TextureReadback {
+                texture: texture(7),
+            },
         )
         .unwrap();
     let submission = frame.submit().unwrap();
@@ -67,7 +81,12 @@ fn recording_a_node_is_atomic_and_payload_is_retained() {
     let invalid = NodeDesc::new("", QueueKind::Graphics);
     assert!(
         frame
-            .record_node(invalid, ExecutableNode::TextureReadback { texture: 1 })
+            .record_node(
+                invalid,
+                ExecutableNode::TextureReadback {
+                    texture: texture(1),
+                },
+            )
             .is_err()
     );
     assert!(matches!(frame.submit(), Err(FrameError::MissingGraph)));

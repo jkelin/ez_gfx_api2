@@ -19,10 +19,12 @@
 mod renderer {
     use crate::shared;
     use crate::shared::{FrameInput, SceneInput, SceneKey};
+    use anyhow::Context as _;
     use ez_gfx::{
-        DrawIndexedCommand, DynamicPipelineState, EzGfxResult, PublicBinding, ResourceIdentity,
-        SamplerAddressMode, SamplerFilter, ShaderRequest, Stage, TextureConfig, TextureSamplerDesc,
-        TextureSource, acquire_indirect, acquire_structured, create_index_heap, destroy_index_heap,
+        ContextHandle, DrawIndexedCommand, DynamicPipelineState, EzGfxResult, IndirectBufferHandle,
+        PublicBinding, ResourceIdentity, SamplerAddressMode, SamplerFilter, ShaderHandle,
+        StructuredBufferHandle, TextureConfig, TextureHandle, TextureSamplerDesc, TextureSource,
+        acquire_indirect, acquire_structured, create_index_heap, destroy_index_heap,
         destroy_shader, load_shader, load_texture, release_indirect, release_structured,
         render_add_graphics, set_indirect_count, texture_binding, unload_texture, upload_indices,
         write_indirect, write_structured,
@@ -57,14 +59,14 @@ mod renderer {
 
     pub(super) struct ImGuiScene {
         imgui: imgui::Context,
-        shader: u64,
-        texture: u64,
+        shader: ShaderHandle,
+        texture: TextureHandle,
         identity_start: u32,
-        indirect: u64,
+        indirect: IndirectBufferHandle,
         indirect_capacity: u32,
-        vertices: Option<u64>,
-        draw_indices: Option<u64>,
-        commands: Option<u64>,
+        vertices: Option<StructuredBufferHandle>,
+        draw_indices: Option<StructuredBufferHandle>,
+        commands: Option<StructuredBufferHandle>,
         vertex_capacity: usize,
         index_capacity: usize,
         command_capacity: usize,
@@ -77,11 +79,10 @@ mod renderer {
         uploaded_draw_counts: Vec<u32>,
         draw_counts: Vec<u32>,
         push: Push,
-        bindings: [PublicBinding; 3],
     }
 
     impl ImGuiScene {
-        pub(super) fn create(context: u64) -> Result<Self, String> {
+        pub(super) fn create(context: ContextHandle) -> anyhow::Result<Self> {
             let mut imgui = imgui::Context::create();
             imgui.set_ini_filename(None);
             let identity = (0..IDENTITY_INDEX_COUNT as u32).collect::<Vec<_>>();
@@ -110,13 +111,13 @@ mod renderer {
                 false,
                 &config,
             )
-            .map_err(|error| format!("load ImGui font atlas: {error:?}"))?
-            .get();
+            .map_err(|error| anyhow::anyhow!("{error:?}"))
+            .context("load ImGui font atlas")?;
             let texture_id = match texture_binding(context, texture) {
                 Ok(value) => value,
                 Err(error) => {
                     unload_texture(context, texture);
-                    return Err(format!("resolve ImGui font binding: {error:?}"));
+                    return Err(anyhow::anyhow!("{error:?}").context("resolve ImGui font binding"));
                 }
             };
             imgui.fonts().tex_id = TextureId::new(texture_id as usize);
@@ -136,28 +137,31 @@ mod renderer {
                 Err(error) => {
                     destroy_index_heap(context);
                     unload_texture(context, texture);
-                    return Err(format!("upload ImGui identity indices: {error:?}"));
+                    return Err(
+                        anyhow::anyhow!("{error:?}").context("upload ImGui identity indices")
+                    );
                 }
             };
             let indirect = match acquire_indirect(context, 256) {
-                Ok(handle) => handle.get(),
+                Ok(handle) => handle,
                 Err(error) => {
                     destroy_index_heap(context);
                     unload_texture(context, texture);
-                    return Err(format!("acquire ImGui indirect draws: {error:?}"));
+                    return Err(
+                        anyhow::anyhow!("{error:?}").context("acquire ImGui indirect draws")
+                    );
                 }
             };
-            let requests = [
-                ShaderRequest::new("vertexmain", Stage::Vertex).unwrap(),
-                ShaderRequest::new("fragmentmain", Stage::Fragment).unwrap(),
-            ];
-            let shader = match load_shader(context, include_bytes!("04_imgui.ezgfx"), &requests) {
-                Ok(value) => value.get(),
+            let shader = match load_shader(
+                context,
+                include_bytes!(concat!(env!("OUT_DIR"), "/04_imgui.ezgfxshader")),
+            ) {
+                Ok(value) => value,
                 Err(error) => {
                     release_indirect(context, indirect);
                     destroy_index_heap(context);
                     unload_texture(context, texture);
-                    return Err(format!("load ImGui artifact: {error:?}"));
+                    return Err(anyhow::anyhow!("{error:?}").context("load ImGui artifact"));
                 }
             };
             Ok(Self {
@@ -190,24 +194,10 @@ mod renderer {
                     },
                     padding: 0.0,
                 },
-                bindings: [
-                    PublicBinding {
-                        name: "imgui_vertices".to_owned(),
-                        resource: ResourceIdentity::Structured(0),
-                    },
-                    PublicBinding {
-                        name: "imgui_indices".to_owned(),
-                        resource: ResourceIdentity::Structured(0),
-                    },
-                    PublicBinding {
-                        name: "imgui_commands".to_owned(),
-                        resource: ResourceIdentity::Structured(0),
-                    },
-                ],
             })
         }
 
-        fn rebuild_draw_data(&mut self) -> Result<(), String> {
+        fn rebuild_draw_data(&mut self) -> anyhow::Result<()> {
             self.cpu_vertices.clear();
             self.cpu_indices.clear();
             self.cpu_commands.clear();
@@ -245,22 +235,22 @@ mod renderer {
                 || self.cpu_indices.is_empty()
                 || self.cpu_commands.is_empty()
             {
-                return Err("ImGui produced no drawable commands".to_owned());
+                anyhow::bail!("ImGui produced no drawable commands");
             }
             Ok(())
         }
 
         fn upload_dynamic<T: bytemuck::Pod>(
-            context: u64,
+            context: ContextHandle,
             name: &str,
             values: &[T],
-            buffer: &mut Option<u64>,
+            buffer: &mut Option<StructuredBufferHandle>,
             capacity: &mut usize,
-        ) -> Result<Option<u64>, String> {
+        ) -> anyhow::Result<Option<StructuredBufferHandle>> {
             if values.len() > *capacity {
                 let replacement = acquire_structured(context, shared::byte_len(values)?)
-                    .map_err(|error| format!("acquire {name}: {error:?}"))?
-                    .get();
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))
+                    .with_context(|| format!("acquire {name}"))?;
                 if let Err(error) = status(
                     write_structured(context, replacement, shared::slice_bytes(values)),
                     &format!("upload {name}"),
@@ -274,7 +264,7 @@ mod renderer {
                 *capacity = values.len();
                 Ok(Some(replacement))
             } else {
-                let handle = buffer.ok_or_else(|| format!("{name} buffer unavailable"))?;
+                let handle = buffer.ok_or_else(|| anyhow::anyhow!("{name} buffer unavailable"))?;
                 status(
                     write_structured(context, handle, shared::slice_bytes(values)),
                     &format!("rewrite {name}"),
@@ -301,7 +291,7 @@ mod renderer {
                 }
             }
         }
-        pub(super) fn update(&mut self, frame: FrameInput) -> Result<(), String> {
+        pub(super) fn update(&mut self, frame: FrameInput) -> anyhow::Result<()> {
             let display_size = [frame.width as f32, frame.height as f32];
             {
                 let io = self.imgui.io_mut();
@@ -318,47 +308,41 @@ mod renderer {
             self.push.display_size = display_size;
             self.rebuild_draw_data()
         }
-        pub(super) fn record(&mut self, context: u64) -> Result<(), String> {
+        pub(super) fn record(&mut self, context: ContextHandle) -> anyhow::Result<()> {
             if self.cpu_vertices != self.uploaded_vertices {
-                if let Some(handle) = Self::upload_dynamic(
+                Self::upload_dynamic(
                     context,
                     "imgui_vertices",
                     &self.cpu_vertices,
                     &mut self.vertices,
                     &mut self.vertex_capacity,
-                )? {
-                    self.bindings[0].resource = ResourceIdentity::Structured(handle);
-                }
+                )?;
                 std::mem::swap(&mut self.cpu_vertices, &mut self.uploaded_vertices);
             }
             if self.cpu_indices != self.uploaded_indices {
-                if let Some(handle) = Self::upload_dynamic(
+                Self::upload_dynamic(
                     context,
                     "imgui_indices",
                     &self.cpu_indices,
                     &mut self.draw_indices,
                     &mut self.index_capacity,
-                )? {
-                    self.bindings[1].resource = ResourceIdentity::Structured(handle);
-                }
+                )?;
                 std::mem::swap(&mut self.cpu_indices, &mut self.uploaded_indices);
             }
             if self.cpu_commands != self.uploaded_commands {
-                if let Some(handle) = Self::upload_dynamic(
+                Self::upload_dynamic(
                     context,
                     "imgui_commands",
                     &self.cpu_commands,
                     &mut self.commands,
                     &mut self.command_capacity,
-                )? {
-                    self.bindings[2].resource = ResourceIdentity::Structured(handle);
-                }
+                )?;
                 std::mem::swap(&mut self.cpu_commands, &mut self.uploaded_commands);
             }
             if self.uploaded_commands.len() > self.indirect_capacity as usize {
                 let replacement = acquire_indirect(context, self.uploaded_commands.len() as u32)
-                    .map_err(|error| format!("grow ImGui indirect draws: {error:?}"))?
-                    .get();
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))
+                    .context("grow ImGui indirect draws")?;
                 let previous = std::mem::replace(&mut self.indirect, replacement);
                 release_indirect(context, previous);
                 self.indirect_capacity = self.uploaded_commands.len() as u32;
@@ -388,20 +372,42 @@ mod renderer {
                 )?;
                 self.uploaded_draw_counts.clone_from(&self.draw_counts);
             }
-            let bindings = &self.bindings;
+            let bindings = [
+                PublicBinding {
+                    name: "imgui_vertices".to_owned(),
+                    resource: ResourceIdentity::Structured(
+                        self.vertices
+                            .ok_or_else(|| anyhow::anyhow!("ImGui vertex buffer unavailable"))?,
+                    ),
+                },
+                PublicBinding {
+                    name: "imgui_indices".to_owned(),
+                    resource: ResourceIdentity::Structured(
+                        self.draw_indices
+                            .ok_or_else(|| anyhow::anyhow!("ImGui index buffer unavailable"))?,
+                    ),
+                },
+                PublicBinding {
+                    name: "imgui_commands".to_owned(),
+                    resource: ResourceIdentity::Structured(
+                        self.commands
+                            .ok_or_else(|| anyhow::anyhow!("ImGui command buffer unavailable"))?,
+                    ),
+                },
+            ];
             status(
                 render_add_graphics(
                     context,
                     self.shader,
                     self.indirect,
-                    bindings,
+                    &bindings,
                     DynamicPipelineState::from_abi(0, 0, 0, 1).unwrap(),
                     shared::bytes_of(&self.push),
                 ),
                 "record ImGui graphics pipeline",
             )
         }
-        pub(super) fn destroy(self, context: u64) {
+        pub(super) fn destroy(self, context: ContextHandle) {
             if let Some(value) = self.commands {
                 release_structured(context, value);
             }
@@ -418,10 +424,10 @@ mod renderer {
         }
     }
 
-    fn status(result: EzGfxResult, operation: &str) -> Result<(), String> {
+    fn status(result: EzGfxResult, operation: &str) -> anyhow::Result<()> {
         match result {
             EzGfxResult::Ok => Ok(()),
-            error => Err(format!("{operation}: {error:?}")),
+            error => Err(anyhow::anyhow!("{error:?}").context(operation.to_owned())),
         }
     }
     fn imgui_key(key: SceneKey) -> Option<Key> {
@@ -448,11 +454,12 @@ mod renderer {
 #[path = "../shared/mod.rs"]
 mod shared;
 
+use anyhow::Context as _;
 use ez_gfx::{
-    Backend, ContextOptions, EzGfxResult, SurfaceOptions, SurfacePlatform, begin_render,
-    create_context, create_surface, destroy_context, destroy_surface, finish_render,
-    frame_readback, init_device, poll_diagnostic, poll_runtime_event, resize_surface,
-    set_snapshot_cache, wait_idle,
+    Backend, ContextHandle, ContextOptions, EzGfxResult, SurfaceHandle, SurfaceOptions,
+    SurfacePlatform, begin_render, create_context, create_surface, destroy_context,
+    destroy_surface, finish_render, frame_readback, init_device, poll_diagnostic,
+    poll_runtime_event, resize_surface, set_snapshot_cache, wait_idle,
 };
 use renderer::ImGuiScene as ExampleScene;
 use shared::{
@@ -464,41 +471,50 @@ const HEIGHT: u32 = 480;
 
 struct Example {
     resources: Option<ExampleScene>,
-    context: u64,
-    surface: u64,
+    context: Option<ContextHandle>,
+    surface: Option<SurfaceHandle>,
     benchmark: shared::BenchmarkRunner,
 }
 
 impl Example {
-    const fn new(benchmark: Option<shared::BenchmarkConfig>) -> Self {
+    fn new(benchmark: Option<shared::BenchmarkConfig>) -> Self {
         Self {
             resources: None,
-            context: 0,
-            surface: 0,
+            context: None,
+            surface: None,
             benchmark: shared::BenchmarkRunner::new(benchmark),
         }
+    }
+
+    fn context(&self) -> ContextHandle {
+        self.context.expect("example context is initialized")
+    }
+
+    fn surface(&self) -> SurfaceHandle {
+        self.surface.expect("example surface is initialized")
     }
 }
 
 impl LifecycleCallbacks for Example {
     type Report = shared::ProgramReport;
 
-    fn initialize(&mut self, native: NativeSurface, width: u32, height: u32) -> Result<(), String> {
+    fn initialize(&mut self, native: NativeSurface, width: u32, height: u32) -> anyhow::Result<()> {
         let (backend, backend_name) = backend()?;
         let platform = match native.platform {
             NativePlatform::Win32 => SurfacePlatform::Win32,
             NativePlatform::MetalLayer => SurfacePlatform::MetalLayer,
         };
-        self.context = create_context(ContextOptions {
+        let context = create_context(ContextOptions {
             enable_debug: shared::env_flag("EZ_GFX_EXAMPLE_DEBUG")?,
             enable_validation: shared::env_flag("EZ_GFX_EXAMPLE_VALIDATION")?,
             surface_platform: platform,
             backend,
         })
-        .map_err(|error| format!("create {backend_name} context: {error:?}"))?
-        .get();
-        self.surface = create_surface(
-            self.context,
+        .map_err(|error| anyhow::anyhow!("{error:?}"))
+        .with_context(|| format!("create {backend_name} context"))?;
+        self.context = Some(context);
+        let surface = create_surface(
+            context,
             SurfaceOptions {
                 window: native.window,
                 display: native.display,
@@ -508,23 +524,24 @@ impl LifecycleCallbacks for Example {
                 cache_presented_snapshots: false,
             },
         )
-        .map_err(|error| format!("create {backend_name} surface: {error:?}"))?
-        .get();
+        .map_err(|error| anyhow::anyhow!("{error:?}"))
+        .with_context(|| format!("create {backend_name} surface"))?;
+        self.surface = Some(surface);
         status(
-            init_device(self.context, self.surface),
+            init_device(self.context(), self.surface()),
             &format!("initialize {backend_name} surface device"),
         )?;
         status(
-            resize_surface(self.context, self.surface, width, height),
+            resize_surface(self.context(), self.surface(), width, height),
             &format!("initialize {backend_name} swapchain"),
         )?;
-        self.resources = Some(ExampleScene::create(self.context)?);
+        self.resources = Some(ExampleScene::create(self.context())?);
         Ok(())
     }
 
-    fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
+    fn resize(&mut self, width: u32, height: u32) -> anyhow::Result<()> {
         status(
-            resize_surface(self.context, self.surface, width, height),
+            resize_surface(self.context(), self.surface(), width, height),
             "resize presented surface",
         )
     }
@@ -540,25 +557,24 @@ impl LifecycleCallbacks for Example {
         frame: FrameInput,
         terminal: bool,
         frame_index: u32,
-    ) -> Result<(), String> {
+    ) -> anyhow::Result<()> {
         self.benchmark.begin_frame(frame_index);
+        let context = self.context();
+        let surface = self.surface();
         if terminal {
             status(
-                set_snapshot_cache(self.context, self.surface, true),
+                set_snapshot_cache(context, surface, true),
                 "enable terminal snapshot cache",
             )?;
         }
         let resources = self
             .resources
             .as_mut()
-            .ok_or_else(|| "example resources are unavailable".to_owned())?;
+            .ok_or_else(|| anyhow::anyhow!("example resources are unavailable"))?;
         resources.update(frame)?;
-        status(
-            begin_render(self.context, self.surface),
-            "begin presented frame",
-        )?;
-        resources.record(self.context)?;
-        status(finish_render(self.context), "submit and present example")?;
+        status(begin_render(context, surface), "begin presented frame")?;
+        resources.record(context)?;
+        status(finish_render(context), "submit and present example")?;
         self.benchmark.end_frame(frame_index.saturating_add(1));
         Ok(())
     }
@@ -568,20 +584,23 @@ impl LifecycleCallbacks for Example {
         width: u32,
         height: u32,
         frames: u32,
-    ) -> Result<shared::ProgramReport, String> {
-        let rgba8 = frame_readback(self.context)
-            .map_err(|error| format!("read presented snapshot: {error:?}"))?;
+    ) -> anyhow::Result<shared::ProgramReport> {
+        let rgba8 = frame_readback(self.context())
+            .map_err(|error| anyhow::anyhow!("{error:?}"))
+            .context("read presented snapshot")?;
         let counts = shared::drain_bounded(
             4096,
             || {
-                poll_runtime_event(self.context)
+                poll_runtime_event(self.context())
                     .map(|(record, dropped)| (record.is_some(), dropped))
-                    .map_err(|error| format!("poll runtime event: {error:?}"))
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))
+                    .context("poll runtime event")
             },
             || {
-                poll_diagnostic(self.context)
+                poll_diagnostic(self.context())
                     .map(|(record, dropped)| (record.is_some(), dropped))
-                    .map_err(|error| format!("poll diagnostic: {error:?}"))
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))
+                    .context("poll diagnostic")
             },
         )?;
         Ok(shared::ProgramReport {
@@ -599,26 +618,24 @@ impl LifecycleCallbacks for Example {
     }
 
     fn shutdown(&mut self) {
-        if self.context == 0 {
+        let Some(context) = self.context.take() else {
             return;
-        }
-        let _ = wait_idle(self.context);
+        };
+        let _ = wait_idle(context);
         if let Some(resources) = self.resources.take() {
-            resources.destroy(self.context);
+            resources.destroy(context);
         }
-        if self.surface != 0 {
-            destroy_surface(self.context, self.surface);
-            self.surface = 0;
+        if let Some(surface) = self.surface.take() {
+            destroy_surface(context, surface);
         }
-        destroy_context(self.context);
-        self.context = 0;
+        destroy_context(context);
     }
 }
 
 fn run_example_with_benchmark(
     frame_limit: Option<u32>,
     benchmark: Option<shared::BenchmarkConfig>,
-) -> Result<Option<shared::ProgramReport>, String> {
+) -> anyhow::Result<Option<shared::ProgramReport>> {
     shared::run(
         LifecycleConfig {
             width: WIDTH,
@@ -630,7 +647,7 @@ fn run_example_with_benchmark(
     )
 }
 
-fn backend() -> Result<(Backend, &'static str), String> {
+fn backend() -> anyhow::Result<(Backend, &'static str)> {
     match std::env::var("EZ_GFX_BACKEND").ok().as_deref() {
         #[cfg(target_vendor = "apple")]
         None | Some("metal") => Ok((Backend::Metal, "Metal")),
@@ -638,14 +655,14 @@ fn backend() -> Result<(Backend, &'static str), String> {
         None | Some("vulkan") => Ok((Backend::Vulkan, "Vulkan")),
         #[cfg(windows)]
         Some("dx12") => Ok((Backend::Dx12, "DX12")),
-        Some(value) => Err(format!("unsupported EZ_GFX_BACKEND `{value}`")),
+        Some(value) => Err(anyhow::anyhow!("unsupported EZ_GFX_BACKEND `{value}`")),
     }
 }
 
-fn status(result: EzGfxResult, operation: &str) -> Result<(), String> {
+fn status(result: EzGfxResult, operation: &str) -> anyhow::Result<()> {
     match result {
         EzGfxResult::Ok => Ok(()),
-        error => Err(format!("{operation}: {error:?}")),
+        error => Err(anyhow::anyhow!("{error:?}").context(operation.to_owned())),
     }
 }
 
@@ -668,6 +685,6 @@ mod tests {
         #[cfg(target_vendor = "apple")]
         assert_eq!(backend(), Ok((Backend::Metal, "Metal")));
         #[cfg(not(target_vendor = "apple"))]
-        assert_eq!(backend(), Ok((Backend::Vulkan, "Vulkan")));
+        assert_eq!(backend().unwrap(), (Backend::Vulkan, "Vulkan"));
     }
 }

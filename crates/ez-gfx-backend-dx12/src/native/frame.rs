@@ -12,10 +12,26 @@ use super::{
     dx12_resource_state, map_windows, transition_barrier, uav_barrier,
 };
 
+const DRAW_INDEXED_ARGUMENT_BYTES: u64 = core::mem::size_of::<
+    windows::Win32::Graphics::Direct3D12::D3D12_DRAW_INDEXED_ARGUMENTS,
+>() as u64;
+
 struct DxFramePlan {
     uses_surface: bool,
     presents: bool,
     external_waits: Vec<u64>,
+}
+
+// D3D12 copy commands are invalid between BeginRenderPass and EndRenderPass.
+fn validate_indirect_copy_phase(pass_active: bool) -> Result<(), HalError> {
+    if pass_active {
+        Err(HalError::InvalidArgument)
+    } else {
+        Ok(())
+    }
+}
+fn indirect_command_bytes(draw_count: u32) -> u64 {
+    u64::from(draw_count) * DRAW_INDEXED_ARGUMENT_BYTES
 }
 
 fn validate_frame_plan(
@@ -99,9 +115,7 @@ fn validate_frame_plan(
                 }
             }
             NativeFrameAction::Graphics(draw) => {
-                let indirect_size = u64::from(draw.draw_count)
-                    .checked_mul(20)
-                    .ok_or(HalError::InvalidArgument)?;
+                let indirect_size = indirect_command_bytes(draw.draw_count);
                 if !pass_active
                     || draw.draw_count == 0
                     || draw.push_constants.len() > 128
@@ -109,8 +123,9 @@ fn validate_frame_plan(
                     || draw.bindings.len() != draw.pipeline.buffer_writable.len()
                     || draw.pipeline.topology.is_none()
                     || draw.pipeline.signature.is_none()
-                    || draw.index_buffer.allocation.size() > u64::from(u32::MAX)
-                    || draw.indirect_buffer.allocation.size() < indirect_size
+                    || draw.index_size == 0
+                    || draw.index_size > u64::from(u32::MAX)
+                    || draw.indirect_size < indirect_size
                     || draw
                         .bindings
                         .iter()
@@ -312,7 +327,7 @@ impl NativeContext {
                 continue;
             }
             let Ok(request) = AllocationRequest::new(
-                draw.indirect_buffer.allocation.size(),
+                indirect_command_bytes(draw.draw_count),
                 16,
                 MemoryClass::Device,
                 false,
@@ -595,6 +610,65 @@ impl DxFrameEncoder<'_> {
 
         Ok(())
     }
+    fn copy_indirect_before_pass(
+        &mut self,
+        action_index: usize,
+        draw: &super::NativeDrawIndexed<'_>,
+    ) -> Result<(), HalError> {
+        validate_indirect_copy_phase(self.pass_active)?;
+        let Some(copy) = self.indirect_copies[action_index].as_ref() else {
+            return Ok(());
+        };
+        let indirect_raw = windows::core::Interface::as_raw(&draw.indirect_buffer.resource);
+        let binding = draw
+            .bindings
+            .iter()
+            .find(|binding| {
+                windows::core::Interface::as_raw(&binding.allocation.resource) == indirect_raw
+            })
+            .ok_or(HalError::InvalidArgument)?;
+        let shader_state = if binding.writable {
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        } else {
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+        };
+        // SAFETY: no render pass is active; the draw and frame allocations retain both resources, and each barrier array remains readable until its recording call returns.
+        unsafe {
+            self.list.ResourceBarrier(&[
+                transition_barrier(
+                    draw.indirect_buffer.resource.clone(),
+                    shader_state,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                ),
+                transition_barrier(
+                    copy.resource.clone(),
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                ),
+            ]);
+            self.list.CopyBufferRegion(
+                &copy.resource,
+                0,
+                &draw.indirect_buffer.resource,
+                0,
+                indirect_command_bytes(draw.draw_count),
+            );
+            self.list.ResourceBarrier(&[
+                transition_barrier(
+                    draw.indirect_buffer.resource.clone(),
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    shader_state,
+                ),
+                transition_barrier(
+                    copy.resource.clone(),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                ),
+            ]);
+        }
+        Ok(())
+    }
     fn graphics(
         &mut self,
         action_index: usize,
@@ -609,67 +683,16 @@ impl DxFrameEncoder<'_> {
             .signature
             .as_ref()
             .ok_or(HalError::InvalidArgument)?;
-        let index_size = u32::try_from(draw.index_buffer.allocation.size())
-            .map_err(|_| HalError::InvalidArgument)?;
+        let index_size = u32::try_from(draw.index_size).map_err(|_| HalError::InvalidArgument)?;
         let index_view = D3D12_INDEX_BUFFER_VIEW {
             // SAFETY: `draw.index_buffer.resource` retains the `ID3D12Resource` object and vtable storage during `GetGPUVirtualAddress`.
             BufferLocation: unsafe { draw.index_buffer.resource.GetGPUVirtualAddress() },
             SizeInBytes: index_size,
             Format: DXGI_FORMAT_R32_UINT,
         };
-        let indirect_resource = if let Some(copy) = self.indirect_copies[action_index].as_ref() {
-            let indirect_raw = windows::core::Interface::as_raw(&draw.indirect_buffer.resource);
-            let binding = draw
-                .bindings
-                .iter()
-                .find(|binding| {
-                    windows::core::Interface::as_raw(&binding.allocation.resource) == indirect_raw
-                })
-                .ok_or(HalError::InvalidArgument)?;
-            let shader_state = if binding.writable {
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-            } else {
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-                    | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-            };
-            // SAFETY: the draw and frame allocations retain both source and copy resources, and each temporary barrier array is readable until `ResourceBarrier` returns.
-            unsafe {
-                self.list.ResourceBarrier(&[
-                    transition_barrier(
-                        draw.indirect_buffer.resource.clone(),
-                        shader_state,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    ),
-                    transition_barrier(
-                        copy.resource.clone(),
-                        D3D12_RESOURCE_STATE_COMMON,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                    ),
-                ]);
-                self.list.CopyBufferRegion(
-                    &copy.resource,
-                    0,
-                    &draw.indirect_buffer.resource,
-                    0,
-                    draw.indirect_buffer.allocation.size(),
-                );
-                self.list.ResourceBarrier(&[
-                    transition_barrier(
-                        draw.indirect_buffer.resource.clone(),
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                        shader_state,
-                    ),
-                    transition_barrier(
-                        copy.resource.clone(),
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                    ),
-                ]);
-            }
-            &copy.resource
-        } else {
-            &draw.indirect_buffer.resource
-        };
+        let indirect_resource = self.indirect_copies[action_index]
+            .as_ref()
+            .map_or(&draw.indirect_buffer.resource, |copy| &copy.resource);
         // SAFETY: the encoder, `pipeline`, and `draw` references retain every command-list, state object, heap, resource, index-view, and push-constant pointer consumed by these recording calls until each call returns.
         unsafe {
             self.list.SetPipelineState(&pipeline.state);
@@ -743,7 +766,19 @@ impl DxFrameEncoder<'_> {
                 NativeFrameAction::Barrier { barrier, resource } => {
                     self.encode_barrier(barrier, resource)?;
                 }
-                NativeFrameAction::BeginPass(pass) => self.begin_pass(pass)?,
+                NativeFrameAction::BeginPass(pass) => {
+                    for (draw_index, candidate) in actions.iter().enumerate().skip(action_index + 1)
+                    {
+                        match candidate {
+                            NativeFrameAction::Graphics(draw) => {
+                                self.copy_indirect_before_pass(draw_index, draw)?;
+                            }
+                            NativeFrameAction::EndPass => break,
+                            _ => {}
+                        }
+                    }
+                    self.begin_pass(pass)?;
+                }
                 NativeFrameAction::Compute(dispatch) => self.compute(dispatch)?,
                 NativeFrameAction::Graphics(draw) => self.graphics(action_index, draw)?,
                 NativeFrameAction::TextureReadback { texture, .. } => {
@@ -974,5 +1009,21 @@ impl NativeContext {
         }
 
         self.collect_frame_readbacks(readbacks, capture_presented, surface)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_written_indirect_copy_uses_logical_extent_before_render_pass() {
+        assert_eq!(indirect_command_bytes(1), 20);
+        assert_eq!(indirect_command_bytes(3), 60);
+        assert_eq!(validate_indirect_copy_phase(false), Ok(()));
+        assert_eq!(
+            validate_indirect_copy_phase(true),
+            Err(HalError::InvalidArgument)
+        );
     }
 }

@@ -2,35 +2,33 @@
 
 ## Completed baseline
 
-- Cargo workspace with compiler-free runtime, safe Rust contracts, C ABI v17, opaque generational handles, validated semantic/artifact/capability data, and panic containment.
-- Vulkan, DX12, and Metal backend crates use a backend-neutral HAL and `gpu-allocator` 0.28.
-- Offline Slang compilation emits SPIR-V 1.5, Shader Model 6.5 DXIL, and Metal products in bounded `.ezgfx` artifacts.
-- Vulkan and DX12 resource upload, compute, indexed-indirect draw, presentation, and opt-in readback paths are implemented. DX12 hardware compute and graphics proofs passed on the local RTX 3080.
-- KTX2/Basis parsing/decoding, progressive-residency data structures, bounded CPU worker/event primitives, six migrated examples, external PNG comparison, runtime/compiler package isolation, and canonical plan updates are present. `ez-gfx` texture loading currently expands to bounded RGBA8 and does not connect the worker/event path; the FFI delegates to it.
-- Final post-format strict verification passed: `cargo clippy --workspace --all-targets --all-features -- -D warnings` and xtask source-line validation.
+- Cargo workspace with compiler-free runtime packages, safe typed Rust handles, C ABI v18 opaque `u64` handles, validated semantic/artifact/capability data, and panic containment.
+- Vulkan, DX12, and Metal backend crates implement a backend-neutral HAL and use `gpu-allocator` 0.28.
+- Build-time Slang compilation emits SPIR-V 1.5, Shader Model 6.5 DXIL, and Metal products in format-v3 `.ezgfxshader` artifacts. Archived count/string/metadata/provenance/variant ceilings are checked before owned decode. Runtime load validates required backend/stage reflection once before native calls, and metallib selection enforces platform, architecture, OS, SDK, language, and library compatibility. Compiler toolchain identity is recorded and bounded but is not a runtime admission criterion.
+- The root `ez_gfx_api.slang` module supplies backend-agnostic shared declarations. Rust examples compile their manifests in `build.rs`; the C structured-buffer cube compiles its manifest in CMake. Generated shader artifacts are not tracked.
+- Safe Rust resources use distinct context, surface, shader, texture, indirect-buffer, structured-buffer, and render-target handle types. The FFI performs explicit checked conversion while preserving opaque ABI values.
+- Tooling uses `clap` derives and `anyhow`; library seams retain typed errors. Example math uses `glam`. Repository dependency review replaced applicable archive, traversal, hashing, temporary-file, serialization, and CLI helpers with maintained crates.
 
 ## Verification status
 
-- `examples/shared` owns neutral Pod byte views, host attachment, winit lifecycle/input orchestration, bounded observability draining, environment-flag parsing, math/mesh preparation (including neutral basic primitive records), and benchmark/snapshot automation. Each example's sole Rust source, `main.rs`, owns its ez-gfx callbacks, direct resource/frame calls, renderer, shaders, and artifacts; every renderer calls safe `ez-gfx` APIs, and no example library or graphics-wrapper target remains.
-- `include/ez_gfx_api.h` now declares all 43 production extern-C exports; strict GCC C11 and C++17 standalone header validation pass; FFI ABI suite passes 13/13.
-- All six one-frame Metal Validation runs pass with zero diagnostics and zero dropped observations.
-- `cargo check -p ez-gfx-examples --bins --tests` passes; the latest examples smoke passes 20/20.
-- Vulkan benchmark smoke passes for all six binaries with one warmup frame, one measured frame, and one uncaptured terminal snapshot frame; each emits its stable numbered benchmark identity and zero dropped observations.
-- Immutable example snapshots matched; they were not regenerated.
-- `cargo fmt --all -- --check` and final strict workspace Clippy/source-line validation pass.
+- Runtime shader loading chooses the artifact-owned entry point for each stage; callers provide no entry-point name.
+- Shader sources import the root shared module and contain no Vulkan namespace, location, register, or physical binding syntax.
+- `include/ez_gfx_api.h`, `bindings/bindings.xml`, and all production FFI exports describe ABI v18. The Win32 C structured-buffer cube builds against that header and exercises compute-written indexed-indirect graphics.
+- Artifact tests cover format/version validation, malicious structurally valid archives exceeding semantic bounds, reflection failure across every backend, deterministic metallib compatibility selection, unique stage entry points, and generated example coverage.
+- The CI backend matrix executes Windows Vulkan through SwiftShader and native Metal on macOS. Linux Vulkan and Windows DX12 compile backend/native tests without claiming hosted runtime coverage.
+- Package CI builds and checks distinct runtime/compiler archives for Windows x64, Linux x64, and Apple Silicon.
 - On the local Windows RTX 3080, one-frame Vulkan and DX12 example runs both pass.
-## Remaining verification
 
-```text
-cargo run -p xtask -- package x86_64-pc-windows-msvc 0.1.0 target/package-smoke
-  blocked: the x86_64-pc-windows-msvc Rust target is not installed
-```
+## Hosted coverage limits
 
+- GitHub-hosted Windows does not guarantee a D3D12 feature-level 12.1 adapter, so DX12 native GPU tests and the C example's DX12 path are compiled but not executed there.
+- The current public Vulkan surface path is Win32-only, so Linux validates Lavapipe availability and compiles Vulkan tests without executing presentation.
+- Hardware Vulkan and DX12 examples, including the DX12 logical-extent path, have local coverage; hosted runtime proof remains limited to the rows above.
 
 ## Constraints
 
 - Runtime packages must not contain or depend on Slang, DXC, compiler crates, or source/JIT fallback.
-- Artifact loading selects an exact backend, stage, entry, and semantic profile; malformed or mismatched data fails closed.
+- Artifact loading selects an exact backend, profile, and stage. Each stage owns exactly one internal entry point; malformed, ambiguous, or mismatched data fails closed.
 - The semantic floor is `ez-gfx-v1`; implemented DXIL requires Shader Model 6.5, not 6.6 direct heap indexing.
 - Native handles and physical shader layouts remain backend-local. Public bindings use stable semantic IDs.
 - FFI validates null/count/size/UTF-8 boundaries and catches panics. Non-null pointer validity remains the C caller's obligation.
@@ -38,19 +36,12 @@ cargo run -p xtask -- package x86_64-pc-windows-msvc 0.1.0 target/package-smoke
 
 ## Architecture backlog
 
-### P0 — graph execution is discarded
+### P0 — transient alias assignments are not lowered
 
 - **Status:** Partial — compiled execution and backend synchronization are connected; alias lowering remains.
 - **Evidence:** `crates/ez-gfx-runtime/src/frame.rs` retains compiled graphs and typed payloads; `render.rs::execute_compiled_graph` produces one immutable `FrameExecutionPlan`. `NativeFrameAdapter` validates waits and native resources, then lowers ordered transitions, pass boundaries, compute, graphics, readback, and present into one command buffer/list on Vulkan, DX12, and Metal. `crates/ez-gfx-runtime/tests/render.rs` proves reordered payload lookup, barriers, waits, coalescing, and atomic backend failure.
 - **Impact:** Graph hazards, pass order, and submission atomicity reach native execution. Transient alias plans still cannot reduce memory.
 - **Acceptance:** Lower compiled alias assignments into backend resource placement without changing executor ordering.
-
-### P0 — multi-pass rendering clears prior work
-
-- **Status:** Implemented for active-surface passes; managed targets remain separate backlog.
-- **Evidence:** Vulkan, DX12, and Metal frame encoders retain one acquired drawable/back buffer across every compiled pass, honor load/store metadata, and present only after the full plan. `crates/ez-gfx-runtime/tests/render.rs::compatible_graphics_nodes_execute_inside_one_pass` proves pass coalescing. `crates/ez-gfx-ffi/tests/metal_present.rs` submits two distinct colored draws and verifies both survive in the captured frame.
-- **Impact:** Repeated and ordered surface passes preserve prior work according to load/store declarations. Managed-target composition remains unavailable because target lifecycle is missing.
-- **Acceptance:** Covered for surfaces; managed attachment proofs belong to the managed-render-target item.
 
 ### P0 — managed render targets are unreachable
 
@@ -65,7 +56,6 @@ cargo run -p xtask -- package x86_64-pc-windows-msvc 0.1.0 target/package-smoke
 - **Evidence:** `crates/ez-gfx/src/state/texture.rs::load_texture` decodes and optionally generates every mip before upload; `crates/ez-gfx/src/state/native.rs` calls `create_texture_rgba8` for all backends. `crates/ez-gfx-runtime/src/texture.rs:17-22,143-177` expands supported KTX2 paths to RGBA8.
 - **Impact:** Caller stalls and memory/bandwidth increase; native BC/ASTC upload, partial updates, eviction, and streaming control are unavailable.
 - **Acceptance:** Context validation precedes work; asynchronous mip/region uploads expose cancellation/completion; native block formats remain compressed through upload.
-
 
 ### P1 — viewport and scissor are not part of the API
 
@@ -91,9 +81,9 @@ cargo run -p xtask -- package x86_64-pc-windows-msvc 0.1.0 target/package-smoke
 ### P1 — platform surface and validation gaps
 
 - **Status:** Partial.
-- **Evidence:** `ez-gfx-hal::FrameExecutionBackend` is the common execution boundary; `render.rs::execute_compiled_graph` submits one immutable plan through it, and `ez-gfx` adapters lower that plan for Vulkan, DX12, and Metal. Context creation still accepts Vulkan only with Win32, DX12 only on Windows/Win32, and Metal only on Apple/MetalLayer (`crates/ez-gfx/src/state/context.rs::create_context`); `examples/shared/host.rs:31-68` handles only Win32/AppKit.
-- **Impact:** Linux Vulkan surfaces are unavailable, and Windows native execution remains unverified on the current host.
-- **Acceptance:** Add Linux surface support and native CI for macOS Metal, Windows Vulkan/DX12, and Linux Vulkan.
+- **Evidence:** `ez-gfx-hal::FrameExecutionBackend` is the common execution seam, and all three adapters lower the same immutable plan. CI executes native Metal on macOS and Windows Vulkan through SwiftShader. Linux Vulkan proves Lavapipe capability and compiles native tests; Windows DX12 compiles native GPU tests. Context creation still accepts Vulkan only with Win32, DX12 only on Windows/Win32, and Metal only on Apple/MetalLayer; example hosts cover Win32 and AppKit.
+- **Impact:** Linux Vulkan surfaces remain unavailable. Hosted DX12 runtime execution remains unavailable because the runner does not guarantee the required adapter.
+- **Acceptance:** Add Linux Vulkan surface support and execute its native presentation tests. Execute DX12 native tests on a runner with a guaranteed feature-level 12.1 adapter.
 
 ### P1 — diagnostics are weak around cleanup and asynchronous work
 
@@ -112,31 +102,18 @@ cargo run -p xtask -- package x86_64-pc-windows-msvc 0.1.0 target/package-smoke
 ### P2 — package and test coverage gaps
 
 - **Status:** Partial.
-- **Evidence:** `crates/ez-gfx-runtime/tests/{frame,frame_graph,render}.rs` cover retained graph execution, ordering, waits, transitions, pass coalescing, payload mapping, and failure boundaries. `crates/ez-gfx-ffi/tests/metal_present.rs` covers native separated-pass color/depth preservation and surface-free readback. `examples/tests/smoke.rs` covers all six binaries and snapshots. Target lifecycle, async FFI uploads, viewport variation, and non-macOS native execution remain uncovered.
-- **Impact:** Core graph and active-surface multi-pass contracts have native Metal coverage; the remaining subsystems and platform matrix can still regress.
-- **Acceptance:** Add target/upload/viewport regression suites, artifact freshness checks, and native Vulkan/DX12 CI/package smoke.
+- **Evidence:** Runtime suites cover retained graph execution, ordering, waits, transitions, pass coalescing, payload mapping, and failures. Artifact suites cover framed `rkyv` validation and build-generated example artifacts. Example smoke tests cover all six Rust scenes and snapshots. CI executes Windows Vulkan with SwiftShader and native Metal, compiles Linux Vulkan and Windows DX12 native tests, builds/links the C structured cube on Windows, and executes its Vulkan path. Package CI checks runtime/compiler archives on all three operating systems.
+- **Impact:** Managed targets, asynchronous uploads, viewport/scissor variation, Linux presentation, and hosted DX12 runtime can still regress or remain unavailable.
+- **Acceptance:** Add target/upload/viewport regression suites, Linux Vulkan presentation CI, and DX12 execution on guaranteed hardware.
 
 ## Ordered implementation sequence
 
-1. [Complete] Backend-neutral submission, transition, wait, pass, target, and completion-token interfaces.
-2. [Complete] Compiled-graph execution retained and consumed by `FrameRecorder`.
-3. Add the managed render-target manager, attachment views, resize/history, and multi-pass load/store behavior.
-4. Connect bounded workers to asynchronous uploads; add texture updates, mip streaming, and native compressed-format paths.
-5. Complete FFI APIs and enforce/document threading, destruction, ownership, and error propagation.
-6. [Current] Metal, Vulkan, and DX12 route frame plans through the common executor; platform conformance remains.
-7. Expand diagnostics, regression tests, artifact freshness checks, packaging checks, and performance benchmarks.
+1. Add the managed render-target manager, attachment views, resize/history, and multi-pass load/store behavior.
+2. Connect bounded workers to asynchronous uploads; add texture updates, mip streaming, and native compressed-format paths.
+3. Complete FFI APIs and enforce/document threading, destruction, ownership, and error propagation.
+4. Expand diagnostics, managed-target/upload/viewport regression tests, Linux Vulkan presentation, DX12 hardware CI, packaging checks, and performance benchmarks.
 
+## Tooling improvements
 
-## New todos
-- format slang shaders so that they look well with spacing and stuff
-- inside the examples, call the shader compiler rather than precompiling the shaders
-- .ezgfx should be renamed to .ezgfxshader and it should have at most one entrypoint per stage so that you wont need to include entrypoint name when calling load_shader
-- update shaders so that there is one global ez_gfx_api.slang inside root which will contain the shared slang code. when importing the library the users will also import this shared slang code
-- the shader should not use anything from the vk:: namespace or vk_location or whatever, the shaders are backend agnostic
-- use newtype for handle u64 instead of passing raw u64 around
-- write AGENTS.md with policies for agents on what to ensure inside the codebase (like keep all backends in sync, keep the ffi in sync with the bindings and so on)
-- migrate the code to anyhow errors and use best practices for error handling
-- use library for the linear algebra (mats, vecs, quaternions) instead of rolling your own inside the examples
-- in fact analyse if there is anything in the whole project that would be better served by a library rather handrolling
-- use rkyv for the serialization/deserialization of the shader format rather than custom bincoder
-- use clap library for the xtask and shader compiler
+- setup nexttest
+- setup miri and integrate with nexttest

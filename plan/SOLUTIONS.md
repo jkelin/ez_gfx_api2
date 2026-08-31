@@ -178,7 +178,7 @@ Compile time, peak RSS, blob size, and shader-runtime performance are unknown. N
 - Risks include stripped attributes, binding differences, matrix/layout changes, compiler-version drift, and unavailable signing/Xcode tools.
 - Compile every shader/entry point for all targets in CI, compare canonical metadata, create pipelines/render snapshots, and record compiler version/options, time, RSS, and blob size.
 
-## P-006: Precompiled shader container and reflection — Versioned sectioned bundle
+## P-006: Precompiled shader container and reflection — Framed, validated `rkyv`
 
 ### Problem and required outcome
 
@@ -186,16 +186,16 @@ Ship multi-backend shader code and complete reflection without Slang at runtime,
 
 ### Decision
 
-Use one `.ezshader` file with a fixed little-endian header and bounded section table. Store canonical reflection, target/entry blobs, compiler identity, interface/source hashes, and optional debug sections. Validate before allocation or backend calls; skip unknown optional sections and reject incompatible required versions. Never silently invoke Slang.
+Use one `.ezgfxshader` file with a fixed 56-byte little-endian frame containing magic, format version, reserved flags, payload length, and BLAKE3 digest. Store stage-grouped target products, canonical reflection, compiler provenance, and one internal entry point per stage in a bounded `rkyv` payload. Verify exact framing and digest, copy into aligned storage, run `bytecheck`, deserialize, and validate semantic/target invariants before allocation or backend calls. Never invoke Slang at runtime.
 
 ### Performance and tradeoffs
 
-Cold/warm load time, RSS, copy behavior, and artifact size are unknown. A single artifact gives atomic deployment and hashing but requires a carefully versioned custom parser. Memory mapping may avoid a file-read copy but does not prove backend module creation is zero-copy.
+Cold/warm load time, RSS, copy behavior, and artifact size remain workload-dependent. The bounded aligned copy permits safe validation of arbitrarily aligned caller bytes before deserialization. A single artifact gives atomic deployment and hashing; explicit framing and `rkyv` validation replace the former custom section parser.
 
 ### Rejected alternatives
 
-- Manifest plus sidecars: partial deployment, path confinement, and synchronization risks are higher. Reconsider if native-tool workflows require loose blobs and an outer atomic package is added.
-- FlatBuffers/schema-generated bundle: still needs an outer blob/integrity format and verifier; reconsider if measured evolution/tooling benefits exceed the dependency cost.
+- Manifest plus sidecars: partial deployment, path confinement, and synchronization risks are higher.
+- Custom section encoding or generated schema tooling: both add owned parsing/evolution machinery already covered by framed `rkyv`; reconsider only if compatibility requirements exceed the explicit format-version cutover.
 
 ### Evidence
 
@@ -654,7 +654,7 @@ One Slang source must render equivalently on Vulkan, DX12, and Metal without Sla
 
 ### Decision
 
-Use one documented source convention and stable, collision-safe semantic resource IDs, but retain complete target-native physical layouts from Slang reflection. `.ezshader` stores a canonical semantic resource graph plus target-indexed SPIR-V/DXIL/Metal binding, packing, entry, and specialization metadata. DXIL uses the lowest implemented semantic requirement, Shader Model 6.5, with explicit descriptor tables/root descriptors rather than Shader Model 6.6 direct heap indexing. Runtime binds semantic IDs through the selected target layout; pipeline/viewport state normalizes coordinates where possible. Offline compilation rejects missing or incompatible target semantics.
+Use the root `ez_gfx_api.slang` module and stable, collision-safe semantic resource IDs, but retain target-native products and reflection in `.ezgfxshader`. Every application shader imports the shared module and contains no Vulkan namespace/location/register syntax. Each stage has one artifact-owned entry point, so runtime callers select only the artifact and backend/profile. DXIL uses Shader Model 6.5 with explicit descriptor tables/root descriptors rather than Shader Model 6.6 direct heap indexing.
 
 ### Performance and tradeoffs
 
@@ -773,7 +773,7 @@ Choose a Metal artifact that preserves universal Slang source and the compiler/r
 
 ### Decision
 
-Offline tooling emits MSL with Slang, compiles it to IR, and links Apple `.metallib` variants. `.ezshader` stores those variants with platform, SDK, minimum OS, Metal language/compiler, entry, and interface metadata. Runtime selects and loads a compatible library or fails before pipeline creation. Metal binary archives remain derived PSO caches under P-024.
+Offline tooling emits MSL with Slang and, on Apple hosts, compiles it to `.metallib`. `.ezgfxshader` stores the Metal product with the same stage entry identity and provenance as SPIR-V/DXIL. Runtime selects and loads a compatible product or fails before pipeline creation. Non-Apple compiler builds emit MSL for cross-target validation, not a runtime-loadable hosted Metal claim.
 
 ### Performance and tradeoffs
 
@@ -831,7 +831,7 @@ Memory is bounded; latency follows host pump cadence. Throughput, contention, qu
 
 ### Problem and required outcome
 
-`.ezshader` inputs need distinct structural-integrity, compatibility, provenance, and authenticity contracts. Runtime must validate before native calls and never claim an unkeyed digest proves authenticity. No remote trust service is requested. Depends on P-001/P-005/P-006/P-025 and informs P-007/P-019/P-020.
+`.ezgfxshader` inputs need distinct structural-integrity, compatibility, provenance, and authenticity contracts. Runtime validates framed lengths, BLAKE3 digest, bytechecked archive structure, and semantic coverage before native calls; the unkeyed digest does not prove authenticity. No remote trust service is requested.
 
 ### Decision
 

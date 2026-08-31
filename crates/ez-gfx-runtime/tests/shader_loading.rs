@@ -1,8 +1,66 @@
 //! Runtime integration and contract tests.
 
-use ez_gfx_artifact::{Artifact, Provenance, Stage, Target, TargetVariant};
+use ez_gfx_artifact::{
+    AppleArchitecture, ApplePlatform, Artifact, CompatibilityVersion, MetalCompatibility,
+    Provenance, Stage, Target, TargetCompatibility, TargetVariant,
+};
 use ez_gfx_core::{Backend, capability::SemanticProfile};
-use ez_gfx_runtime::shader::{RuntimeShader, ShaderLoadError, ShaderRequest};
+use ez_gfx_runtime::shader::{MetalEnvironment, RuntimeShader, ShaderLoadError};
+
+fn compatibility(target: Target) -> TargetCompatibility {
+    match target {
+        Target::Metallib => TargetCompatibility::MetalLibrary {
+            metal: MetalCompatibility {
+                platform: ApplePlatform::MacOs,
+                architecture: AppleArchitecture::X86_64,
+                minimum_os: CompatibilityVersion::new(14, 0),
+                sdk: CompatibilityVersion::new(15, 0),
+                language: CompatibilityVersion::new(3, 0),
+                library: CompatibilityVersion::new(1, 0),
+                toolchain: "apple-clang-16".into(),
+            },
+        },
+        _ => TargetCompatibility::portable(target).unwrap(),
+    }
+}
+
+const METAL_ENVIRONMENT: MetalEnvironment = MetalEnvironment {
+    platform: ApplePlatform::MacOs,
+    architecture: AppleArchitecture::X86_64,
+    os: CompatibilityVersion::new(15, 0),
+    max_language: CompatibilityVersion::new(3, 0),
+    max_library: CompatibilityVersion::new(1, 0),
+};
+
+fn load(bytes: &[u8], backend: Backend) -> Result<RuntimeShader, ShaderLoadError> {
+    RuntimeShader::load_for_environment(
+        bytes,
+        backend,
+        SemanticProfile::V1,
+        (backend == Backend::Metal).then_some(&METAL_ENVIRONMENT),
+    )
+}
+
+fn metadata(stages: &[Stage]) -> Vec<u8> {
+    let reflections = [Target::Spirv, Target::Dxil, Target::Metallib]
+        .into_iter()
+        .flat_map(|target| {
+            stages.iter().map(move |stage| {
+                serde_json::json!({
+                    "target": format!("{target:?}"),
+                    "entry": format!("{stage:?}").replace("Compute", "main"),
+                    "stage": format!("{stage:?}"),
+                    "reflection": {"parameters":[]}
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&serde_json::json!({
+        "semantic_abi": 1,
+        "reflections": reflections
+    }))
+    .unwrap()
+}
 
 fn artifact(metal: Target) -> Vec<u8> {
     let variants = [
@@ -12,11 +70,44 @@ fn artifact(metal: Target) -> Vec<u8> {
     ]
     .into_iter()
     .map(|(target, bytes)| {
-        TargetVariant::new(target, Stage::Compute, "main", "ez-gfx-v1", bytes).unwrap()
+        TargetVariant::new(
+            target,
+            Stage::Compute,
+            "main",
+            "ez-gfx-v1",
+            compatibility(target),
+            bytes,
+        )
+        .unwrap()
     })
     .collect();
     Artifact::new(
-        b"{\"semantic_abi\":1}".to_vec(),
+        metadata(&[Stage::Compute]),
+        Provenance::new("slangc", "2026.16", vec![], "host"),
+        variants,
+    )
+    .unwrap()
+    .encode()
+    .unwrap()
+}
+
+fn artifact_with_metadata(metadata: Vec<u8>) -> Vec<u8> {
+    let variants = [Target::Spirv, Target::Dxil, Target::Metallib]
+        .into_iter()
+        .map(|target| {
+            TargetVariant::new(
+                target,
+                Stage::Compute,
+                "main",
+                "ez-gfx-v1",
+                compatibility(target),
+                vec![target as u8],
+            )
+            .unwrap()
+        })
+        .collect();
+    Artifact::new(
+        metadata,
         Provenance::new("slangc", "2026.16", vec![], "host"),
         variants,
     )
@@ -26,58 +117,197 @@ fn artifact(metal: Target) -> Vec<u8> {
 }
 
 #[test]
-fn selects_exact_backend_profile_entry_and_stage() {
-    let shader = RuntimeShader::load(
-        &artifact(Target::Metallib),
-        Backend::Dx12,
-        SemanticProfile::V1,
-        &[ShaderRequest::new("main", Stage::Compute).unwrap()],
-    )
-    .unwrap();
-    assert_eq!(shader.product("main", Stage::Compute).unwrap(), b"dxil");
-    assert_eq!(shader.metadata(), b"{\"semantic_abi\":1}");
+fn every_backend_rejects_reflection_before_product_exposure() {
+    for (backend, target) in [
+        (Backend::Vulkan, "Spirv"),
+        (Backend::Dx12, "Dxil"),
+        (Backend::Metal, "Metallib"),
+    ] {
+        assert_eq!(
+            load(
+                &artifact_with_metadata(br#"{"reflections":[]}"#.to_vec()),
+                backend,
+            ),
+            Err(ShaderLoadError::Reflection(
+                ez_gfx_runtime::binding::BindingError::MissingReflection
+            ))
+        );
+
+        let malformed = serde_json::to_vec(&serde_json::json!({"reflections":[{
+            "target": target,
+            "entry": "main",
+            "stage": "Compute",
+            "reflection": {"parameters":[{
+                "semantic_name":"resource",
+                "api_kind":"unsupported",
+                "binding_index":0,
+                "binding_space":0
+            }]}
+        }]}))
+        .unwrap();
+        assert_eq!(
+            load(&artifact_with_metadata(malformed), backend),
+            Err(ShaderLoadError::Reflection(
+                ez_gfx_runtime::binding::BindingError::InvalidMetadata
+            ))
+        );
+
+        let invalid_heap = serde_json::to_vec(&serde_json::json!({"reflections":[{
+            "target": target,
+            "entry": "main",
+            "stage": "Compute",
+            "reflection": {
+                "parameters":[],
+                "texture_heap":{
+                    "binding_space":0,
+                    "binding_index":0,
+                    "capacity":0,
+                    "argument_stride":2,
+                    "texture_argument_offset":0,
+                    "sampler_argument_offset":1
+                }
+            }
+        }]}))
+        .unwrap();
+        assert_eq!(
+            load(&artifact_with_metadata(invalid_heap), backend),
+            Err(ShaderLoadError::Reflection(
+                ez_gfx_runtime::binding::BindingError::InvalidMetadata
+            ))
+        );
+    }
 }
 
 #[test]
-fn metal_runtime_requires_offline_metallib_and_never_uses_msl() {
+fn metal_selection_is_compatible_and_deterministic() {
+    let metal = |minimum_os, bytes| {
+        TargetVariant::new(
+            Target::Metallib,
+            Stage::Compute,
+            "main",
+            "ez-gfx-v1",
+            TargetCompatibility::MetalLibrary {
+                metal: MetalCompatibility {
+                    platform: ApplePlatform::MacOs,
+                    architecture: AppleArchitecture::X86_64,
+                    minimum_os,
+                    sdk: CompatibilityVersion::new(15, 0),
+                    language: CompatibilityVersion::new(3, 0),
+                    library: CompatibilityVersion::new(1, 0),
+                    toolchain: "apple-clang-16".into(),
+                },
+            },
+            vec![bytes],
+        )
+        .unwrap()
+    };
+    let bytes = Artifact::new(
+        metadata(&[Stage::Compute]),
+        Provenance::new("slangc", "2026.16", vec![], "host"),
+        vec![
+            TargetVariant::new(
+                Target::Spirv,
+                Stage::Compute,
+                "main",
+                "ez-gfx-v1",
+                compatibility(Target::Spirv),
+                vec![1],
+            )
+            .unwrap(),
+            TargetVariant::new(
+                Target::Dxil,
+                Stage::Compute,
+                "main",
+                "ez-gfx-v1",
+                compatibility(Target::Dxil),
+                vec![2],
+            )
+            .unwrap(),
+            metal(CompatibilityVersion::new(14, 0), 3),
+            metal(CompatibilityVersion::new(15, 0), 4),
+        ],
+    )
+    .unwrap()
+    .encode()
+    .unwrap();
+
+    let selected = load(&bytes, Backend::Metal).unwrap();
+    assert_eq!(selected.product(Stage::Compute), Some([4].as_slice()));
+
+    let incompatible = MetalEnvironment {
+        architecture: AppleArchitecture::Aarch64,
+        ..METAL_ENVIRONMENT
+    };
     assert_eq!(
-        RuntimeShader::load(
-            &artifact(Target::Msl),
+        RuntimeShader::load_for_environment(
+            &bytes,
             Backend::Metal,
             SemanticProfile::V1,
-            &[ShaderRequest::new("main", Stage::Compute).unwrap()]
+            Some(&incompatible),
         ),
         Err(ShaderLoadError::MissingProduct {
-            entry: "main".into(),
             stage: Stage::Compute
         })
     );
 }
 
 #[test]
-fn malformed_or_missing_requests_fail_without_fallback() {
+fn selects_backend_profile_and_every_available_stage() {
+    let shader = RuntimeShader::load(
+        &artifact(Target::Metallib),
+        Backend::Dx12,
+        SemanticProfile::V1,
+    )
+    .unwrap();
+    assert_eq!(shader.product(Stage::Compute).unwrap(), b"dxil");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(shader.metadata()).unwrap()["semantic_abi"],
+        1
+    );
+}
+
+#[test]
+fn metal_runtime_requires_offline_metallib_and_never_uses_msl() {
+    assert_eq!(
+        RuntimeShader::load(&artifact(Target::Msl), Backend::Metal, SemanticProfile::V1),
+        Err(ShaderLoadError::MissingProduct {
+            stage: Stage::Compute
+        })
+    );
+}
+
+#[test]
+fn malformed_and_missing_backend_coverage_fail_without_fallback() {
     assert!(matches!(
-        RuntimeShader::load(
-            b"bad",
-            Backend::Vulkan,
-            SemanticProfile::V1,
-            &[ShaderRequest::new("main", Stage::Compute).unwrap()]
-        ),
+        RuntimeShader::load(b"bad", Backend::Vulkan, SemanticProfile::V1),
         Err(ShaderLoadError::Artifact(_))
     ));
+
+    let variants = [Target::Spirv, Target::Dxil, Target::Metallib]
+        .into_iter()
+        .map(|target| {
+            TargetVariant::new(
+                target,
+                Stage::Compute,
+                "main",
+                "other-profile",
+                compatibility(target),
+                vec![target as u8],
+            )
+            .unwrap()
+        })
+        .collect();
+    let bytes = Artifact::new(
+        metadata(&[Stage::Compute]),
+        Provenance::new("slangc", "2026.16", vec![], "host"),
+        variants,
+    )
+    .unwrap()
+    .encode()
+    .unwrap();
     assert_eq!(
-        ShaderRequest::new("", Stage::Compute),
-        Err(ShaderLoadError::InvalidRequest)
-    );
-    assert_eq!(
-        RuntimeShader::load(
-            &artifact(Target::Metallib),
-            Backend::Vulkan,
-            SemanticProfile::V1,
-            &[ShaderRequest::new("other", Stage::Compute).unwrap()]
-        ),
+        RuntimeShader::load(&bytes, Backend::Vulkan, SemanticProfile::V1),
         Err(ShaderLoadError::MissingProduct {
-            entry: "other".into(),
             stage: Stage::Compute
         })
     );
@@ -94,8 +324,9 @@ fn pipeline_stage_pairing_requires_exact_vertex_fragment_or_compute_products() {
                     TargetVariant::new(
                         target,
                         stage,
-                        "main",
+                        format!("{stage:?}"),
                         "ez-gfx-v1",
+                        compatibility(target),
                         vec![target as u8 + stage as u8 + 1],
                     )
                     .unwrap()
@@ -103,32 +334,22 @@ fn pipeline_stage_pairing_requires_exact_vertex_fragment_or_compute_products() {
         })
         .collect();
     let graphics_artifact = Artifact::new(
-        b"{\"semantic_abi\":1}".to_vec(),
+        metadata(&[Stage::Vertex, Stage::Fragment]),
         Provenance::new("slangc", "2026.16", vec![], "host"),
         variants,
     )
     .unwrap()
     .encode()
     .unwrap();
-    let graphics = RuntimeShader::load(
-        &graphics_artifact,
-        Backend::Vulkan,
-        SemanticProfile::V1,
-        &[
-            ShaderRequest::new("main", Stage::Vertex).unwrap(),
-            ShaderRequest::new("main", Stage::Fragment).unwrap(),
-        ],
-    )
-    .unwrap();
+    let graphics =
+        RuntimeShader::load(&graphics_artifact, Backend::Vulkan, SemanticProfile::V1).unwrap();
     assert_eq!(graphics.graphics_pair().unwrap().0.1, Stage::Vertex);
     assert!(graphics.compute_product().is_err());
 
-    let compute_artifact = artifact(Target::Metallib);
     let compute = RuntimeShader::load(
-        &compute_artifact,
+        &artifact(Target::Metallib),
         Backend::Vulkan,
         SemanticProfile::V1,
-        &[ShaderRequest::new("main", Stage::Compute).unwrap()],
     )
     .unwrap();
     assert_eq!(compute.compute_product().unwrap().1, Stage::Compute);
@@ -136,7 +357,7 @@ fn pipeline_stage_pairing_requires_exact_vertex_fragment_or_compute_products() {
 }
 
 #[test]
-fn one_artifact_can_select_graphics_and_compute_pipelines() {
+fn one_artifact_selects_graphics_and_compute_without_caller_entry_names() {
     let variants = [Target::Spirv, Target::Dxil, Target::Metallib]
         .into_iter()
         .flat_map(|target| {
@@ -146,34 +367,30 @@ fn one_artifact_can_select_graphics_and_compute_pipelines() {
                     TargetVariant::new(
                         target,
                         stage,
-                        format!("{stage:?}"),
+                        if stage == Stage::Compute {
+                            "main".into()
+                        } else {
+                            format!("{stage:?}")
+                        },
                         "ez-gfx-v1",
+                        compatibility(target),
                         vec![target as u8 + stage as u8 + 1],
                     )
                     .unwrap()
                 })
         })
         .collect();
-    let artifact = Artifact::new(
-        b"{\"semantic_abi\":1}".to_vec(),
+    let bytes = Artifact::new(
+        metadata(&[Stage::Vertex, Stage::Fragment, Stage::Compute]),
         Provenance::new("slangc", "2026.16", vec![], "host"),
         variants,
     )
     .unwrap()
     .encode()
     .unwrap();
-    let shader = RuntimeShader::load(
-        &artifact,
-        Backend::Vulkan,
-        SemanticProfile::V1,
-        &[
-            ShaderRequest::new("Vertex", Stage::Vertex).unwrap(),
-            ShaderRequest::new("Fragment", Stage::Fragment).unwrap(),
-            ShaderRequest::new("Compute", Stage::Compute).unwrap(),
-        ],
-    )
-    .unwrap();
+    let shader = RuntimeShader::load(&bytes, Backend::Vulkan, SemanticProfile::V1).unwrap();
 
     assert!(shader.graphics_pair().is_ok());
     assert_eq!(shader.compute_product().unwrap().1, Stage::Compute);
+    assert_eq!(shader.product(Stage::Vertex).unwrap().len(), 1);
 }

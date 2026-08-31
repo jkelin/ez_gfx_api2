@@ -1,7 +1,7 @@
 use super::{
     AllocationRequest, BufferTransfer, CompletionToken, ContextIdentity, EzGfxResult,
     GeometryError, HalError, HashMap, LifecycleError, MemoryAllocator, NativeAllocation,
-    NativeContext, NativeTexture,
+    NativeContext, NativeTexture, PackedHandle,
 };
 
 pub(super) fn map_frame(error: &ez_gfx_runtime::frame::FrameError) -> EzGfxResult {
@@ -81,7 +81,7 @@ pub(super) fn pipeline_layout_key(
 pub(super) fn vulkan_bindings<'a>(
     layout: &ez_gfx_runtime::binding::ReflectedBindings,
     bindings: &[ez_gfx_runtime::binding::PublicBinding],
-    allocations: &'a HashMap<u64, (u64, NativeAllocation)>,
+    allocations: &'a HashMap<PackedHandle, (u64, NativeAllocation)>,
 ) -> Result<Vec<ez_gfx_backend_vulkan::NativeBufferBinding<'a>>, HalError> {
     let mut native = Vec::new();
     for requirement in layout.requirements() {
@@ -89,25 +89,26 @@ pub(super) fn vulkan_bindings<'a>(
             .iter()
             .find(|binding| binding.name == requirement.name)
             .ok_or(HalError::InvalidArgument)?;
-        match public.resource {
-            ez_gfx_runtime::binding::ResourceIdentity::Structured(handle)
-            | ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle)
-                if requirement.descriptor_count == 1 =>
-            {
-                let (size, allocation) =
-                    allocations.get(&handle).ok_or(HalError::InvalidArgument)?;
-                let NativeAllocation::Vulkan(allocation) = allocation else {
-                    return Err(HalError::InvalidArgument);
-                };
-                native.push(ez_gfx_backend_vulkan::NativeBufferBinding {
-                    allocation,
-                    offset: 0,
-                    range: *size,
-                    writable: requirement.writable,
-                });
-            }
-            _ => return Err(HalError::Unsupported),
+        if requirement.descriptor_count != 1 {
+            return Err(HalError::Unsupported);
         }
+        let handle = match public.resource {
+            ez_gfx_runtime::binding::ResourceIdentity::Structured(handle) => handle.packed(),
+            ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle) => handle.packed(),
+            ez_gfx_runtime::binding::ResourceIdentity::RenderTarget(_) => {
+                return Err(HalError::Unsupported);
+            }
+        };
+        let (size, allocation) = allocations.get(&handle).ok_or(HalError::InvalidArgument)?;
+        let NativeAllocation::Vulkan(allocation) = allocation else {
+            return Err(HalError::InvalidArgument);
+        };
+        native.push(ez_gfx_backend_vulkan::NativeBufferBinding {
+            allocation,
+            offset: 0,
+            range: *size,
+            writable: requirement.writable,
+        });
     }
     Ok(native)
 }
@@ -116,7 +117,7 @@ pub(super) fn vulkan_bindings<'a>(
 pub(super) fn metal_bindings<'a>(
     layout: &ez_gfx_runtime::binding::ReflectedBindings,
     bindings: &[ez_gfx_runtime::binding::PublicBinding],
-    allocations: &'a HashMap<u64, (u64, NativeAllocation)>,
+    allocations: &'a HashMap<PackedHandle, (u64, NativeAllocation)>,
 ) -> Result<Vec<ez_gfx_backend_metal::native::NativeBufferBinding<'a>>, HalError> {
     let mut native = Vec::new();
     for requirement in layout.requirements() {
@@ -124,23 +125,25 @@ pub(super) fn metal_bindings<'a>(
             .iter()
             .find(|binding| binding.name == requirement.name)
             .ok_or(HalError::InvalidArgument)?;
-        match public.resource {
-            ez_gfx_runtime::binding::ResourceIdentity::Structured(handle)
-            | ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle)
-                if requirement.descriptor_count == 1 =>
-            {
-                let (_, allocation) = allocations.get(&handle).ok_or(HalError::InvalidArgument)?;
-                let NativeAllocation::Metal(allocation) = allocation else {
-                    return Err(HalError::InvalidArgument);
-                };
-                native.push(ez_gfx_backend_metal::native::NativeBufferBinding {
-                    allocation,
-                    offset: 0,
-                    index: requirement.binding as usize,
-                });
-            }
-            _ => return Err(HalError::Unsupported),
+        if requirement.descriptor_count != 1 {
+            return Err(HalError::Unsupported);
         }
+        let handle = match public.resource {
+            ez_gfx_runtime::binding::ResourceIdentity::Structured(handle) => handle.packed(),
+            ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle) => handle.packed(),
+            ez_gfx_runtime::binding::ResourceIdentity::RenderTarget(_) => {
+                return Err(HalError::Unsupported);
+            }
+        };
+        let (_, allocation) = allocations.get(&handle).ok_or(HalError::InvalidArgument)?;
+        let NativeAllocation::Metal(allocation) = allocation else {
+            return Err(HalError::InvalidArgument);
+        };
+        native.push(ez_gfx_backend_metal::native::NativeBufferBinding {
+            allocation,
+            offset: 0,
+            index: requirement.binding as usize,
+        });
     }
     Ok(native)
 }
@@ -149,7 +152,7 @@ pub(super) fn metal_bindings<'a>(
 pub(super) fn dx12_bindings<'a>(
     layout: &ez_gfx_runtime::binding::ReflectedBindings,
     bindings: &[ez_gfx_runtime::binding::PublicBinding],
-    allocations: &'a HashMap<u64, (u64, NativeAllocation)>,
+    allocations: &'a HashMap<PackedHandle, (u64, NativeAllocation)>,
 ) -> Result<Vec<ez_gfx_backend_dx12::native::NativeBufferBinding<'a>>, HalError> {
     let mut native = Vec::new();
     for requirement in layout.requirements() {
@@ -157,23 +160,25 @@ pub(super) fn dx12_bindings<'a>(
             .iter()
             .find(|binding| binding.name == requirement.name)
             .ok_or(HalError::InvalidArgument)?;
-        match public.resource {
-            ez_gfx_runtime::binding::ResourceIdentity::Structured(handle)
-            | ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle)
-                if requirement.descriptor_count == 1 =>
-            {
-                let (_, allocation) = allocations.get(&handle).ok_or(HalError::InvalidArgument)?;
-                let NativeAllocation::Dx12(allocation) = allocation else {
-                    return Err(HalError::InvalidArgument);
-                };
-                native.push(ez_gfx_backend_dx12::native::NativeBufferBinding {
-                    allocation,
-                    offset: 0,
-                    writable: requirement.writable,
-                });
-            }
-            _ => return Err(HalError::Unsupported),
+        if requirement.descriptor_count != 1 {
+            return Err(HalError::Unsupported);
         }
+        let handle = match public.resource {
+            ez_gfx_runtime::binding::ResourceIdentity::Structured(handle) => handle.packed(),
+            ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle) => handle.packed(),
+            ez_gfx_runtime::binding::ResourceIdentity::RenderTarget(_) => {
+                return Err(HalError::Unsupported);
+            }
+        };
+        let (_, allocation) = allocations.get(&handle).ok_or(HalError::InvalidArgument)?;
+        let NativeAllocation::Dx12(allocation) = allocation else {
+            return Err(HalError::InvalidArgument);
+        };
+        native.push(ez_gfx_backend_dx12::native::NativeBufferBinding {
+            allocation,
+            offset: 0,
+            writable: requirement.writable,
+        });
     }
     Ok(native)
 }

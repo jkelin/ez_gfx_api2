@@ -2,15 +2,19 @@
 
 `ez-gfx-ffi` is the C ABI boundary for the `ez-gfx` runtime. C and other foreign-language clients must include [`include/ez_gfx_api.h`](../../include/ez_gfx_api.h); the declarations and numeric values in that header are canonical. Rust clients should depend on `ez-gfx`, not `ez-gfx-ffi`.
 
+The complete [C structured-buffer cube](../../examples/c/structured_cube/README.md) compiles its shader during the CMake build and exercises ABI v18 compute, structured buffers, indexed-indirect graphics, presentation, and snapshot readback on Win32. CI builds and links it, then runs Vulkan with SwiftShader; hosted DX12 remains compile-only.
+
 ## Compatibility and ownership
 
-Before any other call, read `ez_gfx_abi_version()` and require `EZ_GFX_ABI_VERSION` (ABI v17). Do not call the ABI when the version does not match.
+Before any other call, read `ez_gfx_abi_version()` and require `EZ_GFX_ABI_VERSION` (ABI v18). Do not call the ABI when the version does not match.
 
 `ez_gfx_handle_inspect` decodes a packed handle into its context/child slot and generation fields; it does not validate that the handle is live in a context. `ez_gfx_semantic_id` accepts a non-empty UTF-8 byte range and writes its fixed 16-byte identifier.
 
 The context and all context/resource operations, including teardown, are creator-thread-affine in the delegated runtime. A call from another thread is rejected; a void destruction call cannot report that failure, so perform destruction on the creator thread. The host owns the native window/display/connection or `CAMetalLayer` pointers supplied in `EzGfxSurfaceDesc` and must keep them valid until the returned surface is destroyed. The runtime owns created surfaces, shaders, textures, buffers, heaps, and their native graphics objects; the host owns the opaque handle values and must release them through this ABI.
 
 ## Call order
+
+`ez_gfx_shader_load_artifact(data, size, out_shader, context)` loads every stage present for the context backend/profile. Entry-point names remain artifact metadata and are not caller inputs.
 
 1. Create a context with `ez_gfx_context_create` or `ez_gfx_context_create_backend`.
 2. Create a presentation surface with `ez_gfx_surface_create`, then initialize its device with `ez_gfx_context_init_device`.
