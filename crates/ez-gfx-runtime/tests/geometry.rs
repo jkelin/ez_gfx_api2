@@ -1,3 +1,5 @@
+//! Runtime integration and contract tests.
+
 use ez_gfx_hal::{CompletionToken, QueueKind};
 use ez_gfx_runtime::geometry::{GeometryError, GeometryManager, StagingPool};
 

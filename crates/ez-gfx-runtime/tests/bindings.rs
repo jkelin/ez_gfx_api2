@@ -1,3 +1,5 @@
+//! Runtime integration and contract tests.
+
 use ez_gfx_artifact::Stage;
 use ez_gfx_core::Backend;
 use ez_gfx_runtime::binding::{

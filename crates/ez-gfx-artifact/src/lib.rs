@@ -1,7 +1,9 @@
+//! Validated, deterministic shader artifact containers.
 #![forbid(unsafe_code)]
 
 use std::{collections::BTreeSet, fmt};
 
+/// Maximum encoded artifact size accepted by the container format.
 pub const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 const MAGIC: &[u8; 8] = b"EZSHDR01";
 const VERSION: u16 = 1;
@@ -11,14 +13,21 @@ const MAX_SECTIONS: usize = 128;
 const MAX_STRING: usize = 16 * 1024;
 const MAX_VARIANTS: usize = 64;
 
+/// Shader execution stages represented by an artifact variant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 #[repr(u8)]
 pub enum Stage {
+    /// Vertex shader.
     Vertex = 1,
+    /// Fragment shader.
     Fragment = 2,
+    /// Compute shader.
     Compute = 3,
+    /// Geometry shader.
     Geometry = 4,
+    /// Tessellation control shader.
     TessellationControl = 5,
+    /// Tessellation evaluation shader.
     TessellationEvaluation = 6,
 }
 
@@ -36,12 +45,17 @@ impl Stage {
     }
 }
 
+/// Binary targets supported by shader artifacts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 #[repr(u8)]
 pub enum Target {
+    /// SPIR-V binary.
     Spirv = 1,
+    /// DXIL binary.
     Dxil = 2,
+    /// Metal Shading Language source or binary.
     Msl = 3,
+    /// Metal library binary.
     Metallib = 4,
 }
 
@@ -57,16 +71,28 @@ impl Target {
     }
 }
 
+/// One compiled shader variant and its target metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetVariant {
+    /// Binary target.
     pub target: Target,
+    /// Shader stage.
     pub stage: Stage,
+    /// Entry-point name.
     pub entry_point: String,
+    /// Target profile name.
     pub profile: String,
+    /// Compiled variant bytes.
     pub bytes: Vec<u8>,
 }
 
 impl TargetVariant {
+    /// Validates and constructs a shader variant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when entry-point/profile text is empty, oversized, or
+    /// contains NUL, or when the binary is empty.
     pub fn new(
         target: Target,
         stage: Stage,
@@ -97,15 +123,21 @@ impl TargetVariant {
         })
     }
 }
+/// Compiler identity and options used to produce shader variants.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Provenance {
+    /// Compiler name.
     pub compiler: String,
+    /// Compiler version.
     pub compiler_version: String,
+    /// Compiler options.
     pub options: Vec<String>,
+    /// Toolchain identity.
     pub toolchain: String,
 }
 
 impl Provenance {
+    /// Creates provenance metadata without performing validation.
     pub fn new(
         compiler: impl Into<String>,
         version: impl Into<String>,
@@ -137,15 +169,25 @@ impl Provenance {
     }
 }
 
+/// Complete validated shader artifact with metadata and target variants.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Artifact {
+    /// UTF-8 metadata associated with the compiled artifact.
     pub metadata: Vec<u8>,
+    /// Compiler provenance for the artifact.
     pub provenance: Provenance,
+    /// Target variants with complete cross-target coverage.
     pub variants: Vec<TargetVariant>,
     digest: [u8; 32],
 }
 
 impl Artifact {
+    /// Validates metadata, provenance, uniqueness, and target coverage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid metadata/provenance, invalid variant count,
+    /// duplicate variants, or incomplete target coverage.
     pub fn new(
         metadata: Vec<u8>,
         provenance: Provenance,
@@ -210,10 +252,17 @@ impl Artifact {
         })
     }
 
+    /// Returns the content digest used to identify this artifact.
     pub fn execution_digest(&self) -> [u8; 32] {
         self.digest
     }
 
+    /// Encodes the artifact into its bounded binary container format.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactError::TooLarge`] when encoded sections exceed the
+    /// container limit or when a section cannot be represented.
     pub fn encode(&self) -> Result<Vec<u8>, ArtifactError> {
         let provenance = encode_provenance(&self.provenance)?;
         let digest = digest_content(&self.metadata, &provenance, &self.variants);
@@ -236,7 +285,11 @@ impl Artifact {
         let mut output = Vec::with_capacity(total);
         output.extend_from_slice(MAGIC);
         output.extend_from_slice(&VERSION.to_le_bytes());
-        output.extend_from_slice(&(sections as u16).to_le_bytes());
+        output.extend_from_slice(
+            &u16::try_from(sections)
+                .map_err(|_| ArtifactError::TooLarge)?
+                .to_le_bytes(),
+        );
         output.extend_from_slice(&(total as u64).to_le_bytes());
         output.extend_from_slice(&digest);
         let mut offset = payload_start;
@@ -251,6 +304,17 @@ impl Artifact {
         Ok(output)
     }
 
+    /// Decodes and validates an artifact container.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for truncated, malformed, oversized, or digest-invalid
+    /// input.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if a previously length-checked fixed-width header slice
+    /// cannot be converted to its declared integer type.
     pub fn decode(input: &[u8]) -> Result<Self, ArtifactError> {
         if input.len() > MAX_ARTIFACT_BYTES {
             return Err(ArtifactError::TooLarge);
@@ -261,8 +325,9 @@ impl Artifact {
         if &input[..8] != MAGIC || u16::from_le_bytes(input[8..10].try_into().unwrap()) != VERSION {
             return Err(ArtifactError::InvalidHeader);
         }
-        let count = u16::from_le_bytes(input[10..12].try_into().unwrap()) as usize;
-        let total = u64::from_le_bytes(input[12..20].try_into().unwrap()) as usize;
+        let count = usize::from(u16::from_le_bytes(input[10..12].try_into().unwrap()));
+        let total = usize::try_from(u64::from_le_bytes(input[12..20].try_into().unwrap()))
+            .map_err(|_| ArtifactError::InvalidSection)?;
         if !(3..=MAX_SECTIONS).contains(&count) {
             return Err(ArtifactError::InvalidHeader);
         }
@@ -283,8 +348,12 @@ impl Artifact {
         let mut previous = table_end;
         for i in 0..count {
             let at = HEADER + i * RECORD;
-            let offset = u64::from_le_bytes(input[at..at + 8].try_into().unwrap()) as usize;
-            let len = u64::from_le_bytes(input[at + 8..at + 16].try_into().unwrap()) as usize;
+            let offset = usize::try_from(u64::from_le_bytes(input[at..at + 8].try_into().unwrap()))
+                .map_err(|_| ArtifactError::InvalidSection)?;
+            let len = usize::try_from(u64::from_le_bytes(
+                input[at + 8..at + 16].try_into().unwrap(),
+            ))
+            .map_err(|_| ArtifactError::InvalidSection)?;
             let end = offset
                 .checked_add(len)
                 .ok_or(ArtifactError::InvalidSection)?;
@@ -322,9 +391,17 @@ fn digest_content(metadata: &[u8], provenance: &[u8], variants: &[TargetVariant]
     hasher.update(provenance);
     for variant in variants {
         hasher.update(&[variant.target as u8, variant.stage as u8]);
-        hasher.update(&(variant.entry_point.len() as u32).to_le_bytes());
+        hasher.update(
+            &u32::try_from(variant.entry_point.len())
+                .expect("validated entry points fit in the artifact length field")
+                .to_le_bytes(),
+        );
         hasher.update(variant.entry_point.as_bytes());
-        hasher.update(&(variant.profile.len() as u32).to_le_bytes());
+        hasher.update(
+            &u32::try_from(variant.profile.len())
+                .expect("validated profiles fit in the artifact length field")
+                .to_le_bytes(),
+        );
         hasher.update(variant.profile.as_bytes());
         hasher.update(&(variant.bytes.len() as u64).to_le_bytes());
         hasher.update(&variant.bytes);
@@ -332,7 +409,11 @@ fn digest_content(metadata: &[u8], provenance: &[u8], variants: &[TargetVariant]
     *hasher.finalize().as_bytes()
 }
 fn put_string(out: &mut Vec<u8>, value: &str) {
-    out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    out.extend_from_slice(
+        &u32::try_from(value.len())
+            .expect("validated strings fit in the artifact length field")
+            .to_le_bytes(),
+    );
     out.extend_from_slice(value.as_bytes());
 }
 fn get_string<'a>(input: &'a [u8], at: &mut usize) -> Result<&'a str, ArtifactError> {
@@ -355,7 +436,11 @@ fn encode_provenance(value: &Provenance) -> Result<Vec<u8>, ArtifactError> {
     put_string(&mut out, &value.compiler);
     put_string(&mut out, &value.compiler_version);
     put_string(&mut out, &value.toolchain);
-    out.extend_from_slice(&(value.options.len() as u16).to_le_bytes());
+    out.extend_from_slice(
+        &u16::try_from(value.options.len())
+            .expect("validated options fit in the artifact count field")
+            .to_le_bytes(),
+    );
     for option in &value.options {
         put_string(&mut out, option);
     }
@@ -405,26 +490,45 @@ fn decode_variant(input: &[u8]) -> Result<TargetVariant, ArtifactError> {
     let profile = get_string(input, &mut at)?.to_owned();
     TargetVariant::new(target, stage, entry, profile, input[at..].to_vec())
 }
+/// Errors encountered while encoding, decoding, or validating an artifact.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArtifactError {
+    /// Input ended before the complete container was available.
     Truncated,
+    /// The container exceeds the configured size limit.
     TooLarge,
+    /// The magic, version, count, or total length is invalid.
     InvalidHeader,
+    /// A section record is invalid or out of bounds.
     InvalidSection,
+    /// Metadata is empty, invalid UTF-8, or oversized.
     InvalidMetadata,
+    /// Provenance text or options are invalid.
     InvalidProvenance,
+    /// A target tag is unknown.
     InvalidTarget,
+    /// An entry point is empty, oversized, or contains NUL.
     InvalidEntryPoint,
+    /// A profile is empty, oversized, or contains NUL.
     InvalidProfile,
+    /// A stage tag is unknown.
     InvalidStage,
+    /// The artifact has too few or too many variants.
     InvalidVariantCount,
+    /// A variant contains no compiled bytes.
     EmptyVariant,
+    /// Two variants have the same target identity.
     DuplicateVariant,
+    /// A logical entry point/stage lacks a required backend target.
     MissingCoverage {
+        /// Entry-point name missing target coverage.
         entry: String,
+        /// Shader stage missing target coverage.
         stage: Stage,
+        /// Backend target missing from the artifact.
         target: Target,
     },
+    /// The encoded digest does not match its content.
     DigestMismatch,
 }
 impl fmt::Display for ArtifactError {

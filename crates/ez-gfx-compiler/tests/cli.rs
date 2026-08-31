@@ -1,3 +1,4 @@
+//! Compiler integration tests.
 use std::{fs, process::Command};
 
 #[test]

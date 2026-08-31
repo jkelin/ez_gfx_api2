@@ -1,3 +1,5 @@
+//! Runtime integration and contract tests.
+
 use ez_gfx_hal::{CompletionToken, QueueKind};
 use ez_gfx_runtime::texture::{
     DecodedMip, DecodedTexture, TextureDecoder, TextureError, TextureEvent, TextureRegistry,
@@ -139,9 +141,9 @@ fn residency_binding_and_events_follow_upload_completion() {
         )
         .unwrap();
     assert_eq!(registry.binding_index(texture), Err(TextureError::NotReady));
-    registry.poll(QueueKind::Transfer, 2).unwrap();
+    assert_eq!(registry.poll(QueueKind::Transfer, 2).unwrap(), 0);
     assert_eq!(registry.binding_index(texture), Err(TextureError::NotReady));
-    registry.poll(QueueKind::Transfer, 3).unwrap();
+    assert_eq!(registry.poll(QueueKind::Transfer, 3).unwrap(), 1);
     assert_eq!(registry.binding_index(texture), Ok(0));
     assert_eq!(
         registry.drain_events(),
@@ -151,9 +153,9 @@ fn residency_binding_and_events_follow_upload_completion() {
             resident_mips: 1
         }]
     );
-    registry.poll(QueueKind::Transfer, 4).unwrap();
+    assert_eq!(registry.poll(QueueKind::Transfer, 4).unwrap(), 0);
     assert_eq!(registry.resident_mips(texture), Ok(1));
-    registry.poll(QueueKind::Transfer, 5).unwrap();
+    assert_eq!(registry.poll(QueueKind::Transfer, 5).unwrap(), 1);
     assert_eq!(registry.resident_mips(texture), Ok(2));
     assert_eq!(
         registry.drain_events(),

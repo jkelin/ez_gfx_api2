@@ -1,3 +1,4 @@
+//! Asset format, residency, and worker queue contract tests.
 use ez_gfx_assets::{
     AssetError, AssetEvent, BlockFormat, EventOutcome, EventPhase, EventQueue, MipChain, Region,
     TextureId, TextureState, parse_ktx2, validate_block_payload,
@@ -90,9 +91,9 @@ fn cpu_pool_emits_completion_and_error_once() {
     let mut got = Vec::new();
     while got.len() < 2 && start.elapsed() < Duration::from_secs(1) {
         if let Some(x) = q.pop() {
-            got.push(x)
+            got.push(x);
         } else {
-            thread::yield_now()
+            thread::yield_now();
         }
     }
     assert_eq!(got.len(), 2);
@@ -129,7 +130,7 @@ fn accepted_shutdown_emits_cancelled() {
     let mut got = None;
     while got.is_none() && start.elapsed() < Duration::from_secs(1) {
         got = q.pop();
-        thread::yield_now()
+        thread::yield_now();
     }
     assert_eq!(got.unwrap().outcome, EventOutcome::Cancelled);
 }
@@ -159,7 +160,7 @@ fn panic_releases_job_and_byte_capacity() {
     let mut got = None;
     while got.is_none() && start.elapsed() < Duration::from_secs(1) {
         got = q.pop();
-        thread::yield_now()
+        thread::yield_now();
     }
     assert_eq!(got.unwrap().outcome, EventOutcome::Failed);
     let e2 = AssetEvent {

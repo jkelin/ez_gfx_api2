@@ -1,1 +1,6 @@
 msrv = "1.88.0"
+cognitive-complexity-threshold = 25
+too-many-arguments-threshold = 7
+too-many-lines-threshold = 150
+type-complexity-threshold = 200
+allowed-idents-below-min-chars = ["id", "x", "y", "z", "w", "r", "g", "b", "u", "v"]

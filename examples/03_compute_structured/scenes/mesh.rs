@@ -150,10 +150,10 @@ fn append_primitive(
         .read_normals()
         .map(Iterator::collect::<Vec<_>>)
         .unwrap_or_default();
-    let local_indices = reader
-        .read_indices()
-        .map(|values| values.into_u32().collect::<Vec<_>>())
-        .unwrap_or_else(|| (0..positions.len() as u32).collect());
+    let local_indices = reader.read_indices().map_or_else(
+        || (0..positions.len() as u32).collect(),
+        |values| values.into_u32().collect::<Vec<_>>(),
+    );
     if local_indices.is_empty()
         || local_indices
             .iter()

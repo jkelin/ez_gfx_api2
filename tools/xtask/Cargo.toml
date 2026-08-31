@@ -12,3 +12,7 @@ sha2 = "0.10"
 tar = "0.4"
 walkdir = "2.5"
 zip = { version = "4.3", default-features = false, features = ["deflate"] }
+
+
+[lints]
+workspace = true

@@ -1,4 +1,39 @@
+//! Executable rendering example.
+#[allow(
+    clippy::borrow_as_ptr,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::float_cmp,
+    clippy::ignored_unit_patterns,
+    clippy::map_unwrap_or,
+    clippy::match_overlapping_arm,
+    clippy::needless_pass_by_value,
+    clippy::redundant_closure_for_method_calls,
+    clippy::semicolon_if_nothing_returned,
+    clippy::type_complexity,
+    clippy::unused_self,
+    clippy::wildcard_imports,
+    reason = "Example scene and host modules preserve graphics and callback contracts."
+)]
 mod host;
+#[allow(
+    clippy::borrow_as_ptr,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::float_cmp,
+    clippy::ignored_unit_patterns,
+    clippy::map_unwrap_or,
+    clippy::match_overlapping_arm,
+    clippy::needless_pass_by_value,
+    clippy::redundant_closure_for_method_calls,
+    clippy::semicolon_if_nothing_returned,
+    clippy::type_complexity,
+    clippy::unused_self,
+    clippy::wildcard_imports,
+    reason = "Example scene and host modules preserve graphics and callback contracts."
+)]
 mod scenes;
 
 use std::time::Instant;
@@ -40,6 +75,10 @@ fn parse_backend(value: Option<&str>) -> Result<(u8, &'static str), String> {
 }
 
 #[derive(Debug)]
+#[allow(
+    missing_docs,
+    reason = "Presentation results are consumed by the example test API."
+)]
 pub struct PresentedReport {
     pub width: u32,
     pub height: u32,
@@ -51,6 +90,10 @@ pub struct PresentedReport {
 }
 
 /// The default is interactive; a positive limit produces a deterministic automation run.
+///
+/// # Errors
+///
+/// Returns an error when initialization, rendering, or readback fails.
 pub fn run_example(frame_limit: Option<u32>) -> Result<Option<PresentedReport>, String> {
     if frame_limit == Some(0) {
         return Err("frame limit must be positive".to_owned());
@@ -116,12 +159,27 @@ impl App {
     fn capture(&self) -> Result<Vec<u8>, String> {
         let mut size = 0;
         status(
-            ez_gfx_frame_readback(core::ptr::null_mut(), 0, &mut size, self.context),
+            {
+                // SAFETY: Non-null output pointers reference writable storage of the declared capacity and alignment for this call.
+                unsafe {
+                    ez_gfx_frame_readback(core::ptr::null_mut(), 0, &raw mut size, self.context)
+                }
+            },
             "query presented snapshot",
         )?;
         let mut bytes = vec![0; size];
         status(
-            ez_gfx_frame_readback(bytes.as_mut_ptr(), bytes.len(), &mut size, self.context),
+            {
+                // SAFETY: Non-null output pointers reference writable storage of the declared capacity and alignment for this call.
+                unsafe {
+                    ez_gfx_frame_readback(
+                        bytes.as_mut_ptr(),
+                        bytes.len(),
+                        &raw mut size,
+                        self.context,
+                    )
+                }
+            },
             "read presented snapshot",
         )?;
         bytes.truncate(size);
@@ -145,7 +203,17 @@ impl App {
             let mut present = 0;
             let mut overflow = 0;
             status(
-                ez_gfx_poll_runtime_event(&mut record, &mut present, &mut overflow, self.context),
+                {
+                    // SAFETY: Non-null outputs point to live, aligned caller-owned storage; null pointers intentionally exercise checked rejection.
+                    unsafe {
+                        ez_gfx_poll_runtime_event(
+                            &raw mut record,
+                            &raw mut present,
+                            &raw mut overflow,
+                            self.context,
+                        )
+                    }
+                },
                 "poll runtime event",
             )?;
             dropped = dropped.saturating_add(overflow);
@@ -171,7 +239,17 @@ impl App {
             let mut present = 0;
             let mut overflow = 0;
             status(
-                ez_gfx_poll_diagnostic(&mut diagnostic, &mut present, &mut overflow, self.context),
+                {
+                    // SAFETY: Non-null outputs point to live, aligned caller-owned storage; null pointers intentionally exercise checked rejection.
+                    unsafe {
+                        ez_gfx_poll_diagnostic(
+                            &raw mut diagnostic,
+                            &raw mut present,
+                            &raw mut overflow,
+                            self.context,
+                        )
+                    }
+                },
                 "poll diagnostic",
             )?;
             dropped = dropped.saturating_add(overflow);
@@ -222,6 +300,10 @@ fn scene_key(key: &Key) -> SceneKey {
     }
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "Pointer-sized wheel deltas are bounded by the host input contract."
+)]
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -275,28 +357,38 @@ impl ApplicationHandler for App {
             backend,
         };
         if let Err(error) = status(
-            ez_gfx_context_create_backend(&context_desc, &mut self.context),
+            {
+                // SAFETY: Non-null arguments point to live, aligned caller-owned descriptor and output storage for this call; null pointers intentionally exercise checked rejection.
+                unsafe {
+                    ez_gfx_context_create_backend(&raw const context_desc, &raw mut self.context)
+                }
+            },
             &format!("create {backend_name} context"),
         ) {
             return self.fail(event_loop, error);
         }
         let initialized = status(
-            ez_gfx_surface_create(&host.desc, &mut self.surface, self.context),
+            {
+                // SAFETY: The aligned descriptor and output remain live for this call, and its platform objects outlive the returned surface.
+                unsafe {
+                    ez_gfx_surface_create(&raw const host.desc, &raw mut self.surface, self.context)
+                }
+            },
             &format!("create {backend_name} surface"),
         )
-        .and_then(|_| {
+        .and_then(|()| {
             status(
                 ez_gfx_context_init_device(self.surface, self.context),
                 &format!("initialize {backend_name} surface device"),
             )
         })
-        .and_then(|_| {
+        .and_then(|()| {
             status(
                 ez_gfx_surface_resize(self.surface, WIDTH, HEIGHT, self.context),
                 &format!("initialize {backend_name} swapchain"),
             )
         })
-        .and_then(|_| {
+        .and_then(|()| {
             ImGuiScene::create(self.context).map(|resources| self.resources = Some(resources))
         });
         if let Err(error) = initialized {
@@ -420,7 +512,7 @@ impl ApplicationHandler for App {
                                 runtime_events,
                                 diagnostics,
                                 dropped_observations,
-                            })
+                            });
                         }
                         Err(error) => self.error = Some(error),
                     }

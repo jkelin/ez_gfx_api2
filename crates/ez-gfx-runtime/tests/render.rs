@@ -1,3 +1,5 @@
+//! Runtime integration and contract tests.
+
 use ez_gfx_runtime::render::{CullMode, DynamicPipelineState, PrimitiveTopology};
 
 #[test]
@@ -123,6 +125,17 @@ fn executor_consumes_compiled_order_barriers_and_coalesced_passes() {
             "submit",
         ]
     );
+}
+
+#[test]
+fn empty_graph_with_zero_payloads_builds_and_executes_empty_plan() {
+    let compiled = FrameGraph::new().compile().unwrap();
+    let plan = build_execution_plan(&compiled, 0).unwrap();
+    assert!(plan.actions.is_empty());
+
+    let mut backend = TraceBackend::default();
+    execute_compiled_graph::<_, &'static str>(&compiled, &[], &mut backend).unwrap();
+    assert_eq!(backend.trace, ["submit"]);
 }
 
 #[test]

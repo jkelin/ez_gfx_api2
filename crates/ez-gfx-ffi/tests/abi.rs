@@ -1,5 +1,10 @@
+//! ABI layout, validation, lifecycle, and observability contract tests.
+
 use core::mem::{align_of, size_of};
-#[allow(unused_imports)]
+#[allow(
+    unused_imports,
+    reason = "platform-specific tests consume different ABI symbols"
+)]
 use ez_gfx_ffi::{
     EZ_GFX_ABI_VERSION, EzGfxBackendContextDesc, EzGfxContextDesc, EzGfxDiagnostic,
     EzGfxDrawIndexedCommand, EzGfxDynamicState, EzGfxHandleParts, EzGfxResult, EzGfxRuntimeRecord,
@@ -61,15 +66,45 @@ fn observability_polls_validate_all_output_pointers() {
     let mut present = 0;
     let mut dropped = 0;
     assert_eq!(
-        ez_gfx_poll_runtime_event(core::ptr::null_mut(), &mut present, &mut dropped, 0),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe {
+                ez_gfx_poll_runtime_event(
+                    core::ptr::null_mut(),
+                    &raw mut present,
+                    &raw mut dropped,
+                    0,
+                )
+            }
+        },
         EzGfxResult::InvalidArgument
     );
     assert_eq!(
-        ez_gfx_poll_runtime_event(&mut record, core::ptr::null_mut(), &mut dropped, 0),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe {
+                ez_gfx_poll_runtime_event(
+                    &raw mut record,
+                    core::ptr::null_mut(),
+                    &raw mut dropped,
+                    0,
+                )
+            }
+        },
         EzGfxResult::InvalidArgument
     );
     assert_eq!(
-        ez_gfx_poll_diagnostic(&mut diagnostic, &mut present, core::ptr::null_mut(), 0),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe {
+                ez_gfx_poll_diagnostic(
+                    &raw mut diagnostic,
+                    &raw mut present,
+                    core::ptr::null_mut(),
+                    0,
+                )
+            }
+        },
         EzGfxResult::InvalidArgument
     );
 }
@@ -78,11 +113,17 @@ fn observability_polls_validate_all_output_pointers() {
 fn texture_residency_validates_both_output_pointers() {
     let mut value = 0;
     assert_eq!(
-        ez_gfx_texture_get_residency(0, core::ptr::null_mut(), &mut value, 0),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_texture_get_residency(0, core::ptr::null_mut(), &raw mut value, 0) }
+        },
         EzGfxResult::InvalidArgument
     );
     assert_eq!(
-        ez_gfx_texture_get_residency(0, &mut value, core::ptr::null_mut(), 0),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_texture_get_residency(0, &raw mut value, core::ptr::null_mut(), 0) }
+        },
         EzGfxResult::InvalidArgument
     );
 }
@@ -91,7 +132,10 @@ fn texture_residency_validates_both_output_pointers() {
 fn context_creation_rejects_boundary_inputs_before_native_calls() {
     let mut context = 99;
     assert_eq!(
-        ez_gfx_context_create(core::ptr::null(), &mut context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_context_create(core::ptr::null(), &raw mut context) }
+        },
         EzGfxResult::InvalidArgument
     );
     assert_eq!(context, 99);
@@ -102,7 +146,10 @@ fn context_creation_rejects_boundary_inputs_before_native_calls() {
         surface_platform: 0,
     };
     assert_eq!(
-        ez_gfx_context_create(&invalid, &mut context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_context_create(&raw const invalid, &raw mut context) }
+        },
         EzGfxResult::InvalidArgument
     );
     assert_eq!(context, 99);
@@ -117,8 +164,17 @@ fn context_lifecycle_admits_a_real_vulkan_device_and_invalidates_destroyed_handl
         surface_platform: 0,
     };
     let mut context = 0;
-    assert_eq!(ez_gfx_context_create(&desc, &mut context), EzGfxResult::Ok);
+    assert_eq!(
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_context_create(&raw const desc, &raw mut context) }
+        },
+        EzGfxResult::Ok
+    );
     assert_ne!(context, 0);
+    std::thread::spawn(move || ez_gfx_context_destroy(context))
+        .join()
+        .unwrap();
     assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
     ez_gfx_context_destroy(context);
     assert_eq!(
@@ -138,37 +194,56 @@ fn explicit_dx12_context_allocates_writes_and_releases_structured_memory() {
     };
     let mut context = 0;
     assert_eq!(
-        ez_gfx_context_create_backend(&desc, &mut context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_context_create_backend(&raw const desc, &raw mut context) }
+        },
         EzGfxResult::Ok
     );
     let name = std::ffi::CString::new("vertices").unwrap();
     let mut structured = 0;
     assert_eq!(
-        ez_gfx_structured_acquire(16, 4, name.as_ptr(), &mut structured, context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_structured_acquire(16, 4, name.as_ptr(), &raw mut structured, context) }
+        },
         EzGfxResult::Ok
     );
     let bytes = [7_u8; 64];
     assert_eq!(
-        ez_gfx_structured_write(
-            structured,
-            bytes.as_ptr().cast(),
-            bytes.len() as u64,
-            context
-        ),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe {
+                ez_gfx_structured_write(
+                    structured,
+                    bytes.as_ptr().cast(),
+                    bytes.len() as u64,
+                    context,
+                )
+            }
+        },
         EzGfxResult::Ok
     );
     assert_eq!(
-        ez_gfx_structured_write(structured, bytes.as_ptr().cast(), 65, context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_structured_write(structured, bytes.as_ptr().cast(), 65, context) }
+        },
         EzGfxResult::InvalidArgument
     );
     ez_gfx_structured_release(structured, context);
     assert_eq!(
-        ez_gfx_structured_write(
-            structured,
-            bytes.as_ptr().cast(),
-            bytes.len() as u64,
-            context
-        ),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe {
+                ez_gfx_structured_write(
+                    structured,
+                    bytes.as_ptr().cast(),
+                    bytes.len() as u64,
+                    context,
+                )
+            }
+        },
         EzGfxResult::InvalidContext
     );
     assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
@@ -190,40 +265,60 @@ fn dx12_geometry_uploads_use_real_device_buffers_and_transfer_fence() {
     };
     let mut context = 0;
     assert_eq!(
-        ez_gfx_context_create_backend(&desc, &mut context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_context_create_backend(&raw const desc, &raw mut context) }
+        },
         EzGfxResult::Ok
     );
     let heap = std::ffi::CString::new("position").unwrap();
     assert_eq!(
-        ez_gfx_vertex_heap_create(heap.as_ptr(), 256, 16, context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_vertex_heap_create(heap.as_ptr(), 256, 16, context) }
+        },
         EzGfxResult::Ok
     );
     assert_eq!(
-        ez_gfx_index_heap_create(256, heap.as_ptr(), context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_index_heap_create(256, heap.as_ptr(), context) }
+        },
         EzGfxResult::Ok
     );
     let vertices = [1_u8; 64];
     let mut first = u32::MAX;
     assert_eq!(
-        ez_gfx_vertex_upload(
-            heap.as_ptr(),
-            vertices.as_ptr().cast(),
-            4,
-            16,
-            &mut first,
-            context
-        ),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe {
+                ez_gfx_vertex_upload(
+                    heap.as_ptr(),
+                    vertices.as_ptr().cast(),
+                    4,
+                    16,
+                    &raw mut first,
+                    context,
+                )
+            }
+        },
         EzGfxResult::Ok
     );
     assert_eq!(first, 0);
     let indices = [0_u32, 1, 2];
     assert_eq!(
-        ez_gfx_vertex_upload_indices(indices.as_ptr().cast(), 3, &mut first, context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe {
+                ez_gfx_vertex_upload_indices(indices.as_ptr().cast(), 3, &raw mut first, context)
+            }
+        },
         EzGfxResult::Ok
     );
     assert_eq!(first, 0);
     assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
-    ez_gfx_vertex_heap_destroy(heap.as_ptr(), context);
+    // SAFETY: `heap` is a live NUL-terminated string for this call.
+    unsafe { ez_gfx_vertex_heap_destroy(heap.as_ptr(), context) };
     ez_gfx_index_heap_destroy(context);
     ez_gfx_context_destroy(context);
 }
@@ -270,7 +365,18 @@ fn texture_descriptor_rejects_unsupported_pipeline_state_before_context_access()
         },
     ] {
         assert_eq!(
-            ez_gfx_texture_load(pixels.as_ptr(), pixels.len(), &desc, &mut texture, 0,),
+            {
+                // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+                unsafe {
+                    ez_gfx_texture_load(
+                        pixels.as_ptr(),
+                        pixels.len(),
+                        &raw const desc,
+                        &raw mut texture,
+                        0,
+                    )
+                }
+            },
             EzGfxResult::InvalidArgument
         );
     }
@@ -304,29 +410,43 @@ fn dx12_texture_upload_becomes_resident_and_unload_invalidates_handle() {
     let mut texture = 0;
     let pixels = [1_u8, 2, 3, 4];
     assert_eq!(
-        ez_gfx_context_create_backend(&context_desc, &mut context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_context_create_backend(&raw const context_desc, &raw mut context) }
+        },
         EzGfxResult::Ok
     );
     assert_eq!(
-        ez_gfx_texture_load(
-            pixels.as_ptr(),
-            pixels.len(),
-            &texture_desc,
-            &mut texture,
-            context
-        ),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe {
+                ez_gfx_texture_load(
+                    pixels.as_ptr(),
+                    pixels.len(),
+                    &raw const texture_desc,
+                    &raw mut texture,
+                    context,
+                )
+            }
+        },
         EzGfxResult::Ok
     );
     assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
     let mut binding = u32::MAX;
     assert_eq!(
-        ez_gfx_texture_get_binding(texture, &mut binding, context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_texture_get_binding(texture, &raw mut binding, context) }
+        },
         EzGfxResult::Ok
     );
     assert_eq!(binding, 0);
     ez_gfx_texture_unload(texture, context);
     assert_eq!(
-        ez_gfx_texture_get_binding(texture, &mut binding, context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_texture_get_binding(texture, &raw mut binding, context) }
+        },
         EzGfxResult::InvalidContext
     );
     ez_gfx_context_destroy(context);
@@ -369,26 +489,40 @@ fn dx12_frame_uploads_indirect_compiles_graph_and_reads_back_texture() {
     let mut indirect = 0;
     let debug_name = std::ffi::CString::new("frame").unwrap();
     assert_eq!(
-        ez_gfx_context_create_backend(&context_desc, &mut context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_context_create_backend(&raw const context_desc, &raw mut context) }
+        },
         EzGfxResult::Ok
     );
     assert_eq!(
-        ez_gfx_texture_load(
-            pixels.as_ptr(),
-            pixels.len(),
-            &texture_desc,
-            &mut texture,
-            context
-        ),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe {
+                ez_gfx_texture_load(
+                    pixels.as_ptr(),
+                    pixels.len(),
+                    &raw const texture_desc,
+                    &raw mut texture,
+                    context,
+                )
+            }
+        },
         EzGfxResult::Ok
     );
     assert_eq!(ez_gfx_frame_begin(context), EzGfxResult::Ok);
     assert_eq!(
-        ez_gfx_acquire_indirect(1, debug_name.as_ptr(), &mut indirect, context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_acquire_indirect(1, debug_name.as_ptr(), &raw mut indirect, context) }
+        },
         EzGfxResult::Ok
     );
     assert_eq!(
-        ez_gfx_indirect_write_draw(indirect, 0, &command, context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_indirect_write_draw(indirect, 0, &raw const command, context) }
+        },
         EzGfxResult::Ok
     );
     assert_eq!(
@@ -402,12 +536,20 @@ fn dx12_frame_uploads_indirect_compiles_graph_and_reads_back_texture() {
     assert_eq!(ez_gfx_frame_submit(context), EzGfxResult::Ok);
     let mut size = 0;
     assert_eq!(
-        ez_gfx_frame_readback(core::ptr::null_mut(), 0, &mut size, context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_frame_readback(core::ptr::null_mut(), 0, &raw mut size, context) }
+        },
         EzGfxResult::Ok
     );
     let mut actual = vec![0; size];
     assert_eq!(
-        ez_gfx_frame_readback(actual.as_mut_ptr(), actual.len(), &mut size, context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe {
+                ez_gfx_frame_readback(actual.as_mut_ptr(), actual.len(), &raw mut size, context)
+            }
+        },
         EzGfxResult::Ok
     );
     assert_eq!(actual, pixels);
@@ -419,15 +561,24 @@ fn dx12_frame_uploads_indirect_compiles_graph_and_reads_back_texture() {
 fn pointer_count_and_utf8_are_validated() {
     let mut output = [0_u8; 16];
     assert_eq!(
-        ez_gfx_semantic_id(core::ptr::null(), 1, output.as_mut_ptr()),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_semantic_id(core::ptr::null(), 1, output.as_mut_ptr()) }
+        },
         EzGfxResult::InvalidArgument
     );
     assert_eq!(
-        ez_gfx_semantic_id([0xff_u8].as_ptr(), 1, output.as_mut_ptr()),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_semantic_id([0xff_u8].as_ptr(), 1, output.as_mut_ptr()) }
+        },
         EzGfxResult::InvalidArgument
     );
     assert_eq!(
-        ez_gfx_semantic_id(b"material.albedo".as_ptr(), 15, output.as_mut_ptr()),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_semantic_id(b"material.albedo".as_ptr(), 15, output.as_mut_ptr()) }
+        },
         EzGfxResult::Ok
     );
     assert_ne!(output, [0; 16]);
@@ -444,12 +595,18 @@ fn malformed_handles_fail_without_touching_output() {
         _padding: [99; 3],
     };
     assert_eq!(
-        ez_gfx_handle_inspect(1, &mut parts),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_handle_inspect(1, &raw mut parts) }
+        },
         EzGfxResult::InvalidContext
     );
     assert_eq!(parts.context_slot, 99);
     assert_eq!(
-        ez_gfx_handle_inspect(0, core::ptr::null_mut()),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_handle_inspect(0, core::ptr::null_mut()) }
+        },
         EzGfxResult::InvalidArgument
     );
 }

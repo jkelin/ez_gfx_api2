@@ -2,7 +2,9 @@ use std::ffi::CString;
 
 use super::{
     FrameInput, SceneInput, SceneState,
-    common::*,
+    common::{
+        IndexHeap, Indirect, Shader, Structured, binding, bytes_of, record_compute, record_graphics,
+    },
     math::{Mat4, OrbitCamera, mul, perspective},
     mesh::{MeshData, load_glb},
 };

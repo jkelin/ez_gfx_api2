@@ -1,3 +1,4 @@
+//! Contract tests for semantic and adapter capability validation.
 use ez_gfx_core::{
     Backend, ResourceAccess, ResourceKind, SemanticError, SemanticGraph, SemanticId,
     SemanticResource, TargetBinding, TargetLayout,

@@ -1,3 +1,4 @@
+//! Compiler integration tests.
 use ez_gfx_artifact::{Stage, Target};
 use ez_gfx_compiler::{CompilationRequest, CompilerConfig, CompilerError, TargetRequest};
 use std::path::PathBuf;

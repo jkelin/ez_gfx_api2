@@ -7,3 +7,6 @@ license.workspace = true
 
 [dependencies]
 blake3.workspace = true
+
+[lints]
+workspace = true

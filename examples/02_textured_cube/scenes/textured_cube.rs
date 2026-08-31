@@ -4,7 +4,9 @@ use ez_gfx_ffi::{EzGfxDrawIndexedCommand, EzGfxDynamicState};
 
 use super::{
     FrameInput, SceneInput, SceneState,
-    common::*,
+    common::{
+        IndexHeap, Indirect, Shader, Structured, Texture, binding, bytes_of, record_graphics,
+    },
     math::{Mat4, OrbitCamera, identity, mul, perspective},
 };
 

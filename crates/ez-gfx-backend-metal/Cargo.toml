@@ -16,3 +16,6 @@ objc2-foundation.workspace = true
 gpu-allocator = { workspace = true, features = ["std", "metal"] }
 dispatch2.workspace = true
 objc2-quartz-core.workspace = true
+
+[lints]
+workspace = true

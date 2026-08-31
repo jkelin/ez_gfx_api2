@@ -1,3 +1,5 @@
+//! DX12 native initialization and memory lifecycle tests.
+
 #[cfg(windows)]
 #[test]
 fn creates_hardware_device() {

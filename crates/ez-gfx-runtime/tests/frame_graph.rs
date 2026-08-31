@@ -1,3 +1,5 @@
+//! Runtime integration and contract tests.
+
 use ez_gfx_hal::{
     BufferRange, CompletionToken, QueueKind, ResourceAccess, ResourceState, ShaderStage,
 };
@@ -242,6 +244,10 @@ fn first_use_load_rejects_transient_attachments() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "This integration test covers the complete pass-merge contract."
+)]
 fn store_then_load_passes_merge_but_repeated_clear_and_transitions_do_not() {
     let write = state(
         QueueKind::Graphics,

@@ -2,7 +2,10 @@ use std::ffi::CString;
 
 use ez_gfx_ffi::EzGfxDrawIndexedCommand;
 
-use super::{FrameInput, SceneInput, SceneState, common::*};
+use super::{
+    FrameInput, SceneInput, SceneState,
+    common::{IndexHeap, Indirect, Shader, Structured, binding, record_graphics},
+};
 
 pub struct Triangle {
     shader: Shader,

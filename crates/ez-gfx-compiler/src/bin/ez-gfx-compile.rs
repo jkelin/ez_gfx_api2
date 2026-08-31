@@ -1,3 +1,4 @@
+//! Compiler command-line integration.
 use ez_gfx_artifact::{Stage, Target};
 use ez_gfx_compiler::{CompilationRequest, CompilerConfig, TargetRequest};
 use serde::Deserialize;

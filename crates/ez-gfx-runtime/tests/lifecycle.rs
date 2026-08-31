@@ -1,3 +1,5 @@
+//! Runtime integration and contract tests.
+
 use ez_gfx_core::handle::{LocalHandle, PackedHandle};
 use ez_gfx_runtime::{ContextHealth, ContextIdentity, LifecycleError, ResourceKind};
 
@@ -68,7 +70,7 @@ fn context_is_affine_to_its_creation_thread() {
             assert_eq!(
                 identity.check_thread_and_health(),
                 Err(LifecycleError::WrongThread)
-            )
+            );
         });
     });
     assert_eq!(identity.check_thread_and_health(), Ok(()));

@@ -3,7 +3,12 @@ use std::ffi::CString;
 use ez_gfx_ffi::{EzGfxDrawIndexedCommand, EzGfxDynamicState};
 use imgui::{Condition, DrawCmd, Key, MouseButton, TextureId};
 
-use super::{FrameInput, SceneInput, SceneKey, SceneState, common::*};
+use super::{
+    FrameInput, SceneInput, SceneKey, SceneState,
+    common::{
+        IndexHeap, Indirect, Shader, Structured, Texture, binding, bytes_of, record_graphics,
+    },
+};
 
 const IDENTITY_INDEX_COUNT: usize = 65_536;
 

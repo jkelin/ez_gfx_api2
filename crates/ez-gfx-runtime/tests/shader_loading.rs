@@ -1,3 +1,5 @@
+//! Runtime integration and contract tests.
+
 use ez_gfx_artifact::{Artifact, Provenance, Stage, Target, TargetVariant};
 use ez_gfx_core::{Backend, capability::SemanticProfile};
 use ez_gfx_runtime::shader::{RuntimeShader, ShaderLoadError, ShaderRequest};

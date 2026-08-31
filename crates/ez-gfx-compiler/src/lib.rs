@@ -1,3 +1,5 @@
+//! Shader compilation request validation and artifact production.
+
 #![forbid(unsafe_code)]
 use core::fmt;
 use ez_gfx_artifact::{Artifact, ArtifactError, Provenance, Stage, Target, TargetVariant};
@@ -18,6 +20,10 @@ static INVOCATION_COUNTER: AtomicU64 = AtomicU64::new(0);
 struct InvocationDirectory(PathBuf);
 
 impl InvocationDirectory {
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the parent or invocation directory cannot be created, including after 1,024 name collisions.
     fn create(parent: &Path) -> Result<Self, CompilerError> {
         fs::create_dir_all(parent).map_err(CompilerError::Io)?;
         for _ in 0..1024 {
@@ -43,9 +49,13 @@ impl Drop for InvocationDirectory {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Errors reported while checking backend layout coverage and semantic compatibility.
 pub enum CompilationContractError {
+    /// The target layout repeats a backend already supplied.
     DuplicateBackend(Backend),
+    /// No target layout was supplied for the indicated backend.
     MissingBackend(Backend),
+    /// A target layout violates semantic graph requirements.
     Semantic(SemanticError),
 }
 impl fmt::Display for CompilationContractError {
@@ -54,6 +64,11 @@ impl fmt::Display for CompilationContractError {
     }
 }
 impl std::error::Error for CompilationContractError {}
+/// Verifies that Vulkan, DX12, and Metal each have one semantically valid target layout.
+///
+/// # Errors
+///
+/// Returns an error for duplicate backends, missing Vulkan, DX12, or Metal layouts, or a layout rejected by the semantic graph.
 pub fn validate_target_layouts(
     graph: &SemanticGraph,
     layouts: &[TargetLayout],
@@ -76,17 +91,26 @@ pub fn validate_target_layouts(
 }
 
 #[derive(Clone, Debug)]
+/// Settings for Slang version validation and aggregate compiled-output size.
 pub struct CompilerConfig {
+    /// Tool build-tag fragment required for compilation.
     pub required_version: String,
+    /// Maximum combined byte size permitted for compiled outputs.
     pub max_output_bytes: usize,
 }
 impl CompilerConfig {
+    /// Creates compiler settings with the required Slang build-tag fragment and a 64 MiB output limit.
     pub fn new(required_version: impl Into<String>) -> Self {
         Self {
             required_version: required_version.into(),
             max_output_bytes: 64 * 1024 * 1024,
         }
     }
+    /// Opens a Slang global session and returns its build tag after version validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the native Slang session is unavailable or its build tag does not contain the required version.
     pub fn validate_tool(&self) -> Result<String, CompilerError> {
         let session = shader_slang::GlobalSession::new().ok_or(CompilerError::NativeUnavailable)?;
         let version = session.build_tag_string().to_owned();
@@ -101,13 +125,23 @@ impl CompilerConfig {
 }
 
 #[derive(Clone, Debug)]
+/// Identifies one shader compilation by target format, stage, entry point, and Slang profile.
 pub struct TargetRequest {
+    /// Binary format to produce for this shader.
     pub target: Target,
+    /// Pipeline stage implemented by the entry point.
     pub stage: Stage,
+    /// Source entry point to compile.
     pub entry_point: String,
+    /// Slang profile used to compile the entry point.
     pub profile: String,
 }
 impl TargetRequest {
+    /// Creates a target request after validating the entry-point and profile strings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entry point or profile is empty or contains a NUL character.
     pub fn new(
         target: Target,
         stage: Stage,
@@ -133,18 +167,29 @@ impl TargetRequest {
 }
 
 #[derive(Clone, Debug)]
+/// Inputs, target matrix, metadata, and provenance used to compile one shader source file.
 pub struct CompilationRequest {
+    /// Shader source file to compile.
     pub source: PathBuf,
+    /// Directory used for temporary and generated outputs.
     pub output_dir: PathBuf,
+    /// Requested target, stage, entry-point, and profile combinations.
     pub targets: Vec<TargetRequest>,
+    /// Additional directories searched for imported shader sources.
     pub include_dirs: Vec<PathBuf>,
+    /// Preprocessor definitions passed to Slang.
     pub defines: Vec<String>,
+    /// JSON-encoded semantic metadata embedded in the artifact.
     pub semantic_metadata: Vec<u8>,
+    /// Toolchain description recorded in artifact provenance.
     pub toolchain: String,
+    /// Apple Metal toolchain description recorded in artifact provenance.
     pub apple_toolchain: String,
+    /// Whether Metal coverage requires compiled metallib output.
     pub release_complete: bool,
 }
 impl CompilationRequest {
+    /// Creates a compilation request with default metadata, no includes or defines, and required metallib coverage.
     pub fn new(source: PathBuf, output_dir: PathBuf, targets: Vec<TargetRequest>) -> Self {
         Self {
             source,
@@ -158,6 +203,11 @@ impl CompilationRequest {
             release_complete: true,
         }
     }
+    /// Checks paths, defines, target uniqueness and coverage, and semantic metadata JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid defines or include paths, duplicate variants, missing target coverage, an empty target list, an invalid source or output path, or invalid metadata JSON.
     pub fn validate(&self) -> Result<(), CompilerError> {
         if self.defines.iter().any(|v| {
             let (key, _) = v.split_once('=').unwrap_or((v.as_str(), ""));
@@ -231,6 +281,11 @@ impl CompilationRequest {
     }
 }
 
+/// Compiles all requested shader targets and packages binaries, reflection metadata, and provenance into an artifact.
+///
+/// # Errors
+///
+/// Returns an error if request validation, Slang setup or compilation, Metal tool invocation, file I/O, output-limit enforcement, metadata serialization, or artifact construction fails.
 pub fn compile(
     config: &CompilerConfig,
     request: &CompilationRequest,
@@ -307,18 +362,138 @@ pub fn compile(
         })
         .collect::<Result<_, _>>()?;
     let mut components = vec![module.downcast().clone()];
-    let mut canonical_parameters = CanonicalParameters::new();
     components.extend(entries.iter().map(|entry| entry.downcast().clone()));
     let linked = session
         .create_composite_component_type(&components)
         .and_then(|p| p.link())
         .map_err(|e| CompilerError::Native(e.to_string()))?;
+    let (variants, reflections) = compile_targets(
+        &linked,
+        request,
+        invocation_dir.as_ref(),
+        config.max_output_bytes,
+    )?;
+    let semantic: serde_json::Value = serde_json::from_slice(&request.semantic_metadata)
+        .map_err(|_| CompilerError::InvalidRequest("metadata JSON"))?;
+    let metadata =
+        serde_json::to_vec(&serde_json::json!({"semantic": semantic, "reflections": reflections}))
+            .map_err(|e| CompilerError::Native(e.to_string()))?;
+    Artifact::new(
+        metadata,
+        Provenance::new(
+            "shader-slang",
+            version,
+            request.defines.clone(),
+            format!(
+                "{};apple-metal={}",
+                request.toolchain, request.apple_toolchain
+            ),
+        ),
+        variants,
+    )
+    .map_err(CompilerError::Artifact)
+}
+
+type ReflectedParameter = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    u32,
+    u32,
+    Option<u32>,
+    bool,
+);
+
+fn collect_parameters<'a>(
+    parameters: impl Iterator<Item = &'a shader_slang::reflection::VariableLayout>,
+) -> Vec<ReflectedParameter> {
+    let mut parameters: Vec<_> = parameters
+        .filter_map(|parameter| {
+            let name = parameter.name()?.to_owned();
+            let layout = parameter.type_layout();
+            let variable = parameter.variable()?;
+            let mut api_attribute = None;
+            let mut texture_heap_capacity = None;
+            let mut depth_required = false;
+            for attribute in variable.user_attributes() {
+                match attribute.name() {
+                    "StructuredBuffer" => api_attribute = Some(("structured", attribute)),
+                    "IndirectBuffer" => api_attribute = Some(("indirect", attribute)),
+                    "ColorTarget" | "DepthTarget" => {
+                        api_attribute = Some(("render_target", attribute));
+                    }
+                    "BindlessTextureHeap" if attribute.argument_count() == 1 => {
+                        texture_heap_capacity = Some(
+                            attribute
+                                .argument_value_int(0)
+                                .and_then(|value| u32::try_from(value).ok())
+                                .unwrap_or(0),
+                        );
+                    }
+                    "DepthPipeline" if attribute.argument_count() == 0 => {
+                        depth_required = true;
+                    }
+                    _ => {}
+                }
+            }
+            let (api_kind, semantic_name) = match api_attribute {
+                Some((kind, attribute)) if attribute.argument_count() == 1 => (
+                    Some(kind.to_owned()),
+                    attribute.argument_value_string(0).map(str::to_owned),
+                ),
+                _ => (None, None),
+            };
+            let shape = format!("{:?}", layout.resource_shape());
+            let resource_access = match layout.resource_access() {
+                Some(shader_slang::ResourceAccess::Read) => "Read",
+                Some(shader_slang::ResourceAccess::ReadWrite) => "ReadWrite",
+                Some(shader_slang::ResourceAccess::RasterOrdered) => "RasterOrdered",
+                Some(shader_slang::ResourceAccess::Append) => "Append",
+                Some(shader_slang::ResourceAccess::Consume) => "Consume",
+                Some(shader_slang::ResourceAccess::Write) => "Write",
+                Some(shader_slang::ResourceAccess::Feedback) => "Feedback",
+                Some(shader_slang::ResourceAccess::Unknown) => "Unknown",
+                None | Some(shader_slang::ResourceAccess::None) => "None",
+            };
+            Some((
+                name,
+                format!("{:?}", layout.kind()),
+                format!("{:?}", layout.parameter_category()),
+                shape,
+                resource_access.to_owned(),
+                semantic_name,
+                api_kind,
+                parameter.binding_index(),
+                parameter.binding_space(),
+                texture_heap_capacity,
+                depth_required,
+            ))
+        })
+        .collect();
+    parameters.sort();
+    parameters
+}
+
+fn compile_targets(
+    linked: &shader_slang::ComponentType,
+    request: &CompilationRequest,
+    invocation_dir: Option<&InvocationDirectory>,
+    max_output_bytes: usize,
+) -> Result<(Vec<TargetVariant>, Vec<serde_json::Value>), CompilerError> {
+    let mut canonical_parameters = CanonicalParameters::new();
     let mut total_output = 0usize;
     let mut variants = Vec::new();
     let mut reflections = Vec::new();
     for (index, target) in request.targets.iter().enumerate() {
         let layout = linked
-            .layout(index as i64)
+            .layout(
+                i64::try_from(index)
+                    .map_err(|_| CompilerError::InvalidRequest("too many targets"))?,
+            )
             .map_err(|e| CompilerError::Native(e.to_string()))?;
         let reflected_entry = layout
             .entry_points()
@@ -343,71 +518,8 @@ pub fn compile(
                 target.entry_point
             )));
         }
-        let mut parameters: Vec<_> = layout
-            .parameters()
-            .chain(reflected_entry.parameters())
-            .filter_map(|parameter| {
-                let name = parameter.name()?.to_owned();
-                let layout = parameter.type_layout();
-                let variable = parameter.variable()?;
-                let mut api_attribute = None;
-                let mut texture_heap_capacity = None;
-                let mut depth_required = false;
-                for attribute in variable.user_attributes() {
-                    match attribute.name() {
-                        "StructuredBuffer" => api_attribute = Some(("structured", attribute)),
-                        "IndirectBuffer" => api_attribute = Some(("indirect", attribute)),
-                        "ColorTarget" | "DepthTarget" => {
-                            api_attribute = Some(("render_target", attribute))
-                        }
-                        "BindlessTextureHeap" if attribute.argument_count() == 1 => {
-                            texture_heap_capacity = Some(
-                                attribute
-                                    .argument_value_int(0)
-                                    .and_then(|value| u32::try_from(value).ok())
-                                    .unwrap_or(0),
-                            );
-                        }
-                        "DepthPipeline" if attribute.argument_count() == 0 => {
-                            depth_required = true;
-                        }
-                        _ => {}
-                    }
-                }
-                let (api_kind, semantic_name) = match api_attribute {
-                    Some((kind, attribute)) if attribute.argument_count() == 1 => (
-                        Some(kind.to_owned()),
-                        attribute.argument_value_string(0).map(str::to_owned),
-                    ),
-                    _ => (None, None),
-                };
-                let shape = format!("{:?}", layout.resource_shape());
-                let resource_access = match layout.resource_access() {
-                    Some(shader_slang::ResourceAccess::Read) => "Read",
-                    Some(shader_slang::ResourceAccess::ReadWrite) => "ReadWrite",
-                    Some(shader_slang::ResourceAccess::RasterOrdered) => "RasterOrdered",
-                    Some(shader_slang::ResourceAccess::Append) => "Append",
-                    Some(shader_slang::ResourceAccess::Consume) => "Consume",
-                    Some(shader_slang::ResourceAccess::Write) => "Write",
-                    Some(shader_slang::ResourceAccess::Feedback) => "Feedback",
-                    Some(shader_slang::ResourceAccess::Unknown) => "Unknown",
-                    None | Some(shader_slang::ResourceAccess::None) => "None",
-                };
-                Some((
-                    name,
-                    format!("{:?}", layout.kind()),
-                    format!("{:?}", layout.parameter_category()),
-                    shape,
-                    resource_access.to_owned(),
-                    semantic_name,
-                    api_kind,
-                    parameter.binding_index(),
-                    parameter.binding_space(),
-                    texture_heap_capacity,
-                    depth_required,
-                ))
-            })
-            .collect();
+        let mut parameters: Vec<_> =
+            collect_parameters(layout.parameters().chain(reflected_entry.parameters()));
         parameters.sort();
         let canonical_view = parameters
             .iter()
@@ -462,7 +574,12 @@ pub fn compile(
         let reflection = serde_json::json!({"entry": target.entry_point, "stage": format!("{:?}", target.stage), "profile": target.profile, "parameters": parameters.iter().map(|(name,kind,category,shape,access,semantic_name,api_kind,binding_index,binding_space,_,_)| serde_json::json!({"name":name,"kind":kind,"category":category,"resource_shape":shape,"resource_access":access,"semantic_name":semantic_name,"api_kind":api_kind,"binding_index":binding_index,"binding_space":binding_space,"descriptor_count":1})).collect::<Vec<_>>(), "texture_heap": texture_heap, "depth_required": depth_required});
         reflections.push(serde_json::json!({"target": format!("{:?}", target.target), "entry": target.entry_point, "stage": format!("{:?}", target.stage), "profile": target.profile, "reflection": reflection}));
         let blob = linked
-            .entry_point_code(index as i64, index as i64)
+            .entry_point_code(
+                i64::try_from(index)
+                    .map_err(|_| CompilerError::InvalidRequest("too many targets"))?,
+                i64::try_from(index)
+                    .map_err(|_| CompilerError::InvalidRequest("too many targets"))?,
+            )
             .map_err(|e| CompilerError::Native(e.to_string()))?;
         let mut bytes = blob.as_slice().to_vec();
         if target.target == Target::Metallib {
@@ -471,9 +588,8 @@ pub fn compile(
                     "xcrun (macOS only)".into(),
                 ));
             }
-            let invocation_dir = invocation_dir
-                .as_ref()
-                .ok_or(CompilerError::InvalidRequest("Metal output directory"))?;
+            let invocation_dir =
+                invocation_dir.ok_or(CompilerError::InvalidRequest("Metal output directory"))?;
             let stem = format!("{}-{index}", target.entry_point);
             let msl = invocation_dir.0.join(format!("{stem}.metal"));
             let metallib = invocation_dir.0.join(format!("{stem}.metallib"));
@@ -486,7 +602,7 @@ pub fn compile(
         total_output = total_output
             .checked_add(bytes.len())
             .ok_or(CompilerError::OutputLimit)?;
-        if bytes.is_empty() || total_output > config.max_output_bytes {
+        if bytes.is_empty() || total_output > max_output_bytes {
             return Err(CompilerError::OutputLimit);
         }
         variants.push(
@@ -500,26 +616,18 @@ pub fn compile(
             .map_err(CompilerError::Artifact)?,
         );
     }
-    let semantic: serde_json::Value = serde_json::from_slice(&request.semantic_metadata)
-        .map_err(|_| CompilerError::InvalidRequest("metadata JSON"))?;
-    let metadata =
-        serde_json::to_vec(&serde_json::json!({"semantic": semantic, "reflections": reflections}))
-            .map_err(|e| CompilerError::Native(e.to_string()))?;
-    Artifact::new(
-        metadata,
-        Provenance::new(
-            "shader-slang",
-            version,
-            request.defines.clone(),
-            format!(
-                "{};apple-metal={}",
-                request.toolchain, request.apple_toolchain
-            ),
-        ),
-        variants,
-    )
-    .map_err(CompilerError::Artifact)
+    Ok((variants, reflections))
 }
+
+/// Compiles Metal source to AIR and links it into a metallib using the macOS `xcrun` toolchain.
+///
+/// # Errors
+///
+/// Returns an error if either Apple compiler command cannot start or exits unsuccessfully.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Callers transfer owned paths used for platform tool invocation."
+)]
 pub fn build_metallib(metal: PathBuf, output: PathBuf) -> Result<(), CompilerError> {
     let ir = output.with_extension("air");
     let mut c = Command::new("xcrun");
@@ -540,6 +648,10 @@ pub fn build_metallib(metal: PathBuf, output: PathBuf) -> Result<(), CompilerErr
     let _ = fs::remove_file(&ir);
     result
 }
+///
+/// # Errors
+///
+/// Returns an error if the command cannot start or exits unsuccessfully.
 fn run_apple(c: &mut Command) -> Result<(), CompilerError> {
     let o = c.output().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -556,24 +668,41 @@ fn run_apple(c: &mut Command) -> Result<(), CompilerError> {
     Ok(())
 }
 #[derive(Debug)]
+/// Failures from request validation, shader compilation, Apple tooling, output limits, I/O, or artifact creation.
 pub enum CompilerError {
+    /// The compilation request is malformed or incomplete.
     InvalidRequest(&'static str),
+    /// A required compilation target was not requested.
     MissingTarget(Target),
+    /// An entry point and stage lack output for a required target.
     MissingCoverage {
+        /// Entry-point name.
         entry: String,
+        /// Shader stage.
         stage: Stage,
+        /// Compilation target.
         target: Target,
     },
-    NativeUnavailable,
-    Native(String),
-    AppleToolNotFound(String),
-    ToolFailed(String),
+    /// The compiler's expected and observed versions differ.
     VersionMismatch {
+        /// Expected toolchain version.
         expected: String,
+        /// Observed toolchain version.
         found: String,
     },
+    /// The native compiler backend is unavailable.
+    NativeUnavailable,
+    /// A native compiler operation failed.
+    Native(String),
+    /// The Apple shader toolchain is unavailable.
+    AppleToolNotFound(String),
+    /// An external compiler tool failed.
+    ToolFailed(String),
+    /// Compiled output is empty, overflows its size total, or exceeds the configured limit.
     OutputLimit,
+    /// File or directory access failed.
     Io(std::io::Error),
+    /// Artifact construction or validation failed.
     Artifact(ArtifactError),
 }
 impl fmt::Display for CompilerError {

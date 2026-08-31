@@ -1,3 +1,4 @@
+//! Contract tests for packed handles and generational arenas.
 use ez_gfx_core::handle::{GenerationalArena, HandleError, HandleParts, LocalHandle, PackedHandle};
 
 #[test]

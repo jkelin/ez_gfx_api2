@@ -1,3 +1,4 @@
+//! Bounded texture asset metadata, mip residency, and worker events.
 #![forbid(unsafe_code)]
 
 use parking_lot::Mutex;
@@ -11,15 +12,24 @@ use std::{
     },
 };
 
+/// Block-compressed texture formats supported by the asset pipeline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlockFormat {
+    /// BC1 linear.
     Bc1,
+    /// BC1 sRGB.
     Bc1Srgb,
+    /// BC3 linear.
     Bc3,
+    /// BC3 sRGB.
     Bc3Srgb,
+    /// BC7 linear.
     Bc7,
+    /// BC7 sRGB.
     Bc7Srgb,
+    /// ASTC 4x4 linear.
     Astc4x4,
+    /// ASTC 4x4 sRGB.
     Astc4x4Srgb,
 }
 impl BlockFormat {
@@ -30,9 +40,15 @@ impl BlockFormat {
         }
     }
 }
+/// Nonzero identifier for a streamed texture.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct TextureId(u64);
 impl TextureId {
+    /// Constructs a nonzero texture identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssetError::InvalidTextureId`] for zero.
     pub fn try_new(value: u64) -> Result<Self, AssetError> {
         if value == 0 {
             Err(AssetError::InvalidTextureId)
@@ -41,20 +57,35 @@ impl TextureId {
         }
     }
 }
+/// Current mip residency state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextureState {
+    /// No mip is resident.
     Empty,
+    /// At least the sample mip is resident.
     SampleReady,
+    /// Every mip is resident.
     FullyResident,
 }
+/// Aligned rectangular texture update region.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Region {
+    /// Horizontal texel origin.
     pub x: u32,
+    /// Vertical texel origin.
     pub y: u32,
+    /// Region width in texels.
     pub width: u32,
+    /// Region height in texels.
     pub height: u32,
 }
 impl Region {
+    /// Validates a region against texture dimensions and block alignment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssetError::Overflow`] for coordinate overflow or
+    /// [`AssetError::InvalidRegion`] for zero, out-of-bounds, or misaligned regions.
     pub fn new(
         x: u32,
         y: u32,
@@ -83,6 +114,12 @@ impl Region {
         })
     }
 }
+/// Validates a block-compressed mip payload against its dimensions.
+///
+/// # Errors
+///
+/// Returns [`AssetError::InvalidMip`], [`AssetError::Overflow`], or
+/// [`AssetError::InvalidPayload`] when the mip or payload is invalid.
 pub fn validate_block_payload(
     format: BlockFormat,
     width: u32,
@@ -92,24 +129,27 @@ pub fn validate_block_payload(
 ) -> Result<(), AssetError> {
     if mip >= 32 {
         return Err(AssetError::InvalidMip);
-    };
+    }
     let w = width.checked_shr(mip).ok_or(AssetError::InvalidMip)?.max(1);
     let h = height
         .checked_shr(mip)
         .ok_or(AssetError::InvalidMip)?
         .max(1);
+    let bytes_per_block = u32::try_from(format.bytes()).map_err(|_| AssetError::Overflow)?;
     let expected = w
         .div_ceil(4)
         .checked_mul(h.div_ceil(4))
-        .and_then(|n| n.checked_mul(format.bytes() as u32))
-        .ok_or(AssetError::Overflow)? as usize;
-    if payload.len() != expected {
-        Err(AssetError::InvalidPayload)
-    } else {
+        .and_then(|n| n.checked_mul(bytes_per_block))
+        .ok_or(AssetError::Overflow)?;
+    let expected = usize::try_from(expected).map_err(|_| AssetError::Overflow)?;
+    if payload.len() == expected {
         Ok(())
+    } else {
+        Err(AssetError::InvalidPayload)
     }
 }
 
+/// Mip levels and residency state for one texture.
 pub struct MipChain {
     id: TextureId,
     width: u32,
@@ -118,6 +158,11 @@ pub struct MipChain {
     mips: Vec<Option<Vec<u8>>>,
 }
 impl MipChain {
+    /// Creates an empty mip chain with bounded dimensions and levels.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssetError::InvalidDimensions`] for zero or unsupported dimensions.
     pub fn new(
         id: TextureId,
         width: u32,
@@ -127,7 +172,7 @@ impl MipChain {
     ) -> Result<Self, AssetError> {
         if width == 0 || height == 0 || mip_count == 0 || mip_count > 16 {
             return Err(AssetError::InvalidDimensions);
-        };
+        }
         Ok(Self {
             id,
             width,
@@ -136,12 +181,15 @@ impl MipChain {
             mips: vec![None; mip_count as usize],
         })
     }
+    /// Returns the number of mip levels.
     pub fn mip_count(&self) -> usize {
         self.mips.len()
     }
+    /// Returns the texture identifier.
     pub fn id(&self) -> TextureId {
         self.id
     }
+    /// Computes the current residency state.
     pub fn state(&self) -> TextureState {
         let last = self.mips.len() - 1;
         if self.mips[last].is_none() {
@@ -152,18 +200,28 @@ impl MipChain {
             TextureState::SampleReady
         }
     }
+    /// Uploads one previously missing mip level.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid, already resident, or malformed mip payload.
     pub fn upload_mip(&mut self, mip: u32, payload: Vec<u8>) -> Result<(), AssetError> {
         let index = usize::try_from(mip).map_err(|_| AssetError::InvalidMip)?;
         if index >= self.mips.len() {
             return Err(AssetError::InvalidMip);
-        };
+        }
         if self.mips[index].is_some() {
             return Err(AssetError::AlreadyResident);
-        };
+        }
         validate_block_payload(self.format, self.width, self.height, mip, &payload)?;
         self.mips[index] = Some(payload);
         Ok(())
     }
+    /// Validates a region update against the resident mip and row pitch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid mip, region, residency state, row pitch, or payload.
     pub fn update_region(
         &self,
         mip: u32,
@@ -174,7 +232,7 @@ impl MipChain {
         let index = usize::try_from(mip).map_err(|_| AssetError::InvalidMip)?;
         if index >= self.mips.len() {
             return Err(AssetError::InvalidMip);
-        };
+        }
         let w = (self.width >> mip).max(1);
         let h = (self.height >> mip).max(1);
         Region::new(
@@ -188,39 +246,56 @@ impl MipChain {
         )?;
         if self.mips[index].is_none() {
             return Err(AssetError::NotResident);
-        };
+        }
         let rows = region.height.div_ceil(4) as usize;
         let min_pitch = region.width.div_ceil(4) as usize * self.format.bytes();
         let required = row_pitch.checked_mul(rows).ok_or(AssetError::Overflow)?;
         if row_pitch < min_pitch || payload.len() != required {
             return Err(AssetError::InvalidPayload);
-        };
+        }
         Ok(())
     }
 }
 
+/// Terminal outcome of an asset job.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventOutcome {
+    /// Job completed successfully.
     Completed,
+    /// Job failed.
     Failed,
+    /// Job was cancelled.
     Cancelled,
 }
+/// Pipeline phase that emitted an asset event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventPhase {
+    /// Decode phase.
     Decode,
+    /// Transcode phase.
     Transcode,
+    /// Upload phase.
     Upload,
 }
+/// Result notification for one asset job.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AssetEvent {
+    /// Correlation identifier assigned by the caller.
     pub correlation_id: u64,
+    /// Worker job identifier.
     pub job_id: u64,
+    /// Texture associated with the job.
     pub texture: TextureId,
+    /// Pipeline phase.
     pub phase: EventPhase,
+    /// Number of bytes processed.
     pub bytes: usize,
+    /// Terminal job outcome.
     pub outcome: EventOutcome,
+    /// Optional failure detail.
     pub error: Option<AssetError>,
 }
+/// Bounded, cancellable queue of asset events.
 pub struct EventQueue {
     events: Mutex<VecDeque<AssetEvent>>,
     capacity: usize,
@@ -228,6 +303,11 @@ pub struct EventQueue {
     cancelled: AtomicBool,
 }
 impl EventQueue {
+    /// Creates a queue with the requested event capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssetError::InvalidQueue`] when capacity is zero.
     pub fn new(capacity: usize) -> Result<Self, AssetError> {
         if capacity == 0 {
             return Err(AssetError::InvalidQueue);
@@ -239,6 +319,12 @@ impl EventQueue {
             cancelled: AtomicBool::new(false),
         })
     }
+    /// Enqueues an event unless cancelled or full.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssetError::Cancelled`] after cancellation or
+    /// [`AssetError::QueueFull`] when capacity is exhausted.
     pub fn push(&self, event: AssetEvent) -> Result<(), AssetError> {
         if self.cancelled.load(Ordering::Acquire) {
             return Err(AssetError::Cancelled);
@@ -267,11 +353,13 @@ impl EventQueue {
         self.reserved.fetch_sub(1, Ordering::AcqRel);
         events.push_back(event);
     }
+    /// Removes and returns the oldest queued event.
     pub fn pop(&self) -> Option<AssetEvent> {
         self.events.lock().pop_front()
     }
+    /// Prevents future reservations and pushes.
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release)
+        self.cancelled.store(true, Ordering::Release);
     }
 }
 
@@ -287,6 +375,7 @@ impl Drop for JobPermit {
     }
 }
 
+/// Bounded CPU worker pool for asset processing.
 pub struct CpuPool {
     pool: ThreadPool,
     cancelled: Arc<AtomicBool>,
@@ -296,6 +385,12 @@ pub struct CpuPool {
     bytes: Arc<AtomicUsize>,
 }
 impl CpuPool {
+    /// Creates a worker pool with job and byte budgets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssetError::InvalidPool`] when any budget is zero or the
+    /// worker pool cannot be created.
     pub fn new(threads: usize, max_jobs: usize, max_bytes: usize) -> Result<Self, AssetError> {
         if threads == 0 || max_jobs == 0 || max_bytes == 0 {
             return Err(AssetError::InvalidPool);
@@ -345,6 +440,12 @@ impl CpuPool {
             }
         }
     }
+    /// Schedules a CPU job after reserving its resource budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssetError::Cancelled`] when shut down or
+    /// [`AssetError::QueueFull`] when job capacity is exhausted.
     pub fn submit<F>(&self, job: F) -> Result<(), AssetError>
     where
         F: FnOnce() + Send + 'static,
@@ -362,6 +463,11 @@ impl CpuPool {
         });
         Ok(())
     }
+    /// Runs a job and publishes its result as an asset event.
+    ///
+    /// # Errors
+    ///
+    /// Returns queue or worker-budget errors before scheduling the job.
     pub fn submit_event<F>(
         &self,
         queue: Arc<EventQueue>,
@@ -408,11 +514,18 @@ impl CpuPool {
         });
         Ok(())
     }
+    /// Cancels queued and future CPU work.
     pub fn shutdown(&self) {
-        self.cancelled.store(true, Ordering::Release)
+        self.cancelled.store(true, Ordering::Release);
     }
 }
 
+/// Transcodes a validated Basis payload into the requested block format.
+///
+/// # Errors
+///
+/// Returns [`AssetError::InvalidBasis`] for invalid headers or
+/// [`AssetError::BasisTranscode`] when transcoding fails.
 #[cfg(feature = "basis")]
 pub fn transcode_basis(data: &[u8], target: BlockFormat) -> Result<Vec<u8>, AssetError> {
     use basis_universal::transcoding::{Transcoder, TranscoderTextureFormat};
@@ -428,31 +541,59 @@ pub fn transcode_basis(data: &[u8], target: BlockFormat) -> Result<Vec<u8>, Asse
     };
     transcoder
         .prepare_transcoding(data)
-        .map_err(|_| AssetError::BasisTranscode)?;
+        .map_err(|()| AssetError::BasisTranscode)?;
     transcoder
-        .transcode_image_level(data, format, Default::default())
+        .transcode_image_level(
+            data,
+            format,
+            basis_universal::transcoding::TranscodeParameters::default(),
+        )
         .map_err(|_| AssetError::BasisTranscode)
 }
 
 #[cfg(not(feature = "basis"))]
+/// Transcodes Basis payload bytes into the requested block format.
+///
+/// # Errors
+///
+/// Returns [`AssetError::BasisDisabled`] when Basis support is unavailable.
 pub fn transcode_basis(_data: &[u8], _target: BlockFormat) -> Result<Vec<u8>, AssetError> {
     Err(AssetError::BasisDisabled)
 }
 
 #[derive(Debug, Eq, PartialEq)]
+/// Parsed KTX2 payload representation.
 pub enum Ktx2Payload {
+    /// Direct block-compressed mip levels.
     Direct {
+        /// Block format of each level.
         format: BlockFormat,
+        /// Texture width.
         width: u32,
+        /// Texture height.
         height: u32,
+        /// Mip payloads in level order.
         levels: Vec<Vec<u8>>,
     },
+    /// Basis-compressed payload requiring runtime transcoding.
     Basis {
+        /// Texture width.
         width: u32,
+        /// Texture height.
         height: u32,
+        /// Basis payload bytes.
         data: Vec<u8>,
     },
 }
+/// Parses and validates a KTX2 container.
+///
+/// # Errors
+///
+/// Returns a parsing, bounds, format, or payload validation error.
+///
+/// # Panics
+///
+/// Panics only if a slice accepted as exactly four or eight bytes cannot be converted to its fixed-size array type.
 pub fn parse_ktx2(input: &[u8]) -> Result<Ktx2Payload, AssetError> {
     const IDENT: &[u8; 12] = b"\xabKTX 20\xbb\r\n\x1a\n";
     if input.len() < 80 || &input[..12] != IDENT {
@@ -522,8 +663,14 @@ pub fn parse_ktx2(input: &[u8]) -> Result<Ktx2Payload, AssetError> {
         let end = offset.checked_add(length).ok_or(AssetError::Overflow)?;
         if offset < table || end > input.len() {
             return Err(AssetError::Truncated);
-        };
-        validate_block_payload(format, width, height, level as u32, &input[offset..end])?;
+        }
+        validate_block_payload(
+            format,
+            width,
+            height,
+            u32::try_from(level).map_err(|_| AssetError::Overflow)?,
+            &input[offset..end],
+        )?;
         output.push(input[offset..end].to_vec());
     }
     Ok(Ktx2Payload::Direct {
@@ -534,27 +681,48 @@ pub fn parse_ktx2(input: &[u8]) -> Result<Ktx2Payload, AssetError> {
     })
 }
 
+/// Errors reported by bounded asset parsing and processing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AssetError {
+    /// Input ended before a complete record.
     Truncated,
+    /// Texture ID is zero.
     InvalidTextureId,
+    /// Texture dimensions or mip count are invalid.
     InvalidDimensions,
+    /// Mip index is invalid.
     InvalidMip,
+    /// Region coordinates or alignment are invalid.
     InvalidRegion,
+    /// Mip payload length is invalid.
     InvalidPayload,
+    /// Arithmetic exceeded a representable bound.
     Overflow,
+    /// Mip is already resident.
     AlreadyResident,
+    /// Mip is not resident.
     NotResident,
+    /// Queue has been cancelled.
     Cancelled,
+    /// Queue has no free capacity.
     QueueFull,
+    /// Worker pool has shut down.
     Shutdown,
+    /// Queue capacity is invalid.
     InvalidQueue,
+    /// Worker pool limits are invalid.
     InvalidPool,
+    /// Worker closure panicked.
     WorkerPanic,
+    /// Basis support was not compiled.
     BasisDisabled,
+    /// Basis transcoding failed.
     BasisTranscode,
+    /// Basis payload is invalid.
     InvalidBasis,
+    /// KTX2 payload is invalid.
     InvalidKtx2,
+    /// KTX2 format is unsupported.
     UnsupportedKtx2,
 }
 impl fmt::Display for AssetError {

@@ -30,3 +30,6 @@ objc2.workspace = true
 objc2-core-foundation.workspace = true
 objc2-metal = { workspace = true, features = ["MTLTypes"] }
 objc2-quartz-core.workspace = true
+
+[lints]
+workspace = true

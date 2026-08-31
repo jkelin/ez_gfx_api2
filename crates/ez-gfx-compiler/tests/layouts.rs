@@ -1,3 +1,4 @@
+//! Compiler integration tests.
 use ez_gfx_compiler::{CompilationContractError, validate_target_layouts};
 use ez_gfx_core::{
     Backend, ResourceAccess, ResourceKind, SemanticGraph, SemanticResource, TargetBinding,

@@ -2,7 +2,7 @@ pub use ez_gfx_hal::{
     BlendMode, CullMode, DynamicPipelineState, FrontFace, PrimitiveTopology, RenderStateError,
 };
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ez_gfx_hal::{
     AttachmentLoadOp, AttachmentStoreOp, ExecutionAction, ExecutionBarrier, ExecutionPass,
@@ -12,14 +12,26 @@ use ez_gfx_hal::{
 use crate::graph::{CompiledGraph, LoadOp, ResourceRange, StoreOp};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Errors that can prevent a compiled render graph from becoming or executing a frame plan.
 pub enum ExecutionError<E> {
-    MissingPayload { node: u32 },
+    /// A graph node has no corresponding payload.
+    MissingPayload {
+        /// Missing node index.
+        node: u32,
+    },
+    /// More payloads were supplied than the graph's ordered nodes require.
     UnexpectedPayloads,
+    /// A compiled image transition contains an invalid mip or layer range.
     InvalidCompiledRange,
+    /// The rendering backend rejected the frame plan or its payloads.
     Backend(E),
 }
 
 /// Converts a compiled graph into one immutable command plan before native recording begins.
+///
+/// # Errors
+///
+/// Returns an error if a graph node lacks a payload, extra payloads are supplied, or a compiled image transition has an invalid mip or layer range.
 pub fn build_execution_plan(
     graph: &CompiledGraph,
     payload_count: usize,
@@ -36,7 +48,7 @@ pub fn build_execution_plan(
     }
 
     let mut pass_starts = BTreeMap::new();
-    let mut pass_ends = BTreeMap::new();
+    let mut pass_ends = BTreeSet::new();
     for pass in graph.passes() {
         let (Some(first), Some(last)) = (pass.nodes.first(), pass.nodes.last()) else {
             continue;
@@ -51,7 +63,7 @@ pub fn build_execution_plan(
                     .iter()
                     .map(|resource| resource.index())
                     .collect(),
-                depth: pass.info.depth().map(|resource| resource.index()),
+                depth: pass.info.depth().map(super::graph::ResourceId::index),
                 area: pass.info.area(),
                 samples: pass.info.samples(),
                 load: match pass.info.load() {
@@ -65,7 +77,7 @@ pub fn build_execution_plan(
                 },
             },
         );
-        pass_ends.insert(last.index(), ());
+        pass_ends.insert(last.index());
     }
 
     let mut actions = Vec::new();
@@ -78,7 +90,7 @@ pub fn build_execution_plan(
                 .map(|wait| {
                     ExecutionAction::Wait(ExecutionWait {
                         node: node.index(),
-                        source: wait.source.map(|source| source.index()),
+                        source: wait.source.map(super::graph::NodeId::index),
                         external: wait.external,
                     })
                 }),
@@ -112,7 +124,7 @@ pub fn build_execution_plan(
             actions.push(ExecutionAction::BeginPass(pass));
         }
         actions.push(ExecutionAction::ExecuteNode(node.index()));
-        if pass_ends.contains_key(&node.index()) {
+        if pass_ends.contains(&node.index()) {
             actions.push(ExecutionAction::EndPass);
         }
     }
@@ -120,6 +132,10 @@ pub fn build_execution_plan(
 }
 
 /// Preflights the whole plan, then gives it to the backend as one atomic frame submission.
+///
+/// # Errors
+///
+/// Returns an error if plan construction finds missing or extra payloads or an invalid compiled image range, or if the backend rejects execution.
 pub fn execute_compiled_graph<B, P>(
     graph: &CompiledGraph,
     payloads: &[P],

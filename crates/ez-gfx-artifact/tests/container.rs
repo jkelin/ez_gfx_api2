@@ -1,3 +1,4 @@
+//! Binary artifact encoding and validation contract tests.
 use ez_gfx_artifact::{
     Artifact, ArtifactError, MAX_ARTIFACT_BYTES, Provenance, Stage, Target, TargetVariant,
 };
@@ -103,7 +104,10 @@ fn digest_covers_metadata_and_provenance() {
     for field in [0usize, 1usize] {
         let mut bytes = original.clone();
         let section = 52 + field * 16;
-        let offset = u64::from_le_bytes(bytes[section..section + 8].try_into().unwrap()) as usize;
+        let offset = usize::try_from(u64::from_le_bytes(
+            bytes[section..section + 8].try_into().unwrap(),
+        ))
+        .unwrap();
         bytes[offset + if field == 0 { 1 } else { 5 }] ^= 1;
         assert!(matches!(
             Artifact::decode(&bytes),

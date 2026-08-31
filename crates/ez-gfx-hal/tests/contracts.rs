@@ -1,3 +1,4 @@
+//! HAL allocation, layout, and synchronization contract tests.
 use ez_gfx_hal::{
     AllocationBlockPolicy, AllocationBlockPolicyError, AllocationError, AllocationRequest,
     BufferRange, DEFAULT_ALLOCATION_BLOCK_POLICY, ImageSubresources, MemoryClass, QueueKind,

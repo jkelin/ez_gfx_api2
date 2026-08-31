@@ -8,32 +8,51 @@ use ez_gfx_core::handle::{GenerationalArena, HandleError, HandleParts, LocalHand
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
+/// Classifies resources tracked by a graphics context.
 pub enum ResourceKind {
+    /// Native presentation surface.
     Surface = 1,
+    /// Compiled shader resource.
     Shader = 2,
+    /// Indirect command resource.
     Indirect = 3,
+    /// Structured buffer resource.
     Structured = 4,
+    /// Texture resource.
     Texture = 5,
+    /// Render-target resource.
     RenderTarget = 6,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
+/// Indicates whether a graphics context can accept work.
 pub enum ContextHealth {
+    /// The context can accept work.
     Healthy = 0,
+    /// The context is permanently unavailable.
     Lost = 1,
 }
 
 #[derive(Debug)]
+/// Tracks context ownership, thread affinity, health, and resource identities.
 pub struct ContextIdentity {
+    /// Local handle used as the owner of packed resource handles.
     owner: LocalHandle,
+    /// Thread permitted to access the context.
     creator: ThreadId,
+    /// Atomically stored context health state.
     health: AtomicU8,
+    /// Generational storage mapping child handles to resource kinds.
     resources: GenerationalArena<ResourceKind>,
 }
 
 impl ContextIdentity {
     /// Owner fields must fit the existing 20/20 context packing before any resource is inserted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the owner cannot be encoded as a context handle.
     pub fn new(owner: LocalHandle) -> Result<Self, LifecycleError> {
         PackedHandle::context(owner).map_err(LifecycleError::Handle)?;
         Ok(Self {
@@ -44,10 +63,13 @@ impl ContextIdentity {
         })
     }
 
+    /// # Panics
+    ///
+    /// Panics only if the validated owner cannot be repacked as a context handle.
     pub fn context_handle(&self) -> PackedHandle {
         PackedHandle::context(self.owner).expect("owner was validated at construction")
     }
-
+    /// Returns the current context health with acquire ordering.
     pub fn health(&self) -> ContextHealth {
         match self.health.load(Ordering::Acquire) {
             0 => ContextHealth::Healthy,
@@ -56,6 +78,10 @@ impl ContextIdentity {
     }
 
     /// The first loss transition succeeds; later reports are observable but never repeat fan-out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context has already been marked lost.
     pub fn mark_lost(&self) -> Result<(), LifecycleError> {
         self.health
             .compare_exchange(
@@ -69,6 +95,10 @@ impl ContextIdentity {
     }
 
     /// Loss takes precedence over affinity so no thread can begin work after a fatal native result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is lost or the current thread is not the creator thread.
     pub fn check_thread_and_health(&self) -> Result<(), LifecycleError> {
         if self.health() == ContextHealth::Lost {
             return Err(LifecycleError::DeviceLost);
@@ -80,6 +110,10 @@ impl ContextIdentity {
     }
 
     /// Identity capacity is limited by the packed 12-bit child slot and generation fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is lost, the current thread is not the creator thread, arena insertion fails, or the child handle cannot be packed.
     pub fn insert(&mut self, kind: ResourceKind) -> Result<PackedHandle, LifecycleError> {
         self.check_thread_and_health()?;
         let local = self
@@ -96,6 +130,10 @@ impl ContextIdentity {
     }
 
     /// Owner, packed form, generation, and kind are all checked before typed resource lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is lost, the current thread is not the creator thread, the handle is invalid, is not a resource handle, has the wrong owner, is stale, or has the wrong resource kind.
     pub fn resolve(
         &self,
         handle: PackedHandle,
@@ -117,6 +155,10 @@ impl ContextIdentity {
     }
 
     /// Null/stale/wrong-kind destroys fail closed; generation advances before the slot is reused.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if resource resolution fails or the resolved child handle is stale when removed.
     pub fn remove(
         &mut self,
         handle: PackedHandle,
@@ -130,11 +172,17 @@ impl ContextIdentity {
         Ok(())
     }
 
+    /// Invalidates every tracked resource handle.
     pub fn invalidate_resources(&mut self) {
         let _ = self.resources.clear();
     }
 }
 
+/// Extracts owner and child handles from a packed resource handle.
+///
+/// # Errors
+///
+/// Returns an error if the packed handle is invalid or is a context handle rather than a resource handle.
 fn child_parts(handle: PackedHandle) -> Result<(LocalHandle, LocalHandle), LifecycleError> {
     match handle.parts().map_err(LifecycleError::Handle)? {
         HandleParts::Child { owner, child } => Ok((owner, child)),
@@ -143,18 +191,28 @@ fn child_parts(handle: PackedHandle) -> Result<(LocalHandle, LocalHandle), Lifec
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Reports lifecycle and handle-validation failures.
 pub enum LifecycleError {
+    /// Packed-handle encoding or arena operation failed.
     Handle(HandleError),
+    /// The resource belongs to another context.
     WrongOwner,
+    /// The resource kind differs from the expected kind.
     WrongResourceKind,
+    /// The resource handle no longer identifies a live allocation.
     StaleHandle,
+    /// A context handle was supplied where a resource handle was required.
     ExpectedResource,
+    /// The operation ran on a thread other than the context creator.
     WrongThread,
+    /// The context cannot accept work because the device was lost.
     DeviceLost,
+    /// The context had already transitioned to the lost state.
     AlreadyLost,
 }
 
 impl fmt::Display for LifecycleError {
+    /// Formats the lifecycle failure using its debug representation.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{self:?}")
     }

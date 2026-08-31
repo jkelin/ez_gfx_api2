@@ -41,7 +41,9 @@ impl HostSurface {
                 width: f64::from(width),
                 height: f64::from(height),
             });
+            // SAFETY: The host contract guarantees valid graphics resource pointers.
             let view = unsafe { &*(handle.ns_view.as_ptr() as *const objc2::runtime::AnyObject) };
+            // SAFETY: The host contract guarantees valid graphics resource pointers.
             unsafe {
                 let _: () = msg_send![view, setWantsLayer: true];
                 let _: () = msg_send![view, setLayer: Retained::as_ptr(&layer)];

@@ -1,3 +1,4 @@
+//! Smoke tests for the migrated examples.
 use std::{path::PathBuf, process::Command};
 
 const BINARIES: [(&str, &str, &str, u32); 6] = [

@@ -1,3 +1,4 @@
+//! Progressive native texture-residency tests through the C ABI.
 #![cfg(windows)]
 
 use std::ffi::CString;
@@ -19,7 +20,10 @@ fn vulkan_reports_completed_progressive_mip_residency() {
     };
     let mut context = 0;
     assert_eq!(
-        ez_gfx_context_create_backend(&context_desc, &mut context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_context_create_backend(&raw const context_desc, &raw mut context) }
+        },
         EzGfxResult::Ok
     );
 
@@ -42,19 +46,38 @@ fn vulkan_reports_completed_progressive_mip_residency() {
     };
     let mut texture = 0;
     assert_eq!(
-        ez_gfx_texture_load(bytes.as_ptr(), bytes.len(), &desc, &mut texture, context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe {
+                ez_gfx_texture_load(
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    &raw const desc,
+                    &raw mut texture,
+                    context,
+                )
+            }
+        },
         EzGfxResult::Ok
     );
 
     let mut resident = 0;
     let mut total = 0;
-    let first = ez_gfx_texture_get_residency(texture, &mut resident, &mut total, context);
+    let first = {
+        // SAFETY: Non-null outputs point to live, aligned u32 storage; null pointers intentionally exercise checked rejection.
+        unsafe { ez_gfx_texture_get_residency(texture, &raw mut resident, &raw mut total, context) }
+    };
     assert!(matches!(first, EzGfxResult::Ok | EzGfxResult::NotReady));
     assert!(resident <= total);
 
     assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
     assert_eq!(
-        ez_gfx_texture_get_residency(texture, &mut resident, &mut total, context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe {
+                ez_gfx_texture_get_residency(texture, &raw mut resident, &raw mut total, context)
+            }
+        },
         EzGfxResult::Ok
     );
     assert_eq!(resident, total);

@@ -1,3 +1,5 @@
+//! Runtime integration and contract tests.
+
 use ez_gfx_hal::{BufferRange, QueueKind, ResourceAccess, ResourceState};
 use ez_gfx_runtime::{
     frame::{ExecutableNode, FrameError, FrameRecorder, FrameState},

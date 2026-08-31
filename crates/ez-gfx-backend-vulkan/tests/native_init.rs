@@ -1,3 +1,5 @@
+//! Native Vulkan initialization smoke test.
+
 #[cfg(windows)]
 #[test]
 fn creates_vulkan_13_instance() {

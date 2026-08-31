@@ -1,22 +1,35 @@
 use ez_gfx_core::Backend;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Native window integration modes accepted by the runtime.
 pub enum SurfacePlatform {
+    /// Uses Win32 window and instance handles.
     Win32,
+    /// Uses a GLFW-created native window.
     Glfw,
+    /// Uses a Core Animation Metal layer.
     MetalLayer,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Settings used to initialize a graphics context.
 pub struct ContextOptions {
+    /// Enables graphics API debug facilities.
     pub enable_debug: bool,
+    /// Enables backend validation checks.
     pub enable_validation: bool,
+    /// Selects the native surface integration mode.
     pub surface_platform: SurfacePlatform,
+    /// Selects the graphics backend.
     pub backend: Backend,
 }
 
 impl ContextOptions {
     /// ABI booleans and backend/platform discriminants are validated before native setup.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidBoolean` when either boolean byte is not 0 or 1, or `InvalidPlatform` when the platform code is invalid or incompatible with Vulkan.
     pub fn new(
         enable_debug: u8,
         enable_validation: u8,
@@ -32,6 +45,10 @@ impl ContextOptions {
 
     /// Backend/platform pairs are closed: DX12 requires Win32, Metal requires a layer, and Vulkan
     /// accepts host-window platforms but never a Metal layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidBoolean` when either boolean byte is not 0 or 1, or `InvalidPlatform` when the platform code is invalid or incompatible with the selected backend.
     pub fn new_for_backend(
         enable_debug: u8,
         enable_validation: u8,
@@ -59,17 +76,28 @@ impl ContextOptions {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Native handles, dimensions, and presentation settings for a surface.
 pub struct SurfaceOptions {
+    /// Borrowed native window or Metal layer handle.
     pub window: usize,
+    /// Borrowed native display or Win32 instance handle.
     pub display: usize,
+    /// Identifies how the native handles are interpreted.
     pub platform: SurfacePlatform,
+    /// Initial drawable width in pixels.
     pub width: u32,
+    /// Initial drawable height in pixels.
     pub height: u32,
+    /// Enables caching of presented snapshots.
     pub cache_presented_snapshots: bool,
 }
 
 impl SurfaceOptions {
-    /// GLFW may omit display; Win32 requires both borrowed handles; Metal accepts a borrowed CAMetalLayer.
+    /// GLFW may omit display; Win32 requires both borrowed handles; Metal accepts a borrowed `CAMetalLayer`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MissingNativeHandle` for a null required handle, `MixedZeroExtent` or `ZeroInitialExtent` for an invalid extent, or `InvalidBoolean` when `cache` is not 0 or 1.
     pub fn new(
         window: usize,
         display: usize,
@@ -97,15 +125,24 @@ impl SurfaceOptions {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Tracks a surface's drawable extent and pending presentation changes.
 pub struct SurfaceState {
+    /// Current drawable width in pixels, or zero while minimized.
     width: u32,
+    /// Current drawable height in pixels, or zero while minimized.
     height: u32,
+    /// Indicates whether an unconsumed resize has occurred.
     resize_pending: bool,
+    /// Indicates whether presented snapshots are cached.
     snapshot_cache: bool,
 }
 
 impl SurfaceState {
     /// Construction requires a drawable extent; minimized state is entered only through resize.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ZeroInitialExtent` when either dimension is zero.
     pub fn new(width: u32, height: u32, snapshot_cache: bool) -> Result<Self, PublicApiError> {
         if width == 0 || height == 0 {
             return Err(PublicApiError::ZeroInitialExtent);
@@ -118,7 +155,11 @@ impl SurfaceState {
         })
     }
 
-    /// A 0x0 extent is a valid minimized transition reported as NotReady; mixed-zero is invalid.
+    /// A 0x0 extent is a valid minimized transition reported as `NotReady`; mixed-zero is invalid.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MixedZeroExtent` when exactly one dimension is zero, or `NotReady` when both dimensions are zero.
     pub fn resize(&mut self, width: u32, height: u32) -> Result<(), PublicApiError> {
         validate_extent(width, height)?;
         self.width = width;
@@ -131,6 +172,7 @@ impl SurfaceState {
         }
     }
 
+    /// Returns the drawable extent, or `None` while minimized.
     pub const fn extent(&self) -> Option<(u32, u32)> {
         if self.width == 0 {
             None
@@ -138,30 +180,46 @@ impl SurfaceState {
             Some((self.width, self.height))
         }
     }
+    /// Reports whether a resize is awaiting consumption.
     pub const fn resize_pending(&self) -> bool {
         self.resize_pending
     }
+    /// Consumes and returns the pending-resize flag.
     pub fn take_resize_pending(&mut self) -> bool {
         core::mem::replace(&mut self.resize_pending, false)
     }
+    /// Reports whether presented snapshots are cached.
     pub const fn snapshot_cache(&self) -> bool {
         self.snapshot_cache
     }
+    /// Enables or disables caching of presented snapshots.
     pub fn set_snapshot_cache(&mut self, enabled: bool) {
         self.snapshot_cache = enabled;
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Failures exposed by runtime option and surface-state validation.
 pub enum PublicApiError {
+    /// A boolean byte was neither zero nor one.
     InvalidBoolean,
+    /// A platform code or backend/platform pairing is unsupported.
     InvalidPlatform,
+    /// A required native window, display, or layer handle was null.
     MissingNativeHandle,
+    /// Exactly one extent dimension was zero.
     MixedZeroExtent,
+    /// Surface creation requested a zero-sized drawable.
     ZeroInitialExtent,
+    /// The surface is temporarily unavailable, such as while minimized.
     NotReady,
 }
 
+/// Decodes an ABI boolean encoded as zero or one.
+///
+/// # Errors
+///
+/// Returns `InvalidBoolean` when `value` is neither 0 nor 1.
 fn parse_bool(value: u8) -> Result<bool, PublicApiError> {
     match value {
         0 => Ok(false),
@@ -170,6 +228,11 @@ fn parse_bool(value: u8) -> Result<bool, PublicApiError> {
     }
 }
 
+/// Decodes an ABI platform discriminant.
+///
+/// # Errors
+///
+/// Returns `InvalidPlatform` when `value` is not a recognized platform discriminant.
 fn parse_platform(value: u8) -> Result<SurfacePlatform, PublicApiError> {
     match value {
         0 => Ok(SurfacePlatform::Win32),
@@ -179,10 +242,15 @@ fn parse_platform(value: u8) -> Result<SurfacePlatform, PublicApiError> {
     }
 }
 
+/// Accepts extents whose dimensions are either both zero or both nonzero.
+///
+/// # Errors
+///
+/// Returns `MixedZeroExtent` when exactly one dimension is zero.
 fn validate_extent(width: u32, height: u32) -> Result<(), PublicApiError> {
-    if (width == 0) != (height == 0) {
-        Err(PublicApiError::MixedZeroExtent)
-    } else {
+    if (width == 0) == (height == 0) {
         Ok(())
+    } else {
+        Err(PublicApiError::MixedZeroExtent)
     }
 }

@@ -7,3 +7,6 @@ license.workspace = true
 
 [dependencies]
 ez-gfx-core.workspace = true
+
+[lints]
+workspace = true

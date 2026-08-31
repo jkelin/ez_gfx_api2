@@ -46,3 +46,6 @@ winit = "0.30"
 objc2.workspace = true
 objc2-core-foundation.workspace = true
 objc2-quartz-core.workspace = true
+
+[lints]
+workspace = true

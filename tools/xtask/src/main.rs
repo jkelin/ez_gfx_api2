@@ -1,3 +1,4 @@
+//! Packaging and repository quality checks.
 use std::{
     env,
     ffi::OsStr,
@@ -23,7 +24,11 @@ fn main() {
 fn dispatch() -> Result<(), String> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
-        Some("package") => package(PackageArgs::parse(args.collect())?),
+        Some("package") => {
+            let positional = args.collect::<Vec<_>>();
+            package(&PackageArgs::parse(&positional)?)
+        }
+        Some("source-lines") => source_lines(),
         Some(task) => Err(format!("unknown task: {task}")),
         None => Err("task is required".to_owned()),
     }
@@ -37,17 +42,16 @@ struct PackageArgs {
 
 impl PackageArgs {
     // Positional arguments are bounded to target, version, and output; extras are rejected.
-    fn parse(args: Vec<String>) -> Result<Self, String> {
+    fn parse(args: &[String]) -> Result<Self, String> {
         if args.len() > 3 {
             return Err("usage: xtask package [target] [version] [output]".to_owned());
         }
         Ok(Self {
-            target: args.first().cloned().map(Ok).unwrap_or_else(host_target)?,
+            target: args.first().cloned().map_or_else(host_target, Ok)?,
             version: args.get(1).cloned().unwrap_or_else(|| "0.1.0".to_owned()),
             output: args
                 .get(2)
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("dist")),
+                .map_or_else(|| PathBuf::from("dist"), PathBuf::from),
         })
     }
 }
@@ -69,7 +73,7 @@ fn host_target() -> Result<String, String> {
 }
 
 // Packaging is fail-fast: missing products, compiler libraries, or dependency isolation abort before archives are emitted.
-fn package(args: PackageArgs) -> Result<(), String> {
+fn package(args: &PackageArgs) -> Result<(), String> {
     run(
         "cargo",
         &[
@@ -234,7 +238,7 @@ fn find_native_library(name: &str) -> Result<PathBuf, String> {
             .into_iter()
             .filter_map(Result::ok)
             .find(|entry| entry.file_type().is_file() && entry.file_name() == OsStr::new(name))
-            .map(|entry| entry.into_path())
+            .map(walkdir::DirEntry::into_path)
         {
             return Ok(path);
         }
@@ -349,4 +353,194 @@ fn run(program: &str, args: &[&str]) -> Result<(), String> {
 // Static operation labels keep I/O errors concise while preserving their causes.
 fn io_error(operation: &'static str) -> impl FnOnce(io::Error) -> String {
     move |error| format!("{operation}: {error}")
+}
+
+const SOURCE_LINE_LIMIT: usize = 1_200;
+
+fn source_lines() -> Result<(), String> {
+    let root = env::current_dir().map_err(io_error("find repository root"))?;
+    let root_string = root.to_str().ok_or("repository root is not UTF-8")?;
+    let output = Command::new("git")
+        .args([
+            "-C",
+            root_string,
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "*.rs",
+        ])
+        .output()
+        .map_err(|error| format!("run git ls-files: {error}"))?;
+
+    if !output.status.success() {
+        return Err(format!("git ls-files exited with {}", output.status));
+    }
+
+    let listed = String::from_utf8(output.stdout)
+        .map_err(|_| "git ls-files output is not UTF-8".to_owned())?;
+    let files = existing_rust_paths(&root, &parse_rust_paths(&listed)?)?;
+    let diagnostics = source_line_diagnostics(&root, &files, SOURCE_LINE_LIMIT)?;
+    if diagnostics.is_empty() {
+        println!(
+            "source-lines: all tracked and unignored Rust files are at most {SOURCE_LINE_LIMIT} lines"
+        );
+        return Ok(());
+    }
+    for diagnostic in &diagnostics {
+        eprintln!("{diagnostic}");
+    }
+    Err(format!(
+        "source-lines: {} file(s) exceed the {SOURCE_LINE_LIMIT}-line limit",
+        diagnostics.len()
+    ))
+}
+
+fn parse_rust_paths(output: &str) -> Result<Vec<PathBuf>, String> {
+    let mut paths = Vec::new();
+    for line in output.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(line);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+        {
+            return Err(format!(
+                "git ls-files returned invalid relative path: {line}"
+            ));
+        }
+        if path.extension() == Some(OsStr::new("rs")) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn existing_rust_paths(root: &Path, paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    if !root.is_dir() {
+        return Err(format!(
+            "repository root is not a directory: {}",
+            root.display()
+        ));
+    }
+    Ok(paths
+        .iter()
+        .filter(|path| root.join(path).is_file())
+        .cloned()
+        .collect())
+}
+
+fn source_line_diagnostics(
+    root: &Path,
+    files: &[PathBuf],
+    limit: usize,
+) -> Result<Vec<String>, String> {
+    if !root.is_dir() {
+        return Err(format!(
+            "repository root is not a directory: {}",
+            root.display()
+        ));
+    }
+    if limit == 0 {
+        return Err("source line limit must be greater than zero".to_owned());
+    }
+
+    let mut diagnostics = Vec::new();
+    for path in files {
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+        {
+            return Err(format!("invalid relative Rust path: {}", path.display()));
+        }
+        let full_path = root.join(path);
+        let bytes = fs::read(&full_path)
+            .map_err(|error| format!("read {}: {error}", full_path.display()))?;
+        let lines = physical_line_count(&bytes);
+        if lines > limit {
+            diagnostics.push(format!(
+                "source-lines: {} has {lines} physical lines (maximum {limit})",
+                path.display()
+            ));
+        }
+    }
+    Ok(diagnostics)
+}
+
+fn physical_line_count(bytes: &[u8]) -> usize {
+    // Empty input has no lines; a final newline terminates the preceding line
+    // without creating an additional empty line.
+    let newline_count = bytes
+        .iter()
+        .fold(0, |count, &byte| count + usize::from(byte == b'\n'));
+    newline_count + usize::from(bytes.last().is_some_and(|&byte| byte != b'\n'))
+}
+
+#[cfg(test)]
+mod source_line_tests {
+    use super::{
+        existing_rust_paths, parse_rust_paths, physical_line_count, source_line_diagnostics,
+    };
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
+
+    #[test]
+    fn physical_line_count_handles_empty_and_boundary_newlines() {
+        assert_eq!(physical_line_count(b""), 0);
+        assert_eq!(physical_line_count(b"\n"), 1);
+        assert_eq!(physical_line_count(b"\n\n"), 2);
+        assert_eq!(physical_line_count(b"one"), 1);
+        assert_eq!(physical_line_count(b"one\n"), 1);
+        assert_eq!(physical_line_count(b"one\ntwo"), 2);
+        assert_eq!(physical_line_count(b"one\n\ntwo\n"), 3);
+    }
+
+    #[test]
+    fn parse_paths_filters_sorts_deduplicates_and_rejects_escape() {
+        assert_eq!(
+            parse_rust_paths("z.rs\na.txt\nz.rs\na.rs\n").unwrap(),
+            vec![PathBuf::from("a.rs"), PathBuf::from("z.rs")]
+        );
+        assert!(parse_rust_paths("../escape.rs").is_err());
+    }
+
+    #[test]
+    fn diagnostics_are_deterministic_and_validate_inputs() {
+        let root = std::env::temp_dir().join(format!("xtask-source-lines-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("short.rs"), b"a\n").unwrap();
+        fs::write(root.join("long.rs"), b"a\nb\nc").unwrap();
+        let files = vec!["long.rs".into(), "short.rs".into()];
+        assert_eq!(
+            source_line_diagnostics(Path::new(&root), &files, 2).unwrap(),
+            vec!["source-lines: long.rs has 3 physical lines (maximum 2)"]
+        );
+        assert!(source_line_diagnostics(Path::new(&root), &files, 0).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn source_paths_skip_deleted_files() {
+        let root = std::env::temp_dir().join(format!("xtask-source-paths-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("tracked.rs"), b"fn tracked() {}\n").unwrap();
+        fs::write(root.join("untracked.rs"), b"fn untracked() {}\n").unwrap();
+        // `git ls-files --exclude-standard` omits ignored paths before this helper runs.
+        let listed = parse_rust_paths("tracked.rs\ndeleted.rs\nuntracked.rs\n").unwrap();
+        assert_eq!(
+            existing_rust_paths(Path::new(&root), &listed).unwrap(),
+            vec![PathBuf::from("tracked.rs"), PathBuf::from("untracked.rs")]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 }

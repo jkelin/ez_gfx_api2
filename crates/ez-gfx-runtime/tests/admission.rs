@@ -1,3 +1,5 @@
+//! Runtime integration and contract tests.
+
 use ez_gfx_core::{
     Backend,
     capability::{AdapterCapabilities, AdapterClass, AdapterInfo, CompressionSupport},

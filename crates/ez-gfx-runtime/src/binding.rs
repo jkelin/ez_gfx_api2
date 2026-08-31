@@ -5,20 +5,29 @@ use ez_gfx_core::{Backend, capability::MAX_BINDLESS_SAMPLED_TEXTURES};
 use serde::Deserialize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Classifies the GPU resource represented by a binding.
 pub enum BindingKind {
+    /// A structured buffer resource.
     Structured,
+    /// A buffer used for indirect GPU commands.
     Indirect,
+    /// A render-target resource.
     RenderTarget,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Associates an opaque runtime handle with its GPU resource kind.
 pub enum ResourceIdentity {
+    /// A structured buffer handle.
     Structured(u64),
+    /// An indirect-command buffer handle.
     Indirect(u64),
+    /// A render-target handle.
     RenderTarget(u64),
 }
 
 impl ResourceIdentity {
+    /// Returns the GPU resource kind associated with this identity.
     pub const fn kind(&self) -> BindingKind {
         match self {
             Self::Structured(_) => BindingKind::Structured,
@@ -27,6 +36,7 @@ impl ResourceIdentity {
         }
     }
 
+    /// Returns the opaque runtime handle.
     pub const fn handle(&self) -> u64 {
         match *self {
             Self::Structured(handle) | Self::Indirect(handle) | Self::RenderTarget(handle) => {
@@ -37,46 +47,75 @@ impl ResourceIdentity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Names a GPU resource supplied for shader binding.
 pub struct PublicBinding {
+    /// Shader-visible semantic name.
     pub name: String,
+    /// Opaque identity of the supplied GPU resource.
     pub resource: ResourceIdentity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Describes one named resource required by shader reflection.
 pub struct BindingRequirement {
+    /// Shader-visible semantic name.
     pub name: String,
+    /// Required GPU resource kind.
     pub kind: BindingKind,
+    /// Descriptor space containing the resource.
     pub space: u32,
+    /// First descriptor index occupied by the resource.
     pub binding: u32,
+    /// Number of consecutive descriptors occupied by the resource.
     pub descriptor_count: u32,
+    /// Whether the shader may write to the resource.
     pub writable: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Stores validated named resource requirements for one backend.
 pub struct ReflectedBindings {
+    /// Graphics API targeted by the reflected metadata.
     backend: Backend,
+    /// Named resource requirements sorted by semantic name.
     requirements: Vec<BindingRequirement>,
 }
 
+/// Maximum number of sampled textures supported by the bindless heap.
 pub const MAX_TEXTURE_HEAP_CAPACITY: u32 = MAX_BINDLESS_SAMPLED_TEXTURES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Describes the reflected bindless texture heap and argument encoding.
 pub struct TextureHeapLayout {
+    /// Descriptor space containing the texture heap.
     pub space: u32,
+    /// Descriptor index of the texture heap.
     pub binding: u32,
+    /// Maximum number of sampled textures addressable by the heap.
     pub capacity: u32,
+    /// Byte stride between encoded texture arguments.
     pub argument_stride: u32,
+    /// Byte offset of the texture reference within each argument.
     pub texture_argument_offset: u32,
+    /// Byte offset of the sampler reference within each argument.
     pub sampler_argument_offset: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Captures reflected texture-heap and depth-attachment requirements.
 pub struct PipelineLayout {
+    /// Bindless texture-heap layout when declared by the shader.
     texture_heap: Option<TextureHeapLayout>,
+    /// Whether rendering requires a depth attachment.
     depth_required: bool,
 }
 
 impl PipelineLayout {
+    /// Parses and validates the pipeline layout for a backend entry point and stage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entry point is invalid, matching reflection is missing or ambiguous, metadata cannot be parsed, or the reflected texture-heap layout is invalid.
     pub fn parse(
         metadata: &[u8],
         backend: Backend,
@@ -111,10 +150,12 @@ impl PipelineLayout {
         })
     }
 
+    /// Returns the bindless texture-heap layout when present.
     pub const fn texture_heap(&self) -> Option<&TextureHeapLayout> {
         self.texture_heap.as_ref()
     }
 
+    /// Reports whether the pipeline requires a depth attachment.
     pub const fn depth_required(&self) -> bool {
         self.depth_required
     }
@@ -122,6 +163,10 @@ impl PipelineLayout {
 
 impl ReflectedBindings {
     /// Metadata must contain exactly one reflection for the requested target/entry/stage; DXIL keeps SRV and UAV register namespaces distinct.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reflection metadata is invalid, missing, or ambiguous, or if named requirements contain duplicate names, invalid descriptor counts or ranges, or overlapping physical slots.
     pub fn parse(
         metadata: &[u8],
         backend: Backend,
@@ -137,7 +182,7 @@ impl ReflectedBindings {
             let Some(name) = parameter.semantic_name else {
                 continue;
             };
-            let Some(kind) = parameter.api_kind.and_then(parse_kind) else {
+            let Some(kind) = parameter.api_kind.as_deref().and_then(parse_kind) else {
                 continue;
             };
             if name.is_empty() || name.len() > 255 || name.as_bytes().contains(&0) {
@@ -184,11 +229,16 @@ impl ReflectedBindings {
         })
     }
 
+    /// Returns reflected resource requirements sorted by semantic name.
     pub fn requirements(&self) -> &[BindingRequirement] {
         &self.requirements
     }
 
     /// Public bindings are order-independent, but must match every reflected named resource exactly once and with the correct opaque-handle kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if supplied bindings contain duplicate or unknown names, omit a required name, or use the wrong resource kind.
     pub fn validate(&self, bindings: &[PublicBinding]) -> Result<(), BindingError> {
         let expected = self
             .requirements
@@ -220,6 +270,10 @@ impl ReflectedBindings {
     }
 
     /// Stage layouts merge only when repeated semantic names preserve kind and physical location.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backends differ, a repeated name has conflicting requirements, or distinct requirements occupy the same physical slot.
     pub fn merge(&self, other: &Self) -> Result<Self, BindingError> {
         if self.backend != other.backend {
             return Err(BindingError::InvalidMetadata);
@@ -257,15 +311,30 @@ impl ReflectedBindings {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Runtime binding validation errors.
 pub enum BindingError {
+    /// Reflection metadata is invalid.
     InvalidMetadata,
+    /// Shader reflection is absent.
     MissingReflection,
+    /// Reflection data is ambiguous.
     AmbiguousReflection,
+    /// A logical binding is duplicated.
     Duplicate(String),
-    DuplicatePhysicalSlot { space: u32, binding: u32 },
+    /// A physical heap slot is duplicated.
+    DuplicatePhysicalSlot {
+        /// Descriptor space.
+        space: u32,
+        /// Descriptor binding.
+        binding: u32,
+    },
+    /// A semantic name has incompatible requirements across shader stages.
     ConflictingStageBinding(String),
+    /// A semantic name required by reflection was not supplied.
     Missing(String),
+    /// A supplied semantic name is not present in reflection.
     Unknown(String),
+    /// A supplied resource has the wrong GPU resource kind.
     KindMismatch(String),
 }
 
@@ -320,8 +389,9 @@ const fn one() -> u32 {
     1
 }
 
-fn parse_kind(value: String) -> Option<BindingKind> {
-    match value.as_str() {
+/// Maps a reflected API resource tag to its supported binding kind.
+fn parse_kind(value: &str) -> Option<BindingKind> {
+    match value {
         "structured" => Some(BindingKind::Structured),
         "indirect" => Some(BindingKind::Indirect),
         "render_target" => Some(BindingKind::RenderTarget),
@@ -329,6 +399,11 @@ fn parse_kind(value: String) -> Option<BindingKind> {
     }
 }
 
+/// Finds the unique reflection matching the backend, entry point, and shader stage.
+///
+/// # Errors
+///
+/// Returns an error if the entry point is invalid, the metadata is not valid JSON, or matching reflection is missing or ambiguous.
 fn matching_reflection(
     metadata: &[u8],
     backend: Backend,

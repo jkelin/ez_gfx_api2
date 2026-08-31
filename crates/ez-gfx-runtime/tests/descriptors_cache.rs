@@ -1,3 +1,5 @@
+//! Runtime integration and contract tests.
+
 use ez_gfx_core::{Backend, capability::SemanticProfile};
 use ez_gfx_hal::{CompletionToken, QueueKind};
 use ez_gfx_runtime::{cache::*, descriptor::*};

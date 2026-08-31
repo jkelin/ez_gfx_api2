@@ -1,3 +1,4 @@
+//! Native Vulkan and DX12 compute-pipeline smoke tests through the C ABI.
 #![cfg(windows)]
 
 use std::ffi::CString;
@@ -69,7 +70,10 @@ void main(uint3 id: SV_DispatchThreadID) { values[id.x] += 1; }
     };
     let mut context = 0;
     assert_eq!(
-        ez_gfx_context_create_backend(&desc, &mut context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe { ez_gfx_context_create_backend(&raw const desc, &raw mut context) }
+        },
         EzGfxResult::Ok
     );
 
@@ -81,31 +85,46 @@ void main(uint3 id: SV_DispatchThreadID) { values[id.x] += 1; }
     };
     let mut shader = 0;
     assert_eq!(
-        ez_gfx_shader_load_artifact(
-            artifact.as_ptr(),
-            artifact.len(),
-            &entry,
-            1,
-            &mut shader,
-            context
-        ),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe {
+                ez_gfx_shader_load_artifact(
+                    artifact.as_ptr(),
+                    artifact.len(),
+                    &raw const entry,
+                    1,
+                    &raw mut shader,
+                    context,
+                )
+            }
+        },
         EzGfxResult::Ok
     );
 
     let binding_name = CString::new("values").unwrap();
     let mut structured = 0;
     assert_eq!(
-        ez_gfx_structured_acquire(4, 1, binding_name.as_ptr(), &mut structured, context),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe {
+                ez_gfx_structured_acquire(4, 1, binding_name.as_ptr(), &raw mut structured, context)
+            }
+        },
         EzGfxResult::Ok
     );
     let value = 41_u32.to_ne_bytes();
     assert_eq!(
-        ez_gfx_structured_write(
-            structured,
-            value.as_ptr().cast(),
-            value.len() as u64,
-            context
-        ),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe {
+                ez_gfx_structured_write(
+                    structured,
+                    value.as_ptr().cast(),
+                    value.len() as u64,
+                    context,
+                )
+            }
+        },
         EzGfxResult::Ok
     );
     let binding = EzGfxBinding {
@@ -117,17 +136,22 @@ void main(uint3 id: SV_DispatchThreadID) { values[id.x] += 1; }
 
     assert_eq!(ez_gfx_frame_begin(context), EzGfxResult::Ok);
     assert_eq!(
-        ez_gfx_render_add_compute_pipeline(
-            shader,
-            1,
-            1,
-            1,
-            &binding,
-            1,
-            core::ptr::null(),
-            0,
-            context
-        ),
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe {
+                ez_gfx_render_add_compute_pipeline(
+                    shader,
+                    1,
+                    1,
+                    1,
+                    &raw const binding,
+                    1,
+                    core::ptr::null(),
+                    0,
+                    context,
+                )
+            }
+        },
         EzGfxResult::Ok
     );
     assert_eq!(ez_gfx_frame_submit(context), EzGfxResult::Ok);

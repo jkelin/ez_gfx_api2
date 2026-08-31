@@ -12,3 +12,6 @@ ez-gfx-hal.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Security", "Win32_System_Threading"] }
 gpu-allocator = { workspace = true, features = ["std", "d3d12"] }
+
+[lints]
+workspace = true

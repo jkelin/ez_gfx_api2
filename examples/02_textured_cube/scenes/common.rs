@@ -45,14 +45,19 @@ impl Shader {
         }
         let mut handle = 0;
         status(
-            ez_gfx_shader_load_artifact(
-                artifact.as_ptr(),
-                artifact.len(),
-                entries.as_ptr(),
-                entries.len(),
-                &mut handle,
-                context,
-            ),
+            {
+                // SAFETY: Artifact bytes, aligned entries, NUL-terminated entry names, and output storage remain live for this call.
+                unsafe {
+                    ez_gfx_shader_load_artifact(
+                        artifact.as_ptr(),
+                        artifact.len(),
+                        entries.as_ptr(),
+                        entries.len(),
+                        &raw mut handle,
+                        context,
+                    )
+                }
+            },
             "load scene artifact",
         )?;
         Ok(Self(handle))
@@ -76,16 +81,32 @@ impl Structured {
         let name = CString::new(name).map_err(|_| "buffer name contains NUL".to_owned())?;
         let mut handle = 0;
         status(
-            ez_gfx_structured_acquire(element_size, count, name.as_ptr(), &mut handle, context),
+            {
+                // SAFETY: The NUL-terminated name and aligned output storage remain live for this call.
+                unsafe {
+                    ez_gfx_structured_acquire(
+                        element_size,
+                        count,
+                        name.as_ptr(),
+                        &raw mut handle,
+                        context,
+                    )
+                }
+            },
             "acquire structured buffer",
         )?;
         if let Err(error) = status(
-            ez_gfx_structured_write(
-                handle,
-                values.as_ptr().cast(),
-                size_of_val(values) as u64,
-                context,
-            ),
+            {
+                // SAFETY: The data pointer references a live byte range of the declared size for this call.
+                unsafe {
+                    ez_gfx_structured_write(
+                        handle,
+                        values.as_ptr().cast(),
+                        size_of_val(values) as u64,
+                        context,
+                    )
+                }
+            },
             "upload structured buffer",
         ) {
             ez_gfx_structured_release(handle, context);
@@ -111,7 +132,12 @@ impl Indirect {
         let name = CString::new(name).map_err(|_| "indirect name contains NUL".to_owned())?;
         let mut handle = 0;
         status(
-            ez_gfx_acquire_indirect(capacity, name.as_ptr(), &mut handle, context),
+            {
+                // SAFETY: The name is a live NUL-terminated string and the output is live aligned storage for this call.
+                unsafe {
+                    ez_gfx_acquire_indirect(capacity, name.as_ptr(), &raw mut handle, context)
+                }
+            },
             "acquire indirect buffer",
         )?;
         Ok(Self { handle })
@@ -124,7 +150,12 @@ impl Indirect {
         command: EzGfxDrawIndexedCommand,
     ) -> Result<(), String> {
         status(
-            ez_gfx_indirect_write_draw(self.handle, index, &command, context),
+            {
+                // SAFETY: The command pointer references one live, aligned draw command for this call.
+                unsafe {
+                    ez_gfx_indirect_write_draw(self.handle, index, &raw const command, context)
+                }
+            },
             "write indirect draw",
         )
     }
@@ -149,17 +180,25 @@ impl IndexHeap {
             .map_err(|_| "index heap size exceeds ABI".to_owned())?;
         let name = CString::new(name).map_err(|_| "index heap name contains NUL".to_owned())?;
         status(
-            ez_gfx_index_heap_create(bytes, name.as_ptr(), context),
+            {
+                // SAFETY: The debug name is a live NUL-terminated string for this call.
+                unsafe { ez_gfx_index_heap_create(bytes, name.as_ptr(), context) }
+            },
             "create index heap",
         )?;
         let mut start = 0;
         if let Err(error) = status(
-            ez_gfx_vertex_upload_indices(
-                indices.as_ptr().cast(),
-                indices.len() as u32,
-                &mut start,
-                context,
-            ),
+            {
+                // SAFETY: The index byte range and aligned output remain live with the declared sizes for this call.
+                unsafe {
+                    ez_gfx_vertex_upload_indices(
+                        indices.as_ptr().cast(),
+                        indices.len() as u32,
+                        &raw mut start,
+                        context,
+                    )
+                }
+            },
             "upload indices",
         ) {
             ez_gfx_index_heap_destroy(context);
@@ -179,7 +218,10 @@ pub struct Texture {
 }
 
 impl Texture {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Example host callbacks mirror the rendering API contract."
+    )]
     pub fn load(
         context: u64,
         bytes: &[u8],
@@ -209,12 +251,26 @@ impl Texture {
         };
         let mut handle = 0;
         status(
-            ez_gfx_texture_load(bytes.as_ptr(), bytes.len(), &desc, &mut handle, context),
+            {
+                // SAFETY: Texture bytes, the aligned descriptor and optional NUL-terminated label, and output storage remain live for this call; nulls only exercise checked rejection.
+                unsafe {
+                    ez_gfx_texture_load(
+                        bytes.as_ptr(),
+                        bytes.len(),
+                        &raw const desc,
+                        &raw mut handle,
+                        context,
+                    )
+                }
+            },
             "load texture",
         )?;
         let mut binding = 0;
         if let Err(error) = status(
-            ez_gfx_texture_get_binding(handle, &mut binding, context),
+            {
+                // SAFETY: The non-null output points to one live, aligned u32 for this call.
+                unsafe { ez_gfx_texture_get_binding(handle, &raw mut binding, context) }
+            },
             "resolve texture binding",
         ) {
             ez_gfx_texture_unload(handle, context);
@@ -246,20 +302,31 @@ pub fn record_graphics(
     push: &[u8],
 ) -> Result<(), String> {
     status(
-        ez_gfx_render_add_vertex_pipeline(
-            shader,
-            indirect,
-            bindings.as_ptr(),
-            bindings.len() as u32,
-            dynamic.as_ref().map_or(core::ptr::null(), |value| value),
-            push.as_ptr().cast(),
-            push.len() as u32,
-            context,
-        ),
+        {
+            // SAFETY: Binding entries and names, optional dynamic state, and the declared push-byte range remain live and properly aligned for this call.
+            unsafe {
+                ez_gfx_render_add_vertex_pipeline(
+                    shader,
+                    indirect,
+                    bindings.as_ptr(),
+                    bindings.len() as u32,
+                    dynamic.as_ref().map_or(core::ptr::null(), |value| value),
+                    push.as_ptr().cast(),
+                    push.len() as u32,
+                    context,
+                )
+            }
+        },
         "record graphics pipeline",
     )
 }
 
 pub fn bytes_of<T>(value: &T) -> &[u8] {
-    unsafe { core::slice::from_raw_parts((value as *const T).cast(), std::mem::size_of::<T>()) }
+    // SAFETY: The host contract guarantees valid graphics resource pointers.
+    unsafe {
+        core::slice::from_raw_parts(
+            std::ptr::from_ref::<T>(value).cast(),
+            std::mem::size_of::<T>(),
+        )
+    }
 }

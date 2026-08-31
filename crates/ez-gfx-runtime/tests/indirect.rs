@@ -1,3 +1,5 @@
+//! Runtime integration and contract tests.
+
 use ez_gfx_runtime::indirect::*;
 
 fn view(x: i32) -> DynamicView {
