@@ -94,7 +94,7 @@ enum {
  * @EzGfxTextureError_WorkerUnavailable: No texture upload worker is available.
  * @EzGfxTextureError_NotFound: The texture handle is not loaded.
  *
- * Result returned by texture loading and unloading.
+ * Retained texture-specific code set and type for ABI compatibility. Current texture exports return EzGfxResult or void.
  */
 typedef uint8_t EzGfxTextureError;
 enum {
@@ -470,6 +470,25 @@ typedef struct EzGfxByteBuffer {
 } EzGfxByteBuffer;
 
 /**
+ * EzGfxHandleParts:
+ * @context_slot: Context arena slot.
+ * @context_generation: Context slot generation.
+ * @child_slot: Child-resource arena slot; zero for a context handle.
+ * @child_generation: Child-resource slot generation; zero for a context handle.
+ * @is_context: Non-zero when the handle refers directly to a context.
+ *
+ * Decoded fields of an opaque packed handle.
+ */
+typedef struct EzGfxHandleParts {
+    uint32_t context_slot;
+    uint32_t context_generation;
+    uint32_t child_slot;
+    uint32_t child_generation;
+    uint8_t is_context;
+    uint8_t _padding[3];
+} EzGfxHandleParts;
+
+/**
  * ez_gfx_abi_version:
  *
  * Returns: (transfer none): ABI version; no context is required.
@@ -570,9 +589,9 @@ EzGfxResult ez_gfx_texture_get_binding(EzGfxTexture texture, uint32_t *out_bindi
 EzGfxResult ez_gfx_texture_get_residency(EzGfxTexture texture, uint32_t *out_resident_mips, uint32_t *out_total_mips, EzGfxContext context) EZ_GFX_ACCESS(write_only, 2) EZ_GFX_ACCESS(write_only, 3);
 /** Invalidates the handle and releases owned GPU storage. */
 void ez_gfx_texture_unload(EzGfxTexture texture, EzGfxContext context);
-/** Begins rendering to a validated, non-minimized surface. */
+/** Begins and resets one presented-surface frame; use instead of ez_gfx_frame_begin. */
 EzGfxResult ez_gfx_begin_render(EzGfxSurface surface, EzGfxContext context);
-/** Begins one backend-neutral frame recording interval. */
+/** Begins one non-presented/headless frame; do not call both begin functions for one frame. */
 EzGfxResult ez_gfx_frame_begin(EzGfxContext context);
 /** Creates a bounded indexed-indirect command buffer. */
 EzGfxResult ez_gfx_acquire_indirect(uint32_t capacity, const char *debug_name, EzGfxIndirectBuffer *out_indirect, EzGfxContext context) EZ_GFX_ACCESS(write_only, 3);
@@ -588,15 +607,15 @@ EzGfxResult ez_gfx_render_add_vertex_pipeline(EzGfxShader shader, EzGfxIndirectB
 EzGfxResult ez_gfx_render_add_compute_pipeline(EzGfxShader shader, uint32_t dispatch_x, uint32_t dispatch_y, uint32_t dispatch_z, const EzGfxBinding *bindings, uint32_t binding_count, const void *push_constants, uint32_t push_constant_size, EzGfxContext context) EZ_GFX_ACCESS(read_only, 5, 6) EZ_GFX_ACCESS(read_only, 7, 8);
 /** Compiles and enqueues a texture-readback graph node for the active frame. */
 EzGfxResult ez_gfx_graph_enqueue_texture_readback(EzGfxTexture texture, EzGfxContext context);
-/** Uploads indirect commands, executes recorded pipelines, and completes readback. */
+/** Submits the active recording without native presentation and completes any recorded readback. */
 EzGfxResult ez_gfx_frame_submit(EzGfxContext context);
 /** Polls one bounded runtime event. out_present is zero when no event is queued; out_dropped reports overflow since the prior poll. */
 EzGfxResult ez_gfx_poll_runtime_event(EzGfxRuntimeRecord *out_record, uint8_t *out_present, uint64_t *out_dropped, EzGfxContext context) EZ_GFX_ACCESS(write_only, 1) EZ_GFX_ACCESS(write_only, 2) EZ_GFX_ACCESS(write_only, 3);
 /** Polls one bounded local diagnostic. out_present is zero when none is queued; out_dropped reports overflow since the prior poll. */
 EzGfxResult ez_gfx_poll_diagnostic(EzGfxDiagnostic *out_diagnostic, uint8_t *out_present, uint64_t *out_dropped, EzGfxContext context) EZ_GFX_ACCESS(write_only, 1) EZ_GFX_ACCESS(write_only, 2) EZ_GFX_ACCESS(write_only, 3);
-/** Submits the active frame and presents its surface. */
+/** Submits the active frame, then presents; does not present if submission fails. */
 EzGfxResult ez_gfx_finish_render(EzGfxContext context);
-/** Copies the last frame readback; capacity zero queries the required size. */
+/** Copies a readback only after an enqueued readback's submission completes; capacity zero queries required size. */
 EzGfxResult ez_gfx_frame_readback(uint8_t *data, size_t capacity, size_t *out_size, EzGfxContext context) EZ_GFX_ACCESS(write_only, 1, 2) EZ_GFX_ACCESS(write_only, 3);
 /** Creates a named device-local vertex heap. */
 EzGfxResult ez_gfx_vertex_heap_create(const char * name, uint64_t capacity, uint64_t stride, EzGfxContext context);
@@ -633,6 +652,25 @@ void ez_gfx_structured_release(EzGfxStructuredBuffer structured, EzGfxContext co
  * Returns: (transfer none): No return value; null handles are ignored.
  */
 void ez_gfx_surface_destroy(EzGfxSurface surface, EzGfxContext context);
+
+/**
+ * ez_gfx_handle_inspect:
+ * @handle: Opaque packed context or resource handle.
+ * @out_parts (out caller-allocates): Receives the decoded slot and generation fields.
+ *
+ * Returns: (transfer none): Returns EzGfxResult_Ok or EzGfxResult_InvalidContext.
+ */
+EzGfxResult ez_gfx_handle_inspect(uint64_t handle, EzGfxHandleParts * out_parts) EZ_GFX_ACCESS(write_only, 2);
+
+/**
+ * ez_gfx_semantic_id:
+ * @name (in) (not nullable): UTF-8 name bytes.
+ * @length: Number of bytes in name.
+ * @out_id (out caller-allocates): Receives the 16-byte semantic identifier.
+ *
+ * Returns: (transfer none): Returns EzGfxResult_Ok or EzGfxResult_InvalidArgument.
+ */
+EzGfxResult ez_gfx_semantic_id(const uint8_t * name, size_t length, uint8_t * out_id) EZ_GFX_ACCESS(read_only, 1, 2) EZ_GFX_ACCESS(write_only, 3);
 
 #ifdef __cplusplus
 }

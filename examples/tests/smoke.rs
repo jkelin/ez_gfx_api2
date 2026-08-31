@@ -1,5 +1,7 @@
 //! Smoke tests for the migrated examples.
-use std::{path::PathBuf, process::Command};
+#[path = "../shared/mod.rs"]
+mod shared;
+use std::path::PathBuf;
 
 const BINARIES: [(&str, &str, &str, u32); 6] = [
     (
@@ -49,13 +51,7 @@ fn snapshot(binary: &str, file: &str) -> (String, image::RgbaImage) {
     let reference = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("snapshots")
         .join(file);
-    let mut command = Command::new(binary);
-    command
-        .env("EZ_GFX_BACKEND", target_backend())
-        .env("EZ_GFX_EXAMPLE_MAX_FRAMES", "1")
-        .env("EZ_GFX_EXAMPLE_REPORT", "1")
-        .env("EZ_GFX_EXAMPLE_SNAPSHOT", &reference)
-        .env("VK_LOADER_LAYERS_DISABLE", "~implicit~");
+    let mut command = shared::snapshot_command(binary, &reference, target_backend());
     #[cfg(target_vendor = "apple")]
     command.env("MTL_DEBUG_LAYER", "1");
     let output = command

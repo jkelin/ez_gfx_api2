@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/ez-gfx",
     "crates/ez-gfx-core",
     "crates/ez-gfx-hal",
     "crates/ez-gfx-runtime",
@@ -40,6 +41,7 @@ undocumented_unsafe_blocks = "warn"
 must_use_candidate = "allow"
 
 [workspace.dependencies]
+ez-gfx = { path = "crates/ez-gfx" }
 ez-gfx-core = { path = "crates/ez-gfx-core" }
 ez-gfx-hal = { path = "crates/ez-gfx-hal" }
 ez-gfx-runtime = { path = "crates/ez-gfx-runtime" }

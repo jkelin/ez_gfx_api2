@@ -1,5 +1,5 @@
-//! Executable rendering example.
-#[allow(
+//! Structured compute using safe ez-gfx context, resource, and frame APIs.
+#![allow(
     clippy::borrow_as_ptr,
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -14,604 +14,507 @@
     clippy::type_complexity,
     clippy::unused_self,
     clippy::wildcard_imports,
-    reason = "Example scene and host modules preserve graphics and callback contracts."
+    reason = "The inline renderer preserves fixed graphics ABI and callback contracts."
 )]
-mod host;
-#[allow(
-    clippy::borrow_as_ptr,
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::float_cmp,
-    clippy::ignored_unit_patterns,
-    clippy::map_unwrap_or,
-    clippy::match_overlapping_arm,
-    clippy::needless_pass_by_value,
-    clippy::redundant_closure_for_method_calls,
-    clippy::semicolon_if_nothing_returned,
-    clippy::type_complexity,
-    clippy::unused_self,
-    clippy::wildcard_imports,
-    reason = "Example scene and host modules preserve graphics and callback contracts."
-)]
-mod scenes;
+mod renderer {
+    use crate::shared;
+    use crate::shared::{FrameInput, SceneInput};
+    use crate::shared::{
+        math::{Mat4, OrbitCamera, mul, perspective},
+        mesh::{BasicPrimitive, basic_primitives, load_geometry_glb},
+    };
+    use ez_gfx::{
+        DynamicPipelineState, EzGfxResult, PublicBinding, ResourceIdentity, ShaderRequest, Stage,
+        acquire_indirect, acquire_structured, create_index_heap, destroy_index_heap,
+        destroy_shader, load_shader, release_indirect, release_structured, render_add_compute,
+        render_add_graphics, set_indirect_count, upload_indices, write_structured,
+    };
 
-use std::time::Instant;
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct ScenePush {
+        mvp: Mat4,
+        primitive_count: u32,
+        padding: [u32; 3],
+    }
 
-use crate::host::HostSurface;
-use crate::scenes::{FrameInput, ModelScene, SceneInput, SceneKey, SceneState};
+    pub(super) struct ModelScene {
+        shader: u64,
+        positions: u64,
+        normals: u64,
+        primitives: u64,
+        indirect: u64,
+        camera: OrbitCamera,
+        target: [f32; 3],
+        near: f32,
+        far: f32,
+        push: ScenePush,
+        primitive_count: u32,
+        bindings: [PublicBinding; 4],
+    }
 
-use ez_gfx_ffi::{
-    EzGfxBackendContextDesc, EzGfxDiagnostic, EzGfxResult, EzGfxRuntimeRecord, ez_gfx_begin_render,
-    ez_gfx_context_create_backend, ez_gfx_context_destroy, ez_gfx_context_init_device,
-    ez_gfx_context_wait_idle, ez_gfx_finish_render, ez_gfx_frame_readback, ez_gfx_poll_diagnostic,
-    ez_gfx_poll_runtime_event, ez_gfx_surface_create, ez_gfx_surface_destroy,
-    ez_gfx_surface_resize, ez_gfx_surface_set_snapshot_cache,
+    impl ModelScene {
+        #[allow(
+            clippy::too_many_lines,
+            reason = "The example keeps every safe resource acquisition, binding, and failure cleanup visible in one linear flow."
+        )]
+        pub(super) fn create(context: u64) -> Result<Self, String> {
+            let mesh = load_geometry_glb(include_bytes!("../shared/assets/sponza.glb"))?;
+            let primitive_count = u32::try_from(mesh.primitives.len())
+                .map_err(|_| "primitive count exceeds ABI".to_owned())?;
+            let primitive_bytes = u64::from(primitive_count)
+                .checked_mul(
+                    u64::try_from(std::mem::size_of::<BasicPrimitive>())
+                        .map_err(|_| "primitive record size exceeds ABI".to_owned())?,
+                )
+                .ok_or_else(|| "primitive records size overflow".to_owned())?;
+            if primitive_bytes > 16 * 1024 * 1024 {
+                return Err("primitive records exceed ABI boundary".to_owned());
+            }
+            let index_bytes = shared::byte_len(&mesh.indices)?;
+            let positions_bytes = shared::byte_len(&mesh.positions)?;
+            let normals_bytes = shared::byte_len(&mesh.normals)?;
+            status(
+                create_index_heap(context, index_bytes),
+                "create model index heap",
+            )?;
+            let first_index = match upload_indices(
+                context,
+                mesh.indices.len() as u32,
+                shared::slice_bytes(&mesh.indices),
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    destroy_index_heap(context);
+                    return Err(format!("upload model indices: {error:?}"));
+                }
+            };
+            let records = match basic_primitives(&mesh, first_index) {
+                Ok(records) => records,
+                Err(error) => {
+                    destroy_index_heap(context);
+                    return Err(error);
+                }
+            };
+            let positions = match acquire_structured(context, positions_bytes) {
+                Ok(handle) => handle.get(),
+                Err(error) => {
+                    destroy_index_heap(context);
+                    return Err(format!("acquire positions: {error:?}"));
+                }
+            };
+            if let Err(error) = status(
+                write_structured(context, positions, shared::slice_bytes(&mesh.positions)),
+                "upload positions",
+            ) {
+                release_structured(context, positions);
+                destroy_index_heap(context);
+                return Err(error);
+            }
+            let normals = match acquire_structured(context, normals_bytes) {
+                Ok(handle) => handle.get(),
+                Err(error) => {
+                    release_structured(context, positions);
+                    destroy_index_heap(context);
+                    return Err(format!("acquire normals: {error:?}"));
+                }
+            };
+            if let Err(error) = status(
+                write_structured(context, normals, shared::slice_bytes(&mesh.normals)),
+                "upload normals",
+            ) {
+                release_structured(context, normals);
+                release_structured(context, positions);
+                destroy_index_heap(context);
+                return Err(error);
+            }
+            let primitives = match acquire_structured(context, primitive_bytes) {
+                Ok(handle) => handle.get(),
+                Err(error) => {
+                    release_structured(context, normals);
+                    release_structured(context, positions);
+                    destroy_index_heap(context);
+                    return Err(format!("acquire primitives: {error:?}"));
+                }
+            };
+            if let Err(error) = status(
+                write_structured(context, primitives, shared::slice_bytes(&records)),
+                "upload primitives",
+            ) {
+                release_structured(context, primitives);
+                release_structured(context, normals);
+                release_structured(context, positions);
+                destroy_index_heap(context);
+                return Err(error);
+            }
+            let indirect = match acquire_indirect(context, primitive_count) {
+                Ok(handle) => handle.get(),
+                Err(error) => {
+                    release_structured(context, primitives);
+                    release_structured(context, normals);
+                    release_structured(context, positions);
+                    destroy_index_heap(context);
+                    return Err(format!("acquire compute draw commands: {error:?}"));
+                }
+            };
+            if let Err(error) = status(
+                set_indirect_count(context, indirect, primitive_count),
+                "set compute draw count",
+            ) {
+                release_indirect(context, indirect);
+                release_structured(context, primitives);
+                release_structured(context, normals);
+                release_structured(context, positions);
+                destroy_index_heap(context);
+                return Err(error);
+            }
+            let requests = [
+                ShaderRequest::new("vertexmain", Stage::Vertex).unwrap(),
+                ShaderRequest::new("fragmentmain", Stage::Fragment).unwrap(),
+                ShaderRequest::new("computemain", Stage::Compute).unwrap(),
+            ];
+            let shader = match load_shader(
+                context,
+                include_bytes!("03_compute_structured.ezgfx"),
+                &requests,
+            ) {
+                Ok(value) => value.get(),
+                Err(error) => {
+                    release_indirect(context, indirect);
+                    release_structured(context, primitives);
+                    release_structured(context, normals);
+                    release_structured(context, positions);
+                    destroy_index_heap(context);
+                    return Err(format!("load compute model artifact: {error:?}"));
+                }
+            };
+            Ok(Self {
+                shader,
+                positions,
+                normals,
+                primitives,
+                indirect,
+                camera: OrbitCamera::new((-30.0_f32).to_radians(), 52.0_f32.to_radians(), 2.2),
+                target: [0.0, 0.55, 0.0],
+                near: 0.1,
+                far: 500.0,
+                push: ScenePush {
+                    mvp: [0.0; 16],
+                    primitive_count,
+                    padding: [0; 3],
+                },
+                primitive_count,
+                bindings: [
+                    PublicBinding {
+                        name: "positions".to_owned(),
+                        resource: ResourceIdentity::Structured(positions),
+                    },
+                    PublicBinding {
+                        name: "normals".to_owned(),
+                        resource: ResourceIdentity::Structured(normals),
+                    },
+                    PublicBinding {
+                        name: "primitives".to_owned(),
+                        resource: ResourceIdentity::Structured(primitives),
+                    },
+                    PublicBinding {
+                        name: "draw_commands".to_owned(),
+                        resource: ResourceIdentity::Indirect(indirect),
+                    },
+                ],
+            })
+        }
+    }
+
+    impl ModelScene {
+        pub(super) fn handle_input(&mut self, input: SceneInput) {
+            match input {
+                SceneInput::CursorMoved { x, y } => self.camera.cursor([x, y]),
+                SceneInput::PrimaryButton(value) => self.camera.set_dragging(value),
+                SceneInput::ScrollLines(lines) => self.camera.zoom(lines),
+                _ => {}
+            }
+        }
+        pub(super) fn update(&mut self, frame: FrameInput) -> Result<(), String> {
+            self.push.mvp = mul(
+                perspective(
+                    60.0_f32.to_radians(),
+                    frame.width as f32 / frame.height as f32,
+                    self.near,
+                    self.far,
+                )?,
+                self.camera.view(self.target)?,
+            );
+            Ok(())
+        }
+        pub(super) fn record(&mut self, context: u64) -> Result<(), String> {
+            let bindings = &self.bindings;
+            status(
+                render_add_compute(
+                    context,
+                    self.shader,
+                    [self.primitive_count, 1, 1],
+                    bindings,
+                    shared::bytes_of(&self.push),
+                ),
+                "record compute pipeline",
+            )?;
+            status(
+                render_add_graphics(
+                    context,
+                    self.shader,
+                    self.indirect,
+                    bindings,
+                    DynamicPipelineState::from_abi(0, 0, 0, 0).unwrap(),
+                    shared::bytes_of(&self.push),
+                ),
+                "record model graphics pipeline",
+            )
+        }
+        pub(super) fn destroy(self, context: u64) {
+            release_indirect(context, self.indirect);
+            release_structured(context, self.primitives);
+            release_structured(context, self.normals);
+            release_structured(context, self.positions);
+            destroy_index_heap(context);
+            destroy_shader(context, self.shader);
+        }
+    }
+
+    fn status(result: EzGfxResult, operation: &str) -> Result<(), String> {
+        match result {
+            EzGfxResult::Ok => Ok(()),
+            error => Err(format!("{operation}: {error:?}")),
+        }
+    }
+}
+#[path = "../shared/mod.rs"]
+mod shared;
+
+use ez_gfx::{
+    Backend, ContextOptions, EzGfxResult, SurfaceOptions, SurfacePlatform, begin_render,
+    create_context, create_surface, destroy_context, destroy_surface, finish_render,
+    frame_readback, init_device, poll_diagnostic, poll_runtime_event, resize_surface,
+    set_snapshot_cache, wait_idle,
 };
-use winit::{
-    application::ApplicationHandler,
-    dpi::PhysicalSize,
-    event::WindowEvent,
-    event::{ElementState, MouseButton, MouseScrollDelta},
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::{Key, NamedKey},
-    window::{Window, WindowId},
+use renderer::ModelScene as ExampleScene;
+use shared::{
+    FrameInput, LifecycleCallbacks, LifecycleConfig, NativePlatform, NativeSurface, SceneInput,
 };
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
-/// Missing input preserves Vulkan; only implemented native backend names are accepted.
-/// Selects the host-compatible backend; Metal is the only native macOS presentation path.
-fn parse_backend(value: Option<&str>) -> Result<(u8, &'static str), String> {
-    match value {
-        #[cfg(target_vendor = "apple")]
-        None | Some("metal") => Ok((3, "Metal")),
-        #[cfg(not(target_vendor = "apple"))]
-        None | Some("vulkan") => Ok((1, "Vulkan")),
-        #[cfg(windows)]
-        Some("dx12") => Ok((2, "DX12")),
-        Some(value) => Err(format!("unsupported EZ_GFX_BACKEND `{value}`")),
-    }
-}
 
-#[derive(Debug)]
-#[allow(
-    missing_docs,
-    reason = "Presentation results are consumed by the example test API."
-)]
-pub struct PresentedReport {
-    pub width: u32,
-    pub height: u32,
-    pub frames: u32,
-    pub rgba8: Vec<u8>,
-    pub runtime_events: u32,
-    pub diagnostics: u32,
-    pub dropped_observations: u64,
-}
-
-/// The default is interactive; a positive limit produces a deterministic automation run.
-///
-/// # Errors
-///
-/// Returns an error when initialization, rendering, or readback fails.
-pub fn run_example(frame_limit: Option<u32>) -> Result<Option<PresentedReport>, String> {
-    if frame_limit == Some(0) {
-        return Err("frame limit must be positive".to_owned());
-    }
-    if std::env::var_os("VK_LOADER_LAYERS_DISABLE").is_none() {
-        // SAFETY: this runs on the main thread before Vulkan or the event loop starts.
-        unsafe { std::env::set_var("VK_LOADER_LAYERS_DISABLE", "~implicit~") };
-    }
-    let event_loop = EventLoop::new().map_err(|error| error.to_string())?;
-    event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(frame_limit);
-    event_loop
-        .run_app(&mut app)
-        .map_err(|error| error.to_string())?;
-    app.cleanup();
-    if let Some(error) = app.error {
-        return Err(error);
-    }
-    Ok(app.report)
-}
-
-struct App {
-    frame_limit: Option<u32>,
-    window: Option<Window>,
-    host: Option<HostSurface>,
-    resources: Option<ModelScene>,
+struct Example {
+    resources: Option<ExampleScene>,
     context: u64,
     surface: u64,
-    width: u32,
-    height: u32,
-    frames: u32,
-    last_frame: Instant,
-    report: Option<PresentedReport>,
-    error: Option<String>,
+    benchmark: shared::BenchmarkRunner,
 }
 
-impl App {
-    // Before resumed there are no native resources; cleanup therefore remains idempotent.
-    fn new(frame_limit: Option<u32>) -> Self {
+impl Example {
+    const fn new(benchmark: Option<shared::BenchmarkConfig>) -> Self {
         Self {
-            host: None,
-            frame_limit,
-            window: None,
+            resources: None,
             context: 0,
             surface: 0,
-            resources: None,
-            frames: 0,
-            last_frame: Instant::now(),
-            width: WIDTH,
-            height: HEIGHT,
-            report: None,
-            error: None,
+            benchmark: shared::BenchmarkRunner::new(benchmark),
         }
     }
+}
 
-    // OS callbacks retain errors and exit rather than unwinding across the application handler.
-    fn fail(&mut self, event_loop: &ActiveEventLoop, error: impl Into<String>) {
-        self.error = Some(error.into());
-        event_loop.exit();
-    }
+impl LifecycleCallbacks for Example {
+    type Report = shared::ProgramReport;
 
-    // A two-call readback prevents writing through an undersized host buffer.
-    fn capture(&self) -> Result<Vec<u8>, String> {
-        let mut size = 0;
-        status(
-            {
-                // SAFETY: Non-null output pointers reference writable storage of the declared capacity and alignment for this call.
-                unsafe {
-                    ez_gfx_frame_readback(core::ptr::null_mut(), 0, &raw mut size, self.context)
-                }
+    fn initialize(&mut self, native: NativeSurface, width: u32, height: u32) -> Result<(), String> {
+        let (backend, backend_name) = backend()?;
+        let platform = match native.platform {
+            NativePlatform::Win32 => SurfacePlatform::Win32,
+            NativePlatform::MetalLayer => SurfacePlatform::MetalLayer,
+        };
+        self.context = create_context(ContextOptions {
+            enable_debug: shared::env_flag("EZ_GFX_EXAMPLE_DEBUG")?,
+            enable_validation: shared::env_flag("EZ_GFX_EXAMPLE_VALIDATION")?,
+            surface_platform: platform,
+            backend,
+        })
+        .map_err(|error| format!("create {backend_name} context: {error:?}"))?
+        .get();
+        self.surface = create_surface(
+            self.context,
+            SurfaceOptions {
+                window: native.window,
+                display: native.display,
+                platform,
+                width,
+                height,
+                cache_presented_snapshots: false,
             },
-            "query presented snapshot",
-        )?;
-        let mut bytes = vec![0; size];
+        )
+        .map_err(|error| format!("create {backend_name} surface: {error:?}"))?
+        .get();
         status(
-            {
-                // SAFETY: Non-null output pointers reference writable storage of the declared capacity and alignment for this call.
-                unsafe {
-                    ez_gfx_frame_readback(
-                        bytes.as_mut_ptr(),
-                        bytes.len(),
-                        &raw mut size,
-                        self.context,
-                    )
-                }
-            },
-            "read presented snapshot",
+            init_device(self.context, self.surface),
+            &format!("initialize {backend_name} surface device"),
         )?;
-        bytes.truncate(size);
-        Ok(bytes)
+        status(
+            resize_surface(self.context, self.surface, width, height),
+            &format!("initialize {backend_name} swapchain"),
+        )?;
+        self.resources = Some(ExampleScene::create(self.context)?);
+        Ok(())
     }
 
-    // Polling is bounded even if a producer misbehaves; empty queues terminate without reading uninitialized payloads.
-    fn drain_observability(&self) -> Result<(u32, u32, u64), String> {
-        let mut events = 0_u32;
-        let mut diagnostics = 0_u32;
-        let mut dropped = 0_u64;
-        for _ in 0..4096 {
-            let mut record = EzGfxRuntimeRecord {
-                correlation_id: 0,
-                resource: 0,
-                backend: 0,
-                phase: 0,
-                status: 0,
-                _padding: [0; 5],
-            };
-            let mut present = 0;
-            let mut overflow = 0;
-            status(
-                {
-                    // SAFETY: Non-null outputs point to live, aligned caller-owned storage; null pointers intentionally exercise checked rejection.
-                    unsafe {
-                        ez_gfx_poll_runtime_event(
-                            &raw mut record,
-                            &raw mut present,
-                            &raw mut overflow,
-                            self.context,
-                        )
-                    }
-                },
-                "poll runtime event",
-            )?;
-            dropped = dropped.saturating_add(overflow);
-            if present == 0 {
-                break;
-            }
-            events += 1;
-        }
-        for _ in 0..4096 {
-            let record = EzGfxRuntimeRecord {
-                correlation_id: 0,
-                resource: 0,
-                backend: 0,
-                phase: 0,
-                status: 0,
-                _padding: [0; 5],
-            };
-            let mut diagnostic = EzGfxDiagnostic {
-                record,
-                level: 0,
-                _padding: [0; 7],
-            };
-            let mut present = 0;
-            let mut overflow = 0;
-            status(
-                {
-                    // SAFETY: Non-null outputs point to live, aligned caller-owned storage; null pointers intentionally exercise checked rejection.
-                    unsafe {
-                        ez_gfx_poll_diagnostic(
-                            &raw mut diagnostic,
-                            &raw mut present,
-                            &raw mut overflow,
-                            self.context,
-                        )
-                    }
-                },
-                "poll diagnostic",
-            )?;
-            dropped = dropped.saturating_add(overflow);
-            if present == 0 {
-                break;
-            }
-            diagnostics += 1;
-        }
-        Ok((events, diagnostics, dropped))
+    fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
+        status(
+            resize_surface(self.context, self.surface, width, height),
+            "resize presented surface",
+        )
     }
 
-    // The externally owned window outlives surface destruction and is dropped only with this app.
-    fn cleanup(&mut self) {
+    fn input(&mut self, input: SceneInput) {
+        if let Some(resources) = &mut self.resources {
+            resources.handle_input(input);
+        }
+    }
+
+    fn render(
+        &mut self,
+        frame: FrameInput,
+        terminal: bool,
+        frame_index: u32,
+    ) -> Result<(), String> {
+        self.benchmark.begin_frame(frame_index);
+        if terminal {
+            status(
+                set_snapshot_cache(self.context, self.surface, true),
+                "enable terminal snapshot cache",
+            )?;
+        }
+        let resources = self
+            .resources
+            .as_mut()
+            .ok_or_else(|| "example resources are unavailable".to_owned())?;
+        resources.update(frame)?;
+        status(
+            begin_render(self.context, self.surface),
+            "begin presented frame",
+        )?;
+        resources.record(self.context)?;
+        status(finish_render(self.context), "submit and present example")?;
+        self.benchmark.end_frame(frame_index.saturating_add(1));
+        Ok(())
+    }
+
+    fn capture(
+        &mut self,
+        width: u32,
+        height: u32,
+        frames: u32,
+    ) -> Result<shared::ProgramReport, String> {
+        let rgba8 = frame_readback(self.context)
+            .map_err(|error| format!("read presented snapshot: {error:?}"))?;
+        let counts = shared::drain_bounded(
+            4096,
+            || {
+                poll_runtime_event(self.context)
+                    .map(|(record, dropped)| (record.is_some(), dropped))
+                    .map_err(|error| format!("poll runtime event: {error:?}"))
+            },
+            || {
+                poll_diagnostic(self.context)
+                    .map(|(record, dropped)| (record.is_some(), dropped))
+                    .map_err(|error| format!("poll diagnostic: {error:?}"))
+            },
+        )?;
+        Ok(shared::ProgramReport {
+            frame: shared::PresentedFrame {
+                width,
+                height,
+                frames,
+                rgba8,
+                runtime_events: counts.runtime_events,
+                diagnostics: counts.diagnostics,
+                dropped_observations: counts.dropped,
+            },
+            benchmark: self.benchmark.report(),
+        })
+    }
+
+    fn shutdown(&mut self) {
         if self.context == 0 {
             return;
         }
-        let _ = ez_gfx_context_wait_idle(self.context);
+        let _ = wait_idle(self.context);
         if let Some(resources) = self.resources.take() {
-            Box::new(resources).destroy(self.context);
+            resources.destroy(self.context);
         }
         if self.surface != 0 {
-            ez_gfx_surface_destroy(self.surface, self.context);
+            destroy_surface(self.context, self.surface);
             self.surface = 0;
         }
-        ez_gfx_context_destroy(self.context);
+        destroy_context(self.context);
         self.context = 0;
     }
 }
 
-fn scene_key(key: &Key) -> SceneKey {
-    match key {
-        Key::Named(NamedKey::Tab) => SceneKey::Tab,
-        Key::Named(NamedKey::ArrowLeft) => SceneKey::Left,
-        Key::Named(NamedKey::ArrowRight) => SceneKey::Right,
-        Key::Named(NamedKey::ArrowUp) => SceneKey::Up,
-        Key::Named(NamedKey::ArrowDown) => SceneKey::Down,
-        Key::Named(NamedKey::PageUp) => SceneKey::PageUp,
-        Key::Named(NamedKey::PageDown) => SceneKey::PageDown,
-        Key::Named(NamedKey::Home) => SceneKey::Home,
-        Key::Named(NamedKey::End) => SceneKey::End,
-        Key::Named(NamedKey::Insert) => SceneKey::Insert,
-        Key::Named(NamedKey::Delete) => SceneKey::Delete,
-        Key::Named(NamedKey::Backspace) => SceneKey::Backspace,
-        Key::Named(NamedKey::Space) => SceneKey::Space,
-        Key::Named(NamedKey::Enter) => SceneKey::Enter,
-        Key::Named(NamedKey::Escape) => SceneKey::Escape,
-        _ => SceneKey::Other,
-    }
+fn run_example_with_benchmark(
+    frame_limit: Option<u32>,
+    benchmark: Option<shared::BenchmarkConfig>,
+) -> Result<Option<shared::ProgramReport>, String> {
+    shared::run(
+        LifecycleConfig {
+            width: WIDTH,
+            height: HEIGHT,
+            title: "ez_gfx_api2",
+            frame_limit,
+        },
+        Example::new(benchmark),
+    )
 }
 
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "Pointer-sized wheel deltas are bounded by the host input contract."
-)]
-impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-        let attributes = Window::default_attributes()
-            .with_title("ez_gfx_api2".to_owned())
-            .with_inner_size(PhysicalSize::new(WIDTH, HEIGHT));
-        let window = match event_loop.create_window(attributes) {
-            Ok(window) => window,
-            Err(error) => return self.fail(event_loop, error.to_string()),
-        };
-        let host = match HostSurface::attach(&window, WIDTH, HEIGHT) {
-            Ok(host) => host,
-            Err(error) => return self.fail(event_loop, error),
-        };
-        let (backend, backend_name) = match std::env::var("EZ_GFX_BACKEND") {
-            Ok(value) => match parse_backend(Some(&value)) {
-                Ok(selection) => selection,
-                Err(error) => return self.fail(event_loop, error),
-            },
-            Err(std::env::VarError::NotPresent) => parse_backend(None).unwrap(),
-            Err(error) => return self.fail(event_loop, error.to_string()),
-        };
+fn backend() -> Result<(Backend, &'static str), String> {
+    match std::env::var("EZ_GFX_BACKEND").ok().as_deref() {
         #[cfg(target_vendor = "apple")]
-        if backend != 3 {
-            return self.fail(event_loop, "macOS example host requires Metal backend");
-        }
-        let context_desc = EzGfxBackendContextDesc {
-            enable_debug: match std::env::var("EZ_GFX_EXAMPLE_DEBUG").ok().as_deref() {
-                None | Some("0") => 0,
-                Some("1") => 1,
-                Some(value) => {
-                    return self.fail(
-                        event_loop,
-                        format!("EZ_GFX_EXAMPLE_DEBUG must be 0 or 1, got `{value}`"),
-                    );
-                }
-            },
-            enable_validation: match std::env::var("EZ_GFX_EXAMPLE_VALIDATION").ok().as_deref() {
-                None | Some("0") => 0,
-                Some("1") => 1,
-                Some(value) => {
-                    return self.fail(
-                        event_loop,
-                        format!("EZ_GFX_EXAMPLE_VALIDATION must be 0 or 1, got `{value}`"),
-                    );
-                }
-            },
-            surface_platform: host.desc.platform,
-            backend,
-        };
-        if let Err(error) = status(
-            {
-                // SAFETY: Non-null arguments point to live, aligned caller-owned descriptor and output storage for this call; null pointers intentionally exercise checked rejection.
-                unsafe {
-                    ez_gfx_context_create_backend(&raw const context_desc, &raw mut self.context)
-                }
-            },
-            &format!("create {backend_name} context"),
-        ) {
-            return self.fail(event_loop, error);
-        }
-        let initialized = status(
-            {
-                // SAFETY: The aligned descriptor and output remain live for this call, and its platform objects outlive the returned surface.
-                unsafe {
-                    ez_gfx_surface_create(&raw const host.desc, &raw mut self.surface, self.context)
-                }
-            },
-            &format!("create {backend_name} surface"),
-        )
-        .and_then(|()| {
-            status(
-                ez_gfx_context_init_device(self.surface, self.context),
-                &format!("initialize {backend_name} surface device"),
-            )
-        })
-        .and_then(|()| {
-            status(
-                ez_gfx_surface_resize(self.surface, WIDTH, HEIGHT, self.context),
-                &format!("initialize {backend_name} swapchain"),
-            )
-        })
-        .and_then(|()| {
-            ModelScene::create(self.context).map(|resources| self.resources = Some(resources))
-        });
-        if let Err(error) = initialized {
-            return self.fail(event_loop, error);
-        }
-        self.host = Some(host);
-        self.window = Some(window);
-        self.window.as_ref().unwrap().request_redraw();
-    }
-
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        if self.window.as_ref().is_none_or(|window| window.id() != id) {
-            return;
-        }
-        match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) if size.width > 0 && size.height > 0 => {
-                self.width = size.width;
-                self.height = size.height;
-                if let Some(host) = &self.host {
-                    host.resize(size.width, size.height);
-                }
-                if let Err(error) = status(
-                    ez_gfx_surface_resize(self.surface, size.width, size.height, self.context),
-                    "resize presented surface",
-                ) {
-                    self.fail(event_loop, error);
-                }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                if let Some(resources) = &mut self.resources {
-                    resources.handle_input(SceneInput::CursorMoved {
-                        x: position.x,
-                        y: position.y,
-                    });
-                }
-            }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => {
-                if let Some(resources) = &mut self.resources {
-                    resources
-                        .handle_input(SceneInput::PrimaryButton(state == ElementState::Pressed));
-                }
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(position) => position.y as f32 / 24.0,
-                };
-                if let Some(resources) = &mut self.resources {
-                    resources.handle_input(SceneInput::ScrollLines(lines));
-                }
-            }
-            WindowEvent::KeyboardInput { event, .. } => {
-                if let Some(resources) = &mut self.resources {
-                    resources.handle_input(SceneInput::Key {
-                        key: scene_key(&event.logical_key),
-                        pressed: event.state == ElementState::Pressed,
-                    });
-                    if event.state == ElementState::Pressed
-                        && let Key::Character(text) = &event.logical_key
-                    {
-                        for character in text.chars() {
-                            resources.handle_input(SceneInput::Character(character));
-                        }
-                    }
-                }
-            }
-            WindowEvent::RedrawRequested => {
-                let terminal_frame = self
-                    .frame_limit
-                    .is_some_and(|limit| self.frames.saturating_add(1) >= limit);
-                if terminal_frame {
-                    if let Err(error) = status(
-                        ez_gfx_surface_set_snapshot_cache(self.surface, 1, self.context),
-                        "enable terminal snapshot cache",
-                    ) {
-                        return self.fail(event_loop, error);
-                    }
-                }
-                let delta_seconds = self.last_frame.elapsed().as_secs_f32();
-                self.last_frame = Instant::now();
-                let result = self
-                    .resources
-                    .as_mut()
-                    .ok_or_else(|| "example resources are unavailable".to_owned())
-                    .and_then(|resources| {
-                        resources.update(FrameInput {
-                            width: self.width,
-                            height: self.height,
-                            delta_seconds,
-                        })?;
-                        status(
-                            ez_gfx_begin_render(self.surface, self.context),
-                            "begin presented frame",
-                        )?;
-                        resources.record(self.context)?;
-                        status(
-                            ez_gfx_finish_render(self.context),
-                            "submit and present example",
-                        )
-                    });
-                if let Err(error) = result {
-                    return self.fail(event_loop, error);
-                }
-                self.frames += 1;
-                if self.frame_limit.is_some_and(|limit| self.frames >= limit) {
-                    match self.capture().and_then(|rgba8| {
-                        self.drain_observability()
-                            .map(|observations| (rgba8, observations))
-                    }) {
-                        Ok((rgba8, (runtime_events, diagnostics, dropped_observations))) => {
-                            self.report = Some(PresentedReport {
-                                width: self.width,
-                                height: self.height,
-                                frames: self.frames,
-                                rgba8,
-                                runtime_events,
-                                diagnostics,
-                                dropped_observations,
-                            });
-                        }
-                        Err(error) => self.error = Some(error),
-                    }
-                    event_loop.exit();
-                } else {
-                    self.window.as_ref().unwrap().request_redraw();
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        self.cleanup();
+        None | Some("metal") => Ok((Backend::Metal, "Metal")),
+        #[cfg(not(target_vendor = "apple"))]
+        None | Some("vulkan") => Ok((Backend::Vulkan, "Vulkan")),
+        #[cfg(windows)]
+        Some("dx12") => Ok((Backend::Dx12, "DX12")),
+        Some(value) => Err(format!("unsupported EZ_GFX_BACKEND `{value}`")),
     }
 }
 
-// Every ABI error remains visible to the example caller.
 fn status(result: EzGfxResult, operation: &str) -> Result<(), String> {
     match result {
         EzGfxResult::Ok => Ok(()),
         error => Err(format!("{operation}: {error:?}")),
     }
 }
+
 fn main() {
-    let frame_limit = match std::env::var("EZ_GFX_EXAMPLE_MAX_FRAMES") {
-        Ok(value) => {
-            let value = value.parse::<u32>().unwrap_or_else(|_| {
-                eprintln!("EZ_GFX_EXAMPLE_MAX_FRAMES must be a positive integer");
-                std::process::exit(2)
-            });
-            if value == 0 {
-                eprintln!("EZ_GFX_EXAMPLE_MAX_FRAMES must be positive");
-                std::process::exit(2);
-            }
-            Some(value)
+    let backend = std::env::var("EZ_GFX_BACKEND").unwrap_or_else(|_| {
+        if cfg!(target_vendor = "apple") {
+            "metal".to_owned()
+        } else {
+            "vulkan".to_owned()
         }
-        Err(std::env::VarError::NotPresent) => None,
-        Err(error) => {
-            eprintln!("EZ_GFX_EXAMPLE_MAX_FRAMES: {error}");
-            std::process::exit(2);
-        }
-    };
-    let report = run_example(frame_limit).unwrap_or_else(|error| {
-        eprintln!("example failed: {error}");
-        std::process::exit(1)
     });
-    if let Some(report) = report {
-        if let Some(path) = std::env::var_os("EZ_GFX_EXAMPLE_SNAPSHOT") {
-            let update = std::env::var("EZ_GFX_UPDATE_SNAPSHOTS").ok().as_deref() == Some("1");
-            if update {
-                image::save_buffer_with_format(
-                    &path,
-                    &report.rgba8,
-                    report.width,
-                    report.height,
-                    image::ColorType::Rgba8,
-                    image::ImageFormat::Png,
-                )
-                .unwrap_or_else(|e| panic!("update snapshot: {e}"));
-            } else {
-                let expected = image::open(&path)
-                    .unwrap_or_else(|e| panic!("open snapshot: {e}"))
-                    .into_rgba8();
-                assert_eq!(expected.dimensions(), (report.width, report.height));
-                assert_eq!(expected.into_raw(), report.rgba8);
-            }
-        }
-        if std::env::var_os("EZ_GFX_EXAMPLE_REPORT").is_some() {
-            println!(
-                "ez-gfx-snapshot {} {} {} {} {} {} {}",
-                report.width,
-                report.height,
-                report.frames,
-                blake3::hash(&report.rgba8),
-                report.runtime_events,
-                report.diagnostics,
-                report.dropped_observations
-            );
-        }
-    }
+    shared::run_program(
+        "03_compute_structured",
+        &backend,
+        run_example_with_benchmark,
+    );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_backend;
-
+    use super::*;
     #[test]
     fn backend_selection_defaults_and_validates() {
         #[cfg(target_vendor = "apple")]
-        assert_eq!(parse_backend(None), Ok((3, "Metal")));
-        #[cfg(target_vendor = "apple")]
-        assert_eq!(parse_backend(Some("metal")), Ok((3, "Metal")));
+        assert_eq!(backend(), Ok((Backend::Metal, "Metal")));
         #[cfg(not(target_vendor = "apple"))]
-        assert_eq!(parse_backend(None), Ok((1, "Vulkan")));
-        #[cfg(not(target_vendor = "apple"))]
-        assert_eq!(parse_backend(Some("vulkan")), Ok((1, "Vulkan")));
-        #[cfg(windows)]
-        assert_eq!(parse_backend(Some("dx12")), Ok((2, "DX12")));
-        assert!(parse_backend(Some("unknown")).is_err());
+        assert_eq!(backend(), Ok((Backend::Vulkan, "Vulkan")));
     }
 }

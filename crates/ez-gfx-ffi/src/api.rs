@@ -17,25 +17,7 @@ pub type EzGfxTexture = EzGfxHandle;
 /// Opaque identifier for a render-target resource.
 pub type EzGfxRenderTarget = EzGfxHandle;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-/// C ABI result enumeration.
-pub enum EzGfxResult {
-    /// Indicates successful completion.
-    Ok = 0,
-    /// Indicates that one or more arguments are invalid.
-    InvalidArgument = 1,
-    /// Indicates that the context identifier is invalid or stale.
-    InvalidContext = 2,
-    /// Indicates a failure reported by the native graphics backend.
-    NativeFailure = 3,
-    /// Indicates that completion or output is not yet available.
-    NotReady = 4,
-    /// Indicates that the requested capability is unavailable.
-    Unsupported = 5,
-    /// Indicates that the graphics device was lost.
-    DeviceLost = 6,
-}
+pub use ez_gfx::EzGfxResult;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]

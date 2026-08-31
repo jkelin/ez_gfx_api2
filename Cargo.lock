@@ -241,6 +241,20 @@ name = "bytemuck"
 version = "1.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
+dependencies = [
+ "bytemuck_derive",
+]
+
+[[package]]
+name = "bytemuck_derive"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc0e56a716f1e132ff6bf4bdac1c944a3fcdc1cae65f70a4a2a1ac3b401d2d1f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
+]
 
 [[package]]
 name = "byteorder"
@@ -561,6 +575,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ez-gfx"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ez-gfx-artifact",
+ "ez-gfx-backend-dx12",
+ "ez-gfx-backend-metal",
+ "ez-gfx-backend-vulkan",
+ "ez-gfx-core",
+ "ez-gfx-hal",
+ "ez-gfx-runtime",
+]
+
+[[package]]
 name = "ez-gfx-artifact"
 version = "0.1.0"
 dependencies = [
@@ -634,7 +662,8 @@ name = "ez-gfx-examples"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "ez-gfx-ffi",
+ "bytemuck",
+ "ez-gfx",
  "gltf",
  "image",
  "imgui",
@@ -649,15 +678,9 @@ dependencies = [
 name = "ez-gfx-ffi"
 version = "0.1.0"
 dependencies = [
- "blake3",
+ "ez-gfx",
  "ez-gfx-artifact",
- "ez-gfx-backend-dx12",
- "ez-gfx-backend-metal",
- "ez-gfx-backend-vulkan",
  "ez-gfx-compiler",
- "ez-gfx-core",
- "ez-gfx-hal",
- "ez-gfx-runtime",
  "objc2 0.6.4",
  "objc2-core-foundation",
  "objc2-metal 0.3.2",

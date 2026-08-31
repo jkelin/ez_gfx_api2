@@ -1,0 +1,23 @@
+[package]
+name = "ez-gfx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ez-gfx-core.workspace = true
+ez-gfx-hal.workspace = true
+ez-gfx-runtime.workspace = true
+ez-gfx-artifact.workspace = true
+blake3.workspace = true
+ez-gfx-backend-vulkan = { path = "../ez-gfx-backend-vulkan" }
+
+[target.'cfg(windows)'.dependencies]
+ez-gfx-backend-dx12 = { path = "../ez-gfx-backend-dx12" }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+ez-gfx-backend-metal = { path = "../ez-gfx-backend-metal" }
+
+[lints]
+workspace = true

@@ -1,5 +1,5 @@
-//! Executable rendering example.
-#[allow(
+//! `ImGui` using safe ez-gfx context, resource, and frame APIs.
+#![allow(
     clippy::borrow_as_ptr,
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -14,604 +14,660 @@
     clippy::type_complexity,
     clippy::unused_self,
     clippy::wildcard_imports,
-    reason = "Example scene and host modules preserve graphics and callback contracts."
+    reason = "The inline renderer preserves fixed graphics ABI and callback contracts."
 )]
-mod host;
-#[allow(
-    clippy::borrow_as_ptr,
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::float_cmp,
-    clippy::ignored_unit_patterns,
-    clippy::map_unwrap_or,
-    clippy::match_overlapping_arm,
-    clippy::needless_pass_by_value,
-    clippy::redundant_closure_for_method_calls,
-    clippy::semicolon_if_nothing_returned,
-    clippy::type_complexity,
-    clippy::unused_self,
-    clippy::wildcard_imports,
-    reason = "Example scene and host modules preserve graphics and callback contracts."
-)]
-mod scenes;
+mod renderer {
+    use crate::shared;
+    use crate::shared::{FrameInput, SceneInput, SceneKey};
+    use ez_gfx::{
+        DrawIndexedCommand, DynamicPipelineState, EzGfxResult, PublicBinding, ResourceIdentity,
+        SamplerAddressMode, SamplerFilter, ShaderRequest, Stage, TextureConfig, TextureSamplerDesc,
+        TextureSource, acquire_indirect, acquire_structured, create_index_heap, destroy_index_heap,
+        destroy_shader, load_shader, load_texture, release_indirect, release_structured,
+        render_add_graphics, set_indirect_count, texture_binding, unload_texture, upload_indices,
+        write_indirect, write_structured,
+    };
+    use imgui::{Condition, DrawCmd, Key, MouseButton, TextureId};
 
-use std::time::Instant;
+    const IDENTITY_INDEX_COUNT: usize = 65_536;
+    #[repr(C)]
+    #[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+    struct ImGuiVertex {
+        pos: [f32; 2],
+        uv: [f32; 2],
+        col: u32,
+        padding: [u32; 3],
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+    struct ImGuiCommand {
+        clip_rect: [f32; 4],
+        texture_id: u32,
+        idx_offset: u32,
+        vtx_offset: u32,
+        padding: u32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct Push {
+        display_size: [f32; 2],
+        vertical_sign: f32,
+        padding: f32,
+    }
 
-use crate::host::HostSurface;
-use crate::scenes::{FrameInput, ImGuiScene, SceneInput, SceneKey, SceneState};
+    pub(super) struct ImGuiScene {
+        imgui: imgui::Context,
+        shader: u64,
+        texture: u64,
+        identity_start: u32,
+        indirect: u64,
+        indirect_capacity: u32,
+        vertices: Option<u64>,
+        draw_indices: Option<u64>,
+        commands: Option<u64>,
+        vertex_capacity: usize,
+        index_capacity: usize,
+        command_capacity: usize,
+        cpu_vertices: Vec<ImGuiVertex>,
+        cpu_indices: Vec<u32>,
+        cpu_commands: Vec<ImGuiCommand>,
+        uploaded_vertices: Vec<ImGuiVertex>,
+        uploaded_indices: Vec<u32>,
+        uploaded_commands: Vec<ImGuiCommand>,
+        uploaded_draw_counts: Vec<u32>,
+        draw_counts: Vec<u32>,
+        push: Push,
+        bindings: [PublicBinding; 3],
+    }
 
-use ez_gfx_ffi::{
-    EzGfxBackendContextDesc, EzGfxDiagnostic, EzGfxResult, EzGfxRuntimeRecord, ez_gfx_begin_render,
-    ez_gfx_context_create_backend, ez_gfx_context_destroy, ez_gfx_context_init_device,
-    ez_gfx_context_wait_idle, ez_gfx_finish_render, ez_gfx_frame_readback, ez_gfx_poll_diagnostic,
-    ez_gfx_poll_runtime_event, ez_gfx_surface_create, ez_gfx_surface_destroy,
-    ez_gfx_surface_resize, ez_gfx_surface_set_snapshot_cache,
+    impl ImGuiScene {
+        pub(super) fn create(context: u64) -> Result<Self, String> {
+            let mut imgui = imgui::Context::create();
+            imgui.set_ini_filename(None);
+            let identity = (0..IDENTITY_INDEX_COUNT as u32).collect::<Vec<_>>();
+            let identity_bytes = shared::byte_len(&identity)?;
+            let atlas = imgui.fonts().build_rgba32_texture();
+            let config = TextureConfig {
+                width: atlas.width,
+                height: atlas.height,
+                mip_count: 0,
+                sampler: TextureSamplerDesc {
+                    min_filter: SamplerFilter::Linear,
+                    mag_filter: SamplerFilter::Linear,
+                    max_anisotropy: 1.0,
+                    address_u: SamplerAddressMode::Clamp,
+                    address_v: SamplerAddressMode::Clamp,
+                    address_w: SamplerAddressMode::Clamp,
+                },
+            };
+            let texture = load_texture(
+                context,
+                TextureSource::Rgba8 {
+                    width: atlas.width,
+                    height: atlas.height,
+                },
+                atlas.data,
+                false,
+                &config,
+            )
+            .map_err(|error| format!("load ImGui font atlas: {error:?}"))?
+            .get();
+            let texture_id = match texture_binding(context, texture) {
+                Ok(value) => value,
+                Err(error) => {
+                    unload_texture(context, texture);
+                    return Err(format!("resolve ImGui font binding: {error:?}"));
+                }
+            };
+            imgui.fonts().tex_id = TextureId::new(texture_id as usize);
+            if let Err(error) = status(
+                create_index_heap(context, identity_bytes),
+                "create ImGui index heap",
+            ) {
+                unload_texture(context, texture);
+                return Err(error);
+            }
+            let identity_start = match upload_indices(
+                context,
+                identity.len() as u32,
+                shared::slice_bytes(&identity),
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    destroy_index_heap(context);
+                    unload_texture(context, texture);
+                    return Err(format!("upload ImGui identity indices: {error:?}"));
+                }
+            };
+            let indirect = match acquire_indirect(context, 256) {
+                Ok(handle) => handle.get(),
+                Err(error) => {
+                    destroy_index_heap(context);
+                    unload_texture(context, texture);
+                    return Err(format!("acquire ImGui indirect draws: {error:?}"));
+                }
+            };
+            let requests = [
+                ShaderRequest::new("vertexmain", Stage::Vertex).unwrap(),
+                ShaderRequest::new("fragmentmain", Stage::Fragment).unwrap(),
+            ];
+            let shader = match load_shader(context, include_bytes!("04_imgui.ezgfx"), &requests) {
+                Ok(value) => value.get(),
+                Err(error) => {
+                    release_indirect(context, indirect);
+                    destroy_index_heap(context);
+                    unload_texture(context, texture);
+                    return Err(format!("load ImGui artifact: {error:?}"));
+                }
+            };
+            Ok(Self {
+                imgui,
+                shader,
+                texture,
+                identity_start,
+                indirect,
+                indirect_capacity: 256,
+                vertices: None,
+                draw_indices: None,
+                commands: None,
+                vertex_capacity: 0,
+                index_capacity: 0,
+                command_capacity: 0,
+                cpu_vertices: Vec::new(),
+                cpu_indices: Vec::new(),
+                cpu_commands: Vec::new(),
+                draw_counts: Vec::new(),
+                uploaded_vertices: Vec::new(),
+                uploaded_indices: Vec::new(),
+                uploaded_commands: Vec::new(),
+                uploaded_draw_counts: Vec::new(),
+                push: Push {
+                    display_size: [640.0, 480.0],
+                    vertical_sign: if cfg!(target_vendor = "apple") {
+                        -1.0
+                    } else {
+                        1.0
+                    },
+                    padding: 0.0,
+                },
+                bindings: [
+                    PublicBinding {
+                        name: "imgui_vertices".to_owned(),
+                        resource: ResourceIdentity::Structured(0),
+                    },
+                    PublicBinding {
+                        name: "imgui_indices".to_owned(),
+                        resource: ResourceIdentity::Structured(0),
+                    },
+                    PublicBinding {
+                        name: "imgui_commands".to_owned(),
+                        resource: ResourceIdentity::Structured(0),
+                    },
+                ],
+            })
+        }
+
+        fn rebuild_draw_data(&mut self) -> Result<(), String> {
+            self.cpu_vertices.clear();
+            self.cpu_indices.clear();
+            self.cpu_commands.clear();
+            self.draw_counts.clear();
+            let draw = self.imgui.render();
+            for list in draw.draw_lists() {
+                let vertex_base = self.cpu_vertices.len() as u32;
+                let index_base = self.cpu_indices.len() as u32;
+                self.cpu_vertices
+                    .extend(list.vtx_buffer().iter().map(|vertex| ImGuiVertex {
+                        pos: vertex.pos,
+                        uv: vertex.uv,
+                        col: u32::from(vertex.col[0])
+                            | (u32::from(vertex.col[1]) << 8)
+                            | (u32::from(vertex.col[2]) << 16)
+                            | (u32::from(vertex.col[3]) << 24),
+                        padding: [0; 3],
+                    }));
+                self.cpu_indices
+                    .extend(list.idx_buffer().iter().map(|index| u32::from(*index)));
+                for command in list.commands() {
+                    if let DrawCmd::Elements { count, cmd_params } = command {
+                        self.cpu_commands.push(ImGuiCommand {
+                            clip_rect: cmd_params.clip_rect,
+                            texture_id: cmd_params.texture_id.id() as u32,
+                            idx_offset: index_base + cmd_params.idx_offset as u32,
+                            vtx_offset: vertex_base + cmd_params.vtx_offset as u32,
+                            padding: 0,
+                        });
+                        self.draw_counts.push(count as u32);
+                    }
+                }
+            }
+            if self.cpu_vertices.is_empty()
+                || self.cpu_indices.is_empty()
+                || self.cpu_commands.is_empty()
+            {
+                return Err("ImGui produced no drawable commands".to_owned());
+            }
+            Ok(())
+        }
+
+        fn upload_dynamic<T: bytemuck::Pod>(
+            context: u64,
+            name: &str,
+            values: &[T],
+            buffer: &mut Option<u64>,
+            capacity: &mut usize,
+        ) -> Result<Option<u64>, String> {
+            if values.len() > *capacity {
+                let replacement = acquire_structured(context, shared::byte_len(values)?)
+                    .map_err(|error| format!("acquire {name}: {error:?}"))?
+                    .get();
+                if let Err(error) = status(
+                    write_structured(context, replacement, shared::slice_bytes(values)),
+                    &format!("upload {name}"),
+                ) {
+                    release_structured(context, replacement);
+                    return Err(error);
+                }
+                if let Some(previous) = buffer.replace(replacement) {
+                    release_structured(context, previous);
+                }
+                *capacity = values.len();
+                Ok(Some(replacement))
+            } else {
+                let handle = buffer.ok_or_else(|| format!("{name} buffer unavailable"))?;
+                status(
+                    write_structured(context, handle, shared::slice_bytes(values)),
+                    &format!("rewrite {name}"),
+                )?;
+                Ok(None)
+            }
+        }
+    }
+
+    impl ImGuiScene {
+        pub(super) fn handle_input(&mut self, input: SceneInput) {
+            let io = self.imgui.io_mut();
+            match input {
+                SceneInput::CursorMoved { x, y } => io.add_mouse_pos_event([x as f32, y as f32]),
+                SceneInput::PrimaryButton(value) => {
+                    io.add_mouse_button_event(MouseButton::Left, value)
+                }
+                SceneInput::ScrollLines(lines) => io.add_mouse_wheel_event([0.0, lines]),
+                SceneInput::Character(value) => io.add_input_character(value),
+                SceneInput::Key { key, pressed } => {
+                    if let Some(key) = imgui_key(key) {
+                        io.add_key_event(key, pressed);
+                    }
+                }
+            }
+        }
+        pub(super) fn update(&mut self, frame: FrameInput) -> Result<(), String> {
+            let display_size = [frame.width as f32, frame.height as f32];
+            {
+                let io = self.imgui.io_mut();
+                io.display_size = display_size;
+                io.delta_time = frame.delta_seconds.max(1.0 / 1000.0);
+            }
+            let ui = self.imgui.frame();
+            ui.window("Dear ImGui Demo")
+                .position([20.0, 20.0], Condition::Always)
+                .size([550.0, 440.0], Condition::Always)
+                .build(|| {});
+            let mut open = true;
+            ui.show_demo_window(&mut open);
+            self.push.display_size = display_size;
+            self.rebuild_draw_data()
+        }
+        pub(super) fn record(&mut self, context: u64) -> Result<(), String> {
+            if self.cpu_vertices != self.uploaded_vertices {
+                if let Some(handle) = Self::upload_dynamic(
+                    context,
+                    "imgui_vertices",
+                    &self.cpu_vertices,
+                    &mut self.vertices,
+                    &mut self.vertex_capacity,
+                )? {
+                    self.bindings[0].resource = ResourceIdentity::Structured(handle);
+                }
+                std::mem::swap(&mut self.cpu_vertices, &mut self.uploaded_vertices);
+            }
+            if self.cpu_indices != self.uploaded_indices {
+                if let Some(handle) = Self::upload_dynamic(
+                    context,
+                    "imgui_indices",
+                    &self.cpu_indices,
+                    &mut self.draw_indices,
+                    &mut self.index_capacity,
+                )? {
+                    self.bindings[1].resource = ResourceIdentity::Structured(handle);
+                }
+                std::mem::swap(&mut self.cpu_indices, &mut self.uploaded_indices);
+            }
+            if self.cpu_commands != self.uploaded_commands {
+                if let Some(handle) = Self::upload_dynamic(
+                    context,
+                    "imgui_commands",
+                    &self.cpu_commands,
+                    &mut self.commands,
+                    &mut self.command_capacity,
+                )? {
+                    self.bindings[2].resource = ResourceIdentity::Structured(handle);
+                }
+                std::mem::swap(&mut self.cpu_commands, &mut self.uploaded_commands);
+            }
+            if self.uploaded_commands.len() > self.indirect_capacity as usize {
+                let replacement = acquire_indirect(context, self.uploaded_commands.len() as u32)
+                    .map_err(|error| format!("grow ImGui indirect draws: {error:?}"))?
+                    .get();
+                let previous = std::mem::replace(&mut self.indirect, replacement);
+                release_indirect(context, previous);
+                self.indirect_capacity = self.uploaded_commands.len() as u32;
+                self.uploaded_draw_counts.clear();
+            }
+            if self.draw_counts != self.uploaded_draw_counts {
+                for (index, count) in self.draw_counts.iter().copied().enumerate() {
+                    status(
+                        write_indirect(
+                            context,
+                            self.indirect,
+                            index as u32,
+                            DrawIndexedCommand {
+                                index_count: count,
+                                instance_count: 1,
+                                first_index: self.identity_start,
+                                vertex_offset: 0,
+                                first_instance: index as u32,
+                            },
+                        ),
+                        &format!("write ImGui draw {index}"),
+                    )?;
+                }
+                status(
+                    set_indirect_count(context, self.indirect, self.uploaded_commands.len() as u32),
+                    "set ImGui draw count",
+                )?;
+                self.uploaded_draw_counts.clone_from(&self.draw_counts);
+            }
+            let bindings = &self.bindings;
+            status(
+                render_add_graphics(
+                    context,
+                    self.shader,
+                    self.indirect,
+                    bindings,
+                    DynamicPipelineState::from_abi(0, 0, 0, 1).unwrap(),
+                    shared::bytes_of(&self.push),
+                ),
+                "record ImGui graphics pipeline",
+            )
+        }
+        pub(super) fn destroy(self, context: u64) {
+            if let Some(value) = self.commands {
+                release_structured(context, value);
+            }
+            if let Some(value) = self.draw_indices {
+                release_structured(context, value);
+            }
+            if let Some(value) = self.vertices {
+                release_structured(context, value);
+            }
+            release_indirect(context, self.indirect);
+            destroy_index_heap(context);
+            unload_texture(context, self.texture);
+            destroy_shader(context, self.shader);
+        }
+    }
+
+    fn status(result: EzGfxResult, operation: &str) -> Result<(), String> {
+        match result {
+            EzGfxResult::Ok => Ok(()),
+            error => Err(format!("{operation}: {error:?}")),
+        }
+    }
+    fn imgui_key(key: SceneKey) -> Option<Key> {
+        Some(match key {
+            SceneKey::Tab => Key::Tab,
+            SceneKey::Left => Key::LeftArrow,
+            SceneKey::Right => Key::RightArrow,
+            SceneKey::Up => Key::UpArrow,
+            SceneKey::Down => Key::DownArrow,
+            SceneKey::PageUp => Key::PageUp,
+            SceneKey::PageDown => Key::PageDown,
+            SceneKey::Home => Key::Home,
+            SceneKey::End => Key::End,
+            SceneKey::Insert => Key::Insert,
+            SceneKey::Delete => Key::Delete,
+            SceneKey::Backspace => Key::Backspace,
+            SceneKey::Space => Key::Space,
+            SceneKey::Enter => Key::Enter,
+            SceneKey::Escape => Key::Escape,
+            SceneKey::Other => return None,
+        })
+    }
+}
+#[path = "../shared/mod.rs"]
+mod shared;
+
+use ez_gfx::{
+    Backend, ContextOptions, EzGfxResult, SurfaceOptions, SurfacePlatform, begin_render,
+    create_context, create_surface, destroy_context, destroy_surface, finish_render,
+    frame_readback, init_device, poll_diagnostic, poll_runtime_event, resize_surface,
+    set_snapshot_cache, wait_idle,
 };
-use winit::{
-    application::ApplicationHandler,
-    dpi::PhysicalSize,
-    event::WindowEvent,
-    event::{ElementState, MouseButton, MouseScrollDelta},
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::{Key, NamedKey},
-    window::{Window, WindowId},
+use renderer::ImGuiScene as ExampleScene;
+use shared::{
+    FrameInput, LifecycleCallbacks, LifecycleConfig, NativePlatform, NativeSurface, SceneInput,
 };
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
-/// Missing input preserves Vulkan; only implemented native backend names are accepted.
-/// Selects the host-compatible backend; Metal is the only native macOS presentation path.
-fn parse_backend(value: Option<&str>) -> Result<(u8, &'static str), String> {
-    match value {
-        #[cfg(target_vendor = "apple")]
-        None | Some("metal") => Ok((3, "Metal")),
-        #[cfg(not(target_vendor = "apple"))]
-        None | Some("vulkan") => Ok((1, "Vulkan")),
-        #[cfg(windows)]
-        Some("dx12") => Ok((2, "DX12")),
-        Some(value) => Err(format!("unsupported EZ_GFX_BACKEND `{value}`")),
-    }
-}
 
-#[derive(Debug)]
-#[allow(
-    missing_docs,
-    reason = "Presentation results are consumed by the example test API."
-)]
-pub struct PresentedReport {
-    pub width: u32,
-    pub height: u32,
-    pub frames: u32,
-    pub rgba8: Vec<u8>,
-    pub runtime_events: u32,
-    pub diagnostics: u32,
-    pub dropped_observations: u64,
-}
-
-/// The default is interactive; a positive limit produces a deterministic automation run.
-///
-/// # Errors
-///
-/// Returns an error when initialization, rendering, or readback fails.
-pub fn run_example(frame_limit: Option<u32>) -> Result<Option<PresentedReport>, String> {
-    if frame_limit == Some(0) {
-        return Err("frame limit must be positive".to_owned());
-    }
-    if std::env::var_os("VK_LOADER_LAYERS_DISABLE").is_none() {
-        // SAFETY: this runs on the main thread before Vulkan or the event loop starts.
-        unsafe { std::env::set_var("VK_LOADER_LAYERS_DISABLE", "~implicit~") };
-    }
-    let event_loop = EventLoop::new().map_err(|error| error.to_string())?;
-    event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(frame_limit);
-    event_loop
-        .run_app(&mut app)
-        .map_err(|error| error.to_string())?;
-    app.cleanup();
-    if let Some(error) = app.error {
-        return Err(error);
-    }
-    Ok(app.report)
-}
-
-struct App {
-    frame_limit: Option<u32>,
-    window: Option<Window>,
-    host: Option<HostSurface>,
-    resources: Option<ImGuiScene>,
+struct Example {
+    resources: Option<ExampleScene>,
     context: u64,
     surface: u64,
-    width: u32,
-    height: u32,
-    frames: u32,
-    last_frame: Instant,
-    report: Option<PresentedReport>,
-    error: Option<String>,
+    benchmark: shared::BenchmarkRunner,
 }
 
-impl App {
-    // Before resumed there are no native resources; cleanup therefore remains idempotent.
-    fn new(frame_limit: Option<u32>) -> Self {
+impl Example {
+    const fn new(benchmark: Option<shared::BenchmarkConfig>) -> Self {
         Self {
-            host: None,
-            frame_limit,
-            window: None,
+            resources: None,
             context: 0,
             surface: 0,
-            resources: None,
-            frames: 0,
-            last_frame: Instant::now(),
-            width: WIDTH,
-            height: HEIGHT,
-            report: None,
-            error: None,
+            benchmark: shared::BenchmarkRunner::new(benchmark),
         }
     }
+}
 
-    // OS callbacks retain errors and exit rather than unwinding across the application handler.
-    fn fail(&mut self, event_loop: &ActiveEventLoop, error: impl Into<String>) {
-        self.error = Some(error.into());
-        event_loop.exit();
-    }
+impl LifecycleCallbacks for Example {
+    type Report = shared::ProgramReport;
 
-    // A two-call readback prevents writing through an undersized host buffer.
-    fn capture(&self) -> Result<Vec<u8>, String> {
-        let mut size = 0;
-        status(
-            {
-                // SAFETY: Non-null output pointers reference writable storage of the declared capacity and alignment for this call.
-                unsafe {
-                    ez_gfx_frame_readback(core::ptr::null_mut(), 0, &raw mut size, self.context)
-                }
+    fn initialize(&mut self, native: NativeSurface, width: u32, height: u32) -> Result<(), String> {
+        let (backend, backend_name) = backend()?;
+        let platform = match native.platform {
+            NativePlatform::Win32 => SurfacePlatform::Win32,
+            NativePlatform::MetalLayer => SurfacePlatform::MetalLayer,
+        };
+        self.context = create_context(ContextOptions {
+            enable_debug: shared::env_flag("EZ_GFX_EXAMPLE_DEBUG")?,
+            enable_validation: shared::env_flag("EZ_GFX_EXAMPLE_VALIDATION")?,
+            surface_platform: platform,
+            backend,
+        })
+        .map_err(|error| format!("create {backend_name} context: {error:?}"))?
+        .get();
+        self.surface = create_surface(
+            self.context,
+            SurfaceOptions {
+                window: native.window,
+                display: native.display,
+                platform,
+                width,
+                height,
+                cache_presented_snapshots: false,
             },
-            "query presented snapshot",
-        )?;
-        let mut bytes = vec![0; size];
+        )
+        .map_err(|error| format!("create {backend_name} surface: {error:?}"))?
+        .get();
         status(
-            {
-                // SAFETY: Non-null output pointers reference writable storage of the declared capacity and alignment for this call.
-                unsafe {
-                    ez_gfx_frame_readback(
-                        bytes.as_mut_ptr(),
-                        bytes.len(),
-                        &raw mut size,
-                        self.context,
-                    )
-                }
-            },
-            "read presented snapshot",
+            init_device(self.context, self.surface),
+            &format!("initialize {backend_name} surface device"),
         )?;
-        bytes.truncate(size);
-        Ok(bytes)
+        status(
+            resize_surface(self.context, self.surface, width, height),
+            &format!("initialize {backend_name} swapchain"),
+        )?;
+        self.resources = Some(ExampleScene::create(self.context)?);
+        Ok(())
     }
 
-    // Polling is bounded even if a producer misbehaves; empty queues terminate without reading uninitialized payloads.
-    fn drain_observability(&self) -> Result<(u32, u32, u64), String> {
-        let mut events = 0_u32;
-        let mut diagnostics = 0_u32;
-        let mut dropped = 0_u64;
-        for _ in 0..4096 {
-            let mut record = EzGfxRuntimeRecord {
-                correlation_id: 0,
-                resource: 0,
-                backend: 0,
-                phase: 0,
-                status: 0,
-                _padding: [0; 5],
-            };
-            let mut present = 0;
-            let mut overflow = 0;
-            status(
-                {
-                    // SAFETY: Non-null outputs point to live, aligned caller-owned storage; null pointers intentionally exercise checked rejection.
-                    unsafe {
-                        ez_gfx_poll_runtime_event(
-                            &raw mut record,
-                            &raw mut present,
-                            &raw mut overflow,
-                            self.context,
-                        )
-                    }
-                },
-                "poll runtime event",
-            )?;
-            dropped = dropped.saturating_add(overflow);
-            if present == 0 {
-                break;
-            }
-            events += 1;
-        }
-        for _ in 0..4096 {
-            let record = EzGfxRuntimeRecord {
-                correlation_id: 0,
-                resource: 0,
-                backend: 0,
-                phase: 0,
-                status: 0,
-                _padding: [0; 5],
-            };
-            let mut diagnostic = EzGfxDiagnostic {
-                record,
-                level: 0,
-                _padding: [0; 7],
-            };
-            let mut present = 0;
-            let mut overflow = 0;
-            status(
-                {
-                    // SAFETY: Non-null outputs point to live, aligned caller-owned storage; null pointers intentionally exercise checked rejection.
-                    unsafe {
-                        ez_gfx_poll_diagnostic(
-                            &raw mut diagnostic,
-                            &raw mut present,
-                            &raw mut overflow,
-                            self.context,
-                        )
-                    }
-                },
-                "poll diagnostic",
-            )?;
-            dropped = dropped.saturating_add(overflow);
-            if present == 0 {
-                break;
-            }
-            diagnostics += 1;
-        }
-        Ok((events, diagnostics, dropped))
+    fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
+        status(
+            resize_surface(self.context, self.surface, width, height),
+            "resize presented surface",
+        )
     }
 
-    // The externally owned window outlives surface destruction and is dropped only with this app.
-    fn cleanup(&mut self) {
+    fn input(&mut self, input: SceneInput) {
+        if let Some(resources) = &mut self.resources {
+            resources.handle_input(input);
+        }
+    }
+
+    fn render(
+        &mut self,
+        frame: FrameInput,
+        terminal: bool,
+        frame_index: u32,
+    ) -> Result<(), String> {
+        self.benchmark.begin_frame(frame_index);
+        if terminal {
+            status(
+                set_snapshot_cache(self.context, self.surface, true),
+                "enable terminal snapshot cache",
+            )?;
+        }
+        let resources = self
+            .resources
+            .as_mut()
+            .ok_or_else(|| "example resources are unavailable".to_owned())?;
+        resources.update(frame)?;
+        status(
+            begin_render(self.context, self.surface),
+            "begin presented frame",
+        )?;
+        resources.record(self.context)?;
+        status(finish_render(self.context), "submit and present example")?;
+        self.benchmark.end_frame(frame_index.saturating_add(1));
+        Ok(())
+    }
+
+    fn capture(
+        &mut self,
+        width: u32,
+        height: u32,
+        frames: u32,
+    ) -> Result<shared::ProgramReport, String> {
+        let rgba8 = frame_readback(self.context)
+            .map_err(|error| format!("read presented snapshot: {error:?}"))?;
+        let counts = shared::drain_bounded(
+            4096,
+            || {
+                poll_runtime_event(self.context)
+                    .map(|(record, dropped)| (record.is_some(), dropped))
+                    .map_err(|error| format!("poll runtime event: {error:?}"))
+            },
+            || {
+                poll_diagnostic(self.context)
+                    .map(|(record, dropped)| (record.is_some(), dropped))
+                    .map_err(|error| format!("poll diagnostic: {error:?}"))
+            },
+        )?;
+        Ok(shared::ProgramReport {
+            frame: shared::PresentedFrame {
+                width,
+                height,
+                frames,
+                rgba8,
+                runtime_events: counts.runtime_events,
+                diagnostics: counts.diagnostics,
+                dropped_observations: counts.dropped,
+            },
+            benchmark: self.benchmark.report(),
+        })
+    }
+
+    fn shutdown(&mut self) {
         if self.context == 0 {
             return;
         }
-        let _ = ez_gfx_context_wait_idle(self.context);
+        let _ = wait_idle(self.context);
         if let Some(resources) = self.resources.take() {
-            Box::new(resources).destroy(self.context);
+            resources.destroy(self.context);
         }
         if self.surface != 0 {
-            ez_gfx_surface_destroy(self.surface, self.context);
+            destroy_surface(self.context, self.surface);
             self.surface = 0;
         }
-        ez_gfx_context_destroy(self.context);
+        destroy_context(self.context);
         self.context = 0;
     }
 }
 
-fn scene_key(key: &Key) -> SceneKey {
-    match key {
-        Key::Named(NamedKey::Tab) => SceneKey::Tab,
-        Key::Named(NamedKey::ArrowLeft) => SceneKey::Left,
-        Key::Named(NamedKey::ArrowRight) => SceneKey::Right,
-        Key::Named(NamedKey::ArrowUp) => SceneKey::Up,
-        Key::Named(NamedKey::ArrowDown) => SceneKey::Down,
-        Key::Named(NamedKey::PageUp) => SceneKey::PageUp,
-        Key::Named(NamedKey::PageDown) => SceneKey::PageDown,
-        Key::Named(NamedKey::Home) => SceneKey::Home,
-        Key::Named(NamedKey::End) => SceneKey::End,
-        Key::Named(NamedKey::Insert) => SceneKey::Insert,
-        Key::Named(NamedKey::Delete) => SceneKey::Delete,
-        Key::Named(NamedKey::Backspace) => SceneKey::Backspace,
-        Key::Named(NamedKey::Space) => SceneKey::Space,
-        Key::Named(NamedKey::Enter) => SceneKey::Enter,
-        Key::Named(NamedKey::Escape) => SceneKey::Escape,
-        _ => SceneKey::Other,
-    }
+fn run_example_with_benchmark(
+    frame_limit: Option<u32>,
+    benchmark: Option<shared::BenchmarkConfig>,
+) -> Result<Option<shared::ProgramReport>, String> {
+    shared::run(
+        LifecycleConfig {
+            width: WIDTH,
+            height: HEIGHT,
+            title: "ez_gfx_api2",
+            frame_limit,
+        },
+        Example::new(benchmark),
+    )
 }
 
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "Pointer-sized wheel deltas are bounded by the host input contract."
-)]
-impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-        let attributes = Window::default_attributes()
-            .with_title("ez_gfx_api2".to_owned())
-            .with_inner_size(PhysicalSize::new(WIDTH, HEIGHT));
-        let window = match event_loop.create_window(attributes) {
-            Ok(window) => window,
-            Err(error) => return self.fail(event_loop, error.to_string()),
-        };
-        let host = match HostSurface::attach(&window, WIDTH, HEIGHT) {
-            Ok(host) => host,
-            Err(error) => return self.fail(event_loop, error),
-        };
-        let (backend, backend_name) = match std::env::var("EZ_GFX_BACKEND") {
-            Ok(value) => match parse_backend(Some(&value)) {
-                Ok(selection) => selection,
-                Err(error) => return self.fail(event_loop, error),
-            },
-            Err(std::env::VarError::NotPresent) => parse_backend(None).unwrap(),
-            Err(error) => return self.fail(event_loop, error.to_string()),
-        };
+fn backend() -> Result<(Backend, &'static str), String> {
+    match std::env::var("EZ_GFX_BACKEND").ok().as_deref() {
         #[cfg(target_vendor = "apple")]
-        if backend != 3 {
-            return self.fail(event_loop, "macOS example host requires Metal backend");
-        }
-        let context_desc = EzGfxBackendContextDesc {
-            enable_debug: match std::env::var("EZ_GFX_EXAMPLE_DEBUG").ok().as_deref() {
-                None | Some("0") => 0,
-                Some("1") => 1,
-                Some(value) => {
-                    return self.fail(
-                        event_loop,
-                        format!("EZ_GFX_EXAMPLE_DEBUG must be 0 or 1, got `{value}`"),
-                    );
-                }
-            },
-            enable_validation: match std::env::var("EZ_GFX_EXAMPLE_VALIDATION").ok().as_deref() {
-                None | Some("0") => 0,
-                Some("1") => 1,
-                Some(value) => {
-                    return self.fail(
-                        event_loop,
-                        format!("EZ_GFX_EXAMPLE_VALIDATION must be 0 or 1, got `{value}`"),
-                    );
-                }
-            },
-            surface_platform: host.desc.platform,
-            backend,
-        };
-        if let Err(error) = status(
-            {
-                // SAFETY: Non-null arguments point to live, aligned caller-owned descriptor and output storage for this call; null pointers intentionally exercise checked rejection.
-                unsafe {
-                    ez_gfx_context_create_backend(&raw const context_desc, &raw mut self.context)
-                }
-            },
-            &format!("create {backend_name} context"),
-        ) {
-            return self.fail(event_loop, error);
-        }
-        let initialized = status(
-            {
-                // SAFETY: The aligned descriptor and output remain live for this call, and its platform objects outlive the returned surface.
-                unsafe {
-                    ez_gfx_surface_create(&raw const host.desc, &raw mut self.surface, self.context)
-                }
-            },
-            &format!("create {backend_name} surface"),
-        )
-        .and_then(|()| {
-            status(
-                ez_gfx_context_init_device(self.surface, self.context),
-                &format!("initialize {backend_name} surface device"),
-            )
-        })
-        .and_then(|()| {
-            status(
-                ez_gfx_surface_resize(self.surface, WIDTH, HEIGHT, self.context),
-                &format!("initialize {backend_name} swapchain"),
-            )
-        })
-        .and_then(|()| {
-            ImGuiScene::create(self.context).map(|resources| self.resources = Some(resources))
-        });
-        if let Err(error) = initialized {
-            return self.fail(event_loop, error);
-        }
-        self.host = Some(host);
-        self.window = Some(window);
-        self.window.as_ref().unwrap().request_redraw();
-    }
-
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        if self.window.as_ref().is_none_or(|window| window.id() != id) {
-            return;
-        }
-        match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) if size.width > 0 && size.height > 0 => {
-                self.width = size.width;
-                self.height = size.height;
-                if let Some(host) = &self.host {
-                    host.resize(size.width, size.height);
-                }
-                if let Err(error) = status(
-                    ez_gfx_surface_resize(self.surface, size.width, size.height, self.context),
-                    "resize presented surface",
-                ) {
-                    self.fail(event_loop, error);
-                }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                if let Some(resources) = &mut self.resources {
-                    resources.handle_input(SceneInput::CursorMoved {
-                        x: position.x,
-                        y: position.y,
-                    });
-                }
-            }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => {
-                if let Some(resources) = &mut self.resources {
-                    resources
-                        .handle_input(SceneInput::PrimaryButton(state == ElementState::Pressed));
-                }
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(position) => position.y as f32 / 24.0,
-                };
-                if let Some(resources) = &mut self.resources {
-                    resources.handle_input(SceneInput::ScrollLines(lines));
-                }
-            }
-            WindowEvent::KeyboardInput { event, .. } => {
-                if let Some(resources) = &mut self.resources {
-                    resources.handle_input(SceneInput::Key {
-                        key: scene_key(&event.logical_key),
-                        pressed: event.state == ElementState::Pressed,
-                    });
-                    if event.state == ElementState::Pressed
-                        && let Key::Character(text) = &event.logical_key
-                    {
-                        for character in text.chars() {
-                            resources.handle_input(SceneInput::Character(character));
-                        }
-                    }
-                }
-            }
-            WindowEvent::RedrawRequested => {
-                let terminal_frame = self
-                    .frame_limit
-                    .is_some_and(|limit| self.frames.saturating_add(1) >= limit);
-                if terminal_frame {
-                    if let Err(error) = status(
-                        ez_gfx_surface_set_snapshot_cache(self.surface, 1, self.context),
-                        "enable terminal snapshot cache",
-                    ) {
-                        return self.fail(event_loop, error);
-                    }
-                }
-                let delta_seconds = self.last_frame.elapsed().as_secs_f32();
-                self.last_frame = Instant::now();
-                let result = self
-                    .resources
-                    .as_mut()
-                    .ok_or_else(|| "example resources are unavailable".to_owned())
-                    .and_then(|resources| {
-                        resources.update(FrameInput {
-                            width: self.width,
-                            height: self.height,
-                            delta_seconds,
-                        })?;
-                        status(
-                            ez_gfx_begin_render(self.surface, self.context),
-                            "begin presented frame",
-                        )?;
-                        resources.record(self.context)?;
-                        status(
-                            ez_gfx_finish_render(self.context),
-                            "submit and present example",
-                        )
-                    });
-                if let Err(error) = result {
-                    return self.fail(event_loop, error);
-                }
-                self.frames += 1;
-                if self.frame_limit.is_some_and(|limit| self.frames >= limit) {
-                    match self.capture().and_then(|rgba8| {
-                        self.drain_observability()
-                            .map(|observations| (rgba8, observations))
-                    }) {
-                        Ok((rgba8, (runtime_events, diagnostics, dropped_observations))) => {
-                            self.report = Some(PresentedReport {
-                                width: self.width,
-                                height: self.height,
-                                frames: self.frames,
-                                rgba8,
-                                runtime_events,
-                                diagnostics,
-                                dropped_observations,
-                            });
-                        }
-                        Err(error) => self.error = Some(error),
-                    }
-                    event_loop.exit();
-                } else {
-                    self.window.as_ref().unwrap().request_redraw();
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        self.cleanup();
+        None | Some("metal") => Ok((Backend::Metal, "Metal")),
+        #[cfg(not(target_vendor = "apple"))]
+        None | Some("vulkan") => Ok((Backend::Vulkan, "Vulkan")),
+        #[cfg(windows)]
+        Some("dx12") => Ok((Backend::Dx12, "DX12")),
+        Some(value) => Err(format!("unsupported EZ_GFX_BACKEND `{value}`")),
     }
 }
 
-// Every ABI error remains visible to the example caller.
 fn status(result: EzGfxResult, operation: &str) -> Result<(), String> {
     match result {
         EzGfxResult::Ok => Ok(()),
         error => Err(format!("{operation}: {error:?}")),
     }
 }
+
 fn main() {
-    let frame_limit = match std::env::var("EZ_GFX_EXAMPLE_MAX_FRAMES") {
-        Ok(value) => {
-            let value = value.parse::<u32>().unwrap_or_else(|_| {
-                eprintln!("EZ_GFX_EXAMPLE_MAX_FRAMES must be a positive integer");
-                std::process::exit(2)
-            });
-            if value == 0 {
-                eprintln!("EZ_GFX_EXAMPLE_MAX_FRAMES must be positive");
-                std::process::exit(2);
-            }
-            Some(value)
+    let backend = std::env::var("EZ_GFX_BACKEND").unwrap_or_else(|_| {
+        if cfg!(target_vendor = "apple") {
+            "metal".to_owned()
+        } else {
+            "vulkan".to_owned()
         }
-        Err(std::env::VarError::NotPresent) => None,
-        Err(error) => {
-            eprintln!("EZ_GFX_EXAMPLE_MAX_FRAMES: {error}");
-            std::process::exit(2);
-        }
-    };
-    let report = run_example(frame_limit).unwrap_or_else(|error| {
-        eprintln!("example failed: {error}");
-        std::process::exit(1)
     });
-    if let Some(report) = report {
-        if let Some(path) = std::env::var_os("EZ_GFX_EXAMPLE_SNAPSHOT") {
-            let update = std::env::var("EZ_GFX_UPDATE_SNAPSHOTS").ok().as_deref() == Some("1");
-            if update {
-                image::save_buffer_with_format(
-                    &path,
-                    &report.rgba8,
-                    report.width,
-                    report.height,
-                    image::ColorType::Rgba8,
-                    image::ImageFormat::Png,
-                )
-                .unwrap_or_else(|e| panic!("update snapshot: {e}"));
-            } else {
-                let expected = image::open(&path)
-                    .unwrap_or_else(|e| panic!("open snapshot: {e}"))
-                    .into_rgba8();
-                assert_eq!(expected.dimensions(), (report.width, report.height));
-                assert_eq!(expected.into_raw(), report.rgba8);
-            }
-        }
-        if std::env::var_os("EZ_GFX_EXAMPLE_REPORT").is_some() {
-            println!(
-                "ez-gfx-snapshot {} {} {} {} {} {} {}",
-                report.width,
-                report.height,
-                report.frames,
-                blake3::hash(&report.rgba8),
-                report.runtime_events,
-                report.diagnostics,
-                report.dropped_observations
-            );
-        }
-    }
+    shared::run_program("04_imgui", &backend, run_example_with_benchmark);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_backend;
-
+    use super::*;
     #[test]
     fn backend_selection_defaults_and_validates() {
         #[cfg(target_vendor = "apple")]
-        assert_eq!(parse_backend(None), Ok((3, "Metal")));
-        #[cfg(target_vendor = "apple")]
-        assert_eq!(parse_backend(Some("metal")), Ok((3, "Metal")));
+        assert_eq!(backend(), Ok((Backend::Metal, "Metal")));
         #[cfg(not(target_vendor = "apple"))]
-        assert_eq!(parse_backend(None), Ok((1, "Vulkan")));
-        #[cfg(not(target_vendor = "apple"))]
-        assert_eq!(parse_backend(Some("vulkan")), Ok((1, "Vulkan")));
-        #[cfg(windows)]
-        assert_eq!(parse_backend(Some("dx12")), Ok((2, "DX12")));
-        assert!(parse_backend(Some("unknown")).is_err());
+        assert_eq!(backend(), Ok((Backend::Vulkan, "Vulkan")));
     }
 }

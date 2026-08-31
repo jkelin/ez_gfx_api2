@@ -34,9 +34,10 @@ path = "tests/smoke.rs"
 
 
 [dependencies]
+bytemuck = { version = "1.23", features = ["derive"] }
 blake3.workspace = true
 image.workspace = true
-ez-gfx-ffi = { path = "../crates/ez-gfx-ffi" }
+ez-gfx.workspace = true
 gltf = { version = "1.4", features = ["import", "extensions", "allow_empty_texture"] }
 imgui = "0.12"
 raw-window-handle = "0.6"

@@ -6,15 +6,17 @@
 - Vulkan, DX12, and Metal backend crates use a backend-neutral HAL and `gpu-allocator` 0.28.
 - Offline Slang compilation emits SPIR-V 1.5, Shader Model 6.5 DXIL, and Metal products in bounded `.ezgfx` artifacts.
 - Vulkan and DX12 resource upload, compute, indexed-indirect draw, presentation, and opt-in readback paths are implemented. DX12 hardware compute and graphics proofs passed on the local RTX 3080.
-- KTX2/Basis parsing/decoding, progressive-residency data structures, bounded CPU worker/event primitives, six migrated examples, external PNG comparison, runtime/compiler package isolation, and canonical plan updates are present. FFI texture loading currently expands to bounded RGBA8 and does not connect the worker/event path.
+- KTX2/Basis parsing/decoding, progressive-residency data structures, bounded CPU worker/event primitives, six migrated examples, external PNG comparison, runtime/compiler package isolation, and canonical plan updates are present. `ez-gfx` texture loading currently expands to bounded RGBA8 and does not connect the worker/event path; the FFI delegates to it.
 - Final post-format strict verification passed: `cargo clippy --workspace --all-targets --all-features -- -D warnings` and xtask source-line validation.
 
 ## Verification status
 
-- Six standalone programs own their host setup, `ApplicationHandler`, scene, required helpers, shader inputs, and artifacts; no shared Rust example tree or library target remains.
+- `examples/shared` owns neutral Pod byte views, host attachment, winit lifecycle/input orchestration, bounded observability draining, environment-flag parsing, math/mesh preparation (including neutral basic primitive records), and benchmark/snapshot automation. Each example's sole Rust source, `main.rs`, owns its ez-gfx callbacks, direct resource/frame calls, renderer, shaders, and artifacts; every renderer calls safe `ez-gfx` APIs, and no example library or graphics-wrapper target remains.
+- `include/ez_gfx_api.h` now declares all 43 production extern-C exports; strict GCC C11 and C++17 standalone header validation pass; FFI ABI suite passes 13/13.
 - All six one-frame Metal Validation runs pass with zero diagnostics and zero dropped observations.
-- `cargo build -p ez-gfx-examples --bins` passes; the seven-test examples smoke passes 7/7.
-- Example snapshots were regenerated and verified.
+- `cargo check -p ez-gfx-examples --bins --tests` passes; the latest examples smoke passes 20/20.
+- Vulkan benchmark smoke passes for all six binaries with one warmup frame, one measured frame, and one uncaptured terminal snapshot frame; each emits its stable numbered benchmark identity and zero dropped observations.
+- Immutable example snapshots matched; they were not regenerated.
 - `cargo fmt --all -- --check` and final strict workspace Clippy/source-line validation pass.
 - On the local Windows RTX 3080, one-frame Vulkan and DX12 example runs both pass.
 ## Remaining verification
@@ -53,14 +55,14 @@ cargo run -p xtask -- package x86_64-pc-windows-msvc 0.1.0 target/package-smoke
 ### P0 — managed render targets are unreachable
 
 - **Status:** Missing.
-- **Evidence:** `crates/ez-gfx-runtime/src/binding.rs:7-19` and `crates/ez-gfx-ffi/src/lib.rs:971-983` recognize render-target bindings, but no FFI create/describe/release path exists; `crates/ez-gfx-ffi/src/state/frame/mod.rs::frame_submit` always renders the active surface.
+- **Evidence:** `crates/ez-gfx-runtime/src/binding.rs:7-19` and `crates/ez-gfx/src/state/frame/mod.rs` recognize render-target bindings, but neither the safe API nor FFI has a create/describe/release path; `ez-gfx::frame_submit` always renders the active surface.
 - **Impact:** Shader-declared targets, relative scales, storage/sample transitions, and target history cannot be authored.
 - **Acceptance:** Public target lifecycle validates dimensions/format/ownership, target handles bind successfully, resize/history work, and graph passes attach them.
 
 ### P1 — texture loading is synchronous RGBA8
 
 - **Status:** Partial.
-- **Evidence:** `crates/ez-gfx-ffi/src/state/texture.rs::load_texture` decodes and optionally generates every mip before upload; `crates/ez-gfx-ffi/src/state/native.rs` calls `create_texture_rgba8` for all backends. `crates/ez-gfx-runtime/src/texture.rs:17-22,143-177` expands supported KTX2 paths to RGBA8.
+- **Evidence:** `crates/ez-gfx/src/state/texture.rs::load_texture` decodes and optionally generates every mip before upload; `crates/ez-gfx/src/state/native.rs` calls `create_texture_rgba8` for all backends. `crates/ez-gfx-runtime/src/texture.rs:17-22,143-177` expands supported KTX2 paths to RGBA8.
 - **Impact:** Caller stalls and memory/bandwidth increase; native BC/ASTC upload, partial updates, eviction, and streaming control are unavailable.
 - **Acceptance:** Context validation precedes work; asynchronous mip/region uploads expose cancellation/completion; native block formats remain compressed through upload.
 
@@ -72,31 +74,31 @@ cargo run -p xtask -- package x86_64-pc-windows-msvc 0.1.0 target/package-smoke
 - **Impact:** Subpasses, clipping, and target-relative viewports cannot be represented.
 - **Acceptance:** Validated viewport/scissor state crosses the ABI and is emitted consistently by Metal, Vulkan, and DX12 with boundary tests.
 
-### P1 — asset workers are disconnected from FFI
+### P1 — asset workers are disconnected from the public API
 
 - **Status:** Partial.
-- **Evidence:** `crates/ez-gfx-assets/src/lib.rs:224-276,290-414` implements bounded queues, Rayon workers, cancellation, permits, and events, but `crates/ez-gfx-ffi/Cargo.toml:11-22` does not depend on it and FFI loading is synchronous (`crates/ez-gfx-ffi/src/state/texture.rs::load_texture`).
+- **Evidence:** `crates/ez-gfx-assets/src/lib.rs:224-276,290-414` implements bounded queues, Rayon workers, cancellation, permits, and events, but `crates/ez-gfx/Cargo.toml` does not depend on it and `ez-gfx` loading remains synchronous (`crates/ez-gfx/src/state/texture.rs::load_texture`).
 - **Impact:** Worker safety exists in isolation; applications receive no asynchronous decode/upload lifecycle.
-- **Acceptance:** FFI submits bounded jobs, publishes decode/transcode/upload outcomes, supports cancellation, and ties GPU completion tokens to resource state.
+- **Acceptance:** `ez-gfx` submits bounded jobs, publishes decode/transcode/upload outcomes, supports cancellation, and ties GPU completion tokens to resource state; FFI exposes that lifecycle without reimplementing it.
 
 ### P1 — threading and global context mutex constrain ownership
 
 - **Status:** Partial.
-- **Evidence:** `crates/ez-gfx-runtime/src/lifecycle.rs:27-130` enforces creator-thread, health, owner, generation, and resource-kind checks; `crates/ez-gfx-ffi/src/state/mod.rs` stores all contexts behind one global mutex. Wrong-thread destruction is now rejected while preserving the context; global serialization remains.
+- **Evidence:** `crates/ez-gfx-runtime/src/lifecycle.rs:27-130` enforces creator-thread, health, owner, generation, and resource-kind checks; `crates/ez-gfx/src/state/mod.rs` stores all contexts behind one global mutex. Wrong-thread destruction is rejected while preserving the context; global serialization remains.
 - **Impact:** Normal stale-handle use fails closed, but global serialization limits concurrency and cross-thread destruction can hide failures.
 - **Acceptance:** Document ownership rules, validate destruction affinity or make destruction explicitly thread-safe, surface cleanup failures, and test concurrent independent contexts.
 
 ### P1 — platform surface and validation gaps
 
 - **Status:** Partial.
-- **Evidence:** `ez-gfx-hal::FrameExecutionBackend` is the common execution boundary; `render.rs::execute_compiled_graph` submits one immutable plan through it, and FFI adapters lower that plan for Vulkan, DX12, and Metal. Context creation still accepts Vulkan only with Win32, DX12 only on Windows/Win32, and Metal only on Apple/MetalLayer (`crates/ez-gfx-ffi/src/state/context.rs::create_context`); `examples/01_triangle/host.rs:18-62` handles only Win32/AppKit.
+- **Evidence:** `ez-gfx-hal::FrameExecutionBackend` is the common execution boundary; `render.rs::execute_compiled_graph` submits one immutable plan through it, and `ez-gfx` adapters lower that plan for Vulkan, DX12, and Metal. Context creation still accepts Vulkan only with Win32, DX12 only on Windows/Win32, and Metal only on Apple/MetalLayer (`crates/ez-gfx/src/state/context.rs::create_context`); `examples/shared/host.rs:31-68` handles only Win32/AppKit.
 - **Impact:** Linux Vulkan surfaces are unavailable, and Windows native execution remains unverified on the current host.
 - **Acceptance:** Add Linux surface support and native CI for macOS Metal, Windows Vulkan/DX12, and Linux Vulkan.
 
 ### P1 — diagnostics are weak around cleanup and asynchronous work
 
 - **Status:** Partial.
-- **Evidence:** `crates/ez-gfx-ffi/src/state/frame/mod.rs::frame_submit` records submit failures, but `crates/ez-gfx-ffi/src/state/context.rs::destroy_context` and resource-release paths discard release/destructor errors; worker events are not exposed through FFI.
+- **Evidence:** `crates/ez-gfx/src/state/frame/mod.rs::frame_submit` records submit failures, but `crates/ez-gfx/src/state/context.rs::destroy_context` and resource-release paths discard release/destructor errors; worker events are not exposed through the public APIs.
 - **Impact:** Resource leaks, upload failures, and partial submissions can be silent or lack correlation.
 - **Acceptance:** Every failure has a correlated diagnostic/event, cleanup errors are observable, and queue overflow/cancellation/device-loss semantics are tested.
 
@@ -123,3 +125,18 @@ cargo run -p xtask -- package x86_64-pc-windows-msvc 0.1.0 target/package-smoke
 5. Complete FFI APIs and enforce/document threading, destruction, ownership, and error propagation.
 6. [Current] Metal, Vulkan, and DX12 route frame plans through the common executor; platform conformance remains.
 7. Expand diagnostics, regression tests, artifact freshness checks, packaging checks, and performance benchmarks.
+
+
+## New todos
+- format slang shaders so that they look well with spacing and stuff
+- inside the examples, call the shader compiler rather than precompiling the shaders
+- .ezgfx should be renamed to .ezgfxshader and it should have at most one entrypoint per stage so that you wont need to include entrypoint name when calling load_shader
+- update shaders so that there is one global ez_gfx_api.slang inside root which will contain the shared slang code. when importing the library the users will also import this shared slang code
+- the shader should not use anything from the vk:: namespace or vk_location or whatever, the shaders are backend agnostic
+- use newtype for handle u64 instead of passing raw u64 around
+- write AGENTS.md with policies for agents on what to ensure inside the codebase (like keep all backends in sync, keep the ffi in sync with the bindings and so on)
+- migrate the code to anyhow errors and use best practices for error handling
+- use library for the linear algebra (mats, vecs, quaternions) instead of rolling your own inside the examples
+- in fact analyse if there is anything in the whole project that would be better served by a library rather handrolling
+- use rkyv for the serialization/deserialization of the shader format rather than custom bincoder
+- use clap library for the xtask and shader compiler
