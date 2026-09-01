@@ -221,6 +221,46 @@ pub fn benchmark_frame_limit(config: BenchmarkConfig) -> anyhow::Result<u32> {
         .ok_or_else(|| anyhow::anyhow!("benchmark frame counts exceed u32 limit"))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ByteDifference {
+    index: usize,
+    expected: Option<u8>,
+    actual: Option<u8>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SnapshotMismatch {
+    expected_len: usize,
+    actual_len: usize,
+    expected_hash: blake3::Hash,
+    actual_hash: blake3::Hash,
+    first_difference: ByteDifference,
+}
+
+fn snapshot_mismatch(expected: &[u8], actual: &[u8]) -> Option<SnapshotMismatch> {
+    let content_difference = expected
+        .iter()
+        .zip(actual)
+        .position(|(expected, actual)| expected != actual);
+    if content_difference.is_none() && expected.len() == actual.len() {
+        return None;
+    }
+
+    // Prefix-only length mismatches differ at the first byte present on only one side.
+    let index = content_difference.unwrap_or_else(|| expected.len().min(actual.len()));
+    Some(SnapshotMismatch {
+        expected_len: expected.len(),
+        actual_len: actual.len(),
+        expected_hash: blake3::hash(expected),
+        actual_hash: blake3::hash(actual),
+        first_difference: ByteDifference {
+            index,
+            expected: expected.get(index).copied(),
+            actual: actual.get(index).copied(),
+        },
+    })
+}
+
 /// Applies a captured RGBA frame to the optional snapshot path and report stream.
 pub fn publish_snapshot(
     path: Option<OsString>,
@@ -248,8 +288,32 @@ pub fn publish_snapshot(
             let expected = image::open(&path)
                 .unwrap_or_else(|error| panic!("open snapshot: {error}"))
                 .into_rgba8();
-            assert_eq!(expected.dimensions(), (width, height));
-            assert_eq!(expected.as_raw(), rgba8);
+            assert!(
+                expected.dimensions() == (width, height),
+                "snapshot dimensions differ: expected_path={} expected={}x{} actual_path=<captured frame> actual={}x{}",
+                Path::new(&path).display(),
+                expected.width(),
+                expected.height(),
+                width,
+                height
+            );
+            if let Some(mismatch) = snapshot_mismatch(expected.as_raw(), rgba8) {
+                panic!(
+                    "snapshot pixels differ: expected_path={} expected_dimensions={}x{} expected_bytes={} expected_blake3={} actual_path=<captured frame> actual_dimensions={}x{} actual_bytes={} actual_blake3={} first_difference_index={} expected_byte={:?} actual_byte={:?}",
+                    Path::new(&path).display(),
+                    expected.width(),
+                    expected.height(),
+                    mismatch.expected_len,
+                    mismatch.expected_hash,
+                    width,
+                    height,
+                    mismatch.actual_len,
+                    mismatch.actual_hash,
+                    mismatch.first_difference.index,
+                    mismatch.first_difference.expected,
+                    mismatch.first_difference.actual
+                );
+            }
         }
     }
     if std::env::var_os("EZ_GFX_EXAMPLE_REPORT").is_some() {
@@ -288,7 +352,36 @@ fn positive_env(name: &str, default: u32) -> anyhow::Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BenchmarkConfig, benchmark_frame_limit, parse_env_flag};
+    use super::{BenchmarkConfig, benchmark_frame_limit, parse_env_flag, snapshot_mismatch};
+    #[test]
+    fn snapshot_comparison_accepts_equal_bytes() {
+        assert!(snapshot_mismatch(b"same", b"same").is_none());
+    }
+
+    #[test]
+    fn snapshot_comparison_reports_first_content_mismatch() {
+        let mismatch = snapshot_mismatch(&[1, 2, 3], &[1, 9, 3]).unwrap();
+
+        assert_eq!(mismatch.expected_len, 3);
+        assert_eq!(mismatch.actual_len, 3);
+        assert_eq!(mismatch.expected_hash, blake3::hash(&[1, 2, 3]));
+        assert_eq!(mismatch.actual_hash, blake3::hash(&[1, 9, 3]));
+        assert_eq!(mismatch.first_difference.index, 1);
+        assert_eq!(mismatch.first_difference.expected, Some(2));
+        assert_eq!(mismatch.first_difference.actual, Some(9));
+    }
+
+    #[test]
+    fn snapshot_comparison_reports_length_mismatch_at_prefix_end() {
+        let mismatch = snapshot_mismatch(&[1, 2], &[1]).unwrap();
+
+        assert_eq!(mismatch.expected_len, 2);
+        assert_eq!(mismatch.actual_len, 1);
+        assert_eq!(mismatch.first_difference.index, 1);
+        assert_eq!(mismatch.first_difference.expected, Some(2));
+        assert_eq!(mismatch.first_difference.actual, None);
+    }
+
     #[test]
     fn benchmark_limit_includes_capture_frame_and_checks_overflow() {
         assert_eq!(
