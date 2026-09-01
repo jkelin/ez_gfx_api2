@@ -179,7 +179,7 @@ pub struct EzGfxDrawIndexedCommand {
 pub struct EzGfxByteBuffer {
     /// Specifies the byte count available through `data`.
     pub length: usize,
-    /// Points to the first byte of the read-only range.
+    /// Points to the first byte of the range and may be null only when `length` is zero.
     pub data: *const u8,
 }
 

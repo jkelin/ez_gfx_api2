@@ -166,7 +166,7 @@
     </struct>
     <struct name="EzGfxByteBuffer" doc="Pointer-plus-length byte range for ABI consumers.">
       <field name="length" type="size_t" doc="Number of bytes in data." />
-      <field name="data" type="const uint8_t *" counted-by="length" nullable="true" doc="Byte range; nullable only when length is zero." />
+      <field name="data" type="const uint8_t *" nullable="true" doc="Byte range; nullable only when length is zero." />
     </struct>
     <struct name="EzGfxRuntimeRecord" doc="One host-polled runtime outcome.">
       <field name="correlation_id" type="uint64_t" doc="Context-local nonzero correlation identifier." />

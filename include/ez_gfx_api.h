@@ -12,17 +12,10 @@
 #  else
 #    define EZ_GFX_ACCESS(...)
 #  endif
-#  if __has_attribute(counted_by)
-#    define EZ_GFX_COUNTED_BY(field) __attribute__((counted_by(field)))
-#  else
-#    define EZ_GFX_COUNTED_BY(field)
-#  endif
 #elif defined(__GNUC__) && (__GNUC__ >= 10)
 #  define EZ_GFX_ACCESS(...) __attribute__((access(__VA_ARGS__)))
-#  define EZ_GFX_COUNTED_BY(field)
 #else
 #  define EZ_GFX_ACCESS(...)
-#  define EZ_GFX_COUNTED_BY(field)
 #endif
 
 /* ABI string contract: every const char* is UTF-8 and NUL-terminated for the duration of the call. */
@@ -459,7 +452,7 @@ typedef struct EzGfxDiagnostic {
  */
 typedef struct EzGfxByteBuffer {
     size_t length;
-    const uint8_t * data EZ_GFX_COUNTED_BY(length);
+    const uint8_t * data;
 } EzGfxByteBuffer;
 
 /**

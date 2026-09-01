@@ -221,11 +221,7 @@ fn parse_header_structs(source: &str) -> Result<BTreeMap<String, Vec<Field>>> {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            let declaration = declaration
-                .split("EZ_GFX_COUNTED_BY")
-                .next()
-                .unwrap()
-                .trim();
+            let declaration = declaration.trim();
             let (base, extent) = if let Some(open) = declaration.rfind('[') {
                 let close = declaration[open..]
                     .find(']')
@@ -574,8 +570,14 @@ fn parse_binding_empty(
             values.push((name, value));
         }
         b"field" if current_struct.is_some() => {
+            let struct_name = &current_struct.as_ref().unwrap().0;
+            let field_name = required_attr(reader, element, "name")?;
+            // `counted_by` is valid only on C99 flexible array members, never pointer fields.
+            if optional_attr(reader, element, "counted-by")?.is_some() {
+                bail!("counted-by is invalid on struct field {struct_name}.{field_name}");
+            }
             let field = Field {
-                name: required_attr(reader, element, "name")?,
+                name: field_name,
                 ty: normalize_type(&required_attr(reader, element, "type")?),
                 extent: optional_attr(reader, element, "array-length")?,
             };
@@ -853,4 +855,42 @@ fn parse_signed(input: &str) -> Result<i64> {
         .trim_end_matches(['u', 'U', 'l', 'L'])
         .parse()
         .with_context(|| format!("parse integer {input}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bindings_reject_counted_by_on_struct_pointer_fields() {
+        let bindings = r#"
+            <ez-gfx-bindings abi-version="18">
+              <handles></handles>
+              <enums></enums>
+              <structs>
+                <struct name="EzGfxByteBuffer">
+                  <field name="length" type="size_t"/>
+                  <field name="data" type="const uint8_t *" counted-by="length"/>
+                </struct>
+              </structs>
+              <functions></functions>
+            </ez-gfx-bindings>
+        "#;
+
+        assert!(
+            parse_bindings(bindings)
+                .unwrap_err()
+                .to_string()
+                .contains("counted-by is invalid on struct field EzGfxByteBuffer.data")
+        );
+    }
+
+    #[test]
+    fn generated_header_matches_portable_bindings_contract() {
+        validated_contract(
+            include_str!("../../../include/ez_gfx_api.h"),
+            include_str!("../../../bindings/bindings.xml"),
+        )
+        .unwrap();
+    }
 }
