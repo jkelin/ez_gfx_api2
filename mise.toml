@@ -1,3 +1,6 @@
+[tools]
+"cargo:cargo-nextest" = "0.9.101"
+
 [tasks.check]
 description = "Check the Rust workspace"
 run = "cargo check --workspace"
