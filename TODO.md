@@ -117,5 +117,4 @@
 
 ## Tooling improvements
 
-- setup nexttest
-- setup miri and integrate with nexttest
+- setup miri and integrate with nextest
