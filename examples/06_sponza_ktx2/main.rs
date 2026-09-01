@@ -34,7 +34,7 @@ mod renderer {
         far: f32,
         push: ScenePush,
         primitive_count: u32,
-        bindings: [PublicBinding; 5],
+        bindings: [PublicBinding; 6],
     }
 
     impl ModelScene {
@@ -55,6 +55,7 @@ mod renderer {
             let mesh = load_textured_glb(include_bytes!("../shared/assets/sponza.glb"))?;
             let primitive_count =
                 u32::try_from(mesh.primitives.len()).context("primitive count exceeds ABI")?;
+            let primitive_ids = primitive_ids(&mesh.primitives, mesh.positions.len())?;
             let primitive_bytes = u64::from(primitive_count)
                 .checked_mul(
                     u64::try_from(std::mem::size_of::<PrimitiveTextured>())
@@ -68,6 +69,7 @@ mod renderer {
             let positions_bytes = byte_len(&mesh.positions)?;
             let normals_bytes = byte_len(&mesh.normals)?;
             let uvs_bytes = byte_len(&mesh.uvs)?;
+            let primitive_ids_bytes = byte_len(&primitive_ids)?;
             status(
                 create_index_heap(context, index_bytes),
                 "create Sponza index heap",
@@ -99,6 +101,13 @@ mod renderer {
             status(
                 write_structured(context, uvs, slice_bytes(&mesh.uvs)),
                 "upload uvs",
+            )?;
+            let primitive_ids_buffer = acquire_structured(context, primitive_ids_bytes)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))
+                .context("acquire primitive IDs")?;
+            status(
+                write_structured(context, primitive_ids_buffer, slice_bytes(&primitive_ids)),
+                "upload primitive IDs",
             )?;
             let repeat_sampler = TextureSamplerDesc {
                 min_filter: SamplerFilter::Linear,
@@ -226,6 +235,10 @@ mod renderer {
                         name: "uvs".to_owned(),
                         resource: ResourceIdentity::Structured(uvs),
                     },
+                    PublicBinding {
+                        name: "primitive_ids".to_owned(),
+                        resource: ResourceIdentity::Structured(primitive_ids_buffer),
+                    },
                 ],
             })
         }
@@ -276,10 +289,80 @@ mod renderer {
             )
         }
     }
+    fn primitive_ids(
+        primitives: &[PrimitiveData],
+        vertex_count: usize,
+    ) -> anyhow::Result<Vec<u32>> {
+        if primitives.is_empty() || vertex_count == 0 {
+            anyhow::bail!("primitive identity requires nonempty primitives and vertices");
+        }
+
+        let mut ids = vec![u32::MAX; vertex_count];
+        for (index, primitive) in primitives.iter().enumerate() {
+            let start =
+                usize::try_from(primitive.vertex_offset).context("vertex offset exceeds ABI")?;
+            let end = match primitives.get(index + 1) {
+                Some(next) => {
+                    usize::try_from(next.vertex_offset).context("vertex offset exceeds ABI")?
+                }
+                None => vertex_count,
+            };
+            // The loader appends one contiguous vertex range per primitive; gaps or empty ranges
+            // would make the shader's vertex-to-primitive lookup ambiguous.
+            if (index == 0 && start != 0) || start >= end || end > vertex_count {
+                anyhow::bail!("primitive vertex ranges are not contiguous");
+            }
+            ids[start..end].fill(u32::try_from(index).context("primitive index exceeds ABI")?);
+        }
+        if ids.iter().any(|id| *id == u32::MAX) {
+            anyhow::bail!("primitive vertex ranges do not cover the mesh");
+        }
+        Ok(ids)
+    }
+
     fn status(result: EzGfxResult, operation: &str) -> anyhow::Result<()> {
         match result {
             EzGfxResult::Ok => Ok(()),
             error => Err(anyhow::anyhow!("{error:?}").context(operation.to_owned())),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn primitive(vertex_offset: u32) -> PrimitiveData {
+            PrimitiveData {
+                first_index: 0,
+                index_count: 3,
+                vertex_offset,
+                normal_offset: vertex_offset,
+                uv_offset: vertex_offset,
+                transform: Mat4::IDENTITY,
+                image: None,
+            }
+        }
+
+        #[test]
+        fn primitive_ids_cover_contiguous_vertex_ranges() {
+            assert_eq!(
+                primitive_ids(&[primitive(0), primitive(2)], 5).unwrap(),
+                [0, 0, 1, 1, 1]
+            );
+        }
+
+        #[test]
+        fn primitive_ids_reject_empty_gapped_reversed_and_out_of_bounds_ranges() {
+            for (primitives, vertices) in [
+                (vec![], 0),
+                (vec![primitive(0)], 0),
+                (vec![primitive(1)], 2),
+                (vec![primitive(0), primitive(0)], 2),
+                (vec![primitive(2), primitive(1)], 3),
+                (vec![primitive(0), primitive(3)], 2),
+            ] {
+                assert!(primitive_ids(&primitives, vertices).is_err());
+            }
         }
     }
 }

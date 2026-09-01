@@ -51,7 +51,7 @@ void computemain(uint3 id : SV_DispatchThreadID) {
     command.instance_count = 1;
     command.first_index = primitive.first_index;
     command.vertex_offset = 0;
-    command.first_instance = id.x;
+    command.first_instance = 0;
     draw_commands[id.x] = command;
 }
 
@@ -64,6 +64,9 @@ StructuredBuffer<float4> normals;
 [StructuredBuffer("uvs")]
 StructuredBuffer<float4> uvs;
 
+[StructuredBuffer("primitive_ids")]
+StructuredBuffer<uint> primitive_ids;
+
 [BindlessTextureHeap(EZ_GFX_MAX_TEXTURES)]
 ParameterBlock<TextureHeap> texture_heap;
 
@@ -75,8 +78,8 @@ struct VertexOutput {
 };
 
 [shader("vertex")]
-VertexOutput vertexmain(uint vertex_index : SV_VertexID, uint instance_index : SV_InstanceID) {
-    Primitive primitive = primitives[instance_index];
+VertexOutput vertexmain(uint vertex_index : SV_VertexID) {
+    Primitive primitive = primitives[primitive_ids[vertex_index]];
     VertexOutput output;
     output.position = mul(push.mvp, mul(primitive.transform, float4(positions[vertex_index].xyz, 1.0)));
 
@@ -96,7 +99,15 @@ struct FragmentOutput {
 
 [shader("fragment")]
 FragmentOutput fragmentmain(VertexOutput input) {
-    TextureEntry entry = texture_heap.entries[input.texture_id];
+    uint texture_id;
+    __target_switch {
+    case metal:
+        texture_id = input.texture_id;
+    case spirv:
+    case hlsl:
+        texture_id = NonUniformResourceIndex(input.texture_id);
+    }
+    TextureEntry entry = texture_heap.entries[texture_id];
     float4 albedo = entry.texture.Sample(entry.sampler, input.uv);
     if (albedo.a < 0.7) {
         discard;

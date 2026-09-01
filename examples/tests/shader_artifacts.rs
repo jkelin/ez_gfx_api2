@@ -162,3 +162,80 @@ fn runtime_compiler_reflection_has_unique_physical_bindings_per_stage() -> anyho
     }
     Ok(())
 }
+
+#[test]
+fn sponza_fragment_marks_bindless_texture_and_sampler_selection_nonuniform() -> anyhow::Result<()> {
+    const OP_DECORATE: u16 = 71;
+    const NON_UNIFORM: u32 = 5300;
+
+    let case = artifacts()?
+        .iter()
+        .find(|case| case.name == "sponza")
+        .context("missing Sponza artifact")?;
+    let artifact = Artifact::decode(&case.bytes).context("decode Sponza artifact")?;
+    let variant = artifact
+        .variants
+        .iter()
+        .find(|variant| variant.target == Target::Spirv && variant.stage == Stage::Fragment)
+        .context("missing Sponza SPIR-V fragment product")?;
+    let bytes = variant.bytes.as_slice();
+    assert!(bytes.len().is_multiple_of(4), "SPIR-V must contain words");
+
+    let words = bytes
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte SPIR-V word")))
+        .collect::<Vec<_>>();
+    assert_eq!(words.first().copied(), Some(0x0723_0203));
+
+    let mut decorations = 0;
+    let mut offset = 5;
+    while offset < words.len() {
+        let word_count = (words[offset] >> 16) as usize;
+        let opcode = words[offset] as u16;
+        assert!(word_count != 0, "SPIR-V instruction must advance");
+        if opcode == OP_DECORATE && word_count >= 3 && words[offset + 2] == NON_UNIFORM {
+            decorations += 1;
+        }
+        offset += word_count;
+    }
+
+    assert_eq!(offset, words.len(), "SPIR-V instructions must be complete");
+    assert!(
+        decorations >= 2,
+        "texture and sampler descriptor selections must remain nonuniform"
+    );
+    Ok(())
+}
+
+#[test]
+fn sponza_vertex_reflection_preserves_portable_primitive_identity() -> anyhow::Result<()> {
+    let case = artifacts()?
+        .iter()
+        .find(|case| case.name == "sponza")
+        .context("missing Sponza artifact")?;
+    let artifact = Artifact::decode(&case.bytes).context("decode Sponza artifact")?;
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&artifact.metadata).context("decode Sponza reflection metadata")?;
+    let reflections = metadata["reflections"]
+        .as_array()
+        .context("Sponza reflection metadata has no reflections array")?;
+
+    for target in ["Spirv", "Dxil", "Msl"] {
+        let vertex = reflections
+            .iter()
+            .find(|reflection| reflection["target"] == target && reflection["stage"] == "Vertex")
+            .with_context(|| format!("missing Sponza {target} vertex reflection"))?;
+        let parameters = vertex["reflection"]["parameters"]
+            .as_array()
+            .context("Sponza vertex reflection has no parameters array")?;
+        assert_eq!(
+            parameters
+                .iter()
+                .filter(|parameter| parameter["semantic_name"] == "primitive_ids")
+                .count(),
+            1,
+            "{target} vertex product must consume one primitive identity buffer"
+        );
+    }
+    Ok(())
+}
