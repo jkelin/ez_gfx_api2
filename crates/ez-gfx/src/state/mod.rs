@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::HashMap,
     sync::{LazyLock, Mutex},
 };
@@ -194,16 +195,50 @@ struct ContextState {
     observability: Observability,
 }
 
-type ContextArena = GenerationalArena<Option<ContextState>>;
-static CONTEXTS: LazyLock<Mutex<ContextArena>> =
+type ContextHandleArena = GenerationalArena<()>;
+static CONTEXT_HANDLES: LazyLock<Mutex<ContextHandleArena>> =
     LazyLock::new(|| Mutex::new(GenerationalArena::new()));
+struct ThreadContexts {
+    states: HashMap<LocalHandle, ContextState>,
+}
+
+impl ThreadContexts {
+    fn cleanup_for_thread_exit(&mut self) {
+        // Even if handle-arena locking fails, native states must still drain before TLS teardown.
+        if let Ok(mut handles) = CONTEXT_HANDLES.lock() {
+            for local in self.states.keys() {
+                let _ = handles.remove(*local);
+            }
+        }
+
+        for (_, state) in self.states.drain() {
+            let _ = context::cleanup_context_state(state, None);
+        }
+    }
+}
+
+impl Drop for ThreadContexts {
+    fn drop(&mut self) {
+        self.cleanup_for_thread_exit();
+    }
+}
+
+thread_local! {
+    static CONTEXTS: RefCell<ThreadContexts> = RefCell::new(ThreadContexts {
+        states: HashMap::new(),
+    });
+}
 
 mod buffers;
 mod context;
 mod frame;
 mod native;
+#[cfg(windows)]
+use native::dx12_bindings;
+#[cfg(target_vendor = "apple")]
+use native::metal_bindings;
 use native::{
-    allocate_native, completed_transfer_native, copy_native, destroy_native_texture, dx12_bindings,
+    allocate_native, completed_transfer_native, copy_native, destroy_native_texture,
     free_native_allocation, map_allocation, map_frame, map_geometry, map_hal, map_lifecycle,
     map_native_loss, map_texture, native_layouts, pipeline_layout_key, result_status,
     vulkan_bindings, wait_native_idle, write_native,
@@ -245,13 +280,16 @@ fn with_context_mut<T>(
     operation: impl FnOnce(&mut ContextState) -> Result<T, EzGfxResult>,
 ) -> Result<T, EzGfxResult> {
     let (local, _) = context_local(context)?;
-    let mut arena = CONTEXTS.lock().map_err(|_| EzGfxResult::NativeFailure)?;
-    let context = arena
-        .get_mut(local)
-        .map_err(|_| EzGfxResult::InvalidContext)?
-        .as_mut()
-        .ok_or(EzGfxResult::InvalidContext)?;
-    operation(context)
+    CONTEXTS.with(|contexts| {
+        let mut contexts = contexts
+            .try_borrow_mut()
+            .map_err(|_| EzGfxResult::NativeFailure)?;
+        let context = contexts
+            .states
+            .get_mut(&local)
+            .ok_or(EzGfxResult::InvalidContext)?;
+        operation(context)
+    })
 }
 fn context_local(handle: ContextHandle) -> Result<(LocalHandle, PackedHandle), EzGfxResult> {
     let packed = handle.packed();

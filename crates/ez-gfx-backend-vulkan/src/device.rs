@@ -86,7 +86,7 @@ impl NativeContext {
     ///
     /// # Errors
     ///
-    /// Returns an error if the Vulkan loader or requested validation layer is unavailable, instance or device setup fails, or no suitable adapter is found.
+    /// Returns an error if the Vulkan loader or requested validation layer is unavailable, or instance setup fails.
     pub fn create(
         enable_debug: bool,
         enable_validation: bool,
@@ -135,7 +135,7 @@ impl NativeContext {
         let instance = unsafe { entry.create_instance(&create, None) }.map_err(map_vk)?;
         let surface_loader = khr::surface::Instance::new(&entry, &instance);
 
-        let mut context = Self {
+        let context = Self {
             entry_loader: entry,
             instance,
             surface_loader,
@@ -165,7 +165,6 @@ impl NativeContext {
             image_available: None,
             depth_target: None,
         };
-        context.init_device(None)?;
         Ok(context)
     }
 

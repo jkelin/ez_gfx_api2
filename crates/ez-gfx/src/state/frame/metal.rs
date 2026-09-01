@@ -265,7 +265,7 @@ pub(super) fn execute_metal_frame_plan(
                         };
                         let NativeAllocation::Metal(indirect) = &context
                             .allocations
-                            .get(indirect)
+                            .get(&indirect.packed())
                             .ok_or(EzGfxResult::InvalidContext)?
                             .1
                         else {

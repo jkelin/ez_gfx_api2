@@ -1,15 +1,19 @@
 use super::{
-    AllocationRequest, Backend, CONTEXTS, CompletionToken, ContextHandle, ContextIdentity,
-    ContextOptions, ContextState, DiagnosticLevel, Dx12Context, Dx12Surface, EzGfxResult,
-    FrameRecorder, GeometryAllocation, GeometryManager, HalError, HashMap, MemoryClass,
-    NativeAllocation, NativeContext, NativeSurface, Observability, ResourceKind, RuntimePhase,
-    RuntimeRecord, RuntimeStatus, StagingAllocation, SurfaceHandle, SurfaceOptions,
-    SurfacePlatform, SurfaceRecord, SurfaceState, TextureRegistry, VulkanContext, VulkanPlatform,
-    allocate_native, completed_transfer_native, context_local, copy_native,
-    destroy_native_pipeline, destroy_native_shader, destroy_native_texture, free_native_allocation,
-    map_allocation, map_frame, map_geometry, map_hal, map_lifecycle, map_native_loss, map_texture,
-    result_status, wait_native_idle, with_context_mut, with_surface_mut, write_native,
+    AllocationRequest, Backend, CONTEXT_HANDLES, CONTEXTS, CompletionToken, ContextHandle,
+    ContextIdentity, ContextOptions, ContextState, DiagnosticLevel, EzGfxResult, FrameRecorder,
+    GeometryAllocation, GeometryManager, HalError, HashMap, MemoryClass, NativeAllocation,
+    NativeContext, NativeSurface, Observability, ResourceKind, RuntimePhase, RuntimeRecord,
+    RuntimeStatus, StagingAllocation, SurfaceHandle, SurfaceOptions, SurfacePlatform,
+    SurfaceRecord, SurfaceState, TextureRegistry, VulkanContext, VulkanPlatform, allocate_native,
+    completed_transfer_native, context_local, copy_native, destroy_native_pipeline,
+    destroy_native_shader, destroy_native_texture, free_native_allocation, map_allocation,
+    map_frame, map_geometry, map_hal, map_lifecycle, map_native_loss, map_texture, result_status,
+    wait_native_idle, with_context_mut, with_surface_mut, write_native,
 };
+#[cfg(windows)]
+use super::{Dx12Context, Dx12Surface};
+#[cfg(target_vendor = "apple")]
+use super::{MetalContext, MetalSurface};
 
 /// Creates a graphics context.
 ///
@@ -58,16 +62,26 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle, EzGfxRes
             }
         }
     };
-    let mut arena = CONTEXTS.lock().map_err(|_| EzGfxResult::NativeFailure)?;
-    let local = arena.insert(None).map_err(|_| EzGfxResult::NativeFailure)?;
+    let texture_registry = TextureRegistry::new(
+        ez_gfx_runtime::binding::MAX_TEXTURE_HEAP_CAPACITY,
+        ez_gfx_runtime::binding::MAX_TEXTURE_HEAP_CAPACITY,
+    )
+    .map_err(|_| EzGfxResult::NativeFailure)?;
+    let frame = FrameRecorder::new(1024).map_err(|_| EzGfxResult::NativeFailure)?;
+    let observability = Observability::new(1024, 256).map_err(|_| EzGfxResult::NativeFailure)?;
+    let local = CONTEXT_HANDLES
+        .lock()
+        .map_err(|_| EzGfxResult::NativeFailure)?
+        .insert(())
+        .map_err(|_| EzGfxResult::NativeFailure)?;
     let Ok(identity) = ContextIdentity::new(local) else {
-        let _ = arena.remove(local);
+        if let Ok(mut handles) = CONTEXT_HANDLES.lock() {
+            let _ = handles.remove(local);
+        }
         return Err(EzGfxResult::NativeFailure);
     };
     let handle = identity.context_handle();
-    *arena
-        .get_mut(local)
-        .map_err(|_| EzGfxResult::NativeFailure)? = Some(ContextState {
+    let state = ContextState {
         identity,
         options,
         native,
@@ -78,17 +92,13 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle, EzGfxRes
         pipelines: HashMap::new(),
         graphics_format: None,
         indirects: HashMap::new(),
-        texture_registry: TextureRegistry::new(
-            ez_gfx_runtime::binding::MAX_TEXTURE_HEAP_CAPACITY,
-            ez_gfx_runtime::binding::MAX_TEXTURE_HEAP_CAPACITY,
-        )
-        .map_err(|_| EzGfxResult::NativeFailure)?,
+        texture_registry,
         texture_ready: HashMap::new(),
         geometry: GeometryManager::new(),
         vertex_heaps: HashMap::new(),
         index_heap: None,
         staging: Vec::new(),
-        frame: FrameRecorder::new(1024).map_err(|_| EzGfxResult::NativeFailure)?,
+        frame,
         frame_resources: HashMap::new(),
         frame_native_resources: HashMap::new(),
         frame_index: None,
@@ -98,8 +108,24 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle, EzGfxRes
         last_readback: Vec::new(),
         active_surface: None,
         frame_presented: false,
-        observability: Observability::new(1024, 256).map_err(|_| EzGfxResult::NativeFailure)?,
+        observability,
+    };
+    let inserted = CONTEXTS.with(|contexts| {
+        let mut contexts = contexts
+            .try_borrow_mut()
+            .map_err(|_| EzGfxResult::NativeFailure)?;
+        if contexts.states.contains_key(&local) {
+            return Err(EzGfxResult::NativeFailure);
+        }
+        contexts.states.insert(local, state);
+        Ok(())
     });
+    if let Err(error) = inserted {
+        if let Ok(mut handles) = CONTEXT_HANDLES.lock() {
+            let _ = handles.remove(local);
+        }
+        return Err(error);
+    }
     Ok(handle)
 }
 
@@ -193,24 +219,40 @@ pub fn destroy_context(context: ContextHandle) -> EzGfxResult {
     let Ok((local, _)) = context_local(context) else {
         return EzGfxResult::InvalidContext;
     };
-    let Ok(mut arena) = CONTEXTS.lock() else {
-        return EzGfxResult::NativeFailure;
+    let owned = CONTEXTS.with(|contexts| {
+        let mut contexts = contexts
+            .try_borrow_mut()
+            .map_err(|_| EzGfxResult::NativeFailure)?;
+        contexts
+            .states
+            .get(&local)
+            .ok_or(EzGfxResult::InvalidContext)?
+            .identity
+            .check_thread()
+            .map_err(map_lifecycle)?;
+        contexts
+            .states
+            .remove(&local)
+            .ok_or(EzGfxResult::InvalidContext)
+    });
+    let owned = match owned {
+        Ok(owned) => owned,
+        Err(error) => return error,
     };
-    let Ok(slot) = arena.get(local) else {
-        return EzGfxResult::InvalidContext;
+    let failure = match CONTEXT_HANDLES.lock() {
+        Ok(mut handles) => handles
+            .remove(local)
+            .err()
+            .map(|_| EzGfxResult::NativeFailure),
+        Err(_) => Some(EzGfxResult::NativeFailure),
     };
-    let Some(identity) = slot.as_ref().map(|owned| &owned.identity) else {
-        return EzGfxResult::InvalidContext;
-    };
-    if let Err(error) = identity.check_thread() {
-        return map_lifecycle(error);
-    }
-    let Ok(Some(mut owned)) = arena.remove(local) else {
-        return EzGfxResult::InvalidContext;
-    };
-    drop(arena);
-    let mut failure = None;
 
+    cleanup_context_state(owned, failure)
+}
+pub(super) fn cleanup_context_state(
+    mut owned: ContextState,
+    mut failure: Option<EzGfxResult>,
+) -> EzGfxResult {
     // Handles become terminal before cleanup begins; later failures cannot expose partial state.
     owned.identity.invalidate_resources();
     // Vulkan reports `NotReady` only when no native device or GPU work exists before `init_device`.
@@ -280,6 +322,7 @@ pub fn destroy_context(context: ContextHandle) -> EzGfxResult {
     drop(owned);
     failure.unwrap_or(EzGfxResult::Ok)
 }
+
 /// Creates a presentation surface.
 ///
 /// # Errors

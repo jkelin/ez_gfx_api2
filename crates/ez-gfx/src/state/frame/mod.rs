@@ -1,3 +1,7 @@
+#[cfg(windows)]
+use super::dx12_bindings;
+#[cfg(target_vendor = "apple")]
+use super::metal_bindings;
 use super::{
     Access, Backend, BufferRange, ContextHandle, ContextState, DiagnosticLevel,
     DynamicPipelineState, ExecutableNode, ExecutionAction, ExecutionError, EzGfxResult, Format,
@@ -6,9 +10,9 @@ use super::{
     NativePipeline, NativeShader, NativeSurface, NativeTexture, NodeDesc, PackedHandle, PassInfo,
     PipelineKey, QueueKind, ResourceAccess, ResourceDesc, ResourceId, ResourceKind,
     ResourceLifetime, ResourceState, RuntimePhase, ShaderHandle, ShaderRecord, ShaderStage,
-    StoreOp, TextureHandle, TextureId, dx12_bindings, execute_compiled_graph, map_frame, map_hal,
-    map_lifecycle, native_layouts, pipeline_layout_key, result_status, runtime_record,
-    vulkan_bindings, with_context_mut,
+    StoreOp, TextureHandle, TextureId, execute_compiled_graph, map_frame, map_hal, map_lifecycle,
+    native_layouts, pipeline_layout_key, result_status, runtime_record, vulkan_bindings,
+    with_context_mut,
 };
 type NativeTextureMap = HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>;
 

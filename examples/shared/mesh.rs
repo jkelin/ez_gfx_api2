@@ -364,10 +364,11 @@ mod tests {
             assert_eq!(mesh.positions.len(), mesh.normals.len());
             assert!(mesh.uvs.is_empty());
             assert!(mesh.images.is_empty());
-            assert!(mesh
-                .primitives
-                .iter()
-                .all(|primitive| primitive.image.is_none()));
+            assert!(
+                mesh.primitives
+                    .iter()
+                    .all(|primitive| primitive.image.is_none())
+            );
         }
     }
 
@@ -376,9 +377,10 @@ mod tests {
         let mesh = load_textured_glb(include_bytes!("assets/sponza.glb")).unwrap();
         assert_eq!(mesh.positions.len(), mesh.uvs.len());
         assert!(!mesh.images.is_empty());
-        assert!(mesh
-            .primitives
-            .iter()
-            .any(|primitive| primitive.image.is_some()));
+        assert!(
+            mesh.primitives
+                .iter()
+                .any(|primitive| primitive.image.is_some())
+        );
     }
 }

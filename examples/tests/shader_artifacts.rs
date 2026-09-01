@@ -3,7 +3,7 @@
 use anyhow::Context as _;
 use ez_gfx_artifact::{Artifact, Stage, Target};
 use ez_gfx_compiler::compile_shader;
-use ez_gfx_core::{capability::SemanticProfile, Backend};
+use ez_gfx_core::{Backend, capability::SemanticProfile};
 use ez_gfx_runtime::shader::{RuntimeShader, ShaderLoadError};
 use std::sync::LazyLock;
 
@@ -95,22 +95,28 @@ fn runtime_compiled_metal_product_matches_the_host() -> anyhow::Result<()> {
         let artifact = Artifact::decode(bytes).with_context(|| format!("decode {name}"))?;
         #[cfg(target_vendor = "apple")]
         {
-            assert!(artifact
-                .variants
-                .iter()
-                .any(|variant| variant.target == Target::Metallib));
+            assert!(
+                artifact
+                    .variants
+                    .iter()
+                    .any(|variant| variant.target == Target::Metallib)
+            );
             assert!(RuntimeShader::load(bytes, Backend::Metal, SemanticProfile::V1).is_ok());
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            assert!(artifact
-                .variants
-                .iter()
-                .any(|variant| variant.target == Target::Msl));
-            assert!(!artifact
-                .variants
-                .iter()
-                .any(|variant| variant.target == Target::Metallib));
+            assert!(
+                artifact
+                    .variants
+                    .iter()
+                    .any(|variant| variant.target == Target::Msl)
+            );
+            assert!(
+                !artifact
+                    .variants
+                    .iter()
+                    .any(|variant| variant.target == Target::Metallib)
+            );
             assert!(matches!(
                 RuntimeShader::load(bytes, Backend::Metal, SemanticProfile::V1),
                 Err(ShaderLoadError::MissingProduct {

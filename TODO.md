@@ -71,12 +71,12 @@
 - **Impact:** Worker safety exists in isolation; applications receive no asynchronous decode/upload lifecycle.
 - **Acceptance:** `ez-gfx` submits bounded jobs, publishes decode/transcode/upload outcomes, supports cancellation, and ties GPU completion tokens to resource state; FFI exposes that lifecycle without reimplementing it.
 
-### P1 — threading and global context mutex constrain ownership
+### P1 — thread-affine context cleanup remains explicit
 
-- **Status:** Partial.
-- **Evidence:** `crates/ez-gfx-runtime/src/lifecycle.rs:27-130` enforces creator-thread, health, owner, generation, and resource-kind checks; `crates/ez-gfx/src/state/mod.rs` stores all contexts behind one global mutex. Wrong-thread destruction is rejected while preserving the context; global serialization remains.
-- **Impact:** Normal stale-handle use fails closed, but global serialization limits concurrency and cross-thread destruction can hide failures.
-- **Acceptance:** Document ownership rules, validate destruction affinity or make destruction explicitly thread-safe, surface cleanup failures, and test concurrent independent contexts.
+- **Status:** Partial — process-global state serialization is removed; cross-thread cleanup remains unsupported.
+- **Evidence:** `crates/ez-gfx/src/state/mod.rs` synchronizes only generational context-handle allocation. Non-`Send` `ContextState` stays in creator-thread-local storage; operations remain creator-thread-affine, and thread exit invalidates remaining handles before best-effort native cleanup. State tests cover wrong-thread destruction, thread-exit invalidation, and populated-state cleanup.
+- **Impact:** Independent creator threads do not share a state mutex. Cross-thread destruction is rejected, and implicit thread-exit cleanup cannot return native cleanup failures.
+- **Acceptance:** Decide whether to support ownership transfer or cleanup dispatch; if supported, preserve terminal handle invalidation, surface cleanup failures, and test concurrent independent contexts.
 
 ### P1 — platform surface and validation gaps
 

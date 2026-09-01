@@ -21,23 +21,23 @@ pub use data::{byte_len, bytes_of, slice_bytes};
     reason = "Standalone examples use different shared interfaces."
 )]
 pub use host::{
-    backend_config, backend_name, clip_y, BackendConfig, HostSurface, NativePlatform, NativeSurface,
+    BackendConfig, HostSurface, NativePlatform, NativeSurface, backend_config, backend_name, clip_y,
 };
 #[allow(
     unused_imports,
     reason = "Standalone examples use different shared interfaces."
 )]
-pub use input::{dispatch_window_input, FrameInput, SceneInput, SceneKey};
+pub use input::{FrameInput, SceneInput, SceneKey, dispatch_window_input};
 #[allow(
     unused_imports,
     reason = "Standalone examples use different shared interfaces."
 )]
-pub use lifecycle::{run, LifecycleCallbacks, LifecycleConfig};
+pub use lifecycle::{LifecycleCallbacks, LifecycleConfig, run};
 #[allow(
     unused_imports,
     reason = "Standalone examples use different shared interfaces."
 )]
-pub use observability::{drain_bounded, ObservationCounts};
+pub use observability::{ObservationCounts, drain_bounded};
 
 use anyhow::Context as _;
 use std::{ffi::OsString, path::Path, process::Command, time::Instant};
@@ -288,7 +288,7 @@ fn positive_env(name: &str, default: u32) -> anyhow::Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{benchmark_frame_limit, parse_env_flag, BenchmarkConfig};
+    use super::{BenchmarkConfig, benchmark_frame_limit, parse_env_flag};
     #[test]
     fn benchmark_limit_includes_capture_frame_and_checks_overflow() {
         assert_eq!(
@@ -299,11 +299,13 @@ mod tests {
             .unwrap(),
             6
         );
-        assert!(benchmark_frame_limit(BenchmarkConfig {
-            warmup_frames: u32::MAX,
-            measured_frames: 1
-        })
-        .is_err());
+        assert!(
+            benchmark_frame_limit(BenchmarkConfig {
+                warmup_frames: u32::MAX,
+                measured_frames: 1
+            })
+            .is_err()
+        );
     }
 
     #[test]

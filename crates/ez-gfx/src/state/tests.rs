@@ -120,6 +120,55 @@ fn destroy_context_rejects_wrong_thread_without_consuming_context() {
 }
 
 #[cfg(windows)]
+fn thread_exit_context() -> ContextHandle {
+    dx12_context()
+}
+
+#[cfg(target_vendor = "apple")]
+fn thread_exit_context() -> ContextHandle {
+    create_context(ContextOptions::new_for_backend(0, 0, 2, Backend::Metal).unwrap()).unwrap()
+}
+
+#[cfg(any(windows, target_vendor = "apple"))]
+#[test]
+fn recursive_context_access_returns_native_failure_without_panicking() {
+    let context = thread_exit_context();
+
+    let nested = with_context_mut(context, |_| {
+        with_context_mut(context, |_| Ok::<_, EzGfxResult>(()))
+    });
+
+    assert_eq!(nested, Err(EzGfxResult::NativeFailure));
+    assert_eq!(destroy_context(context), EzGfxResult::Ok);
+}
+
+#[cfg(any(windows, target_vendor = "apple"))]
+#[test]
+fn thread_exit_cleans_populated_context_state_before_drop() {
+    let context = thread_exit_context();
+    let _structured = acquire_structured(context, 64).unwrap();
+    let mut thread_contexts = CONTEXTS.with(|contexts| ThreadContexts {
+        states: std::mem::take(&mut contexts.borrow_mut().states),
+    });
+
+    thread_contexts.cleanup_for_thread_exit();
+
+    assert!(thread_contexts.states.is_empty());
+    assert_eq!(wait_idle(context), EzGfxResult::InvalidContext);
+}
+#[cfg(any(windows, target_vendor = "apple"))]
+#[test]
+fn creator_thread_exit_invalidates_context_handle() {
+    let stale = std::thread::spawn(thread_exit_context).join().unwrap();
+    // Join completes thread-local teardown before stale lookup and possible slot reuse.
+
+    assert_eq!(wait_idle(stale), EzGfxResult::InvalidContext);
+    let current = thread_exit_context();
+    assert_ne!(current, stale);
+    assert_eq!(destroy_context(current), EzGfxResult::Ok);
+}
+
+#[cfg(windows)]
 #[test]
 fn destroyed_resource_handles_are_rejected_by_other_owners() {
     let first = dx12_context();
