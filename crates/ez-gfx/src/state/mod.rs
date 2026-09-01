@@ -203,23 +203,47 @@ struct ThreadContexts {
 }
 
 impl ThreadContexts {
-    fn cleanup_for_thread_exit(&mut self) {
-        // Even if handle-arena locking fails, native states must still drain before TLS teardown.
-        if let Ok(mut handles) = CONTEXT_HANDLES.lock() {
-            for local in self.states.keys() {
-                let _ = handles.remove(*local);
+    fn cleanup_for_thread_exit(&mut self) -> EzGfxResult {
+        // Handles invalidate synchronously before platform-specific abandonment handling.
+        let result = match CONTEXT_HANDLES.lock() {
+            Ok(mut handles) => {
+                let mut result = EzGfxResult::Ok;
+                for local in self.states.keys() {
+                    if handles.remove(*local).is_err() {
+                        result = EzGfxResult::NativeFailure;
+                    }
+                }
+                result
             }
+            Err(_) => EzGfxResult::NativeFailure,
+        };
+
+        #[cfg(windows)]
+        {
+            for (_, state) in self.states.drain() {
+                // Windows TLS destructors run under loader lock; native cleanup or joining can deadlock.
+                std::mem::forget(state);
+            }
+            result
         }
 
-        for (_, state) in self.states.drain() {
-            let _ = context::cleanup_context_state(state, None);
+        #[cfg(not(windows))]
+        {
+            let mut result = result;
+            for (_, state) in self.states.drain() {
+                let cleanup = context::cleanup_context_state(state, None);
+                if result == EzGfxResult::Ok {
+                    result = cleanup;
+                }
+            }
+            result
         }
     }
 }
 
 impl Drop for ThreadContexts {
     fn drop(&mut self) {
-        self.cleanup_for_thread_exit();
+        let _ = self.cleanup_for_thread_exit();
     }
 }
 

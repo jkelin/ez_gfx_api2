@@ -75,10 +75,10 @@
 
 ### P1 — thread-affine context cleanup remains explicit
 
-- **Status:** Partial — process-global state serialization is removed; cross-thread cleanup remains unsupported.
-- **Evidence:** `crates/ez-gfx/src/state/mod.rs` synchronizes only generational context-handle allocation. Non-`Send` `ContextState` stays in creator-thread-local storage; operations remain creator-thread-affine, and thread exit invalidates remaining handles before best-effort native cleanup. State tests cover wrong-thread destruction, thread-exit invalidation, and populated-state cleanup.
-- **Impact:** Independent creator threads do not share a state mutex. Cross-thread destruction is rejected, and implicit thread-exit cleanup cannot return native cleanup failures.
-- **Acceptance:** Decide whether to support ownership transfer or cleanup dispatch; if supported, preserve terminal handle invalidation, surface cleanup failures, and test concurrent independent contexts.
+- **Status:** Partial — Windows TLS abandonment is safe, but cross-thread explicit destruction and observable implicit cleanup failures remain unsupported.
+- **Evidence:** `crates/ez-gfx/src/state/mod.rs` synchronizes only generational context-handle allocation. `ContextState` stays in creator-thread-local storage and operations remain creator-thread-affine. Normal thread TLS teardown invalidates handles synchronously; `ExitProcess` may terminate other threads without running their TLS destructors. Windows deliberately retains each entire abandoned context until process termination because DX12/COM cleanup under loader lock can deadlock, while non-Windows normal TLS teardown retains synchronous best-effort cleanup. State tests cover wrong-thread destruction, populated-state invalidation, and non-hanging creator-thread exit.
+- **Impact:** Independent creator threads do not share a state mutex. Windows callers must explicitly destroy contexts for any reclamation before process exit and for cleanup error reporting; cross-thread destruction is rejected, and implicit cleanup cannot report failures.
+- **Acceptance:** Support cross-thread explicit destruction and surface implicit cleanup failures without performing or joining native cleanup from Windows TLS destructors; preserve terminal handle invalidation and concurrent independent-context behavior.
 
 ### P1 — platform surface and validation gaps
 

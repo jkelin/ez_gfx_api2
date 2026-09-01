@@ -144,23 +144,19 @@ fn recursive_context_access_returns_native_failure_without_panicking() {
 
 #[cfg(any(windows, target_vendor = "apple"))]
 #[test]
-fn thread_exit_cleans_populated_context_state_before_drop() {
+fn thread_exit_invalidates_populated_context_handle() {
     let context = thread_exit_context();
     let _structured = acquire_structured(context, 64).unwrap();
-    let mut thread_contexts = CONTEXTS.with(|contexts| ThreadContexts {
-        states: std::mem::take(&mut contexts.borrow_mut().states),
-    });
+    let cleanup = CONTEXTS.with(|contexts| contexts.borrow_mut().cleanup_for_thread_exit());
 
-    thread_contexts.cleanup_for_thread_exit();
-
-    assert!(thread_contexts.states.is_empty());
+    assert_eq!(cleanup, EzGfxResult::Ok);
     assert_eq!(wait_idle(context), EzGfxResult::InvalidContext);
 }
 #[cfg(any(windows, target_vendor = "apple"))]
 #[test]
-fn creator_thread_exit_invalidates_context_handle() {
+fn creator_thread_exit_returns_and_invalidates_context_handle() {
     let stale = std::thread::spawn(thread_exit_context).join().unwrap();
-    // Join completes thread-local teardown before stale lookup and possible slot reuse.
+    // Join completes thread-local abandonment before stale lookup and possible slot reuse.
 
     assert_eq!(wait_idle(stale), EzGfxResult::InvalidContext);
     let current = thread_exit_context();
