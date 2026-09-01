@@ -136,7 +136,7 @@ impl NativeContext {
         let surface_loader = khr::surface::Instance::new(&entry, &instance);
 
         let context = Self {
-            entry_loader: entry,
+            _entry_loader: entry,
             instance,
             surface_loader,
             physical_device: None,
@@ -182,7 +182,12 @@ impl NativeContext {
         if window.is_null() || display.is_null() {
             return Err(HalError::InvalidArgument);
         }
-        let loader = khr::win32_surface::Instance::new(&self.entry_loader, &self.instance);
+        let Self {
+            _entry_loader: entry_loader,
+            instance,
+            ..
+        } = self;
+        let loader = khr::win32_surface::Instance::new(entry_loader, instance);
         let create = vk::Win32SurfaceCreateInfoKHR::default()
             .hwnd(window as isize)
             .hinstance(display as isize);

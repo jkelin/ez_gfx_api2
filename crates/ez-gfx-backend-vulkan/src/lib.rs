@@ -347,7 +347,8 @@ impl Drop for PendingDevice {
 
 /// Vulkan instance, admitted device, queues, allocators, and frame state.
 pub struct NativeContext {
-    entry_loader: Entry,
+    // Retain ash's dynamically loaded Vulkan library until all instance/device function pointers are dropped.
+    _entry_loader: Entry,
     instance: Instance,
     surface_loader: khr::surface::Instance,
     physical_device: Option<vk::PhysicalDevice>,

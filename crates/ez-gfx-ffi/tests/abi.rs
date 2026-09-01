@@ -482,7 +482,7 @@ fn context_creation_rejects_boundary_inputs_before_native_calls() {
 
 #[cfg(windows)]
 #[test]
-fn context_lifecycle_admits_a_real_vulkan_device_and_invalidates_destroyed_handle() {
+fn context_lifecycle_rejects_cross_thread_destroy_and_invalidates_destroyed_handle() {
     let desc = EzGfxContextDesc {
         enable_debug: 0,
         enable_validation: 0,
@@ -500,7 +500,7 @@ fn context_lifecycle_admits_a_real_vulkan_device_and_invalidates_destroyed_handl
     std::thread::spawn(move || ez_gfx_context_destroy(context))
         .join()
         .unwrap();
-    assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
+    assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::NotReady);
     ez_gfx_context_destroy(context);
     assert_eq!(
         ez_gfx_context_wait_idle(context),

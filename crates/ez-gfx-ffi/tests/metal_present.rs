@@ -3,7 +3,10 @@
 
 use std::{ffi::CString, path::Path};
 
-use ez_gfx_artifact::{Artifact, Provenance, Stage, Target, TargetVariant};
+use ez_gfx_artifact::{
+    AppleArchitecture, ApplePlatform, Artifact, CompatibilityVersion, MetalCompatibility,
+    Provenance, Stage, Target, TargetCompatibility, TargetVariant,
+};
 use ez_gfx_ffi::{
     EzGfxBackendContextDesc, EzGfxDrawIndexedCommand, EzGfxResult, EzGfxSurfaceDesc,
     EzGfxTextureDesc, ez_gfx_acquire_indirect, ez_gfx_begin_render, ez_gfx_context_create_backend,
@@ -400,6 +403,26 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
 
 // The test requires Xcode's offline Metal compiler; runtime code still loads metallib bytes only.
 fn graphics_artifact(root: &Path) -> Vec<u8> {
+    // Portable products use canonical compatibility; the exercised Metal product is a metallib,
+    // not source MSL, so it carries the concrete host architecture and offline library contract.
+    let compatibility = |target| match target {
+        Target::Metallib => TargetCompatibility::MetalLibrary {
+            metal: MetalCompatibility {
+                platform: ApplePlatform::MacOs,
+                architecture: match std::env::consts::ARCH {
+                    "aarch64" => AppleArchitecture::Aarch64,
+                    "x86_64" => AppleArchitecture::X86_64,
+                    _ => panic!("unsupported Apple architecture"),
+                },
+                minimum_os: CompatibilityVersion::new(14, 0),
+                sdk: CompatibilityVersion::new(15, 0),
+                language: CompatibilityVersion::new(3, 0),
+                library: CompatibilityVersion::new(1, 0),
+                toolchain: "apple-clang-16".into(),
+            },
+        },
+        _ => TargetCompatibility::portable(target).unwrap(),
+    };
     let source = root.join("present.metal");
     let library = root.join("present.metallib");
     std::fs::write(
@@ -443,16 +466,35 @@ kernel void computemain(uint thread_id [[thread_position_in_grid]]) {
         (Stage::Fragment, "fragmentmain"),
         (Stage::Compute, "computemain"),
     ] {
-        variants
-            .push(TargetVariant::new(Target::Spirv, stage, entry, "ez-gfx-v1", vec![1]).unwrap());
-        variants
-            .push(TargetVariant::new(Target::Dxil, stage, entry, "ez-gfx-v1", vec![1]).unwrap());
+        variants.push(
+            TargetVariant::new(
+                Target::Spirv,
+                stage,
+                entry,
+                "ez-gfx-v1",
+                compatibility(Target::Spirv),
+                vec![1],
+            )
+            .unwrap(),
+        );
+        variants.push(
+            TargetVariant::new(
+                Target::Dxil,
+                stage,
+                entry,
+                "ez-gfx-v1",
+                compatibility(Target::Dxil),
+                vec![1],
+            )
+            .unwrap(),
+        );
         variants.push(
             TargetVariant::new(
                 Target::Metallib,
                 stage,
                 entry,
                 "ez-gfx-v1",
+                compatibility(Target::Metallib),
                 metallib.clone(),
             )
             .unwrap(),

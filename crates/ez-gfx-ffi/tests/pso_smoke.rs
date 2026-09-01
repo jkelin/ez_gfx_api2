@@ -3,8 +3,7 @@
 
 use std::ffi::CString;
 
-use ez_gfx_artifact::{Stage, Target};
-use ez_gfx_compiler::{CompilationRequest, CompilerConfig, CompilerError, TargetRequest};
+use ez_gfx_compiler::{CompilerError, Target, compile_shader};
 use ez_gfx_ffi::{
     EzGfxBackendContextDesc, EzGfxBinding, EzGfxResult, ez_gfx_context_create_backend,
     ez_gfx_context_destroy, ez_gfx_context_wait_idle, ez_gfx_frame_begin, ez_gfx_frame_submit,
@@ -43,22 +42,12 @@ void main(uint3 id: SV_DispatchThreadID) { values[id.x] += 1; }
     )
     .unwrap();
 
-    let mut request = CompilationRequest::new(
-        source,
-        root.join("out"),
-        vec![
-            TargetRequest::new(Target::Spirv, Stage::Compute, "main", "spirv_1_5").unwrap(),
-            TargetRequest::new(Target::Dxil, Stage::Compute, "main", "sm_6_5").unwrap(),
-            TargetRequest::new(Target::Msl, Stage::Compute, "main", "metal_3_0").unwrap(),
-        ],
-    );
-    request.release_complete = false;
-    let artifact = match ez_gfx_compiler::compile(&CompilerConfig::new(""), &request) {
-        Ok(artifact) => artifact,
-        Err(CompilerError::NativeUnavailable) => return,
-        Err(error) => panic!("shader compilation failed: {error}"),
-    };
-    let artifact = artifact.encode().unwrap();
+    let artifact =
+        match compile_shader(&source, &[Target::Spirv, Target::Dxil, Target::Metal], true) {
+            Ok(artifact) => artifact,
+            Err(CompilerError::NativeUnavailable) => return,
+            Err(error) => panic!("shader compilation failed: {error}"),
+        };
 
     let desc = EzGfxBackendContextDesc {
         enable_debug: 0,

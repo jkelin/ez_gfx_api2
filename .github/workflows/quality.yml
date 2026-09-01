@@ -96,9 +96,26 @@ jobs:
       # proves Lavapipe availability but explicitly compiles, rather than faking, runtime coverage.
       - name: Require Linux Lavapipe capability
         if: matrix.backend == 'vulkan-linux'
-        env:
-          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-        run: vulkaninfo --summary
+        shell: bash
+        run: |
+          lavapipe_icd=
+          while IFS= read -r installed_path; do
+            case "$installed_path" in
+              */vulkan/icd.d/lvp*.json)
+                if [[ -n "$lavapipe_icd" ]]; then
+                  printf 'Found multiple Lavapipe ICD manifests: %s and %s\n' \
+                    "$lavapipe_icd" "$installed_path" >&2
+                  exit 1
+                fi
+                lavapipe_icd="$installed_path"
+                ;;
+            esac
+          done < <(dpkg-query --listfiles mesa-vulkan-drivers)
+          if [[ -z "$lavapipe_icd" || ! -f "$lavapipe_icd" ]]; then
+            printf 'Could not locate the installed Lavapipe ICD manifest\n' >&2
+            exit 1
+          fi
+          VK_DRIVER_FILES="$lavapipe_icd" vulkaninfo --summary
       - name: Test Linux Vulkan backend; compile unsupported native runtime suites
         if: matrix.backend == 'vulkan-linux'
         run: |
@@ -107,11 +124,21 @@ jobs:
           cargo test -p ez-gfx-examples --test smoke --no-run
           cargo build -p ez-gfx-backend-vulkan
 
+      - name: Expose Windows Vulkan tools
+        if: matrix.backend == 'vulkan-windows'
+        shell: pwsh
+        run: |
+          $vulkanTools = Join-Path $env:VULKAN_SDK 'Bin'
+          $vulkanInfo = Join-Path $vulkanTools 'vulkaninfoSDK.exe'
+          if (-not (Test-Path -LiteralPath $vulkanInfo -PathType Leaf)) {
+            throw "Vulkan SDK tools are missing: $vulkanInfo"
+          }
+          $vulkanTools | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Require Windows software Vulkan capability
         if: matrix.backend == 'vulkan-windows'
         env:
           VK_DRIVER_FILES: C:\swiftshader\vk_swiftshader_icd.json
-        run: vulkaninfo --summary
+        run: vulkaninfoSDK.exe --summary
       - name: Test Windows Vulkan backend and native example scene suite
         if: matrix.backend == 'vulkan-windows'
         env:
