@@ -144,9 +144,9 @@ jobs:
           $ErrorActionPreference = "Stop"
           $runtime = (Resolve-Path $env:RUNTIME_DIR).Path
           $compiler = (Resolve-Path $env:COMPILER_DIR).Path
-          $build = Join-Path $env:RUNNER_TEMP "ez-gfx-structured-cube-package"
-          $artifact = Join-Path $build "structured_cube.ezgfxshader"
-          cmake -S examples/c/structured_cube -B $build `
+          $build = Join-Path $env:RUNNER_TEMP "ez-gfx-textured-cube-package"
+          $artifact = Join-Path $build "textured_cube.ezgfxshader"
+          cmake -S examples/c/textured_cube -B $build `
             "-DEZ_GFX_INCLUDE_DIR=$runtime" `
             "-DEZ_GFX_FFI_LIBRARY=$(Join-Path $runtime 'ez_gfx_ffi.dll.lib')" `
             "-DEZ_GFX_FFI_DLL=$(Join-Path $runtime 'ez_gfx_ffi.dll')" `

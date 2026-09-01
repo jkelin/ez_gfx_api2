@@ -90,6 +90,47 @@ fn artifact(metal: Target) -> Vec<u8> {
     .encode()
     .unwrap()
 }
+#[test]
+fn partial_artifact_loads_each_requested_backend_and_rejects_missing_backends() {
+    for (target, available_backend) in [
+        (Target::Spirv, Backend::Vulkan),
+        (Target::Dxil, Backend::Dx12),
+        (Target::Metallib, Backend::Metal),
+    ] {
+        let bytes = Artifact::new(
+            metadata(&[Stage::Compute]),
+            Provenance::new("slangc", "2026.16", vec![], "host"),
+            vec![
+                TargetVariant::new(
+                    target,
+                    Stage::Compute,
+                    "main",
+                    "ez-gfx-v1",
+                    compatibility(target),
+                    vec![target as u8],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+
+        assert!(Artifact::decode(&bytes).is_ok());
+        assert!(load(&bytes, available_backend).is_ok());
+        for missing_backend in [Backend::Vulkan, Backend::Dx12, Backend::Metal]
+            .into_iter()
+            .filter(|backend| *backend != available_backend)
+        {
+            assert_eq!(
+                load(&bytes, missing_backend),
+                Err(ShaderLoadError::MissingProduct {
+                    stage: Stage::Compute
+                })
+            );
+        }
+    }
+}
 
 fn artifact_with_metadata(metadata: Vec<u8>) -> Vec<u8> {
     let variants = [Target::Spirv, Target::Dxil, Target::Metallib]

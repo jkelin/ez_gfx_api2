@@ -34,17 +34,17 @@ pub enum Stage {
     TessellationEvaluation = 6,
 }
 
-/// Binary targets supported by shader artifacts.
+/// Shader products supported by shader artifacts.
 #[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 #[repr(u8)]
 pub enum Target {
-    /// SPIR-V binary.
+    /// SPIR-V binary product.
     Spirv = 1,
-    /// DXIL binary.
+    /// DXIL binary product.
     Dxil = 2,
-    /// Metal Shading Language source or binary.
+    /// Portable Metal Shading Language source.
     Msl = 3,
-    /// Metal library binary.
+    /// Compiled Metal library binary.
     Metallib = 4,
 }
 
@@ -361,18 +361,19 @@ pub struct Artifact {
     pub metadata: Vec<u8>,
     /// Compiler provenance for the artifact.
     pub provenance: Provenance,
-    /// Target variants with complete cross-target coverage.
+    /// Target variants with the same nonempty concrete target-product set for every stage.
     pub variants: Vec<TargetVariant>,
     digest: [u8; 32],
 }
 
 impl Artifact {
-    /// Validates metadata, provenance, uniqueness, stage entry points, and target coverage.
+    /// Validates metadata, provenance, uniqueness, stage entry points, and uniform selected target
+    /// products across every declared stage.
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid metadata/provenance, invalid variant count,
-    /// duplicate variants or stages, incomplete target coverage, or archive serialization failure.
+    /// Returns an error for invalid metadata/provenance, invalid variant count, duplicate variants
+    /// or stages, inconsistent stage target coverage, or archive serialization failure.
     pub fn new(
         metadata: Vec<u8>,
         provenance: Provenance,
@@ -658,13 +659,19 @@ fn validate_payload(
 
     let mut seen = BTreeSet::new();
     let mut stages = BTreeMap::new();
+    let mut selected_targets = 0_u8;
     for variant in variants {
         validate_variant(variant)?;
         validate_compatibility(variant.target, &variant.compatibility)?;
-        if let Some(entry) = stages.insert(variant.stage, variant.entry_point.as_str())
-            && entry != variant.entry_point
-        {
-            return Err(ArtifactError::DuplicateStage(variant.stage));
+        let target_bit = 1_u8 << (variant.target as u8 - 1);
+        selected_targets |= target_bit;
+        if let Some((entry, targets)) = stages.get_mut(&variant.stage) {
+            if *entry != variant.entry_point.as_str() {
+                return Err(ArtifactError::DuplicateStage(variant.stage));
+            }
+            *targets |= target_bit;
+        } else {
+            stages.insert(variant.stage, (variant.entry_point.as_str(), target_bit));
         }
         if !seen.insert((
             variant.target,
@@ -675,28 +682,9 @@ fn validate_payload(
             return Err(ArtifactError::DuplicateVariant);
         }
     }
-
-    for (&stage, &entry) in &stages {
-        for target in [Target::Spirv, Target::Dxil] {
-            if !variants
-                .iter()
-                .any(|variant| variant.stage == stage && variant.target == target)
-            {
-                return Err(ArtifactError::MissingCoverage {
-                    entry: entry.to_owned(),
-                    stage,
-                    target,
-                });
-            }
-        }
-        if !variants.iter().any(|variant| {
-            variant.stage == stage && matches!(variant.target, Target::Msl | Target::Metallib)
-        }) {
-            return Err(ArtifactError::MissingCoverage {
-                entry: entry.to_owned(),
-                stage,
-                target: Target::Metallib,
-            });
+    for (&stage, (_, targets)) in &stages {
+        if *targets != selected_targets {
+            return Err(ArtifactError::InconsistentTargetCoverage { stage });
         }
     }
     Ok(())
@@ -753,14 +741,10 @@ pub enum ArtifactError {
     DuplicateVariant,
     /// A stage names more than one logical entry point.
     DuplicateStage(Stage),
-    /// A logical entry point/stage lacks a required backend target.
-    MissingCoverage {
-        /// Entry-point name missing target coverage.
-        entry: String,
-        /// Shader stage missing target coverage.
+    /// A stage does not contain the artifact's exact selected concrete target-product set.
+    InconsistentTargetCoverage {
+        /// Stage whose concrete target-product set differs from the artifact union.
         stage: Stage,
-        /// Backend target missing from the artifact.
-        target: Target,
     },
     /// The encoded digest does not match its content.
     DigestMismatch,

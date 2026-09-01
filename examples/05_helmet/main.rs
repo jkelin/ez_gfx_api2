@@ -1,36 +1,8 @@
 //! Helmet model using safe ez-gfx context, resource, and frame APIs.
-#![allow(
-    clippy::borrow_as_ptr,
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::float_cmp,
-    clippy::ignored_unit_patterns,
-    clippy::map_unwrap_or,
-    clippy::match_overlapping_arm,
-    clippy::needless_pass_by_value,
-    clippy::redundant_closure_for_method_calls,
-    clippy::semicolon_if_nothing_returned,
-    clippy::type_complexity,
-    clippy::unused_self,
-    clippy::wildcard_imports,
-    reason = "The inline renderer preserves fixed graphics ABI and callback contracts."
-)]
 mod renderer {
-    use crate::shared;
-    use crate::shared::{FrameInput, SceneInput};
-    use crate::shared::{
-        math::{ClipY, OrbitCamera, perspective, row_major},
-        mesh::{BasicPrimitive, basic_primitives, load_geometry_glb},
-    };
+    use crate::shared::{input::*, math::*, mesh::*, *};
     use anyhow::Context as _;
-    use ez_gfx::{
-        ContextHandle, DynamicPipelineState, EzGfxResult, IndirectBufferHandle, PublicBinding,
-        ResourceIdentity, ShaderHandle, StructuredBufferHandle, acquire_indirect,
-        acquire_structured, create_index_heap, destroy_index_heap, destroy_shader, load_shader,
-        release_indirect, release_structured, render_add_compute, render_add_graphics,
-        set_indirect_count, upload_indices, write_structured,
-    };
+    use ez_gfx::*;
     use glam::{DVec2, Mat4, Vec3};
 
     #[repr(C)]
@@ -43,9 +15,6 @@ mod renderer {
 
     pub(super) struct ModelScene {
         shader: ShaderHandle,
-        positions: StructuredBufferHandle,
-        normals: StructuredBufferHandle,
-        primitives: StructuredBufferHandle,
         indirect: IndirectBufferHandle,
         camera: OrbitCamera,
         clip_y: ClipY,
@@ -58,11 +27,20 @@ mod renderer {
     }
 
     impl ModelScene {
-        #[allow(
-            clippy::too_many_lines,
-            reason = "The example keeps every safe resource acquisition, binding, and failure cleanup visible in one linear flow."
-        )]
         pub(super) fn create(context: ContextHandle, clip_y: ClipY) -> anyhow::Result<Self> {
+            let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .context("examples package has no workspace parent")?;
+            let shader_bytes = ez_gfx_compiler::compile_shader(
+                &workspace_root.join("examples/05_helmet/05_helmet.slang"),
+                &[
+                    ez_gfx_compiler::Target::Spirv,
+                    ez_gfx_compiler::Target::Dxil,
+                    ez_gfx_compiler::Target::Metal,
+                ],
+                !cfg!(target_vendor = "apple"),
+            )
+            .context("compile helmet shader")?;
             let mesh = load_geometry_glb(include_bytes!("helmet.glb"))?;
             let primitive_count =
                 u32::try_from(mesh.primitives.len()).context("primitive count exceeds ABI")?;
@@ -75,124 +53,54 @@ mod renderer {
             if primitive_bytes > 16 * 1024 * 1024 {
                 anyhow::bail!("primitive records exceed ABI boundary");
             }
-            let index_bytes = shared::byte_len(&mesh.indices)?;
-            let positions_bytes = shared::byte_len(&mesh.positions)?;
-            let normals_bytes = shared::byte_len(&mesh.normals)?;
+            let index_bytes = byte_len(&mesh.indices)?;
+            let positions_bytes = byte_len(&mesh.positions)?;
+            let normals_bytes = byte_len(&mesh.normals)?;
             status(
                 create_index_heap(context, index_bytes),
                 "create model index heap",
             )?;
-            let first_index = match upload_indices(
+            let first_index = upload_indices(
                 context,
                 mesh.indices.len() as u32,
-                shared::slice_bytes(&mesh.indices),
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    destroy_index_heap(context);
-                    return Err(anyhow::anyhow!("{error:?}").context("upload model indices"));
-                }
-            };
-            let records = match basic_primitives(&mesh, first_index) {
-                Ok(records) => records,
-                Err(error) => {
-                    destroy_index_heap(context);
-                    return Err(error);
-                }
-            };
-            let positions = match acquire_structured(context, positions_bytes) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    destroy_index_heap(context);
-                    return Err(anyhow::anyhow!("{error:?}").context("acquire positions"));
-                }
-            };
-            if let Err(error) = status(
-                write_structured(context, positions, shared::slice_bytes(&mesh.positions)),
+                slice_bytes(&mesh.indices),
+            )
+            .map_err(|error| anyhow::anyhow!("{error:?}"))
+            .context("upload model indices")?;
+            let records = basic_primitives(&mesh, first_index)?;
+            let positions = acquire_structured(context, positions_bytes)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))
+                .context("acquire positions")?;
+            status(
+                write_structured(context, positions, slice_bytes(&mesh.positions)),
                 "upload positions",
-            ) {
-                release_structured(context, positions);
-                destroy_index_heap(context);
-                return Err(error);
-            }
-            let normals = match acquire_structured(context, normals_bytes) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    release_structured(context, positions);
-                    destroy_index_heap(context);
-                    return Err(anyhow::anyhow!("{error:?}").context("acquire normals"));
-                }
-            };
-            if let Err(error) = status(
-                write_structured(context, normals, shared::slice_bytes(&mesh.normals)),
+            )?;
+            let normals = acquire_structured(context, normals_bytes)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))
+                .context("acquire normals")?;
+            status(
+                write_structured(context, normals, slice_bytes(&mesh.normals)),
                 "upload normals",
-            ) {
-                release_structured(context, normals);
-                release_structured(context, positions);
-                destroy_index_heap(context);
-                return Err(error);
-            }
-            let primitives = match acquire_structured(context, primitive_bytes) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    release_structured(context, normals);
-                    release_structured(context, positions);
-                    destroy_index_heap(context);
-                    return Err(anyhow::anyhow!("{error:?}").context("acquire primitives"));
-                }
-            };
-            if let Err(error) = status(
-                write_structured(context, primitives, shared::slice_bytes(&records)),
+            )?;
+            let primitives = acquire_structured(context, primitive_bytes)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))
+                .context("acquire primitives")?;
+            status(
+                write_structured(context, primitives, slice_bytes(&records)),
                 "upload primitives",
-            ) {
-                release_structured(context, primitives);
-                release_structured(context, normals);
-                release_structured(context, positions);
-                destroy_index_heap(context);
-                return Err(error);
-            }
-            let indirect = match acquire_indirect(context, primitive_count) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    release_structured(context, primitives);
-                    release_structured(context, normals);
-                    release_structured(context, positions);
-                    destroy_index_heap(context);
-                    return Err(
-                        anyhow::anyhow!("{error:?}").context("acquire compute draw commands")
-                    );
-                }
-            };
-            if let Err(error) = status(
+            )?;
+            let indirect = acquire_indirect(context, primitive_count)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))
+                .context("acquire compute draw commands")?;
+            status(
                 set_indirect_count(context, indirect, primitive_count),
                 "set compute draw count",
-            ) {
-                release_indirect(context, indirect);
-                release_structured(context, primitives);
-                release_structured(context, normals);
-                release_structured(context, positions);
-                destroy_index_heap(context);
-                return Err(error);
-            }
-            let shader = match load_shader(
-                context,
-                include_bytes!(concat!(env!("OUT_DIR"), "/05_helmet.ezgfxshader")),
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    release_indirect(context, indirect);
-                    release_structured(context, primitives);
-                    release_structured(context, normals);
-                    release_structured(context, positions);
-                    destroy_index_heap(context);
-                    return Err(anyhow::anyhow!("{error:?}").context("load helmet artifact"));
-                }
-            };
+            )?;
+            let shader = load_shader(context, &shader_bytes)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))
+                .context("load helmet artifact")?;
             Ok(Self {
                 shader,
-                positions,
-                normals,
-                primitives,
                 indirect,
                 camera: OrbitCamera::new(35.0_f32.to_radians(), 22.0_f32.to_radians(), 5.0),
                 clip_y,
@@ -256,7 +164,7 @@ mod renderer {
                     self.shader,
                     [self.primitive_count, 1, 1],
                     bindings,
-                    shared::bytes_of(&self.push),
+                    bytes_of(&self.push),
                 ),
                 "record compute pipeline",
             )?;
@@ -267,18 +175,10 @@ mod renderer {
                     self.indirect,
                     bindings,
                     DynamicPipelineState::from_abi(0, 0, 0, 0).unwrap(),
-                    shared::bytes_of(&self.push),
+                    bytes_of(&self.push),
                 ),
                 "record model graphics pipeline",
             )
-        }
-        pub(super) fn destroy(self, context: ContextHandle) {
-            release_indirect(context, self.indirect);
-            release_structured(context, self.primitives);
-            release_structured(context, self.normals);
-            release_structured(context, self.positions);
-            destroy_index_heap(context);
-            destroy_shader(context, self.shader);
         }
     }
 
@@ -289,20 +189,14 @@ mod renderer {
         }
     }
 }
+
 #[path = "../shared/mod.rs"]
 mod shared;
 
 use anyhow::Context as _;
-use ez_gfx::{
-    Backend, ContextHandle, ContextOptions, EzGfxResult, SurfaceHandle, SurfaceOptions,
-    SurfacePlatform, begin_render, create_context, create_surface, destroy_context,
-    destroy_surface, finish_render, frame_readback, init_device, poll_diagnostic,
-    poll_runtime_event, resize_surface, set_snapshot_cache, wait_idle,
-};
+use ez_gfx::*;
 use renderer::ModelScene as ExampleScene;
-use shared::{
-    FrameInput, LifecycleCallbacks, LifecycleConfig, NativePlatform, NativeSurface, SceneInput,
-};
+use shared::*;
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
@@ -311,16 +205,16 @@ struct Example {
     resources: Option<ExampleScene>,
     context: Option<ContextHandle>,
     surface: Option<SurfaceHandle>,
-    benchmark: shared::BenchmarkRunner,
+    benchmark: BenchmarkRunner,
 }
 
 impl Example {
-    fn new(benchmark: Option<shared::BenchmarkConfig>) -> Self {
+    fn new(benchmark: Option<BenchmarkConfig>) -> Self {
         Self {
             resources: None,
             context: None,
             surface: None,
-            benchmark: shared::BenchmarkRunner::new(benchmark),
+            benchmark: BenchmarkRunner::new(benchmark),
         }
     }
 
@@ -334,17 +228,16 @@ impl Example {
 }
 
 impl LifecycleCallbacks for Example {
-    type Report = shared::ProgramReport;
+    type Report = ProgramReport;
 
     fn initialize(&mut self, native: NativeSurface, width: u32, height: u32) -> anyhow::Result<()> {
-        let (backend, backend_name) = backend()?;
-        let platform = match native.platform {
-            NativePlatform::Win32 => SurfacePlatform::Win32,
-            NativePlatform::MetalLayer => SurfacePlatform::MetalLayer,
-        };
+        let config = backend_config(native.platform)?;
+        let backend = config.backend;
+        let backend_name = config.name;
+        let platform = config.platform;
         let context = create_context(ContextOptions {
-            enable_debug: shared::env_flag("EZ_GFX_EXAMPLE_DEBUG")?,
-            enable_validation: shared::env_flag("EZ_GFX_EXAMPLE_VALIDATION")?,
+            enable_debug: env_flag("EZ_GFX_EXAMPLE_DEBUG")?,
+            enable_validation: env_flag("EZ_GFX_EXAMPLE_VALIDATION")?,
             surface_platform: platform,
             backend,
         })
@@ -373,7 +266,10 @@ impl LifecycleCallbacks for Example {
             resize_surface(self.context(), self.surface(), width, height),
             &format!("initialize {backend_name} swapchain"),
         )?;
-        self.resources = Some(ExampleScene::create(self.context(), clip_y(backend))?);
+        self.resources = Some(ExampleScene::create(
+            self.context(),
+            shared::clip_y(backend),
+        )?);
         Ok(())
     }
 
@@ -417,16 +313,11 @@ impl LifecycleCallbacks for Example {
         Ok(())
     }
 
-    fn capture(
-        &mut self,
-        width: u32,
-        height: u32,
-        frames: u32,
-    ) -> anyhow::Result<shared::ProgramReport> {
+    fn capture(&mut self, width: u32, height: u32, frames: u32) -> anyhow::Result<ProgramReport> {
         let rgba8 = frame_readback(self.context())
             .map_err(|error| anyhow::anyhow!("{error:?}"))
             .context("read presented snapshot")?;
-        let counts = shared::drain_bounded(
+        let counts = drain_bounded(
             4096,
             || {
                 poll_runtime_event(self.context())
@@ -441,8 +332,8 @@ impl LifecycleCallbacks for Example {
                     .context("poll diagnostic")
             },
         )?;
-        Ok(shared::ProgramReport {
-            frame: shared::PresentedFrame {
+        Ok(ProgramReport {
+            frame: PresentedFrame {
                 width,
                 height,
                 frames,
@@ -456,25 +347,17 @@ impl LifecycleCallbacks for Example {
     }
 
     fn shutdown(&mut self) {
-        let Some(context) = self.context.take() else {
-            return;
-        };
-        let _ = wait_idle(context);
-        if let Some(resources) = self.resources.take() {
-            resources.destroy(context);
+        if let Some(context) = self.context.take() {
+            let _ = destroy_context(context);
         }
-        if let Some(surface) = self.surface.take() {
-            destroy_surface(context, surface);
-        }
-        destroy_context(context);
     }
 }
 
 fn run_example_with_benchmark(
     frame_limit: Option<u32>,
-    benchmark: Option<shared::BenchmarkConfig>,
-) -> anyhow::Result<Option<shared::ProgramReport>> {
-    shared::run(
+    benchmark: Option<BenchmarkConfig>,
+) -> anyhow::Result<Option<ProgramReport>> {
+    run(
         LifecycleConfig {
             width: WIDTH,
             height: HEIGHT,
@@ -485,27 +368,6 @@ fn run_example_with_benchmark(
     )
 }
 
-fn clip_y(backend: Backend) -> shared::math::ClipY {
-    // Every supported backend has an explicit clip-Y convention; no fallback can hide a new backend.
-    match backend {
-        Backend::Vulkan => shared::math::ClipY::Vulkan,
-        Backend::Dx12 => shared::math::ClipY::Dx12,
-        Backend::Metal => shared::math::ClipY::Metal,
-    }
-}
-
-fn backend() -> anyhow::Result<(Backend, &'static str)> {
-    match std::env::var("EZ_GFX_BACKEND").ok().as_deref() {
-        #[cfg(target_vendor = "apple")]
-        None | Some("metal") => Ok((Backend::Metal, "Metal")),
-        #[cfg(not(target_vendor = "apple"))]
-        None | Some("vulkan") => Ok((Backend::Vulkan, "Vulkan")),
-        #[cfg(windows)]
-        Some("dx12") => Ok((Backend::Dx12, "DX12")),
-        Some(value) => Err(anyhow::anyhow!("unsupported EZ_GFX_BACKEND `{value}`")),
-    }
-}
-
 fn status(result: EzGfxResult, operation: &str) -> anyhow::Result<()> {
     match result {
         EzGfxResult::Ok => Ok(()),
@@ -514,24 +376,9 @@ fn status(result: EzGfxResult, operation: &str) -> anyhow::Result<()> {
 }
 
 fn main() {
-    let backend = std::env::var("EZ_GFX_BACKEND").unwrap_or_else(|_| {
-        if cfg!(target_vendor = "apple") {
-            "metal".to_owned()
-        } else {
-            "vulkan".to_owned()
-        }
+    let backend = backend_name().unwrap_or_else(|error| {
+        eprintln!("{error:#}");
+        std::process::exit(2);
     });
-    shared::run_program("05_helmet", &backend, run_example_with_benchmark);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn backend_selection_defaults_and_validates() {
-        #[cfg(target_vendor = "apple")]
-        assert_eq!(backend(), Ok((Backend::Metal, "Metal")));
-        #[cfg(not(target_vendor = "apple"))]
-        assert_eq!(backend().unwrap(), (Backend::Vulkan, "Vulkan"));
-    }
+    run_program("05_helmet", backend, run_example_with_benchmark);
 }

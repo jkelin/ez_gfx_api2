@@ -21,11 +21,6 @@ Source evidence: `TODO.md` ("Add precompiled shader modules with reflection meta
 - Incoming dependency: `P-006` depends on `P-005` for compilation output.
 - Outgoing dependency: `P-007` and `P-008` depend on `P-006` for runtime shader reflection and pipeline creation.
 
-## Unresolved questions
-
-- Should the container format be binary (e.g. Bincode/FlatBuffers) or human-readable (e.g. JSON metadata alongside raw bytecode)?
-- Should offline compilation be exposed via a CLI tool, build.rs integration, or both?
-
 ## Candidate solutions
 
 ### S-P-006-versioned-sectioned-bundle
@@ -91,6 +86,8 @@ No candidate has comparable load-time, RSS, file-open, or artifact-size measurem
 **Selected: `S-P-006-versioned-sectioned-bundle`.**
 
 Define a fixed 56-byte little-endian frame containing magic, format version, reserved flags, payload length, and BLAKE3 digest around one bounded `rkyv` payload. Format v3 bytechecks aligned bytes and validates archived collection, string, metadata, provenance, and variant ceilings before owned deserialization. Runtime then validates every required backend/stage reflection once, carries typed binding and pipeline-layout products, and rejects missing, ambiguous, malformed, conflicting, or invalid texture-heap data before native shader creation. It never silently invokes Slang.
+
+Compiler production exposes `compile_shader(source, targets, development)`, which discovers stage entry points from the Slang source, compiles the requested SPIR-V, DXIL, and Metal target families, and returns owned validated bytes without writing an artifact. The CLI accepts a source path, repeated `--target` values, `--development`, and optional `--output`; CMake uses this source-path interface for build-time artifact generation. Each non-distributed Rust example is an explicit development compiler client: it passes its adjacent Slang source and all target families, compiles once at process startup, and immediately loads the returned bytes.
 
 **Rejected:** sidecars remain rejected because partial deployment and synchronization undermine a shipping asset boundary. A custom section parser and generated schema pipeline add owned evolution machinery already covered by framed `rkyv`.
 

@@ -1,15 +1,6 @@
 //! Generic automation support shared by rendering examples and their tests.
 #![allow(
     dead_code,
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::float_cmp,
-    clippy::map_unwrap_or,
-    clippy::needless_pass_by_value,
-    clippy::redundant_closure_for_method_calls,
-    clippy::type_complexity,
-    clippy::unused_self,
     reason = "Standalone examples and smoke tests use different subsets; host and asset values cross fixed OS and file-format widths."
 )]
 pub mod data;
@@ -29,22 +20,24 @@ pub use data::{byte_len, bytes_of, slice_bytes};
     unused_imports,
     reason = "Standalone examples use different shared interfaces."
 )]
-pub use host::{HostSurface, NativePlatform, NativeSurface};
+pub use host::{
+    backend_config, backend_name, clip_y, BackendConfig, HostSurface, NativePlatform, NativeSurface,
+};
 #[allow(
     unused_imports,
     reason = "Standalone examples use different shared interfaces."
 )]
-pub use input::{FrameInput, SceneInput, SceneKey, dispatch_window_input};
+pub use input::{dispatch_window_input, FrameInput, SceneInput, SceneKey};
 #[allow(
     unused_imports,
     reason = "Standalone examples use different shared interfaces."
 )]
-pub use lifecycle::{LifecycleCallbacks, LifecycleConfig, run};
+pub use lifecycle::{run, LifecycleCallbacks, LifecycleConfig};
 #[allow(
     unused_imports,
     reason = "Standalone examples use different shared interfaces."
 )]
-pub use observability::{ObservationCounts, drain_bounded};
+pub use observability::{drain_bounded, ObservationCounts};
 
 use anyhow::Context as _;
 use std::{ffi::OsString, path::Path, process::Command, time::Instant};
@@ -229,10 +222,6 @@ pub fn benchmark_frame_limit(config: BenchmarkConfig) -> anyhow::Result<u32> {
 }
 
 /// Applies a captured RGBA frame to the optional snapshot path and report stream.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "The snapshot report deliberately mirrors the flat subprocess report contract."
-)]
 pub fn publish_snapshot(
     path: Option<OsString>,
     update: bool,
@@ -299,7 +288,7 @@ fn positive_env(name: &str, default: u32) -> anyhow::Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BenchmarkConfig, benchmark_frame_limit, parse_env_flag};
+    use super::{benchmark_frame_limit, parse_env_flag, BenchmarkConfig};
     #[test]
     fn benchmark_limit_includes_capture_frame_and_checks_overflow() {
         assert_eq!(
@@ -310,13 +299,11 @@ mod tests {
             .unwrap(),
             6
         );
-        assert!(
-            benchmark_frame_limit(BenchmarkConfig {
-                warmup_frames: u32::MAX,
-                measured_frames: 1
-            })
-            .is_err()
-        );
+        assert!(benchmark_frame_limit(BenchmarkConfig {
+            warmup_frames: u32::MAX,
+            measured_frames: 1
+        })
+        .is_err());
     }
 
     #[test]

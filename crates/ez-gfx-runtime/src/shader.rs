@@ -54,13 +54,16 @@ pub struct RuntimeShader {
 impl RuntimeShader {
     /// Decodes an artifact and selects every compatible stage for the requested backend.
     ///
+    /// Artifacts may contain a target subset. Selection fails closed when the
+    /// requested backend has no product for any declared stage.
+    ///
     /// Metal loads use the running macOS identity. Tests and embedding layers that already own a
     /// platform identity can call [`Self::load_for_environment`] explicitly.
     ///
     /// # Errors
     ///
-    /// Returns an error before product exposure when decoding, compatibility selection, or
-    /// reflection validation fails.
+    /// Returns an error before product exposure when decoding, a requested
+    /// product is missing, compatibility selection fails, or reflection is invalid.
     pub fn load(
         bytes: &[u8],
         backend: Backend,
@@ -74,8 +77,8 @@ impl RuntimeShader {
     ///
     /// # Errors
     ///
-    /// Returns an error before product exposure when decoding, compatibility selection, or
-    /// reflection validation fails.
+    /// Returns an error before product exposure when decoding, a requested product is missing,
+    /// compatibility selection fails, or reflection validation fails.
     pub fn load_for_environment(
         bytes: &[u8],
         backend: Backend,

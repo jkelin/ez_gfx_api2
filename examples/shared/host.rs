@@ -1,4 +1,5 @@
 use anyhow::Context as _;
+use ez_gfx::{Backend, SurfacePlatform};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
@@ -6,6 +7,73 @@ use winit::window::Window;
 pub enum NativePlatform {
     Win32,
     MetalLayer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BackendConfig {
+    pub backend: Backend,
+    pub name: &'static str,
+    pub platform: SurfacePlatform,
+}
+
+/// Resolves the host-compatible backend and native surface platform.
+///
+/// An omitted backend defaults to Vulkan off Apple and Metal on Apple.
+/// Explicit backends unsupported by this host fail rather than silently falling
+/// back; this also keeps the environment boundary deterministic for examples.
+pub fn backend_config(native: NativePlatform) -> anyhow::Result<BackendConfig> {
+    let backend = parse_backend(std::env::var("EZ_GFX_BACKEND").ok().as_deref())?;
+    Ok(BackendConfig {
+        backend,
+        name: backend_name_for(backend),
+        platform: surface_platform(native),
+    })
+}
+
+const fn surface_platform(native: NativePlatform) -> SurfacePlatform {
+    match native {
+        NativePlatform::Win32 => SurfacePlatform::Win32,
+        NativePlatform::MetalLayer => SurfacePlatform::MetalLayer,
+    }
+}
+
+fn parse_backend(value: Option<&str>) -> anyhow::Result<Backend> {
+    match value {
+        #[cfg(target_vendor = "apple")]
+        None | Some("metal") => Ok(Backend::Metal),
+        #[cfg(not(target_vendor = "apple"))]
+        None | Some("vulkan") => Ok(Backend::Vulkan),
+        #[cfg(windows)]
+        Some("dx12") => Ok(Backend::Dx12),
+        Some(value) => Err(anyhow::anyhow!("unsupported EZ_GFX_BACKEND `{value}`")),
+    }
+}
+
+const fn backend_name_for(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Vulkan => "Vulkan",
+        Backend::Dx12 => "DX12",
+        Backend::Metal => "Metal",
+    }
+}
+
+/// Maps a backend to its clip-space convention.
+pub const fn clip_y(backend: Backend) -> crate::shared::math::ClipY {
+    match backend {
+        Backend::Vulkan => crate::shared::math::ClipY::Vulkan,
+        Backend::Dx12 => crate::shared::math::ClipY::Dx12,
+        Backend::Metal => crate::shared::math::ClipY::Metal,
+    }
+}
+
+/// Returns the selected backend's stable display name for process reports.
+pub fn backend_name() -> anyhow::Result<&'static str> {
+    let native = if cfg!(target_vendor = "apple") {
+        NativePlatform::MetalLayer
+    } else {
+        NativePlatform::Win32
+    };
+    Ok(backend_config(native)?.name)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -85,5 +153,48 @@ impl HostSurface {
                 width: f64::from(width),
                 height: f64::from(height),
             });
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_defaults_to_host_backend() {
+        #[cfg(target_vendor = "apple")]
+        assert_eq!(parse_backend(None).unwrap(), Backend::Metal);
+        #[cfg(not(target_vendor = "apple"))]
+        assert_eq!(parse_backend(None).unwrap(), Backend::Vulkan);
+    }
+
+    #[test]
+    fn explicit_supported_backends_report_stable_names() {
+        #[cfg(not(target_vendor = "apple"))]
+        assert_eq!(parse_backend(Some("vulkan")).unwrap(), Backend::Vulkan);
+        #[cfg(windows)]
+        assert_eq!(parse_backend(Some("dx12")).unwrap(), Backend::Dx12);
+        #[cfg(target_vendor = "apple")]
+        assert_eq!(parse_backend(Some("metal")).unwrap(), Backend::Metal);
+    }
+
+    #[test]
+    fn unsupported_backend_is_rejected() {
+        assert!(parse_backend(Some("unsupported")).is_err());
+        #[cfg(not(target_vendor = "apple"))]
+        assert!(parse_backend(Some("metal")).is_err());
+        #[cfg(not(windows))]
+        assert!(parse_backend(Some("dx12")).is_err());
+    }
+
+    #[test]
+    fn native_platform_maps_to_surface_platform() {
+        assert_eq!(
+            surface_platform(NativePlatform::Win32),
+            SurfacePlatform::Win32
+        );
+        assert_eq!(
+            surface_platform(NativePlatform::MetalLayer),
+            SurfacePlatform::MetalLayer
+        );
     }
 }

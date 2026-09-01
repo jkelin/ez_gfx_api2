@@ -125,10 +125,14 @@ pub extern "C" fn ez_gfx_context_wait_idle(context: EzGfxContext) -> EzGfxResult
 }
 #[unsafe(no_mangle)]
 /// Destroys the graphics context and its owned runtime state.
+///
+/// Teardown is terminal on the creator thread even if waiting or a native release fails. The
+/// stable void ABI cannot report that status; safe Rust callers should use
+/// [`ez_gfx::destroy_context`] when cleanup status is required.
 pub extern "C" fn ez_gfx_context_destroy(context: EzGfxContext) {
     catch_void(|| {
         if let Ok(context) = ContextHandle::from_raw(context) {
-            ez_gfx::destroy_context(context);
+            let _ = ez_gfx::destroy_context(context);
         }
     });
 }

@@ -1,4 +1,4 @@
-use super::{FrameInput, HostSurface, NativeSurface, SceneInput, dispatch_window_input};
+use super::{dispatch_window_input, FrameInput, HostSurface, NativeSurface, SceneInput};
 use anyhow::Context as _;
 use std::time::Instant;
 use winit::{
@@ -19,11 +19,11 @@ pub struct LifecycleConfig {
 pub trait LifecycleCallbacks {
     type Report;
     fn initialize(&mut self, surface: NativeSurface, width: u32, height: u32)
-    -> anyhow::Result<()>;
+        -> anyhow::Result<()>;
     fn resize(&mut self, width: u32, height: u32) -> anyhow::Result<()>;
     fn input(&mut self, input: SceneInput);
     fn render(&mut self, frame: FrameInput, terminal: bool, frame_index: u32)
-    -> anyhow::Result<()>;
+        -> anyhow::Result<()>;
     fn capture(&mut self, width: u32, height: u32, frames: u32) -> anyhow::Result<Self::Report>;
     fn shutdown(&mut self);
 }

@@ -1,68 +1,25 @@
 //! Compiler command-line integration.
+
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use ez_gfx_artifact::{Stage, Target};
-use ez_gfx_compiler::{CompilationRequest, CompilerConfig, TargetRequest};
-use serde::Deserialize;
+use ez_gfx_compiler::{Target, compile_shader};
 use std::{fs, path::PathBuf};
 
 #[derive(Parser)]
-#[command(name = "ez-gfx-compile", about = "Compile an ez-gfx shader manifest")]
+#[command(name = "ez-gfx-compile", about = "Compile a Slang shader source")]
 struct Cli {
-    /// Shader compilation manifest.
-    #[arg(value_name = "MANIFEST")]
-    manifest: PathBuf,
-}
-
-#[derive(Deserialize)]
-struct Manifest {
+    /// Root Slang shader source.
+    #[arg(value_name = "SOURCE")]
     source: PathBuf,
-    output: PathBuf,
-    #[serde(default)]
-    required_version: String,
-    #[serde(default)]
-    include_dirs: Vec<PathBuf>,
-    #[serde(default)]
-    defines: Vec<String>,
-    #[serde(default)]
-    semantic_metadata: serde_json::Value,
-    #[serde(default)]
-    toolchain: String,
-    #[serde(default)]
-    apple_toolchain: String,
-    #[serde(default)]
+    /// Target family to compile. Repeat for multiple families.
+    #[arg(short, long = "target", value_name = "TARGETS", required = true)]
+    targets: Vec<Target>,
+    /// Emit portable development outputs, including MSL instead of metallib.
+    #[arg(long)]
     development: bool,
-    targets: Vec<TargetSpec>,
-}
-
-#[derive(Deserialize)]
-struct TargetSpec {
-    target: String,
-    stage: String,
-    entry: String,
-    profile: String,
-}
-
-fn target(value: &str) -> Result<Target> {
-    match value {
-        "spirv" => Ok(Target::Spirv),
-        "dxil" => Ok(Target::Dxil),
-        "msl" => Ok(Target::Msl),
-        "metallib" => Ok(Target::Metallib),
-        _ => bail!("unknown target `{value}`"),
-    }
-}
-
-fn stage(value: &str) -> Result<Stage> {
-    match value {
-        "vertex" => Ok(Stage::Vertex),
-        "fragment" => Ok(Stage::Fragment),
-        "compute" => Ok(Stage::Compute),
-        "geometry" => Ok(Stage::Geometry),
-        "tess-control" => Ok(Stage::TessellationControl),
-        "tess-eval" => Ok(Stage::TessellationEvaluation),
-        _ => bail!("unknown stage `{value}`"),
-    }
+    /// Artifact path. Defaults to SOURCE with the `.ezgfxshader` extension.
+    #[arg(short, long, value_name = "OUTPUT")]
+    output: Option<PathBuf>,
 }
 
 fn main() {
@@ -74,57 +31,22 @@ fn main() {
 }
 
 fn run(cli: &Cli) -> Result<()> {
-    let manifest_bytes = fs::read(&cli.manifest)
-        .with_context(|| format!("read shader manifest {}", cli.manifest.display()))?;
-    let manifest: Manifest = serde_json::from_slice(&manifest_bytes).context("invalid manifest")?;
-    let targets = manifest
-        .targets
-        .into_iter()
-        .map(|spec| {
-            let target = target(&spec.target)?;
-            let stage = stage(&spec.stage)?;
-            TargetRequest::new(target, stage, spec.entry, spec.profile)
-                .context("validate shader target request")
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut request = CompilationRequest::new(
-        manifest.source,
-        manifest
-            .output
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .to_path_buf(),
-        targets,
-    );
-    request.include_dirs = manifest.include_dirs;
-    request.defines = manifest.defines;
-    request.semantic_metadata =
-        serde_json::to_vec(&manifest.semantic_metadata).context("serialize semantic metadata")?;
-    request.toolchain = manifest.toolchain;
-    request.apple_toolchain = manifest.apple_toolchain;
-    request.release_complete = !manifest.development;
-
-    let config = CompilerConfig::new(manifest.required_version);
-    let artifact =
-        ez_gfx_compiler::compile(&config, &request).context("compile shader manifest")?;
-    let bytes = artifact.encode().context("encode shader artifact")?;
-    let parent = manifest
+    let output = cli
         .output
+        .clone()
+        .unwrap_or_else(|| cli.source.with_extension("ezgfxshader"));
+    if output.extension().and_then(|extension| extension.to_str()) != Some("ezgfxshader") {
+        bail!("output must use the .ezgfxshader extension");
+    }
+    let parent = output
         .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
     fs::create_dir_all(parent)
-        .with_context(|| format!("create output directory {}", parent.display()))?;
-    let temporary = parent.join(format!(".ezgfxshader-{}.tmp", std::process::id()));
-    fs::write(&temporary, bytes)
-        .with_context(|| format!("write temporary artifact {}", temporary.display()))?;
-    if let Err(error) = fs::rename(&temporary, &manifest.output) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error).with_context(|| {
-            format!(
-                "replace shader artifact {} atomically",
-                manifest.output.display()
-            )
-        });
-    }
+        .with_context(|| format!("create artifact directory {}", parent.display()))?;
+    let bytes = compile_shader(&cli.source, &cli.targets, cli.development)
+        .with_context(|| format!("compile shader source {}", cli.source.display()))?;
+    fs::write(&output, bytes)
+        .with_context(|| format!("write shader artifact {}", output.display()))?;
     Ok(())
 }

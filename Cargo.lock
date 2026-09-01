@@ -773,7 +773,6 @@ dependencies = [
  "clap",
  "ez-gfx-artifact",
  "ez-gfx-core",
- "serde",
  "serde_json",
  "shader-slang",
  "tempfile",

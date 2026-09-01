@@ -9,7 +9,7 @@ This repository is a Rust/Cargo migration of `ez_gfx_api`. Preserve the recogniz
 - Keep `ez-gfx` safe: it owns runtime behavior, resource lifetimes, graph semantics, and typed errors. `ez-gfx-ffi` is a narrow boundary that validates, converts, delegates, and contains panics; it must not reimplement behavior.
 - Treat Vulkan, DX12, and Metal as one synchronized contract. Any backend-facing abstraction, implementation, test, or documented behavior change must be assessed and updated consistently across all three, or explicitly record why a backend is unsupported.
 - Keep backend-native handles, state lowering, and physical shader layouts private. Public Rust resources use typed handles; the stable C ABI uses opaque `uint64_t`/`u64` handles with generation/owner validation.
-- Keep compiler/runtime dependency isolation absolute: runtime packages and runtime distributions contain no Slang, DXC, compiler crates, native compiler libraries, source compilation, JIT, or shader fallback. Compilation is build-time/offline only.
+- Keep compiler/runtime dependency isolation absolute: runtime crates and distributions contain no Slang, DXC, compiler crates, native compiler libraries, source compilation, JIT, or shader fallback. The non-distributed Rust examples are development compiler clients that compile adjacent Slang source paths with target lists and development mode, then load owned validated artifact bytes; runtime packages remain compiler-free.
 
 ## Shader and artifact contracts
 
@@ -24,7 +24,7 @@ This repository is a Rust/Cargo migration of `ez_gfx_api`. Preserve the recogniz
 
 ## Dependencies and packaging
 
-- Keep Slang/DXC/Apple compiler tooling in compiler/build packages only. Audit dependency trees and native imports for runtime packages. Do not add a runtime fallback to make a build pass.
+- Keep Slang/DXC/Apple compiler tooling in compiler packages and explicit development clients only. Audit dependency trees and native imports for runtime packages. Do not add a runtime fallback to make a build pass.
 - Preserve the existing Cargo workspace and backend-local native dependencies. Do not add a new abstraction layer when the existing HAL/API seam is sufficient.
 
 ## Docs, TODOs, and personal-project discipline

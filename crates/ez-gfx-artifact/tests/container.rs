@@ -73,32 +73,91 @@ fn artifact_allows_only_one_entry_point_per_stage() {
 }
 
 #[test]
-fn graphics_vertex_fragment_entries_require_all_backends() {
-    let mut variants = Vec::new();
-    for (stage, entry, base) in [(Stage::Vertex, "vs", 1), (Stage::Fragment, "fs", 4)] {
-        variants.extend([
-            variant(Target::Spirv, stage, entry, "spirv_1_5", base),
-            variant(Target::Dxil, stage, entry, "sm_6_5", base + 1),
-            variant(Target::Metallib, stage, entry, "metallib_3_0", base + 2),
-        ]);
-    }
-    assert!(
+fn global_target_subsets_round_trip_for_every_stage() {
+    let variants = vec![
+        variant(Target::Spirv, Stage::Vertex, "vs", "spirv_1_5", 1),
+        variant(Target::Msl, Stage::Vertex, "vs", "metal_3_0", 2),
+        variant(Target::Spirv, Stage::Fragment, "fs", "spirv_1_5", 3),
+        variant(Target::Msl, Stage::Fragment, "fs", "metal_3_0", 4),
+    ];
+    let artifact = Artifact::new(
+        br"{}".to_vec(),
+        Provenance::new("s", "v", vec![], "t"),
+        variants,
+    )
+    .unwrap();
+
+    let decoded = Artifact::decode(&artifact.encode().unwrap()).unwrap();
+
+    assert_eq!(decoded, artifact);
+}
+
+#[test]
+fn every_single_stage_target_subset_is_valid() {
+    for (target, profile) in [
+        (Target::Spirv, "spirv_1_5"),
+        (Target::Dxil, "sm_6_5"),
+        (Target::Msl, "metal_3_0"),
+        (Target::Metallib, "metallib_3_0"),
+    ] {
         Artifact::new(
             br"{}".to_vec(),
             Provenance::new("s", "v", vec![], "t"),
-            variants
+            vec![variant(target, Stage::Compute, "cs", profile, 1)],
         )
-        .is_ok()
-    );
+        .unwrap();
+    }
+}
 
-    let missing = vec![variant(Target::Spirv, Stage::Vertex, "vs", "spirv_1_5", 1)];
+#[test]
+fn rejects_disjoint_stage_target_coverage() {
+    let variants = vec![
+        variant(Target::Spirv, Stage::Vertex, "vs", "spirv_1_5", 1),
+        variant(Target::Dxil, Stage::Fragment, "fs", "sm_6_5", 2),
+    ];
+
     assert!(matches!(
         Artifact::new(
             br"{}".to_vec(),
             Provenance::new("s", "v", vec![], "t"),
-            missing
+            variants
         ),
-        Err(ArtifactError::MissingCoverage { .. })
+        Err(ArtifactError::InconsistentTargetCoverage { .. })
+    ));
+}
+
+#[test]
+fn rejects_overlapping_but_uneven_stage_target_coverage() {
+    let variants = vec![
+        variant(Target::Spirv, Stage::Vertex, "vs", "spirv_1_5", 1),
+        variant(Target::Dxil, Stage::Vertex, "vs", "sm_6_5", 2),
+        variant(Target::Spirv, Stage::Fragment, "fs", "spirv_1_5", 3),
+    ];
+
+    assert!(matches!(
+        Artifact::new(
+            br"{}".to_vec(),
+            Provenance::new("s", "v", vec![], "t"),
+            variants
+        ),
+        Err(ArtifactError::InconsistentTargetCoverage { .. })
+    ));
+}
+
+#[test]
+fn rejects_mixed_msl_and_metallib_stage_coverage() {
+    let variants = vec![
+        variant(Target::Msl, Stage::Vertex, "vs", "metal_3_0", 1),
+        variant(Target::Metallib, Stage::Fragment, "fs", "metallib_3_0", 2),
+    ];
+
+    assert!(matches!(
+        Artifact::new(
+            br"{}".to_vec(),
+            Provenance::new("s", "v", vec![], "t"),
+            variants
+        ),
+        Err(ArtifactError::InconsistentTargetCoverage { .. })
     ));
 }
 

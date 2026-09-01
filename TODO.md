@@ -4,8 +4,8 @@
 
 - Cargo workspace with compiler-free runtime packages, safe typed Rust handles, C ABI v18 opaque `u64` handles, validated semantic/artifact/capability data, and panic containment.
 - Vulkan, DX12, and Metal backend crates implement a backend-neutral HAL and use `gpu-allocator` 0.28.
-- Build-time Slang compilation emits SPIR-V 1.5, Shader Model 6.5 DXIL, and Metal products in format-v3 `.ezgfxshader` artifacts. Archived count/string/metadata/provenance/variant ceilings are checked before owned decode. Runtime load validates required backend/stage reflection once before native calls, and metallib selection enforces platform, architecture, OS, SDK, language, and library compatibility. Compiler toolchain identity is recorded and bounded but is not a runtime admission criterion.
-- The root `ez_gfx_api.slang` module supplies backend-agnostic shared declarations. Rust examples compile their manifests in `build.rs`; the C structured-buffer cube compiles its manifest in CMake. Generated shader artifacts are not tracked.
+- The compiler emits SPIR-V 1.5, Shader Model 6.5 DXIL, and Metal products in format-v3 `.ezgfxshader` containers. Archived count/string/metadata/provenance/variant ceilings are checked before owned decode. Runtime load validates required backend/stage reflection once before native calls, and metallib selection enforces platform, architecture, OS, SDK, language, and library compatibility. Compiler toolchain identity is recorded and bounded but is not a runtime admission criterion.
+- The root `ez_gfx_api.slang` module supplies backend-agnostic shared declarations. Each non-distributed Rust example passes its adjacent Slang source to the compiler with SPIR-V, DXIL, and Metal targets in development mode, then loads validated artifact bytes in memory at process startup. These development binaries intentionally depend on compiler tooling; `ez-gfx`, runtime/FFI crates, and packaged runtime distributions remain compiler-free. The C textured cube invokes the same source-path compiler CLI from CMake. Generated shader artifacts are not tracked.
 - Safe Rust resources use distinct context, surface, shader, texture, indirect-buffer, structured-buffer, and render-target handle types. The FFI performs explicit checked conversion while preserving opaque ABI values.
 - Tooling uses `clap` derives and `anyhow`; library seams retain typed errors. Example math uses `glam`. Repository dependency review replaced applicable archive, traversal, hashing, temporary-file, serialization, and CLI helpers with maintained crates.
 
@@ -13,7 +13,7 @@
 
 - Runtime shader loading chooses the artifact-owned entry point for each stage; callers provide no entry-point name.
 - Shader sources import the root shared module and contain no Vulkan namespace, location, register, or physical binding syntax.
-- `include/ez_gfx_api.h`, `bindings/bindings.xml`, and all production FFI exports describe ABI v18. The Win32 C structured-buffer cube builds against that header and exercises compute-written indexed-indirect graphics.
+- `include/ez_gfx_api.h`, `bindings/bindings.xml`, and all production FFI exports describe ABI v18. The Win32 C textured cube builds against that header and exercises compute-written indexed-indirect graphics.
 - Artifact tests cover format/version validation, malicious structurally valid archives exceeding semantic bounds, reflection failure across every backend, deterministic metallib compatibility selection, unique stage entry points, and generated example coverage.
 - The CI backend matrix executes Windows Vulkan through SwiftShader and native Metal on macOS. Linux Vulkan and Windows DX12 compile backend/native tests without claiming hosted runtime coverage.
 - Package CI builds and checks distinct runtime/compiler archives for Windows x64, Linux x64, and Apple Silicon.
@@ -88,7 +88,7 @@
 ### P1 — diagnostics are weak around cleanup and asynchronous work
 
 - **Status:** Partial.
-- **Evidence:** `crates/ez-gfx/src/state/frame/mod.rs::frame_submit` records submit failures, but `crates/ez-gfx/src/state/context.rs::destroy_context` and resource-release paths discard release/destructor errors; worker events are not exposed through the public APIs.
+- **Evidence:** `frame_submit` records submit failures. Safe Rust `destroy_context` returns the first initialized-device wait or fallible release failure after terminal cleanup; pre-device Vulkan has no GPU work, so its `NotReady` wait is benign. Status-free resource releases still discard native destructor failures, and worker events remain unexposed.
 - **Impact:** Resource leaks, upload failures, and partial submissions can be silent or lack correlation.
 - **Acceptance:** Every failure has a correlated diagnostic/event, cleanup errors are observable, and queue overflow/cancellation/device-loss semantics are tested.
 
@@ -102,7 +102,7 @@
 ### P2 — package and test coverage gaps
 
 - **Status:** Partial.
-- **Evidence:** Runtime suites cover retained graph execution, ordering, waits, transitions, pass coalescing, payload mapping, and failures. Artifact suites cover framed `rkyv` validation and build-generated example artifacts. Example smoke tests cover all six Rust scenes and snapshots. CI executes Windows Vulkan with SwiftShader and native Metal, compiles Linux Vulkan and Windows DX12 native tests, builds/links the C structured cube on Windows, and executes its Vulkan path. Package CI checks runtime/compiler archives on all three operating systems.
+- **Evidence:** Runtime suites cover retained graph execution, ordering, waits, transitions, pass coalescing, payload mapping, and failures. Artifact suites cover framed `rkyv` validation and startup-compiled example artifacts. Example smoke tests cover all six Rust scenes and snapshots. CI executes Windows Vulkan with SwiftShader and native Metal, compiles Linux Vulkan and Windows DX12 native tests, builds/links the C textured cube on Windows, and executes its Vulkan path. Package CI checks runtime/compiler separation, manifests, archives, export parity, and forbidden compiler-native imports. GPU performance and size baselines are not yet recorded.
 - **Impact:** Managed targets, asynchronous uploads, viewport/scissor variation, Linux presentation, and hosted DX12 runtime can still regress or remain unavailable.
 - **Acceptance:** Add target/upload/viewport regression suites, Linux Vulkan presentation CI, and DX12 execution on guaranteed hardware.
 

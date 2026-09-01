@@ -63,3 +63,87 @@ fn graphics_pipeline_keys_include_state_attachment_and_texture_interface() {
         4
     );
 }
+
+#[cfg(windows)]
+fn dx12_context() -> ContextHandle {
+    create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Dx12).unwrap()).unwrap()
+}
+#[cfg(windows)]
+#[test]
+fn destroy_context_before_device_initialization_is_successful_and_terminal() {
+    let context =
+        create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).unwrap()).unwrap();
+
+    assert_eq!(destroy_context(context), EzGfxResult::Ok);
+    assert_eq!(wait_idle(context), EzGfxResult::InvalidContext);
+    assert_eq!(destroy_context(context), EzGfxResult::InvalidContext);
+}
+
+#[cfg(windows)]
+#[test]
+fn destroy_context_reclaims_populated_state_and_invalidates_handles() {
+    let context = dx12_context();
+    let structured = acquire_structured(context, 64).unwrap();
+    let indirect = acquire_indirect(context, 2).unwrap();
+    assert_eq!(
+        create_vertex_heap(context, "vertices", 256, 16),
+        EzGfxResult::Ok
+    );
+    assert_eq!(create_index_heap(context, 256), EzGfxResult::Ok);
+
+    assert_eq!(destroy_context(context), EzGfxResult::Ok);
+    assert_eq!(wait_idle(context), EzGfxResult::InvalidContext);
+    assert_eq!(
+        write_structured(context, structured, &[1; 16]),
+        EzGfxResult::InvalidContext
+    );
+    assert_eq!(
+        set_indirect_count(context, indirect, 1),
+        EzGfxResult::InvalidContext
+    );
+    assert_eq!(destroy_context(context), EzGfxResult::InvalidContext);
+}
+
+#[cfg(windows)]
+#[test]
+fn destroy_context_rejects_wrong_thread_without_consuming_context() {
+    let context = dx12_context();
+
+    assert_eq!(
+        std::thread::spawn(move || destroy_context(context))
+            .join()
+            .unwrap(),
+        EzGfxResult::InvalidContext
+    );
+    assert_eq!(wait_idle(context), EzGfxResult::Ok);
+    assert_eq!(destroy_context(context), EzGfxResult::Ok);
+}
+
+#[cfg(windows)]
+#[test]
+fn destroyed_resource_handles_are_rejected_by_other_owners() {
+    let first = dx12_context();
+    let stale = acquire_structured(first, 64).unwrap();
+    let second = dx12_context();
+
+    assert_eq!(destroy_context(first), EzGfxResult::Ok);
+    assert_eq!(
+        write_structured(second, stale, &[1; 16]),
+        EzGfxResult::InvalidContext
+    );
+    assert_eq!(destroy_context(second), EzGfxResult::Ok);
+}
+
+#[cfg(windows)]
+#[test]
+fn lost_context_can_still_be_destroyed_terminally() {
+    let context = dx12_context();
+    with_context_mut(context, |owned| {
+        owned.identity.mark_lost().map_err(map_lifecycle)
+    })
+    .unwrap();
+
+    assert_eq!(wait_idle(context), EzGfxResult::DeviceLost);
+    assert_eq!(destroy_context(context), EzGfxResult::Ok);
+    assert_eq!(wait_idle(context), EzGfxResult::InvalidContext);
+}

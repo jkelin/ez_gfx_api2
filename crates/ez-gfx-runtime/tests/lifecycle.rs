@@ -60,6 +60,7 @@ fn loss_is_terminal_exactly_once_and_rejects_new_work() {
         identity.check_thread_and_health(),
         Err(LifecycleError::DeviceLost)
     );
+    assert_eq!(identity.check_thread(), Ok(()));
 }
 
 #[test]

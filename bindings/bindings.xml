@@ -204,13 +204,13 @@
       <param name="out_context" type="EzGfxContext *" direction="out" doc="Receives the opaque context handle." />
       <returns doc="Returns EzGfxResult_Ok or a validation, admission, or native error." />
     </function>
-    <function name="ez_gfx_context_wait_idle" return="EzGfxResult" context="last" doc="Waits for all context GPU work to become idle.">
+    <function name="ez_gfx_context_wait_idle" return="EzGfxResult" context="last" doc="Waits for all context GPU work to become idle without destroying resources.">
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
-      <returns doc="Returns EzGfxResult_Ok or EzGfxResult_InvalidContext." />
+      <returns doc="Returns EzGfxResult_Ok or an invalid-context, not-ready, native-failure, or device-loss result." />
     </function>
-    <function name="ez_gfx_context_destroy" return="void" context="last" doc="Destroys a context and all native resources it owns.">
-      <param name="context" type="EzGfxContext" doc="Context to destroy; null is ignored." />
-      <returns doc="No return value; null handles are ignored." />
+    <function name="ez_gfx_context_destroy" return="void" context="last" doc="Waits for an initialized device to become idle, then destroys a context and all native resources it owns. A context without a device is destroyed without waiting. Cleanup is terminal once it begins.">
+      <param name="context" type="EzGfxContext" doc="Context to destroy on its creator thread; null, stale, repeated, and wrong-thread calls are ignored." />
+      <returns doc="No return value; wait or release failures cannot be reported through the stable ABI." />
     </function>
     <function name="ez_gfx_surface_create" return="EzGfxResult" context="last" managed="surface-create" doc="Creates a native presentation surface for a caller-owned window or Metal layer.">
       <param name="desc" type="const EzGfxSurfaceDesc *" nullable="false" direction="in" doc="Window and initial extent." />

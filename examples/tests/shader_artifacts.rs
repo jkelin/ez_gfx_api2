@@ -1,49 +1,78 @@
-//! Build-script shader artifact contract tests.
+//! Runtime in-memory shader compilation contract tests.
 
 use anyhow::Context as _;
 use ez_gfx_artifact::{Artifact, Stage, Target};
-use ez_gfx_core::{Backend, capability::SemanticProfile};
+use ez_gfx_compiler::compile_shader;
+use ez_gfx_core::{capability::SemanticProfile, Backend};
 use ez_gfx_runtime::shader::{RuntimeShader, ShaderLoadError};
+use std::sync::LazyLock;
 
-const ARTIFACTS: [(&str, &[u8], bool); 6] = [
-    (
-        "triangle",
-        include_bytes!(concat!(env!("OUT_DIR"), "/01_triangle.ezgfxshader")),
-        false,
-    ),
-    (
-        "cube",
-        include_bytes!(concat!(env!("OUT_DIR"), "/02_textured_cube.ezgfxshader")),
-        false,
-    ),
-    (
-        "compute",
-        include_bytes!(concat!(
-            env!("OUT_DIR"),
-            "/03_compute_structured.ezgfxshader"
-        )),
-        true,
-    ),
-    (
-        "imgui",
-        include_bytes!(concat!(env!("OUT_DIR"), "/04_imgui.ezgfxshader")),
-        false,
-    ),
-    (
-        "helmet",
-        include_bytes!(concat!(env!("OUT_DIR"), "/05_helmet.ezgfxshader")),
-        true,
-    ),
-    (
-        "sponza",
-        include_bytes!(concat!(env!("OUT_DIR"), "/06_sponza_ktx2.ezgfxshader")),
-        true,
-    ),
-];
+struct ArtifactCase {
+    name: &'static str,
+    bytes: Vec<u8>,
+    has_compute: bool,
+}
+
+static ARTIFACTS: LazyLock<Result<Vec<ArtifactCase>, String>> =
+    LazyLock::new(|| compile_artifacts().map_err(|error| format!("{error:#}")));
+
+fn artifacts() -> anyhow::Result<&'static [ArtifactCase]> {
+    ARTIFACTS
+        .as_deref()
+        .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+fn compile_artifacts() -> anyhow::Result<Vec<ArtifactCase>> {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .context("examples package has no workspace parent")?;
+    let shaders: [(&str, &str, bool); 6] = [
+        ("triangle", "examples/01_triangle/01_triangle.slang", false),
+        (
+            "cube",
+            "examples/02_textured_cube/02_textured_cube.slang",
+            false,
+        ),
+        (
+            "compute",
+            "examples/03_compute_structured/03_compute_structured.slang",
+            true,
+        ),
+        ("imgui", "examples/04_imgui/04_imgui.slang", false),
+        ("helmet", "examples/05_helmet/05_helmet.slang", true),
+        (
+            "sponza",
+            "examples/06_sponza_ktx2/06_sponza_ktx2.slang",
+            true,
+        ),
+    ];
+
+    shaders
+        .into_iter()
+        .map(|(name, source, has_compute)| {
+            let bytes = compile_shader(
+                &workspace_root.join(source),
+                &[
+                    ez_gfx_compiler::Target::Spirv,
+                    ez_gfx_compiler::Target::Dxil,
+                    ez_gfx_compiler::Target::Metal,
+                ],
+                !cfg!(target_vendor = "apple"),
+            )
+            .with_context(|| format!("compile {name}"))?;
+            Ok(ArtifactCase {
+                name,
+                bytes,
+                has_compute,
+            })
+        })
+        .collect()
+}
 
 #[test]
-fn generated_artifacts_select_every_stage_without_entry_requests() -> anyhow::Result<()> {
-    for (name, bytes, has_compute) in ARTIFACTS {
+fn runtime_compiled_artifacts_select_every_stage_without_entry_requests() -> anyhow::Result<()> {
+    for case in artifacts()? {
+        let (name, bytes, has_compute) = (case.name, case.bytes.as_slice(), case.has_compute);
         for backend in [Backend::Vulkan, Backend::Dx12] {
             let shader = RuntimeShader::load(bytes, backend, SemanticProfile::V1)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))
@@ -60,33 +89,28 @@ fn generated_artifacts_select_every_stage_without_entry_requests() -> anyhow::Re
 }
 
 #[test]
-fn generated_metal_product_matches_the_build_host() -> anyhow::Result<()> {
-    for (name, bytes, _) in ARTIFACTS {
+fn runtime_compiled_metal_product_matches_the_host() -> anyhow::Result<()> {
+    for case in artifacts()? {
+        let (name, bytes) = (case.name, case.bytes.as_slice());
         let artifact = Artifact::decode(bytes).with_context(|| format!("decode {name}"))?;
         #[cfg(target_vendor = "apple")]
         {
-            assert!(
-                artifact
-                    .variants
-                    .iter()
-                    .any(|variant| variant.target == Target::Metallib)
-            );
+            assert!(artifact
+                .variants
+                .iter()
+                .any(|variant| variant.target == Target::Metallib));
             assert!(RuntimeShader::load(bytes, Backend::Metal, SemanticProfile::V1).is_ok());
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            assert!(
-                artifact
-                    .variants
-                    .iter()
-                    .any(|variant| variant.target == Target::Msl)
-            );
-            assert!(
-                !artifact
-                    .variants
-                    .iter()
-                    .any(|variant| variant.target == Target::Metallib)
-            );
+            assert!(artifact
+                .variants
+                .iter()
+                .any(|variant| variant.target == Target::Msl));
+            assert!(!artifact
+                .variants
+                .iter()
+                .any(|variant| variant.target == Target::Metallib));
             assert!(matches!(
                 RuntimeShader::load(bytes, Backend::Metal, SemanticProfile::V1),
                 Err(ShaderLoadError::MissingProduct {
@@ -100,8 +124,9 @@ fn generated_metal_product_matches_the_build_host() -> anyhow::Result<()> {
 }
 
 #[test]
-fn compiler_assigned_reflection_has_unique_physical_bindings_per_stage() -> anyhow::Result<()> {
-    for (name, bytes, _) in ARTIFACTS {
+fn runtime_compiler_reflection_has_unique_physical_bindings_per_stage() -> anyhow::Result<()> {
+    for case in artifacts()? {
+        let (name, bytes) = (case.name, case.bytes.as_slice());
         let artifact = Artifact::decode(bytes).with_context(|| format!("decode {name}"))?;
         let metadata: serde_json::Value = serde_json::from_slice(&artifact.metadata)
             .with_context(|| format!("decode {name} reflection metadata"))?;

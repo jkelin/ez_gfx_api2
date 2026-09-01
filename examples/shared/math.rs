@@ -192,16 +192,14 @@ mod tests {
             [1.0, 1.0, 0.0, 100.0],
             [1.0, 1.0, 1.0, 1.0],
         ] {
-            assert!(
-                perspective(
-                    arguments[0],
-                    arguments[1],
-                    arguments[2],
-                    arguments[3],
-                    ClipY::Vulkan,
-                )
-                .is_err()
-            );
+            assert!(perspective(
+                arguments[0],
+                arguments[1],
+                arguments[2],
+                arguments[3],
+                ClipY::Vulkan,
+            )
+            .is_err());
         }
         assert!(look_at(Vec3::ZERO, Vec3::ZERO, Vec3::Y).is_err());
         assert!(look_at(Vec3::ZERO, -Vec3::Z, -Vec3::Z).is_err());

@@ -7,7 +7,7 @@ use super::{
     SurfacePlatform, SurfaceRecord, SurfaceState, TextureRegistry, VulkanContext, VulkanPlatform,
     allocate_native, completed_transfer_native, context_local, copy_native,
     destroy_native_pipeline, destroy_native_shader, destroy_native_texture, free_native_allocation,
-    map_allocation, map_frame, map_geometry, map_hal, map_lifecycle, map_native_loss,
+    map_allocation, map_frame, map_geometry, map_hal, map_lifecycle, map_native_loss, map_texture,
     result_status, wait_native_idle, with_context_mut, with_surface_mut, write_native,
 };
 
@@ -155,7 +155,11 @@ pub fn poll_diagnostic(context: ContextHandle) -> Result<DiagnosticPoll, EzGfxRe
     })
 }
 
-/// Waits for all context work to finish.
+/// Waits for all context work to finish without destroying resources.
+///
+/// # Errors
+///
+/// Returns an invalid-context, not-ready, native-failure, or device-loss result.
 pub fn wait_idle(context: ContextHandle) -> EzGfxResult {
     result_status(with_context_mut(context, |context| {
         context
@@ -173,55 +177,108 @@ pub fn wait_idle(context: ContextHandle) -> EzGfxResult {
     }))
 }
 
-/// Destroys a graphics context and its resources.
-pub fn destroy_context(context: ContextHandle) {
+/// Destroys a graphics context and every resource it owns.
+///
+/// Device initialization is optional: a context destroyed before `init_device` has no GPU work to
+/// wait for. Once a native device exists, teardown waits for it before releasing resources. The
+/// context is removed even when that wait or a fallible native release fails, so a failed teardown
+/// never leaves a live, partially destroyed context. The first cleanup failure is returned after
+/// all remaining releases are attempted.
+///
+/// # Errors
+///
+/// Returns [`EzGfxResult::InvalidContext`] for an invalid, stale, repeated, or wrong-thread
+/// destroy. Native wait/release failures are returned after terminal cleanup.
+pub fn destroy_context(context: ContextHandle) -> EzGfxResult {
     let Ok((local, _)) = context_local(context) else {
-        return;
+        return EzGfxResult::InvalidContext;
     };
     let Ok(mut arena) = CONTEXTS.lock() else {
-        return;
+        return EzGfxResult::NativeFailure;
     };
-    let Ok(slot) = arena.get_mut(local) else {
-        return;
+    let Ok(slot) = arena.get(local) else {
+        return EzGfxResult::InvalidContext;
     };
-    // A void destroy from the wrong thread cannot report failure, so preserve the live context.
-    if slot
-        .as_ref()
-        .is_some_and(|owned| owned.identity.check_thread_and_health().is_err())
+    let Some(identity) = slot.as_ref().map(|owned| &owned.identity) else {
+        return EzGfxResult::InvalidContext;
+    };
+    if let Err(error) = identity.check_thread() {
+        return map_lifecycle(error);
+    }
+    let Ok(Some(mut owned)) = arena.remove(local) else {
+        return EzGfxResult::InvalidContext;
+    };
+    drop(arena);
+    let mut failure = None;
+
+    // Handles become terminal before cleanup begins; later failures cannot expose partial state.
+    owned.identity.invalidate_resources();
+    // Vulkan reports `NotReady` only when no native device or GPU work exists before `init_device`.
+    if let Err(error) = wait_native_idle(&mut owned.native)
+        && error != HalError::NotReady
     {
-        return;
+        failure.get_or_insert_with(|| map_native_loss(&owned.identity, error));
     }
-    let Some(mut owned) = slot.take() else {
-        return;
-    };
-    let _ = wait_native_idle(&mut owned.native);
-    for (_, surface) in owned.surfaces.drain() {
-        destroy_native_surface(&mut owned.native, surface.native);
-    }
+
     for (_, pipeline) in owned.pipelines.drain() {
         destroy_native_pipeline(&mut owned.native, pipeline);
     }
     for (_, shader) in owned.shaders.drain() {
         destroy_native_shader(&mut owned.native, shader.native);
     }
-    for (_, (_, texture, _, _, _)) in owned.textures.drain() {
-        let _ = destroy_native_texture(&mut owned.native, texture);
+    for (handle, (id, texture, _, _, _)) in owned.textures.drain() {
+        owned.texture_ready.remove(&handle);
+        if let Err(error) = owned.texture_registry.unload(id) {
+            failure.get_or_insert_with(|| map_texture(error));
+        }
+        if let Err(error) = destroy_native_texture(&mut owned.native, texture) {
+            failure.get_or_insert_with(|| map_allocation(error));
+        }
+    }
+    owned.texture_ready.clear();
+    if let Err(error) = owned.texture_registry.clear() {
+        failure.get_or_insert_with(|| map_texture(error));
     }
     for (_, (_, allocation)) in owned.allocations.drain() {
-        let _ = free_native_allocation(&mut owned.native, allocation);
+        if let Err(error) = free_native_allocation(&mut owned.native, allocation) {
+            failure.get_or_insert_with(|| map_allocation(error));
+        }
     }
+    owned.indirects.clear();
     for (_, heap) in owned.vertex_heaps.drain() {
-        let _ = free_native_allocation(&mut owned.native, heap.allocation);
+        if let Err(error) = free_native_allocation(&mut owned.native, heap.allocation) {
+            failure.get_or_insert_with(|| map_allocation(error));
+        }
     }
-    if let Some(heap) = owned.index_heap.take() {
-        let _ = free_native_allocation(&mut owned.native, heap.allocation);
+    if let Some(heap) = owned.index_heap.take()
+        && let Err(error) = free_native_allocation(&mut owned.native, heap.allocation)
+    {
+        failure.get_or_insert_with(|| map_allocation(error));
     }
     for staging in owned.staging.drain(..) {
-        let _ = free_native_allocation(&mut owned.native, staging.allocation);
+        if let Err(error) = free_native_allocation(&mut owned.native, staging.allocation) {
+            failure.get_or_insert_with(|| map_allocation(error));
+        }
     }
-    owned.identity.invalidate_resources();
+    owned.graphics_format = None;
+    owned.frame_resources.clear();
+    owned.frame_native_resources.clear();
+    owned.frame_index = None;
+    owned.frame_surface = None;
+    owned.frame_depth = None;
+    owned.frame_has_graphics = false;
+    owned.last_readback.clear();
+    owned.active_surface = None;
+    owned.frame_presented = false;
+
+    for (_, surface) in owned.surfaces.drain() {
+        destroy_native_surface(&mut owned.native, surface.native);
+    }
+
+    // FrameRecorder, GeometryManager, Observability, options, and emptied collections are CPU-only;
+    // NativeContext drops last, after every object created from it.
     drop(owned);
-    let _ = arena.remove(local);
+    failure.unwrap_or(EzGfxResult::Ok)
 }
 /// Creates a presentation surface.
 ///

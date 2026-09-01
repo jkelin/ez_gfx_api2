@@ -640,6 +640,34 @@ impl TextureRegistry {
         Ok(())
     }
 
+    /// Invalidates every texture slot and discards queued events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without mutation if an occupied slot cannot advance its generation.
+    pub fn clear(&mut self) -> Result<(), TextureError> {
+        if self
+            .slots
+            .iter()
+            .any(|entry| entry.state.is_some() && entry.generation == u32::MAX)
+        {
+            return Err(TextureError::GenerationExhausted);
+        }
+
+        self.free.clear();
+        for (slot, entry) in self.slots.iter_mut().enumerate() {
+            if entry.state.take().is_some() {
+                entry.generation += 1;
+            }
+            if entry.generation != u32::MAX {
+                self.free
+                    .push(u32::try_from(slot).map_err(|_| TextureError::CapacityExceeded)?);
+            }
+        }
+        self.events.clear();
+        Ok(())
+    }
+
     /// Returns the descriptor binding reserved by an existing texture handle.
     ///
     /// # Errors

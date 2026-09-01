@@ -99,6 +99,20 @@ impl ContextIdentity {
             .map_err(|_| LifecycleError::AlreadyLost)
     }
 
+    /// Checks creator-thread affinity without rejecting a lost context.
+    ///
+    /// This is reserved for terminal cleanup, which must remain possible after device loss.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when called from a thread other than the context creator.
+    pub fn check_thread(&self) -> Result<(), LifecycleError> {
+        if thread::current().id() != self.creator {
+            return Err(LifecycleError::WrongThread);
+        }
+        Ok(())
+    }
+
     /// Loss takes precedence over affinity so no thread can begin work after a fatal native result.
     ///
     /// # Errors
@@ -108,10 +122,7 @@ impl ContextIdentity {
         if self.health() == ContextHealth::Lost {
             return Err(LifecycleError::DeviceLost);
         }
-        if thread::current().id() != self.creator {
-            return Err(LifecycleError::WrongThread);
-        }
-        Ok(())
+        self.check_thread()
     }
 
     /// Identity capacity is limited by the packed 12-bit child slot and generation fields.

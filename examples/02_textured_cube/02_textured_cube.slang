@@ -1,4 +1,4 @@
-import ez_gfx_api;
+import "../../ez_gfx_api";
 
 struct Push {
     row_major float4x4 mvp;

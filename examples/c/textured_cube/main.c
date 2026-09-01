@@ -10,7 +10,7 @@
 #include <string.h>
 
 #if EZ_GFX_ABI_VERSION != 18u
-#error "structured_cube requires ez-gfx ABI v18"
+#error "textured_cube requires ez-gfx ABI v18"
 #endif
 
 #define WIDTH 640u
@@ -103,7 +103,7 @@ static int parse_u32(const char *text, uint32_t *value) {
 static int parse_options(int argc, char **argv, Options *options) {
     int index;
     memset(options, 0, sizeof(*options));
-    options->artifact_path = "structured_cube.ezgfxshader";
+    options->artifact_path = "textured_cube.ezgfxshader";
     options->max_frames = 300;
 
     for (index = 1; index < argc; ++index) {
@@ -256,7 +256,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
 
 /* Partial Win32 creation unregisters its class before returning failure. */
 static HWND create_window(HINSTANCE instance) {
-    const char *class_name = "EzGfxStructuredCubeWindow";
+    const char *class_name = "EzGfxTexturedCubeWindow";
     WNDCLASSA window_class;
     RECT bounds = {0, 0, (LONG)WIDTH, (LONG)HEIGHT};
     HWND window;
@@ -274,7 +274,7 @@ static HWND create_window(HINSTANCE instance) {
         UnregisterClassA(class_name, instance);
         return NULL;
     }
-    window = CreateWindowExA(0, class_name, "ez-gfx structured cube",
+    window = CreateWindowExA(0, class_name, "ez-gfx textured cube",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT,
         bounds.right - bounds.left, bounds.bottom - bounds.top, NULL, NULL, instance, NULL);
     if (window == NULL) {
@@ -289,7 +289,7 @@ static HWND create_window(HINSTANCE instance) {
 
 /* Every partially initialized path joins reverse-order cleanup through one exit. */
 int main(int argc, char **argv) {
-    const char *class_name = "EzGfxStructuredCubeWindow";
+    const char *class_name = "EzGfxTexturedCubeWindow";
     Options options;
     HINSTANCE instance = GetModuleHandleA(NULL);
     HWND window = NULL;
@@ -304,7 +304,7 @@ int main(int argc, char **argv) {
     EzGfxStructuredBuffer positions = 0, normals = 0, primitives = 0;
     EzGfxIndirectBuffer indirect = 0;
     uint32_t first_index = 0, frame;
-    int success = 0, index_heap_created = 0;
+    int success = 0;
     EzGfxBackendContextDesc context_desc;
     EzGfxSurfaceDesc surface_desc;
     Primitive primitive;
@@ -332,9 +332,7 @@ int main(int argc, char **argv) {
     if (!checked(ez_gfx_surface_create(&surface_desc, &surface, context), "create surface")) goto cleanup;
     if (!checked(ez_gfx_context_init_device(surface, context), "initialize surface device")) goto cleanup;
     if (!checked(ez_gfx_surface_resize(surface, WIDTH, HEIGHT, context), "resize surface")) goto cleanup;
-
     if (!checked(ez_gfx_index_heap_create(sizeof(INDICES), "cube indices", context), "create index heap")) goto cleanup;
-    index_heap_created = 1;
     if (!checked(ez_gfx_vertex_upload_indices(INDICES, 36, &first_index, context), "upload indices")) goto cleanup;
     if (!checked(ez_gfx_structured_acquire(sizeof(Vec4), 24, "positions", &positions, context), "acquire positions")) goto cleanup;
     if (!checked(ez_gfx_structured_write(positions, POSITIONS, sizeof(POSITIONS), context), "write positions")) goto cleanup;
@@ -347,7 +345,6 @@ int main(int argc, char **argv) {
     if (!checked(ez_gfx_acquire_indirect(1, "draw commands", &indirect, context), "acquire indirect")) goto cleanup;
     if (!checked(ez_gfx_indirect_set_draw_count(indirect, 1, context), "set indirect count")) goto cleanup;
     if (!checked(ez_gfx_shader_load_artifact(artifact, artifact_size, &shader, context), "load shader artifact")) goto cleanup;
-    if (!checked(ez_gfx_context_wait_idle(context), "wait for uploads")) goto cleanup;
 
     bindings[0] = (EzGfxBinding){"positions", positions, 0, 0};
     bindings[1] = (EzGfxBinding){"normals", normals, 0, 0};
@@ -379,7 +376,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "no frame was presented\n");
         goto cleanup;
     }
-    if (!checked(ez_gfx_context_wait_idle(context), "wait idle")) goto cleanup;
 
     if (options.snapshot_path != NULL) {
         if (!checked(ez_gfx_frame_readback(NULL, 0, &snapshot_size, context), "query snapshot size")) goto cleanup;
@@ -395,14 +391,6 @@ int main(int argc, char **argv) {
     success = 1;
 
 cleanup:
-    if (context != 0 && !checked(ez_gfx_context_wait_idle(context), "cleanup wait idle")) success = 0;
-    if (shader != 0) ez_gfx_shader_destroy(shader, context);
-    if (indirect != 0) ez_gfx_indirect_release(indirect, context);
-    if (primitives != 0) ez_gfx_structured_release(primitives, context);
-    if (normals != 0) ez_gfx_structured_release(normals, context);
-    if (positions != 0) ez_gfx_structured_release(positions, context);
-    if (index_heap_created) ez_gfx_index_heap_destroy(context);
-    if (surface != 0) ez_gfx_surface_destroy(surface, context);
     if (context != 0) ez_gfx_context_destroy(context);
     if (window != NULL && IsWindow(window)) DestroyWindow(window);
     if (window != NULL) UnregisterClassA(class_name, instance);

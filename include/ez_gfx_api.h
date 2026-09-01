@@ -504,15 +504,16 @@ EzGfxResult ez_gfx_context_create_backend(const EzGfxBackendContextDesc * desc, 
  * ez_gfx_context_wait_idle:
  * @context (not nullable): Owning context.
  *
- * Returns: (transfer none): Returns EzGfxResult_Ok or EzGfxResult_InvalidContext.
+ * Waits without destroying resources. Returns: (transfer none): EzGfxResult_Ok or an invalid-context, not-ready, native-failure, or device-loss result.
  */
 EzGfxResult ez_gfx_context_wait_idle(EzGfxContext context);
 
 /**
  * ez_gfx_context_destroy:
- * @context: Context to destroy; null is ignored.
+ * @context: Context to destroy on its creator thread; null, stale, repeated, and wrong-thread calls are ignored.
  *
- * Returns: (transfer none): No return value; null handles are ignored.
+ * Waits for an initialized device to become idle, then destroys every resource owned by the context. A context without a device is destroyed without waiting. Cleanup is terminal once it begins.
+ * Returns: (transfer none): No return value; wait or release failures cannot be reported through the stable ABI.
  */
 void ez_gfx_context_destroy(EzGfxContext context);
 

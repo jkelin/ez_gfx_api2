@@ -184,3 +184,35 @@ fn cancel_upload_reuses_binding_without_emitting_public_events() {
     assert_ne!(replacement, failed);
     assert_eq!(registry.begin_upload(), Err(TextureError::CapacityExceeded));
 }
+
+#[test]
+fn clear_invalidates_every_slot_and_rebuilds_the_free_list() {
+    let mut registry = TextureRegistry::new(3, 3).unwrap();
+    let resident = registry.begin_upload().unwrap();
+    let allocated = registry.begin_upload().unwrap();
+    let vacant = registry.begin_upload().unwrap();
+    registry.cancel_upload(vacant).unwrap();
+    let ready = CompletionToken::new(QueueKind::Transfer, 1).unwrap();
+    registry.mark_submitted(resident, ready).unwrap();
+    registry.poll(QueueKind::Transfer, 1).unwrap();
+
+    registry.clear().unwrap();
+
+    assert!(registry.drain_events().is_empty());
+    for stale in [resident, allocated, vacant] {
+        assert_eq!(registry.binding_index(stale), Err(TextureError::NotFound));
+    }
+    let replacements = [
+        registry.begin_upload().unwrap(),
+        registry.begin_upload().unwrap(),
+        registry.begin_upload().unwrap(),
+    ];
+    assert_eq!(
+        replacements
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        3
+    );
+    assert_eq!(registry.begin_upload(), Err(TextureError::CapacityExceeded));
+}

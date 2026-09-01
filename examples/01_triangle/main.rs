@@ -1,42 +1,31 @@
 //! Triangle using safe ez-gfx context, resource, and frame APIs.
-#![allow(
-    clippy::borrow_as_ptr,
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::float_cmp,
-    clippy::ignored_unit_patterns,
-    clippy::map_unwrap_or,
-    clippy::match_overlapping_arm,
-    clippy::needless_pass_by_value,
-    clippy::redundant_closure_for_method_calls,
-    clippy::semicolon_if_nothing_returned,
-    clippy::type_complexity,
-    clippy::unused_self,
-    clippy::wildcard_imports,
-    reason = "The inline renderer preserves fixed graphics ABI and callback contracts."
-)]
 mod renderer {
-    use crate::shared::{FrameInput, SceneInput};
-    use ez_gfx::{
-        ContextHandle, DrawIndexedCommand, DynamicPipelineState, EzGfxResult, IndirectBufferHandle,
-        PublicBinding, ResourceIdentity, ShaderHandle, StructuredBufferHandle, acquire_indirect,
-        acquire_structured, create_index_heap, destroy_index_heap, destroy_shader, load_shader,
-        release_indirect, release_structured, render_add_graphics, set_indirect_count,
-        upload_indices, write_indirect, write_structured,
-    };
+    use anyhow::Context as _;
+    use ez_gfx::*;
 
-    use crate::shared;
+    use crate::shared::{input::*, *};
 
     pub(super) struct Triangle {
         shader: ShaderHandle,
-        positions: StructuredBufferHandle,
         indirect: IndirectBufferHandle,
         bindings: [PublicBinding; 1],
     }
 
     impl Triangle {
         pub(super) fn create(context: ContextHandle) -> anyhow::Result<Self> {
+            let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .context("examples package has no workspace parent")?;
+            let shader_bytes = ez_gfx_compiler::compile_shader(
+                &workspace_root.join("examples/01_triangle/01_triangle.slang"),
+                &[
+                    ez_gfx_compiler::Target::Spirv,
+                    ez_gfx_compiler::Target::Dxil,
+                    ez_gfx_compiler::Target::Metal,
+                ],
+                !cfg!(target_vendor = "apple"),
+            )
+            .context("compile triangle shader")?;
             let vertical = if cfg!(target_vendor = "apple") {
                 -1.0
             } else {
@@ -49,47 +38,24 @@ mod renderer {
             ];
             let indices = [0_u32, 1, 2];
 
-            let index_bytes = shared::byte_len(&indices)?;
-            let positions_bytes = shared::byte_len(&positions)?;
+            let index_bytes = byte_len(&indices)?;
+            let positions_bytes = byte_len(&positions)?;
             status(create_index_heap(context, index_bytes), "create index heap")?;
-            let first_index = match upload_indices(
-                context,
-                indices.len() as u32,
-                shared::slice_bytes(&indices),
-            ) {
-                Ok(first_index) => first_index,
-                Err(error) => {
-                    destroy_index_heap(context);
-                    return Err(anyhow::anyhow!("{error:?}").context("upload indices"));
-                }
-            };
-            let positions_handle = match acquire_structured(context, positions_bytes) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    destroy_index_heap(context);
-                    return Err(anyhow::anyhow!("{error:?}").context("acquire positions"));
-                }
-            };
-            if let Err(error) = status(
-                write_structured(context, positions_handle, shared::slice_bytes(&positions)),
+            let first_index = upload_indices(context, indices.len() as u32, slice_bytes(&indices))
+                .map_err(|error| anyhow::anyhow!("{error:?}"))
+                .context("upload indices")?;
+            let positions_handle = acquire_structured(context, positions_bytes)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))
+                .context("acquire positions")?;
+            status(
+                write_structured(context, positions_handle, slice_bytes(&positions)),
                 "upload positions",
-            ) {
-                release_structured(context, positions_handle);
-                destroy_index_heap(context);
-                return Err(error);
-            }
+            )?;
 
-            let indirect = match acquire_indirect(context, 1) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    release_structured(context, positions_handle);
-                    destroy_index_heap(context);
-                    return Err(
-                        anyhow::anyhow!("{error:?}").context("acquire triangle indirect buffer")
-                    );
-                }
-            };
-            let draw_result = status(
+            let indirect = acquire_indirect(context, 1)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))
+                .context("acquire triangle indirect buffer")?;
+            status(
                 write_indirect(
                     context,
                     indirect,
@@ -103,36 +69,18 @@ mod renderer {
                     },
                 ),
                 "write triangle draw",
-            )
-            .and_then(|()| {
-                status(
-                    set_indirect_count(context, indirect, 1),
-                    "set triangle draw count",
-                )
-            });
-            if let Err(error) = draw_result {
-                release_indirect(context, indirect);
-                release_structured(context, positions_handle);
-                destroy_index_heap(context);
-                return Err(error);
-            }
+            )?;
+            status(
+                set_indirect_count(context, indirect, 1),
+                "set triangle draw count",
+            )?;
 
-            let shader = match load_shader(
-                context,
-                include_bytes!(concat!(env!("OUT_DIR"), "/01_triangle.ezgfxshader")),
-            ) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    release_indirect(context, indirect);
-                    release_structured(context, positions_handle);
-                    destroy_index_heap(context);
-                    return Err(anyhow::anyhow!("{error:?}").context("load triangle artifact"));
-                }
-            };
+            let shader = load_shader(context, &shader_bytes)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))
+                .context("load triangle artifact")?;
 
             Ok(Self {
                 shader,
-                positions: positions_handle,
                 indirect,
                 bindings: [PublicBinding {
                     name: "positions".to_owned(),
@@ -155,13 +103,6 @@ mod renderer {
                 "record triangle graphics pipeline",
             )
         }
-
-        pub(super) fn destroy(self, context: ContextHandle) {
-            release_indirect(context, self.indirect);
-            release_structured(context, self.positions);
-            destroy_index_heap(context);
-            destroy_shader(context, self.shader);
-        }
     }
 
     fn status(result: EzGfxResult, operation: &str) -> anyhow::Result<()> {
@@ -171,20 +112,14 @@ mod renderer {
         }
     }
 }
+
 #[path = "../shared/mod.rs"]
 mod shared;
 
 use anyhow::Context as _;
-use ez_gfx::{
-    Backend, ContextHandle, ContextOptions, EzGfxResult, SurfaceHandle, SurfaceOptions,
-    SurfacePlatform, begin_render, create_context, create_surface, destroy_context,
-    destroy_surface, finish_render, frame_readback, init_device, poll_diagnostic,
-    poll_runtime_event, resize_surface, set_snapshot_cache, wait_idle,
-};
+use ez_gfx::*;
 use renderer::Triangle as ExampleScene;
-use shared::{
-    FrameInput, LifecycleCallbacks, LifecycleConfig, NativePlatform, NativeSurface, SceneInput,
-};
+use shared::*;
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
@@ -193,16 +128,16 @@ struct Example {
     resources: Option<ExampleScene>,
     context: Option<ContextHandle>,
     surface: Option<SurfaceHandle>,
-    benchmark: shared::BenchmarkRunner,
+    benchmark: BenchmarkRunner,
 }
 
 impl Example {
-    fn new(benchmark: Option<shared::BenchmarkConfig>) -> Self {
+    fn new(benchmark: Option<BenchmarkConfig>) -> Self {
         Self {
             resources: None,
             context: None,
             surface: None,
-            benchmark: shared::BenchmarkRunner::new(benchmark),
+            benchmark: BenchmarkRunner::new(benchmark),
         }
     }
 
@@ -216,17 +151,16 @@ impl Example {
 }
 
 impl LifecycleCallbacks for Example {
-    type Report = shared::ProgramReport;
+    type Report = ProgramReport;
 
     fn initialize(&mut self, native: NativeSurface, width: u32, height: u32) -> anyhow::Result<()> {
-        let (backend, backend_name) = backend()?;
-        let platform = match native.platform {
-            NativePlatform::Win32 => SurfacePlatform::Win32,
-            NativePlatform::MetalLayer => SurfacePlatform::MetalLayer,
-        };
+        let config = backend_config(native.platform)?;
+        let backend = config.backend;
+        let backend_name = config.name;
+        let platform = config.platform;
         let context = create_context(ContextOptions {
-            enable_debug: shared::env_flag("EZ_GFX_EXAMPLE_DEBUG")?,
-            enable_validation: shared::env_flag("EZ_GFX_EXAMPLE_VALIDATION")?,
+            enable_debug: env_flag("EZ_GFX_EXAMPLE_DEBUG")?,
+            enable_validation: env_flag("EZ_GFX_EXAMPLE_VALIDATION")?,
             surface_platform: platform,
             backend,
         })
@@ -299,16 +233,11 @@ impl LifecycleCallbacks for Example {
         Ok(())
     }
 
-    fn capture(
-        &mut self,
-        width: u32,
-        height: u32,
-        frames: u32,
-    ) -> anyhow::Result<shared::ProgramReport> {
+    fn capture(&mut self, width: u32, height: u32, frames: u32) -> anyhow::Result<ProgramReport> {
         let rgba8 = frame_readback(self.context())
             .map_err(|error| anyhow::anyhow!("{error:?}"))
             .context("read presented snapshot")?;
-        let counts = shared::drain_bounded(
+        let counts = drain_bounded(
             4096,
             || {
                 poll_runtime_event(self.context())
@@ -323,8 +252,8 @@ impl LifecycleCallbacks for Example {
                     .context("poll diagnostic")
             },
         )?;
-        Ok(shared::ProgramReport {
-            frame: shared::PresentedFrame {
+        Ok(ProgramReport {
+            frame: PresentedFrame {
                 width,
                 height,
                 frames,
@@ -338,25 +267,17 @@ impl LifecycleCallbacks for Example {
     }
 
     fn shutdown(&mut self) {
-        let Some(context) = self.context.take() else {
-            return;
-        };
-        let _ = wait_idle(context);
-        if let Some(resources) = self.resources.take() {
-            resources.destroy(context);
+        if let Some(context) = self.context.take() {
+            let _ = destroy_context(context);
         }
-        if let Some(surface) = self.surface.take() {
-            destroy_surface(context, surface);
-        }
-        destroy_context(context);
     }
 }
 
 fn run_example_with_benchmark(
     frame_limit: Option<u32>,
-    benchmark: Option<shared::BenchmarkConfig>,
-) -> anyhow::Result<Option<shared::ProgramReport>> {
-    shared::run(
+    benchmark: Option<BenchmarkConfig>,
+) -> anyhow::Result<Option<ProgramReport>> {
+    run(
         LifecycleConfig {
             width: WIDTH,
             height: HEIGHT,
@@ -367,44 +288,17 @@ fn run_example_with_benchmark(
     )
 }
 
-fn backend() -> anyhow::Result<(Backend, &'static str)> {
-    match std::env::var("EZ_GFX_BACKEND").ok().as_deref() {
-        #[cfg(target_vendor = "apple")]
-        None | Some("metal") => Ok((Backend::Metal, "Metal")),
-        #[cfg(not(target_vendor = "apple"))]
-        None | Some("vulkan") => Ok((Backend::Vulkan, "Vulkan")),
-        #[cfg(windows)]
-        Some("dx12") => Ok((Backend::Dx12, "DX12")),
-        Some(value) => Err(anyhow::anyhow!("unsupported EZ_GFX_BACKEND `{value}`")),
-    }
+fn main() {
+    let backend = backend_name().unwrap_or_else(|error| {
+        eprintln!("{error:#}");
+        std::process::exit(2);
+    });
+    run_program("01_triangle", backend, run_example_with_benchmark);
 }
 
 fn status(result: EzGfxResult, operation: &str) -> anyhow::Result<()> {
     match result {
         EzGfxResult::Ok => Ok(()),
         error => Err(anyhow::anyhow!("{error:?}").context(operation.to_owned())),
-    }
-}
-
-fn main() {
-    let backend = std::env::var("EZ_GFX_BACKEND").unwrap_or_else(|_| {
-        if cfg!(target_vendor = "apple") {
-            "metal".to_owned()
-        } else {
-            "vulkan".to_owned()
-        }
-    });
-    shared::run_program("01_triangle", &backend, run_example_with_benchmark);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn backend_selection_defaults_and_validates() {
-        #[cfg(target_vendor = "apple")]
-        assert_eq!(backend(), Ok((Backend::Metal, "Metal")));
-        #[cfg(not(target_vendor = "apple"))]
-        assert_eq!(backend().unwrap(), (Backend::Vulkan, "Vulkan"));
     }
 }

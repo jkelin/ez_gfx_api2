@@ -44,7 +44,7 @@ jobs:
           -p ez-gfx-compiler
           -p ez-gfx-ffi
           -p xtask
-      - name: Test example logic and generated shader artifacts
+      - name: Test example logic and source-compiled shader artifacts
         run: |
           cargo test -p ez-gfx-examples --bins
           cargo test -p ez-gfx-examples --test shader_artifacts
@@ -146,21 +146,21 @@ jobs:
 
       - name: Build FFI
         run: cargo build -p ez-gfx-ffi
-      - name: Build and link C structured cube
+      - name: Build and link C textured cube
         if: runner.os == 'Windows'
         run: |
           cargo build -p ez-gfx-compiler --bin ez-gfx-compile
-          cmake -S examples/c/structured_cube -B target/c-examples/structured_cube-build
-          cmake --build target/c-examples/structured_cube-build --config Debug
-      - name: Run C structured cube with SwiftShader
+          cmake -S examples/c/textured_cube -B target/c-examples/textured_cube-build
+          cmake --build target/c-examples/textured_cube-build --config Debug
+      - name: Run C textured cube with SwiftShader
         if: matrix.backend == 'vulkan-windows'
         env:
           VK_DRIVER_FILES: C:\swiftshader\vk_swiftshader_icd.json
         shell: bash
         run: |
-          target/c-examples/structured_cube-build/Debug/structured_cube.exe \
+          target/c-examples/textured_cube-build/Debug/textured_cube.exe \
             --backend vulkan \
-            --artifact target/c-examples/structured_cube-build/Debug/structured_cube.ezgfxshader \
+            --artifact target/c-examples/textured_cube-build/Debug/textured_cube.ezgfxshader \
             --max-frames 1 \
-            --snapshot target/c-examples/structured-cube-vulkan.rgba
-          test "$(wc -c < target/c-examples/structured-cube-vulkan.rgba)" -eq 1228800
+            --snapshot target/c-examples/textured-cube-vulkan.rgba
+          test "$(wc -c < target/c-examples/textured-cube-vulkan.rgba)" -eq 1228800

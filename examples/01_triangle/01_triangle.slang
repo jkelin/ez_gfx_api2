@@ -1,4 +1,4 @@
-import ez_gfx_api;
+import "../../ez_gfx_api";
 
 [StructuredBuffer("positions")]
 StructuredBuffer<float4> positions;

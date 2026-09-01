@@ -1,13 +1,16 @@
 //! Shader compilation request validation and artifact production.
 
 #![forbid(unsafe_code)]
+mod error;
+
+pub use error::CompilerError;
+
 use core::fmt;
 use ez_gfx_artifact::{
-    AppleArchitecture, ApplePlatform, Artifact, ArtifactError, CompatibilityVersion,
-    MetalCompatibility, Provenance, Stage, Target, TargetCompatibility, TargetVariant,
+    AppleArchitecture, ApplePlatform, Artifact, CompatibilityVersion, MetalCompatibility,
+    Provenance, Stage, Target as ArtifactTarget, TargetCompatibility, TargetVariant,
 };
 use ez_gfx_core::{Backend, SemanticError, SemanticGraph, TargetLayout};
-use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -78,379 +81,314 @@ pub fn validate_target_layouts(
     Ok(())
 }
 
-#[derive(Clone, Debug)]
-/// Settings for Slang version validation and aggregate compiled-output size.
-pub struct CompilerConfig {
-    /// Tool build-tag fragment required for compilation.
-    pub required_version: String,
-    /// Maximum combined byte size permitted for compiled outputs.
-    pub max_output_bytes: usize,
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+/// Backend-independent shader output family.
+pub enum Target {
+    /// SPIR-V 1.5.
+    Spirv,
+    /// DirectX IL Shader Model 6.5.
+    Dxil,
+    /// Metal 3.0, emitted as MSL in development and metallib otherwise.
+    Metal,
 }
-impl CompilerConfig {
-    /// Creates compiler settings with the required Slang build-tag fragment and a 64 MiB output limit.
-    pub fn new(required_version: impl Into<String>) -> Self {
+
+impl fmt::Display for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Spirv => "spirv",
+            Self::Dxil => "dxil",
+            Self::Metal => "metal",
+        })
+    }
+}
+
+impl std::str::FromStr for Target {
+    type Err = CompilerError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "spirv" => Ok(Self::Spirv),
+            "dxil" => Ok(Self::Dxil),
+            "metal" => Ok(Self::Metal),
+            _ => Err(CompilerError::InvalidRequest("target")),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CompilerConfig {
+    max_output_bytes: usize,
+}
+
+impl Default for CompilerConfig {
+    fn default() -> Self {
         Self {
-            required_version: required_version.into(),
             max_output_bytes: 64 * 1024 * 1024,
         }
     }
-    /// Opens a Slang global session and returns its build tag after version validation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the native Slang session is unavailable or its build tag does not contain the required version.
-    pub fn validate_tool(&self) -> Result<String, CompilerError> {
-        let session = shader_slang::GlobalSession::new().ok_or(CompilerError::NativeUnavailable)?;
-        let version = session.build_tag_string().to_owned();
-        if !self.required_version.is_empty() && !version.contains(&self.required_version) {
-            return Err(CompilerError::VersionMismatch {
-                expected: self.required_version.clone(),
-                found: version,
-            });
-        }
-        Ok(version)
-    }
 }
 
 #[derive(Clone, Debug)]
-/// Identifies one shader compilation by target format, stage, entry point, and Slang profile.
-pub struct TargetRequest {
-    /// Binary format to produce for this shader.
-    pub target: Target,
-    /// Pipeline stage implemented by the entry point.
-    pub stage: Stage,
-    /// Source entry point to compile.
-    pub entry_point: String,
-    /// Slang profile used to compile the entry point.
-    pub profile: String,
-}
-impl TargetRequest {
-    /// Creates a target request after validating the entry-point and profile strings.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the entry point or profile is empty or contains a NUL character.
-    pub fn new(
-        target: Target,
-        stage: Stage,
-        entry_point: impl Into<String>,
-        profile: impl Into<String>,
-    ) -> Result<Self, CompilerError> {
-        let entry_point = entry_point.into();
-        let profile = profile.into();
-        if entry_point.is_empty()
-            || entry_point.contains('\0')
-            || profile.is_empty()
-            || profile.contains('\0')
-        {
-            return Err(CompilerError::InvalidRequest("entry/profile"));
-        }
-        Ok(Self {
-            target,
-            stage,
-            entry_point,
-            profile,
-        })
-    }
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Selects whether a build emits portable MSL source or an Apple metallib.
-pub enum MetalOutput {
-    /// Produces MSL without requiring Apple tools.
-    Source,
-    /// Produces a metallib and requires the Apple `xcrun` toolchain.
-    Library,
+struct TargetRequest {
+    target: ArtifactTarget,
+    stage: Stage,
+    entry_point: String,
+    profile: &'static str,
 }
 
 #[derive(Clone, Debug)]
-/// Compiler configuration and request derived from one shader manifest.
-pub struct ShaderBuildPlan {
-    /// Compiler version and output-limit configuration.
-    pub config: CompilerConfig,
-    /// Fully resolved compilation request.
-    pub request: CompilationRequest,
+struct DiscoveredEntry {
+    name: String,
+    stage: Stage,
 }
 
-#[derive(Deserialize)]
-struct ShaderManifest {
-    source: PathBuf,
-    output: PathBuf,
-    #[serde(default)]
-    required_version: String,
-    #[serde(default)]
-    include_dirs: Vec<PathBuf>,
-    #[serde(default)]
-    defines: Vec<String>,
-    #[serde(default)]
-    semantic_metadata: serde_json::Value,
-    #[serde(default)]
-    toolchain: String,
-    #[serde(default)]
-    apple_toolchain: String,
-    targets: Vec<ManifestTarget>,
-}
-
-#[derive(Deserialize)]
-struct ManifestTarget {
-    target: String,
-    stage: String,
-    entry: String,
-    profile: String,
-}
-
-/// Parses a shader manifest into a host-specific compilation plan.
+/// Compiles a Slang source file into owned, validated `.ezgfxshader` bytes.
 ///
-/// Relative source and include paths are resolved from `workspace_root`; the
-/// manifest output path is validated but replaced by `output_dir`.
+/// Entry points and stages are discovered from Slang declarations. Profiles are
+/// fixed to SPIR-V 1.5, Shader Model 6.5, and Metal 3.0. Development builds
+/// emit portable MSL for `metal`; release builds emit a metallib.
 ///
 /// # Errors
 ///
-/// Returns an error for malformed JSON, missing output names, unknown target or
-/// stage names, or invalid target requests.
-pub fn plan_manifest(
-    manifest: &[u8],
-    workspace_root: &Path,
-    output_dir: &Path,
-    metal: MetalOutput,
-) -> Result<ShaderBuildPlan, CompilerError> {
-    let manifest: ShaderManifest = serde_json::from_slice(manifest)
-        .map_err(|_| CompilerError::InvalidRequest("manifest JSON"))?;
-    if manifest.output.file_name().is_none() {
-        return Err(CompilerError::InvalidRequest("manifest output"));
+/// Returns an error if the source or target list is invalid, Slang reflection
+/// or compilation fails, a stage is declared more than once, Apple tooling is
+/// unavailable, or artifact encoding or validation fails.
+pub fn compile_shader(
+    source: &Path,
+    targets: &[Target],
+    development: bool,
+) -> Result<Vec<u8>, CompilerError> {
+    // Metadata distinguishes regular files from directories before platform-specific
+    // open behavior can obscure the invalid source kind.
+    let source_error = |source_error| CompilerError::SourceRead {
+        path: source.to_path_buf(),
+        source: source_error,
+    };
+    let metadata = fs::metadata(source).map_err(source_error)?;
+    if !metadata.is_file() {
+        return Err(CompilerError::InvalidRequest("source file"));
     }
+    fs::File::open(source).map_err(source_error)?;
+    // Slang's module loader resolves `<stem>.slang`; reject other extensions so
+    // the file opened above and the module loaded below share one lowercase convention.
+    if source.extension().and_then(|extension| extension.to_str()) != Some("slang") {
+        return Err(CompilerError::InvalidRequest("source extension"));
+    }
+    let targets = normalize_targets(targets)?;
 
-    let targets = manifest
-        .targets
-        .into_iter()
-        .map(|target| {
-            let format = match target.target.as_str() {
-                "spirv" => Target::Spirv,
-                "dxil" => Target::Dxil,
-                "msl" | "metallib" => match metal {
-                    MetalOutput::Source => Target::Msl,
-                    MetalOutput::Library => Target::Metallib,
-                },
-                _ => return Err(CompilerError::InvalidRequest("manifest target")),
-            };
-            let stage = match target.stage.as_str() {
-                "vertex" => Stage::Vertex,
-                "fragment" => Stage::Fragment,
-                "compute" => Stage::Compute,
-                "geometry" => Stage::Geometry,
-                "tess-control" => Stage::TessellationControl,
-                "tess-eval" => Stage::TessellationEvaluation,
-                _ => return Err(CompilerError::InvalidRequest("manifest stage")),
-            };
-            TargetRequest::new(format, stage, target.entry, target.profile)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut request = CompilationRequest::new(
-        resolve_manifest_path(workspace_root, &manifest.source),
-        output_dir.to_path_buf(),
-        targets,
+    let output = tempfile::tempdir().map_err(CompilerError::TemporaryOutputCreate)?;
+    let entries = discover_entries(source, targets[0], development)?;
+    let target_requests = plan_target_requests(&entries, &targets, development);
+    let request = CompilationRequest::new(
+        source.to_path_buf(),
+        output.path().to_path_buf(),
+        target_requests,
     );
-    request.include_dirs = manifest
-        .include_dirs
-        .iter()
-        .map(|path| resolve_manifest_path(workspace_root, path))
-        .collect();
-    request.defines = manifest.defines;
-    request.semantic_metadata = serde_json::to_vec(&manifest.semantic_metadata)
-        .map_err(|_| CompilerError::InvalidRequest("metadata JSON"))?;
-    request.toolchain = manifest.toolchain;
-    request.apple_toolchain = manifest.apple_toolchain;
-    request.release_complete = metal == MetalOutput::Library;
+    let artifact = compile_request(&CompilerConfig::default(), &request)?;
+    let bytes = artifact.encode().map_err(CompilerError::ArtifactEncoding)?;
+    Artifact::decode(&bytes).map_err(CompilerError::ArtifactValidation)?;
 
-    Ok(ShaderBuildPlan {
-        config: CompilerConfig::new(manifest.required_version),
-        request,
-    })
+    Ok(bytes)
 }
 
-fn resolve_manifest_path(root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else if path == Path::new(".") {
-        root.to_path_buf()
-    } else {
-        root.join(path)
+fn normalize_targets(targets: &[Target]) -> Result<Vec<Target>, CompilerError> {
+    if targets.is_empty() {
+        return Err(CompilerError::InvalidRequest("targets"));
     }
+    let mut unique = BTreeSet::new();
+    if targets.iter().any(|target| !unique.insert(*target)) {
+        return Err(CompilerError::InvalidRequest("duplicate target"));
+    }
+    Ok(unique.into_iter().collect())
+}
+
+fn plan_target_requests(
+    entries: &[DiscoveredEntry],
+    targets: &[Target],
+    development: bool,
+) -> Vec<TargetRequest> {
+    let mut requests = Vec::with_capacity(entries.len() * targets.len());
+    for target in targets {
+        let (artifact_target, profile) = match target {
+            Target::Spirv => (ArtifactTarget::Spirv, "spirv_1_5"),
+            Target::Dxil => (ArtifactTarget::Dxil, "sm_6_5"),
+            Target::Metal if development => (ArtifactTarget::Msl, "metal_3_0"),
+            Target::Metal => (ArtifactTarget::Metallib, "metal_3_0"),
+        };
+        requests.extend(entries.iter().map(|entry| TargetRequest {
+            target: artifact_target,
+            stage: entry.stage,
+            entry_point: entry.name.clone(),
+            profile,
+        }));
+    }
+    requests
 }
 
 #[derive(Clone, Debug)]
-/// Inputs, target matrix, metadata, and provenance used to compile one shader source file.
-pub struct CompilationRequest {
-    /// Shader source file to compile.
-    pub source: PathBuf,
-    /// Directory used for temporary and generated outputs.
-    pub output_dir: PathBuf,
-    /// Requested target, stage, entry-point, and profile combinations.
-    pub targets: Vec<TargetRequest>,
-    /// Additional directories searched for imported shader sources.
-    pub include_dirs: Vec<PathBuf>,
-    /// Preprocessor definitions passed to Slang.
-    pub defines: Vec<String>,
-    /// JSON-encoded semantic metadata embedded in the artifact.
-    pub semantic_metadata: Vec<u8>,
-    /// Toolchain description recorded in artifact provenance.
-    pub toolchain: String,
-    /// Apple Metal toolchain description recorded in artifact provenance.
-    pub apple_toolchain: String,
-    /// Whether Metal coverage requires compiled metallib output.
-    pub release_complete: bool,
+struct CompilationRequest {
+    source: PathBuf,
+    output_dir: PathBuf,
+    targets: Vec<TargetRequest>,
 }
+
 impl CompilationRequest {
-    /// Creates a compilation request with default metadata, no includes or defines, and required metallib coverage.
-    pub fn new(source: PathBuf, output_dir: PathBuf, targets: Vec<TargetRequest>) -> Self {
+    fn new(source: PathBuf, output_dir: PathBuf, targets: Vec<TargetRequest>) -> Self {
         Self {
             source,
             output_dir,
             targets,
-            include_dirs: vec![],
-            defines: vec![],
-            semantic_metadata: br"{}".to_vec(),
-            toolchain: "unknown".into(),
-            apple_toolchain: "unknown".into(),
-            release_complete: true,
         }
     }
-    /// Checks paths, defines, target uniqueness and coverage, and semantic metadata JSON.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for invalid defines or include paths, duplicate variants, missing target coverage, an empty target list, an invalid source or output path, or invalid metadata JSON.
-    pub fn validate(&self) -> Result<(), CompilerError> {
-        if self.defines.iter().any(|v| {
-            let (key, _) = v.split_once('=').unwrap_or((v.as_str(), ""));
-            key.is_empty() || key.contains('\0') || v.contains('\0')
-        }) {
-            return Err(CompilerError::InvalidRequest("invalid define"));
-        }
-        if self
-            .include_dirs
-            .iter()
-            .any(|path| path.to_string_lossy().contains('\0'))
-        {
-            return Err(CompilerError::InvalidRequest("invalid include path"));
-        }
-        let mut exact = BTreeSet::new();
-        for t in &self.targets {
-            if !exact.insert((
-                t.target,
-                t.stage,
-                t.entry_point.as_str(),
-                t.profile.as_str(),
-            )) {
-                return Err(CompilerError::InvalidRequest("duplicate variant"));
-            }
-        }
-        let mut stages = BTreeMap::new();
-        for target in &self.targets {
-            if let Some(entry) = stages.insert(target.stage, target.entry_point.as_str())
-                && entry != target.entry_point
-            {
-                return Err(CompilerError::DuplicateStage(target.stage));
-            }
-        }
-        for (&stage, &entry) in &stages {
-            for target in [Target::Spirv, Target::Dxil] {
-                if !self
-                    .targets
-                    .iter()
-                    .any(|t| t.entry_point == entry && t.stage == stage && t.target == target)
-                {
-                    return Err(CompilerError::MissingCoverage {
-                        entry: entry.into(),
-                        stage,
-                        target,
-                    });
-                }
-            }
-            let metal = self.targets.iter().any(|t| {
-                t.entry_point == entry
-                    && t.stage == stage
-                    && if self.release_complete {
-                        t.target == Target::Metallib
-                    } else {
-                        matches!(t.target, Target::Msl | Target::Metallib)
-                    }
-            });
-            if !metal {
-                return Err(CompilerError::MissingCoverage {
-                    entry: entry.into(),
-                    stage,
-                    target: Target::Metallib,
-                });
-            }
-        }
+
+    fn validate(&self) -> Result<(), CompilerError> {
         if self.targets.is_empty()
             || !self.source.is_file()
             || self.output_dir.as_os_str().is_empty()
         {
             return Err(CompilerError::InvalidRequest("source/output"));
         }
-        if serde_json::from_slice::<serde_json::Value>(&self.semantic_metadata).is_err() {
-            return Err(CompilerError::InvalidRequest("metadata JSON"));
-        }
         Ok(())
     }
 }
+fn module_name(source: &Path) -> Result<&str, CompilerError> {
+    source
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .ok_or(CompilerError::InvalidRequest("source name"))
+}
 
-/// Compiles all requested shader targets and packages binaries, reflection metadata, and provenance into an artifact.
-///
-/// # Errors
-///
-/// Returns an error if request validation, Slang setup or compilation, Metal tool invocation, file I/O, output-limit enforcement, metadata serialization, or artifact construction fails.
-pub fn compile(
+fn source_search_path(source: &Path) -> Result<std::ffi::CString, CompilerError> {
+    // Slang receives this path as UTF-8 C text, so unrepresentable or interior-NUL
+    // parents must fail instead of naming a different module search directory.
+    let parent = source
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_str()
+        .ok_or(CompilerError::InvalidRequest("search path"))?;
+    std::ffi::CString::new(parent).map_err(|_| CompilerError::InvalidRequest("search path"))
+}
+
+fn compile_target(target: ArtifactTarget) -> shader_slang::CompileTarget {
+    match target {
+        ArtifactTarget::Spirv => shader_slang::CompileTarget::Spirv,
+        ArtifactTarget::Dxil => shader_slang::CompileTarget::Dxil,
+        ArtifactTarget::Msl | ArtifactTarget::Metallib => shader_slang::CompileTarget::Metal,
+    }
+}
+
+fn discovery_target(target: Target, development: bool) -> (ArtifactTarget, &'static str) {
+    match target {
+        Target::Spirv => (ArtifactTarget::Spirv, "spirv_1_5"),
+        Target::Dxil => (ArtifactTarget::Dxil, "sm_6_5"),
+        Target::Metal if development => (ArtifactTarget::Msl, "metal_3_0"),
+        Target::Metal => (ArtifactTarget::Metallib, "metal_3_0"),
+    }
+}
+
+fn artifact_stage(stage: shader_slang::Stage) -> Result<Stage, CompilerError> {
+    match stage {
+        shader_slang::Stage::Vertex => Ok(Stage::Vertex),
+        shader_slang::Stage::Fragment => Ok(Stage::Fragment),
+        shader_slang::Stage::Compute => Ok(Stage::Compute),
+        shader_slang::Stage::Geometry => Ok(Stage::Geometry),
+        shader_slang::Stage::Hull => Ok(Stage::TessellationControl),
+        shader_slang::Stage::Domain => Ok(Stage::TessellationEvaluation),
+        unsupported => Err(CompilerError::UnsupportedStage(format!("{unsupported:?}"))),
+    }
+}
+
+fn discover_entries(
+    source: &Path,
+    target: Target,
+    development: bool,
+) -> Result<Vec<DiscoveredEntry>, CompilerError> {
+    use shader_slang::Downcast;
+    let module_name = module_name(source)?;
+    let search = source_search_path(source)?;
+
+    let global = shader_slang::GlobalSession::new().ok_or(CompilerError::NativeUnavailable)?;
+    let options = shader_slang::CompilerOptions::default()
+        .optimization(shader_slang::OptimizationLevel::High)
+        .matrix_layout_row(true);
+    let (artifact_target, profile) = discovery_target(target, development);
+    let target_desc = shader_slang::TargetDesc::default()
+        .format(compile_target(artifact_target))
+        .profile(global.find_profile(profile))
+        .options(&options);
+    let paths = [search.as_ptr()];
+    let target_descs = [target_desc];
+    let session_desc = shader_slang::SessionDesc::default()
+        .targets(&target_descs)
+        .search_paths(&paths)
+        .options(&options);
+    let session = global
+        .create_session(&session_desc)
+        .ok_or(CompilerError::NativeUnavailable)?;
+    let module = session
+        .load_module(module_name)
+        .map_err(|error| CompilerError::Native(error.to_string()))?;
+    let module_entries: Vec<_> = module.entry_points().collect();
+    if module_entries.is_empty() {
+        return Err(CompilerError::NoEntryPoints);
+    }
+    let mut components = Vec::with_capacity(module_entries.len() + 1);
+    components.push(module.downcast().clone());
+    components.extend(module_entries.iter().map(|entry| entry.downcast().clone()));
+    let linked = session
+        .create_composite_component_type(&components)
+        .and_then(|program| program.link())
+        .map_err(|error| CompilerError::Native(error.to_string()))?;
+    let layout = linked
+        .layout(0)
+        .map_err(|error| CompilerError::Native(error.to_string()))?;
+    let mut stages = BTreeSet::new();
+    let mut entries = Vec::with_capacity(module_entries.len());
+    for entry in layout.entry_points() {
+        let stage = artifact_stage(entry.stage())?;
+        if !stages.insert(stage) {
+            return Err(CompilerError::DuplicateStage(stage));
+        }
+        entries.push(DiscoveredEntry {
+            name: entry.name().to_owned(),
+            stage,
+        });
+    }
+    if entries.len() != module_entries.len() {
+        return Err(CompilerError::Native(
+            "entry point reflection count mismatch".into(),
+        ));
+    }
+    Ok(entries)
+}
+
+fn compile_request(
     config: &CompilerConfig,
     request: &CompilationRequest,
 ) -> Result<Artifact, CompilerError> {
     use shader_slang::Downcast;
     request.validate()?;
-    let version = config.validate_tool()?;
     let invocation_dir = request
         .targets
         .iter()
-        .any(|target| target.target == Target::Metallib)
+        .any(|target| target.target == ArtifactTarget::Metallib)
         .then(|| InvocationDirectory::create(&request.output_dir))
         .transpose()?;
-    let module_name = request
-        .source
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or(CompilerError::InvalidRequest("source name"))?;
-    let search = std::ffi::CString::new(
-        request
-            .source
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .to_string_lossy()
-            .as_ref(),
-    )
-    .map_err(|_| CompilerError::InvalidRequest("search path"))?;
+    let module_name = module_name(&request.source)?;
+    let search = source_search_path(&request.source)?;
     let global = shader_slang::GlobalSession::new().ok_or(CompilerError::NativeUnavailable)?;
-    let mut options = shader_slang::CompilerOptions::default()
+    let version = global.build_tag_string().to_owned();
+    let options = shader_slang::CompilerOptions::default()
         .optimization(shader_slang::OptimizationLevel::High)
         .matrix_layout_row(true);
-    for include in &request.include_dirs {
-        options = options.include(include.to_string_lossy().as_ref());
-    }
-    for define in &request.defines {
-        let (key, value) = define.split_once('=').unwrap_or((define.as_str(), ""));
-        options = options.macro_define(key, value);
-    }
     let target_descs: Vec<_> = request
         .targets
         .iter()
-        .map(|t| {
-            let format = match t.target {
-                Target::Spirv => shader_slang::CompileTarget::Spirv,
-                Target::Dxil => shader_slang::CompileTarget::Dxil,
-                Target::Msl | Target::Metallib => shader_slang::CompileTarget::Metal,
-            };
+        .map(|target| {
             shader_slang::TargetDesc::default()
-                .format(format)
-                .profile(global.find_profile(&t.profile))
+                .format(compile_target(target.target))
+                .profile(global.find_profile(target.profile))
                 .options(&options)
         })
         .collect();
@@ -464,46 +402,37 @@ pub fn compile(
         .ok_or(CompilerError::NativeUnavailable)?;
     let module = session
         .load_module(module_name)
-        .map_err(|e| CompilerError::Native(e.to_string()))?;
+        .map_err(|error| CompilerError::Native(error.to_string()))?;
     let entries: Vec<_> = request
         .targets
         .iter()
-        .map(|t| {
+        .map(|target| {
             module
-                .find_entry_point_by_name(&t.entry_point)
+                .find_entry_point_by_name(&target.entry_point)
                 .ok_or_else(|| {
-                    CompilerError::Native(format!("entry point missing: {}", t.entry_point))
+                    CompilerError::Native(format!("entry point missing: {}", target.entry_point))
                 })
         })
         .collect::<Result<_, _>>()?;
-    let mut components = vec![module.downcast().clone()];
+    let mut components = Vec::with_capacity(entries.len() + 1);
+    components.push(module.downcast().clone());
     components.extend(entries.iter().map(|entry| entry.downcast().clone()));
     let linked = session
         .create_composite_component_type(&components)
-        .and_then(|p| p.link())
-        .map_err(|e| CompilerError::Native(e.to_string()))?;
+        .and_then(|program| program.link())
+        .map_err(|error| CompilerError::Native(error.to_string()))?;
     let (variants, reflections) = compile_targets(
         &linked,
         request,
         invocation_dir.as_ref(),
         config.max_output_bytes,
     )?;
-    let semantic: serde_json::Value = serde_json::from_slice(&request.semantic_metadata)
-        .map_err(|_| CompilerError::InvalidRequest("metadata JSON"))?;
     let metadata =
-        serde_json::to_vec(&serde_json::json!({"semantic": semantic, "reflections": reflections}))
-            .map_err(|e| CompilerError::Native(e.to_string()))?;
+        serde_json::to_vec(&serde_json::json!({"semantic": {}, "reflections": reflections}))
+            .map_err(|error| CompilerError::Native(error.to_string()))?;
     Artifact::new(
         metadata,
-        Provenance::new(
-            "shader-slang",
-            version,
-            request.defines.clone(),
-            format!(
-                "{};apple-metal={}",
-                request.toolchain, request.apple_toolchain
-            ),
-        ),
+        Provenance::new("shader-slang", version, vec![], "fixed profiles"),
         variants,
     )
     .map_err(CompilerError::Artifact)
@@ -624,11 +553,8 @@ fn apple_tool_output(args: &[&str]) -> Result<String, CompilerError> {
         .map_err(|_| CompilerError::InvalidRequest("Apple tool output"))
 }
 
-fn target_compatibility(
-    target: &TargetRequest,
-    request: &CompilationRequest,
-) -> Result<TargetCompatibility, CompilerError> {
-    if target.target != Target::Metallib {
+fn target_compatibility(target: &TargetRequest) -> Result<TargetCompatibility, CompilerError> {
+    if target.target != ArtifactTarget::Metallib {
         return TargetCompatibility::portable(target.target).map_err(CompilerError::Artifact);
     }
     let architecture = match std::env::consts::ARCH {
@@ -646,12 +572,8 @@ fn target_compatibility(
         .map(|value| parse_compatibility_version(&value))
         .transpose()?
         .unwrap_or(sdk);
-    let language = parse_compatibility_version(&target.profile)?;
-    let toolchain = if request.apple_toolchain.is_empty() || request.apple_toolchain == "unknown" {
-        apple_tool_output(&["metal", "--version"])?
-    } else {
-        request.apple_toolchain.clone()
-    };
+    let language = parse_compatibility_version(target.profile)?;
+    let toolchain = apple_tool_output(&["metal", "--version"])?;
     Ok(TargetCompatibility::MetalLibrary {
         metal: MetalCompatibility {
             platform: ApplePlatform::MacOs,
@@ -769,7 +691,7 @@ fn compile_targets(
             )
             .map_err(|e| CompilerError::Native(e.to_string()))?;
         let mut bytes = blob.as_slice().to_vec();
-        if target.target == Target::Metallib {
+        if target.target == ArtifactTarget::Metallib {
             if !cfg!(target_os = "macos") {
                 return Err(CompilerError::AppleToolNotFound(
                     "xcrun (macOS only)".into(),
@@ -798,7 +720,7 @@ fn compile_targets(
                 target.stage,
                 &target.entry_point,
                 "ez-gfx-v1",
-                target_compatibility(target, request)?,
+                target_compatibility(target)?,
                 bytes,
             )
             .map_err(CompilerError::Artifact)?,
@@ -855,52 +777,6 @@ fn run_apple(c: &mut Command) -> Result<(), CompilerError> {
     }
     Ok(())
 }
-#[derive(Debug)]
-/// Failures from request validation, shader compilation, Apple tooling, output limits, I/O, or artifact creation.
-pub enum CompilerError {
-    /// The compilation request is malformed or incomplete.
-    InvalidRequest(&'static str),
-    /// One stage names more than one logical entry point.
-    DuplicateStage(Stage),
-    /// A required compilation target was not requested.
-    MissingTarget(Target),
-    /// An entry point and stage lack output for a required target.
-    MissingCoverage {
-        /// Entry-point name.
-        entry: String,
-        /// Shader stage.
-        stage: Stage,
-        /// Compilation target.
-        target: Target,
-    },
-    /// The compiler's expected and observed versions differ.
-    VersionMismatch {
-        /// Expected toolchain version.
-        expected: String,
-        /// Observed toolchain version.
-        found: String,
-    },
-    /// The native compiler backend is unavailable.
-    NativeUnavailable,
-    /// A native compiler operation failed.
-    Native(String),
-    /// The Apple shader toolchain is unavailable.
-    AppleToolNotFound(String),
-    /// An external compiler tool failed.
-    ToolFailed(String),
-    /// Compiled output is empty, overflows its size total, or exceeds the configured limit.
-    OutputLimit,
-    /// File or directory access failed.
-    Io(std::io::Error),
-    /// Artifact construction or validation failed.
-    Artifact(ArtifactError),
-}
-impl fmt::Display for CompilerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-impl std::error::Error for CompilerError {}
 
 #[cfg(test)]
 mod compatibility_tests {
@@ -921,5 +797,54 @@ mod compatibility_tests {
             CompatibilityVersion::new(15, 0)
         );
         assert!(parse_compatibility_version("metal").is_err());
+    }
+
+    #[test]
+    fn bare_relative_source_searches_the_current_directory() {
+        assert_eq!(
+            source_search_path(Path::new("shader.slang"))
+                .unwrap()
+                .as_c_str(),
+            c"."
+        );
+    }
+
+    #[test]
+    fn source_search_path_rejects_embedded_nul() {
+        assert!(matches!(
+            source_search_path(Path::new("bad\0dir/shader.slang")),
+            Err(CompilerError::InvalidRequest("search path"))
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn source_search_path_rejects_non_utf8_parent() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        let parent = PathBuf::from(OsString::from_wide(&[
+            u16::from(b'b'),
+            u16::from(b'a'),
+            u16::from(b'd'),
+            0xD800,
+        ]));
+        assert!(matches!(
+            source_search_path(&parent.join("shader.slang")),
+            Err(CompilerError::InvalidRequest("search path"))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_search_path_rejects_non_utf8_parent() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let parent = PathBuf::from(OsString::from_vec(b"bad\xFF".to_vec()));
+        assert!(matches!(
+            source_search_path(&parent.join("shader.slang")),
+            Err(CompilerError::InvalidRequest("search path"))
+        ));
     }
 }
