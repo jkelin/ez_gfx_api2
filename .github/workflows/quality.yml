@@ -148,16 +148,34 @@ jobs:
         env:
           VK_DRIVER_FILES: C:\swiftshader\vk_swiftshader_icd.json
         run: vulkaninfoSDK.exe --summary
-      - name: Test Windows Vulkan contracts; compile native surfaces without a device
+      - name: Test Windows Vulkan backend library contracts
         if: matrix.backend == 'vulkan-windows'
-        run: |
-          cargo nextest run -p ez-gfx-backend-vulkan --lib
-          cargo nextest run -p ez-gfx --lib
-          cargo nextest run -p ez-gfx-backend-vulkan --test native_init --no-run
-          cargo nextest run -p ez-gfx --no-run
-          cargo nextest run -p ez-gfx-ffi --no-run
-          cargo nextest run -p ez-gfx-examples --no-run
-          cargo build -p ez-gfx-backend-vulkan
+        timeout-minutes: 20
+        run: cargo nextest run -p ez-gfx-backend-vulkan --lib
+      - name: Test Windows Vulkan ez-gfx library contracts
+        if: matrix.backend == 'vulkan-windows'
+        timeout-minutes: 20
+        run: cargo nextest run -p ez-gfx --lib
+      - name: Compile Windows Vulkan native init test suite
+        if: matrix.backend == 'vulkan-windows'
+        timeout-minutes: 20
+        run: cargo nextest run -p ez-gfx-backend-vulkan --test native_init --no-run
+      - name: Compile Windows Vulkan ez-gfx test suites
+        if: matrix.backend == 'vulkan-windows'
+        timeout-minutes: 20
+        run: cargo nextest run -p ez-gfx --no-run
+      - name: Compile Windows Vulkan ez-gfx-ffi test suites
+        if: matrix.backend == 'vulkan-windows'
+        timeout-minutes: 20
+        run: cargo nextest run -p ez-gfx-ffi --no-run
+      - name: Compile Windows Vulkan ez-gfx-examples test suites
+        if: matrix.backend == 'vulkan-windows'
+        timeout-minutes: 20
+        run: cargo nextest run -p ez-gfx-examples --no-run
+      - name: Build Windows Vulkan backend
+        if: matrix.backend == 'vulkan-windows'
+        timeout-minutes: 20
+        run: cargo build -p ez-gfx-backend-vulkan
 
       # GitHub-hosted Windows runners do not guarantee a D3D12 feature-level 12.1
       # adapter. Backend unit tests execute; native GPU and example suites compile only.
