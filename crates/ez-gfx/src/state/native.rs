@@ -41,6 +41,7 @@ pub(super) fn destroy_native_texture(
         (NativeContext::Metal(context), NativeTexture::Metal(texture)) => {
             context.destroy_texture(texture)
         }
+        #[cfg(any(windows, target_vendor = "apple"))]
         _ => Err(ez_gfx_hal::AllocationError::NativeFailure),
     }
 }
@@ -100,6 +101,9 @@ pub(super) fn vulkan_bindings<'a>(
             }
         };
         let (size, allocation) = allocations.get(&handle).ok_or(HalError::InvalidArgument)?;
+        #[cfg(not(any(windows, target_vendor = "apple")))]
+        let NativeAllocation::Vulkan(allocation) = allocation;
+        #[cfg(any(windows, target_vendor = "apple"))]
         let NativeAllocation::Vulkan(allocation) = allocation else {
             return Err(HalError::InvalidArgument);
         };
@@ -238,6 +242,7 @@ pub(super) fn write_native(
             target[..bytes.len()].copy_from_slice(bytes);
             context.flush(allocation, 0, bytes.len() as u64)
         }
+        #[cfg(any(windows, target_vendor = "apple"))]
         _ => Err(ez_gfx_hal::AllocationError::NativeFailure),
     }
 }
@@ -268,6 +273,7 @@ pub(super) fn copy_native(
             NativeAllocation::Metal(source),
             NativeAllocation::Metal(destination),
         ) => context.copy_buffer(source, destination, source_offset, destination_offset, size),
+        #[cfg(any(windows, target_vendor = "apple"))]
         _ => Err(ez_gfx_hal::AllocationError::NativeFailure),
     }
 }
@@ -300,6 +306,7 @@ pub(super) fn free_native_allocation(
         (NativeContext::Metal(context), NativeAllocation::Metal(allocation)) => {
             context.free(allocation)
         }
+        #[cfg(any(windows, target_vendor = "apple"))]
         _ => Err(ez_gfx_hal::AllocationError::NativeFailure),
     }
 }

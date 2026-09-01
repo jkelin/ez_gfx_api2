@@ -406,6 +406,7 @@ pub fn init_device(context: ContextHandle, surface: SurfaceHandle) -> EzGfxResul
             (NativeContext::Metal(native), NativeSurface::Metal(surface)) => {
                 native.init_device(surface)
             }
+            #[cfg(any(windows, target_vendor = "apple"))]
             _ => Err(HalError::InvalidArgument),
         }
         .map_err(|error| map_native_loss(&context.identity, error))?;
@@ -555,6 +556,7 @@ pub fn present(context: ContextHandle) -> EzGfxResult {
                 (NativeContext::Metal(native), NativeSurface::Metal(surface)) => {
                     native.acquire_present(surface, width, height)
                 }
+                #[cfg(any(windows, target_vendor = "apple"))]
                 _ => Err(HalError::InvalidArgument),
             },
         };
@@ -576,6 +578,7 @@ pub(super) fn destroy_native_surface(context: &mut NativeContext, surface: Nativ
         (NativeContext::Metal(context), NativeSurface::Metal(surface)) => {
             context.destroy_surface(surface);
         }
+        #[cfg(any(windows, target_vendor = "apple"))]
         _ => {}
     }
 }

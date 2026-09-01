@@ -5,7 +5,7 @@ use super::{
     FrameSlot, HalError, NativeContext, NativeSurface, PendingDevice, SemanticProfile,
     SurfacePlatform, TEXTURE_DESCRIPTOR_CAPACITY, create_frame_slots, khr, map_allocation_hal,
     map_allocator, map_allocator_hal, map_vk, paired_texture_capacity,
-    texture_descriptor_layout_bindings, vk,
+    texture_descriptor_layout_bindings, texture_heap_rejection, vk,
 };
 
 fn create_device_frame_state(
@@ -612,10 +612,7 @@ impl NativeContext {
                 compression,
             )
         };
-        if features12.descriptor_indexing == 0
-            || features12.descriptor_binding_partially_bound == 0
-            || features12.descriptor_binding_sampled_image_update_after_bind == 0
-        {
+        if texture_heap_rejection(&features12).is_some() {
             return Ok(None);
         }
         // SAFETY: `physical` was obtained from `self.instance` during this probe pass and remains usable for `get_physical_device_properties`.

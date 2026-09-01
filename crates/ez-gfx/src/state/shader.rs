@@ -119,6 +119,7 @@ pub(super) fn destroy_native_shader(context: &mut NativeContext, shader: NativeS
         (NativeContext::Metal(context), NativeShader::Metal(shader)) => {
             context.destroy_shader(shader)
         }
+        #[cfg(any(windows, target_vendor = "apple"))]
         _ => {}
     }
 }
@@ -136,6 +137,7 @@ pub(super) fn destroy_native_pipeline(context: &mut NativeContext, pipeline: Nat
         (NativeContext::Metal(context), NativePipeline::Metal(pipeline)) => {
             context.destroy_pipeline(pipeline)
         }
+        #[cfg(any(windows, target_vendor = "apple"))]
         _ => {}
     }
 }

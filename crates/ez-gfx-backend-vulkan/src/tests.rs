@@ -31,6 +31,35 @@ fn paired_texture_capacity_honors_every_update_after_bind_limit() {
     limits.max_per_stage_update_after_bind_resources = 2046;
     assert_eq!(paired_texture_capacity(&limits), 1023);
 }
+
+#[test]
+fn texture_heap_rejects_missing_consumed_features_in_diagnostic_order() {
+    let mut features = vk::PhysicalDeviceVulkan12Features {
+        descriptor_indexing: vk::FALSE,
+        descriptor_binding_partially_bound: vk::TRUE,
+        descriptor_binding_sampled_image_update_after_bind: vk::FALSE,
+        shader_sampled_image_array_non_uniform_indexing: vk::FALSE,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        texture_heap_rejection(&features),
+        Some("descriptor_binding_sampled_image_update_after_bind")
+    );
+    features.descriptor_binding_sampled_image_update_after_bind = vk::TRUE;
+    assert_eq!(
+        texture_heap_rejection(&features),
+        Some("shader_sampled_image_array_non_uniform_indexing")
+    );
+    features.shader_sampled_image_array_non_uniform_indexing = vk::TRUE;
+    assert_eq!(texture_heap_rejection(&features), None);
+    features.descriptor_binding_partially_bound = vk::FALSE;
+    assert_eq!(
+        texture_heap_rejection(&features),
+        Some("descriptor_binding_partially_bound")
+    );
+}
+
 #[test]
 fn resource_access_selects_compatible_pipeline_stages() {
     let cases = [

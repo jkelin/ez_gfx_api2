@@ -15,15 +15,17 @@
 - Shader sources import the root shared module and contain no Vulkan namespace, location, register, or physical binding syntax.
 - `include/ez_gfx_api.h`, `bindings/bindings.xml`, and all production FFI exports describe ABI v18. The Win32 C textured cube builds against that header and exercises compute-written indexed-indirect graphics.
 - Artifact tests cover format/version validation, malicious structurally valid archives exceeding semantic bounds, reflection failure across every backend, deterministic metallib compatibility selection, unique stage entry points, and generated example coverage.
-- The CI backend matrix executes Windows Vulkan through SwiftShader and native Metal on macOS. Linux Vulkan and Windows DX12 compile backend/native tests without claiming hosted runtime coverage.
+- The CI backend matrix diagnoses the Windows SwiftShader SDK, tools, and ICD but compile-checks Vulkan native surfaces only: SwiftShader lacks required descriptor-indexing/update-after-bind capabilities. The hosted macOS row runs device-independent compiler, artifact, core, HAL, and runtime tests, then compile-checks Metal, `ez-gfx`, FFI, examples, and `metal_present`; Linux Vulkan and Windows DX12 also compile native tests without claiming hosted runtime coverage.
 - Package CI builds and checks distinct runtime/compiler archives for Windows x64, Linux x64, and Apple Silicon.
 - On the local Windows RTX 3080, one-frame Vulkan and DX12 example runs both pass.
 
 ## Hosted coverage limits
 
 - GitHub-hosted Windows does not guarantee a D3D12 feature-level 12.1 adapter, so DX12 native GPU tests and the C example's DX12 path are compiled but not executed there.
+- The Windows SwiftShader ICD is discoverable and `vulkaninfoSDK --summary` runs, but it reports `descriptorBindingSampledImageUpdateAfterBind=false`, `shaderSampledImageArrayNonUniformIndexing=false`, and zero update-after-bind pool capacity. The runtime remains fail-closed; live Vulkan software-adapter evidence is pending an adapter satisfying the required descriptor indexing.
 - The current public Vulkan surface path is Win32-only, so Linux validates Lavapipe availability and compiles Vulkan tests without executing presentation.
-- Hardware Vulkan and DX12 examples, including the DX12 logical-extent path, have local coverage; hosted runtime proof remains limited to the rows above.
+- GitHub-hosted macOS runners provide the Apple compiler toolchain but no Metal device. Metal backend, FFI, example, and presentation tests compile there, but live Metal submission and presentation remain unverified pending a GPU-backed macOS runner.
+- Hardware Vulkan and DX12 examples, including the DX12 logical-extent path, have local coverage; hosted runtime proof remains unavailable for Windows SwiftShader until a capable software adapter is available.
 
 ## Constraints
 
@@ -81,9 +83,9 @@
 ### P1 — platform surface and validation gaps
 
 - **Status:** Partial.
-- **Evidence:** `ez-gfx-hal::FrameExecutionBackend` is the common execution seam, and all three adapters lower the same immutable plan. CI executes native Metal on macOS and Windows Vulkan through SwiftShader. Linux Vulkan proves Lavapipe capability and compiles native tests; Windows DX12 compiles native GPU tests. Context creation still accepts Vulkan only with Win32, DX12 only on Windows/Win32, and Metal only on Apple/MetalLayer; example hosts cover Win32 and AppKit.
-- **Impact:** Linux Vulkan surfaces remain unavailable. Hosted DX12 runtime execution remains unavailable because the runner does not guarantee the required adapter.
-- **Acceptance:** Add Linux Vulkan surface support and execute its native presentation tests. Execute DX12 native tests on a runner with a guaranteed feature-level 12.1 adapter.
+- **Evidence:** `ez-gfx-hal::FrameExecutionBackend` is the common execution seam, and all three adapters lower the same immutable plan. CI diagnoses the Windows SwiftShader SDK/tools/ICD but compile-checks Vulkan native surfaces because required descriptor indexing is unavailable; the hosted macOS row runs device-independent contracts and compile-checks Metal native surfaces because it has no Metal device; Linux Vulkan and Windows DX12 likewise compile native tests. Context creation still accepts Vulkan only with Win32, DX12 only on Windows/Win32, and Metal only on Apple/MetalLayer; example hosts cover Win32 and AppKit.
+- **Impact:** Linux Vulkan surfaces remain unavailable. Hosted DX12 runtime execution remains unavailable because the runner does not guarantee the required adapter. Live Metal submission and presentation lack verification on a GPU-backed macOS runner. Live Vulkan software-adapter evidence also remains unavailable pending an adapter satisfying required descriptor indexing.
+- **Acceptance:** Add Linux Vulkan surface support and execute its native presentation tests. Execute DX12 native tests on a runner with a guaranteed feature-level 12.1 adapter, Vulkan native tests on an adapter satisfying required descriptor indexing, and Metal native tests on a GPU-backed macOS runner.
 
 ### P1 — diagnostics are weak around cleanup and asynchronous work
 
@@ -102,9 +104,9 @@
 ### P2 — package and test coverage gaps
 
 - **Status:** Partial.
-- **Evidence:** Runtime suites cover retained graph execution, ordering, waits, transitions, pass coalescing, payload mapping, and failures. Artifact suites cover framed `rkyv` validation and startup-compiled example artifacts. Example smoke tests cover all six Rust scenes and snapshots. CI executes Windows Vulkan with SwiftShader and native Metal, compiles Linux Vulkan and Windows DX12 native tests, builds/links the C textured cube on Windows, and executes its Vulkan path. Package CI checks runtime/compiler separation, manifests, archives, export parity, and forbidden compiler-native imports. GPU performance and size baselines are not yet recorded.
-- **Impact:** Managed targets, asynchronous uploads, viewport/scissor variation, Linux presentation, and hosted DX12 runtime can still regress or remain unavailable.
-- **Acceptance:** Add target/upload/viewport regression suites, Linux Vulkan presentation CI, and DX12 execution on guaranteed hardware.
+- **Evidence:** Runtime suites cover retained graph execution, ordering, waits, transitions, pass coalescing, payload mapping, and failures. Artifact suites cover framed `rkyv` validation and startup-compiled example artifacts. Example smoke tests cover all six Rust scenes and snapshots. CI diagnoses SwiftShader capabilities, compile-checks Windows Vulkan native surfaces without GPU operations, and hosted macOS, Linux Vulkan, and Windows DX12 compile their native tests without claiming unavailable device coverage. The hosted macOS row still runs device-independent compiler and artifact contracts. CI builds/links the C textured cube on Windows without executing it. Package CI checks runtime/compiler separation, manifests, archives, export parity, and forbidden compiler-native imports. GPU performance and size baselines remain unverified.
+- **Impact:** Managed targets, asynchronous uploads, viewport/scissor variation, Linux presentation, hosted Vulkan/DX12 runtime, and live Metal submission/presentation can still regress or remain unavailable.
+- **Acceptance:** Add target/upload/viewport regression suites, Linux Vulkan presentation CI, Vulkan execution on an adapter satisfying required descriptor indexing, DX12 execution on guaranteed hardware, and Metal execution on a GPU-backed macOS runner.
 
 ## Ordered implementation sequence
 

@@ -63,6 +63,20 @@ fn paired_texture_capacity(limits: &vk::PhysicalDeviceDescriptorIndexingProperti
         .min(TEXTURE_DESCRIPTOR_CAPACITY)
 }
 
+fn texture_heap_rejection(
+    features12: &vk::PhysicalDeviceVulkan12Features<'_>,
+) -> Option<&'static str> {
+    if features12.descriptor_binding_sampled_image_update_after_bind == 0 {
+        Some("descriptor_binding_sampled_image_update_after_bind")
+    } else if features12.descriptor_binding_partially_bound == 0 {
+        Some("descriptor_binding_partially_bound")
+    } else if features12.shader_sampled_image_array_non_uniform_indexing == 0 {
+        Some("shader_sampled_image_array_non_uniform_indexing")
+    } else {
+        None
+    }
+}
+
 fn sampler_create_info(desc: TextureSamplerDesc, mip_count: u32) -> vk::SamplerCreateInfo<'static> {
     let filter = |value| match value {
         SamplerFilter::Nearest => vk::Filter::NEAREST,
