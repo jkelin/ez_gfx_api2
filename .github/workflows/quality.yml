@@ -21,6 +21,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: clippy,rustfmt
+      - name: Install pinned cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.101
       - name: Install pinned Vulkan SDK with Slang
         uses: jakoch/install-vulkan-sdk-action@37effcfa045411f8bfbbda26df2fd1b3bf3436fa # v1.6.0
         with:
@@ -34,7 +38,7 @@ jobs:
         run: cargo run -p xtask -- source-lines
       - name: Run platform-neutral tests
         run: >-
-          cargo test
+          cargo nextest run
           -p ez-gfx-core
           -p ez-gfx
           -p ez-gfx-hal
@@ -44,10 +48,12 @@ jobs:
           -p ez-gfx-compiler
           -p ez-gfx-ffi
           -p xtask
+      - name: Run platform-neutral doctests
+        run: cargo test --doc --workspace
       - name: Test example logic and source-compiled shader artifacts
         run: |
-          cargo test -p ez-gfx-examples --bins
-          cargo test -p ez-gfx-examples --test shader_artifacts
+          cargo nextest run -p ez-gfx-examples --bins
+          cargo nextest run -p ez-gfx-examples --test shader_artifacts
 
   backends:
     name: ${{ matrix.name }}
@@ -71,6 +77,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Install pinned cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.101
       - name: Install Linux Vulkan loader, tools, and Lavapipe
         if: matrix.backend == 'vulkan-linux'
         run: |
@@ -118,9 +128,9 @@ jobs:
       - name: Test Linux Vulkan backend; compile unsupported native runtime suites
         if: matrix.backend == 'vulkan-linux'
         run: |
-          cargo test -p ez-gfx-backend-vulkan --lib
-          cargo test -p ez-gfx-backend-vulkan --test native_init --no-run
-          cargo test -p ez-gfx-examples --test smoke --no-run
+          cargo nextest run -p ez-gfx-backend-vulkan --lib
+          cargo nextest run -p ez-gfx-backend-vulkan --test native_init --no-run
+          cargo nextest run -p ez-gfx-examples --test smoke --no-run
           cargo build -p ez-gfx-backend-vulkan
 
       - name: Expose Windows Vulkan tools
@@ -141,12 +151,12 @@ jobs:
       - name: Test Windows Vulkan contracts; compile native surfaces without a device
         if: matrix.backend == 'vulkan-windows'
         run: |
-          cargo test -p ez-gfx-backend-vulkan --lib
-          cargo test -p ez-gfx --lib
-          cargo test -p ez-gfx-backend-vulkan --test native_init --no-run
-          cargo test -p ez-gfx --no-run
-          cargo test -p ez-gfx-ffi --no-run
-          cargo test -p ez-gfx-examples --no-run
+          cargo nextest run -p ez-gfx-backend-vulkan --lib
+          cargo nextest run -p ez-gfx --lib
+          cargo nextest run -p ez-gfx-backend-vulkan --test native_init --no-run
+          cargo nextest run -p ez-gfx --no-run
+          cargo nextest run -p ez-gfx-ffi --no-run
+          cargo nextest run -p ez-gfx-examples --no-run
           cargo build -p ez-gfx-backend-vulkan
 
       # GitHub-hosted Windows runners do not guarantee a D3D12 feature-level 12.1
@@ -154,11 +164,11 @@ jobs:
       - name: Test DX12 units and boundary; compile unsupported native runtime suites
         if: matrix.backend == 'dx12'
         run: |
-          cargo test -p ez-gfx-backend-dx12 --lib
-          cargo test -p ez-gfx-backend-dx12 --test native_init rejects_a_null_hwnd_before_swapchain_creation -- --exact
-          cargo test -p ez-gfx-backend-dx12 --test native_init --no-run
-          cargo test -p ez-gfx-examples --test smoke --no-run
-          cargo test -p ez-gfx-ffi --test pso_smoke --no-run
+          cargo nextest run -p ez-gfx-backend-dx12 --lib
+          cargo nextest run -p ez-gfx-backend-dx12 --test native_init -E 'test(=rejects_a_null_hwnd_before_swapchain_creation)'
+          cargo nextest run -p ez-gfx-backend-dx12 --test native_init --no-run
+          cargo nextest run -p ez-gfx-examples --test smoke --no-run
+          cargo nextest run -p ez-gfx-ffi --test pso_smoke --no-run
           cargo build -p ez-gfx-backend-dx12
 
       # GitHub-hosted macOS runners expose the Apple toolchain but no Metal device.
@@ -166,16 +176,16 @@ jobs:
       - name: Test device-independent Metal contracts
         if: matrix.backend == 'metal'
         run: |
-          cargo test -p ez-gfx-core -p ez-gfx-hal -p ez-gfx-runtime
-          cargo test -p ez-gfx-artifact -p ez-gfx-compiler
+          cargo nextest run -p ez-gfx-core -p ez-gfx-hal -p ez-gfx-runtime
+          cargo nextest run -p ez-gfx-artifact -p ez-gfx-compiler
       - name: Compile Metal runtime surfaces without a device
         if: matrix.backend == 'metal'
         run: |
-          cargo test -p ez-gfx-backend-metal --no-run
-          cargo test -p ez-gfx --no-run
-          cargo test -p ez-gfx-ffi --no-run
-          cargo test -p ez-gfx-examples --no-run
-          cargo test -p ez-gfx-ffi --test metal_present --no-run
+          cargo nextest run -p ez-gfx-backend-metal --no-run
+          cargo nextest run -p ez-gfx --no-run
+          cargo nextest run -p ez-gfx-ffi --no-run
+          cargo nextest run -p ez-gfx-examples --no-run
+          cargo nextest run -p ez-gfx-ffi --test metal_present --no-run
 
       - name: Build FFI
         run: cargo build -p ez-gfx-ffi

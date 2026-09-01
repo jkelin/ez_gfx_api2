@@ -1,4 +1,4 @@
-use super::{FrameInput, HostSurface, NativeSurface, SceneInput, dispatch_window_input};
+use super::{FrameInput, HostSurface, NativeSurface, SceneInput, dispatch_window_input, env_flag};
 use anyhow::Context as _;
 use std::time::Instant;
 use winit::{
@@ -39,9 +39,10 @@ pub fn run<C: LifecycleCallbacks>(
         // SAFETY: this executes before the event loop or graphics initialization begins.
         unsafe { std::env::set_var("VK_LOADER_LAYERS_DISABLE", "~implicit~") };
     }
+    let visible = !env_flag("EZ_GFX_EXAMPLE_HIDDEN")?;
     let event_loop = EventLoop::new().context("create event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(config, callbacks);
+    let mut app = App::new(config, callbacks, visible);
     let run_result = event_loop.run_app(&mut app).context("run event loop");
     finish_app(app, run_result)
 }
@@ -58,6 +59,7 @@ fn finish_app<C: LifecycleCallbacks>(
 struct App<C: LifecycleCallbacks> {
     config: LifecycleConfig,
     callbacks: C,
+    visible: bool,
     window: Option<Window>,
     host: Option<HostSurface>,
     width: u32,
@@ -69,12 +71,13 @@ struct App<C: LifecycleCallbacks> {
 }
 
 impl<C: LifecycleCallbacks> App<C> {
-    fn new(config: LifecycleConfig, callbacks: C) -> Self {
+    fn new(config: LifecycleConfig, callbacks: C, visible: bool) -> Self {
         Self {
             width: config.width,
             height: config.height,
             config,
             callbacks,
+            visible,
             window: None,
             host: None,
             frames: 0,
@@ -87,6 +90,31 @@ impl<C: LifecycleCallbacks> App<C> {
         self.error = Some(error);
         event_loop.exit();
     }
+    fn render_frame(&mut self, event_loop: &ActiveEventLoop) {
+        let terminal = self
+            .config
+            .frame_limit
+            .is_some_and(|limit| self.frames.saturating_add(1) >= limit);
+        let frame = FrameInput {
+            width: self.width,
+            height: self.height,
+            delta_seconds: self.last_frame.elapsed().as_secs_f32(),
+        };
+        self.last_frame = Instant::now();
+        if let Err(error) = self.callbacks.render(frame, terminal, self.frames) {
+            return self.fail(event_loop, error);
+        }
+        self.frames += 1;
+        if terminal {
+            match self.callbacks.capture(self.width, self.height, self.frames) {
+                Ok(report) => self.report = Some(report),
+                Err(error) => self.error = Some(error),
+            }
+            event_loop.exit();
+        } else {
+            self.window.as_ref().unwrap().request_redraw();
+        }
+    }
 }
 
 impl<C: LifecycleCallbacks> ApplicationHandler for App<C> {
@@ -96,7 +124,8 @@ impl<C: LifecycleCallbacks> ApplicationHandler for App<C> {
         }
         let attributes = Window::default_attributes()
             .with_title(self.config.title)
-            .with_inner_size(PhysicalSize::new(self.config.width, self.config.height));
+            .with_inner_size(PhysicalSize::new(self.config.width, self.config.height))
+            .with_visible(self.visible);
         let window = match event_loop
             .create_window(attributes)
             .context("create example window")
@@ -116,7 +145,12 @@ impl<C: LifecycleCallbacks> ApplicationHandler for App<C> {
         }
         self.host = Some(host);
         self.window = Some(window);
-        self.window.as_ref().unwrap().request_redraw();
+        if self.visible {
+            self.window.as_ref().unwrap().request_redraw();
+        } else {
+            // Hidden automation windows are not guaranteed to receive a platform redraw event.
+            self.render_frame(event_loop);
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -135,31 +169,7 @@ impl<C: LifecycleCallbacks> ApplicationHandler for App<C> {
                     self.fail(event_loop, error);
                 }
             }
-            WindowEvent::RedrawRequested => {
-                let terminal = self
-                    .config
-                    .frame_limit
-                    .is_some_and(|limit| self.frames.saturating_add(1) >= limit);
-                let frame = FrameInput {
-                    width: self.width,
-                    height: self.height,
-                    delta_seconds: self.last_frame.elapsed().as_secs_f32(),
-                };
-                self.last_frame = Instant::now();
-                if let Err(error) = self.callbacks.render(frame, terminal, self.frames) {
-                    return self.fail(event_loop, error);
-                }
-                self.frames += 1;
-                if terminal {
-                    match self.callbacks.capture(self.width, self.height, self.frames) {
-                        Ok(report) => self.report = Some(report),
-                        Err(error) => self.error = Some(error),
-                    }
-                    event_loop.exit();
-                } else {
-                    self.window.as_ref().unwrap().request_redraw();
-                }
-            }
+            WindowEvent::RedrawRequested => self.render_frame(event_loop),
             _ => {
                 dispatch_window_input(&event, |input| self.callbacks.input(input));
             }
@@ -221,6 +231,7 @@ mod tests {
                 frame_limit: Some(1),
             },
             Callbacks { shutdowns: 0 },
+            false,
         )
     }
 

@@ -7,8 +7,13 @@ description = "Run strict Clippy checks and source line limits"
 run = "cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo run -p xtask -- source-lines"
 
 [tasks.test]
-description = "Run the workspace test suite"
-run = "cargo test --workspace"
+description = "Run the complete workspace test suite"
+run = "cargo nextest run --workspace && cargo test --doc --workspace"
+
+[tasks.test-doc]
+description = "Run workspace documentation tests (nextest excludes doctests)"
+run = "cargo test --doc --workspace"
+
 
 [tasks.examples-build]
 description = "Build all migrated Rust examples"
@@ -17,7 +22,7 @@ run = "cargo build -p ez-gfx-examples --bins"
 
 [tasks.examples-smoke]
 description = "Run every host-compatible example API smoke"
-run = "cargo test -p ez-gfx-examples --test smoke"
+run = "cargo nextest run -p ez-gfx-examples --test smoke"
 
 [tasks.example-1]
 run = "cargo run -p ez-gfx-examples --bin 01_triangle"

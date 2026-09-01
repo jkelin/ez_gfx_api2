@@ -330,6 +330,7 @@ pub fn snapshot_command(binary: &str, path: &Path, backend: &str) -> Command {
     command
         .env("EZ_GFX_BACKEND", backend)
         .env("EZ_GFX_EXAMPLE_MAX_FRAMES", "1")
+        .env("EZ_GFX_EXAMPLE_HIDDEN", "1")
         .env("EZ_GFX_EXAMPLE_REPORT", "1")
         .env("EZ_GFX_EXAMPLE_SNAPSHOT", path)
         .env("VK_LOADER_LAYERS_DISABLE", "~implicit~");

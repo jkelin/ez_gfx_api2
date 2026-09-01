@@ -16,6 +16,9 @@ ez-gfx-core.workspace = true
 ez-gfx-artifact.workspace = true
 ez-gfx-compiler.workspace = true
 
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
 [target.'cfg(target_vendor = "apple")'.dev-dependencies]
 objc2.workspace = true
 objc2-core-foundation.workspace = true
