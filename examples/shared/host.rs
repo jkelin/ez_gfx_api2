@@ -1,5 +1,7 @@
+#[cfg(any(windows, target_vendor = "apple"))]
 use anyhow::Context as _;
 use ez_gfx::{Backend, SurfacePlatform};
+#[cfg(any(windows, target_vendor = "apple"))]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
@@ -93,6 +95,9 @@ impl HostSurface {
     pub fn attach(window: &Window, width: u32, height: u32) -> anyhow::Result<Self> {
         #[cfg(not(target_vendor = "apple"))]
         let _ = (width, height);
+        #[cfg(not(any(windows, target_vendor = "apple")))]
+        let _ = window;
+        #[cfg(any(windows, target_vendor = "apple"))]
         let raw = window
             .window_handle()
             .context("get native window handle")?
