@@ -1,31 +1,21 @@
 //! Progressive native texture-residency tests through the C ABI.
 #![cfg(windows)]
 
+mod common;
+
+use common::TestContext;
 use std::ffi::CString;
 
 use ez_gfx_ffi::{
-    EzGfxBackendContextDesc, EzGfxResult, EzGfxTextureDesc, ez_gfx_context_create_backend,
-    ez_gfx_context_destroy, ez_gfx_context_wait_idle, ez_gfx_texture_get_residency,
+    EzGfxResult, EzGfxTextureDesc, ez_gfx_context_wait_idle, ez_gfx_texture_get_residency,
     ez_gfx_texture_load, ez_gfx_texture_unload,
 };
 
 #[cfg(windows)]
 #[test]
 fn vulkan_reports_completed_progressive_mip_residency() {
-    let context_desc = EzGfxBackendContextDesc {
-        enable_debug: 0,
-        enable_validation: 0,
-        surface_platform: 0,
-        backend: 1,
-    };
-    let mut context = 0;
-    assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_context_create_backend(&raw const context_desc, &raw mut context) }
-        },
-        EzGfxResult::Ok
-    );
+    let native = TestContext::create(1);
+    let context = native.context;
 
     let bytes = [128_u8; 4 * 4 * 4];
     let label = CString::new("residency-test").unwrap();
@@ -83,5 +73,5 @@ fn vulkan_reports_completed_progressive_mip_residency() {
     assert_eq!(resident, total);
     assert_eq!(total, 3);
     ez_gfx_texture_unload(texture, context);
-    ez_gfx_context_destroy(context);
+    drop(native);
 }
