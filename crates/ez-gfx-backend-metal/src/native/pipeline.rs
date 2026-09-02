@@ -46,6 +46,7 @@ impl NativeContext {
         shader: &NativeShader,
         product_index: usize,
         entry: &str,
+        texture_heap: Option<ShaderTextureHeapLayout>,
     ) -> Result<NativePipeline, HalError> {
         if entry.is_empty() || entry.as_bytes().contains(&0) {
             return Err(HalError::InvalidArgument);
@@ -61,8 +62,13 @@ impl NativeContext {
             .device
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|_| HalError::NativeFailure)?;
+        let argument_encoder = texture_heap.map(|heap| {
+            // SAFETY: reflection validated the compute argument-buffer index against the selected entry point.
+            unsafe { function.newArgumentEncoderWithBufferIndex(heap.binding as usize) }
+        });
         Ok(NativePipeline::Compute {
             state: ThreadBound::new(state),
+            argument_encoder: argument_encoder.map(ThreadBound::new),
         })
     }
 
@@ -77,7 +83,8 @@ impl NativeContext {
         graphics: &(usize, String, usize, String),
         state: DynamicPipelineState,
         depth_required: bool,
-        texture_heap: Option<ShaderTextureHeapLayout>,
+        vertex_texture_heap: Option<ShaderTextureHeapLayout>,
+        fragment_texture_heap: Option<ShaderTextureHeapLayout>,
     ) -> Result<NativePipeline, HalError> {
         if graphics.1.is_empty()
             || graphics.1.as_bytes().contains(&0)
@@ -114,23 +121,134 @@ impl NativeContext {
             color.setBlendingEnabled(true);
             color.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
             color.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+            color.setSourceAlphaBlendFactor(MTLBlendFactor::One);
+            color.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
         }
         let pipeline = self
             .device
             .newRenderPipelineStateWithDescriptor_error(&descriptor)
             .map_err(|_| HalError::NativeFailure)?;
-        // SAFETY: `heap.binding` identifies the texture heap's fragment argument-buffer slot, and `fragment` keeps the `MTLFunction` storage allocated through `newArgumentEncoderWithBufferIndex:`.
-        let argument_encoder = texture_heap.map(|heap| unsafe {
+        let vertex_argument_encoder = vertex_texture_heap.map(|heap| unsafe {
+            // SAFETY: reflection validated the vertex argument-buffer index.
+            vertex.newArgumentEncoderWithBufferIndex(heap.binding as usize)
+        });
+        let fragment_argument_encoder = fragment_texture_heap.map(|heap| unsafe {
+            // SAFETY: reflection validated the fragment argument-buffer index.
             fragment.newArgumentEncoderWithBufferIndex(heap.binding as usize)
         });
         Ok(NativePipeline::Graphics {
             state: ThreadBound::new(pipeline),
-            argument_encoder: argument_encoder.map(ThreadBound::new),
+            vertex_argument_encoder: vertex_argument_encoder.map(ThreadBound::new),
+            fragment_argument_encoder: fragment_argument_encoder.map(ThreadBound::new),
         })
     }
 
     /// Defers pipeline destruction until every referencing frame completes.
     pub fn destroy_pipeline(&mut self, pipeline: NativePipeline) {
         let _ = self.defer_resource(DeferredResource::Pipeline(pipeline));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DynamicPipelineState, NativeContext, NativePipeline, ShaderTextureHeapLayout};
+    use ez_gfx_artifact::Stage;
+    use ez_gfx_compiler::{Target, compile_shader};
+    use ez_gfx_core::{Backend, capability::SemanticProfile};
+    use ez_gfx_runtime::shader::RuntimeShader;
+
+    #[test]
+    fn graphics_pipeline_creates_argument_encoders_for_both_heap_users() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("graphics_texture_heap.slang");
+        std::fs::write(
+            &source,
+            r#"[__AttributeUsage(_AttributeTargets.Var)]
+struct BindlessTextureHeapAttribute { int capacity; };
+struct TextureEntry { Texture2D<float4> texture; SamplerState sampler; };
+struct TextureHeap { TextureEntry entries[1024]; };
+
+[BindlessTextureHeap(1024)]
+ParameterBlock<TextureHeap> texture_heap;
+
+struct VertexOutput { float4 position : SV_Position; };
+
+[shader("vertex")]
+VertexOutput vertexmain(uint id : SV_VertexID) {
+    float sampled = texture_heap.entries[0].texture.SampleLevel(
+        texture_heap.entries[0].sampler, float2(0.5, 0.5), 0).r;
+    float2 positions[3] = {
+        float2(-0.5, -0.5),
+        float2(0.5, -0.5),
+        float2(0.0, 0.5)
+    };
+    VertexOutput output;
+    output.position = float4(positions[id] + float2(sampled * 0.01, 0.0), 0.0, 1.0);
+    return output;
+}
+
+[shader("fragment")]
+float4 fragmentmain() : SV_Target {
+    return texture_heap.entries[0].texture.SampleLevel(
+        texture_heap.entries[0].sampler, float2(0.5, 0.5), 0);
+}
+"#,
+        )
+        .unwrap();
+
+        let artifact = compile_shader(&source, &[Target::Metal], false).unwrap();
+        let runtime = RuntimeShader::load(&artifact, Backend::Metal, SemanticProfile::V1).unwrap();
+        let vertex_layout = runtime.pipeline_layout(Stage::Vertex).unwrap();
+        let fragment_layout = runtime.pipeline_layout(Stage::Fragment).unwrap();
+        let vertex_heap = vertex_layout.texture_heap().unwrap();
+        let fragment_heap = fragment_layout.texture_heap().unwrap();
+        assert_eq!(vertex_heap, fragment_heap);
+        let heap = ShaderTextureHeapLayout::new(
+            vertex_heap.space,
+            vertex_heap.binding,
+            vertex_heap.capacity,
+            vertex_heap.argument_stride,
+            vertex_heap.texture_argument_offset,
+            vertex_heap.sampler_argument_offset,
+        )
+        .unwrap();
+        let products = runtime
+            .products()
+            .map(|(_, bytes)| bytes)
+            .collect::<Vec<_>>();
+        let (vertex, fragment) = runtime.graphics_pair().unwrap();
+        let graphics = (
+            vertex.0,
+            vertex.2.to_owned(),
+            fragment.0,
+            fragment.2.to_owned(),
+        );
+
+        let mut context = NativeContext::create_default().unwrap();
+        let shader = context.create_shader(&products).unwrap();
+        let pipeline = context
+            .create_graphics_pipeline(
+                &shader,
+                &graphics,
+                DynamicPipelineState::from_abi(0, 0, 0, 0).unwrap(),
+                false,
+                Some(heap),
+                Some(heap),
+            )
+            .unwrap();
+        let NativePipeline::Graphics {
+            vertex_argument_encoder,
+            fragment_argument_encoder,
+            ..
+        } = &pipeline
+        else {
+            panic!("expected graphics pipeline");
+        };
+        assert!(vertex_argument_encoder.is_some());
+        assert!(fragment_argument_encoder.is_some());
+
+        context.destroy_pipeline(pipeline);
+        context.destroy_shader(shader);
+        context.wait_idle().unwrap();
     }
 }

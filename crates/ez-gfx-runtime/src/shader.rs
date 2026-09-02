@@ -193,6 +193,19 @@ impl RuntimeShader {
             .ok_or(BindingError::MissingReflection)
     }
 
+    /// Returns the validated compute thread-group dimensions.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BindingError::MissingReflection` if no compute stage was selected.
+    pub fn compute_workgroup_size(&self) -> Result<[u32; 3], BindingError> {
+        self.reflections
+            .iter()
+            .find(|reflection| reflection.stage() == Stage::Compute)
+            .and_then(ValidatedStageReflection::workgroup_size)
+            .ok_or(BindingError::MissingReflection)
+    }
+
     /// Graphics pipelines require exactly one selected vertex product and one selected fragment product.
     ///
     /// # Errors

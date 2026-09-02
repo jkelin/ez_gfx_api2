@@ -87,6 +87,31 @@ fn target_order_does_not_change_artifact_bytes_when_slang_is_available() {
 }
 
 #[test]
+fn compute_workgroup_size_is_serialized_for_every_target_when_slang_is_available() {
+    if shader_slang::GlobalSession::new().is_none() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("shader.slang");
+    fs::write(
+        &source,
+        "[shader(\"compute\")] [numthreads(8,2,1)] void main() {}",
+    )
+    .unwrap();
+
+    let bytes = compile_shader(&source, ALL_TARGETS, true).unwrap();
+    let artifact = Artifact::decode(&bytes).unwrap();
+    let metadata: serde_json::Value = serde_json::from_slice(&artifact.metadata).unwrap();
+
+    for reflection in metadata["reflections"].as_array().unwrap() {
+        assert_eq!(
+            reflection["reflection"]["workgroup_size"],
+            serde_json::json!([8, 2, 1])
+        );
+    }
+}
+
+#[test]
 fn discovered_entries_compile_for_every_requested_target_when_slang_is_available() {
     if shader_slang::GlobalSession::new().is_none() {
         return;

@@ -746,13 +746,17 @@ name = "ez-gfx-backend-metal"
 version = "0.1.0"
 dependencies = [
  "dispatch2",
+ "ez-gfx-artifact",
+ "ez-gfx-compiler",
  "ez-gfx-core",
  "ez-gfx-hal",
+ "ez-gfx-runtime",
  "gpu-allocator",
  "objc2 0.6.4",
  "objc2-foundation 0.3.2",
  "objc2-metal 0.3.2",
  "objc2-quartz-core 0.3.2",
+ "tempfile",
 ]
 
 [[package]]

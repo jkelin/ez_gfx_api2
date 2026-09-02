@@ -17,5 +17,11 @@ gpu-allocator = { workspace = true, features = ["std", "metal"] }
 dispatch2.workspace = true
 objc2-quartz-core.workspace = true
 
+[target.'cfg(target_vendor = "apple")'.dev-dependencies]
+ez-gfx-artifact.workspace = true
+ez-gfx-compiler.workspace = true
+ez-gfx-runtime.workspace = true
+tempfile.workspace = true
+
 [lints]
 workspace = true

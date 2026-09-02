@@ -9,9 +9,9 @@ use std::{
 
 /// Maximum encoded artifact size accepted by the container format.
 pub const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
-const MAGIC: &[u8; 8] = b"EZSHDR03";
+const MAGIC: &[u8; 8] = b"EZSHDR04";
 /// Current framed rkyv shader artifact format version.
-pub const ARTIFACT_FORMAT_VERSION: u32 = 3;
+pub const ARTIFACT_FORMAT_VERSION: u32 = 4;
 const HEADER_BYTES: usize = 56;
 const MAX_STRING: usize = 16 * 1024;
 const MAX_VARIANTS: usize = 64;

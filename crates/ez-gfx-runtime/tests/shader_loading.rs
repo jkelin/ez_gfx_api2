@@ -46,11 +46,15 @@ fn metadata(stages: &[Stage]) -> Vec<u8> {
         .into_iter()
         .flat_map(|target| {
             stages.iter().map(move |stage| {
+                let workgroup_size = (*stage == Stage::Compute).then_some([1, 1, 1]);
                 serde_json::json!({
                     "target": format!("{target:?}"),
                     "entry": format!("{stage:?}").replace("Compute", "main"),
                     "stage": format!("{stage:?}"),
-                    "reflection": {"parameters":[]}
+                    "reflection": {
+                        "parameters":[],
+                        "workgroup_size": workgroup_size
+                    }
                 })
             })
         })
@@ -178,12 +182,15 @@ fn every_backend_rejects_reflection_before_product_exposure() {
             "target": target,
             "entry": "main",
             "stage": "Compute",
-            "reflection": {"parameters":[{
-                "semantic_name":"resource",
-                "api_kind":"unsupported",
-                "binding_index":0,
-                "binding_space":0
-            }]}
+            "reflection": {
+                "parameters":[{
+                    "semantic_name":"resource",
+                    "api_kind":"unsupported",
+                    "binding_index":0,
+                    "binding_space":0
+                }],
+                "workgroup_size":[1,1,1]
+            }
         }]}))
         .unwrap();
         assert_eq!(
@@ -207,6 +214,7 @@ fn every_backend_rejects_reflection_before_product_exposure() {
                     "texture_argument_offset":0,
                     "sampler_argument_offset":1
                 }
+                ,"workgroup_size":[1,1,1]
             }
         }]}))
         .unwrap();

@@ -35,7 +35,11 @@ pub fn load_shader(context: ContextHandle, artifact: &[u8]) -> Result<ShaderHand
             .map(|product| (product.0, product.2.to_owned()));
         let graphics_layout = graphics
             .as_ref()
-            .map(|_| shader.pipeline_layout(ez_gfx_artifact::Stage::Fragment))
+            .map(|_| {
+                shader
+                    .pipeline_layout(ez_gfx_artifact::Stage::Vertex)?
+                    .merge(&shader.pipeline_layout(ez_gfx_artifact::Stage::Fragment)?)
+            })
             .transpose()
             .map_err(|_| EzGfxResult::InvalidArgument)?;
         if graphics.is_none() && compute.is_none() {
@@ -117,7 +121,7 @@ pub(super) fn destroy_native_shader(context: &mut NativeContext, shader: NativeS
         }
         #[cfg(target_vendor = "apple")]
         (NativeContext::Metal(context), NativeShader::Metal(shader)) => {
-            context.destroy_shader(shader)
+            context.destroy_shader(shader);
         }
         #[cfg(any(windows, target_vendor = "apple"))]
         _ => {}
@@ -135,7 +139,7 @@ pub(super) fn destroy_native_pipeline(context: &mut NativeContext, pipeline: Nat
         }
         #[cfg(target_vendor = "apple")]
         (NativeContext::Metal(context), NativePipeline::Metal(pipeline)) => {
-            context.destroy_pipeline(pipeline)
+            context.destroy_pipeline(pipeline);
         }
         #[cfg(any(windows, target_vendor = "apple"))]
         _ => {}

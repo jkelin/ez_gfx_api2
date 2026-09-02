@@ -699,5 +699,5 @@ mod vulkan;
 #[cfg(windows)]
 use dx12::execute_dx12_frame_plan;
 #[cfg(target_vendor = "apple")]
-use metal::*;
+use metal::execute_metal_frame_plan;
 use vulkan::execute_vulkan_frame_plan;

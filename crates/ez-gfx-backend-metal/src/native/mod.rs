@@ -109,8 +109,12 @@ pub struct NativeGraphicsDraw<'a> {
     pub state: DynamicPipelineState,
     /// Buffer containing 32-bit indices.
     pub index: &'a NativeAllocation,
+    /// Logical byte length of the index resource.
+    pub index_size: u64,
     /// Buffer containing indexed indirect commands.
     pub indirect: &'a NativeAllocation,
+    /// Logical byte length of the indirect resource.
+    pub indirect_size: u64,
     /// Number of indirect commands to encode.
     pub draw_count: u32,
     /// Inline constant payload.
@@ -127,10 +131,16 @@ pub struct NativeComputeDispatch<'a> {
     pub pipeline: &'a NativePipeline,
     /// Workgroup count for each dimension.
     pub groups: [u32; 3],
+    /// Threads launched in each workgroup, reflected from the compute entry point.
+    pub threads_per_group: [u32; 3],
     /// Inline constant payload.
     pub push_constants: &'a [u8],
     /// Reflected public buffer bindings.
     pub bindings: &'a [NativeBufferBinding<'a>],
+    /// Reflected compute texture argument-buffer layout, when present.
+    pub texture_heap: Option<ShaderTextureHeapLayout>,
+    /// Textures referenced by the compute argument buffer.
+    pub textures: &'a [&'a NativeTexture],
 }
 
 /// Metal resource referenced by a compiled frame barrier.
@@ -192,17 +202,23 @@ pub struct NativeTexture {
 
 /// Metal compute or graphics pipeline state.
 pub enum NativePipeline {
-    /// Compute pipeline state.
+    /// Compute pipeline state and optional texture argument encoder.
     Compute {
         /// Retained compute pipeline object.
         state: ThreadBound<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+        /// Encoder for the compute-stage bindless texture heap.
+        argument_encoder: Option<ThreadBound<Retained<ProtocolObject<dyn MTLArgumentEncoder>>>>,
     },
-    /// Graphics pipeline state and optional texture argument encoder.
+    /// Graphics pipeline state and stage-specific texture argument encoders.
     Graphics {
         /// Retained graphics pipeline object.
         state: ThreadBound<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
-        /// Encoder for the reflected bindless texture heap.
-        argument_encoder: Option<ThreadBound<Retained<ProtocolObject<dyn MTLArgumentEncoder>>>>,
+        /// Encoder for a vertex-stage bindless texture heap.
+        vertex_argument_encoder:
+            Option<ThreadBound<Retained<ProtocolObject<dyn MTLArgumentEncoder>>>>,
+        /// Encoder for a fragment-stage bindless texture heap.
+        fragment_argument_encoder:
+            Option<ThreadBound<Retained<ProtocolObject<dyn MTLArgumentEncoder>>>>,
     },
 }
 struct FrameSlot {

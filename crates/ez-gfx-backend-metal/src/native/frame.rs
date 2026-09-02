@@ -2,18 +2,48 @@ use super::{
     AllocationRequest, AttachmentLoadOp, AttachmentStoreOp, CAMetalDrawable, CAMetalLayer,
     CullMode, FrontFace, HalError, MAX_ARGUMENT_BUFFERS_PER_SLOT, MTLArgumentEncoder,
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus,
-    MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLCullMode, MTLDevice,
-    MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType,
-    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderStages, MTLResource,
-    MTLResourceOptions, MTLResourceUsage, MTLSize, MTLStoreAction, MTLTexture, MTLWinding,
-    MemoryAllocator, MemoryClass, NativeAllocation, NativeContext, NativeFrameAction,
-    NativeFrameResource, NativeGraphicsDraw, NativePipeline, NativeSurface, PrimitiveTopology,
-    ProtocolObject, QueueKind, ThreadBound, c_void, map_allocation_hal,
+    MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState,
+    MTLCullMode, MTLDevice, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
+    MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderStages,
+    MTLResource, MTLResourceOptions, MTLResourceUsage, MTLSize, MTLStoreAction, MTLTexture,
+    MTLWinding, MemoryAllocator, MemoryClass, NativeAllocation, NativeContext, NativeFrameAction,
+    NativeFrameResource, NativeGraphicsDraw, NativePipeline, NativeSurface, NativeTexture,
+    PrimitiveTopology, ProtocolObject, QueueKind, ThreadBound, c_void, map_allocation_hal,
 };
 
 type MetalDrawable = super::Retained<ProtocolObject<dyn CAMetalDrawable>>;
 
 type MetalFrameReadback = (NativeAllocation, u64, u64, u64, u32);
+type MetalArgumentEncoder = ThreadBound<super::Retained<ProtocolObject<dyn MTLArgumentEncoder>>>;
+
+fn buffer_range_fits(allocation_size: u64, range: ez_gfx_hal::BufferRange) -> bool {
+    range
+        .offset
+        .checked_add(range.size)
+        .is_some_and(|end| end <= allocation_size)
+}
+
+fn draw_ranges_fit(
+    index_physical_size: u64,
+    index_logical_size: u64,
+    indirect_physical_size: u64,
+    indirect_logical_size: u64,
+    draw_count: u32,
+) -> bool {
+    let required_indirect = u64::from(draw_count).checked_mul(20);
+    index_logical_size != 0
+        && index_logical_size <= index_physical_size
+        && indirect_logical_size <= indirect_physical_size
+        && required_indirect.is_some_and(|required| required <= indirect_logical_size)
+}
+
+fn metal_size(size: [u32; 3]) -> MTLSize {
+    MTLSize {
+        width: size[0] as usize,
+        height: size[1] as usize,
+        depth: size[2] as usize,
+    }
+}
 
 struct MetalFrameResources {
     slot_index: usize,
@@ -47,9 +77,10 @@ impl MetalFrameEncoder<'_> {
         }
         match resource {
             NativeFrameResource::Buffer(allocation) => {
-                if !matches!(barrier.range, ez_gfx_hal::ExecutionRange::Buffer(_))
-                    || allocation.allocation.size() == 0
-                {
+                let ez_gfx_hal::ExecutionRange::Buffer(range) = barrier.range else {
+                    return Err(HalError::InvalidArgument);
+                };
+                if !buffer_range_fits(allocation.allocation.size(), range) {
                     return Err(HalError::InvalidArgument);
                 }
             }
@@ -136,15 +167,24 @@ impl MetalFrameEncoder<'_> {
 
         Ok(())
     }
-    fn compute(&mut self, dispatch: &super::NativeComputeDispatch<'_>) -> Result<(), HalError> {
+    fn compute(
+        &mut self,
+        action_index: usize,
+        dispatch: &super::NativeComputeDispatch<'_>,
+    ) -> Result<(), HalError> {
         if self.render_encoder.is_some()
             || dispatch.groups.contains(&0)
+            || dispatch.threads_per_group.contains(&0)
             || dispatch.push_constants.len() > 128
             || !dispatch.push_constants.len().is_multiple_of(4)
         {
             return Err(HalError::InvalidArgument);
         }
-        let NativePipeline::Compute { state } = dispatch.pipeline else {
+        let NativePipeline::Compute {
+            state,
+            argument_encoder,
+        } = dispatch.pipeline
+        else {
             return Err(HalError::InvalidArgument);
         };
         let encoder = self
@@ -165,6 +205,29 @@ impl MetalFrameEncoder<'_> {
                 );
             };
         }
+        match (
+            dispatch.texture_heap,
+            argument_encoder.as_ref(),
+            self.prepared_arguments
+                .get(action_index)
+                .and_then(|prepared| *prepared),
+        ) {
+            (Some(heap), Some(_), Some(index)) => {
+                let buffer = &self.frame_slot.argument_buffers[index];
+                for texture in dispatch.textures {
+                    let resource = <ProtocolObject<dyn MTLTexture> as AsRef<
+                        ProtocolObject<dyn MTLResource>,
+                    >>::as_ref(&*texture.texture);
+                    encoder.useResource_usage(resource, MTLResourceUsage::Read);
+                }
+                // SAFETY: frame preparation encoded the complete compute argument buffer and retains it through command completion.
+                unsafe {
+                    encoder.setBuffer_offset_atIndex(Some(buffer), 0, heap.binding as usize);
+                }
+            }
+            (None, None, None) => {}
+            _ => return Err(HalError::InvalidArgument),
+        }
         if let Some(bytes) =
             core::ptr::NonNull::new(dispatch.push_constants.as_ptr() as *mut c_void)
             && !dispatch.push_constants.is_empty()
@@ -175,16 +238,8 @@ impl MetalFrameEncoder<'_> {
             };
         }
         encoder.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize {
-                width: dispatch.groups[0] as usize,
-                height: dispatch.groups[1] as usize,
-                depth: dispatch.groups[2] as usize,
-            },
-            MTLSize {
-                width: 1,
-                height: 1,
-                depth: 1,
-            },
+            metal_size(dispatch.groups),
+            metal_size(dispatch.threads_per_group),
         );
         encoder.endEncoding();
 
@@ -201,13 +256,16 @@ impl MetalFrameEncoder<'_> {
             .ok_or(HalError::InvalidArgument)?;
         let NativePipeline::Graphics {
             state,
-            argument_encoder: _,
+            vertex_argument_encoder,
+            fragment_argument_encoder,
         } = draw.pipeline
         else {
             return Err(HalError::InvalidArgument);
         };
-        let argument_buffer = self.prepared_arguments[action_index]
-            .map(|index| &self.frame_slot.argument_buffers[index]);
+        let argument_buffer = self
+            .prepared_arguments
+            .get(action_index)
+            .and_then(|prepared| prepared.map(|index| &self.frame_slot.argument_buffers[index]));
         encoder.setRenderPipelineState(state);
         if draw.depth_required {
             let depth = self
@@ -252,21 +310,48 @@ impl MetalFrameEncoder<'_> {
                 );
             }
         }
-        if let (Some(heap), Some(buffer)) = (draw.texture_heap, argument_buffer) {
-            for texture in draw.textures {
-                let resource = <ProtocolObject<dyn MTLTexture> as AsRef<
-                    ProtocolObject<dyn MTLResource>,
-                >>::as_ref(&*texture.texture);
-                encoder.useResource_usage_stages(
-                    resource,
-                    MTLResourceUsage::Read,
-                    MTLRenderStages::Fragment,
-                );
+        match (draw.texture_heap, argument_buffer) {
+            (Some(heap), Some(buffer)) => {
+                for texture in draw.textures {
+                    let resource = <ProtocolObject<dyn MTLTexture> as AsRef<
+                        ProtocolObject<dyn MTLResource>,
+                    >>::as_ref(&*texture.texture);
+                    if vertex_argument_encoder.is_some() {
+                        encoder.useResource_usage_stages(
+                            resource,
+                            MTLResourceUsage::Read,
+                            MTLRenderStages::Vertex,
+                        );
+                    }
+                    if fragment_argument_encoder.is_some() {
+                        encoder.useResource_usage_stages(
+                            resource,
+                            MTLResourceUsage::Read,
+                            MTLRenderStages::Fragment,
+                        );
+                    }
+                }
+                // SAFETY: frame preparation sized and encoded this buffer with every declaring stage encoder, and the frame slot retains it through completion.
+                unsafe {
+                    if vertex_argument_encoder.is_some() {
+                        encoder.setVertexBuffer_offset_atIndex(
+                            Some(buffer),
+                            0,
+                            heap.binding as usize,
+                        );
+                    }
+                    if fragment_argument_encoder.is_some() {
+                        encoder.setFragmentBuffer_offset_atIndex(
+                            Some(buffer),
+                            0,
+                            heap.binding as usize,
+                        );
+                    }
+                }
             }
-            // SAFETY: `buffer` is the frame-slot argument buffer sized to at least the argument encoder's `encodedLength`; offset 0 is in bounds, and the frame slot retains its storage through command completion.
-            unsafe {
-                encoder.setFragmentBuffer_offset_atIndex(Some(buffer), 0, heap.binding as usize);
-            }
+            (None, None)
+                if vertex_argument_encoder.is_none() && fragment_argument_encoder.is_none() => {}
+            _ => return Err(HalError::InvalidArgument),
         }
         if let Some(bytes) = core::ptr::NonNull::new(draw.push_constants.as_ptr() as *mut c_void)
             && !draw.push_constants.is_empty()
@@ -349,48 +434,35 @@ impl MetalFrameEncoder<'_> {
 }
 
 impl NativeContext {
-    pub(super) fn prepare_argument_buffer(
+    fn prepare_texture_argument_buffer(
         &mut self,
         slot: usize,
-        draw: &NativeGraphicsDraw<'_>,
+        heap: Option<ez_gfx_hal::ShaderTextureHeapLayout>,
+        textures: &[&NativeTexture],
+        encoders: &[Option<&MetalArgumentEncoder>],
         argument_index: usize,
     ) -> Result<Option<usize>, HalError> {
-        if draw.draw_count == 0
-            || draw.push_constants.len() > 128
-            || !draw.push_constants.len().is_multiple_of(4)
-            || draw.state.topology == PrimitiveTopology::TriangleFan
-            || draw
-                .bindings
-                .iter()
-                .any(|binding| binding.offset as u64 >= binding.allocation.allocation.size())
-        {
-            return Err(HalError::InvalidArgument);
-        }
-        let NativePipeline::Graphics {
-            argument_encoder, ..
-        } = draw.pipeline
-        else {
-            return Err(HalError::InvalidArgument);
-        };
-        let Some(heap) = draw.texture_heap else {
-            return if argument_encoder.is_none() {
+        let Some(heap) = heap else {
+            return if encoders.iter().all(Option::is_none) {
                 Ok(None)
             } else {
                 Err(HalError::InvalidArgument)
             };
         };
-        if argument_index >= MAX_ARGUMENT_BUFFERS_PER_SLOT {
-            return Err(HalError::OutOfMemory);
-        }
-        let encoder = argument_encoder.as_ref().ok_or(HalError::InvalidArgument)?;
-        if draw
-            .textures
-            .iter()
-            .any(|texture| texture.binding >= heap.capacity)
+        if encoders.iter().all(Option::is_none)
+            || argument_index >= MAX_ARGUMENT_BUFFERS_PER_SLOT
+            || textures
+                .iter()
+                .any(|texture| texture.binding >= heap.capacity)
         {
             return Err(HalError::InvalidArgument);
         }
-        let required = encoder.encodedLength();
+        let required = encoders
+            .iter()
+            .flatten()
+            .map(|encoder| encoder.encodedLength())
+            .max()
+            .ok_or(HalError::InvalidArgument)?;
         let slot = self
             .frame_slots
             .get_mut(slot)
@@ -409,20 +481,117 @@ impl NativeContext {
             );
         }
         let buffer = &slot.argument_buffers[argument_index];
-        // SAFETY: `buffer` has length at least `encoder.encodedLength()` by the allocation check above, so offset 0 exposes the complete argument-buffer storage, which the frame slot retains until command completion.
-        unsafe { encoder.setArgumentBuffer_offset(Some(buffer), 0) };
-        for texture in draw.textures {
-            let texture_index = texture.binding as usize * heap.argument_stride as usize
-                + heap.texture_argument_offset as usize;
-            let sampler_index = texture.binding as usize * heap.argument_stride as usize
-                + heap.sampler_argument_offset as usize;
-            // SAFETY: `texture.binding < heap.capacity` was checked, so the heap's stride/offset layout yields encoder-declared texture and sampler indices, and `draw.textures` holds both objects while the argument encoder writes their handles.
-            unsafe {
-                encoder.setTexture_atIndex(Some(&texture.texture), texture_index);
-                encoder.setSamplerState_atIndex(Some(&texture.sampler), sampler_index);
+        for encoder in encoders.iter().flatten() {
+            // SAFETY: `buffer` is at least the maximum encoded length across the declaring stage encoders and is retained by the frame slot.
+            unsafe { encoder.setArgumentBuffer_offset(Some(buffer), 0) };
+            for texture in textures {
+                let texture_index = texture.binding as usize * heap.argument_stride as usize
+                    + heap.texture_argument_offset as usize;
+                let sampler_index = texture.binding as usize * heap.argument_stride as usize
+                    + heap.sampler_argument_offset as usize;
+                // SAFETY: validated heap capacity and stride/offset metadata place both argument indices in the encoder-declared layout.
+                unsafe {
+                    encoder.setTexture_atIndex(Some(&texture.texture), texture_index);
+                    encoder.setSamplerState_atIndex(Some(&texture.sampler), sampler_index);
+                }
             }
         }
         Ok(Some(argument_index))
+    }
+
+    fn prepare_graphics_argument_buffer(
+        &mut self,
+        slot: usize,
+        draw: &NativeGraphicsDraw<'_>,
+        argument_index: usize,
+    ) -> Result<Option<usize>, HalError> {
+        if draw.draw_count == 0
+            || draw.push_constants.len() > 128
+            || !draw.push_constants.len().is_multiple_of(4)
+            || draw.state.topology == PrimitiveTopology::TriangleFan
+            || !draw_ranges_fit(
+                draw.index.allocation.size(),
+                draw.index_size,
+                draw.indirect.allocation.size(),
+                draw.indirect_size,
+                draw.draw_count,
+            )
+            || draw
+                .bindings
+                .iter()
+                .any(|binding| binding.offset as u64 >= binding.allocation.allocation.size())
+        {
+            return Err(HalError::InvalidArgument);
+        }
+        let NativePipeline::Graphics {
+            vertex_argument_encoder,
+            fragment_argument_encoder,
+            ..
+        } = draw.pipeline
+        else {
+            return Err(HalError::InvalidArgument);
+        };
+        let encoders = [
+            vertex_argument_encoder.as_ref(),
+            fragment_argument_encoder.as_ref(),
+        ];
+        self.prepare_texture_argument_buffer(
+            slot,
+            draw.texture_heap,
+            draw.textures,
+            &encoders,
+            argument_index,
+        )
+    }
+
+    fn prepare_compute_argument_buffer(
+        &mut self,
+        slot: usize,
+        dispatch: &super::NativeComputeDispatch<'_>,
+        argument_index: usize,
+    ) -> Result<Option<usize>, HalError> {
+        let NativePipeline::Compute {
+            argument_encoder, ..
+        } = dispatch.pipeline
+        else {
+            return Err(HalError::InvalidArgument);
+        };
+        let encoders = [argument_encoder.as_ref()];
+        self.prepare_texture_argument_buffer(
+            slot,
+            dispatch.texture_heap,
+            dispatch.textures,
+            &encoders,
+            argument_index,
+        )
+    }
+
+    fn prepare_compute_action(
+        &mut self,
+        slot: usize,
+        dispatch: &super::NativeComputeDispatch<'_>,
+        argument_index: usize,
+    ) -> Result<Option<usize>, HalError> {
+        let NativePipeline::Compute { state, .. } = dispatch.pipeline else {
+            return Err(HalError::InvalidArgument);
+        };
+        let thread_count = dispatch
+            .threads_per_group
+            .into_iter()
+            .try_fold(1_u64, |total, value| total.checked_mul(u64::from(value)));
+        if dispatch.groups.contains(&0)
+            || dispatch.threads_per_group.contains(&0)
+            || thread_count.is_none_or(|count| count > state.maxTotalThreadsPerThreadgroup() as u64)
+            || dispatch.push_constants.len() > 128
+            || !dispatch.push_constants.len().is_multiple_of(4)
+            || dispatch
+                .bindings
+                .iter()
+                .any(|binding| binding.offset as u64 >= binding.allocation.allocation.size())
+        {
+            return Err(HalError::InvalidArgument);
+        }
+        self.prepare_compute_argument_buffer(slot, dispatch, argument_index)
     }
 
     pub(super) fn allocate_frame_readback(
@@ -522,8 +691,10 @@ impl NativeContext {
                 NativeFrameAction::Barrier { barrier, resource } => {
                     let valid = match resource {
                         NativeFrameResource::Buffer(allocation) => {
-                            matches!(barrier.range, ez_gfx_hal::ExecutionRange::Buffer(_))
-                                && allocation.allocation.size() != 0
+                            let ez_gfx_hal::ExecutionRange::Buffer(range) = barrier.range else {
+                                return Err(HalError::InvalidArgument);
+                            };
+                            buffer_range_fits(allocation.allocation.size(), range)
                         }
                         NativeFrameResource::Texture(texture) => {
                             matches!(barrier.range, ez_gfx_hal::ExecutionRange::Image(_))
@@ -557,18 +728,15 @@ impl NativeContext {
                     }
                 }
                 NativeFrameAction::Compute(dispatch) => {
-                    if pass_active
-                        || dispatch.groups.contains(&0)
-                        || dispatch.push_constants.len() > 128
-                        || !dispatch.push_constants.len().is_multiple_of(4)
-                        || dispatch.bindings.iter().any(|binding| {
-                            binding.offset as u64 >= binding.allocation.allocation.size()
-                        })
-                        || !matches!(dispatch.pipeline, NativePipeline::Compute { .. })
-                    {
+                    if pass_active {
                         Err(HalError::InvalidArgument)
                     } else {
-                        Ok(None)
+                        self.prepare_compute_action(slot_index, dispatch, argument_count)
+                            .inspect(|prepared| {
+                                if prepared.is_some() {
+                                    argument_count += 1;
+                                }
+                            })
                     }
                 }
                 NativeFrameAction::Graphics(draw) => {
@@ -578,7 +746,7 @@ impl NativeContext {
                     {
                         Err(HalError::InvalidArgument)
                     } else {
-                        self.prepare_argument_buffer(slot_index, draw, argument_count)
+                        self.prepare_graphics_argument_buffer(slot_index, draw, argument_count)
                             .inspect(|prepared| {
                                 if prepared.is_some() {
                                     argument_count += 1;
@@ -821,7 +989,9 @@ impl NativeContext {
                         encoder.encode_barrier(barrier, resource)?;
                     }
                     NativeFrameAction::BeginPass(pass) => encoder.begin_pass(pass)?,
-                    NativeFrameAction::Compute(dispatch) => encoder.compute(dispatch)?,
+                    NativeFrameAction::Compute(dispatch) => {
+                        encoder.compute(action_index, dispatch)?;
+                    }
                     NativeFrameAction::Graphics(draw) => encoder.graphics(action_index, draw)?,
                     NativeFrameAction::TextureReadback {
                         texture,
@@ -880,5 +1050,39 @@ impl NativeContext {
             return Err(error);
         }
         self.finish_frame(command, readbacks, slot_index, capture_presented, surface)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{buffer_range_fits, draw_ranges_fit, metal_size};
+    use ez_gfx_hal::BufferRange;
+
+    #[test]
+    fn buffer_barrier_range_must_fit_allocation() {
+        assert!(buffer_range_fits(64, BufferRange::new(16, 48).unwrap()));
+        assert!(!buffer_range_fits(63, BufferRange::new(16, 48).unwrap()));
+        assert!(!buffer_range_fits(
+            u64::MAX,
+            BufferRange {
+                offset: u64::MAX - 3,
+                size: 4,
+            }
+        ));
+    }
+
+    #[test]
+    fn indexed_indirect_logical_ranges_bound_native_reads() {
+        assert!(draw_ranges_fit(64, 64, 40, 40, 2));
+        assert!(!draw_ranges_fit(64, 0, 40, 40, 2));
+        assert!(!draw_ranges_fit(64, 65, 40, 40, 2));
+        assert!(!draw_ranges_fit(64, 64, 40, 39, 2));
+        assert!(!draw_ranges_fit(64, 64, 39, 40, 2));
+    }
+
+    #[test]
+    fn reflected_threadgroup_dimensions_reach_metal_dispatch_shape() {
+        let size = metal_size([8, 2, 1]);
+        assert_eq!((size.width, size.height, size.depth), (8, 2, 1));
     }
 }

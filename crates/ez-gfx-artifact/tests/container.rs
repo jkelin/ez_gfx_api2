@@ -1,8 +1,8 @@
 //! Binary artifact encoding and validation contract tests.
 use ez_gfx_artifact::{
-    AppleArchitecture, ApplePlatform, Artifact, ArtifactError, CompatibilityVersion,
-    MAX_ARTIFACT_BYTES, MetalCompatibility, Provenance, Stage, Target, TargetCompatibility,
-    TargetVariant,
+    ARTIFACT_FORMAT_VERSION, AppleArchitecture, ApplePlatform, Artifact, ArtifactError,
+    CompatibilityVersion, MAX_ARTIFACT_BYTES, MetalCompatibility, Provenance, Stage, Target,
+    TargetCompatibility, TargetVariant,
 };
 
 fn compatibility(target: Target) -> TargetCompatibility {
@@ -191,6 +191,23 @@ fn rejects_duplicate_exact_variant_and_invalid_bounds() {
     assert!(matches!(
         Artifact::decode(&vec![0; MAX_ARTIFACT_BYTES + 1]),
         Err(ArtifactError::TooLarge)
+    ));
+}
+
+#[test]
+fn encoding_uses_format_v4_and_rejects_v3() {
+    assert_eq!(ARTIFACT_FORMAT_VERSION, 4);
+
+    let bytes = sample().encode().unwrap();
+    assert_eq!(&bytes[..8], b"EZSHDR04");
+    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 4);
+
+    let mut version_three = bytes;
+    version_three[..8].copy_from_slice(b"EZSHDR03");
+    version_three[8..12].copy_from_slice(&3_u32.to_le_bytes());
+    assert!(matches!(
+        Artifact::decode(&version_three),
+        Err(ArtifactError::InvalidHeader)
     ));
 }
 

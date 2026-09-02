@@ -111,6 +111,7 @@ pub struct ValidatedStageReflection {
     stage: Stage,
     bindings: ReflectedBindings,
     pipeline_layout: PipelineLayout,
+    workgroup_size: Option<[u32; 3]>,
 }
 
 impl ValidatedStageReflection {
@@ -127,6 +128,11 @@ impl ValidatedStageReflection {
     /// Returns the validated pipeline layout.
     pub const fn pipeline_layout(&self) -> &PipelineLayout {
         &self.pipeline_layout
+    }
+
+    /// Returns the compute thread-group dimensions; non-compute stages have none.
+    pub const fn workgroup_size(&self) -> Option<[u32; 3]> {
+        self.workgroup_size
     }
 }
 
@@ -184,6 +190,26 @@ impl PipelineLayout {
     /// Reports whether the pipeline requires a depth attachment.
     pub const fn depth_required(&self) -> bool {
         self.depth_required
+    }
+
+    /// Combines stage layouts for one graphics pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BindingError::ConflictingStageLayout`] when both stages declare different physical texture heaps.
+    pub fn merge(&self, other: &Self) -> Result<Self, BindingError> {
+        let texture_heap = match (self.texture_heap, other.texture_heap) {
+            (Some(left), Some(right)) if left != right => {
+                return Err(BindingError::ConflictingStageLayout);
+            }
+            (Some(heap), _) | (_, Some(heap)) => Some(heap),
+            (None, None) => None,
+        };
+
+        Ok(Self {
+            texture_heap,
+            depth_required: self.depth_required || other.depth_required,
+        })
     }
 }
 
@@ -374,10 +400,19 @@ pub fn validate_stage_reflections(
         if matches.next().is_some() {
             return Err(BindingError::AmbiguousReflection);
         }
+        let workgroup_size = reflection.reflection.workgroup_size;
+        if stage == Stage::Compute {
+            if workgroup_size.is_none_or(|size| size.contains(&0)) {
+                return Err(BindingError::InvalidMetadata);
+            }
+        } else if workgroup_size.is_some() {
+            return Err(BindingError::InvalidMetadata);
+        }
         validated.push(ValidatedStageReflection {
             stage,
             bindings: ReflectedBindings::from_reflection(reflection, backend)?,
             pipeline_layout: PipelineLayout::from_reflection(reflection)?,
+            workgroup_size,
         });
     }
 
@@ -387,6 +422,7 @@ pub fn validate_stage_reflections(
         .find(|value| value.stage == Stage::Fragment);
     if let (Some(vertex), Some(fragment)) = (vertex, fragment) {
         vertex.bindings.merge(&fragment.bindings)?;
+        vertex.pipeline_layout.merge(&fragment.pipeline_layout)?;
     }
     Ok(validated)
 }
@@ -411,6 +447,8 @@ pub enum BindingError {
     },
     /// A semantic name has incompatible requirements across shader stages.
     ConflictingStageBinding(String),
+    /// Graphics stages declare incompatible physical pipeline layouts.
+    ConflictingStageLayout,
     /// A semantic name required by reflection was not supplied.
     Missing(String),
     /// A supplied semantic name is not present in reflection.
@@ -441,6 +479,8 @@ struct Reflection {
     texture_heap: Option<TextureHeapMetadata>,
     #[serde(default)]
     depth_required: bool,
+    #[serde(default)]
+    workgroup_size: Option<[u32; 3]>,
 }
 
 #[derive(Deserialize)]

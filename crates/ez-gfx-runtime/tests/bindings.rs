@@ -175,3 +175,72 @@ fn pipeline_layout_reads_canonical_texture_heap_and_depth_contract() {
         Err(BindingError::InvalidMetadata)
     );
 }
+
+#[test]
+fn graphics_stage_layouts_merge_only_identical_texture_heaps() {
+    let matching = br#"{"reflections":[
+        {"target":"Metallib","entry":"vertexmain","stage":"Vertex","reflection":{"parameters":[],"texture_heap":{"binding_space":1,"binding_index":6,"capacity":1024,"argument_stride":2,"texture_argument_offset":0,"sampler_argument_offset":1}}},
+        {"target":"Metallib","entry":"fragmentmain","stage":"Fragment","reflection":{"parameters":[],"texture_heap":{"binding_space":1,"binding_index":6,"capacity":1024,"argument_stride":2,"texture_argument_offset":0,"sampler_argument_offset":1},"depth_required":true}}
+    ]}"#;
+    let reflections = ez_gfx_runtime::binding::validate_stage_reflections(
+        matching,
+        Backend::Metal,
+        &[
+            (Stage::Vertex, "vertexmain"),
+            (Stage::Fragment, "fragmentmain"),
+        ],
+    )
+    .unwrap();
+    let merged = reflections[0]
+        .pipeline_layout()
+        .merge(reflections[1].pipeline_layout())
+        .unwrap();
+    assert_eq!(
+        merged.texture_heap(),
+        reflections[0].pipeline_layout().texture_heap()
+    );
+    assert!(merged.depth_required());
+
+    let conflicting = std::str::from_utf8(matching).unwrap().replacen(
+        "\"binding_index\":6",
+        "\"binding_index\":5",
+        1,
+    );
+    assert_eq!(
+        ez_gfx_runtime::binding::validate_stage_reflections(
+            conflicting.as_bytes(),
+            Backend::Metal,
+            &[
+                (Stage::Vertex, "vertexmain"),
+                (Stage::Fragment, "fragmentmain"),
+            ],
+        ),
+        Err(BindingError::ConflictingStageLayout)
+    );
+}
+
+#[test]
+fn compute_reflection_requires_nonzero_workgroup_size() {
+    let valid = br#"{"reflections":[{"target":"Metallib","entry":"computemain","stage":"Compute","reflection":{"parameters":[],"workgroup_size":[8,2,1]}}]}"#;
+    let reflections = ez_gfx_runtime::binding::validate_stage_reflections(
+        valid,
+        Backend::Metal,
+        &[(Stage::Compute, "computemain")],
+    )
+    .unwrap();
+    assert_eq!(reflections[0].workgroup_size(), Some([8, 2, 1]));
+
+    for invalid in [
+        br#"{"reflections":[{"target":"Metallib","entry":"computemain","stage":"Compute","reflection":{"parameters":[]}}]}"#.as_slice(),
+        br#"{"reflections":[{"target":"Metallib","entry":"computemain","stage":"Compute","reflection":{"parameters":[],"workgroup_size":[8,0,1]}}]}"#.as_slice(),
+    ] {
+        assert_eq!(
+            ez_gfx_runtime::binding::validate_stage_reflections(
+                invalid,
+                Backend::Metal,
+                &[(Stage::Compute, "computemain")],
+            ),
+            Err(BindingError::InvalidMetadata)
+        );
+    }
+}

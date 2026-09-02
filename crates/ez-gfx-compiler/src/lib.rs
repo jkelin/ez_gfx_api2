@@ -450,6 +450,7 @@ type ReflectedParameter = (
     u32,
     Option<u32>,
     bool,
+    shader_slang::ParameterCategory,
 );
 
 fn collect_parameters<'a>(
@@ -515,10 +516,11 @@ fn collect_parameters<'a>(
                 parameter.binding_space(),
                 texture_heap_capacity,
                 depth_required,
+                layout.parameter_category(),
             ))
         })
         .collect();
-    parameters.sort();
+    parameters.sort_by(|left, right| left.0.cmp(&right.0));
     parameters
 }
 
@@ -533,6 +535,56 @@ fn parse_compatibility_version(value: &str) -> Result<CompatibilityVersion, Comp
         .find_map(|component| component.parse::<u16>().ok())
         .unwrap_or(0);
     Ok(CompatibilityVersion::new(major, minor))
+}
+
+fn parse_deployment_version(value: &str) -> Result<CompatibilityVersion, CompilerError> {
+    // Deployment targets are numeric dotted versions, unlike profile labels that may be prefixed.
+    let mut components = value.trim().split('.');
+    let major = components
+        .next()
+        .filter(|component| !component.is_empty())
+        .ok_or(CompilerError::InvalidRequest("deployment target"))?
+        .parse::<u16>()
+        .map_err(|_| CompilerError::InvalidRequest("deployment target"))?;
+    let minor = match components.next() {
+        None => 0,
+        Some(component) if !component.is_empty() => component
+            .parse::<u16>()
+            .map_err(|_| CompilerError::InvalidRequest("deployment target"))?,
+        Some(_) => return Err(CompilerError::InvalidRequest("deployment target")),
+    };
+    if components.next().is_some() {
+        return Err(CompilerError::InvalidRequest("deployment target"));
+    }
+    Ok(CompatibilityVersion::new(major, minor))
+}
+
+fn metal_minimum_os(
+    deployment_target: Option<&str>,
+    host_os: CompatibilityVersion,
+) -> Result<CompatibilityVersion, CompilerError> {
+    // An explicit deployment target is authoritative; otherwise use the host OS,
+    // never the SDK version, because SDKs commonly support older deployment targets.
+    deployment_target
+        .map(parse_deployment_version)
+        .transpose()
+        .map(|value| value.unwrap_or(host_os))
+}
+
+fn host_macos_version() -> Result<CompatibilityVersion, CompilerError> {
+    let output = Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .map_err(CompilerError::Io)?;
+    if !output.status.success() {
+        return Err(CompilerError::ToolFailed(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    parse_compatibility_version(
+        std::str::from_utf8(&output.stdout)
+            .map_err(|_| CompilerError::InvalidRequest("macOS version"))?,
+    )
 }
 
 fn apple_tool_output(args: &[&str]) -> Result<String, CompilerError> {
@@ -567,11 +619,10 @@ fn target_compatibility(target: &TargetRequest) -> Result<TargetCompatibility, C
         "macosx",
         "--show-sdk-version",
     ])?)?;
-    let minimum_os = std::env::var("MACOSX_DEPLOYMENT_TARGET")
-        .ok()
-        .map(|value| parse_compatibility_version(&value))
-        .transpose()?
-        .unwrap_or(sdk);
+    let minimum_os = metal_minimum_os(
+        std::env::var("MACOSX_DEPLOYMENT_TARGET").ok().as_deref(),
+        host_macos_version()?,
+    )?;
     let language = parse_compatibility_version(target.profile)?;
     let toolchain = apple_tool_output(&["metal", "--version"])?;
     Ok(TargetCompatibility::MetalLibrary {
@@ -585,6 +636,55 @@ fn target_compatibility(target: &TargetRequest) -> Result<TargetCompatibility, C
             toolchain,
         },
     })
+}
+
+fn reflected_workgroup_size(
+    stage: Stage,
+    reflected: [u64; 3],
+    entry: &str,
+) -> Result<Option<[u32; 3]>, CompilerError> {
+    if stage != Stage::Compute {
+        return Ok(None);
+    }
+    let dimension = |value| {
+        u32::try_from(value)
+            .map_err(|_| CompilerError::Native(format!("invalid compute workgroup size: {entry}")))
+    };
+    let [x, y, z] = reflected;
+    let size = [dimension(x)?, dimension(y)?, dimension(z)?];
+    if size.contains(&0) {
+        return Err(CompilerError::Native(format!(
+            "invalid compute workgroup size: {entry}"
+        )));
+    }
+    Ok(Some(size))
+}
+
+fn select_texture_heap<T>(
+    heaps: impl IntoIterator<Item = Result<Option<(T, u32)>, CompilerError>>,
+    entry: &str,
+) -> Result<Option<(T, u32)>, CompilerError> {
+    let mut selected = None;
+    for heap in heaps {
+        let Some(heap) = heap? else {
+            continue;
+        };
+        if selected.is_some() {
+            return Err(CompilerError::Native(format!(
+                "multiple bindless texture heaps: {entry}"
+            )));
+        }
+        selected = Some(heap);
+    }
+    if selected
+        .as_ref()
+        .is_some_and(|(_, capacity)| *capacity == 0 || *capacity > 1024)
+    {
+        return Err(CompilerError::Native(format!(
+            "invalid bindless texture heap capacity: {entry}"
+        )));
+    }
+    Ok(selected)
 }
 
 fn compile_targets(
@@ -627,9 +727,21 @@ fn compile_targets(
                 target.entry_point
             )));
         }
-        let mut parameters: Vec<_> =
+        let workgroup_size = reflected_workgroup_size(
+            target.stage,
+            reflected_entry.compute_thread_group_size(),
+            &target.entry_point,
+        )?;
+        let entry_metadata = linked
+            .entry_point_metadata(
+                i64::try_from(index)
+                    .map_err(|_| CompilerError::InvalidRequest("too many targets"))?,
+                i64::try_from(index)
+                    .map_err(|_| CompilerError::InvalidRequest("too many targets"))?,
+            )
+            .map_err(|error| CompilerError::Native(error.to_string()))?;
+        let parameters: Vec<_> =
             collect_parameters(layout.parameters().chain(reflected_entry.parameters()));
-        parameters.sort();
         let canonical_view = parameters
             .iter()
             .filter(|parameter| parameter.6.is_some())
@@ -652,35 +764,37 @@ fn compile_targets(
         } else {
             canonical_parameters.insert(key, canonical_view);
         }
-        let mut heaps = parameters
+        let used_heaps = parameters
             .iter()
-            .filter_map(|parameter| parameter.9.map(|capacity| (parameter, capacity)));
-        if let Some((_, capacity)) = heaps.clone().next()
-            && (capacity == 0 || capacity > 1024)
-        {
-            return Err(CompilerError::Native(format!(
-                "invalid bindless texture heap capacity: {}",
-                target.entry_point
-            )));
-        }
-        let texture_heap = heaps.next().map(|(parameter, capacity)| {
-            serde_json::json!({
-                "binding_space": parameter.8,
-                "binding_index": parameter.7,
-                "capacity": capacity,
-                "argument_stride": 2,
-                "texture_argument_offset": 0,
-                "sampler_argument_offset": 1,
-            })
-        });
-        if heaps.next().is_some() {
-            return Err(CompilerError::Native(format!(
-                "multiple bindless texture heaps: {}",
-                target.entry_point
-            )));
-        }
+            .filter_map(|parameter| parameter.9.map(|capacity| (parameter, capacity)))
+            .map(|(parameter, capacity)| {
+                entry_metadata
+                    .is_parameter_location_used(
+                        parameter.11,
+                        u64::from(parameter.8),
+                        u64::from(parameter.7),
+                    )
+                    .ok_or_else(|| {
+                        CompilerError::Native(format!(
+                            "texture heap usage reflection failed: {}",
+                            target.entry_point
+                        ))
+                    })
+                    .map(|used| used.then_some((parameter, capacity)))
+            });
+        let texture_heap =
+            select_texture_heap(used_heaps, &target.entry_point)?.map(|(parameter, capacity)| {
+                serde_json::json!({
+                    "binding_space": parameter.8,
+                    "binding_index": parameter.7,
+                    "capacity": capacity,
+                    "argument_stride": 2,
+                    "texture_argument_offset": 0,
+                    "sampler_argument_offset": 1,
+                })
+            });
         let depth_required = parameters.iter().any(|parameter| parameter.10);
-        let reflection = serde_json::json!({"entry": target.entry_point, "stage": format!("{:?}", target.stage), "profile": target.profile, "parameters": parameters.iter().map(|(name,kind,category,shape,access,semantic_name,api_kind,binding_index,binding_space,_,_)| serde_json::json!({"name":name,"kind":kind,"category":category,"resource_shape":shape,"resource_access":access,"semantic_name":semantic_name,"api_kind":api_kind,"binding_index":binding_index,"binding_space":binding_space,"descriptor_count":1})).collect::<Vec<_>>(), "texture_heap": texture_heap, "depth_required": depth_required});
+        let reflection = serde_json::json!({"entry": target.entry_point, "stage": format!("{:?}", target.stage), "profile": target.profile, "parameters": parameters.iter().map(|(name,kind,category,shape,access,semantic_name,api_kind,binding_index,binding_space,_,_,_)| serde_json::json!({"name":name,"kind":kind,"category":category,"resource_shape":shape,"resource_access":access,"semantic_name":semantic_name,"api_kind":api_kind,"binding_index":binding_index,"binding_space":binding_space,"descriptor_count":1})).collect::<Vec<_>>(), "texture_heap": texture_heap, "depth_required": depth_required, "workgroup_size": workgroup_size});
         reflections.push(serde_json::json!({"target": format!("{:?}", target.target), "entry": target.entry_point, "stage": format!("{:?}", target.stage), "profile": target.profile, "reflection": reflection}));
         let blob = linked
             .entry_point_code(
@@ -800,6 +914,43 @@ mod compatibility_tests {
     }
 
     #[test]
+    fn reflected_workgroup_size_validates_each_fixed_dimension() {
+        assert_eq!(
+            reflected_workgroup_size(Stage::Compute, [8, 2, 1], "main").unwrap(),
+            Some([8, 2, 1])
+        );
+        assert!(reflected_workgroup_size(Stage::Compute, [1, 0, 1], "main").is_err());
+        assert!(reflected_workgroup_size(Stage::Compute, [1, u64::MAX, 1], "main").is_err());
+        assert_eq!(
+            reflected_workgroup_size(Stage::Vertex, [0, 0, 0], "main").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn texture_heap_selection_rejects_ambiguity_and_invalid_capacity() {
+        let none = std::iter::empty::<Result<Option<(u8, u32)>, CompilerError>>();
+        assert_eq!(select_texture_heap(none, "main").unwrap(), None);
+        assert_eq!(
+            select_texture_heap([Ok(None), Ok(Some((7_u8, 1024)))], "main").unwrap(),
+            Some((7, 1024))
+        );
+        assert!(select_texture_heap([Ok(Some((1_u8, 1))), Ok(Some((2, 1)))], "main").is_err());
+        assert!(select_texture_heap([Ok(Some((1_u8, 0)))], "main").is_err());
+        assert!(select_texture_heap([Ok(Some((1_u8, 1025)))], "main").is_err());
+        assert!(matches!(
+            select_texture_heap(
+                [
+                    Ok(Some((1_u8, 1))),
+                    Err(CompilerError::InvalidRequest("reflection")),
+                ],
+                "main"
+            ),
+            Err(CompilerError::InvalidRequest("reflection"))
+        ));
+    }
+
+    #[test]
     fn bare_relative_source_searches_the_current_directory() {
         assert_eq!(
             source_search_path(Path::new("shader.slang"))
@@ -815,6 +966,32 @@ mod compatibility_tests {
             source_search_path(Path::new("bad\0dir/shader.slang")),
             Err(CompilerError::InvalidRequest("search path"))
         ));
+    }
+
+    #[test]
+    fn metal_minimum_os_rejects_malformed_deployment_target() {
+        for value in ["macos", "14.foo", "14.3.2", "prefix_14"] {
+            assert!(
+                metal_minimum_os(Some(value), CompatibilityVersion::new(15, 7)).is_err(),
+                "{value} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_minimum_os_prefers_explicit_deployment_target() {
+        assert_eq!(
+            metal_minimum_os(Some("14.3"), CompatibilityVersion::new(26, 2)).unwrap(),
+            CompatibilityVersion::new(14, 3)
+        );
+    }
+
+    #[test]
+    fn metal_minimum_os_uses_host_when_deployment_target_is_absent() {
+        assert_eq!(
+            metal_minimum_os(None, CompatibilityVersion::new(15, 7)).unwrap(),
+            CompatibilityVersion::new(15, 7)
+        );
     }
 
     #[cfg(windows)]

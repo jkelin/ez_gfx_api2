@@ -220,7 +220,12 @@ fn sponza_vertex_reflection_preserves_portable_primitive_identity() -> anyhow::R
         .as_array()
         .context("Sponza reflection metadata has no reflections array")?;
 
-    for target in ["Spirv", "Dxil", "Msl"] {
+    let metal_target = if cfg!(target_vendor = "apple") {
+        "Metallib"
+    } else {
+        "Msl"
+    };
+    for target in ["Spirv", "Dxil", metal_target] {
         let vertex = reflections
             .iter()
             .find(|reflection| reflection["target"] == target && reflection["stage"] == "Vertex")
