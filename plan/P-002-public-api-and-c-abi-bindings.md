@@ -75,7 +75,7 @@ No candidate has measured ABI-call, allocation, submission, or GPU-throughput da
 
 **Selected: `S-P-002-layered-rust-facade-and-ffi`.**
 
-Expose an idiomatic RAII Rust API while preserving the recognizable handle/function contract through a separate `ez-gfx-ffi` package. Keep the core independent of ABI details. Validate every pointer/count, UTF-8 string, handle owner/generation, arithmetic bound, and out-parameter; map typed Rust errors to fixed C statuses; prevent unwinding across the boundary.
+Expose an idiomatic RAII Rust API while preserving the recognizable handle/function contract through a separate `ez-gfx-ffi` package. Keep the core independent of ABI details. Every stable string uses an adjacent explicit byte length: required strings are non-null and nonzero, optional strings are either null+zero or non-null+nonzero, all ranges are capped UTF-8 without embedded NUL, and no terminator scan occurs. Validate every pointer/count, handle owner/generation, arithmetic bound, and out-parameter; map typed Rust errors to fixed C statuses; prevent unwinding across the boundary.
 
 **Rejected:** Rust-only parity is rejected because the source repository contains a maintained C ABI and C# consumers, and removing them is a larger compatibility break than “roughly maintain” supports. It becomes viable only if the user explicitly drops non-Rust compatibility.
 

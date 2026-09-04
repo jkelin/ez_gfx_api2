@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define EZ_GFX_ABI_VERSION 18u
+#define EZ_GFX_ABI_VERSION 19u
 
 #if defined(__clang__)
 #  if __has_attribute(access)
@@ -18,7 +18,7 @@
 #  define EZ_GFX_ACCESS(...)
 #endif
 
-/* ABI string contract: every const char* is UTF-8 and NUL-terminated for the duration of the call. */
+/* ABI string contract: each const char* has an explicit byte length, denotes exactly that many UTF-8 bytes without scanning for a terminator, and rejects embedded NUL. */
 
 #ifdef __cplusplus
 extern "C" {
@@ -326,19 +326,28 @@ typedef struct EzGfxSurfaceDesc {
 
 /**
  * EzGfxShaderDesc:
- * @path (not nullable): UTF-8, NUL-terminated shader path.
- * @vertex_entry (nullable): Optional UTF-8 vertex entry point.
- * @fragment_entry (nullable): Optional UTF-8 fragment entry point.
- * @compute_entry (nullable): Optional UTF-8 compute entry point.
+ * @path (not nullable): Exactly @path_length UTF-8 bytes.
+ * @path_length: Non-zero byte length of @path.
+ * @vertex_entry (nullable): Exactly @vertex_entry_length UTF-8 bytes, or null when its length is zero.
+ * @vertex_entry_length: Byte length of @vertex_entry.
+ * @fragment_entry (nullable): Exactly @fragment_entry_length UTF-8 bytes, or null when its length is zero.
+ * @fragment_entry_length: Byte length of @fragment_entry.
+ * @compute_entry (nullable): Exactly @compute_entry_length UTF-8 bytes, or null when its length is zero.
+ * @compute_entry_length: Byte length of @compute_entry.
  * @kind: Value from EzGfxShaderKind.
  *
- * Shader source and entry-point metadata.
+ * Shader source and entry-point metadata. String ranges are not NUL-terminated
+ * and embedded NUL bytes are invalid.
  */
 typedef struct EzGfxShaderDesc {
     const char * path;
+    size_t path_length;
     const char * vertex_entry;
+    size_t vertex_entry_length;
     const char * fragment_entry;
+    size_t fragment_entry_length;
     const char * compute_entry;
+    size_t compute_entry_length;
     EzGfxShaderKind kind;
 } EzGfxShaderDesc;
 
@@ -356,7 +365,8 @@ typedef struct EzGfxShaderDesc {
  * @address_mode_u: Value from EzGfxTextureAddressMode.
  * @address_mode_v: Value from EzGfxTextureAddressMode.
  * @address_mode_w: Value from EzGfxTextureAddressMode.
- * @debug_label (nullable): Optional UTF-8 debug label.
+ * @debug_label (nullable): Exactly @debug_label_length UTF-8 bytes, or null when its length is zero.
+ * @debug_label_length: Byte length of @debug_label.
  *
  * Texture decoding and sampling metadata.
  */
@@ -374,19 +384,23 @@ typedef struct EzGfxTextureDesc {
     EzGfxTextureAddressMode address_mode_v;
     EzGfxTextureAddressMode address_mode_w;
     const char * debug_label;
+    size_t debug_label_length;
 } EzGfxTextureDesc;
 
 /**
  * EzGfxBinding:
- * @name (not nullable): UTF-8 shader binding name.
+ * @name (not nullable): Exactly @name_length UTF-8 shader-binding-name bytes.
+ * @name_length: Non-zero byte length of @name.
  * @structured: Optional structured buffer handle.
- * @indirect: Optional indirect buffer handle.
+ * @indirect: Optional indirect-command buffer handle.
  * @render_target: Optional render-target handle.
  *
- * Shader resource binding.
+ * Shader resource binding. Names are not NUL-terminated and embedded NUL bytes
+ * are invalid.
  */
 typedef struct EzGfxBinding {
     const char * name;
+    size_t name_length;
     EzGfxStructuredBuffer structured;
     EzGfxIndirectBuffer indirect;
     EzGfxRenderTarget render_target;
@@ -581,7 +595,7 @@ EzGfxResult ez_gfx_begin_render(EzGfxSurface surface, EzGfxContext context);
 /** Begins one non-presented/headless frame; do not call both begin functions for one frame. */
 EzGfxResult ez_gfx_frame_begin(EzGfxContext context);
 /** Creates a bounded indexed-indirect command buffer. */
-EzGfxResult ez_gfx_acquire_indirect(uint32_t capacity, const char *debug_name, EzGfxIndirectBuffer *out_indirect, EzGfxContext context) EZ_GFX_ACCESS(write_only, 3);
+EzGfxResult ez_gfx_acquire_indirect(uint32_t capacity, const char *debug_name, size_t debug_name_length, EzGfxIndirectBuffer *out_indirect, EzGfxContext context) EZ_GFX_ACCESS(read_only, 2, 3) EZ_GFX_ACCESS(write_only, 4);
 /** Writes one standard indexed indirect command. */
 EzGfxResult ez_gfx_indirect_write_draw(EzGfxIndirectBuffer indirect, uint32_t index, const EzGfxDrawIndexedCommand *command, EzGfxContext context) EZ_GFX_ACCESS(read_only, 3);
 /** Sets the submitted prefix of the indirect command buffer. */
@@ -605,13 +619,13 @@ EzGfxResult ez_gfx_finish_render(EzGfxContext context);
 /** Copies a readback only after an enqueued readback's submission completes; capacity zero queries required size. */
 EzGfxResult ez_gfx_frame_readback(uint8_t *data, size_t capacity, size_t *out_size, EzGfxContext context) EZ_GFX_ACCESS(write_only, 1, 2) EZ_GFX_ACCESS(write_only, 3);
 /** Creates a named device-local vertex heap. */
-EzGfxResult ez_gfx_vertex_heap_create(const char * name, uint64_t capacity, uint64_t stride, EzGfxContext context);
+EzGfxResult ez_gfx_vertex_heap_create(const char * name, size_t name_length, uint64_t capacity, uint64_t stride, EzGfxContext context) EZ_GFX_ACCESS(read_only, 1, 2);
 
 /** Destroys a named vertex heap; invalid names are ignored. */
-void ez_gfx_vertex_heap_destroy(const char * name, EzGfxContext context);
+void ez_gfx_vertex_heap_destroy(const char * name, size_t name_length, EzGfxContext context) EZ_GFX_ACCESS(read_only, 1, 2);
 
 /** Creates the context's device-local u32 index heap. */
-EzGfxResult ez_gfx_index_heap_create(uint64_t capacity, const char * debug_name, EzGfxContext context);
+EzGfxResult ez_gfx_index_heap_create(uint64_t capacity, const char * debug_name, size_t debug_name_length, EzGfxContext context) EZ_GFX_ACCESS(read_only, 2, 3);
 
 /** Destroys the context's index heap. */
 void ez_gfx_index_heap_destroy(EzGfxContext context);
@@ -620,10 +634,10 @@ void ez_gfx_index_heap_destroy(EzGfxContext context);
 EzGfxResult ez_gfx_vertex_upload_indices(const void * data, uint32_t count, uint32_t * out_start_index, EzGfxContext context) EZ_GFX_ACCESS(read_only, 1, 2) EZ_GFX_ACCESS(write_only, 3);
 
 /** Uploads vertices through pooled staging and returns the first vertex. */
-EzGfxResult ez_gfx_vertex_upload(const char * heap_name, const void * data, uint32_t element_count, uint64_t element_size, uint32_t * out_start_index, EzGfxContext context) EZ_GFX_ACCESS(read_only, 2, 3) EZ_GFX_ACCESS(write_only, 5);
+EzGfxResult ez_gfx_vertex_upload(const char * heap_name, size_t heap_name_length, const void * data, uint32_t element_count, uint64_t element_size, uint32_t * out_start_index, EzGfxContext context) EZ_GFX_ACCESS(read_only, 1, 2) EZ_GFX_ACCESS(read_only, 3, 4) EZ_GFX_ACCESS(write_only, 6);
 
 /** Acquires a real mapped upload buffer owned by an initialized context. */
-EzGfxResult ez_gfx_structured_acquire(uint32_t element_size, uint32_t element_count, const char * debug_name, EzGfxStructuredBuffer * out_structured, EzGfxContext context) EZ_GFX_ACCESS(write_only, 4);
+EzGfxResult ez_gfx_structured_acquire(uint32_t element_size, uint32_t element_count, const char * debug_name, size_t debug_name_length, EzGfxStructuredBuffer * out_structured, EzGfxContext context) EZ_GFX_ACCESS(read_only, 3, 4) EZ_GFX_ACCESS(write_only, 5);
 
 /** Copies bytes into a mapped buffer and flushes non-coherent memory. */
 EzGfxResult ez_gfx_structured_write(EzGfxStructuredBuffer structured, const void * data, uint64_t data_size, EzGfxContext context) EZ_GFX_ACCESS(read_only, 2, 3);
@@ -651,9 +665,13 @@ EzGfxResult ez_gfx_handle_inspect(uint64_t handle, EzGfxHandleParts * out_parts)
 
 /**
  * ez_gfx_semantic_id:
- * @name (in) (not nullable): UTF-8 name bytes.
- * @length: Number of bytes in name.
+ * @name (in) (not nullable): Exact canonical semantic-name bytes; no terminator is read.
+ * @length: Name byte count in the inclusive range 1..255.
  * @out_id (out caller-allocates): Receives the 16-byte semantic identifier.
+ *
+ * A semantic name is ASCII dot-separated. Every non-empty segment starts with
+ * an ASCII letter and continues with only ASCII letters, digits, or underscores.
+ * Embedded NUL, empty segments, non-ASCII bytes, and all other shapes are invalid.
  *
  * Returns: (transfer none): Returns EzGfxResult_Ok or EzGfxResult_InvalidArgument.
  */

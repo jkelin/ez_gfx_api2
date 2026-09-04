@@ -520,6 +520,11 @@ pub fn validate_rgba8_mips(mips: &[ImageMip<'_>]) -> Result<(), ContractError> {
     if first.width == 0 || first.height == 0 {
         return Err(ContractError::InvalidImage);
     }
+    // Native mip chains contain the terminal 1x1 level once, never repeated levels after it.
+    let max_mips = u32::BITS - first.width.max(first.height).leading_zeros();
+    if mips.len() > max_mips as usize {
+        return Err(ContractError::InvalidImage);
+    }
     let mut width = first.width;
     let mut height = first.height;
     for mip in mips {
@@ -702,7 +707,7 @@ pub struct ResourceState {
 }
 
 impl ResourceState {
-    /// Transfer queues carry no shader stage; attachment and present access require graphics.
+    /// Transfer queues carry no shader stage; index and attachment/present access require graphics.
     /// Creates a resource state after checking queue, stage, and access compatibility.
     ///
     /// # Errors
@@ -713,7 +718,36 @@ impl ResourceState {
         stage: ShaderStage,
         access: ResourceAccess,
     ) -> Result<Self, ContractError> {
-        if queue == QueueKind::Transfer && stage != ShaderStage::None {
+        let transfer_access = matches!(
+            access,
+            ResourceAccess::TransferRead | ResourceAccess::TransferWrite
+        );
+        let shader_access = matches!(
+            access,
+            ResourceAccess::SampledRead
+                | ResourceAccess::StorageRead
+                | ResourceAccess::StorageWrite
+                | ResourceAccess::StorageReadWrite
+                | ResourceAccess::IndirectStorageRead
+                | ResourceAccess::IndirectStorageReadWrite
+        );
+        // Transfer queues cannot execute fixed-function or programmable-stage accesses.
+        if queue == QueueKind::Transfer && (stage != ShaderStage::None || !transfer_access) {
+            return Err(ContractError::InvalidState);
+        }
+        if queue == QueueKind::Compute
+            && matches!(
+                stage,
+                ShaderStage::Vertex | ShaderStage::Fragment | ShaderStage::AllGraphics
+            )
+        {
+            return Err(ContractError::InvalidState);
+        }
+        if shader_access && stage == ShaderStage::None {
+            return Err(ContractError::InvalidState);
+        }
+        // Index buffers lower to graphics-only vertex-input/index-buffer states on every backend.
+        if access == ResourceAccess::IndexRead && queue != QueueKind::Graphics {
             return Err(ContractError::InvalidState);
         }
         if matches!(
@@ -735,11 +769,10 @@ impl ResourceState {
         {
             return Err(ContractError::InvalidState);
         }
-        if matches!(
-            access,
-            ResourceAccess::TransferRead | ResourceAccess::TransferWrite
-        ) && stage != ShaderStage::None
-        {
+        if transfer_access && stage != ShaderStage::None {
+            return Err(ContractError::InvalidState);
+        }
+        if access == ResourceAccess::Present && stage != ShaderStage::None {
             return Err(ContractError::InvalidState);
         }
 

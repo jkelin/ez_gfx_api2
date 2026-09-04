@@ -3,8 +3,6 @@
 
 mod common;
 
-use std::ffi::CString;
-
 use common::TestContext;
 use ez_gfx_compiler::{CompilerError, Target, compile_shader};
 use ez_gfx_ffi::{
@@ -71,13 +69,20 @@ void main(uint3 id: SV_DispatchThreadID) { values[id.x] += 1; }
         EzGfxResult::Ok
     );
 
-    let binding_name = CString::new("values").unwrap();
+    let binding_name = b"values";
     let mut structured = 0;
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_structured_acquire(4, 1, binding_name.as_ptr(), &raw mut structured, context)
+                ez_gfx_structured_acquire(
+                    4,
+                    1,
+                    binding_name.as_ptr(),
+                    binding_name.len(),
+                    &raw mut structured,
+                    context,
+                )
             }
         },
         EzGfxResult::Ok
@@ -99,6 +104,7 @@ void main(uint3 id: SV_DispatchThreadID) { values[id.x] += 1; }
     );
     let binding = EzGfxBinding {
         name: binding_name.as_ptr(),
+        name_length: binding_name.len(),
         structured,
         indirect: 0,
         render_target: 0,

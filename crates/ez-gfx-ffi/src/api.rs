@@ -1,4 +1,4 @@
-use core::ffi::{c_char, c_void};
+use core::ffi::c_void;
 
 /// Opaque 64-bit identifier used for graphics resources across the C ABI.
 pub type EzGfxHandle = u64;
@@ -90,14 +90,22 @@ pub struct EzGfxSurfaceDesc {
 #[repr(C)]
 /// Describes shader source and stage entry points for resource creation.
 pub struct EzGfxShaderDesc {
-    /// Points to a NUL-terminated shader source path.
-    pub path: *const c_char,
-    /// Points to the NUL-terminated vertex-stage entry-point name.
-    pub vertex_entry: *const c_char,
-    /// Points to the NUL-terminated fragment-stage entry-point name.
-    pub fragment_entry: *const c_char,
-    /// Points to the NUL-terminated compute-stage entry-point name.
-    pub compute_entry: *const c_char,
+    /// Points to exactly `path_length` UTF-8 bytes.
+    pub path: *const u8,
+    /// Specifies the nonzero byte length available through `path`.
+    pub path_length: usize,
+    /// Points to exactly `vertex_entry_length` UTF-8 bytes when present.
+    pub vertex_entry: *const u8,
+    /// Specifies the vertex-entry byte length, or zero when absent.
+    pub vertex_entry_length: usize,
+    /// Points to exactly `fragment_entry_length` UTF-8 bytes when present.
+    pub fragment_entry: *const u8,
+    /// Specifies the fragment-entry byte length, or zero when absent.
+    pub fragment_entry_length: usize,
+    /// Points to exactly `compute_entry_length` UTF-8 bytes when present.
+    pub compute_entry: *const u8,
+    /// Specifies the compute-entry byte length, or zero when absent.
+    pub compute_entry_length: usize,
     /// Identifies the shader kind by its C ABI numeric code.
     pub kind: u8,
 }
@@ -129,15 +137,19 @@ pub struct EzGfxTextureDesc {
     pub address_mode_v: u8,
     /// Selects the texture-addressing mode for the W coordinate.
     pub address_mode_w: u8,
-    /// Points to a NUL-terminated diagnostic label for the texture.
-    pub debug_label: *const c_char,
+    /// Points to exactly `debug_label_length` UTF-8 bytes when present.
+    pub debug_label: *const u8,
+    /// Specifies the debug-label byte length, or zero when absent.
+    pub debug_label_length: usize,
 }
 #[derive(Clone, Copy)]
 #[repr(C)]
 /// Associates a named shader binding with buffer and render-target resources.
 pub struct EzGfxBinding {
-    /// Points to the NUL-terminated shader binding name.
-    pub name: *const c_char,
+    /// Points to exactly `name_length` UTF-8 shader-binding-name bytes.
+    pub name: *const u8,
+    /// Specifies the nonzero byte length available through `name`.
+    pub name_length: usize,
     /// Identifies the structured buffer assigned to the binding.
     pub structured: EzGfxStructuredBuffer,
     /// Identifies the indirect-command buffer assigned to the binding.

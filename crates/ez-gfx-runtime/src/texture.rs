@@ -305,6 +305,14 @@ fn decoded(mips: Vec<DecodedMip>) -> Result<DecodedTexture, TextureError> {
     };
     let width = first.width;
     let height = first.height;
+    if width == 0 || height == 0 {
+        return Err(TextureError::TooLarge);
+    }
+    // A native chain contains the terminal 1x1 level once, with no repeated levels after it.
+    let max_mips = u32::BITS - width.max(height).leading_zeros();
+    if mips.len() > max_mips as usize {
+        return Err(TextureError::InvalidData);
+    }
     let mut expected_width = width;
     let mut expected_height = height;
     let mut total = 0_u64;
@@ -323,7 +331,7 @@ fn decoded(mips: Vec<DecodedMip>) -> Result<DecodedTexture, TextureError> {
         expected_width = (expected_width / 2).max(1);
         expected_height = (expected_height / 2).max(1);
     }
-    if width == 0 || height == 0 || total > MAX_TEXTURE_BYTES as u64 {
+    if total > MAX_TEXTURE_BYTES as u64 {
         return Err(TextureError::TooLarge);
     }
     let mip_count = u32::try_from(mips.len()).map_err(|_| TextureError::TooLarge)?;
@@ -608,11 +616,13 @@ impl TextureRegistry {
         {
             return Err(TextureError::InvalidState);
         }
-        entry.state = None;
-        entry.generation = entry
+        // Exhaustion fails before clearing state so callers never receive an error after destruction.
+        let next_generation = entry
             .generation
             .checked_add(1)
             .ok_or(TextureError::GenerationExhausted)?;
+        entry.state = None;
+        entry.generation = next_generation;
         self.free.push(texture.slot);
         Ok(())
     }
@@ -630,11 +640,13 @@ impl TextureRegistry {
         if entry.generation != texture.generation || entry.state.is_none() {
             return Err(TextureError::NotFound);
         }
-        entry.state = None;
-        entry.generation = entry
+        // Exhaustion fails before clearing state or omitting the corresponding unload event.
+        let next_generation = entry
             .generation
             .checked_add(1)
             .ok_or(TextureError::GenerationExhausted)?;
+        entry.state = None;
+        entry.generation = next_generation;
         self.free.push(texture.slot);
         self.events.push(TextureEvent::Unloaded { texture });
         Ok(())
@@ -739,4 +751,33 @@ pub enum TextureError {
     NotFound,
     /// A reused slot can no longer advance its generation counter.
     GenerationExhausted,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generation_exhaustion_does_not_partially_cancel_or_unload() {
+        for cancel in [true, false] {
+            let mut registry = TextureRegistry::new(1, 1).unwrap();
+            registry.slots.push(Slot {
+                generation: u32::MAX,
+                state: Some(TextureState::Allocated),
+            });
+            let texture = TextureId {
+                slot: 0,
+                generation: u32::MAX,
+            };
+
+            let result = if cancel {
+                registry.cancel_upload(texture)
+            } else {
+                registry.unload(texture)
+            };
+
+            assert_eq!(result, Err(TextureError::GenerationExhausted));
+            assert!(registry.state(texture).is_ok());
+        }
+    }
 }

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use ez_gfx_hal::CompletionToken;
+use ez_gfx_hal::{CompletionToken, QueueKind};
 
 const MAX_HEAP_NAME_BYTES: usize = 255;
 
@@ -21,6 +21,7 @@ struct Heap {
     stride: u64,
     used: u64,
     ready: Option<CompletionToken>,
+    latest_reservation: Option<GeometryUpload>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -66,6 +67,7 @@ impl GeometryManager {
                 stride,
                 used: 0,
                 ready: None,
+                latest_reservation: None,
             },
         );
         Ok(())
@@ -88,6 +90,7 @@ impl GeometryManager {
             stride: 4,
             used: 0,
             ready: None,
+            latest_reservation: None,
         });
         Ok(())
     }
@@ -131,11 +134,12 @@ impl GeometryManager {
         )
     }
 
-    /// Rollback is accepted only for the most recent reservation, preventing overlapping reuse.
+    /// Only the immediately latest reservation is rollbackable. A newer reservation permanently
+    /// supersedes the previous candidate, even when the newer reservation is rolled back.
     ///
     /// # Errors
     ///
-    /// Returns `UnknownHeap` if the vertex heap does not exist or `InvalidRollback` if the upload is not its most recent reservation.
+    /// Returns `UnknownHeap` if the vertex heap does not exist or `InvalidRollback` if the upload is not the current rollback candidate.
     pub fn rollback_vertices(
         &mut self,
         name: &str,
@@ -149,11 +153,13 @@ impl GeometryManager {
         )
     }
 
-    /// Reclaims the most recent index reservation.
+    /// Reclaims the immediately latest index reservation.
+    ///
+    /// A successful rollback clears the candidate rather than restoring an older reservation.
     ///
     /// # Errors
     ///
-    /// Returns `UnknownHeap` if the index heap does not exist or `InvalidRollback` if the upload is not its most recent reservation.
+    /// Returns `UnknownHeap` if the index heap does not exist or `InvalidRollback` if the upload is not the current rollback candidate.
     pub fn rollback_indices(&mut self, upload: GeometryUpload) -> Result<(), GeometryError> {
         rollback(
             self.index.as_mut().ok_or(GeometryError::UnknownHeap)?,
@@ -246,19 +252,22 @@ fn reserve(heap: &mut Heap, count: u32) -> Result<GeometryUpload, GeometryError>
         byte_offset: heap.used,
         byte_size,
     };
+    heap.latest_reservation = Some(upload);
     heap.used = end;
     Ok(upload)
 }
 
-/// Reclaims a reservation when it is the heap's most recent allocation.
+/// Reclaims only the immediately latest reservation.
 ///
 /// # Errors
 ///
-/// Returns `InvalidRollback` if the upload end overflows or does not equal the heap's current used size.
+/// Returns `InvalidRollback` unless the upload exactly matches the current rollback candidate.
 fn rollback(heap: &mut Heap, upload: GeometryUpload) -> Result<(), GeometryError> {
-    if upload.byte_offset.checked_add(upload.byte_size) != Some(heap.used) {
+    // Public fields are forgeable, and rollback must not revive an older superseded candidate.
+    if heap.latest_reservation != Some(upload) {
         return Err(GeometryError::InvalidRollback);
     }
+    heap.latest_reservation.take();
     heap.used = upload.byte_offset;
     Ok(())
 }
@@ -379,7 +388,8 @@ impl StagingPool {
     ///
     /// # Errors
     ///
-    /// Returns `InvalidStagingSlot` if the slot does not exist or is not currently checked out.
+    /// Returns `InvalidStagingSlot` if the slot does not exist or is not currently checked out,
+    /// or `WrongQueue` if the token is not from the transfer timeline consumed by checkout.
     pub fn retire(
         &mut self,
         slot: StagingSlot,
@@ -391,6 +401,10 @@ impl StagingPool {
             .ok_or(GeometryError::InvalidStagingSlot)?;
         if !entry.in_use {
             return Err(GeometryError::InvalidStagingSlot);
+        }
+        // `checkout` receives only the transfer timeline value, so other queues cannot gate reuse.
+        if token.queue != QueueKind::Transfer {
+            return Err(GeometryError::WrongQueue);
         }
         entry.in_use = false;
         entry.retirement = Some(token);
@@ -441,6 +455,8 @@ pub enum GeometryError {
     StagingPoolExhausted,
     /// The staging slot index is unknown or the slot is not checked out.
     InvalidStagingSlot,
+    /// A staging retirement token did not belong to the transfer queue.
+    WrongQueue,
     /// The reservation is not the heap's most recent allocation.
     InvalidRollback,
 }

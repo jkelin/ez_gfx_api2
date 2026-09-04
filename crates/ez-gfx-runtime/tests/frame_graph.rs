@@ -666,3 +666,185 @@ fn explicitly_ordered_cross_queue_transients_may_share_a_logical_slot() {
             .any(|wait| wait.source == Some(first))
     );
 }
+
+#[test]
+fn explicit_order_orients_hazards_in_scheduled_direction() {
+    let mut graph = FrameGraph::new();
+    let buffer = graph
+        .add_resource(ResourceDesc::buffer(64, 4, ResourceLifetime::External).unwrap())
+        .unwrap();
+    let reader = graph
+        .add_node(
+            NodeDesc::new("reader", QueueKind::Compute).access(Access::buffer(
+                buffer,
+                BufferRange::new(0, 64).unwrap(),
+                state(
+                    QueueKind::Compute,
+                    ShaderStage::Compute,
+                    ResourceAccess::StorageRead,
+                ),
+            )),
+        )
+        .unwrap();
+    let writer = graph
+        .add_node(
+            NodeDesc::new("writer", QueueKind::Compute).access(Access::buffer(
+                buffer,
+                BufferRange::new(0, 64).unwrap(),
+                state(
+                    QueueKind::Compute,
+                    ShaderStage::Compute,
+                    ResourceAccess::StorageWrite,
+                ),
+            )),
+        )
+        .unwrap();
+    graph.add_dependency(writer, reader).unwrap();
+
+    let compiled = graph.compile().unwrap();
+
+    assert_eq!(compiled.order(), &[writer, reader]);
+    assert_eq!(
+        compiled.hazards(),
+        &[HazardEdge::new(writer, reader, buffer, HazardKind::Raw)]
+    );
+}
+
+#[test]
+fn transient_attachment_load_requires_the_loaded_subresource_to_survive() {
+    let mut graph = FrameGraph::new();
+    let image = graph
+        .add_resource(
+            ResourceDesc::image(
+                16,
+                16,
+                2,
+                1,
+                Format::Rgba8Unorm,
+                1,
+                ResourceLifetime::Transient,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    graph
+        .add_node(
+            NodeDesc::new("other mip", QueueKind::Compute).access(Access::image(
+                image,
+                ImageRange::new(1, 1, 0, 1).unwrap(),
+                state(
+                    QueueKind::Compute,
+                    ShaderStage::Compute,
+                    ResourceAccess::StorageWrite,
+                ),
+            )),
+        )
+        .unwrap();
+    graph
+        .add_node(
+            NodeDesc::new("load mip zero", QueueKind::Graphics)
+                .access(Access::image(
+                    image,
+                    ImageRange::new(0, 1, 0, 1).unwrap(),
+                    state(
+                        QueueKind::Graphics,
+                        ShaderStage::Fragment,
+                        ResourceAccess::ColorAttachmentWrite,
+                    ),
+                ))
+                .pass(
+                    PassInfo::new(
+                        vec![image],
+                        None,
+                        [0, 0, 16, 16],
+                        1,
+                        LoadOp::Load,
+                        StoreOp::Store,
+                    )
+                    .unwrap(),
+                ),
+        )
+        .unwrap();
+
+    assert!(matches!(graph.compile(), Err(GraphError::InvalidPass)));
+}
+
+#[test]
+fn discarded_transient_attachment_cannot_be_loaded_later() {
+    let mut graph = FrameGraph::new();
+    let image = graph
+        .add_resource(
+            ResourceDesc::image(
+                16,
+                16,
+                1,
+                1,
+                Format::Rgba8Unorm,
+                1,
+                ResourceLifetime::Transient,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let attachment = Access::image(
+        image,
+        ImageRange::all(1, 1).unwrap(),
+        state(
+            QueueKind::Graphics,
+            ShaderStage::Fragment,
+            ResourceAccess::ColorAttachmentWrite,
+        ),
+    );
+    graph
+        .add_node(
+            NodeDesc::new("discard", QueueKind::Graphics)
+                .access(attachment)
+                .pass(
+                    PassInfo::new(
+                        vec![image],
+                        None,
+                        [0, 0, 16, 16],
+                        1,
+                        LoadOp::Clear,
+                        StoreOp::Discard,
+                    )
+                    .unwrap(),
+                ),
+        )
+        .unwrap();
+    graph
+        .add_node(
+            NodeDesc::new("load discarded", QueueKind::Graphics)
+                .access(attachment)
+                .pass(
+                    PassInfo::new(
+                        vec![image],
+                        None,
+                        [0, 0, 16, 16],
+                        1,
+                        LoadOp::Load,
+                        StoreOp::Store,
+                    )
+                    .unwrap(),
+                ),
+        )
+        .unwrap();
+
+    assert!(matches!(graph.compile(), Err(GraphError::InvalidPass)));
+}
+
+#[test]
+fn image_descriptions_reject_mips_beyond_the_terminal_texel() {
+    assert!(matches!(
+        ResourceDesc::image(
+            1,
+            1,
+            2,
+            1,
+            Format::Rgba8Unorm,
+            1,
+            ResourceLifetime::Transient,
+        ),
+        Err(GraphError::InvalidResource)
+    ));
+}

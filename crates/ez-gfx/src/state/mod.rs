@@ -196,8 +196,16 @@ struct ContextState {
 }
 
 type ContextHandleArena = GenerationalArena<()>;
-static CONTEXT_HANDLES: LazyLock<Mutex<ContextHandleArena>> =
-    LazyLock::new(|| Mutex::new(GenerationalArena::new()));
+static CONTEXT_HANDLES: LazyLock<Mutex<ContextHandleArena>> = LazyLock::new(|| {
+    // Context generations and slots must retire before exceeding their packed 20-bit fields.
+    Mutex::new(
+        GenerationalArena::with_limits(
+            PackedHandle::MAX_CONTEXT_SLOT,
+            PackedHandle::MAX_CONTEXT_GENERATION,
+        )
+        .expect("packed context limits have a nonzero generation"),
+    )
+});
 struct ThreadContexts {
     states: HashMap<LocalHandle, ContextState>,
 }

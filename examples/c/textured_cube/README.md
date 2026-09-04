@@ -1,6 +1,6 @@
 # C textured cube
 
-Minimal ABI v18 example: static cube positions, normals, indices, and one primitive record are uploaded through `include/ez_gfx_api.h`. Compute writes the indexed-indirect command; graphics consumes it and presents a normal-colored cube.
+Minimal ABI v19 example: static cube positions, normals, indices, and one primitive record are uploaded through `include/ez_gfx_api.h`. Compute writes the indexed-indirect command; graphics consumes it and presents a normal-colored cube.
 
 ## Build
 

@@ -1,7 +1,7 @@
 //! Native Metal rendering and presentation tests through the C ABI.
 #![cfg(target_vendor = "apple")]
 
-use std::{ffi::CString, path::Path};
+use std::path::Path;
 
 use ez_gfx_artifact::{
     AppleArchitecture, ApplePlatform, Artifact, CompatibilityVersion, MetalCompatibility,
@@ -67,6 +67,7 @@ fn metal_texture_readback_submits_without_a_surface() {
         address_mode_v: 0,
         address_mode_w: 0,
         debug_label: core::ptr::null(),
+        debug_label_length: 0,
     };
     let expected = [1_u8, 2, 3, 4, 5, 6, 7, 8];
     let mut context = 0;
@@ -337,12 +338,17 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
         EzGfxResult::Ok
     );
 
-    let label = CString::new("metal-present").unwrap();
+    let label = b"metal-present";
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_index_heap_create(3 * size_of::<u32>() as u64, label.as_ptr(), context)
+                ez_gfx_index_heap_create(
+                    3 * size_of::<u32>() as u64,
+                    label.as_ptr(),
+                    label.len(),
+                    context,
+                )
             }
         },
         EzGfxResult::Ok
@@ -367,7 +373,9 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_acquire_indirect(1, label.as_ptr(), &raw mut indirect, context) }
+            unsafe {
+                ez_gfx_acquire_indirect(1, label.as_ptr(), label.len(), &raw mut indirect, context)
+            }
         },
         EzGfxResult::Ok
     );

@@ -9,7 +9,7 @@ The six numbered directories are standalone development programs that own their 
 - [05 Helmet](05_helmet/README.md)
 - [06 Sponza KTX2](06_sponza_ktx2/README.md)
 
-The Win32 [`C textured cube`](c/textured_cube/README.md) is a separate ABI v18 flow. CMake compiles its Slang source with SPIR-V, DXIL, and Metal targets in development mode, links `ez-gfx-ffi`, and copies the generated artifact beside the executable. CI builds it on Windows and executes Vulkan with SwiftShader; the hosted DX12 row is compile-only.
+The Win32 [`C textured cube`](c/textured_cube/README.md) is a separate ABI v19 flow. CMake compiles its Slang source with SPIR-V, DXIL, and Metal targets in development mode, links `ez-gfx-ffi`, and copies the generated artifact beside the executable. CI builds it on Windows and executes Vulkan with SwiftShader; the hosted DX12 row is compile-only.
 
 | Binary | Complete renderer | Owned inputs |
 | --- | --- | --- |

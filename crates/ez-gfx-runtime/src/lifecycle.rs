@@ -61,7 +61,12 @@ impl ContextIdentity {
             owner,
             creator: thread::current().id(),
             health: AtomicU8::new(ContextHealth::Healthy as u8),
-            resources: GenerationalArena::new(),
+            // Child generations retire at the 12-bit wire limit so no free slot can poison reuse.
+            resources: GenerationalArena::with_limits(
+                PackedHandle::MAX_CHILD_SLOT,
+                PackedHandle::MAX_CHILD_GENERATION,
+            )
+            .map_err(LifecycleError::Handle)?,
         })
     }
 

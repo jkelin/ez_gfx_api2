@@ -76,3 +76,15 @@ fn context_is_affine_to_its_creation_thread() {
     });
     assert_eq!(identity.check_thread_and_health(), Ok(()));
 }
+
+#[test]
+fn exhausted_child_generation_does_not_block_other_resource_slots() {
+    let mut identity = ContextIdentity::new(LocalHandle::new(0, 1).unwrap()).unwrap();
+
+    for _ in 0..0xfff {
+        let resource = identity.insert(ResourceKind::Texture).unwrap();
+        identity.remove(resource, ResourceKind::Texture).unwrap();
+    }
+
+    assert!(identity.insert(ResourceKind::Texture).is_ok());
+}

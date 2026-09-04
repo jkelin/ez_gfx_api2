@@ -118,8 +118,10 @@ impl Region {
 ///
 /// # Errors
 ///
-/// Returns [`AssetError::InvalidMip`], [`AssetError::Overflow`], or
-/// [`AssetError::InvalidPayload`] when the mip or payload is invalid.
+/// Returns [`AssetError::InvalidDimensions`] for zero dimensions,
+/// [`AssetError::InvalidMip`] for an invalid mip, [`AssetError::Overflow`] for
+/// arithmetic overflow, or [`AssetError::InvalidPayload`] when the payload is
+/// invalid.
 pub fn validate_block_payload(
     format: BlockFormat,
     width: u32,
@@ -127,8 +129,14 @@ pub fn validate_block_payload(
     mip: u32,
     payload: &[u8],
 ) -> Result<(), AssetError> {
-    if mip >= 32 {
-        return Err(AssetError::InvalidMip);
+    // Zero dimensions do not describe a real mip; rejecting them prevents the
+    // `max(1)` normalization below from accepting fabricated 1x1 payloads.
+    if width == 0 || height == 0 || mip >= 32 {
+        return if width == 0 || height == 0 {
+            Err(AssetError::InvalidDimensions)
+        } else {
+            Err(AssetError::InvalidMip)
+        };
     }
     let w = width.checked_shr(mip).ok_or(AssetError::InvalidMip)?.max(1);
     let h = height

@@ -1,9 +1,13 @@
 //! C ABI for the ez-gfx runtime.
 
 mod api;
+mod bounded_string;
 mod identity;
 
 pub use api::*;
+use bounded_string::{
+    read_bounded_string, validate_bounded_string, validate_optional_bounded_string,
+};
 pub use identity::*;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -15,8 +19,8 @@ use ez_gfx::{
     SurfacePlatform, TextureHandle, TextureSamplerDesc, TextureSource,
 };
 
-/// Identifies C ABI revision 18 for compatibility checks.
-pub const EZ_GFX_ABI_VERSION: u32 = 18;
+/// Identifies C ABI revision 19 for compatibility checks.
+pub const EZ_GFX_ABI_VERSION: u32 = 19;
 /// Caps any caller-provided byte range at 16 MiB.
 pub const EZ_GFX_MAX_BOUNDARY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -276,7 +280,7 @@ pub extern "C" fn ez_gfx_shader_destroy(shader: EzGfxShader, context: EzGfxConte
 ///
 /// # Safety
 ///
-/// Non-null `data` must be readable for `data_size` bytes, non-null `desc` readable for one aligned descriptor, and non-null `out_texture` writable for one aligned handle. A non-null descriptor label must reference a NUL-terminated string for this call.
+/// Non-null `data` must be readable for `data_size` bytes, non-null `desc` readable for one aligned descriptor, and non-null `out_texture` writable for one aligned handle. The optional descriptor label must be either null with zero length or non-null and readable for its exact nonzero UTF-8 byte length without embedded NUL bytes.
 pub unsafe extern "C" fn ez_gfx_texture_load(
     data: *const u8,
     data_size: usize,
@@ -301,7 +305,7 @@ pub unsafe extern "C" fn ez_gfx_texture_load(
             || desc.mag_filter > 1
             || !desc.max_anisotropy.is_finite()
             || !(1.0..=16.0).contains(&desc.max_anisotropy)
-            || (!desc.debug_label.is_null() && read_c_string(desc.debug_label).is_err())
+            || validate_optional_bounded_string(desc.debug_label, desc.debug_label_length).is_err()
         {
             return EzGfxResult::InvalidArgument;
         }
@@ -454,15 +458,17 @@ pub extern "C" fn ez_gfx_frame_begin(context: EzGfxContext) -> EzGfxResult {
 ///
 /// # Safety
 ///
-/// A non-null `debug_name` must reference a NUL-terminated string, and non-null `out_indirect` one writable, aligned handle, for this call.
+/// `debug_name` must be non-null and readable for exactly `debug_name_length` bytes; the range must be non-empty UTF-8 without embedded NUL bytes. Non-null `out_indirect` must address one writable, aligned handle for this call.
 pub unsafe extern "C" fn ez_gfx_acquire_indirect(
     capacity: u32,
-    debug_name: *const std::ffi::c_char,
+    debug_name: *const u8,
+    debug_name_length: usize,
     out_indirect: *mut EzGfxIndirectBuffer,
     context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
-        if out_indirect.is_null() || read_c_string(debug_name).is_err() {
+        if out_indirect.is_null() || validate_bounded_string(debug_name, debug_name_length).is_err()
+        {
             return EzGfxResult::InvalidArgument;
         }
         let context = try_handle!(ContextHandle, context);
@@ -546,7 +552,7 @@ pub extern "C" fn ez_gfx_indirect_release(indirect: EzGfxIndirectBuffer, context
 ///
 /// # Safety
 ///
-/// Non-null `bindings` must be readable for `binding_count` aligned entries, including valid non-null NUL-terminated binding names. Non-null `dynamic_state` must address one readable aligned value, and non-null `push_constants` must be readable for `push_constant_size` bytes.
+/// Non-null `bindings` must be readable for `binding_count` aligned entries; every binding name must be a non-null, non-empty exact UTF-8 byte range without embedded NUL bytes. Non-null `dynamic_state` must address one readable aligned value, and non-null `push_constants` must be readable for `push_constant_size` bytes.
 pub unsafe extern "C" fn ez_gfx_render_add_vertex_pipeline(
     shader: EzGfxShader,
     indirect: EzGfxIndirectBuffer,
@@ -609,7 +615,7 @@ pub unsafe extern "C" fn ez_gfx_render_add_vertex_pipeline(
 ///
 /// # Safety
 ///
-/// Non-null `bindings` must be readable for `binding_count` aligned entries, including valid non-null NUL-terminated binding names. Non-null `push_constants` must be readable for `push_constant_size` bytes.
+/// Non-null `bindings` must be readable for `binding_count` aligned entries; every binding name must be a non-null, non-empty exact UTF-8 byte range without embedded NUL bytes. Non-null `push_constants` must be readable for `push_constant_size` bytes.
 pub unsafe extern "C" fn ez_gfx_render_add_compute_pipeline(
     shader: EzGfxShader,
     dispatch_x: u32,
@@ -894,15 +900,16 @@ pub extern "C" fn ez_gfx_surface_destroy(surface: EzGfxSurface, context: EzGfxCo
 ///
 /// # Safety
 ///
-/// A non-null `name` must reference a NUL-terminated string for this call.
+/// `name` must be non-null and readable for exactly `name_length` bytes; the range must be non-empty UTF-8 without embedded NUL bytes.
 pub unsafe extern "C" fn ez_gfx_vertex_heap_create(
-    name: *const std::ffi::c_char,
+    name: *const u8,
+    name_length: usize,
     capacity: u64,
     stride: u64,
     context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
-        let name = match read_c_string(name) {
+        let name = match read_bounded_string(name, name_length) {
             Ok(name) => name,
             Err(status) => return status,
         };
@@ -916,13 +923,17 @@ pub unsafe extern "C" fn ez_gfx_vertex_heap_create(
 ///
 /// # Safety
 ///
-/// A non-null `name` must reference a NUL-terminated string for this call.
+/// `name` must be non-null and readable for exactly `name_length` bytes; the range must be non-empty UTF-8 without embedded NUL bytes.
 pub unsafe extern "C" fn ez_gfx_vertex_heap_destroy(
-    name: *const std::ffi::c_char,
+    name: *const u8,
+    name_length: usize,
     context: EzGfxContext,
 ) {
     catch_void(|| {
-        if let (Ok(name), Ok(context)) = (read_c_string(name), ContextHandle::from_raw(context)) {
+        if let (Ok(name), Ok(context)) = (
+            read_bounded_string(name, name_length),
+            ContextHandle::from_raw(context),
+        ) {
             ez_gfx::destroy_vertex_heap(context, &name);
         }
     });
@@ -933,14 +944,15 @@ pub unsafe extern "C" fn ez_gfx_vertex_heap_destroy(
 ///
 /// # Safety
 ///
-/// A non-null `debug_name` must reference a NUL-terminated string for this call.
+/// `debug_name` must be non-null and readable for exactly `debug_name_length` bytes; the range must be non-empty UTF-8 without embedded NUL bytes.
 pub unsafe extern "C" fn ez_gfx_index_heap_create(
     capacity: u64,
-    debug_name: *const std::ffi::c_char,
+    debug_name: *const u8,
+    debug_name_length: usize,
     context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
-        if read_c_string(debug_name).is_err() {
+        if validate_bounded_string(debug_name, debug_name_length).is_err() {
             return EzGfxResult::InvalidArgument;
         }
         let context = try_handle!(ContextHandle, context);
@@ -997,9 +1009,10 @@ pub unsafe extern "C" fn ez_gfx_vertex_upload_indices(
 ///
 /// # Safety
 ///
-/// A non-null `heap_name` must reference a NUL-terminated string, non-null `data` must be readable for `element_count * element_size` bytes, and non-null `out_start_index` must address one writable, aligned `u32`, for this call.
+/// `heap_name` must be non-null and readable for exactly `heap_name_length` non-empty UTF-8 bytes without embedded NUL bytes. Non-null `data` must be readable for `element_count * element_size` bytes, and non-null `out_start_index` must address one writable, aligned `u32`, for this call.
 pub unsafe extern "C" fn ez_gfx_vertex_upload(
-    heap_name: *const std::ffi::c_char,
+    heap_name: *const u8,
+    heap_name_length: usize,
     data: *const std::ffi::c_void,
     element_count: u32,
     element_size: u64,
@@ -1007,7 +1020,7 @@ pub unsafe extern "C" fn ez_gfx_vertex_upload(
     context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
-        let name = match read_c_string(heap_name) {
+        let name = match read_bounded_string(heap_name, heap_name_length) {
             Ok(name) => name,
             Err(status) => return status,
         };
@@ -1045,27 +1058,20 @@ pub unsafe extern "C" fn ez_gfx_vertex_upload(
 ///
 /// # Safety
 ///
-/// A non-null `debug_name` must reference a NUL-terminated string, and non-null `out_structured` must address one writable, aligned handle, for this call.
+/// `debug_name` must be non-null and readable for exactly `debug_name_length` non-empty UTF-8 bytes without embedded NUL bytes. Non-null `out_structured` must address one writable, aligned handle for this call.
 pub unsafe extern "C" fn ez_gfx_structured_acquire(
     element_size: u32,
     element_count: u32,
-    debug_name: *const std::ffi::c_char,
+    debug_name: *const u8,
+    debug_name_length: usize,
     out_structured: *mut EzGfxStructuredBuffer,
     context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         if element_size == 0
             || element_count == 0
-            || debug_name.is_null()
             || out_structured.is_null()
-        {
-            return EzGfxResult::InvalidArgument;
-        }
-        // SAFETY: ABI requires a readable NUL-terminated string for the duration of the call.
-        let name = unsafe { std::ffi::CStr::from_ptr(debug_name) };
-        if name.to_bytes().is_empty()
-            || name.to_bytes().len() > EZ_GFX_MAX_BOUNDARY_BYTES
-            || name.to_str().is_err()
+            || validate_bounded_string(debug_name, debug_name_length).is_err()
         {
             return EzGfxResult::InvalidArgument;
         }
@@ -1132,19 +1138,6 @@ pub extern "C" fn ez_gfx_structured_release(
 fn catch_status(operation: impl FnOnce() -> EzGfxResult) -> EzGfxResult {
     catch_unwind(AssertUnwindSafe(operation)).unwrap_or(EzGfxResult::NativeFailure)
 }
-fn read_c_string(pointer: *const std::ffi::c_char) -> Result<String, EzGfxResult> {
-    if pointer.is_null() {
-        return Err(EzGfxResult::InvalidArgument);
-    }
-    // SAFETY: every C string boundary requires readable NUL-terminated storage for the call.
-    let bytes = unsafe { std::ffi::CStr::from_ptr(pointer) }.to_bytes();
-    if bytes.is_empty() || bytes.len() > EZ_GFX_MAX_BOUNDARY_BYTES {
-        return Err(EzGfxResult::InvalidArgument);
-    }
-    core::str::from_utf8(bytes)
-        .map(str::to_owned)
-        .map_err(|_| EzGfxResult::InvalidArgument)
-}
 
 /// Binding arrays are bounded; every item requires one UTF-8 name and exactly one non-null typed handle.
 fn read_bindings(
@@ -1161,7 +1154,7 @@ fn read_bindings(
     let raw = unsafe { core::slice::from_raw_parts(pointer, count as usize) };
     let mut bindings = Vec::with_capacity(raw.len());
     for binding in raw {
-        let name = read_c_string(binding.name)?;
+        let name = read_bounded_string(binding.name, binding.name_length)?;
         let resource = match (
             binding.structured != 0,
             binding.indirect != 0,

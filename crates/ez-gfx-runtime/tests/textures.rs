@@ -98,6 +98,60 @@ fn generated_mips_box_filter_odd_edges_and_stop_at_one_pixel() {
 }
 
 #[test]
+fn mip_validation_accepts_a_complete_terminal_chain() {
+    let complete = DecodedTexture {
+        width: 4,
+        height: 2,
+        mip_count: 3,
+        mips: vec![
+            DecodedMip {
+                width: 4,
+                height: 2,
+                rgba8: vec![0; 32],
+            },
+            DecodedMip {
+                width: 2,
+                height: 1,
+                rgba8: vec![0; 8],
+            },
+            DecodedMip {
+                width: 1,
+                height: 1,
+                rgba8: vec![0; 4],
+            },
+        ],
+    };
+
+    assert_eq!(generate_mips(complete.clone()), Ok(complete));
+}
+
+#[test]
+fn mip_validation_rejects_levels_after_the_terminal_texel() {
+    let repeated_terminal = DecodedTexture {
+        width: 1,
+        height: 1,
+        mip_count: 2,
+        mips: vec![
+            DecodedMip {
+                width: 1,
+                height: 1,
+                rgba8: vec![0; 4],
+            },
+            DecodedMip {
+                width: 1,
+                height: 1,
+                rgba8: vec![0; 4],
+            },
+        ],
+    };
+
+    assert_eq!(
+        generate_mips(repeated_terminal),
+        Err(TextureError::InvalidData)
+    );
+}
+
+#[test]
 fn malformed_ktx2_is_rejected_without_panics() {
     assert_eq!(
         TextureDecoder::decode(TextureSource::Ktx2, b"bad"),

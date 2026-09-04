@@ -9,8 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if EZ_GFX_ABI_VERSION != 18u
-#error "textured_cube requires ez-gfx ABI v18"
+#if EZ_GFX_ABI_VERSION != 19u
+#error "textured_cube requires ez-gfx ABI v19"
 #endif
 
 #define WIDTH 640u
@@ -332,24 +332,24 @@ int main(int argc, char **argv) {
     if (!checked(ez_gfx_surface_create(&surface_desc, &surface, context), "create surface")) goto cleanup;
     if (!checked(ez_gfx_context_init_device(surface, context), "initialize surface device")) goto cleanup;
     if (!checked(ez_gfx_surface_resize(surface, WIDTH, HEIGHT, context), "resize surface")) goto cleanup;
-    if (!checked(ez_gfx_index_heap_create(sizeof(INDICES), "cube indices", context), "create index heap")) goto cleanup;
+    if (!checked(ez_gfx_index_heap_create(sizeof(INDICES), "cube indices", sizeof("cube indices") - 1, context), "create index heap")) goto cleanup;
     if (!checked(ez_gfx_vertex_upload_indices(INDICES, 36, &first_index, context), "upload indices")) goto cleanup;
-    if (!checked(ez_gfx_structured_acquire(sizeof(Vec4), 24, "positions", &positions, context), "acquire positions")) goto cleanup;
+    if (!checked(ez_gfx_structured_acquire(sizeof(Vec4), 24, "positions", sizeof("positions") - 1, &positions, context), "acquire positions")) goto cleanup;
     if (!checked(ez_gfx_structured_write(positions, POSITIONS, sizeof(POSITIONS), context), "write positions")) goto cleanup;
-    if (!checked(ez_gfx_structured_acquire(sizeof(Vec4), 24, "normals", &normals, context), "acquire normals")) goto cleanup;
+    if (!checked(ez_gfx_structured_acquire(sizeof(Vec4), 24, "normals", sizeof("normals") - 1, &normals, context), "acquire normals")) goto cleanup;
     if (!checked(ez_gfx_structured_write(normals, NORMALS, sizeof(NORMALS), context), "write normals")) goto cleanup;
 
     primitive = (Primitive){first_index, 36, 0, 0};
-    if (!checked(ez_gfx_structured_acquire(sizeof(Primitive), 1, "primitives", &primitives, context), "acquire primitives")) goto cleanup;
+    if (!checked(ez_gfx_structured_acquire(sizeof(Primitive), 1, "primitives", sizeof("primitives") - 1, &primitives, context), "acquire primitives")) goto cleanup;
     if (!checked(ez_gfx_structured_write(primitives, &primitive, sizeof(primitive), context), "write primitives")) goto cleanup;
-    if (!checked(ez_gfx_acquire_indirect(1, "draw commands", &indirect, context), "acquire indirect")) goto cleanup;
+    if (!checked(ez_gfx_acquire_indirect(1, "draw commands", sizeof("draw commands") - 1, &indirect, context), "acquire indirect")) goto cleanup;
     if (!checked(ez_gfx_indirect_set_draw_count(indirect, 1, context), "set indirect count")) goto cleanup;
     if (!checked(ez_gfx_shader_load_artifact(artifact, artifact_size, &shader, context), "load shader artifact")) goto cleanup;
 
-    bindings[0] = (EzGfxBinding){"positions", positions, 0, 0};
-    bindings[1] = (EzGfxBinding){"normals", normals, 0, 0};
-    bindings[2] = (EzGfxBinding){"primitives", primitives, 0, 0};
-    bindings[3] = (EzGfxBinding){"draw_commands", 0, indirect, 0};
+    bindings[0] = (EzGfxBinding){"positions", sizeof("positions") - 1, positions, 0, 0};
+    bindings[1] = (EzGfxBinding){"normals", sizeof("normals") - 1, normals, 0, 0};
+    bindings[2] = (EzGfxBinding){"primitives", sizeof("primitives") - 1, primitives, 0, 0};
+    bindings[3] = (EzGfxBinding){"draw_commands", sizeof("draw_commands") - 1, 0, indirect, 0};
     dynamic_state = (EzGfxDynamicState){EzGfxCullMode_None, EzGfxFrontFace_CounterClockwise,
         EzGfxPrimitiveType_TriangleList, EzGfxBlendMode_None};
 

@@ -94,6 +94,15 @@ pub enum HandleParts {
 pub struct PackedHandle(u64);
 
 impl PackedHandle {
+    /// Largest local slot index representable by a packed context handle.
+    pub const MAX_CONTEXT_SLOT: u32 = (1_u32 << CONTEXT_SLOT_BITS) - 2;
+    /// Largest context generation representable by a packed handle.
+    pub const MAX_CONTEXT_GENERATION: u32 = (1_u32 << CONTEXT_GENERATION_BITS) - 1;
+    /// Largest local slot index representable by a packed child handle.
+    pub const MAX_CHILD_SLOT: u32 = (1_u32 << CHILD_SLOT_BITS) - 2;
+    /// Largest child generation representable by a packed handle.
+    pub const MAX_CHILD_GENERATION: u32 = (1_u32 << CHILD_GENERATION_BITS) - 1;
+
     /// Context slot values are stored as slot+1; the largest bit-pattern is therefore not a slot.
     ///
     /// # Errors
@@ -306,6 +315,8 @@ pub struct GenerationalArena<T> {
     slots: Vec<Slot<T>>,
     free: Vec<u32>,
     live: usize,
+    max_slot: u32,
+    max_generation: u32,
 }
 
 impl<T> Default for GenerationalArena<T> {
@@ -321,7 +332,28 @@ impl<T> GenerationalArena<T> {
             slots: Vec::new(),
             free: Vec::new(),
             live: 0,
+            max_slot: u32::MAX,
+            max_generation: u32::MAX,
         }
+    }
+
+    /// Creates an empty arena whose reusable identities fit a narrower external representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandleError::ZeroGeneration`] when `max_generation` is zero.
+    pub const fn with_limits(max_slot: u32, max_generation: u32) -> Result<Self, HandleError> {
+        if max_generation == 0 {
+            return Err(HandleError::ZeroGeneration);
+        }
+
+        Ok(Self {
+            slots: Vec::new(),
+            free: Vec::new(),
+            live: 0,
+            max_slot,
+            max_generation,
+        })
     }
 
     /// Retired exhausted slots are skipped; growth fails before a slot index exceeds `u32`.
@@ -343,6 +375,9 @@ impl<T> GenerationalArena<T> {
 
         let slot_index =
             u32::try_from(self.slots.len()).map_err(|_| HandleError::CapacityExhausted)?;
+        if slot_index > self.max_slot {
+            return Err(HandleError::CapacityExhausted);
+        }
         self.slots.push(Slot {
             generation: 1,
             value: Some(value),
@@ -400,7 +435,7 @@ impl<T> GenerationalArena<T> {
         }
         let value = slot.value.take().ok_or(HandleError::Stale)?;
         self.live -= 1;
-        advance_slot(slot, handle.slot, &mut self.free);
+        advance_slot(slot, handle.slot, self.max_generation, &mut self.free);
         Ok(value)
     }
 
@@ -418,6 +453,7 @@ impl<T> GenerationalArena<T> {
                 advance_slot(
                     slot,
                     u32::try_from(index).map_err(|_| HandleError::SlotOutOfRange)?,
+                    self.max_generation,
                     &mut self.free,
                 );
             } else if !slot.retired {
@@ -439,14 +475,14 @@ impl<T> GenerationalArena<T> {
     }
 }
 
-fn advance_slot<T>(slot: &mut Slot<T>, index: u32, free: &mut Vec<u32>) {
-    match slot.generation.checked_add(1) {
-        Some(generation) => {
-            slot.generation = generation;
-            free.push(index);
-        }
-        None => slot.retired = true,
+fn advance_slot<T>(slot: &mut Slot<T>, index: u32, max_generation: u32, free: &mut Vec<u32>) {
+    // A narrower wire generation retires at its own maximum rather than producing unencodable IDs.
+    if slot.generation >= max_generation {
+        slot.retired = true;
+        return;
     }
+    slot.generation += 1;
+    free.push(index);
 }
 
 #[cfg(test)]
@@ -463,6 +499,8 @@ mod tests {
             }],
             free: Vec::new(),
             live: 1,
+            max_slot: u32::MAX,
+            max_generation: u32::MAX,
         };
         let exhausted = LocalHandle::new(0, u32::MAX).unwrap();
         assert_eq!(arena.remove(exhausted).unwrap(), 1);

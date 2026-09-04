@@ -286,7 +286,7 @@ mod tests {
     }
 
     const VALID_HEADER: &str = r"
-        #define EZ_GFX_ABI_VERSION 18u
+        #define EZ_GFX_ABI_VERSION 19u
         /* ez_gfx_documented_only() */
         uint32_t ez_gfx_one(void);
         uint32_t ez_gfx_two(void);
@@ -294,7 +294,7 @@ mod tests {
 
     fn bindings(functions: &str) -> String {
         format!(
-            r#"<ez-gfx-bindings abi-version="18">
+            r#"<ez-gfx-bindings abi-version="19">
                 <handles></handles><enums></enums><structs></structs>
                 <functions>{functions}</functions>
             </ez-gfx-bindings>"#
@@ -334,7 +334,7 @@ mod tests {
             "void ez_gfx_bad-name(void);",
             "/* no declarations */",
         ] {
-            let header = format!("#define EZ_GFX_ABI_VERSION 18u\n{declaration}");
+            let header = format!("#define EZ_GFX_ABI_VERSION 19u\n{declaration}");
             assert!(validated_contract(&header, &valid_bindings()).is_err());
         }
     }
@@ -462,7 +462,7 @@ mod tests {
     }
 
     const CONTRACT_HEADER: &str = r"
-        #define EZ_GFX_ABI_VERSION 18u
+        #define EZ_GFX_ABI_VERSION 19u
         #define EZ_GFX_ACCESS(...)
         typedef uint64_t EzGfxContext;
         typedef uint8_t EzGfxResult;
@@ -488,7 +488,7 @@ mod tests {
     ";
 
     const CONTRACT_BINDINGS: &str = r#"
-        <ez-gfx-bindings abi-version="18">
+        <ez-gfx-bindings abi-version="19">
           <handles><handle name="EzGfxContext"/></handles>
           <enums>
             <enum name="EzGfxResult" underlying="uint8_t">
@@ -558,7 +558,7 @@ mod tests {
     fn declaration_parity_reports_version_signature_handle_and_struct_drift() {
         for (header, bindings, expected) in [
             (
-                CONTRACT_HEADER.replace("18u", "19u"),
+                CONTRACT_HEADER.replace("19u", "20u"),
                 CONTRACT_BINDINGS.to_owned(),
                 "ABI version",
             ),

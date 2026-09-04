@@ -37,4 +37,4 @@ Operations that produce a handle or value, including acquisitions and indexed up
 | [04 Dear ImGui](https://github.com/jkelin/ez_gfx_api2/blob/main/examples/04_imgui/README.md) | Dynamic UI buffers and per-command clipping |
 | [05 Helmet](https://github.com/jkelin/ez_gfx_api2/blob/main/examples/05_helmet/README.md) | GLB geometry and depth-tested rendering |
 | [06 Sponza KTX2](https://github.com/jkelin/ez_gfx_api2/blob/main/examples/06_sponza_ktx2/README.md) | KTX2 materials and compute-to-graphics flow |
-| [C textured cube](../../examples/c/textured_cube/README.md) | ABI v18 compute-written indexed-indirect cube on Win32 |
+| [C textured cube](../../examples/c/textured_cube/README.md) | ABI v19 compute-written indexed-indirect cube on Win32 |

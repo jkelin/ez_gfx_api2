@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<ez-gfx-bindings version="1" abi-version="18" library="ez_gfx_ffi">
+<ez-gfx-bindings version="1" abi-version="19" library="ez_gfx_ffi">
   <description>Public EzGfx C ABI. This file is manually maintained; generated headers and managed bindings are derived from it.</description>
   <handles>
     <handle name="EzGfxContext" doc="Opaque packed u64 context handle (slot+1/generation in bits 0-39)." />
@@ -123,11 +123,15 @@
       <field name="height" type="uint32_t" validation="greater-than-zero" doc="Initial framebuffer height." />
       <field name="cache_presented_snapshots" type="uint8_t" doc="Non-zero caches presented images." />
     </struct>
-    <struct name="EzGfxShaderDesc" doc="Shader source and entry-point metadata.">
-      <field name="path" type="const char *" nullable="false" doc="UTF-8, NUL-terminated shader path." />
-      <field name="vertex_entry" type="const char *" nullable="true" doc="Optional UTF-8 vertex entry point." />
-      <field name="fragment_entry" type="const char *" nullable="true" doc="Optional UTF-8 fragment entry point." />
-      <field name="compute_entry" type="const char *" nullable="true" doc="Optional UTF-8 compute entry point." />
+    <struct name="EzGfxShaderDesc" doc="Shader source and stage entry-point metadata.">
+      <field name="path" type="const char *" nullable="false" doc="Exactly path_length UTF-8 bytes; no NUL terminator is required." />
+      <field name="path_length" type="size_t" validation="greater-than-zero-at-most-boundary-limit" doc="Path byte length." />
+      <field name="vertex_entry" type="const char *" nullable="true" doc="Optional exact UTF-8 byte range paired with vertex_entry_length." />
+      <field name="vertex_entry_length" type="size_t" validation="zero-or-at-most-boundary-limit" doc="Vertex-entry byte length." />
+      <field name="fragment_entry" type="const char *" nullable="true" doc="Optional exact UTF-8 byte range paired with fragment_entry_length." />
+      <field name="fragment_entry_length" type="size_t" validation="zero-or-at-most-boundary-limit" doc="Fragment-entry byte length." />
+      <field name="compute_entry" type="const char *" nullable="true" doc="Optional exact UTF-8 byte range paired with compute_entry_length." />
+      <field name="compute_entry_length" type="size_t" validation="zero-or-at-most-boundary-limit" doc="Compute-entry byte length." />
       <field name="kind" type="EzGfxShaderKind" doc="Value from EzGfxShaderKind." />
     </struct>
     <struct name="EzGfxTextureDesc" doc="Texture decoding and sampling metadata.">
@@ -143,12 +147,14 @@
       <field name="address_mode_u" type="EzGfxTextureAddressMode" doc="Value from EzGfxTextureAddressMode." />
       <field name="address_mode_v" type="EzGfxTextureAddressMode" doc="Value from EzGfxTextureAddressMode." />
       <field name="address_mode_w" type="EzGfxTextureAddressMode" doc="Value from EzGfxTextureAddressMode." />
-      <field name="debug_label" type="const char *" nullable="true" doc="Optional UTF-8 debug label." />
+      <field name="debug_label" type="const char *" nullable="true" doc="Optional exact UTF-8 byte range paired with debug_label_length." />
+      <field name="debug_label_length" type="size_t" validation="zero-or-at-most-boundary-limit" doc="Debug-label byte length." />
     </struct>
     <struct name="EzGfxBinding" doc="Shader resource binding.">
-      <field name="name" type="const char *" nullable="false" doc="UTF-8 shader binding name." />
+      <field name="name" type="const char *" nullable="false" doc="Exactly name_length UTF-8 bytes; no NUL terminator is required." />
+      <field name="name_length" type="size_t" validation="greater-than-zero-at-most-boundary-limit" doc="Binding-name byte length." />
       <field name="structured" type="EzGfxStructuredBuffer" doc="Optional structured buffer handle." />
-      <field name="indirect" type="EzGfxIndirectBuffer" doc="Optional indirect buffer handle." />
+      <field name="indirect" type="EzGfxIndirectBuffer" doc="Optional indirect-command buffer handle." />
       <field name="render_target" type="EzGfxRenderTarget" doc="Optional render-target handle." />
     </struct>
     <struct name="EzGfxDynamicState" doc="Optional dynamic state overrides.">
@@ -279,7 +285,8 @@
     </function>
     <function name="ez_gfx_acquire_indirect" return="EzGfxResult" context="last" doc="Creates a bounded indexed-indirect buffer.">
       <param name="capacity" type="uint32_t" doc="Command capacity." />
-      <param name="debug_name" type="const char *" nullable="false" doc="UTF-8 debug name." />
+      <param name="debug_name" type="const char *" nullable="false" direction="in" array-length="debug_name_length" doc="Exact UTF-8 debug-name bytes." />
+      <param name="debug_name_length" type="size_t" validation="greater-than-zero-at-most-boundary-limit" doc="Debug-name byte length." />
       <param name="out_indirect" type="EzGfxIndirectBuffer *" direction="out" doc="Receives the handle." />
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
       <returns doc="Returns validation or allocation status." />
@@ -365,20 +372,23 @@
       <returns doc="Returns EzGfxResult_Ok or a validation error." />
     </function>
     <function name="ez_gfx_vertex_heap_create" return="EzGfxResult" context="last" doc="Creates a named device-local vertex heap.">
-      <param name="name" type="const char *" nullable="false" doc="Bounded UTF-8 heap name." />
+      <param name="name" type="const char *" nullable="false" direction="in" array-length="name_length" doc="Exact UTF-8 heap-name bytes." />
+      <param name="name_length" type="size_t" validation="greater-than-zero-at-most-boundary-limit" doc="Heap-name byte length." />
       <param name="capacity" type="uint64_t" validation="greater-than-zero" doc="Heap capacity in bytes." />
       <param name="stride" type="uint64_t" validation="greater-than-zero" doc="Vertex stride." />
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning initialized context." />
       <returns doc="Returns validation, allocation, or native status." />
     </function>
     <function name="ez_gfx_vertex_heap_destroy" return="void" context="last" doc="Destroys a named vertex heap.">
-      <param name="name" type="const char *" nullable="false" doc="Heap name." />
+      <param name="name" type="const char *" nullable="false" direction="in" array-length="name_length" doc="Exact UTF-8 heap-name bytes." />
+      <param name="name_length" type="size_t" validation="greater-than-zero-at-most-boundary-limit" doc="Heap-name byte length." />
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
       <returns doc="Invalid names are ignored." />
     </function>
     <function name="ez_gfx_index_heap_create" return="EzGfxResult" context="last" doc="Creates the device-local u32 index heap.">
       <param name="capacity" type="uint64_t" validation="greater-than-zero" doc="Heap capacity in bytes." />
-      <param name="debug_name" type="const char *" nullable="false" doc="Bounded UTF-8 label." />
+      <param name="debug_name" type="const char *" nullable="false" direction="in" array-length="debug_name_length" doc="Exact UTF-8 label bytes." />
+      <param name="debug_name_length" type="size_t" validation="greater-than-zero-at-most-boundary-limit" doc="Debug-name byte length." />
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning initialized context." />
       <returns doc="Returns validation, allocation, or native status." />
     </function>
@@ -394,7 +404,8 @@
       <returns doc="Returns queueing or validation status." />
     </function>
     <function name="ez_gfx_vertex_upload" return="EzGfxResult" context="last" doc="Uploads vertices through pooled staging.">
-      <param name="heap_name" type="const char *" nullable="false" doc="Heap name." />
+      <param name="heap_name" type="const char *" nullable="false" direction="in" array-length="heap_name_length" doc="Exact UTF-8 heap-name bytes." />
+      <param name="heap_name_length" type="size_t" validation="greater-than-zero-at-most-boundary-limit" doc="Heap-name byte length." />
       <param name="data" type="const void *" nullable="false" direction="in" array-length="element_count" array-byte-size="element_size" doc="Vertex bytes." />
       <param name="element_count" type="uint32_t" validation="greater-than-zero" doc="Vertex count." />
       <param name="element_size" type="uint64_t" validation="greater-than-zero" doc="Must equal heap stride." />
@@ -405,7 +416,8 @@
     <function name="ez_gfx_structured_acquire" return="EzGfxResult" context="last" managed="utf8-string" doc="Acquires a real mapped upload buffer.">
       <param name="element_size" type="uint32_t" validation="greater-than-zero" doc="Element size in bytes." />
       <param name="element_count" type="uint32_t" validation="greater-than-zero" doc="Number of elements." />
-      <param name="debug_name" type="const char *" nullable="false" doc="Non-empty UTF-8 debug name." />
+      <param name="debug_name" type="const char *" nullable="false" direction="in" array-length="debug_name_length" doc="Exact UTF-8 debug-name bytes." />
+      <param name="debug_name_length" type="size_t" validation="greater-than-zero-at-most-boundary-limit" doc="Debug-name byte length." />
       <param name="out_structured" type="EzGfxStructuredBuffer *" direction="out" doc="Receives the buffer handle." />
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning initialized context." />
       <returns doc="Returns EzGfxResult_Ok or a validation, allocation, or device error." />
@@ -446,9 +458,9 @@
       <param name="out_parts" type="EzGfxHandleParts *" direction="out" doc="Receives context and optional child slot generations." />
       <returns doc="Returns EzGfxResult_Ok or a handle validation error." />
     </function>
-    <function name="ez_gfx_semantic_id" return="EzGfxResult" doc="Computes the fixed 16-byte semantic identifier for a UTF-8 name.">
-      <param name="name" type="const uint8_t *" nullable="false" direction="in" array-length="length" doc="Non-empty UTF-8 name bytes." />
-      <param name="length" type="size_t" validation="greater-than-zero" doc="Name byte count." />
+    <function name="ez_gfx_semantic_id" return="EzGfxResult" doc="Computes the fixed 16-byte identifier for a canonical semantic name.">
+      <param name="name" type="const uint8_t *" nullable="false" direction="in" array-length="length" doc="Exact ASCII dot-separated name bytes; each non-empty segment starts with a letter and continues with letters, digits, or underscores; embedded NUL is invalid." />
+      <param name="length" type="size_t" validation="canonical-semantic-name-1-to-255-bytes" doc="Name byte count in the inclusive range 1..255." />
       <param name="out_id" type="uint8_t *" direction="out" array-length="16" doc="Receives exactly 16 identifier bytes." />
       <returns doc="Returns EzGfxResult_Ok or EzGfxResult_InvalidArgument." />
     </function>

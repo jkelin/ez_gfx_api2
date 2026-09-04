@@ -12,6 +12,18 @@ fn validates_blocks_and_regions() {
     assert!(Region::new(1, 0, 4, 4, 8, 8, BlockFormat::Bc1).is_err());
 }
 #[test]
+fn block_payload_rejects_zero_dimensions() {
+    assert_eq!(
+        validate_block_payload(BlockFormat::Bc1, 0, 8, 0, &[0; 16]),
+        Err(AssetError::InvalidDimensions)
+    );
+    assert_eq!(
+        validate_block_payload(BlockFormat::Bc1, 8, 0, 0, &[0; 16]),
+        Err(AssetError::InvalidDimensions)
+    );
+}
+
+#[test]
 fn mip_progression_starts_coarsest() {
     let mut c = MipChain::new(TextureId::try_new(7).unwrap(), 16, 8, 3, BlockFormat::Bc7).unwrap();
     assert_eq!(c.state(), TextureState::Empty);

@@ -864,7 +864,7 @@ mod tests {
     #[test]
     fn bindings_reject_counted_by_on_struct_pointer_fields() {
         let bindings = r#"
-            <ez-gfx-bindings abi-version="18">
+            <ez-gfx-bindings abi-version="19">
               <handles></handles>
               <enums></enums>
               <structs>

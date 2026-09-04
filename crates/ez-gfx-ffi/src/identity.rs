@@ -1,6 +1,9 @@
-use super::{EZ_GFX_MAX_BOUNDARY_BYTES, EzGfxHandleParts, EzGfxResult, catch_status};
+use super::{EzGfxHandleParts, EzGfxResult, catch_status};
 use ez_gfx::SemanticId;
-use ez_gfx_core::handle::{HandleParts, PackedHandle};
+use ez_gfx_core::{
+    handle::{HandleParts, PackedHandle},
+    semantic::MAX_SEMANTIC_NAME_BYTES,
+};
 
 #[unsafe(no_mangle)]
 /// Decodes a packed handle into its context and optional child slot generations.
@@ -44,26 +47,21 @@ pub unsafe extern "C" fn ez_gfx_handle_inspect(
 }
 
 #[unsafe(no_mangle)]
-/// Computes the fixed-size semantic identifier for a UTF-8 name.
+/// Computes the fixed-size identifier for a canonical semantic name.
 ///
 /// # Safety
 ///
-/// Non-null `name` must be readable for `length` bytes, and non-null `out_id` writable for 16 bytes, for this call.
+/// Non-null `name` must be readable for `length` bytes, and non-null `out_id` writable for 16 bytes, for this call. The exact byte range must contain a 1-to-255-byte ASCII dot-separated name; every non-empty segment starts with an ASCII letter and continues with only ASCII letters, digits, or underscores.
 pub unsafe extern "C" fn ez_gfx_semantic_id(
     name: *const u8,
     length: usize,
     out_id: *mut u8,
 ) -> EzGfxResult {
     catch_status(|| {
-        if out_id.is_null()
-            || name.is_null()
-            || length == 0
-            || length > EZ_GFX_MAX_BOUNDARY_BYTES
-            || length > isize::MAX as usize
-        {
+        if out_id.is_null() || name.is_null() || length == 0 || length > MAX_SEMANTIC_NAME_BYTES {
             return EzGfxResult::InvalidArgument;
         }
-        // SAFETY: `length` is checked nonzero and within both the byte and `isize` limits; the caller keeps `name` readable for `length` `u8` values (alignment 1) through UTF-8 validation.
+        // SAFETY: `length` is checked nonzero and within the semantic-name byte limit; the caller keeps `name` readable for `length` `u8` values (alignment 1) through UTF-8 validation.
         let bytes = unsafe { core::slice::from_raw_parts(name, length) };
         let Ok(name) = core::str::from_utf8(bytes) else {
             return EzGfxResult::InvalidArgument;

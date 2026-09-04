@@ -82,11 +82,11 @@ impl ResourceDesc {
         })
     }
 
-    /// Dimensions/counts are nonzero, sample count is closed, and byte-size arithmetic must fit u64.
+    /// Dimensions/counts are nonzero, mip levels stop at 1x1, and sample count is closed.
     ///
     /// # Errors
     ///
-    /// Returns `GraphError::InvalidResource` if any dimension or count is zero or `samples` is not 1, 2, 4, or 8.
+    /// Returns `GraphError::InvalidResource` for zero dimensions/counts, mip levels beyond 1x1, or unsupported samples.
     pub fn image(
         width: u32,
         height: u32,
@@ -96,9 +96,11 @@ impl ResourceDesc {
         samples: u8,
         lifetime: ResourceLifetime,
     ) -> Result<Self, GraphError> {
+        let max_mips = u32::BITS - width.max(height).leading_zeros();
         if width == 0
             || height == 0
             || mips == 0
+            || mips > max_mips
             || layers == 0
             || !matches!(samples, 1 | 2 | 4 | 8)
         {
@@ -494,7 +496,9 @@ impl FrameGraph {
     ///
     /// Returns `GraphError::Cycle` if the dependency graph is cyclic or `GraphError::InvalidPass` if a transient attachment is loaded before initialization.
     pub fn compile(&self) -> Result<CompiledGraph, GraphError> {
-        let hazards = self.build_hazards();
+        // Explicit dependencies define the legal direction for otherwise ambiguous hazards.
+        let explicit_order = stable_topological(self.nodes.len(), &self.explicit_edges)?;
+        let hazards = self.build_hazards(&explicit_order);
         let mut edges = self.explicit_edges.clone();
         edges.extend(hazards.iter().map(|edge| (edge.from, edge.to)));
         let order = stable_topological(self.nodes.len(), &edges)?;
@@ -525,59 +529,100 @@ impl FrameGraph {
     ///
     /// Returns `GraphError::InvalidPass` if a transient attachment is loaded before an earlier scheduled write initializes it.
     fn validate_transient_attachment_loads(&self, order: &[NodeId]) -> Result<(), GraphError> {
-        let mut initialized = BTreeSet::new();
-        for node in order {
-            let node = &self.nodes[node.0 as usize];
-            if node
-                .pass
-                .as_ref()
-                .is_some_and(|pass| pass.load == LoadOp::Load)
-            {
-                let pass = node.pass.as_ref().expect("pass was checked");
-                for attachment in pass.colors.iter().copied().chain(pass.depth) {
-                    // Transient images have no preserved contents before the graph's first write.
-                    if self.resources[attachment.0 as usize].desc.lifetime
-                        == ResourceLifetime::Transient
-                        && !initialized.contains(&attachment)
-                    {
-                        return Err(GraphError::InvalidPass);
+        let mut initialized: BTreeMap<ResourceId, Vec<ResourceRange>> = BTreeMap::new();
+        for node_id in order {
+            let node = &self.nodes[node_id.0 as usize];
+            if let Some(pass) = &node.pass {
+                let attachments = pass.colors.iter().copied().chain(pass.depth);
+                if pass.load == LoadOp::Load {
+                    for attachment in attachments.clone() {
+                        if self.resources[attachment.0 as usize].desc.lifetime
+                            != ResourceLifetime::Transient
+                        {
+                            continue;
+                        }
+                        for access in node.accesses.iter().filter(|access| {
+                            access.resource == attachment
+                                && matches!(
+                                    access.state.access,
+                                    ResourceAccess::ColorAttachmentWrite
+                                        | ResourceAccess::DepthStencilRead
+                                        | ResourceAccess::DepthStencilWrite
+                                )
+                        }) {
+                            let mut uncovered = vec![access.range];
+                            for covered in initialized.get(&attachment).into_iter().flatten() {
+                                uncovered = uncovered
+                                    .into_iter()
+                                    .flat_map(|range| subtract(range, *covered))
+                                    .collect();
+                            }
+                            // Loading is valid only when prior writes cover the exact attachment range.
+                            if !uncovered.is_empty() {
+                                return Err(GraphError::InvalidPass);
+                            }
+                        }
                     }
                 }
             }
-            initialized.extend(
-                node.accesses
-                    .iter()
-                    .filter(|access| is_write(access.state.access))
-                    .map(|access| access.resource),
-            );
+
+            for access in node
+                .accesses
+                .iter()
+                .filter(|access| is_write(access.state.access))
+            {
+                initialized
+                    .entry(access.resource)
+                    .or_default()
+                    .push(access.range);
+            }
+
+            if let Some(pass) = &node.pass
+                && pass.store == StoreOp::Discard
+            {
+                for attachment in pass.colors.iter().copied().chain(pass.depth) {
+                    let discarded: Vec<_> = node
+                        .accesses
+                        .iter()
+                        .filter(|access| {
+                            access.resource == attachment
+                                && matches!(
+                                    access.state.access,
+                                    ResourceAccess::ColorAttachmentWrite
+                                        | ResourceAccess::DepthStencilRead
+                                        | ResourceAccess::DepthStencilWrite
+                                )
+                        })
+                        .map(|access| access.range)
+                        .collect();
+                    if let Some(ranges) = initialized.get_mut(&attachment) {
+                        for discard in discarded {
+                            *ranges = ranges
+                                .drain(..)
+                                .flat_map(|range| subtract(range, discard))
+                                .collect();
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
 
     /// Derives ordered read/write hazard edges for overlapping resource accesses.
-    fn build_hazards(&self) -> Vec<HazardEdge> {
+    fn build_hazards(&self, order: &[NodeId]) -> Vec<HazardEdge> {
         let mut result = Vec::new();
-        for later in 0..self.nodes.len() {
-            for earlier in 0..later {
-                for before in &self.nodes[earlier].accesses {
-                    for after in &self.nodes[later].accesses {
+        for later_position in 0..order.len() {
+            let later = order[later_position];
+            for earlier in order[..later_position].iter().copied() {
+                for before in &self.nodes[earlier.0 as usize].accesses {
+                    for after in &self.nodes[later.0 as usize].accesses {
                         if before.resource != after.resource || !overlaps(before.range, after.range)
                         {
                             continue;
                         }
                         if let Some(kind) = hazard_kind(before.state.access, after.state.access) {
-                            result.push(HazardEdge::new(
-                                NodeId(
-                                    u32::try_from(earlier)
-                                        .expect("node count is bounded by handle space"),
-                                ),
-                                NodeId(
-                                    u32::try_from(later)
-                                        .expect("node count is bounded by handle space"),
-                                ),
-                                before.resource,
-                                kind,
-                            ));
+                            result.push(HazardEdge::new(earlier, later, before.resource, kind));
                         }
                     }
                 }

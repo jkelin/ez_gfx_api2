@@ -1,7 +1,7 @@
 //! ABI layout, validation, lifecycle, and observability contract tests.
 
 use core::{
-    ffi::{c_char, c_void},
+    ffi::c_void,
     mem::{align_of, offset_of, size_of},
 };
 use ez_gfx_ffi as ffi;
@@ -51,7 +51,7 @@ fn status_values_and_abi_version_are_stable() {
         ],
         [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     );
-    assert_eq!(EZ_GFX_ABI_VERSION, 18);
+    assert_eq!(EZ_GFX_ABI_VERSION, 19);
 }
 
 #[test]
@@ -111,24 +111,28 @@ fn layouts_are_stable() {
     );
     assert_eq!(
         (size_of::<EzGfxShaderDesc>(), align_of::<EzGfxShaderDesc>()),
-        (40, 8)
+        (72, 8)
     );
     assert_eq!(
         [
             offset_of!(EzGfxShaderDesc, path),
+            offset_of!(EzGfxShaderDesc, path_length),
             offset_of!(EzGfxShaderDesc, vertex_entry),
+            offset_of!(EzGfxShaderDesc, vertex_entry_length),
             offset_of!(EzGfxShaderDesc, fragment_entry),
+            offset_of!(EzGfxShaderDesc, fragment_entry_length),
             offset_of!(EzGfxShaderDesc, compute_entry),
+            offset_of!(EzGfxShaderDesc, compute_entry_length),
             offset_of!(EzGfxShaderDesc, kind)
         ],
-        [0, 8, 16, 24, 32]
+        [0, 8, 16, 24, 32, 40, 48, 56, 64]
     );
     assert_eq!(
         (
             size_of::<EzGfxTextureDesc>(),
             align_of::<EzGfxTextureDesc>()
         ),
-        (40, 8)
+        (48, 8)
     );
     assert_eq!(
         [
@@ -144,22 +148,24 @@ fn layouts_are_stable() {
             offset_of!(EzGfxTextureDesc, address_mode_u),
             offset_of!(EzGfxTextureDesc, address_mode_v),
             offset_of!(EzGfxTextureDesc, address_mode_w),
-            offset_of!(EzGfxTextureDesc, debug_label)
+            offset_of!(EzGfxTextureDesc, debug_label),
+            offset_of!(EzGfxTextureDesc, debug_label_length)
         ],
-        [0, 1, 4, 8, 12, 16, 17, 18, 20, 24, 25, 26, 32]
+        [0, 1, 4, 8, 12, 16, 17, 18, 20, 24, 25, 26, 32, 40]
     );
     assert_eq!(
         (size_of::<EzGfxBinding>(), align_of::<EzGfxBinding>()),
-        (32, 8)
+        (40, 8)
     );
     assert_eq!(
         [
             offset_of!(EzGfxBinding, name),
+            offset_of!(EzGfxBinding, name_length),
             offset_of!(EzGfxBinding, structured),
             offset_of!(EzGfxBinding, indirect),
             offset_of!(EzGfxBinding, render_target)
         ],
-        [0, 8, 16, 24]
+        [0, 8, 16, 24, 32]
     );
     assert_eq!(
         (
@@ -293,7 +299,7 @@ fn all_public_export_signatures_are_stable() {
     let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_texture_unload;
     let _: extern "C" fn(Handle, Handle) -> Status = ffi::ez_gfx_begin_render;
     let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_frame_begin;
-    let _: unsafe extern "C" fn(u32, *const c_char, *mut Handle, Handle) -> Status =
+    let _: unsafe extern "C" fn(u32, *const u8, usize, *mut Handle, Handle) -> Status =
         ffi::ez_gfx_acquire_indirect;
     let _: unsafe extern "C" fn(Handle, u32, *const EzGfxDrawIndexedCommand, Handle) -> Status =
         ffi::ez_gfx_indirect_write_draw;
@@ -329,23 +335,24 @@ fn all_public_export_signatures_are_stable() {
     let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_finish_render;
     let _: unsafe extern "C" fn(*mut u8, usize, *mut usize, Handle) -> Status =
         ffi::ez_gfx_frame_readback;
-    let _: unsafe extern "C" fn(*const c_char, u64, u64, Handle) -> Status =
+    let _: unsafe extern "C" fn(*const u8, usize, u64, u64, Handle) -> Status =
         ffi::ez_gfx_vertex_heap_create;
-    let _: unsafe extern "C" fn(*const c_char, Handle) = ffi::ez_gfx_vertex_heap_destroy;
-    let _: unsafe extern "C" fn(u64, *const c_char, Handle) -> Status =
+    let _: unsafe extern "C" fn(*const u8, usize, Handle) = ffi::ez_gfx_vertex_heap_destroy;
+    let _: unsafe extern "C" fn(u64, *const u8, usize, Handle) -> Status =
         ffi::ez_gfx_index_heap_create;
     let _: extern "C" fn(Handle) = ffi::ez_gfx_index_heap_destroy;
     let _: unsafe extern "C" fn(*const c_void, u32, *mut u32, Handle) -> Status =
         ffi::ez_gfx_vertex_upload_indices;
     let _: unsafe extern "C" fn(
-        *const c_char,
+        *const u8,
+        usize,
         *const c_void,
         u32,
         u64,
         *mut u32,
         Handle,
     ) -> Status = ffi::ez_gfx_vertex_upload;
-    let _: unsafe extern "C" fn(u32, u32, *const c_char, *mut Handle, Handle) -> Status =
+    let _: unsafe extern "C" fn(u32, u32, *const u8, usize, *mut Handle, Handle) -> Status =
         ffi::ez_gfx_structured_acquire;
     let _: unsafe extern "C" fn(Handle, *const c_void, u64, Handle) -> Status =
         ffi::ez_gfx_structured_write;
@@ -356,7 +363,7 @@ fn all_public_export_signatures_are_stable() {
 }
 
 #[test]
-fn shader_load_v18_signature_and_boundary_validation_are_stable() {
+fn shader_load_v19_signature_and_boundary_validation_are_stable() {
     let _: unsafe extern "C" fn(*const u8, usize, *mut u64, u64) -> EzGfxResult =
         ez_gfx_shader_load_artifact;
     let mut shader = 99;
@@ -366,6 +373,169 @@ fn shader_load_v18_signature_and_boundary_validation_are_stable() {
         EzGfxResult::InvalidArgument
     );
     assert_eq!(shader, 99);
+}
+
+#[test]
+fn counted_strings_reject_invalid_ranges_before_reading_or_delegating() {
+    let valid = b"frame";
+    let invalid_utf8 = [0xff_u8];
+    let embedded_nul = b"a\0b";
+    let mut indirect = 7;
+
+    assert_eq!(
+        // SAFETY: `valid` is readable for exactly its nonzero byte length and intentionally has no terminator.
+        unsafe { ez_gfx_acquire_indirect(1, valid.as_ptr(), valid.len(), &raw mut indirect, 0) },
+        EzGfxResult::InvalidContext
+    );
+
+    for (pointer, length) in [
+        (core::ptr::null(), 1),
+        (valid.as_ptr(), 0),
+        (
+            valid.as_ptr(),
+            ffi::EZ_GFX_MAX_BOUNDARY_BYTES.saturating_add(1),
+        ),
+        (invalid_utf8.as_ptr(), invalid_utf8.len()),
+        (embedded_nul.as_ptr(), embedded_nul.len()),
+    ] {
+        assert_eq!(
+            // SAFETY: Valid pointers name the declared test-owned ranges; oversized and null ranges are rejected before dereference.
+            unsafe { ez_gfx_acquire_indirect(1, pointer, length, &raw mut indirect, 0) },
+            EzGfxResult::InvalidArgument
+        );
+    }
+}
+
+#[test]
+fn optional_and_nested_counted_strings_enforce_the_same_contract() {
+    let pixels = [0_u8; 4];
+    let label = b"label";
+    let base = EzGfxTextureDesc {
+        source_format: 1,
+        destination_format: 0,
+        width: 1,
+        height: 1,
+        mip_count: 1,
+        generate_mips: 0,
+        min_filter: 0,
+        mag_filter: 0,
+        max_anisotropy: 1.0,
+        address_mode_u: 0,
+        address_mode_v: 0,
+        address_mode_w: 0,
+        debug_label: core::ptr::null(),
+        debug_label_length: 0,
+    };
+    let mut texture = 0;
+
+    for desc in [
+        EzGfxTextureDesc {
+            debug_label: core::ptr::null(),
+            debug_label_length: 1,
+            ..base
+        },
+        EzGfxTextureDesc {
+            debug_label: label.as_ptr(),
+            debug_label_length: 0,
+            ..base
+        },
+    ] {
+        assert_eq!(
+            // SAFETY: Descriptor and pixel storage are live; invalid string pairs are rejected before any string read.
+            unsafe {
+                ez_gfx_texture_load(
+                    pixels.as_ptr(),
+                    pixels.len(),
+                    &raw const desc,
+                    &raw mut texture,
+                    0,
+                )
+            },
+            EzGfxResult::InvalidArgument
+        );
+    }
+
+    let valid_desc = EzGfxTextureDesc {
+        debug_label: label.as_ptr(),
+        debug_label_length: label.len(),
+        ..base
+    };
+    assert_eq!(
+        // SAFETY: `label` is a readable, non-terminated exact UTF-8 range.
+        unsafe {
+            ez_gfx_texture_load(
+                pixels.as_ptr(),
+                pixels.len(),
+                &raw const valid_desc,
+                &raw mut texture,
+                0,
+            )
+        },
+        EzGfxResult::InvalidContext
+    );
+
+    let binding_name = b"values";
+    let child_handle = 1_u64 | (1_u64 << 20) | (1_u64 << 40) | (1_u64 << 52);
+    let binding = EzGfxBinding {
+        name: binding_name.as_ptr(),
+        name_length: binding_name.len(),
+        structured: child_handle,
+        indirect: 0,
+        render_target: 0,
+    };
+    assert_eq!(
+        // SAFETY: The binding and its non-terminated exact name range remain readable for the call.
+        unsafe {
+            ffi::ez_gfx_render_add_compute_pipeline(
+                child_handle,
+                1,
+                1,
+                1,
+                &raw const binding,
+                1,
+                core::ptr::null(),
+                0,
+                0,
+            )
+        },
+        EzGfxResult::InvalidContext
+    );
+
+    let invalid_utf8 = [0xff_u8];
+    let embedded_nul = b"a\0b";
+    for (name, name_length) in [
+        (core::ptr::null(), 1),
+        (binding_name.as_ptr(), 0),
+        (
+            binding_name.as_ptr(),
+            ffi::EZ_GFX_MAX_BOUNDARY_BYTES.saturating_add(1),
+        ),
+        (invalid_utf8.as_ptr(), invalid_utf8.len()),
+        (embedded_nul.as_ptr(), embedded_nul.len()),
+    ] {
+        let invalid_binding = EzGfxBinding {
+            name,
+            name_length,
+            ..binding
+        };
+        assert_eq!(
+            // SAFETY: The binding is readable; valid name pointers own their declared ranges, while null and oversized ranges are rejected before dereference.
+            unsafe {
+                ffi::ez_gfx_render_add_compute_pipeline(
+                    child_handle,
+                    1,
+                    1,
+                    1,
+                    &raw const invalid_binding,
+                    1,
+                    core::ptr::null(),
+                    0,
+                    0,
+                )
+            },
+            EzGfxResult::InvalidArgument
+        );
+    }
 }
 
 #[test]
@@ -525,12 +695,21 @@ fn explicit_dx12_context_allocates_writes_and_releases_structured_memory() {
         },
         EzGfxResult::Ok
     );
-    let name = std::ffi::CString::new("vertices").unwrap();
+    let name = b"vertices";
     let mut structured = 0;
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_structured_acquire(16, 4, name.as_ptr(), &raw mut structured, context) }
+            unsafe {
+                ez_gfx_structured_acquire(
+                    16,
+                    4,
+                    name.as_ptr(),
+                    name.len(),
+                    &raw mut structured,
+                    context,
+                )
+            }
         },
         EzGfxResult::Ok
     );
@@ -596,18 +775,18 @@ fn dx12_geometry_uploads_use_real_device_buffers_and_transfer_fence() {
         },
         EzGfxResult::Ok
     );
-    let heap = std::ffi::CString::new("position").unwrap();
+    let heap = b"position";
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_vertex_heap_create(heap.as_ptr(), 256, 16, context) }
+            unsafe { ez_gfx_vertex_heap_create(heap.as_ptr(), heap.len(), 256, 16, context) }
         },
         EzGfxResult::Ok
     );
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_index_heap_create(256, heap.as_ptr(), context) }
+            unsafe { ez_gfx_index_heap_create(256, heap.as_ptr(), heap.len(), context) }
         },
         EzGfxResult::Ok
     );
@@ -619,6 +798,7 @@ fn dx12_geometry_uploads_use_real_device_buffers_and_transfer_fence() {
             unsafe {
                 ez_gfx_vertex_upload(
                     heap.as_ptr(),
+                    heap.len(),
                     vertices.as_ptr().cast(),
                     4,
                     16,
@@ -642,8 +822,8 @@ fn dx12_geometry_uploads_use_real_device_buffers_and_transfer_fence() {
     );
     assert_eq!(first, 0);
     assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
-    // SAFETY: `heap` is a live NUL-terminated string for this call.
-    unsafe { ez_gfx_vertex_heap_destroy(heap.as_ptr(), context) };
+    // SAFETY: `heap` is readable for exactly `heap.len()` UTF-8 bytes for this call.
+    unsafe { ez_gfx_vertex_heap_destroy(heap.as_ptr(), heap.len(), context) };
     ez_gfx_index_heap_destroy(context);
     ez_gfx_context_destroy(context);
 }
@@ -666,6 +846,7 @@ fn texture_descriptor_rejects_unsupported_pipeline_state_before_context_access()
         address_mode_v: 1,
         address_mode_w: 0,
         debug_label: core::ptr::null(),
+        debug_label_length: 0,
     };
     for desc in [
         EzGfxTextureDesc {
@@ -730,6 +911,7 @@ fn dx12_texture_upload_becomes_resident_and_unload_invalidates_handle() {
         address_mode_v: 0,
         address_mode_w: 0,
         debug_label: core::ptr::null(),
+        debug_label_length: 0,
     };
     let mut context = 0;
     let mut texture = 0;
@@ -800,6 +982,7 @@ fn dx12_frame_uploads_indirect_compiles_graph_and_reads_back_texture() {
         address_mode_v: 0,
         address_mode_w: 0,
         debug_label: core::ptr::null(),
+        debug_label_length: 0,
     };
     let pixels = [1_u8, 2, 3, 4, 5, 6, 7, 8];
     let command = EzGfxDrawIndexedCommand {
@@ -812,7 +995,7 @@ fn dx12_frame_uploads_indirect_compiles_graph_and_reads_back_texture() {
     let mut context = 0;
     let mut texture = 0;
     let mut indirect = 0;
-    let debug_name = std::ffi::CString::new("frame").unwrap();
+    let debug_name = b"frame";
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
@@ -839,7 +1022,15 @@ fn dx12_frame_uploads_indirect_compiles_graph_and_reads_back_texture() {
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_acquire_indirect(1, debug_name.as_ptr(), &raw mut indirect, context) }
+            unsafe {
+                ez_gfx_acquire_indirect(
+                    1,
+                    debug_name.as_ptr(),
+                    debug_name.len(),
+                    &raw mut indirect,
+                    context,
+                )
+            }
         },
         EzGfxResult::Ok
     );
@@ -883,30 +1074,43 @@ fn dx12_frame_uploads_indirect_compiles_graph_and_reads_back_texture() {
     ez_gfx_context_destroy(context);
 }
 #[test]
-fn pointer_count_and_utf8_are_validated() {
-    let mut output = [0_u8; 16];
-    assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_semantic_id(core::ptr::null(), 1, output.as_mut_ptr()) }
-        },
-        EzGfxResult::InvalidArgument
-    );
-    assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_semantic_id([0xff_u8].as_ptr(), 1, output.as_mut_ptr()) }
-        },
-        EzGfxResult::InvalidArgument
-    );
-    assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_semantic_id(b"material.albedo".as_ptr(), 15, output.as_mut_ptr()) }
-        },
-        EzGfxResult::Ok
-    );
-    assert_ne!(output, [0; 16]);
+fn semantic_id_enforces_canonical_name_bytes_and_boundaries() {
+    let mut output = [0xa5_u8; 16];
+    let invalid_utf8 = [0xff_u8];
+    let embedded_nul = b"material\0albedo";
+    let too_long = [b'a'; 256];
+
+    for (name, length) in [
+        (core::ptr::null(), 1),
+        (b"a".as_ptr(), 0),
+        (invalid_utf8.as_ptr(), invalid_utf8.len()),
+        (embedded_nul.as_ptr(), embedded_nul.len()),
+        (b".leading".as_ptr(), b".leading".len()),
+        (b"trailing.".as_ptr(), b"trailing.".len()),
+        (b"double..dot".as_ptr(), b"double..dot".len()),
+        (b"1starts_with_digit".as_ptr(), b"1starts_with_digit".len()),
+        (b"bad-dash".as_ptr(), b"bad-dash".len()),
+        (b"caf\xc3\xa9".as_ptr(), b"caf\xc3\xa9".len()),
+        (too_long.as_ptr(), too_long.len()),
+    ] {
+        assert_eq!(
+            // SAFETY: Valid pointers own exactly the declared range; null and zero deliberately exercise validation before dereference.
+            unsafe { ez_gfx_semantic_id(name, length, output.as_mut_ptr()) },
+            EzGfxResult::InvalidArgument
+        );
+        assert_eq!(output, [0xa5; 16]);
+    }
+
+    let max_length_name = [b'a'; 255];
+    for name in [b"material.albedo_2".as_slice(), max_length_name.as_slice()] {
+        assert_eq!(
+            // SAFETY: `name` is a live exact canonical semantic-name range and output has 16 writable bytes.
+            unsafe { ez_gfx_semantic_id(name.as_ptr(), name.len(), output.as_mut_ptr()) },
+            EzGfxResult::Ok
+        );
+        assert_ne!(output, [0xa5; 16]);
+        output.fill(0xa5);
+    }
 }
 
 #[test]

@@ -83,3 +83,47 @@ fn staging_pool_reuses_only_completed_compatible_slots() {
     pool.release_unsubmitted(second).unwrap();
     assert_eq!(pool.checkout(32, 3).unwrap(), first);
 }
+
+#[test]
+fn staging_pool_rejects_non_transfer_retirement_tokens() {
+    let mut pool = StagingPool::new(1).unwrap();
+    let slot = pool.checkout(64, 0).unwrap();
+
+    assert!(
+        pool.retire(slot, CompletionToken::new(QueueKind::Compute, 1).unwrap())
+            .is_err()
+    );
+    pool.release_unsubmitted(slot).unwrap();
+}
+
+#[test]
+fn rollback_rejects_a_forged_tail_subrange() {
+    let mut geometry = GeometryManager::new();
+    geometry.create_vertex_heap("mesh", 64, 16).unwrap();
+    let upload = geometry.reserve_vertices("mesh", 2, 16).unwrap();
+    let forged = ez_gfx_runtime::geometry::GeometryUpload {
+        first_element: 1,
+        byte_offset: 16,
+        byte_size: 16,
+    };
+
+    assert_eq!(
+        geometry.rollback_vertices("mesh", forged),
+        Err(GeometryError::InvalidRollback)
+    );
+    assert_eq!(geometry.rollback_vertices("mesh", upload), Ok(()));
+}
+
+#[test]
+fn rollback_does_not_restore_an_older_reservation() {
+    let mut geometry = GeometryManager::new();
+    geometry.create_vertex_heap("mesh", 64, 16).unwrap();
+    let older = geometry.reserve_vertices("mesh", 1, 16).unwrap();
+    let latest = geometry.reserve_vertices("mesh", 1, 16).unwrap();
+
+    assert_eq!(geometry.rollback_vertices("mesh", latest), Ok(()));
+    assert_eq!(
+        geometry.rollback_vertices("mesh", older),
+        Err(GeometryError::InvalidRollback)
+    );
+}

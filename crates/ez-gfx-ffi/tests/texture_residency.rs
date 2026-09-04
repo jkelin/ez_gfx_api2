@@ -4,7 +4,6 @@
 mod common;
 
 use common::TestContext;
-use std::ffi::CString;
 
 use ez_gfx_ffi::{
     EzGfxResult, EzGfxTextureDesc, ez_gfx_context_wait_idle, ez_gfx_texture_get_residency,
@@ -18,7 +17,7 @@ fn vulkan_reports_completed_progressive_mip_residency() {
     let context = native.context;
 
     let bytes = [128_u8; 4 * 4 * 4];
-    let label = CString::new("residency-test").unwrap();
+    let label = b"residency-test";
     let desc = EzGfxTextureDesc {
         source_format: 1,
         destination_format: 0,
@@ -33,6 +32,7 @@ fn vulkan_reports_completed_progressive_mip_residency() {
         address_mode_v: 0,
         address_mode_w: 0,
         debug_label: label.as_ptr(),
+        debug_label_length: label.len(),
     };
     let mut texture = 0;
     assert_eq!(

@@ -64,6 +64,7 @@ fn image_mip_chain_requires_halved_extents_and_exact_rgba_rows() {
     use ez_gfx_hal::{ImageMip, validate_rgba8_mips};
     let level0 = [0_u8; 32];
     let level1 = [0_u8; 8];
+    let level2 = [0_u8; 4];
     assert!(
         validate_rgba8_mips(&[
             ImageMip {
@@ -75,6 +76,11 @@ fn image_mip_chain_requires_halved_extents_and_exact_rgba_rows() {
                 width: 2,
                 height: 1,
                 bytes: &level1
+            },
+            ImageMip {
+                width: 1,
+                height: 1,
+                bytes: &level2
             }
         ])
         .is_ok()
@@ -101,6 +107,21 @@ fn image_mip_chain_requires_halved_extents_and_exact_rgba_rows() {
             height: 1,
             bytes: &[0; 3]
         }])
+        .is_err()
+    );
+    assert!(
+        validate_rgba8_mips(&[
+            ImageMip {
+                width: 1,
+                height: 1,
+                bytes: &[0; 4],
+            },
+            ImageMip {
+                width: 1,
+                height: 1,
+                bytes: &[0; 4],
+            },
+        ])
         .is_err()
     );
 }
@@ -130,5 +151,53 @@ fn resource_states_validate_queue_stage_access_combinations() {
             ResourceAccess::ColorAttachmentWrite
         )
         .is_err()
+    );
+    assert!(
+        ResourceState::new(
+            QueueKind::Transfer,
+            ShaderStage::None,
+            ResourceAccess::StorageRead
+        )
+        .is_err()
+    );
+    assert!(
+        ResourceState::new(
+            QueueKind::Graphics,
+            ShaderStage::None,
+            ResourceAccess::SampledRead
+        )
+        .is_err()
+    );
+    assert!(
+        ResourceState::new(
+            QueueKind::Compute,
+            ShaderStage::Vertex,
+            ResourceAccess::StorageRead
+        )
+        .is_err()
+    );
+    assert!(
+        ResourceState::new(
+            QueueKind::Compute,
+            ShaderStage::None,
+            ResourceAccess::IndexRead
+        )
+        .is_err()
+    );
+    assert!(
+        ResourceState::new(
+            QueueKind::Compute,
+            ShaderStage::None,
+            ResourceAccess::IndirectRead
+        )
+        .is_ok()
+    );
+    assert!(
+        ResourceState::new(
+            QueueKind::Transfer,
+            ShaderStage::None,
+            ResourceAccess::TransferRead
+        )
+        .is_ok()
     );
 }
