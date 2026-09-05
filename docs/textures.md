@@ -1,6 +1,270 @@
-# Asynchronous textures
+# Textures
 
 `ez-gfx` splits texture loading across the context owner, a bounded Rayon pool, and a backend transfer queue. The caller receives a generational `TextureHandle` before decoding or GPU upload completes.
+
+## Public Rust interface
+
+The safe crate exports these functions at its root:
+
+```rust
+pub fn load_texture(
+    context: ContextHandle,
+    source: TextureSource,
+    bytes: &[u8],
+    generate_mips: bool,
+    config: &TextureConfig,
+) -> Result<TextureHandle, EzGfxResult>;
+
+pub fn poll_texture_load(context: ContextHandle, texture: TextureHandle) -> EzGfxResult;
+pub fn cancel_texture_load(context: ContextHandle, texture: TextureHandle) -> EzGfxResult;
+pub fn texture_binding(
+    context: ContextHandle,
+    texture: TextureHandle,
+) -> Result<u32, EzGfxResult>;
+pub fn texture_residency(
+    context: ContextHandle,
+    texture: TextureHandle,
+) -> Result<(u32, u32), EzGfxResult>;
+pub fn unload_texture(context: ContextHandle, texture: TextureHandle);
+```
+
+`load_texture` copies `bytes` and returns after bounded admission. `poll_texture_load` is the readiness source of truth: `NotReady` is transient, `Ok` permits binding, and every other result is terminal for that request. `texture_binding` returns the stable bindless texture-heap index, not a `PublicBinding`.
+
+## Rust load and render flow
+
+This follows `examples/02_textured_cube`: buffer resources use `PublicBinding`, while the texture index travels in push constants to the shader’s `[BindlessTextureHeap]`.
+
+```rust
+use bytemuck::{Pod, Zeroable, bytes_of};
+use ez_gfx::*;
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Push {
+    mvp: [[f32; 4]; 4],
+    texture_id: u32,
+    padding: [u32; 3],
+}
+
+struct StreamedTexture {
+    handle: Option<TextureHandle>,
+    binding: u32,
+    fallback_binding: u32,
+    ready: bool,
+}
+
+impl StreamedTexture {
+    fn load(
+        context: ContextHandle,
+        png: &[u8],
+        fallback_binding: u32,
+    ) -> Result<Self, EzGfxResult> {
+        let config = TextureConfig {
+            width: 0,
+            height: 0,
+            mip_count: 0,
+            sampler: TextureSamplerDesc {
+                min_filter: SamplerFilter::Linear,
+                mag_filter: SamplerFilter::Linear,
+                max_anisotropy: 1.0,
+                address_u: SamplerAddressMode::Clamp,
+                address_v: SamplerAddressMode::Clamp,
+                address_w: SamplerAddressMode::Clamp,
+            },
+        };
+        let handle = load_texture(context, TextureSource::Png, png, true, &config)?;
+
+        Ok(Self {
+            handle: Some(handle),
+            binding: fallback_binding,
+            fallback_binding,
+            ready: false,
+        })
+    }
+
+    // Poll on the context creator thread before beginning this frame.
+    fn poll(&mut self, context: ContextHandle) -> Result<(), EzGfxResult> {
+        if self.ready {
+            return Ok(());
+        }
+        let Some(handle) = self.handle else {
+            return Ok(());
+        };
+
+        match poll_texture_load(context, handle) {
+            EzGfxResult::Ok => {
+                // The requested texture can be selected in this same frame.
+                self.binding = texture_binding(context, handle)?;
+                self.ready = true;
+                Ok(())
+            }
+            EzGfxResult::NotReady => {
+                self.binding = self.fallback_binding;
+                Ok(())
+            }
+            terminal => {
+                // Keep rendering with the ready fallback and retire the failed handle.
+                unload_texture(context, handle);
+                self.handle = None;
+                self.binding = self.fallback_binding;
+                Err(terminal)
+            }
+        }
+    }
+
+    fn unload(&mut self, context: ContextHandle) {
+        if let Some(handle) = self.handle.take() {
+            unload_texture(context, handle);
+        }
+    }
+}
+
+fn render_frame(
+    context: ContextHandle,
+    surface: SurfaceHandle,
+    shader: ShaderHandle,
+    indirect: IndirectBufferHandle,
+    positions: StructuredBufferHandle,
+    pipeline_state: DynamicPipelineState,
+    mvp: [[f32; 4]; 4],
+    texture: &mut StreamedTexture,
+) -> Result<(), EzGfxResult> {
+    // A terminal error is reported, but the frame can still use the fallback.
+    if let Err(error) = texture.poll(context) {
+        eprintln!("texture load failed: {error:?}");
+    }
+
+    let push = Push {
+        mvp,
+        texture_id: texture.binding,
+        padding: [0; 3],
+    };
+    let bindings = [PublicBinding {
+        name: "positions".to_owned(),
+        resource: ResourceIdentity::Structured(positions),
+    }];
+
+    status(begin_render(context, surface))?;
+    status(render_add_graphics(
+        context,
+        shader,
+        indirect,
+        &bindings,
+        pipeline_state,
+        bytes_of(&push),
+    ))?;
+    status(finish_render(context))
+}
+
+fn status(value: EzGfxResult) -> Result<(), EzGfxResult> {
+    match value {
+        EzGfxResult::Ok => Ok(()),
+        error => Err(error),
+    }
+}
+```
+
+The fallback must already be resident and have its binding cached. If initial `load_texture` returns `QueueFull`, no handle escaped: retain the fallback and retry admission in a later frame. After successful admission, `NotReady` retains the fallback. `InvalidArgument`, `InvalidContext`, `NativeFailure`, `Unsupported`, `DeviceLost`, `QueueFull`, or `Cancelled` is terminal when returned while progressing the request; log it, unload the handle when still owned, and decide whether the application can continue.
+
+The ready-use point is the successful `texture_binding` call inside `poll`, before `begin_render`. The next `Push.texture_id` may select that index in the same frame. Do not add the texture to `PublicBinding`: that interface names structured, indirect, and render-target resources. The shader uses the index instead:
+
+```slang
+[BindlessTextureHeap(EZ_GFX_MAX_TEXTURES)]
+ParameterBlock<TextureHeap> texture_heap;
+
+TextureEntry entry = texture_heap.entries[push.texture_id];
+float4 color = entry.texture.Sample(entry.sampler, uv);
+```
+
+## C ABI load and render flow
+
+The C ABI uses the same ordering. This excerpt assumes `context`, `surface`, `png_bytes`, `png_size`, `fallback_binding`, `shader`, `indirect`, buffer `bindings`, `binding_count`, `dynamic_state`, and `current_mvp` are already valid:
+
+```c
+typedef struct TexturePush {
+    float mvp[16];
+    uint32_t texture_id;
+    uint32_t padding[3];
+} TexturePush;
+
+EzGfxTextureDesc desc = {0};
+desc.source_format = EzGfxSourceTextureFormat_Png;
+desc.destination_format = EzGfxTextureDestinationFormat_Rgba8Unorm;
+desc.generate_mips = 1;
+desc.min_filter = EzGfxTextureFilter_Linear;
+desc.mag_filter = EzGfxTextureFilter_Linear;
+desc.max_anisotropy = 1.0f;
+desc.address_mode_u = EzGfxTextureAddressMode_ClampToEdge;
+desc.address_mode_v = EzGfxTextureAddressMode_ClampToEdge;
+desc.address_mode_w = EzGfxTextureAddressMode_ClampToEdge;
+
+EzGfxTexture texture = 0;
+uint32_t texture_binding = fallback_binding;
+int texture_ready = 0;
+
+EzGfxResult result =
+    ez_gfx_texture_load(png_bytes, png_size, &desc, &texture, context);
+if (result == EzGfxResult_QueueFull) {
+    /* No handle escaped. Keep the fallback and retry load in a later frame. */
+} else if (result != EzGfxResult_Ok) {
+    /* Invalid input/context is terminal; no texture handle was produced. */
+}
+
+/* Once per frame, before ez_gfx_begin_render: */
+if (texture != 0 && !texture_ready) {
+    result = ez_gfx_texture_poll(texture, context);
+    if (result == EzGfxResult_Ok) {
+        result = ez_gfx_texture_get_binding(texture, &texture_binding, context);
+        if (result == EzGfxResult_Ok) {
+            texture_ready = 1; /* Usable in the frame begun below. */
+        }
+    }
+    if (result != EzGfxResult_Ok && result != EzGfxResult_NotReady) {
+        fprintf(stderr, "texture load failed: %u\n", (unsigned)result);
+        ez_gfx_texture_unload(texture, context);
+        texture = 0;
+        texture_binding = fallback_binding;
+    }
+}
+
+TexturePush push = {0};
+memcpy(push.mvp, current_mvp, sizeof(push.mvp));
+push.texture_id = texture_binding;
+
+result = ez_gfx_begin_render(surface, context);
+if (result != EzGfxResult_Ok) goto cleanup;
+
+result = ez_gfx_render_add_vertex_pipeline(
+    shader,
+    indirect,
+    bindings,
+    binding_count,
+    &dynamic_state,
+    &push,
+    (uint32_t)sizeof(push),
+    context);
+if (result != EzGfxResult_Ok) goto cleanup;
+
+result = ez_gfx_finish_render(context);
+if (result != EzGfxResult_Ok) {
+    /* Submission failed and presentation was skipped. */
+    goto cleanup;
+}
+cleanup:
+
+/* During early cleanup; context destruction also owns terminal cleanup. */
+if (texture != 0) {
+    ez_gfx_texture_unload(texture, context);
+}
+```
+
+`ez_gfx_texture_load` writes `texture` only on success. The source bytes and descriptor need remain valid only through that call. `ez_gfx_texture_get_binding` writes its output only on success. As in Rust, C `EzGfxBinding` does not carry a sampled texture; pass the cached heap index through shader data such as push constants.
+
+## Frame-graph readiness
+
+Polling before binding is the public usage rule. Separately, once the owner thread has created the native texture and admitted its transfer, frame recording interns native-created textures with their texture-transfer completion tokens. The compiled graph lowers those tokens into transfer-to-graphics waits before sampled access. `frame_enqueue_readback` applies the same readiness token before transfer readback.
+
+This is a submission-safety net, not an alternate readiness interface. A pending request has no public bindless index, so application code must not guess an index or select it in shader data. Continue selecting the fallback until `poll_texture_load` and `texture_binding` succeed. Recording graphics while another native-admitted texture is pending can still order GPU graphics behind that upload because the current graphics graph declares native-created textures as sampled resources; this does not block the CPU polling call.
 
 ## Lifecycle
 
