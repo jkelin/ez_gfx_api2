@@ -201,3 +201,32 @@ fn resource_states_validate_queue_stage_access_combinations() {
         .is_ok()
     );
 }
+
+#[test]
+fn staging_buckets_round_up_with_hard_bounds() {
+    use ez_gfx_hal::{StagingPolicy, staging_bucket_size};
+
+    let policy = StagingPolicy::new(64 * 1024, 16 * 1024 * 1024, 32 * 1024 * 1024, 64).unwrap();
+    assert_eq!(staging_bucket_size(1, policy).unwrap(), 64 * 1024);
+    assert_eq!(staging_bucket_size(64 * 1024, policy).unwrap(), 64 * 1024);
+    assert_eq!(
+        staging_bucket_size(64 * 1024 + 1, policy).unwrap(),
+        128 * 1024
+    );
+    assert_eq!(
+        staging_bucket_size(16 * 1024 * 1024, policy).unwrap(),
+        16 * 1024 * 1024
+    );
+    assert!(staging_bucket_size(0, policy).is_err());
+    assert!(staging_bucket_size(16 * 1024 * 1024 + 1, policy).is_err());
+}
+
+#[test]
+fn transfer_batch_policy_flushes_on_count_or_bytes() {
+    use ez_gfx_hal::StagingPolicy;
+
+    let policy = StagingPolicy::new(64, 1024, 512, 4).unwrap();
+    assert!(!policy.should_flush(3, 511));
+    assert!(policy.should_flush(4, 1));
+    assert!(policy.should_flush(1, 512));
+}

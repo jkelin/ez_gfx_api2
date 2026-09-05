@@ -458,10 +458,23 @@ impl CpuPool {
     where
         F: FnOnce() + Send + 'static,
     {
+        self.submit_sized(0, job)
+    }
+
+    /// Schedules a CPU job after reserving job-count and input-byte budgets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssetError::Cancelled`] when shut down or
+    /// [`AssetError::QueueFull`] when either budget is exhausted.
+    pub fn submit_sized<F>(&self, bytes: usize, job: F) -> Result<(), AssetError>
+    where
+        F: FnOnce() + Send + 'static,
+    {
         if self.cancelled.load(Ordering::Acquire) {
             return Err(AssetError::Cancelled);
         }
-        let permit = self.permit(0)?;
+        let permit = self.permit(bytes)?;
         let cancelled = self.cancelled.clone();
         self.pool.spawn(move || {
             let _permit = permit;
@@ -470,6 +483,11 @@ impl CpuPool {
             }
         });
         Ok(())
+    }
+
+    /// Returns the number of accepted jobs that have not finished.
+    pub fn in_flight_jobs(&self) -> usize {
+        self.jobs.load(Ordering::Acquire)
     }
     /// Runs a job and publishes its result as an asset event.
     ///
@@ -739,3 +757,61 @@ impl fmt::Display for AssetError {
     }
 }
 impl std::error::Error for AssetError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn cpu_job_admission_returns_before_the_admitted_work_finishes() {
+        let pool = CpuPool::new(1, 2, 8).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        pool.submit_sized(4, move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        })
+        .unwrap();
+        started_rx.recv().unwrap();
+        assert_eq!(pool.in_flight_jobs(), 1);
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn cpu_pool_rejects_work_while_the_job_budget_is_exhausted() {
+        let pool = CpuPool::new(1, 1, 8).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        pool.submit(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        })
+        .unwrap();
+        started_rx.recv().unwrap();
+
+        assert_eq!(pool.submit(|| {}), Err(AssetError::QueueFull));
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn cpu_pool_releases_byte_budget_only_after_work_finishes() {
+        let pool = CpuPool::new(1, 2, 4).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        pool.submit_sized(4, move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        })
+        .unwrap();
+        started_rx.recv().unwrap();
+
+        assert_eq!(pool.submit_sized(1, || {}), Err(AssetError::QueueFull));
+        release_tx.send(()).unwrap();
+        while pool.in_flight_jobs() != 0 {
+            std::thread::yield_now();
+        }
+        assert!(pool.submit_sized(1, || {}).is_ok());
+    }
+}

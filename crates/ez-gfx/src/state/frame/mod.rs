@@ -64,6 +64,12 @@ fn intern_buffer_resource(
         .frame
         .set_resource_initial_state(resource, initial)
         .map_err(|error| map_frame(&error))?;
+    if let Some(ready) = context.allocation_ready.get(&handle).copied() {
+        context
+            .frame
+            .set_resource_ready(resource, ready)
+            .map_err(|error| map_frame(&error))?;
+    }
     context.frame_resources.insert(handle, resource);
     context
         .frame_native_resources

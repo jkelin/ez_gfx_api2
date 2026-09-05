@@ -3,9 +3,9 @@ use super::{
     AllocatorCreateDesc, BACKEND, CompressionSupport, DEFAULT_ALLOCATION_BLOCK_POLICY,
     DeferredNativeResource, DeferredResource, FRAMES_IN_FLIGHT, FrameSlot, FrameSlotTracker,
     HalError, MTLArgumentBuffersTier, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue,
-    MTLCreateSystemDefaultDevice, MTLDevice, NativeContext, NativeSurface, SemanticProfile,
-    TEXTURE_DESCRIPTOR_CAPACITY, complete_deferred_slot, map_allocation_hal, map_allocator,
-    map_allocator_hal,
+    MTLCreateSystemDefaultDevice, MTLDevice, MemoryAllocator, NativeContext, NativeSurface,
+    QueueKind, SemanticProfile, TEXTURE_DESCRIPTOR_CAPACITY, complete_deferred_slot,
+    map_allocation_hal, map_allocator, map_allocator_hal,
 };
 
 impl NativeContext {
@@ -17,6 +17,8 @@ impl NativeContext {
     pub fn create_default() -> Result<Self, HalError> {
         let device = MTLCreateSystemDefaultDevice().ok_or(HalError::Unsupported)?;
         let queue = device.newCommandQueue().ok_or(HalError::NativeFailure)?;
+        let transfer_queue = device.newCommandQueue().ok_or(HalError::NativeFailure)?;
+        let texture_queue = device.newCommandQueue().ok_or(HalError::NativeFailure)?;
         let tier_two = device.argumentBuffersSupport() == MTLArgumentBuffersTier::Tier2;
         let sampler_capacity =
             u32::try_from(device.maxArgumentBufferSamplerCount()).unwrap_or(u32::MAX);
@@ -70,9 +72,15 @@ impl NativeContext {
             create_residency_set: false,
         })
         .map_err(map_allocator_hal)?;
+        let transfer_worker =
+            super::transfer::start_worker().map_err(|_| HalError::NativeFailure)?;
+        let texture_worker =
+            super::transfer::start_worker().map_err(|_| HalError::NativeFailure)?;
         Ok(Self {
             device,
             queue,
+            transfer_queue,
+            texture_queue,
             allocator: Some(allocator),
             retired: Vec::new(),
             frame_slots: (0..FRAMES_IN_FLIGHT)
@@ -86,6 +94,13 @@ impl NativeContext {
             adapter,
             next_transfer_value: 1,
             completed_transfer_value: 0,
+            pending_transfers: Vec::new(),
+            transfer_worker: Some(transfer_worker),
+            next_texture_value: 1,
+            completed_texture_value: 0,
+            pending_texture_transfers: Vec::new(),
+            texture_worker: Some(texture_worker),
+            texture_staging: ez_gfx_hal::ReusableStagingPool::new(256),
         })
     }
 
@@ -112,11 +127,47 @@ impl NativeContext {
     ///
     /// Returns an error if a command buffer cannot be created, submitted work fails to complete successfully, or reclaiming a deferred allocation fails.
     pub fn wait_idle(&mut self) -> Result<(), HalError> {
+        self.transfer_worker
+            .as_ref()
+            .ok_or(HalError::NativeFailure)?
+            .flush()
+            .map_err(|_| HalError::NativeFailure)?;
+        self.texture_worker
+            .as_ref()
+            .ok_or(HalError::NativeFailure)?
+            .flush()
+            .map_err(|_| HalError::NativeFailure)?;
+        let transfer = self
+            .transfer_queue
+            .commandBuffer()
+            .ok_or(HalError::NativeFailure)?;
+        transfer.commit();
+        transfer.waitUntilCompleted();
+        let transfer_failed =
+            transfer.status() != MTLCommandBufferStatus::Completed || transfer.error().is_some();
+        let texture = self
+            .texture_queue
+            .commandBuffer()
+            .ok_or(HalError::NativeFailure)?;
+        texture.commit();
+        texture.waitUntilCompleted();
+        let texture_failed =
+            texture.status() != MTLCommandBufferStatus::Completed || texture.error().is_some();
         let command = self.queue.commandBuffer().ok_or(HalError::NativeFailure)?;
         command.commit();
         command.waitUntilCompleted();
-        let failed =
-            command.status() != MTLCommandBufferStatus::Completed || command.error().is_some();
+        let failed = transfer_failed
+            || texture_failed
+            || command.status() != MTLCommandBufferStatus::Completed
+            || command.error().is_some();
+        self.completed_transfer_value = self.next_transfer_value.saturating_sub(1);
+        self.reclaim(QueueKind::Transfer, self.completed_transfer_value)
+            .map_err(map_allocation_hal)?;
+        self.pending_transfers.clear();
+        self.completed_texture_value = self.next_texture_value.saturating_sub(1);
+        self.reclaim(QueueKind::TextureTransfer, self.completed_texture_value)
+            .map_err(map_allocation_hal)?;
+        self.pending_texture_transfers.clear();
         for slot in 0..self.frame_slots.len() {
             self.frame_slots[slot].command = None;
             self.frame_tracker.mark_completed(slot);

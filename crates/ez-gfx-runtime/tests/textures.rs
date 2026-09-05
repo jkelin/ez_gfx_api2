@@ -182,7 +182,7 @@ fn ktx2_basislz_transcodes_every_mip_to_rgba8() {
 }
 
 #[test]
-fn residency_binding_and_events_follow_upload_completion() {
+fn polling_reports_not_ready_until_transfer_tokens_reach_ready() {
     let mut registry = TextureRegistry::new(2, 4).unwrap();
     let texture = registry.begin_upload().unwrap();
     let ready = CompletionToken::new(QueueKind::Transfer, 3).unwrap();
@@ -236,6 +236,11 @@ fn cancel_upload_reuses_binding_without_emitting_public_events() {
 
     let replacement = registry.begin_upload().unwrap();
     assert_ne!(replacement, failed);
+    assert_eq!(registry.binding_index(failed), Err(TextureError::NotFound));
+    assert_eq!(
+        registry.cancel_upload(failed),
+        Err(TextureError::InvalidState)
+    );
     assert_eq!(registry.begin_upload(), Err(TextureError::CapacityExceeded));
 }
 

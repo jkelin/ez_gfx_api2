@@ -2,7 +2,9 @@ use super::{
     AllocationCreateDesc, AllocationError, AllocationRequest, AllocationScheme, BufferTransfer,
     CompletionToken, DeferredResource, FRAME_DESCRIPTOR_SET_CAPACITY, FRAMES_IN_FLIGHT, FrameSlot,
     HalError, MemoryAllocator, MemoryClass, MemoryLocation, NativeAllocation, NativeContext,
-    QueueKind, ResourceAccess, ResourceState, RetiredAllocation, ShaderStage, vk,
+    QueueKind, ResourceAccess, ResourceState, RetiredAllocation, ShaderStage,
+    transfer::{VulkanTransferCopy, VulkanTransferJob},
+    vk,
 };
 
 impl MemoryAllocator for NativeContext {
@@ -13,17 +15,27 @@ impl MemoryAllocator for NativeContext {
         request: AllocationRequest,
     ) -> Result<Self::Allocation, AllocationError> {
         let device = self.device.as_ref().ok_or(AllocationError::NativeFailure)?;
-        let create = vk::BufferCreateInfo::default()
-            .size(request.size)
-            .usage(
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::VERTEX_BUFFER
-                    | vk::BufferUsageFlags::INDEX_BUFFER
-                    | vk::BufferUsageFlags::INDIRECT_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_SRC
-                    | vk::BufferUsageFlags::TRANSFER_DST,
-            )
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let queue_families = [
+            self.graphics_queue_family
+                .ok_or(AllocationError::NativeFailure)?,
+            self.transfer_queue_family
+                .ok_or(AllocationError::NativeFailure)?,
+        ];
+        let create = vk::BufferCreateInfo::default().size(request.size).usage(
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::VERTEX_BUFFER
+                | vk::BufferUsageFlags::INDEX_BUFFER
+                | vk::BufferUsageFlags::INDIRECT_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST,
+        );
+        let create = if queue_families[0] == queue_families[1] {
+            create.sharing_mode(vk::SharingMode::EXCLUSIVE)
+        } else {
+            create
+                .sharing_mode(vk::SharingMode::CONCURRENT)
+                .queue_family_indices(&queue_families)
+        };
         // SAFETY: the device is live and the descriptor contains no borrowed arrays.
         let buffer = unsafe { device.create_buffer(&create, None) }
             .map_err(|error| map_allocation_vk(map_vk(error)))?;
@@ -199,66 +211,30 @@ impl BufferTransfer for NativeContext {
     ) -> Result<CompletionToken, AllocationError> {
         validate_allocation_range(source.allocation.size(), source_offset, size)?;
         validate_allocation_range(destination.allocation.size(), destination_offset, size)?;
-        let device = self.device.as_ref().ok_or(AllocationError::NativeFailure)?;
-        let pool = self
-            .transfer_command_pool
-            .ok_or(AllocationError::NativeFailure)?;
-        // SAFETY: pool is this context's transfer command pool, &mut self serializes its host access, and the allocate-info storage spans allocate_command_buffers.
-        let command = unsafe {
-            device.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-        }
-        .map_err(|error| map_allocation_vk(map_vk(error)))?[0];
-        // SAFETY: command was just allocated in the initial state, and the one-time-submit begin-info storage spans begin_command_buffer.
-        unsafe {
-            device.begin_command_buffer(
-                command,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-        }
-        .map_err(|error| map_allocation_vk(map_vk(error)))?;
-        let copy = vk::BufferCopy {
-            src_offset: source_offset,
-            dst_offset: destination_offset,
-            size,
-        };
-        // SAFETY: command is recording, both buffers have the required transfer usages, the copied ranges were bounds-checked, and the BufferCopy storage spans cmd_copy_buffer.
-        unsafe {
-            device.cmd_copy_buffer(
-                command,
-                source.buffer,
-                destination.buffer,
-                core::slice::from_ref(&copy),
-            );
-        };
-        // SAFETY: command remains in the recording state established by begin_command_buffer and is exclusively accessed until end_command_buffer returns.
-        unsafe { device.end_command_buffer(command) }
-            .map_err(|error| map_allocation_vk(map_vk(error)))?;
         let value = self.next_transfer_value;
         self.next_transfer_value = value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
-        let semaphore = self
-            .transfer_timeline
+        let worker = self
+            .transfer_worker
+            .as_ref()
             .ok_or(AllocationError::NativeFailure)?;
-        let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
-            .signal_semaphore_values(core::slice::from_ref(&value));
-        let submit = vk::SubmitInfo::default()
-            .command_buffers(core::slice::from_ref(&command))
-            .signal_semaphores(core::slice::from_ref(&semaphore))
-            .push_next(&mut timeline);
-        // SAFETY: command is executable, &mut self serializes graphics_queue submission, and the SubmitInfo arrays plus timeline pNext storage span queue_submit.
-        unsafe {
-            device.queue_submit(
-                self.graphics_queue.ok_or(AllocationError::NativeFailure)?,
-                core::slice::from_ref(&submit),
-                vk::Fence::null(),
-            )
-        }
-        .map_err(|error| map_allocation_vk(map_vk(error)))?;
+        worker
+            .submit(VulkanTransferJob {
+                value,
+                bytes: size,
+                copy: VulkanTransferCopy::Buffer {
+                    source: source.buffer,
+                    destination: destination.buffer,
+                    region: vk::BufferCopy {
+                        src_offset: source_offset,
+                        dst_offset: destination_offset,
+                        size,
+                    },
+                },
+            })
+            .map_err(|error| match error {
+                ez_gfx_hal::TransferWorkerError::Full => AllocationError::OutOfMemory,
+                ez_gfx_hal::TransferWorkerError::Failed => AllocationError::NativeFailure,
+            })?;
         CompletionToken::new(QueueKind::Transfer, value).map_err(|_| AllocationError::NativeFailure)
     }
 
@@ -401,11 +377,12 @@ pub(super) fn map_allocator(error: &gpu_allocator::AllocationError) -> Allocatio
 
 impl Drop for NativeContext {
     fn drop(&mut self) {
-        if let Some(device) = self.device.as_ref() {
-            // SAFETY: context ownership prevents concurrent use during drop.
-            unsafe {
-                let _ = device.device_wait_idle();
-            }
+        let _ = self.wait_idle();
+        if let Some(mut worker) = self.transfer_worker.take() {
+            worker.shutdown();
+        }
+        if let Some(mut worker) = self.texture_worker.take() {
+            worker.shutdown();
         }
         for slot in &mut self.frame_slots {
             slot.in_flight = false;
@@ -419,6 +396,9 @@ impl Drop for NativeContext {
             let _ = self.destroy_deferred_now(resource);
         }
         let _ = self.destroy_depth_target();
+        for allocation in self.texture_staging.drain() {
+            let _ = self.free(allocation);
+        }
         while let Some(retired) = self.retired.pop() {
             let _ = self.free(retired.allocation);
         }
@@ -453,8 +433,32 @@ impl Drop for NativeContext {
                 // SAFETY: device_wait_idle was issued, so no transfer command buffer is pending when destroy_command_pool releases the pool and its command buffers.
                 unsafe { device.destroy_command_pool(pool, None) };
             }
+            if let Some(pool) = self.transfer_acquire_pool.take() {
+                // SAFETY: transfer worker shutdown and device_wait_idle completed before pool destruction.
+                unsafe { device.destroy_command_pool(pool, None) };
+            }
             if let Some(semaphore) = self.transfer_timeline.take() {
                 // SAFETY: device_wait_idle was issued before the taken transfer timeline semaphore is passed once to destroy_semaphore with its creation allocator None.
+                unsafe { device.destroy_semaphore(semaphore, None) };
+            }
+            if let Some(semaphore) = self.transfer_ownership_timeline.take() {
+                // SAFETY: transfer worker shutdown and device_wait_idle completed before semaphore destruction.
+                unsafe { device.destroy_semaphore(semaphore, None) };
+            }
+            if let Some(pool) = self.texture_command_pool.take() {
+                // SAFETY: texture worker shutdown and device idle completed before pool destruction.
+                unsafe { device.destroy_command_pool(pool, None) };
+            }
+            if let Some(pool) = self.texture_acquire_pool.take() {
+                // SAFETY: texture worker shutdown and device idle completed before pool destruction.
+                unsafe { device.destroy_command_pool(pool, None) };
+            }
+            if let Some(semaphore) = self.texture_timeline.take() {
+                // SAFETY: texture worker shutdown and device idle completed before semaphore destruction.
+                unsafe { device.destroy_semaphore(semaphore, None) };
+            }
+            if let Some(semaphore) = self.texture_ownership_timeline.take() {
+                // SAFETY: texture worker shutdown and device idle completed before semaphore destruction.
                 unsafe { device.destroy_semaphore(semaphore, None) };
             }
             // SAFETY: all allocator-owned memory and child resources were released above.

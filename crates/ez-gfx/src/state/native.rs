@@ -279,15 +279,55 @@ pub(super) fn copy_native(
 }
 
 pub(super) fn completed_transfer_native(
-    context: &NativeContext,
+    context: &mut NativeContext,
 ) -> Result<u64, ez_gfx_hal::AllocationError> {
-    match context {
-        NativeContext::Vulkan(context) => context.completed_transfer_value(),
+    let completed = match context {
+        NativeContext::Vulkan(context) => context.completed_transfer_value()?,
         #[cfg(windows)]
-        NativeContext::Dx12(context) => context.completed_transfer_value(),
+        NativeContext::Dx12(context) => context.completed_transfer_value()?,
         #[cfg(target_vendor = "apple")]
-        NativeContext::Metal(context) => context.completed_transfer_value(),
+        NativeContext::Metal(context) => context.completed_transfer_value()?,
+    };
+    match context {
+        NativeContext::Vulkan(context) => {
+            context.reclaim(ez_gfx_hal::QueueKind::Transfer, completed)?;
+        }
+        #[cfg(windows)]
+        NativeContext::Dx12(context) => {
+            context.reclaim(ez_gfx_hal::QueueKind::Transfer, completed)?;
+        }
+        #[cfg(target_vendor = "apple")]
+        NativeContext::Metal(context) => {
+            context.reclaim(ez_gfx_hal::QueueKind::Transfer, completed)?;
+        }
     }
+    Ok(completed)
+}
+
+pub(super) fn completed_texture_transfer_native(
+    context: &mut NativeContext,
+) -> Result<u64, ez_gfx_hal::AllocationError> {
+    let completed = match context {
+        NativeContext::Vulkan(context) => context.completed_texture_transfer_value()?,
+        #[cfg(windows)]
+        NativeContext::Dx12(context) => context.completed_texture_transfer_value()?,
+        #[cfg(target_vendor = "apple")]
+        NativeContext::Metal(context) => context.completed_texture_transfer_value()?,
+    };
+    match context {
+        NativeContext::Vulkan(context) => {
+            context.reclaim(ez_gfx_hal::QueueKind::TextureTransfer, completed)?;
+        }
+        #[cfg(windows)]
+        NativeContext::Dx12(context) => {
+            context.reclaim(ez_gfx_hal::QueueKind::TextureTransfer, completed)?;
+        }
+        #[cfg(target_vendor = "apple")]
+        NativeContext::Metal(context) => {
+            context.reclaim(ez_gfx_hal::QueueKind::TextureTransfer, completed)?;
+        }
+    }
+    Ok(completed)
 }
 
 pub(super) fn free_native_allocation(

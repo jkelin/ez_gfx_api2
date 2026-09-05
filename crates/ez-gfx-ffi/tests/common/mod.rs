@@ -1,5 +1,3 @@
-#![cfg(windows)]
-
 use std::sync::Once;
 
 use ez_gfx_ffi::{

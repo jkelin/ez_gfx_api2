@@ -9,7 +9,7 @@ use ez_gfx_hal::{
     BufferTransfer, CompletionToken, CullMode, DEFAULT_ALLOCATION_BLOCK_POLICY,
     DynamicPipelineState, ExecutionBarrier, ExecutionPass, FrontFace, HalError, ImageMip,
     MemoryAllocator, MemoryClass, PrimitiveTopology, QueueKind, ResourceAccess, SamplerAddressMode,
-    SamplerFilter, ShaderBufferLayout, TextureSamplerDesc, validate_rgba8_mips,
+    SamplerFilter, ShaderBufferLayout, TextureSamplerDesc, TransferWorker, validate_rgba8_mips,
 };
 use gpu_allocator::{
     AllocationSizes, MemoryLocation,
@@ -41,9 +41,10 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT, D3D12_GRAPHICS_PIPELINE_STATE_DESC,
     D3D12_INDEX_BUFFER_VIEW, D3D12_INDIRECT_ARGUMENT_DESC, D3D12_INDIRECT_ARGUMENT_DESC_0,
     D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, D3D12_LOGIC_OP_NOOP,
-    D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE, D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT,
-    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_RASTERIZER_DESC, D3D12_RENDER_TARGET_BLEND_DESC,
-    D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE,
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+    D3D12_RASTERIZER_DESC, D3D12_RENDER_TARGET_BLEND_DESC, D3D12_RESOURCE_BARRIER,
+    D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
     D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
     D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
     D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_READ,
@@ -70,21 +71,24 @@ use windows::{
         Graphics::{
             Direct3D::{D3D_FEATURE_LEVEL_12_1, ID3DBlob},
             Direct3D12::{
-                D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC,
-                D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, D3D12_FEATURE_D3D12_OPTIONS,
-                D3D12_FEATURE_DATA_D3D12_OPTIONS, D3D12_FENCE_FLAG_NONE, D3D12_RANGE,
+                D3D12_COMMAND_LIST_TYPE_COPY, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                D3D12_COMMAND_QUEUE_DESC, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+                D3D12_FEATURE_D3D12_OPTIONS, D3D12_FEATURE_DATA_D3D12_OPTIONS,
+                D3D12_FENCE_FLAG_NONE, D3D12_RANGE, D3D12_RENDER_TARGET_VIEW_DESC,
                 D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER,
                 D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_NONE,
                 D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                D3D12CreateDevice, ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue,
-                ID3D12Device, ID3D12Fence, ID3D12GraphicsCommandList, ID3D12Resource,
+                D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RTV_DIMENSION_TEXTURE2D,
+                D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12CreateDevice, ID3D12CommandAllocator,
+                ID3D12CommandList, ID3D12CommandQueue, ID3D12Device, ID3D12Fence,
+                ID3D12GraphicsCommandList, ID3D12Resource,
             },
             Dxgi::{
                 Common::{
                     DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
-                    DXGI_FORMAT_R32_UINT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+                    DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_UNKNOWN,
+                    DXGI_SAMPLE_DESC,
                 },
                 CreateDXGIFactory1, DXGI_ADAPTER_FLAG3_SOFTWARE, DXGI_ERROR_NOT_FOUND,
                 DXGI_ERROR_UNSUPPORTED, DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
@@ -228,12 +232,6 @@ struct RetiredAllocation {
     completion: CompletionToken,
 }
 
-struct PendingCopy {
-    completion: CompletionToken,
-    _allocator: ID3D12CommandAllocator,
-    _list: ID3D12GraphicsCommandList,
-}
-
 const FRAMES_IN_FLIGHT: usize = 3;
 
 struct FrameSlot {
@@ -313,11 +311,17 @@ pub struct NativeContext {
     pub device: ID3D12Device,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
+    transfer_fence: ID3D12Fence,
+    texture_fence: ID3D12Fence,
+    transfer_worker: Option<TransferWorker<transfer::Dx12TransferJob>>,
+    texture_worker: Option<TransferWorker<transfer::Dx12TransferJob>>,
     fence_event: HANDLE,
     next_fence: u64,
+    next_transfer_fence: u64,
+    next_texture_fence: u64,
     allocator: Option<Allocator>,
     retired: Vec<RetiredAllocation>,
-    pending_copies: Vec<PendingCopy>,
+    texture_staging: ez_gfx_hal::ReusableStagingPool<NativeAllocation>,
     frame_slots: Vec<FrameSlot>,
     frame_cursor: usize,
     deferred: Vec<DeferredNativeResource>,
@@ -340,10 +344,8 @@ use commands::{
 mod device;
 mod frame;
 mod memory;
-use memory::{
-    adapter_id, map_allocation_windows, map_allocator, map_allocator_hal, map_hal_allocation,
-    map_windows,
-};
+use memory::{adapter_id, map_allocation_windows, map_allocator, map_allocator_hal, map_windows};
 mod pipeline;
 mod surface;
 mod texture;
+mod transfer;

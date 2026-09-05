@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define EZ_GFX_ABI_VERSION 19u
+#define EZ_GFX_ABI_VERSION 20u
 
 #if defined(__clang__)
 #  if __has_attribute(access)
@@ -59,7 +59,9 @@ typedef uint64_t EzGfxRenderTarget;
  * @EzGfxResult_InvalidArgument: A public argument failed validation.
  * @EzGfxResult_InvalidContext: The context is null, stale, or does not own the resource.
  * @EzGfxResult_NativeFailure: The native graphics operation failed.
- * @EzGfxResult_NotReady: The operation is temporarily unavailable, such as a minimized surface.
+ * @EzGfxResult_NotReady: The operation is temporarily unavailable, such as a minimized surface or pending texture.
+ * @EzGfxResult_QueueFull: A bounded asynchronous queue has no available capacity.
+ * @EzGfxResult_Cancelled: The asynchronous operation was cancelled before completion.
  *
  * Result returned by context, surface, shader, buffer, and render operations.
  */
@@ -72,6 +74,8 @@ enum {
     EzGfxResult_NotReady = 4,
     EzGfxResult_Unsupported = 5,
     EzGfxResult_DeviceLost = 6,
+    EzGfxResult_QueueFull = 7,
+    EzGfxResult_Cancelled = 8,
 };
 
 /**
@@ -584,6 +588,10 @@ EzGfxResult ez_gfx_shader_load_artifact(const uint8_t *data, size_t data_size, E
 void ez_gfx_shader_destroy(EzGfxShader shader, EzGfxContext context);
 /** Decodes validated image/KTX2 bytes, including BasisLZ ETC1S and UASTC payloads, then starts an asynchronous GPU upload. */
 EzGfxResult ez_gfx_texture_load(const uint8_t *data, size_t data_size, const EzGfxTextureDesc *desc, EzGfxTexture *out_texture, EzGfxContext context) EZ_GFX_ACCESS(read_only, 1, 2) EZ_GFX_ACCESS(read_only, 3) EZ_GFX_ACCESS(write_only, 4);
+/** Polls decode and GPU transfer readiness without blocking. */
+EzGfxResult ez_gfx_texture_poll(EzGfxTexture texture, EzGfxContext context);
+/** Cancels a texture before native transfer submission. */
+EzGfxResult ez_gfx_texture_cancel(EzGfxTexture texture, EzGfxContext context);
 /** Returns the stable bindless index once upload completion makes the texture resident. */
 EzGfxResult ez_gfx_texture_get_binding(EzGfxTexture texture, uint32_t *out_binding, EzGfxContext context) EZ_GFX_ACCESS(write_only, 2);
 /** Reports completed mip residency and the immutable decoded mip count; resident may be zero while transfers are pending. */

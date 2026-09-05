@@ -19,8 +19,8 @@ use ez_gfx::{
     SurfacePlatform, TextureHandle, TextureSamplerDesc, TextureSource,
 };
 
-/// Identifies C ABI revision 19 for compatibility checks.
-pub const EZ_GFX_ABI_VERSION: u32 = 19;
+/// Identifies C ABI revision 20 for compatibility checks.
+pub const EZ_GFX_ABI_VERSION: u32 = 20;
 /// Caps any caller-provided byte range at 16 MiB.
 pub const EZ_GFX_MAX_BOUNDARY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -362,7 +362,25 @@ pub unsafe extern "C" fn ez_gfx_texture_load(
         }
     })
 }
-
+#[unsafe(no_mangle)]
+/// Polls asynchronous decode and transfer readiness for one texture.
+pub extern "C" fn ez_gfx_texture_poll(texture: EzGfxTexture, context: EzGfxContext) -> EzGfxResult {
+    catch_status(|| {
+        let texture = try_handle!(TextureHandle, texture);
+        ez_gfx::poll_texture_load(try_handle!(ContextHandle, context), texture)
+    })
+}
+#[unsafe(no_mangle)]
+/// Cancels a texture request before native transfer submission.
+pub extern "C" fn ez_gfx_texture_cancel(
+    texture: EzGfxTexture,
+    context: EzGfxContext,
+) -> EzGfxResult {
+    catch_status(|| {
+        let texture = try_handle!(TextureHandle, texture);
+        ez_gfx::cancel_texture_load(try_handle!(ContextHandle, context), texture)
+    })
+}
 #[unsafe(no_mangle)]
 /// Queries the binding index assigned to a loaded texture.
 ///
@@ -390,7 +408,6 @@ pub unsafe extern "C" fn ez_gfx_texture_get_binding(
         }
     })
 }
-
 #[unsafe(no_mangle)]
 /// Queries the resident and total mip counts for a loaded texture.
 ///
@@ -422,7 +439,6 @@ pub unsafe extern "C" fn ez_gfx_texture_get_residency(
         }
     })
 }
-
 #[unsafe(no_mangle)]
 /// Unloads a texture from the context.
 pub extern "C" fn ez_gfx_texture_unload(texture: EzGfxTexture, context: EzGfxContext) {

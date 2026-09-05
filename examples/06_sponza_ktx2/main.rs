@@ -135,6 +135,7 @@ mod renderer {
             )
             .map_err(|error| anyhow::anyhow!("{error:?}"))
             .context("load Sponza fallback")?;
+            status(wait_idle(context), "wait for Sponza fallback")?;
             let fallback_binding = texture_binding(context, fallback)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))
                 .context("resolve fallback binding")?;
@@ -160,6 +161,7 @@ mod renderer {
                             return Err(anyhow::anyhow!("{error:?}").context("load Sponza KTX2"));
                         }
                     };
+                status(wait_idle(context), "wait for Sponza texture")?;
                 let binding = texture_binding(context, texture)
                     .map_err(|error| anyhow::anyhow!("{error:?}"))
                     .context("resolve Sponza texture binding")?;

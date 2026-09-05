@@ -1,6 +1,6 @@
 use super::{
-    AllocationRequest, AttachmentLoadOp, AttachmentStoreOp, CAMetalDrawable, CAMetalLayer,
-    CullMode, FrontFace, HalError, MAX_ARGUMENT_BUFFERS_PER_SLOT, MTLArgumentEncoder,
+    AllocationRequest, AttachmentLoadOp, AttachmentStoreOp, BufferTransfer, CAMetalDrawable,
+    CAMetalLayer, CullMode, FrontFace, HalError, MAX_ARGUMENT_BUFFERS_PER_SLOT, MTLArgumentEncoder,
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus,
     MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState,
     MTLCullMode, MTLDevice, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
@@ -641,11 +641,16 @@ impl NativeContext {
             return Err(HalError::InvalidArgument);
         }
         for action in actions {
-            if let NativeFrameAction::Wait(token) = action
-                && (token.queue != QueueKind::Transfer
-                    || token.value > self.completed_transfer_value)
-            {
-                return Err(HalError::InvalidArgument);
+            if let NativeFrameAction::Wait(token) = action {
+                let completed = match token.queue {
+                    QueueKind::Transfer => self.completed_transfer_value(),
+                    QueueKind::TextureTransfer => self.completed_texture_transfer_value(),
+                    _ => return Err(HalError::InvalidArgument),
+                }
+                .map_err(map_allocation_hal)?;
+                if token.value > completed {
+                    return Err(HalError::InvalidArgument);
+                }
             }
         }
         if actions.iter().any(|action| {

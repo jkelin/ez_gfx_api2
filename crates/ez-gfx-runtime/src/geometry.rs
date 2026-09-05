@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use ez_gfx_hal::{CompletionToken, QueueKind};
+use ez_gfx_hal::{CompletionToken, DEFAULT_STAGING_POLICY, QueueKind, staging_bucket_size};
 
 const MAX_HEAP_NAME_BYTES: usize = 255;
 
@@ -355,9 +355,8 @@ impl StagingPool {
         size: u64,
         completed_transfer: u64,
     ) -> Result<StagingSlot, GeometryError> {
-        if size == 0 {
-            return Err(GeometryError::InvalidCount);
-        }
+        let bucket = staging_bucket_size(size, DEFAULT_STAGING_POLICY)
+            .map_err(|_| GeometryError::InvalidCount)?;
         if let Some((index, entry)) = self.entries.iter_mut().enumerate().find(|(_, entry)| {
             !entry.in_use
                 && entry.capacity >= size
@@ -375,13 +374,25 @@ impl StagingPool {
             return Err(GeometryError::StagingPoolExhausted);
         }
         self.entries.push(StagingEntry {
-            capacity: size,
+            capacity: bucket,
             in_use: true,
             retirement: None,
         });
         let slot = u32::try_from(self.entries.len() - 1)
             .map_err(|_| GeometryError::StagingPoolExhausted)?;
         Ok(StagingSlot(slot))
+    }
+
+    /// Returns the allocated byte capacity of a staging slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeometryError::InvalidStagingSlot`] when the slot does not exist.
+    pub fn slot_capacity(&self, slot: StagingSlot) -> Result<u64, GeometryError> {
+        self.entries
+            .get(slot.0 as usize)
+            .map(|entry| entry.capacity)
+            .ok_or(GeometryError::InvalidStagingSlot)
     }
 
     /// Releases a submitted slot after associating its transfer completion token.

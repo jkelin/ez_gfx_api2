@@ -85,6 +85,16 @@ fn staging_pool_reuses_only_completed_compatible_slots() {
 }
 
 #[test]
+fn staging_pool_allocates_power_of_two_buckets() {
+    let mut pool = StagingPool::new(2).unwrap();
+    let small = pool.checkout(1, 0).unwrap();
+    let large = pool.checkout(65 * 1024, 0).unwrap();
+
+    assert_eq!(pool.slot_capacity(small).unwrap(), 64 * 1024);
+    assert_eq!(pool.slot_capacity(large).unwrap(), 128 * 1024);
+}
+
+#[test]
 fn staging_pool_rejects_non_transfer_retirement_tokens() {
     let mut pool = StagingPool::new(1).unwrap();
     let slot = pool.checkout(64, 0).unwrap();

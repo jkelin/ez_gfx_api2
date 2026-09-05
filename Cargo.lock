@@ -704,7 +704,9 @@ name = "ez-gfx"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "crossbeam-channel",
  "ez-gfx-artifact",
+ "ez-gfx-assets",
  "ez-gfx-backend-dx12",
  "ez-gfx-backend-metal",
  "ez-gfx-backend-vulkan",
@@ -767,6 +769,7 @@ dependencies = [
  "ez-gfx-core",
  "ez-gfx-hal",
  "gpu-allocator",
+ "parking_lot",
 ]
 
 [[package]]

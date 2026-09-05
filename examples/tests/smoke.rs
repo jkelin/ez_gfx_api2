@@ -2,7 +2,10 @@
 #[path = "../shared/mod.rs"]
 mod shared;
 use anyhow::Context as _;
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 const BINARIES: [(&str, &str, &str, u32); 6] = [
     (
@@ -39,20 +42,32 @@ const BINARIES: [(&str, &str, &str, u32); 6] = [
 ];
 
 #[cfg(target_vendor = "apple")]
-fn target_backend() -> &'static str {
-    "metal"
-}
+const TARGET_BACKENDS: &[&str] = &["metal"];
+#[cfg(windows)]
+const TARGET_BACKENDS: &[&str] = &["vulkan", "dx12"];
+#[cfg(all(not(windows), not(target_vendor = "apple")))]
+const TARGET_BACKENDS: &[&str] = &["vulkan"];
+static CAPTURE_ID: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(not(target_vendor = "apple"))]
-fn target_backend() -> &'static str {
-    "vulkan"
-}
-
-fn snapshot(binary: &str, file: &str) -> anyhow::Result<(String, image::RgbaImage)> {
+fn snapshot(binary: &str, file: &str, backend: &str) -> anyhow::Result<(String, image::RgbaImage)> {
     let reference = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("snapshots")
         .join(file);
-    let mut command = shared::snapshot_command(binary, &reference, target_backend());
+    // Secondary backends use isolated captures because rasterization permits backend-specific edge pixels.
+    let temporary = backend != TARGET_BACKENDS[0];
+    let path = if temporary {
+        std::env::temp_dir().join(format!(
+            "ez-gfx-smoke-{}-{}-{backend}-{file}",
+            std::process::id(),
+            CAPTURE_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    } else {
+        reference
+    };
+    let mut command = shared::snapshot_command(binary, &path, backend);
+    if temporary {
+        command.env("EZ_GFX_UPDATE_SNAPSHOTS", "1");
+    }
     #[cfg(target_vendor = "apple")]
     command.env("MTL_DEBUG_LAYER", "1");
     let output = command
@@ -76,8 +91,8 @@ fn snapshot(binary: &str, file: &str) -> anyhow::Result<(String, image::RgbaImag
         "{binary} emitted no runtime events"
     );
     assert_eq!(fields[7], "0", "{binary} dropped observations");
-    let image = image::open(reference)
-        .context("open immutable snapshot")?
+    let image = image::open(&path)
+        .with_context(|| format!("open {backend} snapshot"))?
         .into_rgba8();
     assert_eq!(
         image.dimensions(),
@@ -89,6 +104,9 @@ fn snapshot(binary: &str, file: &str) -> anyhow::Result<(String, image::RgbaImag
         blake3::hash(image.as_raw()).to_string(),
         "{binary} report/image hash mismatch"
     );
+    if temporary {
+        let _ = std::fs::remove_file(path);
+    }
     Ok((report, image))
 }
 
@@ -133,8 +151,10 @@ macro_rules! independent_scene_test {
         #[test]
         fn $test() -> anyhow::Result<()> {
             let (name, file, binary, min_events) = BINARIES[$index];
-            let (report, image) = snapshot(binary, file)?;
-            assert_semantics(name, &report, &image, min_events);
+            for backend in TARGET_BACKENDS {
+                let (report, image) = snapshot(binary, file, backend)?;
+                assert_semantics(name, &report, &image, min_events);
+            }
             Ok(())
         }
     };
@@ -149,10 +169,13 @@ independent_scene_test!(sponza_ktx2_smoke, 5);
 
 #[test]
 fn triangle_snapshot_is_deterministic_across_processes() -> anyhow::Result<()> {
-    let (_, _, binary, _) = BINARIES[0];
-    assert_eq!(
-        snapshot(binary, BINARIES[0].1)?.0,
-        snapshot(binary, BINARIES[0].1)?.0
-    );
+    let (_, file, binary, _) = BINARIES[0];
+    for backend in TARGET_BACKENDS {
+        assert_eq!(
+            snapshot(binary, file, backend)?.0,
+            snapshot(binary, file, backend)?.0,
+            "{backend}"
+        );
+    }
     Ok(())
 }

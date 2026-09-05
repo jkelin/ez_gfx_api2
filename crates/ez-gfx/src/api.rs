@@ -16,4 +16,8 @@ pub enum EzGfxResult {
     Unsupported = 5,
     /// The graphics device was lost.
     DeviceLost = 6,
+    /// A bounded asynchronous queue has no available capacity.
+    QueueFull = 7,
+    /// An asynchronous operation was cancelled before completion.
+    Cancelled = 8,
 }

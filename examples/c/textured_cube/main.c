@@ -9,8 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if EZ_GFX_ABI_VERSION != 19u
-#error "textured_cube requires ez-gfx ABI v19"
+#if EZ_GFX_ABI_VERSION != 20u
+#error "textured_cube requires ez-gfx ABI v20"
 #endif
 
 #define WIDTH 640u

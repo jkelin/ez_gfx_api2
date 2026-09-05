@@ -1,7 +1,7 @@
 use super::{
-    AllocationRequest, AttachmentLoadOp, AttachmentStoreOp, D3D12_CLEAR_FLAG_DEPTH,
-    D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_INDEX_BUFFER_VIEW, D3D12_RESOURCE_STATE_COMMON,
-    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+    AllocationRequest, AttachmentLoadOp, AttachmentStoreOp, CompletionToken,
+    D3D12_CLEAR_FLAG_DEPTH, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_INDEX_BUFFER_VIEW,
+    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
     D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT,
     D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_VIEWPORT, DXGI_FORMAT_R32_UINT, DXGI_PRESENT,
@@ -19,7 +19,7 @@ const DRAW_INDEXED_ARGUMENT_BYTES: u64 = core::mem::size_of::<
 struct DxFramePlan {
     uses_surface: bool,
     presents: bool,
-    external_waits: Vec<u64>,
+    external_waits: Vec<CompletionToken>,
 }
 
 // D3D12 copy commands are invalid between BeginRenderPass and EndRenderPass.
@@ -66,8 +66,13 @@ fn validate_frame_plan(
     let external_waits = actions
         .iter()
         .filter_map(|action| match action {
-            NativeFrameAction::Wait(token) if token.queue == QueueKind::Transfer => {
-                Some(Ok(token.value))
+            NativeFrameAction::Wait(token)
+                if matches!(
+                    token.queue,
+                    QueueKind::Transfer | QueueKind::TextureTransfer
+                ) =>
+            {
+                Some(Ok(*token))
             }
             NativeFrameAction::Wait(_) => Some(Err(HalError::InvalidArgument)),
             _ => None,
@@ -945,9 +950,14 @@ impl NativeContext {
                 return Err(map_windows(error));
             }
         };
-        for value in external_waits {
-            // SAFETY: `self` retains the command queue and fence objects through `ID3D12CommandQueue::Wait`; `value` is a fence value produced by the transfer queue.
-            if let Err(error) = unsafe { self.queue.Wait(&self.fence, value) } {
+        for token in external_waits {
+            let fence = match token.queue {
+                QueueKind::Transfer => &self.transfer_fence,
+                QueueKind::TextureTransfer => &self.texture_fence,
+                _ => unreachable!("frame plan rejected unsupported wait queue"),
+            };
+            // SAFETY: the selected completion fence shares this device and signals `token.value`.
+            if let Err(error) = unsafe { self.queue.Wait(fence, token.value) } {
                 for (_, _, _, _, allocation) in readbacks {
                     let _ = self.free(allocation);
                 }

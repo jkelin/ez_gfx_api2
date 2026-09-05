@@ -1,14 +1,15 @@
 use super::{
-    AllocationRequest, Backend, CONTEXT_HANDLES, CONTEXTS, CompletionToken, ContextHandle,
-    ContextIdentity, ContextOptions, ContextState, DiagnosticLevel, EzGfxResult, FrameRecorder,
-    GeometryAllocation, GeometryManager, HalError, HashMap, MemoryClass, NativeAllocation,
-    NativeContext, NativeSurface, Observability, ResourceKind, RuntimePhase, RuntimeRecord,
-    RuntimeStatus, StagingAllocation, SurfaceHandle, SurfaceOptions, SurfacePlatform,
-    SurfaceRecord, SurfaceState, TextureRegistry, VulkanContext, VulkanPlatform, allocate_native,
-    completed_transfer_native, context_local, copy_native, destroy_native_pipeline,
-    destroy_native_shader, destroy_native_texture, free_native_allocation, map_allocation,
-    map_frame, map_geometry, map_hal, map_lifecycle, map_native_loss, map_texture, result_status,
-    wait_native_idle, with_context_mut, with_surface_mut, write_native,
+    AllocationRequest, AsyncTextureState, Backend, CONTEXT_HANDLES, CONTEXTS, CompletionToken,
+    ContextHandle, ContextIdentity, ContextOptions, ContextState, DEFAULT_STAGING_POLICY,
+    DiagnosticLevel, EzGfxResult, FrameRecorder, GeometryAllocation, GeometryManager, HalError,
+    HashMap, MemoryClass, NativeAllocation, NativeContext, NativeSurface, Observability, Ordering,
+    ResourceKind, RuntimePhase, RuntimeRecord, RuntimeStatus, SurfaceHandle, SurfaceOptions,
+    SurfacePlatform, SurfaceRecord, SurfaceState, TextureRegistry, VulkanContext, VulkanPlatform,
+    allocate_native, completed_transfer_native, context_local, copy_native,
+    destroy_native_pipeline, destroy_native_shader, destroy_native_texture, free_native_allocation,
+    map_allocation, map_frame, map_geometry, map_hal, map_lifecycle, map_native_loss, map_texture,
+    pump_async_textures, result_status, staging_bucket_size, wait_native_idle, with_context_mut,
+    with_surface_mut, write_native,
 };
 #[cfg(windows)]
 use super::{Dx12Context, Dx12Surface};
@@ -69,6 +70,7 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle, EzGfxRes
     .map_err(|_| EzGfxResult::NativeFailure)?;
     let frame = FrameRecorder::new(1024).map_err(|_| EzGfxResult::NativeFailure)?;
     let observability = Observability::new(1024, 256).map_err(|_| EzGfxResult::NativeFailure)?;
+    let async_textures = AsyncTextureState::new()?;
     let local = CONTEXT_HANDLES
         .lock()
         .map_err(|_| EzGfxResult::NativeFailure)?
@@ -87,6 +89,7 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle, EzGfxRes
         native,
         surfaces: HashMap::new(),
         allocations: HashMap::new(),
+        allocation_ready: HashMap::new(),
         shaders: HashMap::new(),
         textures: HashMap::new(),
         pipelines: HashMap::new(),
@@ -94,10 +97,13 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle, EzGfxRes
         indirects: HashMap::new(),
         texture_registry,
         texture_ready: HashMap::new(),
+        pending_textures: HashMap::new(),
+        async_textures,
+        texture_failures: HashMap::new(),
         geometry: GeometryManager::new(),
         vertex_heaps: HashMap::new(),
         index_heap: None,
-        staging: Vec::new(),
+        staging: ez_gfx_hal::ReusableStagingPool::new(256),
         frame,
         frame_resources: HashMap::new(),
         frame_native_resources: HashMap::new(),
@@ -135,7 +141,8 @@ pub(super) fn runtime_status(status: EzGfxResult) -> RuntimeStatus {
         EzGfxResult::InvalidArgument | EzGfxResult::InvalidContext => {
             RuntimeStatus::InvalidArgument
         }
-        EzGfxResult::NotReady => RuntimeStatus::NotReady,
+        EzGfxResult::NotReady | EzGfxResult::QueueFull => RuntimeStatus::NotReady,
+        EzGfxResult::Cancelled => RuntimeStatus::Cancelled,
         EzGfxResult::Unsupported => RuntimeStatus::Unsupported,
         EzGfxResult::NativeFailure => RuntimeStatus::NativeFailure,
         EzGfxResult::DeviceLost => RuntimeStatus::DeviceLost,
@@ -163,11 +170,14 @@ type DiagnosticPoll = (Option<(DiagnosticLevel, RuntimeRecord)>, u64);
 ///
 /// # Errors
 ///
-/// Returns an error when the context handle is invalid or stale.
+/// Returns an error when the context is invalid, stale, unhealthy, or asynchronous texture progress fails.
 pub fn poll_runtime_event(
     context: ContextHandle,
 ) -> Result<(Option<RuntimeRecord>, u64), EzGfxResult> {
-    with_context_mut(context, |context| Ok(context.observability.poll_event()))
+    with_context_mut(context, |context| {
+        pump_async_textures(context)?;
+        Ok(context.observability.poll_event())
+    })
 }
 
 /// Polls the next diagnostic and dropped-record count.
@@ -192,6 +202,12 @@ pub fn wait_idle(context: ContextHandle) -> EzGfxResult {
             .identity
             .check_thread_and_health()
             .map_err(map_lifecycle)?;
+        while !context.pending_textures.is_empty() {
+            pump_async_textures(context)?;
+            if !context.pending_textures.is_empty() {
+                std::thread::yield_now();
+            }
+        }
         let result = match &mut context.native {
             NativeContext::Vulkan(native) => native.wait_idle(),
             #[cfg(windows)]
@@ -255,6 +271,14 @@ pub(super) fn cleanup_context_state(
 ) -> EzGfxResult {
     // Handles become terminal before cleanup begins; later failures cannot expose partial state.
     owned.identity.invalidate_resources();
+    owned.async_textures.pool.shutdown();
+    for (_, pending) in owned.pending_textures.drain() {
+        pending.cancelled.store(true, Ordering::Release);
+        if let Err(error) = owned.texture_registry.cancel_upload(pending.id) {
+            failure.get_or_insert_with(|| map_texture(error));
+        }
+    }
+    owned.texture_failures.clear();
     // Vulkan reports `NotReady` only when no native device or GPU work exists before `init_device`.
     if let Err(error) = wait_native_idle(&mut owned.native)
         && error != HalError::NotReady
@@ -297,8 +321,8 @@ pub(super) fn cleanup_context_state(
     {
         failure.get_or_insert_with(|| map_allocation(error));
     }
-    for staging in owned.staging.drain(..) {
-        if let Err(error) = free_native_allocation(&mut owned.native, staging.allocation) {
+    for allocation in owned.staging.drain() {
+        if let Err(error) = free_native_allocation(&mut owned.native, allocation) {
             failure.get_or_insert_with(|| map_allocation(error));
         }
     }
@@ -772,43 +796,45 @@ pub fn upload_indices(
 
 pub(super) fn stage_upload(
     context: &mut NativeContext,
-    pool: &mut Vec<StagingAllocation>,
+    pool: &mut ez_gfx_hal::ReusableStagingPool<NativeAllocation>,
     destination: &NativeAllocation,
     destination_offset: u64,
     bytes: &[u8],
 ) -> Result<CompletionToken, ez_gfx_hal::AllocationError> {
     let completed = completed_transfer_native(context)?;
-    let index = if let Some(index) = pool.iter().position(|entry| {
-        entry.capacity >= bytes.len() as u64
-            && entry
-                .retirement
-                .is_none_or(|token| token.value <= completed)
-    }) {
-        index
+    for stale in pool.trim(completed) {
+        free_native_allocation(context, stale)?;
+    }
+    let requested = bytes.len() as u64;
+    let (capacity, mut allocation) = if let Some(entry) = pool.take(requested, completed) {
+        entry
     } else {
         if pool.len() >= 8 {
             return Err(ez_gfx_hal::AllocationError::OutOfMemory);
         }
-        let request =
-            AllocationRequest::new(bytes.len() as u64, 16, MemoryClass::Upload, true, None)?;
-        let allocation = allocate_native(context, request)?;
-        pool.push(StagingAllocation {
-            capacity: bytes.len() as u64,
-            allocation,
-            retirement: None,
-        });
-        pool.len() - 1
+        let bucket = staging_bucket_size(requested, DEFAULT_STAGING_POLICY)
+            .map_err(|_| ez_gfx_hal::AllocationError::OutOfMemory)?;
+        let request = AllocationRequest::new(bucket, 16, MemoryClass::Upload, true, None)?;
+        (bucket, allocate_native(context, request)?)
     };
-    let staging = &mut pool[index];
-    write_native(context, &mut staging.allocation, bytes)?;
-    let token = copy_native(
+    if let Err(error) = write_native(context, &mut allocation, bytes) {
+        pool.put(capacity, allocation, None);
+        return Err(error);
+    }
+    let token = match copy_native(
         context,
-        &staging.allocation,
+        &allocation,
         destination,
         0,
         destination_offset,
-        bytes.len() as u64,
-    )?;
-    staging.retirement = Some(token);
+        requested,
+    ) {
+        Ok(token) => token,
+        Err(error) => {
+            pool.put(capacity, allocation, None);
+            return Err(error);
+        }
+    };
+    pool.put(capacity, allocation, Some(token));
     Ok(token)
 }

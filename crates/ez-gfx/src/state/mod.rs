@@ -1,7 +1,10 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
-    sync::{LazyLock, Mutex},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 #[cfg(windows)]
@@ -20,9 +23,10 @@ use ez_gfx_core::{
     },
 };
 use ez_gfx_hal::{
-    AllocationRequest, BufferRange, BufferTransfer, CompletionToken, DynamicPipelineState,
-    ExecutionAction, FrameExecutionBackend, FrameExecutionPlan, HalError, ImageMip,
-    MemoryAllocator, MemoryClass, QueueKind, ResourceAccess, ResourceState, ShaderStage,
+    AllocationRequest, BufferRange, BufferTransfer, CompletionToken, DEFAULT_STAGING_POLICY,
+    DynamicPipelineState, ExecutionAction, FrameExecutionBackend, FrameExecutionPlan, HalError,
+    ImageMip, MemoryAllocator, MemoryClass, QueueKind, ResourceAccess, ResourceState, ShaderStage,
+    staging_bucket_size,
 };
 use ez_gfx_runtime::render::{ExecutionError, execute_compiled_graph};
 use ez_gfx_runtime::{
@@ -38,7 +42,8 @@ use ez_gfx_runtime::{
     observability::{DiagnosticLevel, Observability, RuntimePhase, RuntimeRecord, RuntimeStatus},
     target::Format,
     texture::{
-        TextureDecoder, TextureError, TextureId, TextureRegistry, TextureSource, generate_mips,
+        DecodedTexture, TextureDecoder, TextureError, TextureId, TextureRegistry, TextureSource,
+        generate_mips,
     },
 };
 
@@ -151,10 +156,52 @@ struct GeometryAllocation {
     size: u64,
 }
 
-struct StagingAllocation {
-    capacity: u64,
-    allocation: NativeAllocation,
-    retirement: Option<CompletionToken>,
+struct PendingTexture {
+    id: TextureId,
+    cancelled: Arc<AtomicBool>,
+    config: TextureConfig,
+}
+
+struct DecodedTextureJob {
+    handle: TextureHandle,
+    decoded: Result<DecodedTexture, TextureError>,
+}
+
+struct AsyncTextureState {
+    pool: ez_gfx_assets::CpuPool,
+    ready_tx: crossbeam_channel::Sender<DecodedTextureJob>,
+    ready_rx: crossbeam_channel::Receiver<DecodedTextureJob>,
+    #[cfg(test)]
+    decode_gate: Option<Arc<std::sync::Barrier>>,
+}
+
+impl AsyncTextureState {
+    fn new() -> Result<Self, EzGfxResult> {
+        let threads = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(2)
+            .saturating_sub(1)
+            .max(1);
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded(64);
+        Ok(Self {
+            pool: ez_gfx_assets::CpuPool::new(
+                threads,
+                64,
+                ez_gfx_runtime::texture::MAX_TEXTURE_BYTES,
+            )
+            .map_err(|_| EzGfxResult::NativeFailure)?,
+            ready_tx,
+            ready_rx,
+            #[cfg(test)]
+            decode_gate: None,
+        })
+    }
+}
+
+impl Drop for AsyncTextureState {
+    fn drop(&mut self) {
+        self.pool.shutdown();
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,6 +218,7 @@ struct ContextState {
     native: NativeContext,
     surfaces: HashMap<SurfaceHandle, SurfaceRecord>,
     allocations: HashMap<PackedHandle, (u64, NativeAllocation)>,
+    allocation_ready: HashMap<PackedHandle, CompletionToken>,
     shaders: HashMap<ShaderHandle, ShaderRecord>,
     indirects: HashMap<IndirectBufferHandle, IndexedIndirectBuffer>,
     textures: HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>,
@@ -178,10 +226,13 @@ struct ContextState {
     graphics_format: Option<u32>,
     texture_registry: TextureRegistry,
     texture_ready: HashMap<TextureHandle, CompletionToken>,
+    pending_textures: HashMap<TextureHandle, PendingTexture>,
+    async_textures: AsyncTextureState,
+    texture_failures: HashMap<TextureHandle, EzGfxResult>,
     geometry: GeometryManager,
     vertex_heaps: HashMap<String, GeometryAllocation>,
     index_heap: Option<GeometryAllocation>,
-    staging: Vec<StagingAllocation>,
+    staging: ez_gfx_hal::ReusableStagingPool<NativeAllocation>,
     frame: FrameRecorder,
     frame_resources: HashMap<PackedHandle, ResourceId>,
     frame_native_resources: HashMap<ResourceId, FrameNativeResource>,
@@ -270,10 +321,10 @@ use native::dx12_bindings;
 #[cfg(target_vendor = "apple")]
 use native::metal_bindings;
 use native::{
-    allocate_native, completed_transfer_native, copy_native, destroy_native_texture,
-    free_native_allocation, map_allocation, map_frame, map_geometry, map_hal, map_lifecycle,
-    map_native_loss, map_texture, native_layouts, pipeline_layout_key, result_status,
-    vulkan_bindings, wait_native_idle, write_native,
+    allocate_native, completed_texture_transfer_native, completed_transfer_native, copy_native,
+    destroy_native_texture, free_native_allocation, map_allocation, map_frame, map_geometry,
+    map_hal, map_lifecycle, map_native_loss, map_texture, native_layouts, pipeline_layout_key,
+    result_status, vulkan_bindings, wait_native_idle, write_native,
 };
 mod shader;
 mod texture;

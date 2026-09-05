@@ -39,6 +39,8 @@ pub enum RuntimeStatus {
     NativeFailure = 4,
     /// The graphics device became unavailable.
     DeviceLost = 5,
+    /// The asynchronous operation was cancelled before completion.
+    Cancelled = 6,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

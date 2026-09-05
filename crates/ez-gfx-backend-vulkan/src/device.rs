@@ -2,10 +2,10 @@ use super::{
     AdapterCapabilities, AdapterClass, AdapterInfo, AllocationError, AllocationSizes, Allocator,
     AllocatorCreateDesc, Backend, CStr, CString, CompressionSupport,
     DEFAULT_ALLOCATION_BLOCK_POLICY, DeferredNativeResource, DeferredResource, DeviceProbe, Entry,
-    FrameSlot, HalError, NativeContext, NativeSurface, PendingDevice, SemanticProfile,
-    SurfacePlatform, TEXTURE_DESCRIPTOR_CAPACITY, create_frame_slots, khr, map_allocation_hal,
-    map_allocator, map_allocator_hal, map_vk, paired_texture_capacity,
-    texture_descriptor_layout_bindings, texture_heap_rejection, vk,
+    FrameSlot, HalError, MemoryAllocator, NativeContext, NativeSurface, PendingDevice,
+    SemanticProfile, SurfacePlatform, TEXTURE_DESCRIPTOR_CAPACITY, create_frame_slots, khr,
+    map_allocation_hal, map_allocator, map_allocator_hal, map_vk, paired_texture_capacity,
+    texture_descriptor_layout_bindings, texture_heap_rejection, transfer, vk,
 };
 
 fn create_device_frame_state(
@@ -81,6 +81,18 @@ fn create_device_frame_state(
     Ok((descriptor_set, frame_slots))
 }
 
+fn select_transfer_family(properties: &[vk::QueueFamilyProperties], graphics: u32) -> u32 {
+    properties
+        .iter()
+        .position(|family| {
+            family.queue_count != 0
+                && family.queue_flags.contains(vk::QueueFlags::TRANSFER)
+                && !family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+        })
+        .and_then(|index| u32::try_from(index).ok())
+        .unwrap_or(graphics)
+}
+
 impl NativeContext {
     /// Creates a Vulkan context after validating the requested platform and optional validation layer.
     ///
@@ -145,11 +157,24 @@ impl NativeContext {
             allocator: None,
             retired: Vec::new(),
             graphics_queue: None,
+            graphics_queue_lock: std::sync::Arc::new(parking_lot::Mutex::new(())),
+            transfer_queue: None,
             deferred: Vec::new(),
             graphics_queue_family: None,
+            transfer_queue_family: None,
             transfer_timeline: None,
+            transfer_worker: None,
             transfer_command_pool: None,
+            transfer_acquire_pool: None,
+            texture_staging: ez_gfx_hal::ReusableStagingPool::new(256),
+            transfer_ownership_timeline: None,
+            texture_timeline: None,
+            texture_worker: None,
+            texture_command_pool: None,
+            texture_acquire_pool: None,
+            texture_ownership_timeline: None,
             next_transfer_value: 1,
+            next_texture_value: 1,
             texture_descriptor_pool: None,
             texture_descriptor_layout: None,
             texture_descriptor_set: None,
@@ -222,6 +247,10 @@ impl NativeContext {
     /// # Panics
     ///
     /// Panics if `PendingDevice::new` leaves its `device` field empty.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "device admission and rollback remain local across optional native objects"
+    )]
     pub fn init_device(
         &mut self,
         surface: Option<&NativeSurface>,
@@ -265,10 +294,36 @@ impl NativeContext {
                 if SemanticProfile::V1.admit(adapter.capabilities()).is_err() {
                     continue;
                 }
-                let priority = [1.0_f32];
-                let queue = vk::DeviceQueueCreateInfo::default()
-                    .queue_family_index(queue_family)
-                    .queue_priorities(&priority);
+                // Prefer a transfer-only family; otherwise use a second queue from the graphics
+                // family when available, with queue zero as the universal fallback.
+                // SAFETY: the enumerated physical device belongs to this live instance.
+                let queue_properties = unsafe {
+                    self.instance
+                        .get_physical_device_queue_family_properties(physical)
+                };
+                let transfer_family = select_transfer_family(&queue_properties, queue_family);
+                let graphics_queue_count =
+                    queue_properties[queue_family as usize].queue_count.min(3) as usize;
+                let transfer_queue_count = queue_properties[transfer_family as usize]
+                    .queue_count
+                    .min(2) as usize;
+                let priorities = [1.0_f32, 1.0_f32, 1.0_f32];
+                let queue_infos = if transfer_family == queue_family {
+                    vec![
+                        vk::DeviceQueueCreateInfo::default()
+                            .queue_family_index(queue_family)
+                            .queue_priorities(&priorities[..graphics_queue_count]),
+                    ]
+                } else {
+                    vec![
+                        vk::DeviceQueueCreateInfo::default()
+                            .queue_family_index(queue_family)
+                            .queue_priorities(&priorities[..1]),
+                        vk::DeviceQueueCreateInfo::default()
+                            .queue_family_index(transfer_family)
+                            .queue_priorities(&priorities[..transfer_queue_count]),
+                    ]
+                };
                 let mut enabled12 = vk::PhysicalDeviceVulkan12Features::default()
                     .timeline_semaphore(features12.timeline_semaphore != 0)
                     .buffer_device_address(features12.buffer_device_address != 0)
@@ -305,7 +360,7 @@ impl NativeContext {
                 let create = vk::DeviceCreateInfo::default()
                     .enabled_features(&enabled_core)
                     .enabled_extension_names(enabled_extensions)
-                    .queue_create_infos(core::slice::from_ref(&queue))
+                    .queue_create_infos(&queue_infos)
                     .push_next(&mut enabled11)
                     .push_next(&mut enabled12)
                     .push_next(&mut enabled13);
@@ -317,8 +372,25 @@ impl NativeContext {
                     .device
                     .as_ref()
                     .expect("pending device is initialized");
-                // SAFETY: queue zero was requested from `queue_family` above.
+                // SAFETY: queue zero was requested from the selected graphics family above.
                 let graphics_queue = unsafe { device.get_device_queue(queue_family, 0) };
+                let transfer_index =
+                    u32::from(transfer_family == queue_family && graphics_queue_count > 1);
+                // SAFETY: the selected transfer family and index were included in `queue_infos`.
+                let transfer_queue =
+                    unsafe { device.get_device_queue(transfer_family, transfer_index) };
+                let texture_index = if transfer_family == queue_family {
+                    if graphics_queue_count > 2 {
+                        2
+                    } else {
+                        transfer_index
+                    }
+                } else {
+                    u32::from(transfer_queue_count > 1)
+                };
+                // SAFETY: the selected texture family and index were included in `queue_infos`.
+                let texture_queue =
+                    unsafe { device.get_device_queue(transfer_family, texture_index) };
                 pending.allocator = Some(
                     Allocator::new(&AllocatorCreateDesc {
                         instance: self.instance.clone(),
@@ -338,17 +410,68 @@ impl NativeContext {
                     .map_err(|error| map_allocator_hal(&error))?,
                 );
                 pending.command_pool = Some(
-                    // SAFETY: `queue_family` was selected from the physical device used to create `device`, and the command-pool create-info storage lasts through the call.
+                    // SAFETY: `transfer_family` belongs to the physical device used to create
+                    // `device`, and the command-pool create-info storage spans the call.
                     unsafe {
                         device.create_command_pool(
                             &vk::CommandPoolCreateInfo::default()
-                                .queue_family_index(queue_family)
-                                .flags(vk::CommandPoolCreateFlags::TRANSIENT),
+                                .queue_family_index(transfer_family)
+                                .flags(
+                                    vk::CommandPoolCreateFlags::TRANSIENT
+                                        | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+                                ),
                             None,
                         )
                     }
                     .map_err(map_vk)?,
                 );
+                pending.texture_command_pool = Some(
+                    // SAFETY: this pool uses the admitted transfer family and live device.
+                    unsafe {
+                        device.create_command_pool(
+                            &vk::CommandPoolCreateInfo::default()
+                                .queue_family_index(transfer_family)
+                                .flags(
+                                    vk::CommandPoolCreateFlags::TRANSIENT
+                                        | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+                                ),
+                            None,
+                        )
+                    }
+                    .map_err(map_vk)?,
+                );
+                if transfer_family != queue_family {
+                    pending.acquire_pool = Some(
+                        // SAFETY: `queue_family` belongs to this device and the create-info spans the call.
+                        unsafe {
+                            device.create_command_pool(
+                                &vk::CommandPoolCreateInfo::default()
+                                    .queue_family_index(queue_family)
+                                    .flags(
+                                        vk::CommandPoolCreateFlags::TRANSIENT
+                                            | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+                                    ),
+                                None,
+                            )
+                        }
+                        .map_err(map_vk)?,
+                    );
+                    pending.texture_acquire_pool = Some(
+                        // SAFETY: this pool uses the admitted graphics family and live device.
+                        unsafe {
+                            device.create_command_pool(
+                                &vk::CommandPoolCreateInfo::default()
+                                    .queue_family_index(queue_family)
+                                    .flags(
+                                        vk::CommandPoolCreateFlags::TRANSIENT
+                                            | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+                                    ),
+                                None,
+                            )
+                        }
+                        .map_err(map_vk)?,
+                    );
+                }
                 let mut timeline = vk::SemaphoreTypeCreateInfo::default()
                     .semaphore_type(vk::SemaphoreType::TIMELINE)
                     .initial_value(0);
@@ -362,18 +485,109 @@ impl NativeContext {
                     }
                     .map_err(map_vk)?,
                 );
+                let mut texture_timeline = vk::SemaphoreTypeCreateInfo::default()
+                    .semaphore_type(vk::SemaphoreType::TIMELINE)
+                    .initial_value(0);
+                pending.texture_timeline = Some(
+                    // SAFETY: timeline semaphores are enabled and pNext storage spans the call.
+                    unsafe {
+                        device.create_semaphore(
+                            &vk::SemaphoreCreateInfo::default().push_next(&mut texture_timeline),
+                            None,
+                        )
+                    }
+                    .map_err(map_vk)?,
+                );
+                if transfer_family != queue_family {
+                    let mut ownership_timeline = vk::SemaphoreTypeCreateInfo::default()
+                        .semaphore_type(vk::SemaphoreType::TIMELINE)
+                        .initial_value(0);
+                    pending.ownership_timeline = Some(
+                        // SAFETY: timeline semaphores were enabled and pNext storage spans the call.
+                        unsafe {
+                            device.create_semaphore(
+                                &vk::SemaphoreCreateInfo::default()
+                                    .push_next(&mut ownership_timeline),
+                                None,
+                            )
+                        }
+                        .map_err(map_vk)?,
+                    );
+                    let mut texture_ownership_timeline = vk::SemaphoreTypeCreateInfo::default()
+                        .semaphore_type(vk::SemaphoreType::TIMELINE)
+                        .initial_value(0);
+                    pending.texture_ownership_timeline = Some(
+                        // SAFETY: timeline semaphores are enabled and pNext storage spans the call.
+                        unsafe {
+                            device.create_semaphore(
+                                &vk::SemaphoreCreateInfo::default()
+                                    .push_next(&mut texture_ownership_timeline),
+                                None,
+                            )
+                        }
+                        .map_err(map_vk)?,
+                    );
+                }
+                let worker_device = device.clone();
+                let transfer_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));
+                let texture_lock = if texture_queue == transfer_queue {
+                    transfer_lock.clone()
+                } else {
+                    std::sync::Arc::new(parking_lot::Mutex::new(()))
+                };
+                let graphics_lock = self.graphics_queue_lock.clone();
                 let (descriptor_set, frame_slots) =
                     create_device_frame_state(&self.instance, &mut pending, queue_family)?;
 
+                let transfer_worker = transfer::start_worker(
+                    worker_device.clone(),
+                    transfer_queue,
+                    graphics_queue,
+                    transfer_family,
+                    queue_family,
+                    pending.command_pool.ok_or(HalError::NativeFailure)?,
+                    pending.acquire_pool,
+                    pending.timeline.ok_or(HalError::NativeFailure)?,
+                    pending.ownership_timeline,
+                    transfer_lock,
+                    graphics_lock.clone(),
+                )
+                .map_err(|_| HalError::NativeFailure)?;
+                let texture_worker = transfer::start_worker(
+                    worker_device.clone(),
+                    texture_queue,
+                    graphics_queue,
+                    transfer_family,
+                    queue_family,
+                    pending
+                        .texture_command_pool
+                        .ok_or(HalError::NativeFailure)?,
+                    pending.texture_acquire_pool,
+                    pending.texture_timeline.ok_or(HalError::NativeFailure)?,
+                    pending.texture_ownership_timeline,
+                    texture_lock,
+                    graphics_lock,
+                )
+                .map_err(|_| HalError::NativeFailure)?;
                 self.physical_device = Some(physical);
                 self.adapter_info = Some(adapter.clone());
                 self.graphics_queue_family = Some(queue_family);
+                self.transfer_queue_family = Some(transfer_family);
                 self.graphics_queue = Some(graphics_queue);
+                self.transfer_queue = Some(transfer_queue);
                 self.allocator = pending.allocator.take();
                 self.sampler_anisotropy = core_features.sampler_anisotropy != 0;
                 self.device = pending.device.take();
                 self.transfer_timeline = pending.timeline.take();
+                self.transfer_worker = Some(transfer_worker);
                 self.transfer_command_pool = pending.command_pool.take();
+                self.transfer_acquire_pool = pending.acquire_pool.take();
+                self.transfer_ownership_timeline = pending.ownership_timeline.take();
+                self.texture_timeline = pending.texture_timeline.take();
+                self.texture_worker = Some(texture_worker);
+                self.texture_command_pool = pending.texture_command_pool.take();
+                self.texture_acquire_pool = pending.texture_acquire_pool.take();
+                self.texture_ownership_timeline = pending.texture_ownership_timeline.take();
                 self.texture_descriptor_pool = pending.descriptor_pool.take();
                 self.texture_descriptor_layout = pending.descriptor_layout.take();
                 self.texture_descriptor_set = Some(descriptor_set);
@@ -392,8 +606,22 @@ impl NativeContext {
     /// Returns an error if no device is initialized, waiting for the device fails, or reclaiming a deferred allocation fails.
     pub fn wait_idle(&mut self) -> Result<(), HalError> {
         let device = self.device.as_ref().ok_or(HalError::NotReady)?.clone();
+        self.transfer_worker
+            .as_ref()
+            .ok_or(HalError::NativeFailure)?
+            .flush()
+            .map_err(|_| HalError::NativeFailure)?;
+        self.texture_worker
+            .as_ref()
+            .ok_or(HalError::NativeFailure)?
+            .flush()
+            .map_err(|_| HalError::NativeFailure)?;
         // SAFETY: `device` is the initialized logical device, and exclusive `&mut self` access prevents this context from concurrently submitting through its queues during `device_wait_idle`.
         unsafe { device.device_wait_idle() }.map_err(map_vk)?;
+        self.reclaim(ez_gfx_hal::QueueKind::Transfer, u64::MAX)
+            .map_err(map_allocation_hal)?;
+        self.reclaim(ez_gfx_hal::QueueKind::TextureTransfer, u64::MAX)
+            .map_err(map_allocation_hal)?;
         for slot in &mut self.frame_slots {
             slot.in_flight = false;
         }
@@ -670,5 +898,38 @@ impl NativeContext {
             vertex_storage,
             multi_draw,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn family(flags: vk::QueueFlags, count: u32) -> vk::QueueFamilyProperties {
+        vk::QueueFamilyProperties {
+            queue_flags: flags,
+            queue_count: count,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn transfer_family_prefers_non_graphics_hardware_queue() {
+        let families = [
+            family(vk::QueueFlags::GRAPHICS | vk::QueueFlags::TRANSFER, 2),
+            family(vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER, 1),
+        ];
+
+        assert_eq!(select_transfer_family(&families, 0), 1);
+    }
+
+    #[test]
+    fn transfer_family_falls_back_when_specialized_queue_is_unavailable() {
+        let families = [
+            family(vk::QueueFlags::GRAPHICS | vk::QueueFlags::TRANSFER, 1),
+            family(vk::QueueFlags::TRANSFER, 0),
+        ];
+
+        assert_eq!(select_transfer_family(&families, 0), 0);
     }
 }

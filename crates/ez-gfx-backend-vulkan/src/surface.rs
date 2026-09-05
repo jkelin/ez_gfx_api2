@@ -53,13 +53,19 @@ impl NativeContext {
             .wait_semaphores(core::slice::from_ref(&semaphore))
             .swapchains(core::slice::from_ref(&swapchain))
             .image_indices(core::slice::from_ref(&image));
-        // SAFETY: `image` came from the preceding acquire for `swapchain`, `semaphore` is that acquire's signal, and the three slices backing `present` outlive `queue_present`.
-        match unsafe {
-            self.swapchain_loader
-                .as_ref()
-                .ok_or(HalError::NotReady)?
-                .queue_present(self.graphics_queue.ok_or(HalError::NotReady)?, &present)
-        } {
+        // SAFETY: `image` came from the preceding acquire for `swapchain`, `semaphore` is that
+        // acquire's signal, and the three slices backing `present` outlive `queue_present`.
+        let presented = {
+            let _queue_guard = self.graphics_queue_lock.lock();
+            // SAFETY: the queue lock serializes this present with all graphics submissions.
+            unsafe {
+                self.swapchain_loader
+                    .as_ref()
+                    .ok_or(HalError::NotReady)?
+                    .queue_present(self.graphics_queue.ok_or(HalError::NotReady)?, &present)
+            }
+        };
+        match presented {
             Ok(present_suboptimal) => {
                 if suboptimal || present_suboptimal {
                     self.recreate_swapchain(surface, width, height)?;

@@ -13,9 +13,9 @@ use super::{
     D3D12_TEXTURE_LAYOUT_UNKNOWN, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC, DeferredResource,
     ID3D12CommandAllocator, ID3D12CommandList, ID3D12GraphicsCommandList, ID3D12Resource, INFINITE,
     ImageMip, Interface, MemoryAllocator, MemoryClass, MemoryLocation, NativeAllocation,
-    NativeContext, NativeTexture, PendingCopy, QueueKind, SamplerAddressMode, SamplerFilter,
+    NativeContext, NativeTexture, QueueKind, SamplerAddressMode, SamplerFilter,
     TEXTURE_DESCRIPTOR_CAPACITY, TextureSamplerDesc, WaitForSingleObject, map_allocation_windows,
-    map_allocator, map_hal_allocation, validate_rgba8_mips,
+    map_allocator, validate_rgba8_mips,
 };
 
 fn validate_texture_request(mips: &[ImageMip<'_>], binding: u32) -> Result<(), AllocationError> {
@@ -173,14 +173,7 @@ impl NativeContext {
         resource: ID3D12Resource,
         allocation: Allocation,
         upload: Option<NativeAllocation>,
-        wait_for_queue: bool,
     ) {
-        if wait_for_queue && self.wait_idle().is_ok() {
-            // SAFETY: `GetCompletedValue` only reads the fence counter, and `self` retains the `ID3D12Fence` COM reference for the duration of the call.
-            let completed = unsafe { self.fence.GetCompletedValue() };
-            self.pending_copies
-                .retain(|copy| copy.completion.value > completed);
-        }
         if let Some(upload) = upload {
             let _ = self.free(upload);
         }
@@ -231,13 +224,13 @@ impl NativeContext {
         validate_texture_request(mips, binding)?;
         let (resource, allocation, desc) = self.create_texture_resource(mips)?;
         let mut footprints = vec![
-                windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-                mips.len()
-            ];
+            windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            mips.len()
+        ];
         let mut row_counts = vec![0_u32; mips.len()];
         let mut row_sizes = vec![0_u64; mips.len()];
         let mut upload_size = 0;
-        // SAFETY: `GetCopyableFootprints` reads initialized `desc`, writes exactly `mips.len()` elements into each equally sized output vector, and writes `upload_size`; all pointed-to storage outlasts the call.
+        // SAFETY: every output array has exactly `mips.len()` initialized slots.
         unsafe {
             self.device.GetCopyableFootprints(
                 &raw const desc,
@@ -250,131 +243,65 @@ impl NativeContext {
                 Some(&raw mut upload_size),
             );
         }
-        let Ok(upload_request) =
-            AllocationRequest::new(upload_size, 256, MemoryClass::Upload, true, None)
-        else {
-            self.destroy_unpublished_texture(resource, allocation, None, false);
-            return Err(AllocationError::ZeroSize);
-        };
-        let mut upload = match self.allocate(upload_request) {
-            Ok(upload) => upload,
-            Err(error) => {
-                self.destroy_unpublished_texture(resource, allocation, None, false);
-                return Err(error);
-            }
-        };
-        let populated = self.populate_texture_upload(mips, &footprints, &mut upload, upload_size);
-        if let Err(error) = populated {
-            self.destroy_unpublished_texture(resource, allocation, Some(upload), false);
+        let bucket =
+            ez_gfx_hal::staging_bucket_size(upload_size, ez_gfx_hal::DEFAULT_STAGING_POLICY)
+                .map_err(|_| AllocationError::OutOfMemory)?;
+        let completed = self.completed_texture_transfer_value()?;
+        for stale in self.texture_staging.trim(completed) {
+            self.free(stale)?;
+        }
+        let request = AllocationRequest::new(bucket, 256, MemoryClass::Upload, true, None)
+            .map_err(|_| AllocationError::ZeroSize)?;
+        let mut upload =
+            if let Some((_, upload)) = self.texture_staging.take(upload_size, completed) {
+                upload
+            } else {
+                match self.allocate(request) {
+                    Ok(upload) => upload,
+                    Err(error) => {
+                        self.destroy_unpublished_texture(resource, allocation, None);
+                        return Err(error);
+                    }
+                }
+            };
+        if let Err(error) =
+            self.populate_texture_upload(mips, &footprints, &mut upload, upload_size)
+        {
+            self.destroy_unpublished_texture(resource, allocation, Some(upload));
             return Err(error);
         }
-        let mut queue_touched = false;
-        let submitted = (|| {
-            let mut completions = Vec::with_capacity(mips.len());
-            for (level, footprint) in footprints.into_iter().enumerate() {
-                // SAFETY: `CreateCommandAllocator` receives the defined `DIRECT` command-list type, and `self` retains the device COM reference throughout the call.
-                let allocator: ID3D12CommandAllocator = unsafe {
-                    self.device
-                        .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-                }
-                .map_err(|error| map_allocation_windows(&error))?;
-                // SAFETY: `CreateCommandList` receives the newly created, unused `DIRECT` allocator from the same device; the allocator COM reference outlasts the call.
-                let list: ID3D12GraphicsCommandList = unsafe {
-                    self.device.CreateCommandList(
-                        0,
-                        D3D12_COMMAND_LIST_TYPE_DIRECT,
-                        &allocator,
-                        None,
-                    )
-                }
-                .map_err(|error| map_allocation_windows(&error))?;
-                let source = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: core::mem::ManuallyDrop::new(Some(upload.resource.clone())),
-                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                        PlacedFootprint: footprint,
-                    },
-                };
-                let destination = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: core::mem::ManuallyDrop::new(Some(resource.clone())),
-                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                        SubresourceIndex: u32::try_from(level)
-                            .map_err(|_| AllocationError::NativeFailure)?,
-                    },
-                };
-                // SAFETY: `CopyTextureRegion` reads initialized `source` and `destination` locations whose cloned upload and texture resource references, and the pointed-to local storage, outlast the call.
-                unsafe {
-                    list.CopyTextureRegion(
-                        &raw const destination,
-                        0,
-                        0,
-                        0,
-                        &raw const source,
-                        None,
-                    );
-                };
-                let transition = D3D12_RESOURCE_TRANSITION_BARRIER {
-                    pResource: core::mem::ManuallyDrop::new(Some(resource.clone())),
-                    Subresource: u32::try_from(level)
-                        .map_err(|_| AllocationError::NativeFailure)?,
-                    StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
-                    StateAfter: D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                };
-                let barrier = D3D12_RESOURCE_BARRIER {
-                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                        Transition: core::mem::ManuallyDrop::new(transition),
-                    },
-                };
-                // SAFETY: `barrier.Type` selects its initialized `Transition` arm, the temporary barrier slice lasts through `ResourceBarrier`, and the recording list and referenced resource remain stored through `Close`.
-                unsafe {
-                    list.ResourceBarrier(&[barrier]);
-                    list.Close()
-                }
-                .map_err(|error| map_allocation_windows(&error))?;
-                let command: ID3D12CommandList = list
-                    .cast()
-                    .map_err(|error| map_allocation_windows(&error))?;
-                // SAFETY: `ExecuteCommandLists` receives a command cast from the just-closed list; the command-array storage lasts through the call, and the allocator and list are retained in `pending_copies` or through queue cleanup.
-                unsafe { self.queue.ExecuteCommandLists(&[Some(command)]) };
-                queue_touched = true;
-                let value = self.next_fence;
-                self.next_fence = value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
-                // SAFETY: `Signal` receives this queue's fence and the monotonic value reserved from `next_fence`; `self` retains both COM references throughout the call.
-                unsafe { self.queue.Signal(&self.fence, value) }
-                    .map_err(|error| map_allocation_windows(&error))?;
-                let completion = CompletionToken::new(QueueKind::Transfer, value)
-                    .map_err(|_| AllocationError::NativeFailure)?;
-                self.pending_copies.push(PendingCopy {
-                    completion,
-                    _allocator: allocator,
-                    _list: list,
-                });
-                completions.push(completion);
-            }
-            Ok::<_, AllocationError>(completions)
-        })();
-        let completions = match submitted {
-            Ok(completions) => completions,
-            Err(error) => {
-                self.destroy_unpublished_texture(resource, allocation, Some(upload), queue_touched);
-                return Err(error);
-            }
-        };
-        if let Err(error) = self.wait_idle().map_err(map_hal_allocation) {
-            self.destroy_unpublished_texture(resource, allocation, Some(upload), true);
-            return Err(error);
+        let first = self.next_texture_fence;
+        self.next_texture_fence = first
+            .checked_add(mips.len() as u64)
+            .ok_or(AllocationError::NativeFailure)?;
+        let completions = (first..self.next_texture_fence)
+            .map(|value| CompletionToken::new(QueueKind::TextureTransfer, value))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| AllocationError::NativeFailure)?;
+        let completion = *completions.last().ok_or(AllocationError::NativeFailure)?;
+        let value = completion.value;
+        let submitted = self
+            .texture_worker
+            .as_ref()
+            .ok_or(AllocationError::NativeFailure)?
+            .submit(super::transfer::Dx12TransferJob {
+                value,
+                bytes: upload_size,
+                copy: super::transfer::Dx12TransferCopy::Texture {
+                    source: upload.resource.clone(),
+                    destination: resource.clone(),
+                    footprints,
+                },
+            });
+        if let Err(error) = submitted {
+            self.destroy_unpublished_texture(resource, allocation, Some(upload));
+            return Err(match error {
+                ez_gfx_hal::TransferWorkerError::Full => AllocationError::OutOfMemory,
+                ez_gfx_hal::TransferWorkerError::Failed => AllocationError::NativeFailure,
+            });
         }
-        // SAFETY: `self.fence` is retained by this context while its completed value is queried.
-        let completed = unsafe { self.fence.GetCompletedValue() };
-        self.pending_copies
-            .retain(|copy| copy.completion.value > completed);
-        if let Err(error) = self.free(upload) {
-            self.destroy_unpublished_texture(resource, allocation, None, false);
-            return Err(error);
-        }
+        let capacity = upload.allocation.size();
+        self.texture_staging.put(capacity, upload, Some(completion));
         Ok(publish_texture(
             self,
             resource,
@@ -523,5 +450,28 @@ impl NativeContext {
         }
         self.free(readback)?;
         Ok(pixels)
+    }
+}
+
+impl NativeContext {
+    /// Returns the completed value of the independent texture transfer timeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NativeFailure` when the worker failed and `DeviceLost` for a removed device.
+    pub fn completed_texture_transfer_value(&self) -> Result<u64, AllocationError> {
+        if self
+            .texture_worker
+            .as_ref()
+            .is_some_and(ez_gfx_hal::TransferWorker::failed)
+        {
+            return Err(AllocationError::NativeFailure);
+        }
+        // SAFETY: the context retains the texture fence and device for this query.
+        let value = unsafe { self.texture_fence.GetCompletedValue() };
+        if value == u64::MAX {
+            return Err(AllocationError::DeviceLost);
+        }
+        Ok(value)
     }
 }

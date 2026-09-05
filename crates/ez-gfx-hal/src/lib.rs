@@ -74,6 +74,97 @@ pub const DEFAULT_ALLOCATION_BLOCK_POLICY: AllocationBlockPolicy = AllocationBlo
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Shared limits for reusable staging and adaptive transfer batches.
+pub struct StagingPolicy {
+    /// Smallest power-of-two staging bucket.
+    pub minimum_bucket_bytes: u64,
+    /// Largest accepted staging allocation.
+    pub maximum_bucket_bytes: u64,
+    /// Byte threshold that flushes a transfer batch.
+    pub batch_bytes: u64,
+    /// Copy-count threshold that flushes a transfer batch.
+    pub batch_copies: usize,
+}
+
+impl StagingPolicy {
+    /// Creates a staging policy with power-of-two buckets and nonzero batch limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StagingPolicyError::InvalidPolicy`] for zero, non-power-of-two, or inverted limits.
+    pub const fn new(
+        minimum_bucket_bytes: u64,
+        maximum_bucket_bytes: u64,
+        batch_bytes: u64,
+        batch_copies: usize,
+    ) -> Result<Self, StagingPolicyError> {
+        if minimum_bucket_bytes == 0
+            || maximum_bucket_bytes == 0
+            || batch_bytes == 0
+            || batch_copies == 0
+            || !minimum_bucket_bytes.is_power_of_two()
+            || !maximum_bucket_bytes.is_power_of_two()
+            || minimum_bucket_bytes > maximum_bucket_bytes
+        {
+            return Err(StagingPolicyError::InvalidPolicy);
+        }
+        Ok(Self {
+            minimum_bucket_bytes,
+            maximum_bucket_bytes,
+            batch_bytes,
+            batch_copies,
+        })
+    }
+
+    /// Reports whether an accumulated batch reached either configured limit.
+    pub const fn should_flush(self, copies: usize, bytes: u64) -> bool {
+        copies >= self.batch_copies || bytes >= self.batch_bytes
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Invalid staging-policy or staging-size request.
+pub enum StagingPolicyError {
+    /// Policy limits are zero, inverted, or not powers of two.
+    InvalidPolicy,
+    /// A staging request is zero or exceeds the configured maximum.
+    InvalidSize,
+}
+
+/// Returns the smallest configured power-of-two bucket containing `bytes`.
+///
+/// # Errors
+///
+/// Returns [`StagingPolicyError::InvalidSize`] when `bytes` is zero, exceeds the maximum, or cannot round up.
+pub const fn staging_bucket_size(
+    bytes: u64,
+    policy: StagingPolicy,
+) -> Result<u64, StagingPolicyError> {
+    if bytes == 0 || bytes > policy.maximum_bucket_bytes {
+        return Err(StagingPolicyError::InvalidSize);
+    }
+    let requested = if bytes < policy.minimum_bucket_bytes {
+        policy.minimum_bucket_bytes
+    } else {
+        bytes
+    };
+    match requested.checked_next_power_of_two() {
+        Some(bucket) if bucket <= policy.maximum_bucket_bytes => Ok(bucket),
+        _ => Err(StagingPolicyError::InvalidSize),
+    }
+}
+
+/// Default staging and transfer batching limits.
+pub const DEFAULT_STAGING_POLICY: StagingPolicy = StagingPolicy {
+    minimum_bucket_bytes: 64 * 1024,
+    maximum_bucket_bytes: 64 * 1024 * 1024,
+    batch_bytes: 32 * 1024 * 1024,
+    batch_copies: 64,
+};
+
+mod transfer;
+pub use transfer::{ReusableStagingPool, StagingEntry, TransferWorker, TransferWorkerError};
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Placement and CPU-visibility class requested for an allocation.
 pub enum MemoryClass {
     /// Device-local memory.
@@ -427,6 +518,8 @@ pub enum QueueKind {
     Compute,
     /// Queue dedicated to data transfers.
     Transfer,
+    /// Queue dedicated to texture transfers and layout finalization.
+    TextureTransfer,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -732,7 +825,9 @@ impl ResourceState {
                 | ResourceAccess::IndirectStorageReadWrite
         );
         // Transfer queues cannot execute fixed-function or programmable-stage accesses.
-        if queue == QueueKind::Transfer && (stage != ShaderStage::None || !transfer_access) {
+        if matches!(queue, QueueKind::Transfer | QueueKind::TextureTransfer)
+            && (stage != ShaderStage::None || !transfer_access)
+        {
             return Err(ContractError::InvalidState);
         }
         if queue == QueueKind::Compute

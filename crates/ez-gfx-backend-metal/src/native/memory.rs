@@ -163,10 +163,14 @@ impl BufferTransfer for NativeContext {
         destination_offset: u64,
         size: u64,
     ) -> Result<CompletionToken, AllocationError> {
+        let completed = self.completed_transfer_value()?;
+        self.completed_transfer_value = completed;
+        self.pending_transfers
+            .retain(|pending| pending.value > completed);
         validate_range(source.allocation.size(), source_offset, size)?;
         validate_range(destination.allocation.size(), destination_offset, size)?;
         let command = self
-            .queue
+            .transfer_queue
             .commandBuffer()
             .ok_or(AllocationError::NativeFailure)?;
         let blit = command
@@ -183,24 +187,61 @@ impl BufferTransfer for NativeContext {
             );
             blit.endEncoding();
         }
-        command.commit();
-        command.waitUntilCompleted();
-        if command.status() != MTLCommandBufferStatus::Completed || command.error().is_some() {
-            return Err(AllocationError::NativeFailure);
-        }
         let value = self.next_transfer_value;
         self.next_transfer_value = value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
-        self.completed_transfer_value = value;
+        let pending_command = command.clone();
+        self.transfer_worker
+            .as_ref()
+            .ok_or(AllocationError::NativeFailure)?
+            .submit(super::transfer::MetalTransferJob {
+                value,
+                bytes: size,
+                command: super::transfer::TransferCommand::new(command),
+            })
+            .map_err(|error| match error {
+                ez_gfx_hal::TransferWorkerError::Full => AllocationError::OutOfMemory,
+                ez_gfx_hal::TransferWorkerError::Failed => AllocationError::NativeFailure,
+            })?;
+        self.pending_transfers.push(super::PendingTransfer {
+            value,
+            command: super::ThreadBound::new(pending_command),
+        });
         CompletionToken::new(QueueKind::Transfer, value).map_err(|_| AllocationError::NativeFailure)
     }
 
     fn completed_transfer_value(&self) -> Result<u64, AllocationError> {
-        Ok(self.completed_transfer_value)
+        if self
+            .transfer_worker
+            .as_ref()
+            .is_some_and(ez_gfx_hal::TransferWorker::failed)
+        {
+            return Err(AllocationError::NativeFailure);
+        }
+        let mut completed = self.completed_transfer_value;
+        for pending in &self.pending_transfers {
+            match pending.command.status() {
+                MTLCommandBufferStatus::Completed if pending.command.error().is_none() => {
+                    completed = completed.max(pending.value);
+                }
+                MTLCommandBufferStatus::Error => return Err(AllocationError::NativeFailure),
+                _ => break,
+            }
+        }
+        Ok(completed)
     }
 }
 impl Drop for NativeContext {
     fn drop(&mut self) {
         let _ = self.wait_idle();
+        if let Some(mut worker) = self.transfer_worker.take() {
+            worker.shutdown();
+        }
+        if let Some(mut worker) = self.texture_worker.take() {
+            worker.shutdown();
+        }
+        for allocation in self.texture_staging.drain() {
+            let _ = self.free(allocation);
+        }
         while let Some(retired) = self.retired.pop() {
             let _ = self.free(retired.allocation);
         }

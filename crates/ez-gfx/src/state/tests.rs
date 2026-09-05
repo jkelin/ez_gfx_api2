@@ -64,6 +64,59 @@ fn graphics_pipeline_keys_include_state_attachment_and_texture_interface() {
     );
 }
 
+fn texture_config() -> TextureConfig {
+    TextureConfig {
+        width: 1,
+        height: 1,
+        mip_count: 1,
+        sampler: ez_gfx_hal::TextureSamplerDesc {
+            min_filter: ez_gfx_hal::SamplerFilter::Linear,
+            mag_filter: ez_gfx_hal::SamplerFilter::Linear,
+            max_anisotropy: 1.0,
+            address_u: ez_gfx_hal::SamplerAddressMode::Clamp,
+            address_v: ez_gfx_hal::SamplerAddressMode::Clamp,
+            address_w: ez_gfx_hal::SamplerAddressMode::Clamp,
+        },
+    }
+}
+
+#[test]
+fn texture_admission_is_nonblocking_and_pending_cancellation_invalidates_the_handle() {
+    let context =
+        create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).unwrap()).unwrap();
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    with_context_mut(context, |state| {
+        state.async_textures.decode_gate = Some(gate.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    let texture = load_texture(
+        context,
+        TextureSource::Rgba8 {
+            width: 1,
+            height: 1,
+        },
+        &[1, 2, 3, 4],
+        false,
+        &texture_config(),
+    )
+    .unwrap();
+    assert_eq!(poll_texture_load(context, texture), EzGfxResult::NotReady);
+
+    gate.wait();
+    assert_eq!(cancel_texture_load(context, texture), EzGfxResult::Ok);
+    assert_eq!(
+        poll_texture_load(context, texture),
+        EzGfxResult::InvalidContext
+    );
+    assert_eq!(
+        cancel_texture_load(context, texture),
+        EzGfxResult::InvalidArgument
+    );
+    assert_eq!(destroy_context(context), EzGfxResult::Ok);
+}
+
 #[cfg(windows)]
 fn dx12_context() -> ContextHandle {
     create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Dx12).unwrap()).unwrap()

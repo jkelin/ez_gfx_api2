@@ -55,7 +55,7 @@ mod renderer {
     }
 
     impl ImGuiScene {
-        pub(super) fn create(context: ContextHandle) -> anyhow::Result<Self> {
+        pub(super) fn create(context: ContextHandle, backend: Backend) -> anyhow::Result<Self> {
             let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .context("examples package has no workspace parent")?;
@@ -99,6 +99,7 @@ mod renderer {
             )
             .map_err(|error| anyhow::anyhow!("{error:?}"))
             .context("load ImGui font atlas")?;
+            status(wait_idle(context), "wait for ImGui font atlas")?;
             let texture_id = texture_binding(context, texture)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))
                 .context("resolve ImGui font binding")?;
@@ -139,10 +140,10 @@ mod renderer {
                 uploaded_draw_counts: Vec::new(),
                 push: Push {
                     display_size: [640.0, 480.0],
-                    vertical_sign: if cfg!(target_vendor = "apple") {
-                        -1.0
-                    } else {
+                    vertical_sign: if backend == Backend::Vulkan {
                         1.0
+                    } else {
+                        -1.0
                     },
                     padding: 0.0,
                 },
@@ -459,7 +460,7 @@ impl LifecycleCallbacks for Example {
             resize_surface(self.context(), self.surface(), width, height),
             &format!("initialize {backend_name} swapchain"),
         )?;
-        self.resources = Some(ExampleScene::create(self.context())?);
+        self.resources = Some(ExampleScene::create(self.context(), backend)?);
         Ok(())
     }
 

@@ -127,6 +127,7 @@ mod renderer {
             )
             .map_err(|error| anyhow::anyhow!("{error:?}"))
             .context("load cube texture")?;
+            status(wait_idle(context), "wait for cube texture")?;
             let texture_id = texture_binding(context, texture)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))
                 .context("resolve cube texture binding")?;

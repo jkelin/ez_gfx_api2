@@ -1,8 +1,8 @@
 use super::{
     AdapterCapabilities, AdapterClass, AdapterInfo, AllocationError, AllocationSizes, Allocator,
     AllocatorCreateDesc, BACKEND, CompressionSupport, CreateDXGIFactory1, CreateEventW,
-    D3D_FEATURE_LEVEL_12_1, D3D_SHADER_MODEL_6_5, D3D12_COMMAND_LIST_TYPE_DIRECT,
-    D3D12_COMMAND_QUEUE_DESC, D3D12_DESCRIPTOR_HEAP_DESC,
+    D3D_FEATURE_LEVEL_12_1, D3D_SHADER_MODEL_6_5, D3D12_COMMAND_LIST_TYPE_COPY,
+    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC, D3D12_DESCRIPTOR_HEAP_DESC,
     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
     D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, D3D12_FEATURE_D3D12_OPTIONS,
     D3D12_FEATURE_DATA_D3D12_OPTIONS, D3D12_FEATURE_DATA_SHADER_MODEL, D3D12_FEATURE_SHADER_MODEL,
@@ -11,8 +11,9 @@ use super::{
     DXGI_ADAPTER_FLAG3_SOFTWARE, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_UNSUPPORTED,
     DeferredNativeResource, DeferredResource, HalError, ID3D12CommandQueue, ID3D12DescriptorHeap,
     ID3D12Device, ID3D12DeviceVersion, ID3D12Fence, IDXGIAdapter4, IDXGIFactory4, INFINITE,
-    Interface, NativeContext, NativeSurface, SemanticProfile, TEXTURE_DESCRIPTOR_CAPACITY,
-    WaitForSingleObject, adapter_id, create_frame_slots, map_allocator, map_windows,
+    Interface, MemoryAllocator, NativeContext, NativeSurface, QueueKind, SemanticProfile,
+    TEXTURE_DESCRIPTOR_CAPACITY, WaitForSingleObject, adapter_id, create_frame_slots,
+    map_allocator, map_windows, transfer,
 };
 
 fn initialize_context(
@@ -27,8 +28,26 @@ fn initialize_context(
             ..Default::default()
         })
     }?;
+    // SAFETY: the descriptor requests a native copy queue from the same live device.
+    let transfer_queue: ID3D12CommandQueue = unsafe {
+        device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+            Type: D3D12_COMMAND_LIST_TYPE_COPY,
+            ..Default::default()
+        })
+    }?;
+    // SAFETY: the descriptor requests a second native copy queue from the same live device.
+    let texture_queue: ID3D12CommandQueue = unsafe {
+        device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+            Type: D3D12_COMMAND_LIST_TYPE_COPY,
+            ..Default::default()
+        })
+    }?;
     // SAFETY: CreateFence receives defined value and flag constants, while device retains the ID3D12Device receiver and windows-rs provides ID3D12Fence out storage.
     let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }?;
+    // SAFETY: the transfer fence is created by and retained with the same live device.
+    let transfer_fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }?;
+    // SAFETY: the texture fence is created by and retained with the same live device.
+    let texture_fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }?;
     // SAFETY: CreateEventW permits null security-attribute and name pointers, and windows-rs provides HANDLE result storage for the call.
     let fence_event = unsafe { CreateEventW(None, false, false, None) }?;
     let allocator = Allocator::new(&AllocatorCreateDesc {
@@ -83,16 +102,32 @@ fn initialize_context(
         sampler.ptr += sampler_stride;
     }
     let frame_slots = create_frame_slots(&device)?;
+    let transfer_worker = transfer::start_worker(
+        &device,
+        transfer_queue.clone(),
+        queue.clone(),
+        transfer_fence.clone(),
+    )
+    .map_err(|_| windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL))?;
+    let texture_worker =
+        transfer::start_worker(&device, texture_queue, queue.clone(), texture_fence.clone())
+            .map_err(|_| windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL))?;
     Ok(NativeContext {
         adapter,
         device,
         queue,
         fence,
         fence_event,
+        transfer_fence,
+        texture_fence,
+        transfer_worker: Some(transfer_worker),
+        texture_worker: Some(texture_worker),
         next_fence: 1,
         allocator: Some(allocator),
+        next_transfer_fence: 1,
+        next_texture_fence: 1,
         retired: Vec::new(),
-        pending_copies: Vec::new(),
+        texture_staging: ez_gfx_hal::ReusableStagingPool::new(256),
         frame_slots,
         frame_cursor: 0,
         deferred: Vec::new(),
@@ -243,6 +278,16 @@ impl NativeContext {
     ///
     /// Returns an error if the fence counter overflows, fence signaling or event registration fails, or deferred resource reclamation fails.
     pub fn wait_idle(&mut self) -> Result<(), HalError> {
+        self.transfer_worker
+            .as_ref()
+            .ok_or(HalError::NativeFailure)?
+            .flush()
+            .map_err(|_| HalError::NativeFailure)?;
+        self.texture_worker
+            .as_ref()
+            .ok_or(HalError::NativeFailure)?
+            .flush()
+            .map_err(|_| HalError::NativeFailure)?;
         let value = self.next_fence;
         self.next_fence = self
             .next_fence
@@ -258,6 +303,64 @@ impl NativeContext {
             // SAFETY: WaitForSingleObject receives fence_event, a waitable event HANDLE returned by CreateEventW, and exclusive self access keeps it unclosed for the wait.
             unsafe { WaitForSingleObject(self.fence_event, INFINITE) };
         }
+        // SAFETY: both transfer fences belong to this live device and their workers retain them.
+        let transfer_value = self.next_transfer_fence.saturating_sub(1);
+        // SAFETY: the transfer fence remains live while polling its worker's terminal value.
+        let mut transfer_completed = unsafe { self.transfer_fence.GetCompletedValue() };
+        while transfer_value != 0 && transfer_completed < transfer_value {
+            if self
+                .transfer_worker
+                .as_ref()
+                .is_some_and(ez_gfx_hal::TransferWorker::failed)
+            {
+                return Err(HalError::NativeFailure);
+            }
+            // SAFETY: the worker signals every accepted transfer value, and this short timed wait
+            // lets the caller observe worker or device failure rather than hanging indefinitely.
+            unsafe {
+                self.transfer_fence
+                    .SetEventOnCompletion(transfer_value, self.fence_event)
+            }
+            .map_err(map_windows)?;
+            // SAFETY: `fence_event` remains live and waitable throughout this method.
+            unsafe { WaitForSingleObject(self.fence_event, 10) };
+            // SAFETY: the transfer fence remains live after the timed event wait.
+            transfer_completed = unsafe { self.transfer_fence.GetCompletedValue() };
+        }
+        if transfer_completed == u64::MAX {
+            return Err(HalError::DeviceLost);
+        }
+        self.reclaim(QueueKind::Transfer, transfer_value)
+            .map_err(|_| HalError::NativeFailure)?;
+        // SAFETY: the texture fence remains live while the context owns it.
+        let texture_value = self.next_texture_fence.saturating_sub(1);
+        // SAFETY: the texture fence remains live while polling its worker's terminal value.
+        let mut texture_completed = unsafe { self.texture_fence.GetCompletedValue() };
+        while texture_value != 0 && texture_completed < texture_value {
+            if self
+                .texture_worker
+                .as_ref()
+                .is_some_and(ez_gfx_hal::TransferWorker::failed)
+            {
+                return Err(HalError::NativeFailure);
+            }
+            // SAFETY: the worker signals every accepted texture-transfer value, and this timed wait
+            // lets the caller observe worker or device failure rather than hanging indefinitely.
+            unsafe {
+                self.texture_fence
+                    .SetEventOnCompletion(texture_value, self.fence_event)
+            }
+            .map_err(map_windows)?;
+            // SAFETY: `fence_event` remains live and waitable throughout this method.
+            unsafe { WaitForSingleObject(self.fence_event, 10) };
+            // SAFETY: the texture fence remains live after the timed event wait.
+            texture_completed = unsafe { self.texture_fence.GetCompletedValue() };
+        }
+        if texture_completed == u64::MAX {
+            return Err(HalError::DeviceLost);
+        }
+        self.reclaim(QueueKind::TextureTransfer, texture_value)
+            .map_err(|_| HalError::NativeFailure)?;
         self.reclaim_deferred()
             .map_err(|_| HalError::NativeFailure)?;
         Ok(())

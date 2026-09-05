@@ -19,7 +19,7 @@ use super::{
     D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_ROOT_SIGNATURE_DESC,
     D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, D3D12_ROOT_SIGNATURE_FLAG_NONE,
     D3D12_SHADER_BYTECODE, D3D12_SHADER_VISIBILITY_ALL, D3D12_STENCIL_OP_KEEP,
-    D3D12SerializeRootSignature, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
+    D3D12SerializeRootSignature, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
     DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC, DeferredResource, DynamicPipelineState, FrontFace,
     HalError, ID3D12RootSignature, ID3DBlob, NativeContext, NativePipeline, NativeShader,
     PrimitiveTopology, ShaderBufferLayout, TEXTURE_DESCRIPTOR_CAPACITY, map_windows, ptr,
@@ -306,7 +306,7 @@ impl NativeContext {
             BackFace: stencil,
         };
         let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
-        formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             pRootSignature: core::mem::ManuallyDrop::new(Some(root.clone())),
             VS: D3D12_SHADER_BYTECODE {

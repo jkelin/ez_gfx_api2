@@ -3,7 +3,9 @@ use super::{
     CompletionToken, DeferredResource, ImageMip, MemoryAllocator, MemoryClass, MemoryLocation,
     NativeAllocation, NativeContext, NativeTexture, QueueKind, SAMPLER_DESCRIPTOR_BINDING,
     TEXTURE_DESCRIPTOR_BINDING, TEXTURE_DESCRIPTOR_CAPACITY, TextureSamplerDesc, map_allocation_vk,
-    map_allocator, map_vk, sampler_create_info, validate_rgba8_mips, vk,
+    map_allocator, map_vk, sampler_create_info,
+    transfer::{VulkanTransferCopy, VulkanTransferJob},
+    validate_rgba8_mips, vk,
 };
 
 fn publish_texture(
@@ -45,11 +47,7 @@ fn publish_texture(
 }
 
 struct TextureUpload<'a> {
-    device: &'a ash::Device,
     mips: &'a [ImageMip<'a>],
-    pool: vk::CommandPool,
-    queue: vk::Queue,
-    semaphore: vk::Semaphore,
     image: vk::Image,
     total: u64,
 }
@@ -60,79 +58,14 @@ impl NativeContext {
         mut upload: NativeAllocation,
         request: &TextureUpload<'_>,
     ) -> Result<Vec<CompletionToken>, AllocationError> {
-        let TextureUpload {
-            device,
-            mips,
-            pool,
-            queue,
-            semaphore,
-            image,
-            total,
-        } = *request;
-        let mut commands = Vec::with_capacity(mips.len());
-        let submitted = (|| {
-            let target = self.mapped_slice_mut(&mut upload)?;
-            let mut offset = 0_usize;
-            for mip in mips {
-                target[offset..offset + mip.bytes.len()].copy_from_slice(mip.bytes);
-                offset += mip.bytes.len();
-            }
-            self.flush(&mut upload, 0, total)?;
-
-            let mut completions = Vec::with_capacity(mips.len());
-            let mut source_offset = 0_u64;
-            for (level, mip) in mips.iter().enumerate() {
-                // SAFETY: `pool` is this device's transfer command pool, host access is serialized by `&mut self`, and the allocate-info storage lives through `allocate_command_buffers`.
-                let command = unsafe {
-                    device.allocate_command_buffers(
-                        &vk::CommandBufferAllocateInfo::default()
-                            .command_pool(pool)
-                            .level(vk::CommandBufferLevel::PRIMARY)
-                            .command_buffer_count(1),
-                    )
-                }
-                .map_err(|error| map_allocation_vk(map_vk(error)))?
-                .into_iter()
-                .next()
-                .ok_or(AllocationError::NativeFailure)?;
-                commands.push(command);
-                // SAFETY: `command` was just allocated from `pool` in the initial state, host access is serialized by `&mut self`, and the begin-info storage lives through `begin_command_buffer`.
-                unsafe {
-                    device.begin_command_buffer(
-                        command,
-                        &vk::CommandBufferBeginInfo::default()
-                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                    )
-                }
-                .map_err(|error| map_allocation_vk(map_vk(error)))?;
-                let range = vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: u32::try_from(level)
-                        .map_err(|_| AllocationError::NativeFailure)?,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                };
-                let to_copy = vk::ImageMemoryBarrier::default()
-                    .image(image)
-                    .subresource_range(range)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-                // SAFETY: `command` is recording, `image` memory is bound and retained through submission, and the `to_copy` barrier slice lives through `cmd_pipeline_barrier`.
-                unsafe {
-                    device.cmd_pipeline_barrier(
-                        command,
-                        vk::PipelineStageFlags::TOP_OF_PIPE,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::DependencyFlags::empty(),
-                        &[],
-                        &[],
-                        core::slice::from_ref(&to_copy),
-                    );
-                };
-                let region = vk::BufferImageCopy::default()
-                    .buffer_offset(source_offset)
+        let target = self.mapped_slice_mut(&mut upload)?;
+        let mut offset = 0_usize;
+        let mut regions = Vec::with_capacity(request.mips.len());
+        for (level, mip) in request.mips.iter().enumerate() {
+            target[offset..offset + mip.bytes.len()].copy_from_slice(mip.bytes);
+            regions.push(
+                vk::BufferImageCopy::default()
+                    .buffer_offset(offset as u64)
                     .image_subresource(vk::ImageSubresourceLayers {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         mip_level: u32::try_from(level)
@@ -144,82 +77,44 @@ impl NativeContext {
                         width: mip.width,
                         height: mip.height,
                         depth: 1,
-                    });
-                // SAFETY: `command` is recording, `upload.buffer` and `image` are retained until queue idle, and `region` storage lives through `cmd_copy_buffer_to_image`.
-                unsafe {
-                    device.cmd_copy_buffer_to_image(
-                        command,
-                        upload.buffer,
-                        image,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        core::slice::from_ref(&region),
-                    );
-                };
-                let to_shader = vk::ImageMemoryBarrier::default()
-                    .image(image)
-                    .subresource_range(range)
-                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ);
-                // SAFETY: `command` is recording, `image` is retained through execution, and `to_shader` lives through barrier recording, after which the command remains recording for `end_command_buffer`.
-                unsafe {
-                    device.cmd_pipeline_barrier(
-                        command,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::PipelineStageFlags::ALL_GRAPHICS
-                            | vk::PipelineStageFlags::COMPUTE_SHADER,
-                        vk::DependencyFlags::empty(),
-                        &[],
-                        &[],
-                        core::slice::from_ref(&to_shader),
-                    );
-                    device.end_command_buffer(command)
-                }
-                .map_err(|error| map_allocation_vk(map_vk(error)))?;
-                let value = self.next_transfer_value;
-                self.next_transfer_value =
-                    value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
-                let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
-                    .signal_semaphore_values(core::slice::from_ref(&value));
-                let submit = vk::SubmitInfo::default()
-                    .command_buffers(core::slice::from_ref(&command))
-                    .signal_semaphores(core::slice::from_ref(&semaphore))
-                    .push_next(&mut timeline);
-                // SAFETY: `command` is executable, queue access is serialized by `&mut self`, submit-chain storage lives through `queue_submit`, and the upload and image are retained until queue idle.
-                unsafe {
-                    device.queue_submit(queue, core::slice::from_ref(&submit), vk::Fence::null())
-                }
-                .map_err(|error| map_allocation_vk(map_vk(error)))?;
-                completions.push(
-                    CompletionToken::new(QueueKind::Transfer, value)
-                        .map_err(|_| AllocationError::NativeFailure)?,
-                );
-                source_offset = source_offset
-                    .checked_add(
-                        u64::try_from(mip.bytes.len())
-                            .map_err(|_| AllocationError::NativeFailure)?,
-                    )
-                    .ok_or(AllocationError::NativeFailure)?;
-            }
-            // SAFETY: host access to `queue` is serialized by `&mut self`, and `queue_wait_idle` completes submitted command-buffer use before cleanup.
-            unsafe { device.queue_wait_idle(queue) }
-                .map_err(|error| map_allocation_vk(map_vk(error)))?;
-            Ok(completions)
-        })();
-        if submitted.is_err() {
-            // SAFETY: host access to `queue` is serialized by `&mut self`, and `queue_wait_idle` is issued before any submitted command buffer or upload storage is freed.
-            let _ = unsafe { device.queue_wait_idle(queue) };
+                    }),
+            );
+            offset += mip.bytes.len();
         }
-        if !commands.is_empty() {
-            // SAFETY: every `command` was allocated from `pool`; the normal or error wait path has finished queue use, and the slice lives through `free_command_buffers`.
-            unsafe { device.free_command_buffers(pool, &commands) };
+        self.flush(&mut upload, 0, request.total)?;
+        let first = self.next_texture_value;
+        self.next_texture_value = first
+            .checked_add(request.mips.len() as u64)
+            .ok_or(AllocationError::NativeFailure)?;
+        let completions = (first..self.next_texture_value)
+            .map(|value| CompletionToken::new(QueueKind::TextureTransfer, value))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| AllocationError::NativeFailure)?;
+        let completion = *completions.last().ok_or(AllocationError::NativeFailure)?;
+        let value = completion.value;
+        let submitted = self
+            .texture_worker
+            .as_ref()
+            .ok_or(AllocationError::NativeFailure)?
+            .submit(VulkanTransferJob {
+                value,
+                bytes: request.total,
+                copy: VulkanTransferCopy::Texture {
+                    source: upload.buffer,
+                    destination: request.image,
+                    regions,
+                },
+            });
+        if let Err(error) = submitted {
+            self.free(upload)?;
+            return Err(match error {
+                ez_gfx_hal::TransferWorkerError::Full => AllocationError::OutOfMemory,
+                ez_gfx_hal::TransferWorkerError::Failed => AllocationError::NativeFailure,
+            });
         }
-        let upload_freed = self.free(upload);
-        match (submitted, upload_freed) {
-            (Ok(completions), Ok(())) => Ok(completions),
-            (Err(error), _) | (_, Err(error)) => Err(error),
-        }
+        let capacity = upload.allocation.size();
+        self.texture_staging.put(capacity, upload, Some(completion));
+        Ok(completions)
     }
 }
 
@@ -331,13 +226,6 @@ impl NativeContext {
         let descriptor_set = self
             .texture_descriptor_set
             .ok_or(AllocationError::NativeFailure)?;
-        let pool = self
-            .transfer_command_pool
-            .ok_or(AllocationError::NativeFailure)?;
-        let queue = self.graphics_queue.ok_or(AllocationError::NativeFailure)?;
-        let semaphore = self
-            .transfer_timeline
-            .ok_or(AllocationError::NativeFailure)?;
         let width = mips[0].width;
         let height = mips[0].height;
         let mip_count = u32::try_from(mips.len()).map_err(|_| AllocationError::NativeFailure)?;
@@ -345,8 +233,14 @@ impl NativeContext {
             .iter()
             .try_fold(0_u64, |sum, mip| sum.checked_add(mip.bytes.len() as u64))
             .ok_or(AllocationError::NativeFailure)?;
-        let upload_request = AllocationRequest::new(total, 4, MemoryClass::Upload, true, None)
+        let bucket = ez_gfx_hal::staging_bucket_size(total, ez_gfx_hal::DEFAULT_STAGING_POLICY)
+            .map_err(|_| AllocationError::OutOfMemory)?;
+        let upload_request = AllocationRequest::new(bucket, 4, MemoryClass::Upload, true, None)
             .map_err(|_| AllocationError::ZeroSize)?;
+        let completed = self.completed_texture_transfer_value()?;
+        for stale in self.texture_staging.trim(completed) {
+            self.free(stale)?;
+        }
         if self.allocator.is_none() {
             return Err(AllocationError::NativeFailure);
         }
@@ -388,43 +282,37 @@ impl NativeContext {
                 return Err(map_allocation_vk(map_vk(error)));
             }
         };
-        let upload = match self.allocate(upload_request) {
-            Ok(upload) => upload,
-            Err(error) => {
-                self.destroy_unpublished_texture(
-                    &device,
-                    image,
-                    Some(view),
-                    Some(sampler),
-                    allocation,
-                );
-                return Err(error);
+        let upload = if let Some((_, upload)) = self.texture_staging.take(total, completed) {
+            upload
+        } else {
+            match self.allocate(upload_request) {
+                Ok(upload) => upload,
+                Err(error) => {
+                    self.destroy_unpublished_texture(
+                        &device,
+                        image,
+                        Some(view),
+                        Some(sampler),
+                        allocation,
+                    );
+                    return Err(error);
+                }
             }
         };
-        let completions = match self.upload_texture_mips(
-            upload,
-            &TextureUpload {
-                device: &device,
-                mips,
-                pool,
-                queue,
-                semaphore,
-                image,
-                total,
-            },
-        ) {
-            Ok(completions) => completions,
-            Err(error) => {
-                self.destroy_unpublished_texture(
-                    &device,
-                    image,
-                    Some(view),
-                    Some(sampler),
-                    allocation,
-                );
-                return Err(error);
-            }
-        };
+        let completions =
+            match self.upload_texture_mips(upload, &TextureUpload { mips, image, total }) {
+                Ok(completions) => completions,
+                Err(error) => {
+                    self.destroy_unpublished_texture(
+                        &device,
+                        image,
+                        Some(view),
+                        Some(sampler),
+                        allocation,
+                    );
+                    return Err(error);
+                }
+            };
         let texture = publish_texture(
             &device,
             descriptor_set,
@@ -466,20 +354,32 @@ impl NativeContext {
             .as_ref()
             .ok_or(AllocationError::NativeFailure)?
             .clone();
-        let pool = self
-            .transfer_command_pool
-            .ok_or(AllocationError::NativeFailure)?;
-        let semaphore = self
-            .transfer_timeline
-            .ok_or(AllocationError::NativeFailure)?;
         let queue = self.graphics_queue.ok_or(AllocationError::NativeFailure)?;
-        let value = self.next_transfer_value;
-        let next_value = value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
-        let mut readback = self.allocate(
+        let family = self
+            .graphics_queue_family
+            .ok_or(AllocationError::NativeFailure)?;
+        // SAFETY: `family` belongs to this initialized device and create-info storage spans the call.
+        let pool = unsafe {
+            device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(family)
+                    .flags(vk::CommandPoolCreateFlags::TRANSIENT),
+                None,
+            )
+        }
+        .map_err(|error| map_allocation_vk(map_vk(error)))?;
+        let mut readback = match self.allocate(
             AllocationRequest::new(size, 4, MemoryClass::Readback, true, None)
                 .map_err(|_| AllocationError::ZeroSize)?,
-        )?;
-        // SAFETY: `pool` is this device's transfer command pool, host access is serialized by `&mut self`, and the allocate-info storage lives through `allocate_command_buffers`.
+        ) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                // SAFETY: no command buffer was allocated from this new pool.
+                unsafe { device.destroy_command_pool(pool, None) };
+                return Err(error);
+            }
+        };
+        // SAFETY: this pool is graphics-family local and exclusively owned by this call.
         let command = match unsafe {
             device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
@@ -491,10 +391,13 @@ impl NativeContext {
             Ok(commands) => commands[0],
             Err(error) => {
                 let _ = self.free(readback);
+                // SAFETY: allocation failed before any command buffer became pending.
+                unsafe { device.destroy_command_pool(pool, None) };
                 return Err(map_allocation_vk(map_vk(error)));
             }
         };
         let mut submitted = false;
+        let graphics_queue_lock = self.graphics_queue_lock.clone();
         let result = (|| {
             // SAFETY: `command` was just allocated from `pool` in the initial state, host access is serialized by `&mut self`, and the begin-info storage lives through `begin_command_buffer`.
             unsafe {
@@ -575,29 +478,17 @@ impl NativeContext {
                 device.end_command_buffer(command)
             }
             .map_err(|error| map_allocation_vk(map_vk(error)))?;
-            let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
-                .signal_semaphore_values(core::slice::from_ref(&value));
-            let submit = vk::SubmitInfo::default()
-                .command_buffers(core::slice::from_ref(&command))
-                .signal_semaphores(core::slice::from_ref(&semaphore))
-                .push_next(&mut timeline);
-            // SAFETY: `command` is executable, queue access is serialized by `&mut self`, submit-chain storage lives through `queue_submit`, and image and readback storage are retained until the wait.
+            let submit = vk::SubmitInfo::default().command_buffers(core::slice::from_ref(&command));
+            let _queue_guard = graphics_queue_lock.lock();
+            // SAFETY: the closed command buffer and graphics queue belong to this live device.
             unsafe {
                 device.queue_submit(queue, core::slice::from_ref(&submit), vk::Fence::null())
             }
             .map_err(|error| map_allocation_vk(map_vk(error)))?;
             submitted = true;
-            self.next_transfer_value = next_value;
-            // SAFETY: the preceding successful submit enqueued signal `value` on timeline `semaphore`, and the equal-length wait-info slices live through `wait_semaphores`.
-            unsafe {
-                device.wait_semaphores(
-                    &vk::SemaphoreWaitInfo::default()
-                        .semaphores(core::slice::from_ref(&semaphore))
-                        .values(core::slice::from_ref(&value)),
-                    u64::MAX,
-                )
-            }
-            .map_err(|error| map_allocation_vk(map_vk(error)))?;
+            // SAFETY: the graphics queue remains live and locked through this wait.
+            unsafe { device.queue_wait_idle(queue) }
+                .map_err(|error| map_allocation_vk(map_vk(error)))?;
             self.invalidate(&mut readback, 0, size)?;
             Ok(self.mapped_slice(&readback)?
                 [..usize::try_from(size).map_err(|_| AllocationError::NativeFailure)?]
@@ -609,10 +500,36 @@ impl NativeContext {
         }
         // SAFETY: `command` came from `pool`; unsubmitted paths never made it pending, submitted paths wait for completion, and the slice lives through `free_command_buffers`.
         unsafe { device.free_command_buffers(pool, &[command]) };
+        // SAFETY: the only command buffer was freed above and no pool work remains pending.
+        unsafe { device.destroy_command_pool(pool, None) };
         let freed = self.free(readback);
         match (result, freed) {
             (Ok(pixels), Ok(())) => Ok(pixels),
             (Err(error), _) | (_, Err(error)) => Err(error),
         }
+    }
+}
+
+impl NativeContext {
+    /// Returns the completed value of the independent texture transfer timeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the texture worker failed or the device timeline is unavailable.
+    pub fn completed_texture_transfer_value(&self) -> Result<u64, AllocationError> {
+        if self
+            .texture_worker
+            .as_ref()
+            .is_some_and(ez_gfx_hal::TransferWorker::failed)
+        {
+            return Err(AllocationError::NativeFailure);
+        }
+        let device = self.device.as_ref().ok_or(AllocationError::NativeFailure)?;
+        let timeline = self
+            .texture_timeline
+            .ok_or(AllocationError::NativeFailure)?;
+        // SAFETY: the timeline belongs to the retained live device.
+        unsafe { device.get_semaphore_counter_value(timeline) }
+            .map_err(|error| map_allocation_vk(map_vk(error)))
     }
 }

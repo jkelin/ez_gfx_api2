@@ -1,6 +1,6 @@
 use super::{
-    AllocationRequest, AttachmentLoadOp, AttachmentStoreOp, FRAMES_IN_FLIGHT, HalError,
-    MemoryAllocator, MemoryClass, NativeContext, NativeFrameAction, NativeFrameResource,
+    AllocationRequest, AttachmentLoadOp, AttachmentStoreOp, CompletionToken, FRAMES_IN_FLIGHT,
+    HalError, MemoryAllocator, MemoryClass, NativeContext, NativeFrameAction, NativeFrameResource,
     NativeSurface, QueueKind, ResourceAccess, map_allocation_hal, map_vk, vk, vulkan_state,
 };
 
@@ -702,17 +702,24 @@ impl NativeContext {
                 .device
                 .end_command_buffer(prepared.command_handle)
                 .map_err(map_vk)?;
-            let mut wait_semaphores = Vec::with_capacity(2);
-            let mut wait_values = Vec::with_capacity(2);
+            let _queue_guard = self.graphics_queue_lock.lock();
+            let mut wait_semaphores = Vec::with_capacity(3);
+            let mut wait_values = Vec::with_capacity(3);
             let mut wait_stages = Vec::with_capacity(2);
             if plan.uses_surface {
                 wait_semaphores.push(prepared.available);
                 wait_values.push(0);
                 wait_stages.push(vk::PipelineStageFlags::ALL_COMMANDS);
             }
-            if let Some(value) = plan.external_wait {
-                wait_semaphores.push(self.transfer_timeline.ok_or(HalError::NotReady)?);
-                wait_values.push(value);
+            for token in &plan.external_wait {
+                let semaphore = match token.queue {
+                    QueueKind::Transfer => self.transfer_timeline,
+                    QueueKind::TextureTransfer => self.texture_timeline,
+                    _ => None,
+                }
+                .ok_or(HalError::NotReady)?;
+                wait_semaphores.push(semaphore);
+                wait_values.push(token.value);
                 wait_stages.push(vk::PipelineStageFlags::ALL_COMMANDS);
             }
             let signal_values = [0_u64];
@@ -869,7 +876,7 @@ impl NativeContext {
 struct FramePlan {
     uses_surface: bool,
     presents: bool,
-    external_wait: Option<u64>,
+    external_wait: Vec<CompletionToken>,
 }
 
 fn validate_frame_plan(
@@ -904,15 +911,18 @@ fn validate_frame_plan(
     let external_wait = actions
         .iter()
         .filter_map(|action| match action {
-            NativeFrameAction::Wait(token) if token.queue == QueueKind::Transfer => {
-                Some(Ok(token.value))
+            NativeFrameAction::Wait(token)
+                if matches!(
+                    token.queue,
+                    QueueKind::Transfer | QueueKind::TextureTransfer
+                ) =>
+            {
+                Some(Ok(*token))
             }
             NativeFrameAction::Wait(_) => Some(Err(HalError::InvalidArgument)),
             _ => None,
         })
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .max();
+        .collect::<Result<Vec<_>, _>>()?;
     let mut pass_active = false;
     let mut saw_present = false;
     for action in actions {

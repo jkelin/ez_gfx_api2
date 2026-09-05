@@ -245,6 +245,11 @@ struct RetiredAllocation {
     completion: CompletionToken,
 }
 
+struct PendingTransfer {
+    value: u64,
+    command: ThreadBound<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+}
+
 struct SurfaceDepth {
     texture: ThreadBound<Retained<ProtocolObject<dyn MTLTexture>>>,
     state: ThreadBound<Retained<ProtocolObject<dyn MTLDepthStencilState>>>,
@@ -290,6 +295,8 @@ impl NativeSurface {
 pub struct NativeContext {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    transfer_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    texture_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     allocator: Option<Allocator>,
     retired: Vec<RetiredAllocation>,
     frame_slots: Vec<FrameSlot>,
@@ -298,6 +305,13 @@ pub struct NativeContext {
     adapter: AdapterInfo,
     next_transfer_value: u64,
     completed_transfer_value: u64,
+    pending_transfers: Vec<PendingTransfer>,
+    transfer_worker: Option<ez_gfx_hal::TransferWorker<transfer::MetalTransferJob>>,
+    next_texture_value: u64,
+    completed_texture_value: u64,
+    pending_texture_transfers: Vec<PendingTransfer>,
+    texture_worker: Option<ez_gfx_hal::TransferWorker<transfer::MetalTransferJob>>,
+    texture_staging: ez_gfx_hal::ReusableStagingPool<NativeAllocation>,
 }
 
 // Metal device and command-queue protocol objects are `Send + Sync` in objc2-metal. Every
@@ -310,3 +324,4 @@ use memory::{map_allocation_hal, map_allocator, map_allocator_hal};
 mod pipeline;
 mod surface;
 mod texture;
+mod transfer;

@@ -1,13 +1,12 @@
 use super::{
     AllocationCreateDesc, AllocationError, AllocationRequest, BufferTransfer, CloseHandle,
-    CompletionToken, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
-    D3D12_RANGE, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER,
-    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_NONE,
-    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_GENERIC_READ,
-    D3D12_TEXTURE_LAYOUT_ROW_MAJOR, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC, DeferredResource,
-    HalError, ID3D12CommandAllocator, ID3D12CommandList, ID3D12GraphicsCommandList, ID3D12Resource,
-    Interface, MemoryAllocator, MemoryClass, MemoryLocation, NativeAllocation, NativeContext,
-    PendingCopy, QueueKind, RetiredAllocation, c_void, ptr,
+    CompletionToken, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, D3D12_RANGE, D3D12_RESOURCE_DESC,
+    D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+    D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
+    D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, DXGI_FORMAT_UNKNOWN,
+    DXGI_SAMPLE_DESC, DeferredResource, HalError, ID3D12Resource, MemoryAllocator, MemoryClass,
+    MemoryLocation, NativeAllocation, NativeContext, QueueKind, RetiredAllocation, c_void, ptr,
+    transfer::{Dx12TransferCopy, Dx12TransferJob},
 };
 
 impl MemoryAllocator for NativeContext {
@@ -251,57 +250,39 @@ impl BufferTransfer for NativeContext {
     ) -> Result<CompletionToken, AllocationError> {
         validate_range(source.allocation.size(), source_offset, size)?;
         validate_range(destination.allocation.size(), destination_offset, size)?;
-        // SAFETY: `self.device` is an initialized `ID3D12Device` interface and `D3D12_COMMAND_LIST_TYPE_DIRECT` is a defined allocator type for `CreateCommandAllocator`.
-        let allocator: ID3D12CommandAllocator = unsafe {
-            self.device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-        }
-        .map_err(|error| map_allocation_windows(&error))?;
-        // SAFETY: `CreateCommandList` receives the newly created, unused DIRECT `allocator`, node mask 0, and no initial pipeline state, with allocator storage retained by this function.
-        let list: ID3D12GraphicsCommandList = unsafe {
-            self.device
-                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
-        }
-        .map_err(|error| map_allocation_windows(&error))?;
-        // SAFETY: `list` is an open DIRECT command list, both resource handles denote buffers, and the two `validate_range` calls bound the offsets and size passed to `CopyBufferRegion`.
-        unsafe {
-            list.CopyBufferRegion(
-                &destination.resource,
-                destination_offset,
-                &source.resource,
-                source_offset,
-                size,
-            );
-        };
-        // SAFETY: `list` remains in the recording state returned by `CreateCommandList`, and this is its sole `Close` before submission.
-        unsafe { list.Close() }.map_err(|error| map_allocation_windows(&error))?;
-        let command: ID3D12CommandList = list
-            .cast()
-            .map_err(|error| map_allocation_windows(&error))?;
-        // SAFETY: `command` is the successfully closed DIRECT list, the one-element command array is initialized for the call, and the allocator/list storage is retained until the signaled fence completes.
-        unsafe { self.queue.ExecuteCommandLists(&[Some(command)]) };
-        let value = self.next_fence;
-        self.next_fence = value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
-        // SAFETY: `self.fence` is this context's transfer-completion fence, and `value` is the reserved next fence value for the command list just submitted to `self.queue`.
-        unsafe { self.queue.Signal(&self.fence, value) }
-            .map_err(|error| map_allocation_windows(&error))?;
-        let completion = CompletionToken::new(QueueKind::Transfer, value)
-            .map_err(|_| AllocationError::NativeFailure)?;
-        // SAFETY: `self.fence` is retained by this allocator while its completed value is queried.
-        let completed = unsafe { self.fence.GetCompletedValue() };
-        self.pending_copies
-            .retain(|copy| copy.completion.value > completed);
-        self.pending_copies.push(PendingCopy {
-            completion,
-            _allocator: allocator,
-            _list: list,
-        });
-        Ok(completion)
+        let value = self.next_transfer_fence;
+        self.next_transfer_fence = value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
+        self.transfer_worker
+            .as_ref()
+            .ok_or(AllocationError::NativeFailure)?
+            .submit(Dx12TransferJob {
+                value,
+                bytes: size,
+                copy: Dx12TransferCopy::Buffer {
+                    source: source.resource.clone(),
+                    destination: destination.resource.clone(),
+                    source_offset,
+                    destination_offset,
+                    size,
+                },
+            })
+            .map_err(|error| match error {
+                ez_gfx_hal::TransferWorkerError::Full => AllocationError::OutOfMemory,
+                ez_gfx_hal::TransferWorkerError::Failed => AllocationError::NativeFailure,
+            })?;
+        CompletionToken::new(QueueKind::Transfer, value).map_err(|_| AllocationError::NativeFailure)
     }
 
     fn completed_transfer_value(&self) -> Result<u64, AllocationError> {
-        // SAFETY: `self.fence` is the transfer fence created for this context, and its `ID3D12Fence` COM storage outlives the `GetCompletedValue` call.
-        let value = unsafe { self.fence.GetCompletedValue() };
+        if self
+            .transfer_worker
+            .as_ref()
+            .is_some_and(ez_gfx_hal::TransferWorker::failed)
+        {
+            return Err(AllocationError::NativeFailure);
+        }
+        // SAFETY: the transfer fence is retained by this context.
+        let value = unsafe { self.transfer_fence.GetCompletedValue() };
         if value == u64::MAX {
             return Err(AllocationError::DeviceLost);
         }
@@ -311,6 +292,15 @@ impl BufferTransfer for NativeContext {
 impl Drop for NativeContext {
     fn drop(&mut self) {
         let _ = self.wait_idle();
+        if let Some(mut worker) = self.texture_worker.take() {
+            worker.shutdown();
+        }
+        if let Some(mut worker) = self.transfer_worker.take() {
+            worker.shutdown();
+        }
+        for allocation in self.texture_staging.drain() {
+            let _ = self.free(allocation);
+        }
         while let Some(retired) = self.retired.pop() {
             let _ = self.free(retired.allocation);
         }
@@ -340,14 +330,6 @@ pub(super) fn validate_range(length: u64, offset: u64, size: u64) -> Result<(), 
         return Err(AllocationError::NativeFailure);
     }
     Ok(())
-}
-
-pub(super) fn map_hal_allocation(error: HalError) -> AllocationError {
-    match error {
-        HalError::OutOfMemory => AllocationError::OutOfMemory,
-        HalError::DeviceLost => AllocationError::DeviceLost,
-        _ => AllocationError::NativeFailure,
-    }
 }
 
 pub(super) fn map_windows(_: windows::core::Error) -> HalError {

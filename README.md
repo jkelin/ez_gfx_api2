@@ -5,6 +5,7 @@ Rust/Cargo migration of the original `ez_gfx_api` with Vulkan, Direct3D 12, and 
 ## Architecture
 
 `ez-gfx-core` defines semantic IDs, layouts, capabilities, and packed generational handles. The safe [`ez-gfx`](crates/ez-gfx/README.md) interface exposes distinct context, surface, shader, texture, indirect-buffer, structured-buffer, and render-target handle types; only the C ABI represents them as opaque `uint64_t` values. `ez-gfx-hal` is the backend-neutral execution seam. Backend crates lower it through `ash`, `windows`, and `objc2-metal`. `ez-gfx-runtime` owns validated artifact loading, frame graphs, resource lifetimes, and KTX2/Basis decoding.
+Texture loading is a bounded, nonblocking CPU-to-transfer-queue pipeline; see [Textures](docs/textures.md) for lifecycle, polling, cancellation, staging, backend synchronization, render integration, and C ABI behavior.
 
 [`ez-gfx-compiler`](crates/ez-gfx-compiler/README.md) compiles the root [`ez_gfx_api.slang`](ez_gfx_api.slang) module and application shaders to SPIR-V 1.5, Shader Model 6.5 DXIL, and Metal products. It writes [`.ezgfxshader`](crates/ez-gfx-artifact/README.md) files: a fixed, versioned frame around one bytechecked `rkyv` payload, with bounded lengths, a BLAKE3 digest, provenance, reflection, exactly one entry point per stage, and target coverage validation. Runtime callers load a stage set without naming entry points. Runtime crates and packages contain no compiler, Slang, DXC, source compilation, JIT, or fallback path.
 

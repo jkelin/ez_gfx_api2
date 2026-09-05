@@ -2,6 +2,7 @@
 //!
 //! The context owns every Vulkan object it creates; host window handles are borrowed.
 
+use ez_gfx_hal::TransferWorker;
 use std::ffi::{CStr, CString};
 
 use ash::{Entry, Instance, khr, vk};
@@ -308,6 +309,12 @@ struct PendingDevice {
     allocator: Option<Allocator>,
     command_pool: Option<vk::CommandPool>,
     timeline: Option<vk::Semaphore>,
+    acquire_pool: Option<vk::CommandPool>,
+    ownership_timeline: Option<vk::Semaphore>,
+    texture_command_pool: Option<vk::CommandPool>,
+    texture_acquire_pool: Option<vk::CommandPool>,
+    texture_timeline: Option<vk::Semaphore>,
+    texture_ownership_timeline: Option<vk::Semaphore>,
     descriptor_layout: Option<vk::DescriptorSetLayout>,
     descriptor_pool: Option<vk::DescriptorPool>,
     swapchain_loader: Option<khr::swapchain::Device>,
@@ -321,6 +328,12 @@ impl PendingDevice {
             allocator: None,
             command_pool: None,
             timeline: None,
+            acquire_pool: None,
+            ownership_timeline: None,
+            texture_command_pool: None,
+            texture_acquire_pool: None,
+            texture_timeline: None,
+            texture_ownership_timeline: None,
             descriptor_layout: None,
             descriptor_pool: None,
             swapchain_loader: None,
@@ -348,7 +361,25 @@ impl Drop for PendingDevice {
             if let Some(pool) = self.command_pool.take() {
                 device.destroy_command_pool(pool, None);
             }
+            if let Some(pool) = self.acquire_pool.take() {
+                device.destroy_command_pool(pool, None);
+            }
             if let Some(semaphore) = self.timeline.take() {
+                device.destroy_semaphore(semaphore, None);
+            }
+            if let Some(semaphore) = self.ownership_timeline.take() {
+                device.destroy_semaphore(semaphore, None);
+            }
+            if let Some(pool) = self.texture_command_pool.take() {
+                device.destroy_command_pool(pool, None);
+            }
+            if let Some(pool) = self.texture_acquire_pool.take() {
+                device.destroy_command_pool(pool, None);
+            }
+            if let Some(semaphore) = self.texture_timeline.take() {
+                device.destroy_semaphore(semaphore, None);
+            }
+            if let Some(semaphore) = self.texture_ownership_timeline.take() {
                 device.destroy_semaphore(semaphore, None);
             }
         }
@@ -372,10 +403,23 @@ pub struct NativeContext {
     retired: Vec<RetiredAllocation>,
     deferred: Vec<DeferredNativeResource>,
     graphics_queue: Option<vk::Queue>,
+    graphics_queue_lock: std::sync::Arc<parking_lot::Mutex<()>>,
+    transfer_queue: Option<vk::Queue>,
     graphics_queue_family: Option<u32>,
+    transfer_queue_family: Option<u32>,
     transfer_timeline: Option<vk::Semaphore>,
+    transfer_worker: Option<TransferWorker<transfer::VulkanTransferJob>>,
     transfer_command_pool: Option<vk::CommandPool>,
+    transfer_acquire_pool: Option<vk::CommandPool>,
+    transfer_ownership_timeline: Option<vk::Semaphore>,
+    texture_timeline: Option<vk::Semaphore>,
+    texture_worker: Option<TransferWorker<transfer::VulkanTransferJob>>,
+    texture_command_pool: Option<vk::CommandPool>,
+    texture_acquire_pool: Option<vk::CommandPool>,
+    texture_ownership_timeline: Option<vk::Semaphore>,
+    texture_staging: ez_gfx_hal::ReusableStagingPool<NativeAllocation>,
     next_transfer_value: u64,
+    next_texture_value: u64,
     texture_descriptor_pool: Option<vk::DescriptorPool>,
     texture_descriptor_layout: Option<vk::DescriptorSetLayout>,
     texture_descriptor_set: Option<vk::DescriptorSet>,
@@ -402,6 +446,7 @@ use memory::{
 mod pipeline;
 mod surface;
 mod texture;
+mod transfer;
 
 #[cfg(test)]
 mod tests;

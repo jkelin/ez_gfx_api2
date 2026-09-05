@@ -96,19 +96,20 @@ pub fn write_indirect(
         bytes.extend_from_slice(&command.first_index.to_le_bytes());
         bytes.extend_from_slice(&command.vertex_offset.to_le_bytes());
         bytes.extend_from_slice(&command.first_instance.to_le_bytes());
-        let (_, allocation) = context
-            .allocations
+        let ContextState {
+            native,
+            staging,
+            allocations,
+            allocation_ready,
+            ..
+        } = context;
+        let (_, allocation) = allocations
             .get(&handle)
             .ok_or(EzGfxResult::InvalidContext)?;
-        stage_upload(
-            &mut context.native,
-            &mut context.staging,
-            allocation,
-            u64::from(index) * 20,
-            &bytes,
-        )
-        .map(|_| ())
-        .map_err(map_allocation)
+        let token = stage_upload(native, staging, allocation, u64::from(index) * 20, &bytes)
+            .map_err(map_allocation)?;
+        allocation_ready.insert(handle, token);
+        Ok(())
     }))
 }
 
@@ -145,6 +146,7 @@ pub fn release_indirect(context: ContextHandle, indirect: IndirectBufferHandle) 
             .indirects
             .remove(&indirect)
             .ok_or(EzGfxResult::InvalidContext)?;
+        context.allocation_ready.remove(&handle);
         let (_, allocation) = context
             .allocations
             .remove(&handle)
@@ -172,6 +174,7 @@ pub fn write_structured(
             native,
             staging,
             allocations,
+            allocation_ready,
             ..
         } = context;
         let (capacity, allocation) = allocations
@@ -180,9 +183,9 @@ pub fn write_structured(
         if bytes.len() as u64 > *capacity {
             return Err(EzGfxResult::InvalidArgument);
         }
-        stage_upload(native, staging, allocation, 0, bytes)
-            .map(|_| ())
-            .map_err(map_allocation)
+        let token = stage_upload(native, staging, allocation, 0, bytes).map_err(map_allocation)?;
+        allocation_ready.insert(handle, token);
+        Ok(())
     }))
 }
 
@@ -194,6 +197,7 @@ pub fn release_structured(context: ContextHandle, structured: StructuredBufferHa
             .identity
             .remove(handle, ResourceKind::Structured)
             .map_err(map_lifecycle)?;
+        context.allocation_ready.remove(&handle);
         let (_, allocation) = context
             .allocations
             .remove(&handle)

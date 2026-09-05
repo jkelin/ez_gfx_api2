@@ -1,14 +1,15 @@
 use super::{
     AllocationCreateDesc, CreateDXGIFactory1, D3D12_CLEAR_VALUE, D3D12_CLEAR_VALUE_0,
     D3D12_DEPTH_STENCIL_VALUE, D3D12_DESCRIPTOR_HEAP_DESC, D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
-    D3D12_DESCRIPTOR_HEAP_TYPE_DSV, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_RESOURCE_DESC,
-    D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
-    D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_TEXTURE_LAYOUT_UNKNOWN, DXGI_ALPHA_MODE_IGNORE,
-    DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_PRESENT, DXGI_SAMPLE_DESC,
-    DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
-    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, HWND, HalError,
-    ID3D12DescriptorHeap, ID3D12Resource, IDXGIFactory4, Interface, MemoryLocation, NativeContext,
-    NativeSurface, SurfaceDepth, map_allocator_hal, map_windows,
+    D3D12_DESCRIPTOR_HEAP_TYPE_DSV, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_RENDER_TARGET_VIEW_DESC,
+    D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+    D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+    D3D12_RTV_DIMENSION_TEXTURE2D, D3D12_TEXTURE_LAYOUT_UNKNOWN, DXGI_ALPHA_MODE_IGNORE,
+    DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+    DXGI_PRESENT, DXGI_SAMPLE_DESC, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
+    DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, HWND,
+    HalError, ID3D12DescriptorHeap, ID3D12Resource, IDXGIFactory4, Interface, MemoryLocation,
+    NativeContext, NativeSurface, SurfaceDepth, map_allocator_hal, map_windows,
 };
 
 impl NativeContext {
@@ -144,8 +145,16 @@ impl NativeContext {
             let buffer: ID3D12Resource =
                 // SAFETY: `index` is in `0..3`, matching the swap chain's buffer count, and `swapchain` is retained through `GetBuffer`.
                 unsafe { swapchain.GetBuffer(index) }.map_err(map_windows)?;
-            // SAFETY: `handle` addresses the current slot of the three-entry RTV `heap`, and `buffer` is retained through `CreateRenderTargetView`.
-            unsafe { self.device.CreateRenderTargetView(&buffer, None, handle) };
+            let desc = D3D12_RENDER_TARGET_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            };
+            // SAFETY: `handle` addresses the current slot of the three-entry RTV `heap`; `desc` selects an sRGB-compatible view of the retained UNORM swap-chain buffer.
+            unsafe {
+                self.device
+                    .CreateRenderTargetView(&buffer, Some(&raw const desc), handle);
+            }
             surface.buffers.push(buffer);
             handle.ptr += stride;
         }

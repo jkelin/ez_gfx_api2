@@ -37,7 +37,7 @@ impl NativeContext {
                 mips.len() > 1,
             )
         };
-        // SAFETY: `desc` is the newly allocated `MTLTextureDescriptor`, and `mips.len()` is the validated mip-chain count consumed by `setMipmapLevelCount` during this send.
+        // SAFETY: `desc` is live and the validated mip count is consumed during this send.
         unsafe { desc.setMipmapLevelCount(mips.len()) };
         desc.setUsage(MTLTextureUsage::ShaderRead);
         desc.setStorageMode(MTLStorageMode::Private);
@@ -63,7 +63,52 @@ impl NativeContext {
                 .map_err(map_allocator)?;
             return Err(AllocationError::OutOfMemory);
         };
-        let uploaded = (|| {
+        let total = mips
+            .iter()
+            .try_fold(0_u64, |sum, mip| sum.checked_add(mip.bytes.len() as u64));
+        let Some(total) = total else {
+            drop(texture);
+            self.allocator
+                .as_mut()
+                .ok_or(AllocationError::NativeFailure)?
+                .free(&allocation)
+                .map_err(map_allocator)?;
+            return Err(AllocationError::NativeFailure);
+        };
+        let bucket = ez_gfx_hal::staging_bucket_size(total, ez_gfx_hal::DEFAULT_STAGING_POLICY)
+            .map_err(|_| AllocationError::OutOfMemory)?;
+        let completed = self.completed_texture_transfer_value()?;
+        self.completed_texture_value = completed;
+        self.pending_texture_transfers
+            .retain(|pending| pending.value > completed);
+        for stale in self.texture_staging.trim(completed) {
+            self.free(stale)?;
+        }
+        let request = AllocationRequest::new(bucket, 4, MemoryClass::Upload, true, None)?;
+        let mut upload = if let Some((_, upload)) = self.texture_staging.take(total, completed) {
+            upload
+        } else {
+            match self.allocate(request) {
+                Ok(upload) => upload,
+                Err(error) => {
+                    drop(texture);
+                    self.allocator
+                        .as_mut()
+                        .ok_or(AllocationError::NativeFailure)?
+                        .free(&allocation)
+                        .map_err(map_allocator)?;
+                    return Err(error);
+                }
+            }
+        };
+        let submitted = (|| {
+            let target = self.mapped_slice_mut(&mut upload)?;
+            let mut offset = 0_usize;
+            for mip in mips {
+                target[offset..offset + mip.bytes.len()].copy_from_slice(mip.bytes);
+                offset += mip.bytes.len();
+            }
+            self.flush(&mut upload, 0, total)?;
             let sampler_descriptor = MTLSamplerDescriptor::new();
             sampler_descriptor.setMinFilter(match sampler_desc.min_filter {
                 SamplerFilter::Nearest => MTLSamplerMinMagFilter::Nearest,
@@ -89,72 +134,86 @@ impl NativeContext {
                 .device
                 .newSamplerStateWithDescriptor(&sampler_descriptor)
                 .ok_or(AllocationError::NativeFailure)?;
-            let mut completions = Vec::with_capacity(mips.len());
+            let command = self
+                .texture_queue
+                .commandBuffer()
+                .ok_or(AllocationError::NativeFailure)?;
+            let blit = command
+                .blitCommandEncoder()
+                .ok_or(AllocationError::NativeFailure)?;
+            let mut source_offset = 0_usize;
             for (level, mip) in mips.iter().enumerate() {
-                let size = mip.bytes.len() as u64;
-                let mut upload = self.allocate(
-                    AllocationRequest::new(size, 4, MemoryClass::Upload, true, None)
-                        .map_err(|_| AllocationError::ZeroSize)?,
-                )?;
-                let submitted = (|| {
-                    self.mapped_slice_mut(&mut upload)?[..mip.bytes.len()]
-                        .copy_from_slice(mip.bytes);
-                    self.flush(&mut upload, 0, size)?;
-                    let command = self
-                        .queue
-                        .commandBuffer()
-                        .ok_or(AllocationError::NativeFailure)?;
-                    let blit = command
-                        .blitCommandEncoder()
-                        .ok_or(AllocationError::NativeFailure)?;
-                    // SAFETY: `copyFromBuffer` reads the initialized, flushed `upload.buffer` range described by the checked RGBA8 strides into the validated `texture` mip level, both storages outlive command completion, and `blit` is ended exactly once.
-                    unsafe {
-                        let mip_width = usize::try_from(mip.width)
-                            .map_err(|_| AllocationError::NativeFailure)?;
-                        let mip_height = usize::try_from(mip.height)
-                            .map_err(|_| AllocationError::NativeFailure)?;
-                        let upload_size =
-                            usize::try_from(size).map_err(|_| AllocationError::NativeFailure)?;
-                        let row_bytes = mip_width
-                            .checked_mul(4)
-                            .ok_or(AllocationError::NativeFailure)?;
-                        blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(&upload.buffer, 0, row_bytes, upload_size, MTLSize { width: mip_width, height: mip_height, depth: 1 }, &texture, 0, level, MTLOrigin { x: 0, y: 0, z: 0 });
-                        blit.endEncoding();
-                    }
-                    command.commit();
-                    let value = self.next_transfer_value;
-                    self.next_transfer_value =
-                        value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
-                    command.waitUntilCompleted();
-                    if command.status() != MTLCommandBufferStatus::Completed
-                        || command.error().is_some()
-                    {
-                        return Err(AllocationError::NativeFailure);
-                    }
-                    self.completed_transfer_value = value;
-                    CompletionToken::new(QueueKind::Transfer, value)
-                        .map_err(|_| AllocationError::NativeFailure)
-                })();
-                let freed = self.free(upload);
-                let completion = match (submitted, freed) {
-                    (Ok(completion), Ok(())) => completion,
-                    (Err(error), _) | (_, Err(error)) => return Err(error),
-                };
-                completions.push(completion);
+                let mip_width =
+                    usize::try_from(mip.width).map_err(|_| AllocationError::NativeFailure)?;
+                let mip_height =
+                    usize::try_from(mip.height).map_err(|_| AllocationError::NativeFailure)?;
+                let row_bytes = mip_width
+                    .checked_mul(4)
+                    .ok_or(AllocationError::NativeFailure)?;
+                // SAFETY: every source interval was copied and flushed above; the validated mip geometry and retained objects outlive command completion.
+                unsafe {
+                    blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                        &upload.buffer,
+                        source_offset,
+                        row_bytes,
+                        mip.bytes.len(),
+                        MTLSize { width: mip_width, height: mip_height, depth: 1 },
+                        &texture,
+                        0,
+                        level,
+                        MTLOrigin { x: 0, y: 0, z: 0 },
+                    );
+                }
+                source_offset = source_offset
+                    .checked_add(mip.bytes.len())
+                    .ok_or(AllocationError::NativeFailure)?;
             }
-            Ok((sampler, completions))
+            blit.endEncoding();
+            let first = self.next_texture_value;
+            self.next_texture_value = first
+                .checked_add(mips.len() as u64)
+                .ok_or(AllocationError::NativeFailure)?;
+            let completions = (first..self.next_texture_value)
+                .map(|value| CompletionToken::new(QueueKind::TextureTransfer, value))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| AllocationError::NativeFailure)?;
+            let completion = *completions.last().ok_or(AllocationError::NativeFailure)?;
+            let value = completion.value;
+            let pending_command = command.clone();
+            self.texture_worker
+                .as_ref()
+                .ok_or(AllocationError::NativeFailure)?
+                .submit(super::transfer::MetalTransferJob {
+                    value,
+                    bytes: total,
+                    command: super::transfer::TransferCommand::new(command),
+                })
+                .map_err(|error| match error {
+                    ez_gfx_hal::TransferWorkerError::Full => AllocationError::OutOfMemory,
+                    ez_gfx_hal::TransferWorkerError::Failed => AllocationError::NativeFailure,
+                })?;
+            self.pending_texture_transfers.push(super::PendingTransfer {
+                value,
+                command: ThreadBound::new(pending_command),
+            });
+            Ok((sampler, completion, completions))
         })();
-        match uploaded {
-            Ok((sampler, completions)) => Ok((
-                NativeTexture {
-                    texture: ThreadBound::new(texture),
-                    allocation: ThreadBound::new(allocation),
-                    sampler: ThreadBound::new(sampler),
-                    binding,
-                },
-                completions,
-            )),
+        match submitted {
+            Ok((sampler, completion, completions)) => {
+                let capacity = upload.allocation.size();
+                self.texture_staging.put(capacity, upload, Some(completion));
+                Ok((
+                    NativeTexture {
+                        texture: ThreadBound::new(texture),
+                        allocation: ThreadBound::new(allocation),
+                        sampler: ThreadBound::new(sampler),
+                        binding,
+                    },
+                    completions,
+                ))
+            }
             Err(error) => {
+                let _ = self.free(upload);
                 drop(texture);
                 self.allocator
                     .as_mut()
@@ -233,5 +292,29 @@ impl NativeContext {
     /// Returns an error if deferring the texture exceeds the deferred-resource capacity.
     pub fn destroy_texture(&mut self, texture: NativeTexture) -> Result<(), AllocationError> {
         self.defer_resource(DeferredResource::Texture(texture))
+    }
+}
+
+impl NativeContext {
+    /// Returns the completed value of the independent texture transfer stream.
+    pub fn completed_texture_transfer_value(&self) -> Result<u64, AllocationError> {
+        if self
+            .texture_worker
+            .as_ref()
+            .is_some_and(ez_gfx_hal::TransferWorker::failed)
+        {
+            return Err(AllocationError::NativeFailure);
+        }
+        let mut completed = self.completed_texture_value;
+        for pending in &self.pending_texture_transfers {
+            match pending.command.status() {
+                MTLCommandBufferStatus::Completed if pending.command.error().is_none() => {
+                    completed = completed.max(pending.value);
+                }
+                MTLCommandBufferStatus::Error => return Err(AllocationError::NativeFailure),
+                _ => break,
+            }
+        }
+        Ok(completed)
     }
 }

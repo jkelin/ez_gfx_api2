@@ -2,11 +2,11 @@
 
 `ez-gfx-ffi` is the C ABI boundary for the `ez-gfx` runtime. C and other foreign-language clients must include [`include/ez_gfx_api.h`](../../include/ez_gfx_api.h); the declarations and numeric values in that header are canonical. Rust clients should depend on `ez-gfx`, not `ez-gfx-ffi`.
 
-The complete [C textured cube](../../examples/c/textured_cube/README.md) compiles its shader during the CMake build and exercises ABI v19 compute, structured buffers, indexed-indirect graphics, presentation, and snapshot readback on Win32. CI builds and links it, then runs Vulkan with SwiftShader; hosted DX12 remains compile-only.
+The complete [C textured cube](../../examples/c/textured_cube/README.md) compiles its shader during the CMake build and exercises ABI v20 compute, structured buffers, indexed-indirect graphics, presentation, and snapshot readback on Win32. CI builds and links it, then runs Vulkan with SwiftShader; hosted DX12 remains compile-only.
 
 ## Compatibility and ownership
 
-Before any other call, read `ez_gfx_abi_version()` and require `EZ_GFX_ABI_VERSION` (ABI v19). Do not call the ABI when the version does not match.
+Before any other call, read `ez_gfx_abi_version()` and require `EZ_GFX_ABI_VERSION` (ABI v20). Do not call the ABI when the version does not match.
 
 `ez_gfx_handle_inspect` decodes a packed handle into its context/child slot and generation fields; it does not validate that the handle is live in a context. `ez_gfx_semantic_id` accepts an exact 1-to-255-byte canonical semantic name and writes its fixed 16-byte identifier. Semantic names are ASCII dot-separated identifiers: every non-empty segment starts with an ASCII letter and continues with ASCII letters, digits, or underscores. Empty segments, non-ASCII bytes, embedded NUL, and terminators included in the supplied length are invalid.
 
@@ -24,7 +24,7 @@ The context and all context/resource operations, including teardown, are creator
 6. Poll `ez_gfx_poll_runtime_event` and `ez_gfx_poll_diagnostic` from host-owned output storage. Inspect `out_present`; when it is zero there is no record, and always account for `out_dropped`.
 7. On the creator thread, call `ez_gfx_context_destroy`. If device initialization completed, it waits idle before releasing every context-owned resource, heap, surface, and backend object; a partially initialized context with no device has no GPU work to wait for. Explicit resource destroy/release calls remain available for early reclamation. The stable void ABI cannot report teardown failures, but cleanup is terminal once it begins. Use `ez_gfx_context_wait_idle` first when the host must observe wait failure.
 
-`ez_gfx_surface_resize`, `ez_gfx_surface_get_extent`, `ez_gfx_surface_resize_pending`, and `ez_gfx_surface_set_snapshot_cache` are surface operations between creation and destruction. A minimized surface can produce `EzGfxResult_NotReady`. Texture binding and residency queries use `ez_gfx_texture_get_binding` and `ez_gfx_texture_get_residency` and may report not-ready state through the normal result contract.
+`ez_gfx_surface_resize`, `ez_gfx_surface_get_extent`, `ez_gfx_surface_resize_pending`, and `ez_gfx_surface_set_snapshot_cache` are surface operations between creation and destruction. A minimized surface can produce `EzGfxResult_NotReady`. `ez_gfx_texture_load` copies caller bytes and only queues bounded Rayon decode/mip work. Poll with `ez_gfx_texture_poll`, cancel before native submission with `ez_gfx_texture_cancel`, and query ready bindings/residency with `ez_gfx_texture_get_binding` and `ez_gfx_texture_get_residency`.
 
 ## Boundary rules
 
@@ -36,6 +36,6 @@ Pointer-plus-length byte ranges must describe the complete readable or writable 
 
 Individual destruction and release functions return no status. They catch panics and cannot tell the caller that a nonzero handle was invalid, stale, wrong-context, wrong-kind, or used from the wrong thread. Explicit release is optional before terminal cascading context destruction, but handle provenance and creator-thread affinity remain the host's responsibility. All status-returning exports contain Rust panics at the FFI boundary and convert an unwinding operation to `EzGfxResult_NativeFailure`; void exports contain the panic but provide no failure result.
 
-`ez_gfx_texture_load`, `ez_gfx_texture_get_binding`, and `ez_gfx_texture_get_residency` return `EzGfxResult`; `ez_gfx_texture_unload` is void. Texture loading can additionally surface the ordinary native, argument, context, and readiness outcomes defined there.
+`ez_gfx_texture_load`, `ez_gfx_texture_poll`, `ez_gfx_texture_cancel`, `ez_gfx_texture_get_binding`, and `ez_gfx_texture_get_residency` return `EzGfxResult`; `ez_gfx_texture_unload` is void. Queue saturation returns `EzGfxResult_QueueFull`; polling returns `EzGfxResult_NotReady` until decode and GPU transfer finish.
 
 Shader loading consumes a compiler-produced artifact; this runtime does not compile shader source. The host owns and supplies that artifact memory for the call. Native window-system objects remain host-owned, while native graphics resources created from successful calls remain runtime-owned until explicitly released or reclaimed by `ez_gfx_context_destroy`. Runtime progress and diagnostics are bounded queues: the host must poll both functions and use the reported dropped count to detect lost records rather than assuming that every event was delivered.
