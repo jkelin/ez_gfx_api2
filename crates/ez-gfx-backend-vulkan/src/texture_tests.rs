@@ -471,8 +471,8 @@ fn unsignaled_graphics_fence_retains_texture_and_frame_descriptors() {
     let view = texture.view;
     let descriptor_pool = context.frame_slots[slot].descriptor_pool;
     context.destroy_texture(texture).unwrap();
-    // SAFETY: fence status is queried without modifying the gated submission.
     assert!(
+        // SAFETY: fence status is queried without modifying the gated submission.
         !unsafe {
             context
                 .device
@@ -674,8 +674,8 @@ fn partial_copy_submission_failure_drains_before_future_coarse_frame() {
         context.is_drained(),
         "typed callback failure must still establish native release safety"
     );
-    // SAFETY: queue-idle drain must have retired the successful COPY submission's native signal.
     assert_eq!(
+        // SAFETY: queue-idle drain must have retired the successful COPY submission's native signal.
         unsafe { device.get_semaphore_counter_value(context.texture_ownership_timeline.unwrap()) }
             .unwrap(),
         2
