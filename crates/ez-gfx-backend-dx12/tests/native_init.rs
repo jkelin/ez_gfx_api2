@@ -41,14 +41,18 @@ fn rejects_a_null_hwnd_before_swapchain_creation() {
 #[cfg(windows)]
 #[test]
 fn uploads_each_texture_mip_under_a_distinct_fence() {
-    use ez_gfx_hal::{ImageMip, SamplerAddressMode, SamplerFilter, TextureSamplerDesc};
+    use ez_gfx_hal::{
+        ImageMip, QueueKind, SamplerAddressMode, SamplerFilter, TextureFormat, TextureRegion,
+        TextureSamplerDesc,
+    };
 
     let mut context = ez_gfx_backend_dx12::native::NativeContext::create_default(false)
         .expect("a D3D12 feature-level 12.1 hardware adapter is required");
     let level0 = [7_u8; 4 * 4 * 4];
     let level1 = [9_u8; 2 * 2 * 4];
-    let (texture, completions) = context
-        .create_texture_rgba8(
+    let (mut texture, completions) = context
+        .create_texture(
+            TextureFormat::Rgba8Unorm,
             &[
                 ImageMip {
                     width: 4,
@@ -74,6 +78,29 @@ fn uploads_each_texture_mip_under_a_distinct_fence() {
         .unwrap();
     assert_eq!(completions.len(), 2);
     assert!(completions[0].value < completions[1].value);
+    assert!(
+        completions
+            .iter()
+            .all(|token| token.queue == QueueKind::TextureTransfer)
+    );
     context.wait_idle().unwrap();
+    context.publish_texture_mips(&mut texture, 2).unwrap();
+    let update = [3_u8; 2 * 2 * 4];
+    let update_completion = context
+        .update_texture_region(
+            &mut texture,
+            &TextureRegion {
+                mip_level: 1,
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+                bytes: &update,
+            },
+        )
+        .unwrap();
+    assert!(update_completion.value > completions[1].value);
+    context.wait_idle().unwrap();
+    context.publish_texture_mips(&mut texture, 2).unwrap();
     context.destroy_texture(texture).unwrap();
 }

@@ -56,7 +56,7 @@ fn status_values_and_abi_version_are_stable() {
         ],
         [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     );
-    assert_eq!(EZ_GFX_ABI_VERSION, 20);
+    assert_eq!(EZ_GFX_ABI_VERSION, 23);
 }
 
 #[test]
@@ -303,6 +303,7 @@ fn all_public_export_signatures_are_stable() {
         ffi::ez_gfx_texture_get_binding;
     let _: unsafe extern "C" fn(Handle, *mut u32, *mut u32, Handle) -> Status =
         ffi::ez_gfx_texture_get_residency;
+    let _: extern "C" fn(Handle, u32, Handle) -> Status = ffi::ez_gfx_texture_set_residency;
     let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_texture_unload;
     let _: extern "C" fn(Handle, Handle) -> Status = ffi::ez_gfx_begin_render;
     let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_frame_begin;
@@ -863,7 +864,7 @@ fn texture_descriptor_rejects_unsupported_pipeline_state_before_context_access()
     };
     for desc in [
         EzGfxTextureDesc {
-            destination_format: 1,
+            destination_format: 11,
             ..valid
         },
         EzGfxTextureDesc {

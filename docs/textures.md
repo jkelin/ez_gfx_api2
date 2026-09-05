@@ -46,9 +46,9 @@ pub fn register_texture_decoder(
 pub fn unregister_texture_decoder(source: u8) -> Result<(), TextureError>;
 ```
 
-`load_texture` copies `bytes` and returns after bounded admission. The intended readiness contract is: `NotReady` is transient, `Ok` permits binding, and every other result is terminal for that request. `texture_binding` returns the stable bindless texture-heap index, not a `PublicBinding`.
+`load_texture` copies `bytes` and returns after bounded admission. `NotReady` is transient, `Ok` permits binding, and every other polling result is terminal for that request. `texture_binding` returns the stable bindless texture-heap index, not a `PublicBinding`.
 
-**Readiness warning — source-inferred, not reproduced:** registry completion can advance before a frame-safe descriptor rewrite. `texture_binding` can then return the registry index without checking published mip count. Consequently, `Ok` alone may not establish initial descriptor publication during in-flight rendering. See [the completion/publication sequence](../crates/ez-gfx/src/state/texture.rs#L433-L543) and [registry binding lookup](../crates/ez-gfx-runtime/src/texture.rs#L870-L879). The examples below illustrate the intended contract, not proof that this case is safe.
+Initial readiness requires both completed coarse transfers and a published, frame-safe descriptor. Completed GPU copies alone do not make polling, binding, or `Bind / Ok` succeed. Finer uploads may remain outstanding after initial readiness.
 
 ## Rust load and render flow
 
@@ -114,7 +114,7 @@ impl StreamedTexture {
 
         match poll_texture_load(context, handle) {
             EzGfxResult::Ok => {
-                // Intended ready-use point; see the readiness warning above.
+                // The published coarse view can be sampled in this frame.
                 self.binding = texture_binding(context, handle)?;
                 self.ready = true;
                 Ok(())
@@ -187,7 +187,7 @@ fn status(value: EzGfxResult) -> Result<(), EzGfxResult> {
 
 The fallback must already be resident and have its binding cached. If initial `load_texture` returns `QueueFull`, no handle escaped: retain the fallback and retry admission in a later frame. After successful admission, `NotReady` retains the fallback. `InvalidArgument`, `InvalidContext`, `NativeFailure`, `Unsupported`, `DeviceLost`, `QueueFull`, or `Cancelled` is terminal when returned while progressing the request; log it, unload the handle when still owned, and decide whether the application can continue.
 
-Under the intended contract, the ready-use point is the successful `texture_binding` call inside `poll`, before `begin_render`; the readiness warning above qualifies same-frame use in the current implementation. Do not add the texture to `PublicBinding`: that interface names structured, indirect, and render-target resources. The shader uses the index instead:
+The ready-use point is the successful `texture_binding` call inside `poll`, before `begin_render`. Do not add the texture to `PublicBinding`: that interface names structured, indirect, and render-target resources. The shader uses the index instead:
 
 ```slang
 [BindlessTextureHeap(EZ_GFX_MAX_TEXTURES)]
@@ -199,7 +199,7 @@ float4 color = entry.texture.Sample(entry.sampler, uv);
 
 ## C ABI load and render flow
 
-The C ABI uses the same ordering and shares the readiness warning above. This excerpt assumes `context`, `surface`, `png_bytes`, `png_size`, `fallback_binding`, `shader`, `indirect`, buffer `bindings`, `binding_count`, `dynamic_state`, and `current_mvp` are already valid:
+The C ABI uses the same readiness and ordering contract. This excerpt assumes `context`, `surface`, `png_bytes`, `png_size`, `fallback_binding`, `shader`, `indirect`, buffer `bindings`, `binding_count`, `dynamic_state`, and `current_mvp` are already valid:
 
 ```c
 typedef struct TexturePush {
@@ -237,7 +237,7 @@ if (texture != 0 && !texture_ready) {
     if (result == EzGfxResult_Ok) {
         result = ez_gfx_texture_get_binding(texture, &texture_binding, context);
         if (result == EzGfxResult_Ok) {
-            texture_ready = 1; /* Intended contract; see readiness warning. */
+            texture_ready = 1; /* The coarse descriptor is published. */
         }
     }
     if (result != EzGfxResult_Ok && result != EzGfxResult_NotReady) {
@@ -282,11 +282,11 @@ if (texture != 0) {
 
 ## Frame-graph readiness
 
-Polling before binding is the public usage rule. Separately, once the owner thread has created the native texture and admitted its transfer, frame recording interns native-created textures with their texture-transfer completion tokens. The compiled graph lowers those tokens into transfer-to-graphics waits before sampled access. `frame_enqueue_readback` applies the same readiness token before transfer readback.
+Polling before binding is the public usage rule. Frame recording declares only published textures as sampled resources and attaches completion tokens for their exposed mip ranges. Submission refreshes dependencies, including updates accepted after recording. Hidden fine-mip writes do not replace a coarse view's readiness token. `frame_enqueue_readback` uses the corresponding texture dependency.
 
-This is a submission-safety net, not an alternate readiness interface. A pending request has no public bindless index, so application code must not guess an index or select it in shader data. Continue selecting the fallback until `poll_texture_load` and `texture_binding` succeed. Recording graphics while another native-admitted texture is pending can still order GPU graphics behind that upload because the current graphics graph declares native-created textures as sampled resources; this does not block the CPU polling call.
+A pending request has no public bindless index: do not guess an index or select it in shader data. Continue selecting the fallback until polling and binding succeed. Unpublished uploads do not add unrelated sampling waits. Bindless draws conservatively declare all published textures, so an update to another published texture can still add a dependency.
 
-GPU waits do not themselves publish a descriptor. They do not resolve the source-inferred initial-publication issue described above.
+GPU waits alone do not publish descriptors; readiness and frame-safe publication are checked separately.
 
 ## Lifecycle
 
@@ -294,7 +294,7 @@ GPU waits do not themselves publish a descriptor. They do not resolve the source
 2. Retain the returned handle. The input bytes may be released immediately; `load_texture` copies them before returning.
 3. Call `poll_texture_load` regularly, normally once per frame. Polling moves completed CPU work into native texture creation and transfer submission, then checks GPU completion without waiting.
 4. Continue rendering with a fallback texture while polling returns `NotReady`.
-5. Under the intended readiness contract, after polling returns `Ok`, call `texture_binding` and use its stable bindless index; see the current publication warning above.
+5. After polling returns `Ok`, call `texture_binding` and use its stable bindless index.
 6. Call `unload_texture` for early reclamation, or let `destroy_context` reclaim the texture.
 
 All context and resource calls are creator-thread-affine. A texture handle belongs to one context and remains invalid in every other context. Successful cancellation or unload invalidates it immediately. Native storage and its descriptor/view retire only after accepted transfer and submitted graphics dependencies complete; a retired binding slot cannot be reused early. Slot reuse increments the generation, so stale handles remain invalid.
@@ -305,8 +305,8 @@ All context and resource calls are creator-thread-affine. A texture handle belon
 
 `poll_texture_load(context, texture)` returns:
 
-- `Ok`: the first coarse transfer completion was observed. Intended meaning: safe to sample while finer mips stream. Initial descriptor publication may lag; see the warning above.
-- `NotReady`: CPU work, owner-thread submission, or first sample-ready GPU completion remains pending.
+- `Ok`: the exposed coarse view is transfer-complete and its descriptor is published; finer mips may still stream.
+- `NotReady`: CPU work, owner-thread admission, exposed-range GPU completion, or frame-safe initial publication remains pending.
 - A terminal error: decoding, validation, native allocation, transfer, device, context, or handle validation failed.
 
 Polling is part of progress. CPU workers publish decoded results to a bounded channel; the context creator drains that channel and creates/submits native textures. An application that neither polls nor calls another texture-progressing operation will not advance a decoded request into GPU submission.
@@ -325,7 +325,7 @@ Residency is a sampled-view limit, not a GPU-memory budget: Vulkan replaces an i
 
 Unloading a pending request cancels it. Unloading a native texture immediately invalidates the handle while deferring descriptor/view and storage reclamation until its last accepted transfer and all submitted graphics frames retire. The C unload function is `void`, so C callers do not receive reclamation failures; terminal context destruction performs dependency-ordered cleanup.
 
-Destroying the context stops new CPU admission, drains or discards accepted work safely, joins worker ownership, waits for native work when initialized, and invalidates every child handle. Never retain a texture handle beyond its context.
+Destroying the context stops CPU admission, joins workers, waits for native work, and invalidates every child handle. Worker failure still runs native shutdown and drains actual submitted commands, not an unreachable final token. If a live device cannot establish drain completion, destruction returns the existing typed failure and deliberately retains the failed context's GPU-owned state rather than freeing potentially live resources or aborting the host. This bounded-per-failed-context safety retention is not normal reclamation; explicit device loss follows native release guarantees.
 
 ## Backpressure
 
@@ -334,55 +334,72 @@ Admission is deliberately bounded:
 - source payload: at most 64 MiB per request;
 - CPU pool: at most 64 in-flight jobs and 64 MiB of aggregate admitted source bytes;
 - decoded-result channel: 64 entries;
-- each backend transfer-owner channel: 64 jobs.
+- each backend transfer owner: 64 queued copy jobs, counting every member of an atomically admitted mip bundle.
 
 The Rayon thread count is `max(1, available_parallelism - 1)`, leaving one logical CPU for the host/render thread. A full CPU budget makes `load_texture` return `QueueFull` immediately and no handle escapes. Retry in a later frame after polling existing requests. Do not busy-loop on `QueueFull`.
 
-Transfer admission is also non-waiting. A full or failed native transfer worker turns the affected request into a terminal failure during polling; it does not block until queue space appears.
+Transfer admission is also non-waiting. A full or failed worker makes the affected request fail terminally during polling. Rejected work does not advance completion high-water marks, so later idle waits cannot target work never admitted.
 
 ## Decode, transcode, and mip behavior
 
 ### Source and destination support
 
-These are source-level capabilities, not a claim that every cell has native pixel evidence. The [decoder dispatch](../crates/ez-gfx-runtime/src/texture.rs#L274-L347), [KTX2 branches](../crates/ez-gfx-runtime/src/texture.rs#L412-L474), and [format mappings](../crates/ez-gfx-runtime/src/texture.rs#L590-L634) define admission.
+These are source-level capabilities, not a claim that every cell has native pixel evidence. [Decoder dispatch and KTX2 admission](../crates/ez-gfx-runtime/src/texture.rs), [DDS](../crates/ez-gfx-runtime/src/texture/dds.rs), and [raw mip admission](../crates/ez-gfx-runtime/src/texture/raw.rs) define the validated loading contract.
 
 | Input | Current destination behavior | Limits |
 | --- | --- | --- |
 | Raw RGB8/RGBA8; BMP, JPEG, PNG, TGA | RGBA8 linear or sRGB; `Auto` is linear RGBA8 | RGB expands to RGBA; encoded images convert to RGBA8. No runtime BC/ASTC encoding. |
 | Direct native KTX2 | Preserves RGBA8, BC1, BC3, BC7, or ASTC 4×4, linear/sRGB | Requires no supercompression and an admitted compression family. An explicit destination must match exactly: no conversion or decompression fallback. |
-| KTX2 UASTC/ETC1S | Dependency-selected BC/ASTC/RGBA8; `Auto` preserves color-space metadata | Accepts unsupercompressed UASTC or BasisLZ ETC1S only. Explicit BC1/BC3 transcode requests fail; see below. |
-| Standalone `.basis` | Explicit RGBA8/BC1/BC3/BC7/ASTC 4×4, linear/sRGB | Requires `basis`. `Auto` chooses linear BC7, then linear ASTC, then linear RGBA8; it does not preserve sRGB automatically or choose ETC1S-specific BC1/BC3. |
-| Custom source `128..=255` | Application returns validated mips in a supported native format | Can supply raw blocks indirectly; no built-in DDS or raw compressed source variant. |
+| KTX2 UASTC/ETC1S | Explicit RGBA8/BC1/BC3/BC7/ASTC 4×4, linear/sRGB; source-aware `Auto` | Requires `ktx2` + `basis`; accepts unsupercompressed UASTC or BasisLZ ETC1S. R/Rg restrictions below. |
+| Standalone `.basis` | Same explicit targets and source-aware `Auto` | Requires `basis`; header sRGB is preserved by `Auto`. An unset sRGB flag means linear. |
+| DDS | Preserves DXT1/BC1, DXT5/BC3, or DX10 RGBA8/BC1/BC3/BC7, including DX10 sRGB | Single 2D image; no transcoding. Legacy DXT3/BC2 and legacy BGR/BGRA conversions are not supported. |
+| Raw native mip chain | Preserves RGBA8/BC1/BC3/BC7/ASTC 4×4, linear/sRGB | Explicit format, nonzero dimensions/count; contiguous tightly packed levels, largest first, exact total bytes. No private container header. |
+| Custom source `128..=255` | Application returns validated mips in a supported native format | Explicit destinations must match callback output; compressed output requires adapter admission. |
 
-`TextureDestination` exposes only `Auto` and linear/sRGB RGBA8, BC1, BC3, BC7, and ASTC 4×4. BC2/BC4/BC5/BC6H, other ASTC block shapes, HDR/float texture destinations, arrays, cubemaps, and 3D textures are absent from this loading contract. Inputs and aggregate decoded mip bytes are each limited to 64 MiB. KTX2 Zstd/Zlib supercompression is unsupported. These restrictions concern loaded textures, not separate render-target formats.
+`TextureDestination` exposes only `Auto` and linear/sRGB RGBA8, BC1, BC3, BC7, and ASTC 4×4. BC2/BC4/BC5/BC6H, other ASTC block shapes, HDR/float texture destinations, arrays, cubemaps, 3D textures, and KTX2 Zstd/Zlib supercompression are **evaluated exclusions of this contract**, not required extensions. These restrictions concern loaded textures, not separate render-target formats.
 
-**KTX2 transcode gaps:** the [adapter](../crates/ez-gfx-runtime/src/texture.rs#L501-L553) passes a compression family, not an explicit target, to `basisu_c_sys`. Its selector emits BC7/BC4/BC5/ASTC/RGBA32, not BC1/BC3, so explicit BC1/BC3 requests fail the final format comparison despite enum mappings existing. Single/two-channel `Auto` can select BC4/BC5, which [the output mapping](../crates/ez-gfx-runtime/src/texture.rs#L611-L634) rejects. There is no retry to an admitted fallback. KTX2 `Auto` passes no sRGB override; [standalone Basis `Auto`](../crates/ez-gfx-runtime/src/texture/basis.rs#L30-L40) always selects linear storage. Use an explicit sRGB destination for standalone assets requiring it.
+The [shared target policy](../crates/ez-gfx-runtime/src/texture/basis.rs) chooses ETC1S BC1 for opaque color or BC3 for alpha, and UASTC BC7 on BC-capable adapters; ASTC-only adapters use ASTC 4×4, otherwise RGBA8. `Auto` preserves source transfer metadata; explicit linear/sRGB requests override the label without gamma-converting the encoded values. Both universal containers pass an explicit target to the native transcoder, including BC1/BC3.
+
+**R/Rg restriction:** KTX2 R/Rg `Auto` falls back to RGBA8 with source transfer metadata. Output samples are `(R,0,0,1)` or `(R,G,0,1)`, including second-channel data carried in an ETC1S/UASTC alpha plane. Explicit RGBA8 destinations work; explicit compressed R/Rg requests return `Unsupported` rather than exposing incorrect channels. No BC4/BC5 storage, backend view swizzle, or runtime re-encoding is added.
+
+Input and aggregate decoded mip bytes are each limited to 64 MiB. DDS, raw, and direct KTX2 validate physical mip count, per-level geometry/size, and total output budget before copying mip payloads. DDS/raw additionally require an exact payload total; DDS accepts tightly packed native pitch or matching linear-size metadata, not padded row conversion. DDS unknown/straight/opaque alpha modes preserve bytes; premultiplied/custom modes are unsupported and reserved bits invalid. Universal paths bound output before native decompression/transcoding; malformed metadata fails closed.
 
 ### Features and backend admission
 
-The `basis` feature on `ez-gfx` or `ez-gfx-ffi` enables standalone `TextureSource::Basis` / C source code 7; disabled builds return `Unsupported`. It does **not** remove native transcoder linkage: [runtime dependencies](../crates/ez-gfx-runtime/Cargo.toml#L8-L19) include `image`, `ktx2`, and `basisu_c_sys` unconditionally. Optional KTX2/Basis decoder linkage required by [selected P-014](../plan/P-014-basis-universal-and-compressed-textures.md#selected-solution) remains incomplete. No runtime shader compiler is involved.
+Decoder features are opt-in on `ez-gfx`, `ez-gfx-ffi`, and `ez-gfx-runtime`:
+
+| Features | KTX2 direct data | KTX2 universal data | Standalone Basis | Native Basis linkage |
+| --- | --- | --- | --- | --- |
+| Default / none | `Unsupported` | `Unsupported` | `Unsupported` | None |
+| `ktx2` | Supported | `Unsupported` | `Unsupported` | None |
+| `basis` | `Unsupported` | `Unsupported` | Supported | Included |
+| `ktx2,basis` | Supported | Supported | Supported | Included |
+
+**Build change:** KTX2 no longer works implicitly in default builds. Add `features = ["ktx2", "basis"]` to the safe-crate dependency, or build FFI with `cargo build -p ez-gfx-ffi --features ktx2,basis`. The examples opt in explicitly. Source IDs remain present in disabled builds and report `Unsupported`. DDS/raw/basic raster decoding needs neither feature. [Runtime dependencies](../crates/ez-gfx-runtime/Cargo.toml) keep native transcoding optional; normal dependency graphs remain shader-compiler-free, and runtime features do not enable the Basis encoder.
 
 | Backend | Runtime compression admission | Qualification |
 | --- | --- | --- |
 | Vulkan | Union of advertised BC and ASTC-LDR device features | [Device probe](../crates/ez-gfx-backend-vulkan/src/device.rs#L835-L845); actual adapter-dependent support, not universal ASTC availability. |
-| Direct3D 12 | BC only | [Admission](../crates/ez-gfx-backend-dx12/src/native/device.rs#L232); no ASTC native target mapping. |
-| Metal | BC **or** ASTC | [Probe](../crates/ez-gfx-backend-metal/src/native/device.rs#L27-L31) selects BC when `supportsBCTextureCompression`, otherwise assumes ASTC. It neither positively queries ASTC nor reports both families; BC-capable Apple hardware cannot select ASTC through this capability contract. |
+| Direct3D 12 | BC only | BC base width and height must be multiples of four; unsupported base extents return `Unsupported` through native, safe, and C interfaces. Lower mips retain their logical edge dimensions. No ASTC mapping. |
+| Metal | Union of independently queried BC and ASTC support | [Device probe](../crates/ez-gfx-backend-metal/src/native/device.rs) checks `supportsBCTextureCompression` and Apple-family ASTC support independently. An adapter may advertise both. Native execution remains unverified here. |
 
 RGBA8 is the common uncompressed target. Explicit compressed destinations require the admitted family but still face the source-specific restrictions above. Native mappings alone do not establish execution evidence.
 
+For example, a 7×3 BC base is supported by the tested Vulkan adapter but rejected by DX12. A valid 28×12 DX12 BC base contains a supported 7×3 mip at level two, including 4×3 and 3×3 edge updates. Only the staging footprint rounds up to physical blocks; native logical dimensions and shader UVs are unchanged. See [Microsoft's BC resource and mip rules](https://learn.microsoft.com/en-us/windows/win32/direct3d10/d3d10-graphics-programming-guide-resources-block-compression).
+
 Application source codes `128..=255` use a registered `TextureDecodeCallback`. Rust callbacks are `Send + Sync + 'static` and may run concurrently. Registration snapshots an `Arc` into each accepted job, so unregistering prevents new admission without invalidating queued work. C registers paired decode/release callbacks plus `user_data`: successful output pointers remain valid until ez-gfx copies all mips and invokes release exactly once. The application must retain callback code and `user_data` until unregister and all accepted requests complete.
 
-Raw inputs require nonzero `width` and `height`, and their byte length must match exactly. For encoded inputs, zero descriptor dimensions accept decoded dimensions; nonzero values are assertions checked after decode. A nonzero `mip_count` similarly asserts the decoded/generated count.
+Raw RGB8/RGBA8 require nonzero `width` and `height`, with exact byte length. Native `Raw` additionally requires a nonzero `mip_count` and concrete source format. For encoded inputs, zero descriptor dimensions accept decoded dimensions; nonzero values are assertions checked after decode. A nonzero descriptor `mip_count` similarly asserts the decoded/generated count. Set `generate_mips = false` when supplying a single compressed level without an existing chain.
 
-When mip generation is requested, a one-level RGBA8 source is box-filtered down to 1×1 in the Rayon job. Any existing valid multi-level chain is preserved, even if it stops before 1×1. A one-level compressed source with generation requested is rejected; an existing compressed chain passes through. Dimensions, block geometry, every mip length, ordering, count, and aggregate size are validated before native allocation. See [generation](../crates/ez-gfx-runtime/src/texture.rs#L354-L405) and [validation](../crates/ez-gfx-runtime/src/texture.rs#L641-L683).
+When mip generation is requested, a one-level RGBA8 source is box-filtered down to 1×1 in the Rayon job. Any existing valid multi-level chain is preserved, even if it stops before 1×1. A one-level compressed source with generation requested is rejected; an existing compressed chain passes through. Dimensions, block geometry, every mip length, ordering, count, and aggregate size are validated before native allocation. See [generation and validation](../crates/ez-gfx-runtime/src/texture.rs).
 
 ### Original implementation parity
 
-The [Odin manager](../reference/ez_gfx_api/src/texture_manager.odin#L55-L118) allowed replacing/clearing built-in BMP–KTX2 decoder callbacks; current registrations are custom IDs only and built-ins are always available. Original source regions remained borrowed until the [texture-loaded callback](../reference/ez_gfx_api/src/texture_manager.odin#L1047-L1050); current loading copies source bytes immediately and exposes polling/bounded runtime events, not an equivalent per-load completion callback.
+**Chosen migration deltas:** the [Odin manager](../reference/ez_gfx_api/src/texture_manager.odin#L55-L118) allowed replacing/clearing built-in BMP–KTX2 decoder callbacks; current registration deliberately uses custom IDs only, with encoded-container availability controlled by features. Original source regions remained borrowed until the [texture-loaded callback](../reference/ez_gfx_api/src/texture_manager.odin#L1047-L1050); current loading copies source bytes immediately and uses polling/bounded diagnostic events. A per-load completion callback is not part of the selected current API; diagnostic events do not promise lossless callback delivery.
 
-Original [KTX2 decoding](../reference/ez_gfx_api/src/texture_manager.odin#L815-L841) expanded Basis content to RGBA32 and extracted level zero. Preserved source mip chains, native compressed storage, standalone Basis, progressive residency, and partial updates are additions, not original parity regressions. DDS, wider BC/ASTC formats, and optional linkage must be assessed against selected P-014 rather than credited to the original loader.
+Original [KTX2 decoding](../reference/ez_gfx_api/src/texture_manager.odin#L815-L841) expanded Basis content to RGBA32 and extracted level zero. Preserved source mip chains, native compressed storage, standalone Basis, DDS/raw ingestion, progressive residency, and partial updates are additions, not original parity regressions.
 
-Original [mip generation](../reference/ez_gfx_api/src/texture_manager.odin#L1401-L1476) used Vulkan GPU blits with linear filtering; current generation uses CPU RGBA8 box filtering, so identical filtering results are not guaranteed.
+Original [mip generation](../reference/ez_gfx_api/src/texture_manager.odin#L1401-L1476) used Vulkan GPU blits with linear filtering. CPU RGBA8 box filtering is the chosen portable migration policy, not a missing GPU-blit implementation; identical filtering results are not guaranteed.
 
 ## Transfer and staging contract
 
@@ -397,21 +414,23 @@ The shared transfer module owns:
 
 Texture staging is backend-owned because row pitch, block layout, image layout, and native allocation rules differ. Each backend copies decoded mip or update bytes into reusable host-visible buckets and retains buckets until completion. Geometry transfer uses the same policy and worker machinery but an independent queue timeline.
 
-**Batching gap:** adaptive worker collection is not native cross-texture copy coalescing. [Vulkan](../crates/ez-gfx-backend-vulkan/src/transfer.rs#L34-L40) and [DX12](../crates/ez-gfx-backend-dx12/src/native/transfer.rs#L55-L61) group each texture mip/region by its unique completion value, deliberately preserving real per-mip readiness. [Metal](../crates/ez-gfx-backend-metal/src/native/transfer.rs#L25-L28) commits each prebuilt command buffer separately. The cross-texture native batching promised by [selected P-012](../plan/P-012-transfer-queue-staging-and-batching.md#selected-solution) remains a design gap; pooled staging and bounded transfer owners are implemented.
+Initial mip chains enter atomically and preserve FIFO order. Adjacent copies at the same coarse-to-fine stage can share one native submission across textures; batches never reorder stages or combine successive writes to the same image unsafely. Each mip retains a real completion value, even when one native signal completes several same-stage copies. Vulkan and DX12 record shared copy batches; Metal encodes shared blit command buffers instead of committing one prebuilt buffer per texture.
 
 | Backend | Native transfer path | Completion and ownership |
 | --- | --- | --- |
-| Vulkan | Prefers a transfer-only queue family. It otherwise requests a secondary queue from the graphics family when available and falls back to the universal queue. Texture and geometry workers use separate queues when queue counts permit. | Timeline semaphores order graphics release, copy, and graphics acquire. Each ownership acquire repeats its release's exact old/new layouts. Four command-resource slots retire by completion. Presentation semaphores belong to swapchain images, not frame slots. |
-| Direct3D 12 | A COPY queue records staged buffer/texture copies. A DIRECT queue waits on the copy fence and records state transitions required for graphics use. Texture and geometry have independent copy workers. | Native fences serialize copy-to-direct ownership and expose completion. Four allocator/list/event slots are recycled after their fence values complete. |
-| Metal | A dedicated `MTLCommandQueue` creates blit command buffers and `MTLBlitCommandEncoder` copies. Submission ownership moves to the transfer thread. | GPU events order prior graphics reads before region writes and completed texture writes before subsequent draws/readbacks. Ordered command-buffer values and terminal status retain staging through completion. |
+| Vulkan | Dedicated transfer family where available; otherwise secondary graphics-family queue or universal queue. Texture and geometry use separate queues when possible. | Timeline semaphores order graphics release, copy, and acquire. Fine-copy completion waits run on the transfer owner before enqueueing graphics acquire, allowing an already-ready coarse frame to finish. Exact paired layouts, four retiring command slots, per-image presentation semaphores. |
+| Direct3D 12 | Independent texture/geometry COPY workers; DIRECT queue performs graphics transitions. | The owner waits for copy completion before enqueueing DIRECT acquire. Coarse frames need not wait for later fine copies. Four allocator/list/event slots retire by actual completion. |
+| Metal | Dedicated queue, shared texture blit command buffers, independent BC/ASTC queries. | GPU events order prior reads and later sampling. The owner checks committed command completion/status before advancing targeted submission progress; cancellation-only batches still commit a real completion signal. |
 
 The fallback paths preserve correctness on adapters without a dedicated transfer family or enough independent queues; they reduce overlap, not semantics.
+
+Before graphics waits, all backends flush each referenced transfer owner only through the required accepted token. An already-submitted token returns without draining later stages. This is not a CPU-nonblocking guarantee: native callbacks may wait for the required GPU copy/command to finish before their handoff is safe. That correctness-first tradeoff differs from P-012's original no-per-submission-blocking goal. Copy waits stay on the owner, not ahead of ready coarse work on graphics; measured wall costs appear below.
 
 ## Partial updates and telemetry
 
 `update_texture_region(context, texture, region)` validates a resident texture, mip level, bounds, format-specific byte length, and compressed-block geometry before copying the caller’s bytes. Admission is nonblocking and bounded. Uncompressed rows are tightly packed. BC and ASTC offsets must be block-aligned; width and height must be multiples of four unless the rectangle reaches that mip’s right or bottom edge. Accepted updates enter the same backend transfer owner and graphics handoff as initial uploads.
 
-Updates accepted before frame submission are included even when draws were recorded earlier. Submission refreshes texture dependencies. Vulkan and DX12 flush worker submission before enqueuing a graphics wait, preventing a wait from blocking the graphics queue needed to produce its own handoff signal. Metal commits a graphics release marker before returning update admission and encodes GPU event waits before frame encoders. These dependencies do not require an application idle wait before updating an already sampled texture.
+Updates accepted before submission are included even when draws were recorded earlier. Targeted worker flushes precede graphics event/fence waits on all three backends, including buffer transfers; a failed producer is rejected before an unsignaled wait can poison future frames. Updates outside the exposed mip range preserve coarse sampling readiness. Applications need not call idle before updating a sampled texture.
 
 `texture_upload_telemetry(context)` returns lock-free, context-wide, monotonically saturating totals: Rayon decode/transcode/mip time, bytes copied into texture staging, admission-to-native-submission latency, and native-submission-to-first-sample-ready handoff latency. Samples are diagnostic aggregates, not per-request timing guarantees.
 
@@ -422,12 +441,12 @@ The existing runtime-event queue reports texture progress with the texture handl
 - `Admission / Ok`: bounded CPU admission succeeded and the handle escaped.
 - `Decode / Ok`: decoding, optional transcode, mip generation, and validation succeeded.
 - `Upload / Ok`: the native transfer worker accepted the upload. This is not GPU completion.
-- `Bind / Ok`: the transfer completion value was observed; this currently does not independently prove descriptor publication.
+- `Bind / Ok`: the sampled range's transfer completion was observed and a nonempty descriptor view is published.
 - `Decode / Cancelled`: cancellation succeeded before native transfer admission.
 - `Upload / Cancelled`: cancellation succeeded after native transfer-worker admission.
 - `Decode / <error>`: decoding, validation, or native admission failed terminally.
 
-Poll events with `poll_runtime_event`; it also performs a texture-progress pass. Events are bounded diagnostics, not guaranteed completion callbacks. Use `poll_texture_load` for request state, subject to the initial-publication warning above.
+Poll events with `poll_runtime_event`; it also performs a texture-progress pass. Events are bounded diagnostics, not guaranteed completion callbacks. Use `poll_texture_load` for request state.
 
 ## C ABI mapping
 
@@ -448,27 +467,48 @@ The C lifecycle is identical:
 
 C pointer ranges are needed only for the duration of each call. `ez_gfx_texture_load` copies `data[0..data_size]`; neither the source bytes nor `EzGfxTextureDesc` must remain alive afterward. Output pointers are written only on success. The descriptor label is validated bounded UTF-8 metadata; it is not an asynchronous borrowed string.
 
-Under the intended readiness contract, a typical render loop calls `ez_gfx_texture_poll`, retains the fallback on `NotReady`, and resolves/caches the binding on `Ok`; the publication warning above applies equally to C. Other polling results are terminal and should be logged before unloading the failed handle. On `QueueFull` from load, no valid output texture was produced; retry later.
+ABI **23** adds source codes `8 = Dds` and `9 = Raw` without adding exports or changing descriptor layout. Regenerate/rebuild bindings against [the header](../include/ez_gfx_api.h) and [XML declarations](../bindings/bindings.xml); existing source numbers remain stable. `Raw` uses `destination_format` as its concrete native source/storage format (`Auto` is invalid), plus nonzero `width`, `height`, and `mip_count`. The existing load function receives the complete contiguous mip byte span and copies it before returning.
+
+A typical C render loop calls `ez_gfx_texture_poll`, retains the fallback on `NotReady`, and resolves/caches the binding on `Ok`. Other polling results are terminal and should be logged before unloading the failed handle. On `QueueFull` from load, no valid output texture was produced; retry later.
 
 ## Verification and remaining evidence
 
-The results below are previously recorded evidence, not rerun by this documentation audit. Current source support and known defects above must not be inferred away from passing narrower regressions.
+Current local proof uses the RTX 3080 on Vulkan and DX12; no Metal execution is inferred from it.
 
-RTX 3080 Vulkan/DX12 `texture_pixels` regressions sample BC1, BC3, BC7, and RGBA8 through the existing shader into a hidden 64×64 swapchain. Every pixel is checked: 2,048 left-half pixels change red→green and 2,048 blue pixels remain unchanged. Coverage includes updates after submitted draws, immediate update→draw without CPU polling, draw-record→update→submit, 32 unload-after-submit/reuse cycles per format, stale handles, admitted-upload unload, and final readback equality.
+- `texture_pixels`: BC1/BC3/BC7 linear and sRGB plus RGBA8 sampled into hidden 64×64 surfaces, every pixel checked. Covers changed/untouched regions, queued and record-before-update ordering, sustained residency changes, stale handles, cancellation, and submitted-work unload/reuse. Vulkan tests 7×3 bases; DX12 tests explicit safe/C rejection of those bases and real 7×3 mip-two edges from 28×12 bases.
+- Deterministic native regressions: Vulkan six and DX12 five GPU scenarios prove coarse sampling while a submitted fine copy is GPU-blocked, native cross-texture batching, unsignaled graphics-fence retention, rejected full queues without hanging idle, and drain-safe partial submission failure. The DX12 admission unit adds base/mip geometry coverage.
+- First-publication regression was reproduced before the fix through Vulkan public polling and a deterministic safe-state test. Completed copies no longer produce premature readiness.
+- Final behavioral checks: HAL transfer 11, safe state 15, FFI residency two, and all 32 hidden example smoke tests passed. The expanded pixel matrix passed both backends; Vulkan captures native output and fails on `VUID-` or `Validation Error`. Hidden window helpers assert invisible/non-foreground windows and exact client extents. Shader-artifact contracts were unchanged and were not rerun.
+- Both RTX backends explicitly reject ASTC with `Unsupported`; no ASTC sampling is claimed.
+- Metal library cross-check targets `aarch64-apple-darwin`. Test-target checking is blocked earlier in `shader-slang-sys`: no installed Apple SDK supplies `TargetConditionals.h`. Metal tests have **not** been typechecked or executed by that command. No configured authenticated Apple/ASTC GPU runner was available; no headers were fabricated.
 
-The Vulkan regression requires validation, captures and re-emits native output, and fails on any `VUID-` or `Validation Error`. It passes without validation errors after correcting paired ownership layouts and per-swapchain-image presentation semaphore reuse. DX12 passes the same pixel/order/lifetime checks. Native tests assert `IsWindowVisible == false`, absence of `WS_VISIBLE`, a non-foreground test window, and an exact client extent. No visible validation windows are required.
+### Measured workloads
 
-The examples smoke target includes a bounded three-frame hidden regression (32 tests). Hidden windows advance from the polling event loop without requesting visibility or activation. The shader-artifact target previously passed all five tests; its contract is unchanged.
+Throwaway debug-profile scenarios were executed and removed. These are local wall-time observations, not GPU timestamps, general throughput guarantees, or full-scene benchmarks.
 
-Both RTX adapters advertised BC-only compression and explicitly rejected ASTC 4×4 with `Unsupported`; no ASTC hardware sampling is claimed. Metal GPU-event synchronization cross-checks for `aarch64-apple-darwin`, but Metal was not executed. Basis/KTX2 decoding is covered separately by residency tests, not by the custom-payload pixel regression. Compressed sRGB formats and partial edge blocks remain outside this pixel coverage.
+| Native upload workload: 64 independent 64×64 RGBA8 images, 1 MiB total | Forced serial completion | Queued uploads |
+| --- | --- | --- |
+| Vulkan, three runs | 64 native batches; 102.985–109.079 ms; one retained staging bucket | Two batches; 16.185–17.752 ms; 64 retained buckets |
+| DX12, three runs | 64 native batches; 352.872–644.082 ms; one retained bucket | Five batches; 7.973–14.720 ms; 29 retained buckets |
 
-P-015 remains incomplete in evidence: sustained coarse-to-fine rendering, deterministic unsignaled-fence unload/reuse, native Metal execution, and the dynamic-atlas transfer/frame-time benchmark remain in root `TODO.md`. Residency limits retain full allocations; no VRAM savings or streaming performance gains are claimed. Throwaway scenarios were removed; the self-contained native regression is retained, and immutable snapshots were not regenerated.
+Native queue signals/submission observations counted actual batches; sampled readback matched uploaded bytes. Serial mode waits after every image, whereas queued mode waits after all admissions. Different waiting/allocation costs and retained memory prevent treating this comparison as a frame-rate prediction.
+
+The selected 2048×2048 RGBA8 atlas workload used 64×64 glyph updates, eight warmup frames and 64 measured hidden render frames. Both modes produced identical final shader readback. Dirty regions staged 1,048,576 bytes versus 1,073,741,824 for full-image updates: **1024× less transferred data**.
+
+| Backend | Dirty-region wall µs/frame | Full-image wall µs/frame |
+| --- | ---: | ---: |
+| Vulkan | 6,954.561 | 6,730.919 |
+| DX12 | 14,845.913 | 15,538.956 |
+
+Presentation, CPU work, and completion waits are included. No Vulkan frame-time improvement was observed, and neither result isolates GPU transfer time.
 
 ## Selected scope versus remaining work
 
-- [P-014](../plan/P-014-basis-universal-and-compressed-textures.md#selected-solution): optional linkage, DDS/direct raw-block ingestion, source-aware native target selection, and the KTX2 target gaps above remain. Runtime GPU encoding of raw images into Basis is an explicit non-goal.
-- [P-015](../plan/P-015-texture-streaming-and-partial-updates.md#selected-solution): coarse-first upload, region copies, residency views, and telemetry exist; initial descriptor publication needs reproduction and correction if confirmed. Full-chain allocation is selected: physical mip reclamation, sparse/virtual texturing, and stopping finer uploads on logical eviction are not completion requirements.
-- [P-012](../plan/P-012-transfer-queue-staging-and-batching.md#selected-solution): staging reuse and independent completion streams exist; native cross-texture coalescing remains absent.
-- [P-018](../plan/P-018-async-worker-and-task-architecture.md#selected-solution): bounded Rayon decode and dedicated transfer owners exist. Current polling/events differ from original completion callbacks; callback-dispatch parity/evidence must not be claimed. Neither Tokio nor the rejected custom-thread-pool alternative is required.
+- [P-014](../plan/P-014-basis-universal-and-compressed-textures.md#implementation-evidence): optional linkage, DDS/raw ingestion, source-aware target selection, and explicit BC1/BC3 transcoding are implemented and decoder-tested. R/Rg compressed destinations and wider containers/formats remain explicit restrictions. Runtime GPU encoding of raw images into Basis is an explicit non-goal.
+- [P-015](../plan/P-015-texture-streaming-and-partial-updates.md#implementation-and-evidence-status): published coarse readiness, partial mip-edge updates, logical residency, and telemetry are implemented with Windows GPU evidence. Full-chain allocation is selected: physical mip reclamation, sparse/virtual texturing, and cancelling finer uploads on logical eviction are not completion requirements.
+- [P-012](../plan/P-012-transfer-queue-staging-and-batching.md#selected-solution): pooled staging, independent streams, and native cross-texture batching are implemented. Removing per-batch GPU completion waits remains an open scheduling requirement in root TODO; the current targeted wait tradeoff does not erase that goal. Metal runtime parity remains unproven.
+- [P-018](../plan/P-018-async-worker-and-task-architecture.md#selected-solution): bounded Rayon decode and dedicated transfer owners exist. Polling/events replace original completion callbacks by design; callback-dispatch parity is not claimed. Neither Tokio nor the rejected custom-thread-pool alternative is required.
 
-Remaining evidence includes Metal execution, ASTC and compressed-sRGB sampling, partial edge blocks, sustained coarse-first rendering, deterministic unsignaled-fence retirement/reuse, and the selected transcode, staging-reuse, multicore-load, and dynamic-atlas benchmarks. See [root TODO](../TODO.md). Implementation gaps, source-inferred defects, and unexecuted scenarios are distinct; none is closed by a format enum or a plan status claim.
+Remaining evidence includes native Metal/ASTC execution, Apple SDK-backed test compilation, and broader transcode/multicore/full-scene performance. Windows sRGB, partial mip edges, coarse-first rendering, deterministic retirement, staging/batching, and the selected atlas workload now have concrete evidence. See [root TODO](../TODO.md); implementation parity and runtime proof remain distinct.
+
+Decoder proof is separate: default/no-default, `ktx2`-only, `basis`-only, and combined-feature regressions cover admission, explicit destinations, real ETC1S/UASTC R/Rg pixels, standalone/KTX2 sRGB metadata, and malformed bounds. Warm real-image decode measurements and their limitations are recorded in [P-014 implementation evidence](../plan/P-014-basis-universal-and-compressed-textures.md#implementation-evidence); they do not establish GPU upload or full-scene performance.

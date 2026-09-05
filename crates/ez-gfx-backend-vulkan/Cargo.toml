@@ -12,5 +12,10 @@ ash.workspace = true
 gpu-allocator = { workspace = true, features = ["std", "vulkan"] }
 parking_lot.workspace = true
 
+[dev-dependencies]
+ez-gfx-compiler.workspace = true
+ez-gfx-runtime.workspace = true
+ez-gfx-artifact.workspace = true
+
 [lints]
 workspace = true

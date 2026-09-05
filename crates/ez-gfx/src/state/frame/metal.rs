@@ -449,8 +449,14 @@ pub(super) fn execute_metal_frame_plan(
     }
     let native_textures: Vec<_> = context
         .textures
-        .values()
-        .map(|(_, texture, _, _, _)| match texture {
+        .iter()
+        .filter(|(handle, _)| {
+            context
+                .texture_published_mips
+                .get(handle)
+                .is_some_and(|mips| *mips != 0)
+        })
+        .map(|(_, (_, texture, _, _, _))| match texture {
             NativeTexture::Metal(texture) => Ok(texture),
             NativeTexture::Vulkan(_) => Err(EzGfxResult::NativeFailure),
         })

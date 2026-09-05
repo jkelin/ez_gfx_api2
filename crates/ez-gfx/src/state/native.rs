@@ -357,6 +357,7 @@ pub(super) fn map_allocation(error: ez_gfx_hal::AllocationError) -> EzGfxResult 
         | ez_gfx_hal::AllocationError::NotHostVisible
         | ez_gfx_hal::AllocationError::InvalidAliasClass => EzGfxResult::InvalidArgument,
         ez_gfx_hal::AllocationError::DeviceLost => EzGfxResult::DeviceLost,
+        ez_gfx_hal::AllocationError::Unsupported => EzGfxResult::Unsupported,
         ez_gfx_hal::AllocationError::OutOfMemory | ez_gfx_hal::AllocationError::NativeFailure => {
             EzGfxResult::NativeFailure
         }

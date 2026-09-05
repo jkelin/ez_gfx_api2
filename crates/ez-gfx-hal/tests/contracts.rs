@@ -230,3 +230,103 @@ fn transfer_batch_policy_flushes_on_count_or_bytes() {
     assert!(policy.should_flush(4, 1));
     assert!(policy.should_flush(1, 512));
 }
+
+#[test]
+fn texture_formats_compute_exact_block_storage() {
+    use ez_gfx_hal::TextureFormat;
+
+    for (format, width, height, bytes) in [
+        (TextureFormat::Rgba8Unorm, 7, 5, 140),
+        (TextureFormat::Bc1Unorm, 7, 5, 32),
+        (TextureFormat::Bc1Srgb, 7, 5, 32),
+        (TextureFormat::Bc3Unorm, 7, 5, 64),
+        (TextureFormat::Bc3Srgb, 7, 5, 64),
+        (TextureFormat::Bc7Unorm, 7, 5, 64),
+        (TextureFormat::Bc7Srgb, 7, 5, 64),
+        (TextureFormat::Astc4x4Unorm, 7, 5, 64),
+        (TextureFormat::Astc4x4Srgb, 7, 5, 64),
+    ] {
+        assert_eq!(format.level_bytes(width, height), Some(bytes));
+    }
+    assert_eq!(TextureFormat::Bc7Unorm.level_bytes(0, 4), None);
+}
+
+#[test]
+fn compressed_mips_require_exact_block_payloads_but_not_multiple_extents() {
+    use ez_gfx_hal::{ImageMip, TextureFormat, validate_texture_mips};
+
+    let base = [0_u8; 64];
+    let mip = [0_u8; 16];
+    assert!(
+        validate_texture_mips(
+            TextureFormat::Bc7Unorm,
+            &[
+                ImageMip {
+                    width: 7,
+                    height: 5,
+                    bytes: &base,
+                },
+                ImageMip {
+                    width: 3,
+                    height: 2,
+                    bytes: &mip,
+                },
+            ],
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_texture_mips(
+            TextureFormat::Bc7Unorm,
+            &[ImageMip {
+                width: 7,
+                height: 5,
+                bytes: &[0; 63],
+            }],
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn texture_regions_enforce_bounds_blocks_and_edge_extents() {
+    use ez_gfx_hal::{TextureFormat, TextureRegion, validate_texture_region};
+
+    let aligned = TextureRegion {
+        mip_level: 0,
+        x: 4,
+        y: 4,
+        width: 4,
+        height: 4,
+        bytes: &[0; 16],
+    };
+    assert!(validate_texture_region(TextureFormat::Bc7Unorm, 10, 9, 1, aligned).is_ok());
+
+    let edge = TextureRegion {
+        x: 8,
+        y: 8,
+        width: 2,
+        height: 1,
+        ..aligned
+    };
+    assert!(validate_texture_region(TextureFormat::Bc7Unorm, 10, 9, 1, edge).is_ok());
+
+    for invalid in [
+        TextureRegion { x: 2, ..aligned },
+        TextureRegion {
+            width: 2,
+            ..aligned
+        },
+        TextureRegion {
+            x: 8,
+            width: 4,
+            ..aligned
+        },
+        TextureRegion {
+            bytes: &[0; 15],
+            ..aligned
+        },
+    ] {
+        assert!(validate_texture_region(TextureFormat::Bc7Unorm, 10, 9, 1, invalid).is_err());
+    }
+}

@@ -9,7 +9,9 @@ The six numbered directories are standalone development programs that own their 
 - [05 Helmet](05_helmet/README.md)
 - [06 Sponza KTX2](06_sponza_ktx2/README.md)
 
-The Win32 [`C textured cube`](c/textured_cube/README.md) is a separate ABI v19 flow. CMake compiles its Slang source with SPIR-V, DXIL, and Metal targets in development mode, links `ez-gfx-ffi`, and copies the generated artifact beside the executable. CI builds it on Windows and executes Vulkan with SwiftShader; the hosted DX12 row is compile-only.
+The Rust examples' Cargo dependency explicitly enables `ez-gfx` features `ktx2` and `basis`; the Sponza KTX2 example therefore retains universal decoding. Library/FFI default builds no longer include those decoders. For a separate client, enable both features for universal KTX2, `ktx2` alone for native blocks, or `basis` alone for standalone Basis; see [texture support](../docs/textures.md#features-and-backend-admission).
+
+The Win32 [`C textured cube`](c/textured_cube/README.md) is a separate ABI v23 flow. CMake compiles its Slang source with SPIR-V, DXIL, and Metal targets in development mode, links `ez-gfx-ffi`, and copies the generated artifact beside the executable. CI builds it on Windows and executes Vulkan with SwiftShader; the hosted DX12 row is compile-only.
 
 | Binary | Complete renderer | Owned inputs |
 | --- | --- | --- |

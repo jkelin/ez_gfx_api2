@@ -111,7 +111,7 @@ impl<C: LifecycleCallbacks> App<C> {
                 Err(error) => self.error = Some(error),
             }
             event_loop.exit();
-        } else {
+        } else if self.visible {
             self.window.as_ref().unwrap().request_redraw();
         }
     }
@@ -125,7 +125,8 @@ impl<C: LifecycleCallbacks> ApplicationHandler for App<C> {
         let attributes = Window::default_attributes()
             .with_title(self.config.title)
             .with_inner_size(PhysicalSize::new(self.config.width, self.config.height))
-            .with_visible(self.visible);
+            .with_visible(self.visible)
+            .with_active(self.visible);
         let window = match event_loop
             .create_window(attributes)
             .context("create example window")
@@ -147,8 +148,13 @@ impl<C: LifecycleCallbacks> ApplicationHandler for App<C> {
         self.window = Some(window);
         if self.visible {
             self.window.as_ref().unwrap().request_redraw();
-        } else {
-            // Hidden automation windows are not guaranteed to receive a platform redraw event.
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Hidden windows may never receive redraw events. Poll drives them independently;
+        // exit guards prevent an extra render/capture after a terminal frame or failure.
+        if !self.visible && self.window.is_some() && !event_loop.exiting() {
             self.render_frame(event_loop);
         }
     }
@@ -169,7 +175,7 @@ impl<C: LifecycleCallbacks> ApplicationHandler for App<C> {
                     self.fail(event_loop, error);
                 }
             }
-            WindowEvent::RedrawRequested => self.render_frame(event_loop),
+            WindowEvent::RedrawRequested if self.visible => self.render_frame(event_loop),
             _ => {
                 dispatch_window_input(&event, |input| self.callbacks.input(input));
             }

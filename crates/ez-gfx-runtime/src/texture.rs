@@ -1,8 +1,26 @@
-use ez_gfx_hal::{CompletionToken, QueueKind};
-use std::collections::VecDeque;
+use ez_gfx_core::capability::CompressionSupport;
+use ez_gfx_hal::{CompletionToken, QueueKind, TextureFormat};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{Arc, LazyLock, RwLock},
+};
+
+mod basis;
+mod dds;
+mod ktx2;
+mod raw;
+mod telemetry;
+
+pub use telemetry::{TextureUploadTelemetry, TextureUploadTelemetrySnapshot};
 
 /// Maximum total byte size accepted for encoded or decoded texture data.
 pub const MAX_TEXTURE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Returns mip indices from the terminal coarse level toward level zero.
+pub fn coarse_to_fine_mip_levels(mip_count: u32) -> impl ExactSizeIterator<Item = u32> {
+    // Empty chains intentionally produce no submissions.
+    (0..mip_count).rev()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Texture source format and dimensions.
@@ -21,35 +39,48 @@ pub enum TextureSource {
         /// Height in pixels.
         height: u32,
     },
-    /// A texture encoded as a Windows bitmap.
+    /// A Windows bitmap.
     Bmp,
-    /// A texture encoded as a Windows bitmap.
-    /// A texture encoded as a JPEG image.
+    /// A JPEG image.
     Jpeg,
-    /// A texture encoded as a JPEG image.
-    /// A texture encoded as a PNG image.
+    /// A PNG image.
     Png,
-    /// A texture encoded as a PNG image.
-    /// A texture encoded as a TGA image.
+    /// A TGA image.
     Tga,
-    /// A texture encoded as a TGA image.
-    /// A texture encoded as a KTX2 container.
+    /// A KTX2 container.
     Ktx2,
+    /// A standalone Basis Universal payload.
+    Basis,
+    /// A DDS container containing supported native texture blocks.
+    Dds,
+    /// Tightly packed native mip bytes, ordered largest to smallest.
+    Raw {
+        /// Native texel or block layout.
+        format: TextureFormat,
+        /// Base width in texels.
+        width: u32,
+        /// Base height in texels.
+        height: u32,
+        /// Number of contiguous mip levels.
+        mip_count: u32,
+    },
+    /// Application-defined bytes handled by a registered decoder.
+    Custom(u8),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// One decoded RGBA8 mip level.
+/// One tightly packed decoded or transcoded mip level.
 pub struct DecodedMip {
     /// Width of this mip level in pixels.
     pub width: u32,
     /// Height of this mip level in pixels.
     pub height: u32,
-    /// Row-major RGBA8 pixel bytes.
-    pub rgba8: Vec<u8>,
+    /// Row-major texel or compressed-block bytes.
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// A validated RGBA8 texture with a complete mip chain.
+/// A validated two-dimensional texture with a complete mip chain.
 pub struct DecodedTexture {
     /// Width of the base mip level in pixels.
     pub width: u32,
@@ -57,23 +88,210 @@ pub struct DecodedTexture {
     pub height: u32,
     /// Number of decoded mip levels.
     pub mip_count: u32,
+    /// GPU storage format for every mip.
+    pub format: TextureFormat,
     /// Decoded mip levels ordered from largest to smallest.
     pub mips: Vec<DecodedMip>,
 }
 
-/// Decodes supported texture sources into validated RGBA8 mip levels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Requested GPU texture storage. `Auto` prefers admitted native compression.
+pub enum TextureDestination {
+    /// Chooses native compression when available.
+    Auto,
+    /// Linear normalized RGBA8.
+    Rgba8Unorm,
+    /// sRGB normalized RGBA8.
+    Rgba8Srgb,
+    /// Linear BC1.
+    Bc1Unorm,
+    /// sRGB BC1.
+    Bc1Srgb,
+    /// Linear BC3.
+    Bc3Unorm,
+    /// sRGB BC3.
+    Bc3Srgb,
+    /// Linear BC7.
+    Bc7Unorm,
+    /// sRGB BC7.
+    Bc7Srgb,
+    /// Linear ASTC 4x4.
+    Astc4x4Unorm,
+    /// sRGB ASTC 4x4.
+    Astc4x4Srgb,
+}
+
+impl TextureDestination {
+    fn format(self) -> Option<TextureFormat> {
+        match self {
+            Self::Auto => None,
+            Self::Rgba8Unorm => Some(TextureFormat::Rgba8Unorm),
+            Self::Rgba8Srgb => Some(TextureFormat::Rgba8Srgb),
+            Self::Bc1Unorm => Some(TextureFormat::Bc1Unorm),
+            Self::Bc1Srgb => Some(TextureFormat::Bc1Srgb),
+            Self::Bc3Unorm => Some(TextureFormat::Bc3Unorm),
+            Self::Bc3Srgb => Some(TextureFormat::Bc3Srgb),
+            Self::Bc7Unorm => Some(TextureFormat::Bc7Unorm),
+            Self::Bc7Srgb => Some(TextureFormat::Bc7Srgb),
+            Self::Astc4x4Unorm => Some(TextureFormat::Astc4x4Unorm),
+            Self::Astc4x4Srgb => Some(TextureFormat::Astc4x4Srgb),
+        }
+    }
+
+    fn rgba_format(self) -> Result<TextureFormat, TextureError> {
+        match self {
+            Self::Auto | Self::Rgba8Unorm => Ok(TextureFormat::Rgba8Unorm),
+            Self::Rgba8Srgb => Ok(TextureFormat::Rgba8Srgb),
+            _ => Err(TextureError::Unsupported),
+        }
+    }
+}
+
+/// Decodes supported texture sources into validated mip levels.
 pub struct TextureDecoder;
+/// Thread-safe application decoder invoked on the bounded Rayon pool.
+pub type TextureDecodeCallback = Arc<
+    dyn Fn(&[u8], CompressionSupport) -> Result<DecodedTexture, TextureError>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// Decode request with any application callback retained at admission time.
+#[derive(Clone)]
+pub struct PreparedTextureDecode {
+    source: TextureSource,
+    compression: CompressionSupport,
+    destination: TextureDestination,
+    custom: Option<TextureDecodeCallback>,
+}
+
+static TEXTURE_DECODERS: LazyLock<RwLock<HashMap<u8, TextureDecodeCallback>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Registers one application source decoder. IDs below 128 are reserved.
+///
+/// # Errors
+///
+/// Returns [`TextureError::InvalidData`] for a reserved ID or [`TextureError::InvalidState`] when
+/// the ID is already registered or the registry lock was poisoned.
+pub fn register_texture_decoder(
+    source: u8,
+    callback: TextureDecodeCallback,
+) -> Result<(), TextureError> {
+    if source < 128 {
+        return Err(TextureError::InvalidData);
+    }
+    let mut decoders = TEXTURE_DECODERS
+        .write()
+        .map_err(|_| TextureError::InvalidState)?;
+    if decoders.contains_key(&source) {
+        return Err(TextureError::InvalidState);
+    }
+    decoders.insert(source, callback);
+    Ok(())
+}
+
+/// Removes one application source decoder.
+///
+/// # Errors
+///
+/// Returns [`TextureError::InvalidData`] for a reserved ID, [`TextureError::NotFound`] for an
+/// unregistered ID, or [`TextureError::InvalidState`] when the registry lock was poisoned.
+pub fn unregister_texture_decoder(source: u8) -> Result<(), TextureError> {
+    if source < 128 {
+        return Err(TextureError::InvalidData);
+    }
+    let removed = TEXTURE_DECODERS
+        .write()
+        .map_err(|_| TextureError::InvalidState)?
+        .remove(&source);
+    removed.map(|_| ()).ok_or(TextureError::NotFound)
+}
+
 impl TextureDecoder {
-    /// Inputs, decoded dimensions, and expanded RGBA payloads are bounded before allocation.
+    /// Captures all decoder state needed by later asynchronous execution.
     ///
     /// # Errors
     ///
-    /// Returns an error if the input is empty, malformed, oversized, dimensionally inconsistent, or uses an unsupported KTX2 format or layout.
+    /// Returns an error when a custom decoder is absent or its registry lock is poisoned.
+    pub fn prepare(
+        source: TextureSource,
+        compression: CompressionSupport,
+        destination: TextureDestination,
+    ) -> Result<PreparedTextureDecode, TextureError> {
+        let custom = match source {
+            TextureSource::Custom(source) => Some(
+                TEXTURE_DECODERS
+                    .read()
+                    .map_err(|_| TextureError::InvalidState)?
+                    .get(&source)
+                    .cloned()
+                    .ok_or(TextureError::Unsupported)?,
+            ),
+            _ => None,
+        };
+        Ok(PreparedTextureDecode {
+            source,
+            compression,
+            destination,
+            custom,
+        })
+    }
+
+    /// Decodes into portable linear RGBA8 storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source is malformed, unsupported, or exceeds texture limits.
     pub fn decode(source: TextureSource, data: &[u8]) -> Result<DecodedTexture, TextureError> {
+        Self::decode_for_destination(
+            source,
+            data,
+            CompressionSupport::NONE,
+            TextureDestination::Rgba8Unorm,
+        )
+    }
+
+    /// Preserves or transcodes KTX2 data to the best format admitted by the backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source is malformed or cannot target admitted compression.
+    pub fn decode_with_support(
+        source: TextureSource,
+        data: &[u8],
+        compression: CompressionSupport,
+    ) -> Result<DecodedTexture, TextureError> {
+        Self::decode_for_destination(source, data, compression, TextureDestination::Auto)
+    }
+
+    /// Decodes to an explicit destination, or selects one from backend capabilities for `Auto`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed input or a destination unsupported by the source/backend.
+    pub fn decode_for_destination(
+        source: TextureSource,
+        data: &[u8],
+        compression: CompressionSupport,
+        destination: TextureDestination,
+    ) -> Result<DecodedTexture, TextureError> {
+        Self::prepare(source, compression, destination)?.decode(data)
+    }
+}
+
+impl PreparedTextureDecode {
+    /// Executes the snapshotted decode request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed input or output unsupported by the admitted backend.
+    pub fn decode(&self, data: &[u8]) -> Result<DecodedTexture, TextureError> {
         if data.is_empty() || data.len() > MAX_TEXTURE_BYTES {
             return Err(TextureError::InvalidData);
         }
-        match source {
+        match self.source {
             TextureSource::Rgb8 { width, height } => {
                 let pixel_count = (width as usize)
                     .checked_mul(height as usize)
@@ -86,48 +304,94 @@ impl TextureDecoder {
                 for rgb in data.chunks_exact(3) {
                     rgba8.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
                 }
-                decoded(vec![DecodedMip {
+                decoded(
+                    self.destination.rgba_format()?,
+                    vec![DecodedMip {
+                        width,
+                        height,
+                        bytes: rgba8,
+                    }],
+                )
+            }
+            TextureSource::Rgba8 { width, height } => decoded(
+                self.destination.rgba_format()?,
+                vec![DecodedMip {
                     width,
                     height,
-                    rgba8,
-                }])
-            }
-            TextureSource::Rgba8 { width, height } => decoded(vec![DecodedMip {
-                width,
-                height,
-                rgba8: data.to_vec(),
-            }]),
+                    bytes: data.to_vec(),
+                }],
+            ),
             TextureSource::Bmp | TextureSource::Jpeg | TextureSource::Png | TextureSource::Tga => {
-                let format = match source {
+                let image_format = match self.source {
                     TextureSource::Bmp => image::ImageFormat::Bmp,
                     TextureSource::Jpeg => image::ImageFormat::Jpeg,
                     TextureSource::Png => image::ImageFormat::Png,
                     TextureSource::Tga => image::ImageFormat::Tga,
                     _ => unreachable!(),
                 };
-                let image = image::load_from_memory_with_format(data, format)
+                let image = image::load_from_memory_with_format(data, image_format)
                     .map_err(|_| TextureError::InvalidData)?
                     .into_rgba8();
-                decoded(vec![DecodedMip {
-                    width: image.width(),
-                    height: image.height(),
-                    rgba8: image.into_raw(),
-                }])
+                decoded(
+                    self.destination.rgba_format()?,
+                    vec![DecodedMip {
+                        width: image.width(),
+                        height: image.height(),
+                        bytes: image.into_raw(),
+                    }],
+                )
             }
-            TextureSource::Ktx2 => decode_ktx2(data),
+            TextureSource::Ktx2 => ktx2::decode_ktx2(data, self.compression, self.destination),
+            TextureSource::Basis => basis::decode(data, self.compression, self.destination),
+            TextureSource::Dds => dds::decode(data, self.compression, self.destination),
+            TextureSource::Raw {
+                format,
+                width,
+                height,
+                mip_count,
+            } => raw::decode(
+                data,
+                format,
+                width,
+                height,
+                mip_count,
+                self.compression,
+                self.destination,
+            ),
+            TextureSource::Custom(_) => {
+                // Preparation guarantees custom requests retain exactly one callback.
+                let callback = self.custom.as_ref().ok_or(TextureError::InvalidState)?;
+                let texture = callback(data, self.compression)?;
+                if self
+                    .destination
+                    .format()
+                    .is_some_and(|format| format != texture.format)
+                    || (texture.format.is_compressed()
+                        && !basis::compression_supported(self.compression, texture.format))
+                {
+                    return Err(TextureError::Unsupported);
+                }
+                decoded(texture.format, texture.mips)
+            }
         }
     }
 }
 
-/// Existing mip chains are preserved; a single valid RGBA8 level is box-filtered until both dimensions reach one.
+/// Existing RGBA8 mip chains are preserved; one valid level is box-filtered to one pixel.
 ///
 /// # Errors
 ///
-/// Returns an error if the mip data is invalid or its dimensions, byte size, or mip count exceed supported limits.
+/// Returns an error if the mip data is invalid, compressed, or exceeds supported limits.
 pub fn generate_mips(texture: DecodedTexture) -> Result<DecodedTexture, TextureError> {
-    let mut texture = decoded(texture.mips)?;
+    let mut texture = decoded(texture.format, texture.mips)?;
     if texture.mip_count > 1 {
         return Ok(texture);
+    }
+    if !matches!(
+        texture.format,
+        TextureFormat::Rgba8Unorm | TextureFormat::Rgba8Srgb
+    ) {
+        return Err(TextureError::Unsupported);
     }
     while texture
         .mips
@@ -151,7 +415,7 @@ pub fn generate_mips(texture: DecodedTexture) -> Result<DecodedTexture, TextureE
                         let offset =
                             ((source_y as usize * source.width as usize) + source_x as usize) * 4;
                         for (channel, value) in sum.iter_mut().enumerate() {
-                            *value += u32::from(source.rgba8[offset + channel]);
+                            *value += u32::from(source.bytes[offset + channel]);
                         }
                         samples += 1;
                     }
@@ -164,142 +428,19 @@ pub fn generate_mips(texture: DecodedTexture) -> Result<DecodedTexture, TextureE
         texture.mips.push(DecodedMip {
             width,
             height,
-            rgba8,
+            bytes: rgba8,
         });
     }
     texture.mip_count = u32::try_from(texture.mips.len()).map_err(|_| TextureError::TooLarge)?;
     Ok(texture)
 }
 
-/// Decodes supported two-dimensional KTX2 payloads into RGBA8 mip levels.
+/// Validates mip dimensions, format-specific byte lengths, and aggregate size.
 ///
 /// # Errors
 ///
-/// Returns an error if the KTX2 data is malformed, has an unsupported format or layout, or decodes to invalid or oversized mip data.
-fn decode_ktx2(data: &[u8]) -> Result<DecodedTexture, TextureError> {
-    let reader = ktx2::Reader::new(data).map_err(|_| TextureError::InvalidData)?;
-    let header = reader.header();
-    if header.pixel_height == 0
-        || header.pixel_depth != 0
-        || header.layer_count > 1
-        || header.face_count != 1
-    {
-        return Err(TextureError::Unsupported);
-    }
-    let levels = reader.levels().collect::<Vec<_>>();
-    match (header.format, header.supercompression_scheme) {
-        (Some(ktx2::Format::R8G8B8A8_UNORM | ktx2::Format::R8G8B8A8_SRGB), None) => {
-            let mips = levels
-                .into_iter()
-                .enumerate()
-                .map(|(index, level)| DecodedMip {
-                    width: header
-                        .pixel_width
-                        .checked_shr(u32::try_from(index).expect("validated index fits u32"))
-                        .unwrap_or(0)
-                        .max(1),
-                    height: header
-                        .pixel_height
-                        .checked_shr(u32::try_from(index).expect("validated index fits u32"))
-                        .unwrap_or(0)
-                        .max(1),
-                    rgba8: level.data.to_vec(),
-                })
-                .collect();
-            decoded(mips)
-        }
-        (None, None) if reader.color_model() == Some(ktx2::ColorModel::UASTC) => decode_ktx2_basis(
-            data,
-            header.pixel_width,
-            header.pixel_height,
-            header.level_count.max(1),
-        ),
-        (None, Some(ktx2::SupercompressionScheme::BasisLZ)) => decode_ktx2_basis(
-            data,
-            header.pixel_width,
-            header.pixel_height,
-            header.level_count.max(1),
-        ),
-        _ => Err(TextureError::Unsupported),
-    }
-}
-
-/// The maintained Basis Universal C API validates UASTC/ETC1S payloads, codebooks, and slices; arrays and cubemaps are rejected by this 2D texture contract.
-///
-/// # Errors
-///
-/// Returns an error if Basis transcoding fails, its metadata or output is inconsistent, or the decoded mip data is invalid or oversized.
-fn decode_ktx2_basis(
-    data: &[u8],
-    width: u32,
-    height: u32,
-    mip_count: u32,
-) -> Result<DecodedTexture, TextureError> {
-    use basisu_c_sys::{
-        TranscodeTargetFormat,
-        extra::{
-            BasisuTranscoder, ChannelType, SupportedTextureCompression, basisu_transcoder_init,
-        },
-    };
-
-    basisu_transcoder_init();
-    let transcoder = BasisuTranscoder::new(
-        data,
-        SupportedTextureCompression::empty(),
-        ChannelType::Rgba,
-    )
-    .map_err(|_| TextureError::InvalidData)?;
-    let info = transcoder.get_info();
-    if info.width != width
-        || info.height != height
-        || info.levels != mip_count
-        || info.layers > 1
-        || info.faces != 1
-    {
-        return Err(TextureError::InvalidData);
-    }
-    let image = transcoder
-        .transcode(Some(TranscodeTargetFormat::RGBA32), Some(false))
-        .map_err(|_| TextureError::InvalidData)?;
-    if image.mip_level_count != mip_count {
-        return Err(TextureError::InvalidData);
-    }
-
-    let mut offset = 0_usize;
-    let mut mips = Vec::with_capacity(mip_count as usize);
-    for level in 0..mip_count {
-        let mip_width = width.checked_shr(level).unwrap_or(0).max(1);
-        let mip_height = height.checked_shr(level).unwrap_or(0).max(1);
-        let byte_count = (mip_width as usize)
-            .checked_mul(mip_height as usize)
-            .and_then(|pixels| pixels.checked_mul(4))
-            .ok_or(TextureError::TooLarge)?;
-        let end = offset
-            .checked_add(byte_count)
-            .ok_or(TextureError::TooLarge)?;
-        let rgba8 = image
-            .data
-            .get(offset..end)
-            .ok_or(TextureError::InvalidData)?;
-        mips.push(DecodedMip {
-            width: mip_width,
-            height: mip_height,
-            rgba8: rgba8.to_vec(),
-        });
-        offset = end;
-    }
-    if offset != image.data.len() {
-        return Err(TextureError::InvalidData);
-    }
-    decoded(mips)
-}
-
-/// Validates RGBA8 mip dimensions, byte lengths, and aggregate size.
-///
-/// # Errors
-///
-/// Returns an error if the mip chain is empty or inconsistent, or its dimensions, byte size, or mip count exceed supported limits.
-fn decoded(mips: Vec<DecodedMip>) -> Result<DecodedTexture, TextureError> {
+/// Returns an error if the mip chain is empty or inconsistent, or exceeds supported limits.
+fn decoded(format: TextureFormat, mips: Vec<DecodedMip>) -> Result<DecodedTexture, TextureError> {
     let Some(first) = mips.first() else {
         return Err(TextureError::InvalidData);
     };
@@ -320,11 +461,10 @@ fn decoded(mips: Vec<DecodedMip>) -> Result<DecodedTexture, TextureError> {
         if mip.width != expected_width || mip.height != expected_height {
             return Err(TextureError::InvalidData);
         }
-        let expected = u64::from(mip.width)
-            .checked_mul(u64::from(mip.height))
-            .and_then(|value| value.checked_mul(4))
+        let expected = format
+            .level_bytes(mip.width, mip.height)
             .ok_or(TextureError::TooLarge)?;
-        if mip.rgba8.len() as u64 != expected {
+        if mip.bytes.len() as u64 != expected {
             return Err(TextureError::InvalidData);
         }
         total = total.checked_add(expected).ok_or(TextureError::TooLarge)?;
@@ -339,6 +479,7 @@ fn decoded(mips: Vec<DecodedMip>) -> Result<DecodedTexture, TextureError> {
         width,
         height,
         mip_count,
+        format,
         mips,
     })
 }
@@ -623,6 +764,49 @@ impl TextureRegistry {
             .ok_or(TextureError::GenerationExhausted)?;
         entry.state = None;
         entry.generation = next_generation;
+        self.free.push(texture.slot);
+        Ok(())
+    }
+
+    /// Invalidates a submitted texture while withholding its descriptor slot from reuse.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the handle is stale or its generation cannot advance.
+    pub fn retire(&mut self, texture: TextureId) -> Result<(), TextureError> {
+        let entry = self
+            .slots
+            .get_mut(texture.slot as usize)
+            .ok_or(TextureError::NotFound)?;
+        if entry.generation != texture.generation || entry.state.is_none() {
+            return Err(TextureError::NotFound);
+        }
+        let next_generation = entry
+            .generation
+            .checked_add(1)
+            .ok_or(TextureError::GenerationExhausted)?;
+        entry.state = None;
+        entry.generation = next_generation;
+        self.events.push(TextureEvent::Unloaded { texture });
+        Ok(())
+    }
+
+    /// Releases a retired descriptor slot after native transfer and frame dependencies complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless `texture` is the immediately preceding generation of a withheld slot.
+    pub fn release_retired(&mut self, texture: TextureId) -> Result<(), TextureError> {
+        let entry = self
+            .slots
+            .get(texture.slot as usize)
+            .ok_or(TextureError::NotFound)?;
+        if entry.state.is_some()
+            || entry.generation != texture.generation.saturating_add(1)
+            || self.free.contains(&texture.slot)
+        {
+            return Err(TextureError::InvalidState);
+        }
         self.free.push(texture.slot);
         Ok(())
     }

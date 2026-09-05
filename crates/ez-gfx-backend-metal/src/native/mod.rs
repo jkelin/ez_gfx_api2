@@ -14,20 +14,21 @@ use ez_gfx_hal::{
     BufferTransfer, CompletionToken, CullMode, DEFAULT_ALLOCATION_BLOCK_POLICY,
     DynamicPipelineState, ExecutionBarrier, ExecutionPass, FrontFace, HalError, ImageMip,
     MemoryAllocator, MemoryClass, PrimitiveTopology, QueueKind, SamplerAddressMode, SamplerFilter,
-    ShaderTextureHeapLayout, TextureSamplerDesc, validate_rgba8_mips,
+    ShaderTextureHeapLayout, TextureFormat, TextureRegion, TextureSamplerDesc,
+    validate_texture_mips, validate_texture_region,
 };
 use gpu_allocator::{
     AllocationSizes, MemoryLocation,
     metal::{Allocation, AllocationCreateDesc, Allocator, AllocatorCreateDesc},
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_foundation::NSString;
+use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTLArgumentBuffersTier, MTLArgumentEncoder, MTLBlendFactor, MTLBlitCommandEncoder, MTLBuffer,
     MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
     MTLCompareFunction, MTLComputeCommandEncoder, MTLComputePipelineState,
     MTLCreateSystemDefaultDevice, MTLCullMode, MTLDepthStencilDescriptor, MTLDepthStencilState,
-    MTLDevice, MTLFunction, MTLHeap, MTLIndexType, MTLLibrary, MTLLoadAction, MTLOrigin,
+    MTLDevice, MTLEvent, MTLFunction, MTLHeap, MTLIndexType, MTLLibrary, MTLLoadAction, MTLOrigin,
     MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
     MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLRenderStages, MTLResource,
     MTLResourceOptions, MTLResourceUsage, MTLSamplerAddressMode, MTLSamplerDescriptor,
@@ -196,8 +197,27 @@ pub struct NativeTexture {
     texture: ThreadBound<Retained<ProtocolObject<dyn MTLTexture>>>,
     allocation: ThreadBound<Allocation>,
     sampler: ThreadBound<Retained<ProtocolObject<dyn MTLSamplerState>>>,
+    format: TextureFormat,
+    width: u32,
+    height: u32,
+    mip_count: u32,
+    resident_mips: u32,
+    mip_completions: Vec<u64>,
+    cancellation: std::sync::Arc<transfer::TransferCancellation>,
     /// Slot in the bindless texture argument buffer.
     pub binding: u32,
+}
+
+impl NativeTexture {
+    /// Returns the last transfer value that may reference this texture.
+    pub fn last_transfer_value(&self) -> u64 {
+        self.mip_completions.iter().copied().max().unwrap_or(0)
+    }
+
+    /// Latest copy values ordered from finest to coarsest mip; zero means never submitted.
+    pub fn mip_transfer_values(&self) -> &[u64] {
+        &self.mip_completions
+    }
 }
 
 /// Metal compute or graphics pipeline state.
@@ -296,21 +316,23 @@ pub struct NativeContext {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     transfer_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    texture_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    texture_graphics_event: Retained<ProtocolObject<dyn MTLEvent>>,
+    texture_completion_event: Retained<ProtocolObject<dyn MTLEvent>>,
     allocator: Option<Allocator>,
     retired: Vec<RetiredAllocation>,
     frame_slots: Vec<FrameSlot>,
     frame_tracker: FrameSlotTracker,
     deferred: Vec<DeferredNativeResource>,
     adapter: AdapterInfo,
+    drain_complete: bool,
     next_transfer_value: u64,
     completed_transfer_value: u64,
     pending_transfers: Vec<PendingTransfer>,
     transfer_worker: Option<ez_gfx_hal::TransferWorker<transfer::MetalTransferJob>>,
     next_texture_value: u64,
     completed_texture_value: u64,
-    pending_texture_transfers: Vec<PendingTransfer>,
-    texture_worker: Option<ez_gfx_hal::TransferWorker<transfer::MetalTransferJob>>,
+    pending_texture_transfers: Vec<transfer::PendingTextureTransfer>,
+    texture_worker: Option<ez_gfx_hal::TransferWorker<transfer::TextureTransferJob>>,
     texture_staging: ez_gfx_hal::ReusableStagingPool<NativeAllocation>,
 }
 

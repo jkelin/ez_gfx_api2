@@ -19,8 +19,8 @@ use ez_gfx_hal::{
     BufferTransfer, CompletionToken, CullMode, DEFAULT_ALLOCATION_BLOCK_POLICY,
     DynamicPipelineState, ExecutionBarrier, ExecutionPass, FrontFace, HalError, ImageMip,
     MemoryAllocator, MemoryClass, PrimitiveTopology, QueueKind, ResourceAccess, ResourceState,
-    SamplerAddressMode, SamplerFilter, ShaderBufferLayout, ShaderStage, TextureSamplerDesc,
-    validate_rgba8_mips,
+    SamplerAddressMode, SamplerFilter, ShaderBufferLayout, ShaderStage, TextureFormat,
+    TextureRegion, TextureSamplerDesc, validate_texture_mips, validate_texture_region,
 };
 use gpu_allocator::{
     AllocationSizes, MemoryLocation,
@@ -245,8 +245,27 @@ pub struct NativeTexture {
     view: vk::ImageView,
     allocation: Allocation,
     sampler: vk::Sampler,
+    format: TextureFormat,
+    width: u32,
+    height: u32,
+    mip_count: u32,
+    resident_mips: u32,
+    mip_completions: Vec<u64>,
+    cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Slot in the bindless texture descriptor heap.
     pub binding: u32,
+}
+
+impl NativeTexture {
+    /// Returns the last transfer value that may reference this texture.
+    pub fn last_transfer_value(&self) -> u64 {
+        self.mip_completions.iter().copied().max().unwrap_or(0)
+    }
+
+    /// Latest copy values ordered from finest to coarsest mip; zero means never submitted.
+    pub fn mip_transfer_values(&self) -> &[u64] {
+        &self.mip_completions
+    }
 }
 
 /// Vulkan pipeline and descriptor layout required to bind it.
@@ -275,6 +294,7 @@ enum DeferredResource {
     Pipeline(NativePipeline),
     Shader(NativeShader),
     Texture(NativeTexture),
+    TextureView(vk::ImageView),
 }
 
 struct DeferredNativeResource {
@@ -289,7 +309,6 @@ struct FrameSlot {
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
     image_available: vk::Semaphore,
-    render_finished: vk::Semaphore,
     fence: vk::Fence,
     descriptor_pool: vk::DescriptorPool,
     in_flight: bool,
@@ -393,12 +412,13 @@ impl Drop for PendingDevice {
 /// Vulkan instance, admitted device, queues, allocators, and frame state.
 pub struct NativeContext {
     // Retain ash's dynamically loaded Vulkan library until all instance/device function pointers are dropped.
-    _entry_loader: Entry,
+    entry_loader: Entry,
     instance: Instance,
     surface_loader: khr::surface::Instance,
     physical_device: Option<vk::PhysicalDevice>,
     adapter_info: Option<AdapterInfo>,
     device: Option<ash::Device>,
+    idle_drained: bool,
     allocator: Option<Allocator>,
     retired: Vec<RetiredAllocation>,
     deferred: Vec<DeferredNativeResource>,
@@ -427,6 +447,7 @@ pub struct NativeContext {
     swapchain_loader: Option<khr::swapchain::Device>,
     swapchain: Option<vk::SwapchainKHR>,
     swapchain_views: Vec<vk::ImageView>,
+    swapchain_finished: Vec<vk::Semaphore>,
     swapchain_initialized: Vec<bool>,
     swapchain_format: vk::Format,
     swapchain_extent: vk::Extent2D,

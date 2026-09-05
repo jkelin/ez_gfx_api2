@@ -13,5 +13,11 @@ ez-gfx-hal.workspace = true
 windows = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Security", "Win32_System_Threading"] }
 gpu-allocator = { workspace = true, features = ["std", "d3d12"] }
 
+[dev-dependencies]
+ez-gfx-compiler.workspace = true
+ez-gfx-runtime.workspace = true
+ez-gfx-artifact.workspace = true
+parking_lot.workspace = true
+
 [lints]
 workspace = true

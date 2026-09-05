@@ -78,6 +78,7 @@ mod renderer {
                 width: atlas.width,
                 height: atlas.height,
                 mip_count: 0,
+                destination: ez_gfx::TextureDestination::Rgba8Unorm,
                 sampler: TextureSamplerDesc {
                     min_filter: SamplerFilter::Linear,
                     mag_filter: SamplerFilter::Linear,

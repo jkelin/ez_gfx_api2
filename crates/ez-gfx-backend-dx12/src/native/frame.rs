@@ -370,6 +370,28 @@ impl NativeContext {
         actions: &[NativeFrameAction<'_>],
         uses_surface: bool,
     ) -> Result<DxPreparedFrame, HalError> {
+        // Queue the worker's DIRECT release/acquire before a frame waits on its completion.
+        // Waiting first would stall the same queue that must execute the handoff signal.
+        for queue in [QueueKind::Transfer, QueueKind::TextureTransfer] {
+            if let Some(required) = actions
+                .iter()
+                .filter_map(|action| match action {
+                    NativeFrameAction::Wait(token) if token.queue == queue => Some(token.value),
+                    _ => None,
+                })
+                .max()
+            {
+                let worker = if queue == QueueKind::Transfer {
+                    self.transfer_worker.as_ref()
+                } else {
+                    self.texture_worker.as_ref()
+                };
+                worker
+                    .ok_or(HalError::NotReady)?
+                    .flush_through(required)
+                    .map_err(|_| HalError::NativeFailure)?;
+            }
+        }
         if uses_surface {
             self.ensure_swapchain(
                 surface.as_deref_mut().ok_or(HalError::InvalidArgument)?,

@@ -5,6 +5,7 @@ use std::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
 #[cfg(windows)]
@@ -26,7 +27,7 @@ use ez_gfx_hal::{
     AllocationRequest, BufferRange, BufferTransfer, CompletionToken, DEFAULT_STAGING_POLICY,
     DynamicPipelineState, ExecutionAction, FrameExecutionBackend, FrameExecutionPlan, HalError,
     ImageMip, MemoryAllocator, MemoryClass, QueueKind, ResourceAccess, ResourceState, ShaderStage,
-    staging_bucket_size,
+    TextureFormat, TextureRegion, staging_bucket_size,
 };
 use ez_gfx_runtime::render::{ExecutionError, execute_compiled_graph};
 use ez_gfx_runtime::{
@@ -42,7 +43,8 @@ use ez_gfx_runtime::{
     observability::{DiagnosticLevel, Observability, RuntimePhase, RuntimeRecord, RuntimeStatus},
     target::Format,
     texture::{
-        DecodedTexture, TextureDecoder, TextureError, TextureId, TextureRegistry, TextureSource,
+        DecodedTexture, TextureDecoder, TextureDestination, TextureError, TextureId,
+        TextureRegistry, TextureSource, TextureUploadTelemetry, TextureUploadTelemetrySnapshot,
         generate_mips,
     },
 };
@@ -145,6 +147,12 @@ enum NativeTexture {
     Metal(ez_gfx_backend_metal::native::NativeTexture),
 }
 
+struct RetiredTexture {
+    id: TextureId,
+    native: NativeTexture,
+    completion: CompletionToken,
+}
+
 struct SurfaceRecord {
     native: NativeSurface,
     state: SurfaceState,
@@ -160,6 +168,7 @@ struct PendingTexture {
     id: TextureId,
     cancelled: Arc<AtomicBool>,
     config: TextureConfig,
+    admitted_at: Instant,
 }
 
 struct DecodedTextureJob {
@@ -222,11 +231,18 @@ struct ContextState {
     shaders: HashMap<ShaderHandle, ShaderRecord>,
     indirects: HashMap<IndirectBufferHandle, IndexedIndirectBuffer>,
     textures: HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>,
+    texture_formats: HashMap<TextureHandle, TextureFormat>,
+    texture_published_mips: HashMap<TextureHandle, u32>,
+    texture_residency_targets: HashMap<TextureHandle, u32>,
+    texture_last_transfer: HashMap<TextureHandle, CompletionToken>,
+    retired_textures: Vec<RetiredTexture>,
     pipelines: HashMap<PipelineKey, NativePipeline>,
     graphics_format: Option<u32>,
     texture_registry: TextureRegistry,
     texture_ready: HashMap<TextureHandle, CompletionToken>,
     pending_textures: HashMap<TextureHandle, PendingTexture>,
+    texture_handoffs: HashMap<TextureHandle, Instant>,
+    texture_telemetry: Arc<TextureUploadTelemetry>,
     async_textures: AsyncTextureState,
     texture_failures: HashMap<TextureHandle, EzGfxResult>,
     geometry: GeometryManager,

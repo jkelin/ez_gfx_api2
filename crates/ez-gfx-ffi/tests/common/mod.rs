@@ -7,11 +7,12 @@ use ez_gfx_ffi::{
 };
 use windows::{
     Win32::{
-        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
         UI::WindowsAndMessaging::{
-            CreateWindowExW, DefWindowProcW, DestroyWindow, IsWindowVisible, RegisterClassW,
-            WINDOW_EX_STYLE, WNDCLASSW, WS_OVERLAPPED,
+            CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_STYLE, GetClientRect,
+            GetForegroundWindow, GetWindowLongW, IsWindowVisible, RegisterClassW, WINDOW_EX_STYLE,
+            WNDCLASSW, WS_POPUP, WS_VISIBLE,
         },
     },
     core::w,
@@ -42,14 +43,15 @@ impl TestWindow {
             assert_ne!(unsafe { RegisterClassW(&raw const class) }, 0);
         });
 
-        // The absence of WS_VISIBLE makes the native test surface hidden from creation.
+        // A borderless popup preserves the requested client extent; WS_OVERLAPPED adds non-client
+        // decorations even when hidden. Neither visibility nor activation is requested.
         // SAFETY: the registered class, current module, and static strings remain live; this call has no parent, menu, or creation payload.
         let handle = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("EzGfxNativeTestWindow"),
                 w!("ez-gfx native test"),
-                WS_OVERLAPPED,
+                WS_POPUP,
                 0,
                 0,
                 i32::try_from(WIDTH).expect("test width fits Win32"),
@@ -61,8 +63,19 @@ impl TestWindow {
             )
         }
         .expect("create hidden test window");
-        // SAFETY: `handle` is the successfully created live window owned by this fixture.
-        assert!(!unsafe { IsWindowVisible(handle) }.as_bool());
+        let mut client = RECT::default();
+        // SAFETY: the live fixture window and writable RECT belong to this thread.
+        unsafe {
+            assert!(!IsWindowVisible(handle).as_bool());
+            assert_eq!(
+                GetWindowLongW(handle, GWL_STYLE).cast_unsigned() & WS_VISIBLE.0,
+                0
+            );
+            assert_ne!(GetForegroundWindow(), handle);
+            GetClientRect(handle, &raw mut client).expect("read hidden client extent");
+        }
+        assert_eq!(client.right - client.left, i32::try_from(WIDTH).unwrap());
+        assert_eq!(client.bottom - client.top, i32::try_from(HEIGHT).unwrap());
         Self { handle, instance }
     }
 }
@@ -93,10 +106,15 @@ pub struct TestContext {
 
 impl TestContext {
     pub fn create(backend: u8) -> Self {
+        Self::create_with_validation(backend, false)
+    }
+
+    // Validation is opt-in so existing fixture callers retain their original device requirements.
+    pub fn create_with_validation(backend: u8, validation: bool) -> Self {
         let window = TestWindow::create_hidden();
         let desc = EzGfxBackendContextDesc {
-            enable_debug: 0,
-            enable_validation: 0,
+            enable_debug: u8::from(validation),
+            enable_validation: u8::from(validation),
             surface_platform: 0,
             backend,
         };

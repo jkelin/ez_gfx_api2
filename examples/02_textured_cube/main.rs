@@ -109,6 +109,7 @@ mod renderer {
                 width: 0,
                 height: 0,
                 mip_count: 0,
+                destination: ez_gfx::TextureDestination::Auto,
                 sampler: TextureSamplerDesc {
                     min_filter: SamplerFilter::Linear,
                     mag_filter: SamplerFilter::Linear,

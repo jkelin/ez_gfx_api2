@@ -182,26 +182,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
 
 [[package]]
-name = "basis-universal"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "555fb05709f4e12fa2f6b93a480facf167eb0ecb2558ba41f610f588e77cbd14"
-dependencies = [
- "basis-universal-sys",
- "bitflags 1.3.2",
- "lazy_static",
-]
-
-[[package]]
-name = "basis-universal-sys"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd9bde5e9547958fb0e77d79fc7879edcf91d5e0c8e372ef8959916cf35e8506"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "basisu_c_sys"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -727,8 +707,8 @@ dependencies = [
 name = "ez-gfx-assets"
 version = "0.1.0"
 dependencies = [
- "basis-universal",
  "crossbeam-channel",
+ "ez-gfx-basis",
  "parking_lot",
  "rayon",
 ]
@@ -737,9 +717,13 @@ dependencies = [
 name = "ez-gfx-backend-dx12"
 version = "0.1.0"
 dependencies = [
+ "ez-gfx-artifact",
+ "ez-gfx-compiler",
  "ez-gfx-core",
  "ez-gfx-hal",
+ "ez-gfx-runtime",
  "gpu-allocator",
+ "parking_lot",
  "windows",
 ]
 
@@ -766,10 +750,21 @@ name = "ez-gfx-backend-vulkan"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "ez-gfx-artifact",
+ "ez-gfx-compiler",
  "ez-gfx-core",
  "ez-gfx-hal",
+ "ez-gfx-runtime",
  "gpu-allocator",
  "parking_lot",
+]
+
+[[package]]
+name = "ez-gfx-basis"
+version = "0.1.0"
+dependencies = [
+ "basisu_c_sys",
+ "cc",
 ]
 
 [[package]]
@@ -824,6 +819,7 @@ dependencies = [
  "ez-gfx-artifact",
  "ez-gfx-compiler",
  "ez-gfx-core",
+ "ez-gfx-runtime",
  "objc2 0.6.4",
  "objc2-core-foundation",
  "objc2-metal 0.3.2",
@@ -845,6 +841,7 @@ dependencies = [
  "basisu_c_sys",
  "blake3",
  "ez-gfx-artifact",
+ "ez-gfx-basis",
  "ez-gfx-core",
  "ez-gfx-hal",
  "image",

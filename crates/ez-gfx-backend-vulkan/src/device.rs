@@ -148,11 +148,12 @@ impl NativeContext {
         let surface_loader = khr::surface::Instance::new(&entry, &instance);
 
         let context = Self {
-            _entry_loader: entry,
+            entry_loader: entry,
             instance,
             surface_loader,
             physical_device: None,
             device: None,
+            idle_drained: true,
             adapter_info: None,
             allocator: None,
             retired: Vec::new(),
@@ -182,6 +183,7 @@ impl NativeContext {
             swapchain_loader: None,
             swapchain: None,
             swapchain_views: Vec::new(),
+            swapchain_finished: Vec::new(),
             swapchain_initialized: Vec::new(),
             swapchain_format: vk::Format::UNDEFINED,
             swapchain_extent: vk::Extent2D::default(),
@@ -208,7 +210,7 @@ impl NativeContext {
             return Err(HalError::InvalidArgument);
         }
         let Self {
-            _entry_loader: entry_loader,
+            entry_loader,
             instance,
             ..
         } = self;
@@ -236,6 +238,11 @@ impl NativeContext {
         _display: *mut core::ffi::c_void,
     ) -> Result<NativeSurface, HalError> {
         Err(HalError::Unsupported)
+    }
+
+    /// Returns the admitted adapter after device initialization.
+    pub fn adapter_info(&self) -> Option<&AdapterInfo> {
+        self.adapter_info.as_ref()
     }
 
     /// Device admission checks the semantic floor before creating queues or manager-visible state.
@@ -440,38 +447,37 @@ impl NativeContext {
                     }
                     .map_err(map_vk)?,
                 );
-                if transfer_family != queue_family {
-                    pending.acquire_pool = Some(
-                        // SAFETY: `queue_family` belongs to this device and the create-info spans the call.
-                        unsafe {
-                            device.create_command_pool(
-                                &vk::CommandPoolCreateInfo::default()
-                                    .queue_family_index(queue_family)
-                                    .flags(
-                                        vk::CommandPoolCreateFlags::TRANSIENT
-                                            | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
-                                    ),
-                                None,
-                            )
-                        }
-                        .map_err(map_vk)?,
-                    );
-                    pending.texture_acquire_pool = Some(
-                        // SAFETY: this pool uses the admitted graphics family and live device.
-                        unsafe {
-                            device.create_command_pool(
-                                &vk::CommandPoolCreateInfo::default()
-                                    .queue_family_index(queue_family)
-                                    .flags(
-                                        vk::CommandPoolCreateFlags::TRANSIENT
-                                            | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
-                                    ),
-                                None,
-                            )
-                        }
-                        .map_err(map_vk)?,
-                    );
-                }
+                pending.acquire_pool = Some(
+                    // SAFETY: `queue_family` belongs to this device and the create-info spans the
+                    // call. Same-family texture updates also use this pool for queue handoff.
+                    unsafe {
+                        device.create_command_pool(
+                            &vk::CommandPoolCreateInfo::default()
+                                .queue_family_index(queue_family)
+                                .flags(
+                                    vk::CommandPoolCreateFlags::TRANSIENT
+                                        | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+                                ),
+                            None,
+                        )
+                    }
+                    .map_err(map_vk)?,
+                );
+                pending.texture_acquire_pool = Some(
+                    // SAFETY: this pool uses the admitted graphics family and live device.
+                    unsafe {
+                        device.create_command_pool(
+                            &vk::CommandPoolCreateInfo::default()
+                                .queue_family_index(queue_family)
+                                .flags(
+                                    vk::CommandPoolCreateFlags::TRANSIENT
+                                        | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+                                ),
+                            None,
+                        )
+                    }
+                    .map_err(map_vk)?,
+                );
                 let mut timeline = vk::SemaphoreTypeCreateInfo::default()
                     .semaphore_type(vk::SemaphoreType::TIMELINE)
                     .initial_value(0);
@@ -498,36 +504,34 @@ impl NativeContext {
                     }
                     .map_err(map_vk)?,
                 );
-                if transfer_family != queue_family {
-                    let mut ownership_timeline = vk::SemaphoreTypeCreateInfo::default()
-                        .semaphore_type(vk::SemaphoreType::TIMELINE)
-                        .initial_value(0);
-                    pending.ownership_timeline = Some(
-                        // SAFETY: timeline semaphores were enabled and pNext storage spans the call.
-                        unsafe {
-                            device.create_semaphore(
-                                &vk::SemaphoreCreateInfo::default()
-                                    .push_next(&mut ownership_timeline),
-                                None,
-                            )
-                        }
-                        .map_err(map_vk)?,
-                    );
-                    let mut texture_ownership_timeline = vk::SemaphoreTypeCreateInfo::default()
-                        .semaphore_type(vk::SemaphoreType::TIMELINE)
-                        .initial_value(0);
-                    pending.texture_ownership_timeline = Some(
-                        // SAFETY: timeline semaphores are enabled and pNext storage spans the call.
-                        unsafe {
-                            device.create_semaphore(
-                                &vk::SemaphoreCreateInfo::default()
-                                    .push_next(&mut texture_ownership_timeline),
-                                None,
-                            )
-                        }
-                        .map_err(map_vk)?,
-                    );
-                }
+                let mut ownership_timeline = vk::SemaphoreTypeCreateInfo::default()
+                    .semaphore_type(vk::SemaphoreType::TIMELINE)
+                    .initial_value(0);
+                pending.ownership_timeline = Some(
+                    // SAFETY: timeline semaphores were enabled and pNext storage spans the call.
+                    unsafe {
+                        device.create_semaphore(
+                            &vk::SemaphoreCreateInfo::default().push_next(&mut ownership_timeline),
+                            None,
+                        )
+                    }
+                    .map_err(map_vk)?,
+                );
+                let mut texture_ownership_timeline = vk::SemaphoreTypeCreateInfo::default()
+                    .semaphore_type(vk::SemaphoreType::TIMELINE)
+                    .initial_value(0);
+                pending.texture_ownership_timeline = Some(
+                    // SAFETY: the timeline serializes graphics-to-transfer texture updates even
+                    // when both queues belong to the same family.
+                    unsafe {
+                        device.create_semaphore(
+                            &vk::SemaphoreCreateInfo::default()
+                                .push_next(&mut texture_ownership_timeline),
+                            None,
+                        )
+                    }
+                    .map_err(map_vk)?,
+                );
                 let worker_device = device.clone();
                 let transfer_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));
                 let texture_lock = if texture_queue == transfer_queue {
@@ -605,19 +609,27 @@ impl NativeContext {
     ///
     /// Returns an error if no device is initialized, waiting for the device fails, or reclaiming a deferred allocation fails.
     pub fn wait_idle(&mut self) -> Result<(), HalError> {
+        self.idle_drained = self.device.is_none();
         let device = self.device.as_ref().ok_or(HalError::NotReady)?.clone();
-        self.transfer_worker
-            .as_ref()
-            .ok_or(HalError::NativeFailure)?
-            .flush()
-            .map_err(|_| HalError::NativeFailure)?;
-        self.texture_worker
-            .as_ref()
-            .ok_or(HalError::NativeFailure)?
-            .flush()
-            .map_err(|_| HalError::NativeFailure)?;
+        let mut worker_failed = false;
+        for worker in [&mut self.transfer_worker, &mut self.texture_worker] {
+            if let Some(worker) = worker {
+                if worker.flush().is_err() {
+                    // Join terminal cleanup before native idle; failed callbacks may
+                    // have submitted only the first half of a queue handoff.
+                    worker.shutdown();
+                    worker_failed = true;
+                }
+            } else {
+                worker_failed = true;
+            }
+        }
         // SAFETY: `device` is the initialized logical device, and exclusive `&mut self` access prevents this context from concurrently submitting through its queues during `device_wait_idle`.
         unsafe { device.device_wait_idle() }.map_err(map_vk)?;
+        self.idle_drained = true;
+        if worker_failed {
+            return Err(HalError::NativeFailure);
+        }
         self.reclaim(ez_gfx_hal::QueueKind::Transfer, u64::MAX)
             .map_err(map_allocation_hal)?;
         self.reclaim(ez_gfx_hal::QueueKind::TextureTransfer, u64::MAX)
@@ -635,6 +647,12 @@ impl NativeContext {
                 .map_err(map_allocation_hal)?;
         }
         Ok(())
+    }
+
+    /// Reports whether the last idle attempt proved native storage safe to release.
+    /// Call `wait_idle` immediately before consulting this terminal-cleanup status.
+    pub const fn is_drained(&self) -> bool {
+        self.idle_drained
     }
 
     pub(super) fn in_flight_mask(&self) -> u8 {
@@ -732,6 +750,12 @@ impl NativeContext {
                 }
                 Ok(())
             }
+            DeferredResource::TextureView(view) => {
+                // SAFETY: the replaced view is destroyed only after every frame slot that could
+                // have observed its descriptor has completed.
+                unsafe { device.destroy_image_view(view, None) };
+                Ok(())
+            }
             DeferredResource::Texture(texture) => {
                 // SAFETY: the deferred texture is consumed after its pending frame-slot mask clears; its view and sampler are destroyed before its image and allocation storage.
                 unsafe {
@@ -751,17 +775,22 @@ impl NativeContext {
     /// Destroys backend-owned state associated with a borrowed host surface.
     pub fn destroy_surface(&mut self, surface: NativeSurface) {
         let _ = self.wait_idle();
+        if !self.is_drained() {
+            // Keep the surface and swapchain alive when submitted uses cannot retire.
+            core::mem::forget(surface);
+            return;
+        }
         let _ = self.destroy_depth_target();
         if let Some(device) = self.device.as_ref() {
             for view in self.swapchain_views.drain(..) {
-                // SAFETY: each `view` is drained exactly once before its swapchain, but completion of submitted uses is not established because `wait_idle` errors are ignored.
+                // SAFETY: native idle proved all uses complete; each view is destroyed once before its swapchain.
                 unsafe { device.destroy_image_view(view, None) };
             }
         }
         if let (Some(loader), Some(swapchain)) =
             (self.swapchain_loader.as_ref(), self.swapchain.take())
         {
-            // SAFETY: `swapchain` is taken and its image views are destroyed first, but completion of submitted uses is not established because `wait_idle` errors are ignored.
+            // SAFETY: native idle proved all uses complete and the swapchain's views were destroyed first.
             unsafe { loader.destroy_swapchain(swapchain, None) };
         }
         self.swapchain_format = vk::Format::UNDEFINED;

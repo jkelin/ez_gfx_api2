@@ -8,7 +8,7 @@ use ez_gfx_compiler::{Target, compile_shader};
 use ez_gfx_core::{Backend, capability::SemanticProfile};
 use ez_gfx_hal::{
     AllocationRequest, ImageMip, MemoryAllocator, MemoryClass, SamplerAddressMode, SamplerFilter,
-    ShaderTextureHeapLayout, TextureSamplerDesc,
+    ShaderTextureHeapLayout, TextureFormat, TextureSamplerDesc,
 };
 use ez_gfx_runtime::shader::RuntimeShader;
 
@@ -159,7 +159,14 @@ void computemain(uint3 id : SV_DispatchThreadID) {
         address_v: SamplerAddressMode::Clamp,
         address_w: SamplerAddressMode::Clamp,
     };
-    let (texture, _) = context.create_texture_rgba8(&[mip], 0, sampler).unwrap();
+    let (mut texture, completions) = context
+        .create_texture(TextureFormat::Rgba8Unorm, &[mip], 0, sampler)
+        .unwrap();
+    let completion = completions.last().unwrap().value;
+    while context.completed_texture_transfer_value().unwrap() < completion {
+        std::thread::yield_now();
+    }
+    context.publish_texture_mips(&mut texture, 1).unwrap();
     let mut output = context
         .allocate(AllocationRequest::new(4, 4, MemoryClass::Readback, true, None).unwrap())
         .unwrap();

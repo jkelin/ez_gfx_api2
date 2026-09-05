@@ -179,3 +179,42 @@ fn triangle_snapshot_is_deterministic_across_processes() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn hidden_windows_complete_multiple_frames_without_redraw_events() -> anyhow::Result<()> {
+    for backend in TARGET_BACKENDS {
+        // No snapshot file is needed; the terminal capture still reports its completed frame count.
+        let mut child =
+            shared::snapshot_command(BINARIES[0].2, std::path::Path::new("unused"), backend)
+                .env_remove("EZ_GFX_EXAMPLE_SNAPSHOT")
+                .env("EZ_GFX_EXAMPLE_MAX_FRAMES", "3")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while child.try_wait()?.is_none() {
+            if std::time::Instant::now() >= deadline {
+                child.kill()?;
+                let output = child.wait_with_output()?;
+                anyhow::bail!(
+                    "{backend} hidden frames stalled: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{backend}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report = String::from_utf8(output.stdout)?;
+        assert_eq!(
+            report.split_whitespace().nth(3),
+            Some("3"),
+            "{backend}: {report}"
+        );
+    }
+    Ok(())
+}

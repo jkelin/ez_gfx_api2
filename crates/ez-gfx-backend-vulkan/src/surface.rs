@@ -142,6 +142,10 @@ impl NativeContext {
             // SAFETY: `wait_idle` completed all uses of each drained `view`; every view was created by `device` without custom allocation callbacks.
             unsafe { device.destroy_image_view(view, None) };
         }
+        for semaphore in self.swapchain_finished.drain(..) {
+            // SAFETY: device idle completed all presentation waits on the old swapchain.
+            unsafe { device.destroy_semaphore(semaphore, None) };
+        }
         let old = self.swapchain.unwrap_or(vk::SwapchainKHR::null());
         let count = capabilities.min_image_count.saturating_add(1).min(
             if capabilities.max_image_count == 0 {
@@ -200,12 +204,33 @@ impl NativeContext {
                 }
             }
         }
+        let mut finished = Vec::with_capacity(views.len());
+        for _ in 0..views.len() {
+            // SAFETY: the semaphore belongs to this device and starts unsignaled.
+            match unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) } {
+                Ok(semaphore) => finished.push(semaphore),
+                Err(error) => {
+                    // SAFETY: this new swapchain and its views/semaphores were never submitted.
+                    unsafe {
+                        for semaphore in finished {
+                            device.destroy_semaphore(semaphore, None);
+                        }
+                        for view in views {
+                            device.destroy_image_view(view, None);
+                        }
+                        loader.destroy_swapchain(swapchain, None);
+                    }
+                    return Err(map_vk(error));
+                }
+            }
+        }
         if old != vk::SwapchainKHR::null() {
             // SAFETY: `wait_idle` completed all use of `old`, its image views were destroyed, and successful creation with `old_swapchain(old)` retired it before this destroy.
             unsafe { loader.destroy_swapchain(old, None) };
         }
         self.swapchain = Some(swapchain);
         self.swapchain_views = views;
+        self.swapchain_finished = finished;
         self.swapchain_initialized = vec![false; self.swapchain_views.len()];
         self.swapchain_format = chosen.format;
         self.swapchain_extent = extent;

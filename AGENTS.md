@@ -36,6 +36,7 @@ This repository is a Rust/Cargo migration of `ez_gfx_api`. Preserve the recogniz
 ## Verification
 
 - Test the changed contract within its blast radius, then run applicable source-line checks, Clippy, and formatting in that order at handoff. Use backend-matrix tests where behavior crosses HAL boundaries; include ABI and artifact validation tests for corresponding contract changes. Do not regenerate immutable snapshots without an explicit requirement.
+- All tests and agentic smoke/verification processes MUST run hidden/headless, without showing or activating windows or taking focus. If hidden automation stalls, fix the harness or report the blocker; NEVER fall back to visible windows.
 
 ## UI exception
 

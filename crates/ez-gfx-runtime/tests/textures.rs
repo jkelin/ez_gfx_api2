@@ -1,11 +1,66 @@
 //! Runtime integration and contract tests.
 
-use ez_gfx_hal::{CompletionToken, QueueKind};
+use ez_gfx_core::capability::CompressionSupport;
+use ez_gfx_hal::{CompletionToken, QueueKind, TextureFormat};
 use ez_gfx_runtime::texture::{
-    DecodedMip, DecodedTexture, TextureDecoder, TextureError, TextureEvent, TextureRegistry,
-    TextureSource, generate_mips,
+    DecodedMip, DecodedTexture, TextureDecoder, TextureDestination, TextureError, TextureEvent,
+    TextureRegistry, TextureSource, TextureUploadTelemetry, coarse_to_fine_mip_levels,
+    generate_mips, register_texture_decoder, unregister_texture_decoder,
 };
 use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+use std::sync::Arc;
+
+#[path = "textures/dds.rs"]
+mod dds;
+
+#[test]
+fn progressive_submission_orders_terminal_mip_before_finer_levels() {
+    assert_eq!(
+        coarse_to_fine_mip_levels(0).collect::<Vec<_>>(),
+        Vec::<u32>::new()
+    );
+    assert_eq!(coarse_to_fine_mip_levels(1).collect::<Vec<_>>(), [0]);
+    assert_eq!(
+        coarse_to_fine_mip_levels(4).collect::<Vec<_>>(),
+        [3, 2, 1, 0]
+    );
+}
+
+#[test]
+fn retired_texture_slots_are_not_reused_until_explicit_release() {
+    let mut registry = TextureRegistry::new(2, 2).unwrap();
+    let first = registry.begin_upload().unwrap();
+    let second = registry.begin_upload().unwrap();
+
+    registry.retire(first).unwrap();
+    assert_eq!(
+        registry.begin_upload(),
+        Err(TextureError::CapacityExceeded),
+        "retirement must keep the descriptor binding unavailable"
+    );
+    registry.release_retired(first).unwrap();
+
+    let reused = registry.begin_upload().unwrap();
+    assert_eq!(registry.reserved_binding(reused), Ok(0));
+    assert_ne!(reused, first);
+    assert_eq!(registry.reserved_binding(second), Ok(1));
+}
+
+#[test]
+fn upload_telemetry_snapshots_are_atomic_and_saturating() {
+    let telemetry = TextureUploadTelemetry::default();
+    telemetry.record_decode(u64::MAX);
+    telemetry.record_decode(1);
+    telemetry.record_staging_bytes(17);
+    telemetry.record_queue_latency(23);
+    telemetry.record_handoff_latency(29);
+
+    let snapshot = telemetry.snapshot();
+    assert_eq!(snapshot.decode_microseconds, u64::MAX);
+    assert_eq!(snapshot.staging_bytes, 17);
+    assert_eq!(snapshot.queue_latency_microseconds, 23);
+    assert_eq!(snapshot.handoff_latency_microseconds, 29);
+}
 
 #[test]
 fn raw_and_png_decode_to_bounded_rgba8() {
@@ -23,10 +78,11 @@ fn raw_and_png_decode_to_bounded_rgba8() {
             width: 1,
             height: 1,
             mip_count: 1,
+            format: TextureFormat::Rgba8Unorm,
             mips: vec![DecodedMip {
                 width: 1,
                 height: 1,
-                rgba8: vec![1, 2, 3, 4]
+                bytes: vec![1, 2, 3, 4]
             }]
         }
     );
@@ -49,7 +105,7 @@ fn raw_and_png_decode_to_bounded_rgba8() {
         TextureDecoder::decode(TextureSource::Png, &png)
             .unwrap()
             .mips[0]
-            .rgba8,
+            .bytes,
         vec![9, 8, 7, 6]
     );
     let rgb = TextureDecoder::decode(
@@ -60,7 +116,7 @@ fn raw_and_png_decode_to_bounded_rgba8() {
         &[5, 6, 7],
     )
     .unwrap();
-    assert_eq!(rgb.mips[0].rgba8, vec![5, 6, 7, 255]);
+    assert_eq!(rgb.mips[0].bytes, vec![5, 6, 7, 255]);
 }
 
 #[test]
@@ -69,10 +125,11 @@ fn generated_mips_box_filter_odd_edges_and_stop_at_one_pixel() {
         width: 3,
         height: 1,
         mip_count: 1,
+        format: TextureFormat::Rgba8Unorm,
         mips: vec![DecodedMip {
             width: 3,
             height: 1,
-            rgba8: vec![0, 0, 0, 0, 10, 20, 30, 40, 100, 120, 140, 160],
+            bytes: vec![0, 0, 0, 0, 10, 20, 30, 40, 100, 120, 140, 160],
         }],
     };
     let generated = generate_mips(base).unwrap();
@@ -84,7 +141,7 @@ fn generated_mips_box_filter_odd_edges_and_stop_at_one_pixel() {
         ),
         (2, 1, 1)
     );
-    assert_eq!(generated.mips[1].rgba8, vec![5, 10, 15, 20]);
+    assert_eq!(generated.mips[1].bytes, vec![5, 10, 15, 20]);
 
     let single = TextureDecoder::decode(
         TextureSource::Rgba8 {
@@ -103,21 +160,22 @@ fn mip_validation_accepts_a_complete_terminal_chain() {
         width: 4,
         height: 2,
         mip_count: 3,
+        format: TextureFormat::Rgba8Unorm,
         mips: vec![
             DecodedMip {
                 width: 4,
                 height: 2,
-                rgba8: vec![0; 32],
+                bytes: vec![0; 32],
             },
             DecodedMip {
                 width: 2,
                 height: 1,
-                rgba8: vec![0; 8],
+                bytes: vec![0; 8],
             },
             DecodedMip {
                 width: 1,
                 height: 1,
-                rgba8: vec![0; 4],
+                bytes: vec![0; 4],
             },
         ],
     };
@@ -131,16 +189,17 @@ fn mip_validation_rejects_levels_after_the_terminal_texel() {
         width: 1,
         height: 1,
         mip_count: 2,
+        format: TextureFormat::Rgba8Unorm,
         mips: vec![
             DecodedMip {
                 width: 1,
                 height: 1,
-                rgba8: vec![0; 4],
+                bytes: vec![0; 4],
             },
             DecodedMip {
                 width: 1,
                 height: 1,
-                rgba8: vec![0; 4],
+                bytes: vec![0; 4],
             },
         ],
     };
@@ -151,6 +210,7 @@ fn mip_validation_rejects_levels_after_the_terminal_texel() {
     );
 }
 
+#[cfg(feature = "ktx2")]
 #[test]
 fn malformed_ktx2_is_rejected_without_panics() {
     assert_eq!(
@@ -159,6 +219,181 @@ fn malformed_ktx2_is_rejected_without_panics() {
     );
 }
 
+#[cfg(feature = "basis")]
+#[test]
+fn standalone_basis_decodes_complete_fixture_chain() {
+    let bytes = include_bytes!("fixtures/rust-logo-etc.basis");
+    let decoded =
+        TextureDecoder::decode_with_support(TextureSource::Basis, bytes, CompressionSupport::BC)
+            .unwrap();
+
+    assert_eq!(
+        (decoded.width, decoded.height, decoded.mip_count),
+        (64, 64, 7)
+    );
+    assert_eq!(decoded.format, TextureFormat::Bc3Unorm);
+    assert!(decoded.mips.iter().all(|mip| {
+        mip.bytes.len() as u64 == decoded.format.level_bytes(mip.width, mip.height).unwrap()
+    }));
+}
+
+#[cfg(not(feature = "basis"))]
+#[test]
+fn standalone_basis_is_unsupported_without_feature() {
+    assert_eq!(
+        TextureDecoder::decode(TextureSource::Basis, b"basis"),
+        Err(TextureError::Unsupported)
+    );
+}
+#[test]
+fn custom_decoder_registration_validates_output_and_unregisters_cleanly() {
+    const FORMAT: u8 = 201;
+    unregister_texture_decoder(FORMAT).ok();
+    register_texture_decoder(
+        FORMAT,
+        Arc::new(|bytes, _| {
+            Ok(DecodedTexture {
+                width: 1,
+                height: 1,
+                mip_count: 1,
+                format: TextureFormat::Rgba8Unorm,
+                mips: vec![DecodedMip {
+                    width: 1,
+                    height: 1,
+                    bytes: bytes.to_vec(),
+                }],
+            })
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(
+        TextureDecoder::decode(TextureSource::Custom(FORMAT), &[1, 2, 3, 4])
+            .unwrap()
+            .mips[0]
+            .bytes,
+        [1, 2, 3, 4]
+    );
+    assert_eq!(
+        TextureDecoder::decode(TextureSource::Custom(FORMAT), &[1]),
+        Err(TextureError::InvalidData)
+    );
+    unregister_texture_decoder(FORMAT).unwrap();
+    assert_eq!(
+        TextureDecoder::decode(TextureSource::Custom(FORMAT), &[1, 2, 3, 4]),
+        Err(TextureError::Unsupported)
+    );
+}
+
+#[test]
+fn prepared_custom_decode_retains_callback_after_unregister() {
+    const FORMAT: u8 = 202;
+    unregister_texture_decoder(FORMAT).ok();
+    register_texture_decoder(
+        FORMAT,
+        Arc::new(|bytes, _| {
+            Ok(DecodedTexture {
+                width: 1,
+                height: 1,
+                mip_count: 1,
+                format: TextureFormat::Rgba8Unorm,
+                mips: vec![DecodedMip {
+                    width: 1,
+                    height: 1,
+                    bytes: bytes.to_vec(),
+                }],
+            })
+        }),
+    )
+    .unwrap();
+    let prepared = TextureDecoder::prepare(
+        TextureSource::Custom(FORMAT),
+        CompressionSupport::NONE,
+        TextureDestination::Auto,
+    )
+    .unwrap();
+    unregister_texture_decoder(FORMAT).unwrap();
+
+    assert_eq!(prepared.decode(&[1, 2, 3, 4]).unwrap().width, 1);
+}
+
+#[test]
+fn custom_compressed_output_requires_backend_admission() {
+    const FORMAT: u8 = 203;
+    unregister_texture_decoder(FORMAT).ok();
+    register_texture_decoder(
+        FORMAT,
+        Arc::new(|_, _| {
+            Ok(DecodedTexture {
+                width: 4,
+                height: 4,
+                mip_count: 1,
+                format: TextureFormat::Bc1Unorm,
+                mips: vec![DecodedMip {
+                    width: 4,
+                    height: 4,
+                    bytes: vec![0; 8],
+                }],
+            })
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(
+        TextureDecoder::decode_with_support(
+            TextureSource::Custom(FORMAT),
+            &[1],
+            CompressionSupport::NONE,
+        ),
+        Err(TextureError::Unsupported)
+    );
+    unregister_texture_decoder(FORMAT).unwrap();
+}
+
+#[cfg(all(feature = "ktx2", feature = "basis"))]
+#[test]
+fn basis_transcoding_selects_native_bc_when_supported() {
+    let bytes = include_bytes!("fixtures/alpha_simple_basis.ktx2");
+    let decoded =
+        TextureDecoder::decode_with_support(TextureSource::Ktx2, bytes, CompressionSupport::BC)
+            .unwrap();
+
+    assert!(matches!(
+        decoded.format,
+        TextureFormat::Bc3Unorm | TextureFormat::Bc3Srgb
+    ));
+    assert!(decoded.mips.iter().all(|mip| {
+        mip.bytes.len() as u64 == decoded.format.level_bytes(mip.width, mip.height).unwrap()
+    }));
+}
+
+#[cfg(all(feature = "ktx2", feature = "basis"))]
+#[test]
+fn basis_destination_is_explicit_and_capability_checked() {
+    let bytes = include_bytes!("fixtures/alpha_simple_basis.ktx2");
+    assert_eq!(
+        TextureDecoder::decode_for_destination(
+            TextureSource::Ktx2,
+            bytes,
+            CompressionSupport::NONE,
+            TextureDestination::Bc7Unorm,
+        ),
+        Err(TextureError::Unsupported)
+    );
+    assert_eq!(
+        TextureDecoder::decode_for_destination(
+            TextureSource::Ktx2,
+            bytes,
+            CompressionSupport::BC,
+            TextureDestination::Rgba8Srgb,
+        )
+        .unwrap()
+        .format,
+        TextureFormat::Rgba8Srgb
+    );
+}
+
+#[cfg(all(feature = "ktx2", feature = "basis"))]
 #[test]
 fn ktx2_basislz_transcodes_every_mip_to_rgba8() {
     let bytes = include_bytes!("fixtures/alpha_simple_basis.ktx2");
@@ -177,7 +412,94 @@ fn ktx2_basislz_transcodes_every_mip_to_rgba8() {
         decoded
             .mips
             .iter()
-            .all(|mip| mip.rgba8.len() == mip.width as usize * mip.height as usize * 4)
+            .all(|mip| mip.bytes.len() == mip.width as usize * mip.height as usize * 4)
+    );
+}
+
+#[cfg(all(feature = "ktx2", feature = "basis"))]
+#[test]
+fn ktx2_honors_every_explicit_native_target() {
+    let bytes = include_bytes!("fixtures/alpha_simple_basis.ktx2");
+    for (destination, expected) in [
+        (TextureDestination::Bc1Unorm, TextureFormat::Bc1Unorm),
+        (TextureDestination::Bc3Srgb, TextureFormat::Bc3Srgb),
+        (TextureDestination::Bc7Unorm, TextureFormat::Bc7Unorm),
+        (TextureDestination::Astc4x4Srgb, TextureFormat::Astc4x4Srgb),
+        (TextureDestination::Rgba8Srgb, TextureFormat::Rgba8Srgb),
+    ] {
+        let texture = TextureDecoder::decode_for_destination(
+            TextureSource::Ktx2,
+            bytes,
+            CompressionSupport::BC.union(CompressionSupport::ASTC),
+            destination,
+        )
+        .unwrap();
+        assert_eq!(texture.format, expected);
+        for mip in texture.mips {
+            assert_eq!(
+                mip.bytes.len() as u64,
+                expected.level_bytes(mip.width, mip.height).unwrap()
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "ktx2", feature = "basis"))]
+#[test]
+fn etc1s_data_channels_decode_to_canonical_rgba_pixels() {
+    let original = include_bytes!("fixtures/alpha_simple_basis.ktx2");
+    let reference = TextureDecoder::decode(TextureSource::Ktx2, original).unwrap();
+    let dfd = u32::from_le_bytes(original[48..52].try_into().unwrap()) as usize;
+    for second_channel in [4_u8, 15] {
+        let mut source = original.to_vec();
+        source[dfd + 31] = 3; // ETC1S RRR primary plane.
+        source[dfd + 47] = second_channel; // GGG means RG; otherwise a single R data channel.
+        source[dfd + 14] = 1; // Linear data, not an sRGB color.
+        for destination in [TextureDestination::Auto, TextureDestination::Rgba8Unorm] {
+            let decoded = TextureDecoder::decode_for_destination(
+                TextureSource::Ktx2,
+                &source,
+                CompressionSupport::BC,
+                destination,
+            )
+            .unwrap();
+            assert_eq!(decoded.format, TextureFormat::Rgba8Unorm);
+            for (actual, prior) in decoded.mips.iter().zip(&reference.mips) {
+                for (pixel, encoded) in actual
+                    .bytes
+                    .chunks_exact(4)
+                    .zip(prior.bytes.chunks_exact(4))
+                {
+                    assert_eq!(
+                        pixel,
+                        [
+                            encoded[0],
+                            if second_channel == 4 { encoded[3] } else { 0 },
+                            0,
+                            255
+                        ]
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            TextureDecoder::decode_for_destination(
+                TextureSource::Ktx2,
+                &source,
+                CompressionSupport::BC,
+                TextureDestination::Bc3Unorm,
+            ),
+            Err(TextureError::Unsupported)
+        );
+    }
+}
+
+#[cfg(not(feature = "ktx2"))]
+#[test]
+fn disabled_ktx2_is_explicitly_unsupported() {
+    assert_eq!(
+        TextureDecoder::decode(TextureSource::Ktx2, b"disabled"),
+        Err(TextureError::Unsupported)
     );
 }
 
@@ -274,4 +596,145 @@ fn clear_invalidates_every_slot_and_rebuilds_the_free_list() {
         3
     );
     assert_eq!(registry.begin_upload(), Err(TextureError::CapacityExceeded));
+}
+
+#[test]
+fn raw_ingestion_preserves_and_matches_exactly() {
+    let level = [0x66_u8; 16];
+    let source = TextureSource::Raw {
+        format: TextureFormat::Bc7Unorm,
+        width: 4,
+        height: 4,
+        mip_count: 1,
+    };
+    let decoded = TextureDecoder::decode_for_destination(
+        source,
+        &level,
+        CompressionSupport::BC,
+        TextureDestination::Auto,
+    )
+    .unwrap();
+    assert_eq!(decoded.format, TextureFormat::Bc7Unorm);
+    assert_eq!(decoded.mips[0].bytes, level.to_vec());
+    // A zero count cannot bound the chain and is rejected outright.
+    let defaulted = TextureSource::Raw {
+        format: TextureFormat::Bc7Unorm,
+        width: 4,
+        height: 4,
+        mip_count: 0,
+    };
+    assert_eq!(
+        TextureDecoder::decode_for_destination(
+            defaulted,
+            &level,
+            CompressionSupport::BC,
+            TextureDestination::Auto,
+        ),
+        Err(TextureError::InvalidData)
+    );
+    assert_eq!(
+        TextureDecoder::decode_for_destination(
+            source,
+            &level,
+            CompressionSupport::BC,
+            TextureDestination::Bc3Unorm,
+        ),
+        Err(TextureError::Unsupported)
+    );
+    assert_eq!(
+        TextureDecoder::decode_for_destination(
+            source,
+            &level[..15],
+            CompressionSupport::BC,
+            TextureDestination::Auto,
+        ),
+        Err(TextureError::InvalidData)
+    );
+    let mut trailing = level.to_vec();
+    trailing.push(0);
+    assert_eq!(
+        TextureDecoder::decode_for_destination(
+            source,
+            &trailing,
+            CompressionSupport::BC,
+            TextureDestination::Auto,
+        ),
+        Err(TextureError::InvalidData)
+    );
+    assert_eq!(
+        TextureDecoder::decode_for_destination(
+            source,
+            &level,
+            CompressionSupport::NONE,
+            TextureDestination::Auto,
+        ),
+        Err(TextureError::Unsupported)
+    );
+}
+
+#[test]
+fn raw_rejects_zero_dims_absurd_counts_and_dimension_drift() {
+    let zero = TextureSource::Raw {
+        format: TextureFormat::Rgba8Unorm,
+        width: 0,
+        height: 4,
+        mip_count: 1,
+    };
+    assert_eq!(
+        TextureDecoder::decode_for_destination(
+            zero,
+            &[0; 16],
+            CompressionSupport::NONE,
+            TextureDestination::Auto,
+        ),
+        Err(TextureError::TooLarge)
+    );
+    let absurd = TextureSource::Raw {
+        format: TextureFormat::Rgba8Unorm,
+        width: 1,
+        height: 1,
+        mip_count: 33,
+    };
+    assert_eq!(
+        TextureDecoder::decode_for_destination(
+            absurd,
+            &[0; 4],
+            CompressionSupport::NONE,
+            TextureDestination::Auto,
+        ),
+        Err(TextureError::InvalidData)
+    );
+    // Two declared levels require both byte ranges back to back.
+    let chained = TextureSource::Raw {
+        format: TextureFormat::Rgba8Unorm,
+        width: 2,
+        height: 2,
+        mip_count: 2,
+    };
+    let bytes = [1_u8; 16 + 4];
+    let decoded = TextureDecoder::decode_for_destination(
+        chained,
+        &bytes,
+        CompressionSupport::NONE,
+        TextureDestination::Auto,
+    )
+    .unwrap();
+    assert_eq!(decoded.mip_count, 2);
+    assert_eq!(
+        decoded
+            .mips
+            .iter()
+            .map(|mip| (mip.width, mip.height))
+            .collect::<Vec<_>>(),
+        [(2, 2), (1, 1)]
+    );
+    assert_eq!(
+        TextureDecoder::decode_for_destination(
+            chained,
+            &[1_u8; 16],
+            CompressionSupport::NONE,
+            TextureDestination::Auto,
+        ),
+        Err(TextureError::InvalidData)
+    );
 }

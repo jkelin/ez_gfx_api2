@@ -69,6 +69,7 @@ fn texture_config() -> TextureConfig {
         width: 1,
         height: 1,
         mip_count: 1,
+        destination: TextureDestination::Rgba8Unorm,
         sampler: ez_gfx_hal::TextureSamplerDesc {
             min_filter: ez_gfx_hal::SamplerFilter::Linear,
             mag_filter: ez_gfx_hal::SamplerFilter::Linear,
@@ -114,6 +115,90 @@ fn texture_admission_is_nonblocking_and_pending_cancellation_invalidates_the_han
         cancel_texture_load(context, texture),
         EzGfxResult::InvalidArgument
     );
+    assert_eq!(destroy_context(context), EzGfxResult::Ok);
+}
+
+#[test]
+fn texture_region_validation_and_update_backpressure_are_stable() {
+    let bytes = [0_u8; 16];
+    let valid = TextureRegion {
+        mip_level: 0,
+        x: 1,
+        y: 1,
+        width: 2,
+        height: 2,
+        bytes: &bytes,
+    };
+    assert_eq!(
+        validate_texture_update(TextureFormat::Rgba8Unorm, 4, 4, 3, valid),
+        Ok(())
+    );
+    let invalid = TextureRegion { width: 3, ..valid };
+    assert_eq!(
+        validate_texture_update(TextureFormat::Rgba8Unorm, 4, 4, 3, invalid),
+        Err(EzGfxResult::InvalidArgument)
+    );
+    assert_eq!(
+        map_texture_update_error(ez_gfx_hal::AllocationError::OutOfMemory),
+        EzGfxResult::QueueFull
+    );
+}
+
+#[test]
+fn first_coarse_publication_records_handoff_telemetry_once() {
+    let context =
+        create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).unwrap()).unwrap();
+    let texture = with_context_mut(context, |state| {
+        let packed = state
+            .identity
+            .insert(ResourceKind::Texture)
+            .map_err(map_lifecycle)?;
+        let texture = TextureHandle::from_packed(packed).map_err(|_| EzGfxResult::NativeFailure)?;
+        state.texture_ready.insert(
+            texture,
+            CompletionToken::new(QueueKind::TextureTransfer, 3)
+                .map_err(|_| EzGfxResult::NativeFailure)?,
+        );
+        state.texture_handoffs.insert(
+            texture,
+            Instant::now()
+                .checked_sub(std::time::Duration::from_micros(10))
+                .expect("ten microseconds fits in the monotonic clock"),
+        );
+
+        record_texture_ready(state, texture, 2);
+        assert!(state.texture_ready.contains_key(&texture));
+        record_texture_ready(state, texture, 3);
+        // GPU completion alone is insufficient while a frame still prevents publication.
+        assert!(state.texture_ready.contains_key(&texture));
+        assert_eq!(
+            state
+                .texture_telemetry
+                .snapshot()
+                .handoff_latency_microseconds,
+            0
+        );
+        state.texture_published_mips.insert(texture, 1);
+        record_texture_ready(state, texture, 3);
+        assert!(!state.texture_ready.contains_key(&texture));
+        Ok(texture)
+    })
+    .unwrap();
+
+    let snapshot = texture_upload_telemetry(context).unwrap();
+    assert!(snapshot.handoff_latency_microseconds >= 10);
+    with_context_mut(context, |state| {
+        record_texture_ready(state, texture, u64::MAX);
+        assert_eq!(
+            state
+                .texture_telemetry
+                .snapshot()
+                .handoff_latency_microseconds,
+            snapshot.handoff_latency_microseconds
+        );
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(destroy_context(context), EzGfxResult::Ok);
 }
 
@@ -244,4 +329,23 @@ fn lost_context_can_still_be_destroyed_terminally() {
     assert_eq!(wait_idle(context), EzGfxResult::DeviceLost);
     assert_eq!(destroy_context(context), EzGfxResult::Ok);
     assert_eq!(wait_idle(context), EzGfxResult::InvalidContext);
+}
+
+#[test]
+fn coarse_range_completion_ignores_hidden_fine_updates() {
+    for (values, resident, expected) in [
+        (&[7, 2, 1][..], 1, Some(1)),
+        (&[7, 9, 1][..], 2, Some(9)),
+        (&[7, 9, 1][..], 3, Some(9)),
+        (&[0, 2, 1][..], 2, Some(2)),
+        (&[0, 2, 1][..], 3, None),
+        (&[1][..], 0, None),
+        (&[1][..], 2, None),
+        (&[][..], 1, None),
+    ] {
+        assert_eq!(
+            super::texture::mip_range_completion(values, resident),
+            expected
+        );
+    }
 }

@@ -84,6 +84,7 @@ impl NativeContext {
             ProtocolObject<dyn objc2_metal::MTLDrawable>,
         >>::as_ref(&*drawable);
         command.presentDrawable(drawable);
+        self.drain_complete = false;
         command.commit();
 
         self.frame_slots[slot].command = Some(ThreadBound::new(command));

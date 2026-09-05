@@ -212,7 +212,7 @@ impl BufferTransfer for NativeContext {
         validate_allocation_range(source.allocation.size(), source_offset, size)?;
         validate_allocation_range(destination.allocation.size(), destination_offset, size)?;
         let value = self.next_transfer_value;
-        self.next_transfer_value = value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
+        let next = value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
         let worker = self
             .transfer_worker
             .as_ref()
@@ -221,6 +221,7 @@ impl BufferTransfer for NativeContext {
             .submit(VulkanTransferJob {
                 value,
                 bytes: size,
+                cancelled: None,
                 copy: VulkanTransferCopy::Buffer {
                     source: source.buffer,
                     destination: destination.buffer,
@@ -235,6 +236,8 @@ impl BufferTransfer for NativeContext {
                 ez_gfx_hal::TransferWorkerError::Full => AllocationError::OutOfMemory,
                 ez_gfx_hal::TransferWorkerError::Failed => AllocationError::NativeFailure,
             })?;
+        // Rejected work does not consume a completion value.
+        self.next_transfer_value = next;
         CompletionToken::new(QueueKind::Transfer, value).map_err(|_| AllocationError::NativeFailure)
     }
 
@@ -384,6 +387,23 @@ impl Drop for NativeContext {
         if let Some(mut worker) = self.texture_worker.take() {
             worker.shutdown();
         }
+        if !self.is_drained() {
+            // Quarantine this failed context's owners: a live queue may still use
+            // their storage. Raw Vulkan handles are intentionally not destroyed.
+            core::mem::forget((
+                self.entry_loader.clone(),
+                self.allocator.take(),
+                core::mem::take(&mut self.retired),
+                core::mem::take(&mut self.deferred),
+                core::mem::take(&mut self.frame_slots),
+                self.depth_target.take(),
+                core::mem::replace(
+                    &mut self.texture_staging,
+                    ez_gfx_hal::ReusableStagingPool::new(256),
+                ),
+            ));
+            return;
+        }
         for slot in &mut self.frame_slots {
             slot.in_flight = false;
         }
@@ -410,6 +430,10 @@ impl Drop for NativeContext {
             for view in self.swapchain_views.drain(..) {
                 // SAFETY: device_wait_idle was issued before teardown, and each drained image view is passed once to destroy_image_view with the allocator None used at creation.
                 unsafe { device.destroy_image_view(view, None) };
+            }
+            for semaphore in self.swapchain_finished.drain(..) {
+                // SAFETY: device idle completed presentation waits before swapchain teardown.
+                unsafe { device.destroy_semaphore(semaphore, None) };
             }
             if let (Some(loader), Some(swapchain)) =
                 (self.swapchain_loader.as_ref(), self.swapchain.take())
@@ -527,16 +551,6 @@ pub(super) fn create_frame_slot(
             // SAFETY: the default SemaphoreCreateInfo temporary has an empty pNext chain and remains allocated throughout create_semaphore.
             unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
                 .map_err(map_vk)?;
-        let finished =
-            // SAFETY: the default SemaphoreCreateInfo temporary has an empty pNext chain and remains allocated throughout create_semaphore.
-            match unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) } {
-                Ok(value) => value,
-                Err(error) => {
-                    // SAFETY: available was created with allocator None and has never been submitted, so this error path may pass it once to destroy_semaphore.
-                    unsafe { device.destroy_semaphore(available, None) };
-                    return Err(map_vk(error));
-                }
-            };
         // SAFETY: the FenceCreateInfo temporary contains no borrowed arrays and remains allocated throughout create_fence.
         let fence = match unsafe {
             device.create_fence(
@@ -546,9 +560,8 @@ pub(super) fn create_frame_slot(
         } {
             Ok(value) => value,
             Err(error) => {
-                // SAFETY: finished and available were created with allocator None and never submitted, so this error path may destroy each semaphore once.
+                // SAFETY: available was created with allocator None and never submitted.
                 unsafe {
-                    device.destroy_semaphore(finished, None);
                     device.destroy_semaphore(available, None);
                 }
                 return Err(map_vk(error));
@@ -569,10 +582,9 @@ pub(super) fn create_frame_slot(
         } {
             Ok(value) => value,
             Err(error) => {
-                // SAFETY: fence, finished, and available were created with allocator None and never submitted, so this error path may destroy each once.
+                // SAFETY: fence and available were created with allocator None and never submitted.
                 unsafe {
                     device.destroy_fence(fence, None);
-                    device.destroy_semaphore(finished, None);
                     device.destroy_semaphore(available, None);
                 }
                 return Err(map_vk(error));
@@ -582,7 +594,6 @@ pub(super) fn create_frame_slot(
             command_pool: pool,
             command_buffer: command,
             image_available: available,
-            render_finished: finished,
             fence,
             descriptor_pool,
             in_flight: false,
@@ -599,7 +610,6 @@ pub(super) fn destroy_frame_slot(device: &ash::Device, slot: &FrameSlot) {
     let FrameSlot {
         command_pool,
         image_available,
-        render_finished,
         fence,
         descriptor_pool,
         ..
@@ -608,7 +618,6 @@ pub(super) fn destroy_frame_slot(device: &ash::Device, slot: &FrameSlot) {
     unsafe {
         device.destroy_descriptor_pool(*descriptor_pool, None);
         device.destroy_fence(*fence, None);
-        device.destroy_semaphore(*render_finished, None);
         device.destroy_semaphore(*image_available, None);
         device.destroy_command_pool(*command_pool, None);
     }

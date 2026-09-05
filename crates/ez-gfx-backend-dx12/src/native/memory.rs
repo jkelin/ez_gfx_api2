@@ -251,13 +251,14 @@ impl BufferTransfer for NativeContext {
         validate_range(source.allocation.size(), source_offset, size)?;
         validate_range(destination.allocation.size(), destination_offset, size)?;
         let value = self.next_transfer_fence;
-        self.next_transfer_fence = value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
+        let next = value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
         self.transfer_worker
             .as_ref()
             .ok_or(AllocationError::NativeFailure)?
             .submit(Dx12TransferJob {
                 value,
                 bytes: size,
+                cancelled: None,
                 copy: Dx12TransferCopy::Buffer {
                     source: source.resource.clone(),
                     destination: destination.resource.clone(),
@@ -270,6 +271,8 @@ impl BufferTransfer for NativeContext {
                 ez_gfx_hal::TransferWorkerError::Full => AllocationError::OutOfMemory,
                 ez_gfx_hal::TransferWorkerError::Failed => AllocationError::NativeFailure,
             })?;
+        // Rejected work must not leave an unsignalable idle-wait target.
+        self.next_transfer_fence = next;
         CompletionToken::new(QueueKind::Transfer, value).map_err(|_| AllocationError::NativeFailure)
     }
 
@@ -297,6 +300,30 @@ impl Drop for NativeContext {
         }
         if let Some(mut worker) = self.transfer_worker.take() {
             worker.shutdown();
+        }
+        if !self.is_drained() {
+            // Retain at most this failed context's GPU owners. Releasing COM
+            // references or allocator heaps before an actual drain is unsafe.
+            core::mem::forget((
+                self.adapter.clone(),
+                self.device.clone(),
+                self.queue.clone(),
+                self.fence.clone(),
+                self.transfer_fence.clone(),
+                self.texture_fence.clone(),
+                self.descriptors.clone(),
+                self.samplers.clone(),
+                self.allocator.take(),
+                core::mem::take(&mut self.retired),
+                core::mem::take(&mut self.deferred),
+                core::mem::take(&mut self.frame_slots),
+                core::mem::replace(
+                    &mut self.texture_staging,
+                    ez_gfx_hal::ReusableStagingPool::new(256),
+                ),
+            ));
+            // The event may still be registered with a live native fence.
+            return;
         }
         for allocation in self.texture_staging.drain() {
             let _ = self.free(allocation);

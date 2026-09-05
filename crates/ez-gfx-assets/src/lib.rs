@@ -554,27 +554,22 @@ impl CpuPool {
 /// [`AssetError::BasisTranscode`] when transcoding fails.
 #[cfg(feature = "basis")]
 pub fn transcode_basis(data: &[u8], target: BlockFormat) -> Result<Vec<u8>, AssetError> {
-    use basis_universal::transcoding::{Transcoder, TranscoderTextureFormat};
-    let mut transcoder = Transcoder::new();
-    if !transcoder.validate_header(data) {
-        return Err(AssetError::InvalidBasis);
-    }
-    let format = match target {
-        BlockFormat::Bc1 | BlockFormat::Bc1Srgb => TranscoderTextureFormat::BC1_RGB,
-        BlockFormat::Bc3 | BlockFormat::Bc3Srgb => TranscoderTextureFormat::BC3_RGBA,
-        BlockFormat::Bc7 | BlockFormat::Bc7Srgb => TranscoderTextureFormat::BC7_RGBA,
-        BlockFormat::Astc4x4 | BlockFormat::Astc4x4Srgb => TranscoderTextureFormat::ASTC_4x4_RGBA,
+    let target = match target {
+        BlockFormat::Bc1 | BlockFormat::Bc1Srgb => ez_gfx_basis::BasisTarget::Bc1,
+        BlockFormat::Bc3 | BlockFormat::Bc3Srgb => ez_gfx_basis::BasisTarget::Bc3,
+        BlockFormat::Bc7 | BlockFormat::Bc7Srgb => ez_gfx_basis::BasisTarget::Bc7,
+        BlockFormat::Astc4x4 | BlockFormat::Astc4x4Srgb => ez_gfx_basis::BasisTarget::Astc4x4,
     };
-    transcoder
-        .prepare_transcoding(data)
-        .map_err(|()| AssetError::BasisTranscode)?;
-    transcoder
-        .transcode_image_level(
-            data,
-            format,
-            basis_universal::transcoding::TranscodeParameters::default(),
-        )
-        .map_err(|_| AssetError::BasisTranscode)
+    // The legacy asset helper returns the base image; runtime streaming consumes every mip.
+    ez_gfx_basis::transcode(data, target)
+        .map_err(|error| match error {
+            ez_gfx_basis::BasisError::InvalidData => AssetError::InvalidBasis,
+            ez_gfx_basis::BasisError::Transcode => AssetError::BasisTranscode,
+        })?
+        .into_iter()
+        .next()
+        .map(|mip| mip.bytes)
+        .ok_or(AssetError::InvalidBasis)
 }
 
 #[cfg(not(feature = "basis"))]

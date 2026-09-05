@@ -128,12 +128,11 @@ impl NativeContext {
             .device
             .newRenderPipelineStateWithDescriptor_error(&descriptor)
             .map_err(|_| HalError::NativeFailure)?;
-        let vertex_argument_encoder = vertex_texture_heap.map(|heap| unsafe {
-            // SAFETY: reflection validated the vertex argument-buffer index.
-            vertex.newArgumentEncoderWithBufferIndex(heap.binding as usize)
-        });
+        // SAFETY: reflection validated the vertex argument-buffer index.
+        let vertex_argument_encoder = vertex_texture_heap
+            .map(|heap| unsafe { vertex.newArgumentEncoderWithBufferIndex(heap.binding as usize) });
+        // SAFETY: reflection validated the fragment argument-buffer index.
         let fragment_argument_encoder = fragment_texture_heap.map(|heap| unsafe {
-            // SAFETY: reflection validated the fragment argument-buffer index.
             fragment.newArgumentEncoderWithBufferIndex(heap.binding as usize)
         });
         Ok(NativePipeline::Graphics {

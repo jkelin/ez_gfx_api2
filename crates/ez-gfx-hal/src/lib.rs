@@ -163,7 +163,9 @@ pub const DEFAULT_STAGING_POLICY: StagingPolicy = StagingPolicy {
 };
 
 mod transfer;
-pub use transfer::{ReusableStagingPool, StagingEntry, TransferWorker, TransferWorkerError};
+pub use transfer::{
+    AllocationError, ReusableStagingPool, StagingEntry, TransferWorker, TransferWorkerError,
+};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Placement and CPU-visibility class requested for an allocation.
 pub enum MemoryClass {
@@ -232,32 +234,6 @@ impl AllocationRequest {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Failures produced while allocating, mapping, transferring, or retiring backend memory.
-pub enum AllocationError {
-    /// The requested allocation size is zero.
-    ZeroSize,
-    /// The requested alignment is not a nonzero power of two.
-    InvalidAlignment,
-    /// Mapping was requested for memory that is not host-visible.
-    NotHostVisible,
-    /// The alias class is missing, zero, or assigned to non-transient memory.
-    InvalidAliasClass,
-    /// No suitable memory remains for the allocation.
-    OutOfMemory,
-    /// The device became unavailable during allocation.
-    DeviceLost,
-    /// The native allocator reported an unclassified failure.
-    NativeFailure,
-}
-
-impl fmt::Display for AllocationError {
-    /// Formats the allocation error using its debug name.
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{self:?}")
-    }
-}
-impl std::error::Error for AllocationError {}
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 /// Reflected descriptor interval for one public shader-buffer namespace.
 pub struct ShaderBufferLayout {
@@ -561,9 +537,7 @@ pub struct ImageSubresources {
 }
 
 impl ImageSubresources {
-    /// Counts are nonzero and both half-open range ends must remain representable.
     /// Creates validated half-open mip-level and array-layer ranges.
-    ///
     /// # Errors
     ///
     /// Returns [`ContractError::EmptyRange`] for a zero count or [`ContractError::RangeOverflow`] for an unrepresentable range end.
@@ -591,22 +565,104 @@ impl ImageSubresources {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// Sampled texture storage format shared by runtime and native backends.
+pub enum TextureFormat {
+    /// Linear normalized RGBA8.
+    Rgba8Unorm,
+    /// sRGB normalized RGBA8.
+    Rgba8Srgb,
+    /// Linear BC1 RGB/RGBA blocks.
+    Bc1Unorm,
+    /// sRGB BC1 RGB/RGBA blocks.
+    Bc1Srgb,
+    /// Linear BC3 RGBA blocks.
+    Bc3Unorm,
+    /// sRGB BC3 RGBA blocks.
+    Bc3Srgb,
+    /// Linear BC7 RGBA blocks.
+    Bc7Unorm,
+    /// sRGB BC7 RGBA blocks.
+    Bc7Srgb,
+    /// Linear ASTC 4x4 RGBA blocks.
+    Astc4x4Unorm,
+    /// sRGB ASTC 4x4 RGBA blocks.
+    Astc4x4Srgb,
+}
+
+impl TextureFormat {
+    /// Returns `[block_width, block_height, bytes_per_block]`.
+    pub const fn block(self) -> [u32; 3] {
+        match self {
+            Self::Rgba8Unorm | Self::Rgba8Srgb => [1, 1, 4],
+            Self::Bc1Unorm | Self::Bc1Srgb => [4, 4, 8],
+            Self::Bc3Unorm
+            | Self::Bc3Srgb
+            | Self::Bc7Unorm
+            | Self::Bc7Srgb
+            | Self::Astc4x4Unorm
+            | Self::Astc4x4Srgb => [4, 4, 16],
+        }
+    }
+
+    /// Returns whether storage uses block compression.
+    pub const fn is_compressed(self) -> bool {
+        self.block()[0] != 1
+    }
+
+    /// Computes tightly packed storage for one mip level.
+    pub const fn level_bytes(self, width: u32, height: u32) -> Option<u64> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let [block_width, block_height, block_bytes] = self.block();
+        let blocks_x = width.div_ceil(block_width);
+        let blocks_y = height.div_ceil(block_height);
+        match (blocks_x as u64).checked_mul(blocks_y as u64) {
+            Some(blocks) => blocks.checked_mul(block_bytes as u64),
+            None => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Dimensions and tightly packed RGBA8 payload for one mip level.
+/// Dimensions and tightly packed payload for one mip level.
 pub struct ImageMip<'a> {
     /// Mip width in texels.
     pub width: u32,
     /// Mip height in texels.
     pub height: u32,
-    /// Borrowed tightly packed RGBA8 texel bytes.
+    /// Borrowed tightly packed texel or block bytes.
     pub bytes: &'a [u8],
 }
 
-/// Validates a complete RGBA8 mip chain without allocating; dimensions clamp at one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// One tightly packed two-dimensional mip region update.
+pub struct TextureRegion<'a> {
+    /// Destination mip level.
+    pub mip_level: u32,
+    /// Destination X offset in texels.
+    pub x: u32,
+    /// Destination Y offset in texels.
+    pub y: u32,
+    /// Updated width in texels.
+    pub width: u32,
+    /// Updated height in texels.
+    pub height: u32,
+    /// Borrowed tightly packed texel or block bytes.
+    pub bytes: &'a [u8],
+}
+
+/// Validates a complete mip chain without allocating; dimensions clamp at one.
+///
 /// # Errors
 ///
-/// Returns [`ContractError::InvalidImage`] for malformed dimensions or byte counts, or [`ContractError::RangeOverflow`] when the required byte count overflows.
-pub fn validate_rgba8_mips(mips: &[ImageMip<'_>]) -> Result<(), ContractError> {
+/// Returns [`ContractError::InvalidImage`] for malformed dimensions or byte counts, or
+/// [`ContractError::RangeOverflow`] when the required byte count overflows.
+pub fn validate_texture_mips(
+    format: TextureFormat,
+    mips: &[ImageMip<'_>],
+) -> Result<(), ContractError> {
     let Some(first) = mips.first() else {
         return Err(ContractError::InvalidImage);
     };
@@ -621,9 +677,8 @@ pub fn validate_rgba8_mips(mips: &[ImageMip<'_>]) -> Result<(), ContractError> {
     let mut width = first.width;
     let mut height = first.height;
     for mip in mips {
-        let expected = u64::from(width)
-            .checked_mul(u64::from(height))
-            .and_then(|value| value.checked_mul(4))
+        let expected = format
+            .level_bytes(width, height)
             .ok_or(ContractError::RangeOverflow)?;
         if mip.width != width || mip.height != height || mip.bytes.len() as u64 != expected {
             return Err(ContractError::InvalidImage);
@@ -632,6 +687,73 @@ pub fn validate_rgba8_mips(mips: &[ImageMip<'_>]) -> Result<(), ContractError> {
         height = (height / 2).max(1);
     }
     Ok(())
+}
+
+/// Validates one mip-region update, including compressed-block edge rules.
+///
+/// # Errors
+///
+/// Returns [`ContractError::InvalidImage`] for empty, out-of-range, misaligned, or wrongly sized
+/// regions and [`ContractError::RangeOverflow`] for unrepresentable mip arithmetic.
+pub fn validate_texture_region(
+    format: TextureFormat,
+    texture_width: u32,
+    texture_height: u32,
+    mip_count: u32,
+    region: TextureRegion<'_>,
+) -> Result<(), ContractError> {
+    if texture_width == 0
+        || texture_height == 0
+        || mip_count == 0
+        || region.mip_level >= mip_count
+        || region.width == 0
+        || region.height == 0
+    {
+        return Err(ContractError::InvalidImage);
+    }
+    let mip_width = texture_width
+        .checked_shr(region.mip_level)
+        .unwrap_or(0)
+        .max(1);
+    let mip_height = texture_height
+        .checked_shr(region.mip_level)
+        .unwrap_or(0)
+        .max(1);
+    let end_x = region
+        .x
+        .checked_add(region.width)
+        .ok_or(ContractError::RangeOverflow)?;
+    let end_y = region
+        .y
+        .checked_add(region.height)
+        .ok_or(ContractError::RangeOverflow)?;
+    let [block_width, block_height, block_bytes] = format.block();
+    if end_x > mip_width
+        || end_y > mip_height
+        || !region.x.is_multiple_of(block_width)
+        || !region.y.is_multiple_of(block_height)
+        || (!region.width.is_multiple_of(block_width) && end_x != mip_width)
+        || (!region.height.is_multiple_of(block_height) && end_y != mip_height)
+    {
+        return Err(ContractError::InvalidImage);
+    }
+    let bytes = u64::from(region.width.div_ceil(block_width))
+        .checked_mul(u64::from(region.height.div_ceil(block_height)))
+        .and_then(|blocks| blocks.checked_mul(u64::from(block_bytes)))
+        .ok_or(ContractError::RangeOverflow)?;
+    if region.bytes.len() as u64 != bytes {
+        return Err(ContractError::InvalidImage);
+    }
+    Ok(())
+}
+
+/// Validates a complete RGBA8 mip chain.
+///
+/// # Errors
+///
+/// Returns the same errors as [`validate_texture_mips`].
+pub fn validate_rgba8_mips(mips: &[ImageMip<'_>]) -> Result<(), ContractError> {
+    validate_texture_mips(TextureFormat::Rgba8Unorm, mips)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

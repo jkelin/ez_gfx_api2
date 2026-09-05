@@ -425,15 +425,25 @@ fn graphics_node(
         ShaderStage::AllGraphics,
         Some(indirect),
     )?;
-    let texture_handles: Vec<_> = context.textures.keys().copied().collect();
+    add_texture_accesses(context, node, QueueKind::Graphics, ShaderStage::AllGraphics)
+}
+
+fn add_texture_accesses(
+    context: &mut ContextState,
+    mut node: NodeDesc,
+    queue: QueueKind,
+    stage: ShaderStage,
+) -> Result<NodeDesc, EzGfxResult> {
+    // Unpublished textures cannot be sampled yet; unrelated uploads must not stall the heap.
+    let texture_handles: Vec<_> = context
+        .texture_published_mips
+        .iter()
+        .filter_map(|(texture, mips)| (*mips != 0).then_some(*texture))
+        .collect();
     for texture in texture_handles {
         let resource = intern_texture_resource(context, texture)?;
-        let sampled = ResourceState::new(
-            QueueKind::Graphics,
-            ShaderStage::Fragment,
-            ResourceAccess::SampledRead,
-        )
-        .map_err(|_| EzGfxResult::InvalidArgument)?;
+        let sampled = ResourceState::new(queue, stage, ResourceAccess::SampledRead)
+            .map_err(|_| EzGfxResult::InvalidArgument)?;
         node = node.access(Access::image(
             resource,
             ImageRange::all(1, 1).map_err(|_| EzGfxResult::InvalidArgument)?,
@@ -556,6 +566,7 @@ pub fn render_add_compute(
             ShaderStage::Compute,
             None,
         )?;
+        let node = add_texture_accesses(context, node, QueueKind::Compute, ShaderStage::Compute)?;
         context
             .frame
             .record_node(
@@ -601,6 +612,16 @@ fn validate_binding_handles(
 pub fn frame_submit(context: ContextHandle) -> EzGfxResult {
     result_status(with_context_mut(context, |context| {
         let result = (|| {
+            // Updates admitted after draw recording still precede submission. Refresh their
+            // dependencies so a cached resource entry cannot retain an older ready value.
+            for (texture, completion) in &context.texture_ready {
+                if let Some(resource) = context.frame_resources.get(&texture.packed()) {
+                    context
+                        .frame
+                        .set_resource_ready(*resource, *completion)
+                        .map_err(|error| map_frame(&error))?;
+                }
+            }
             if context.frame_has_graphics {
                 let surface = context.active_surface.ok_or(EzGfxResult::NotReady)?;
                 let resource = context.frame_surface.ok_or(EzGfxResult::NotReady)?;

@@ -10,10 +10,17 @@ pub use ez_gfx_core::handle::{
     SurfaceHandle, TextureHandle,
 };
 pub use ez_gfx_core::{Backend, SemanticId};
-pub use ez_gfx_hal::{DynamicPipelineState, SamplerAddressMode, SamplerFilter, TextureSamplerDesc};
+pub use ez_gfx_hal::{
+    DynamicPipelineState, SamplerAddressMode, SamplerFilter, TextureFormat, TextureRegion,
+    TextureSamplerDesc,
+};
 pub use ez_gfx_runtime::binding::{PublicBinding, ResourceIdentity};
 pub use ez_gfx_runtime::indirect::DrawIndexedCommand;
-pub use ez_gfx_runtime::texture::TextureSource;
+pub use ez_gfx_runtime::texture::{
+    DecodedMip, DecodedTexture, TextureDecodeCallback, TextureDestination, TextureError,
+    TextureSource, TextureUploadTelemetrySnapshot, register_texture_decoder,
+    unregister_texture_decoder,
+};
 pub use ez_gfx_runtime::{ContextOptions, SurfaceOptions, SurfacePlatform};
 pub use state::*;
 

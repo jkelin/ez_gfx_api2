@@ -23,7 +23,7 @@ A globally synchronized generational arena allocates unique context handles. Con
 
 Operations that produce a handle or value, including acquisitions and indexed uploads, return `Result<T, EzGfxResult>`. Commands with no returned value, including synchronization and `destroy_context`, return `EzGfxResult` directly. Individual resource release functions remain status-free.
 
-`load_texture` copies the caller payload, reserves a texture handle, and returns after bounded Rayon work is queued. `poll_texture_load` reports `NotReady` through decode and transfer completion; `cancel_texture_load` succeeds only before native submission. `wait_idle` drains CPU work and transfer queues. Decode, upload, bind, cancellation, and failure records use the existing runtime event stream. See the [texture guide](../../docs/textures.md) for the complete lifecycle, render integration, backpressure limits, and backend transfer semantics.
+`load_texture` copies the caller payload, reserves a texture handle, and returns after bounded Rayon work is queued. `poll_texture_load` reports `NotReady` through decode and transfer completion; `cancel_texture_load` can invalidate a pending or native-admitted request before its first sample-ready completion. `set_texture_residency` controls the contiguous coarse mip range without exposing incomplete transfers. `unload_texture` invalidates immediately and defers native reclamation behind transfer/graphics completion. `wait_idle` drains CPU work and transfer queues. See the [texture guide](../../docs/textures.md) for the complete lifecycle, render integration, backpressure, and backend queue contract.
 
 ## Shader artifacts
 
@@ -39,4 +39,4 @@ Operations that produce a handle or value, including acquisitions and indexed up
 | [04 Dear ImGui](https://github.com/jkelin/ez_gfx_api2/blob/main/examples/04_imgui/README.md) | Dynamic UI buffers and per-command clipping |
 | [05 Helmet](https://github.com/jkelin/ez_gfx_api2/blob/main/examples/05_helmet/README.md) | GLB geometry and depth-tested rendering |
 | [06 Sponza KTX2](https://github.com/jkelin/ez_gfx_api2/blob/main/examples/06_sponza_ktx2/README.md) | KTX2 materials and compute-to-graphics flow |
-| [C textured cube](../../examples/c/textured_cube/README.md) | ABI v20 compute-written indexed-indirect cube on Win32 |
+| [C textured cube](../../examples/c/textured_cube/README.md) | ABI v23 compute-written indexed-indirect cube on Win32 |

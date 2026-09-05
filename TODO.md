@@ -4,7 +4,6 @@
 
 - Lower compiled transient alias assignments into Vulkan, DX12, and Metal resource placement, including alias barriers and overlap-safe retirement (P-004, P-008, P-009).
 - Add managed render-target creation, format-capability probing, per-target clears, sampled/storage bindings, resize/history, graph attachment, and lifecycle APIs across Rust/FFI/backends (P-008, P-009, P-010, P-015).
-- Investigate/fix source-inferred readiness binding before descriptor publication (crates/ez-gfx/src/state/texture.rs:437-463,529-543; not runtime reproduced) (P-015).
 
 ## P1
 
@@ -16,20 +15,13 @@
 - Add bounded, validated host-owned pipeline-cache import/export envelopes with backend/device/driver/schema compatibility; current caches are process-local only (P-007, P-024).
 - Finish terminal device-loss behavior for queued CPU jobs, transfers, staging leases, pending handles, and waits; support explicit cross-thread context destruction without cleanup under Windows loader lock (P-023, P-026).
 - Expand runtime events to preserve one correlation across admission/decode/transfer/bind, and add severity, category, sequence/domain, clocks, units, payloads, overflow markers, and cleanup/resource/device-loss outcomes (P-023, P-026, P-028).
-- Prove sustained coarse-to-fine rendering, deterministic unsignaled-fence unload/reuse, and native Metal compressed pixels; benchmark dynamic-atlas transfer/frame time before declaring P-015 evidence complete. Retained hidden BC1/BC3/BC7/RGBA8 pixel/order/lifetime regressions pass on RTX 3080 Vulkan/DX12 with clean Vulkan validation (P-014, P-015, P-023).
-- Unify Basis/KTX2 concrete target selection: explicit BC1/BC3 fail the strict transcoded-format match, ETC1S R/Rg yields BC4/BC5 rejected even under Auto, and KTX2 Auto preserves container sRGB while standalone Basis Auto stays linear (P-014).
-- Make KTX2/native Basis decoder linkage optional (P-014).
-- Add DDS and direct raw compressed-mip ingestion (P-014).
-- Fix Metal independent BC/ASTC capability probing; current exclusive BC-else-ASTC never reports both (P-003, P-014).
-- Reconcile P-012 cross-texture native batching with real per-mip completion (P-012, P-015).
-- Reconcile original loaded-callback, replaceable built-in decoders, and GPU-vs-CPU mip differences as explicit deltas, not mandatory bugs.
-- Record Zstd/Zlib/container/format limits as evaluated support gaps, not mandatory full-extension support (P-014).
-- Retained evidence gap: no ASTC, sRGB, or partial-edge-block pixel coverage; existing BC1/BC3/BC7/RGBA8 RTX 3080 regressions stand (P-014, P-015).
+- Compile retained Metal backend tests with an actual Apple SDK/Slang toolchain, then execute native Metal and ASTC pixel/progression/retirement/batching/failure scenarios on guaranteed-capability hardware. Windows BC linear/sRGB, partial mip edges, deterministic coarse-first/fence retirement, and selected atlas/staging workloads now pass. Apple library cross-check is separate: test compilation is blocked before Metal typechecking by missing `TargetConditionals.h`; no authenticated Apple GPU runner is configured (P-003, P-012, P-014, P-015, P-023).
+- Remove per-batch GPU completion waits from native transfer owners while preserving failure-safe coarse handoffs, truthful completion, cancellation, and undrainable-context retention. Native cross-texture batching is implemented, but P-012's selected nonblocking-submission goal remains open; current targeted waits are a correctness tradeoff, not scope removal (P-012, P-015).
 
 ## P2
 
 - Add deterministic offscreen pixel goldens for fork/join graphs, scaled targets, storage images, history, aliasing, and all supported backends; run Vulkan, DX12, and Metal native suites on guaranteed-capability GPU runners (P-019, P-020, P-022).
-- Benchmark graph compilation, pass coalescing, alias savings, staging reuse/batch sizes, event latency, async Sponza loading, GPU frame time, and package size before claiming selected-plan performance gains (P-007, P-008, P-009, P-012, P-018, P-028).
+- Benchmark graph compilation, pass coalescing, alias savings, event latency, async Sponza loading, GPU frame time, and package size before claiming broader selected-plan performance gains. Scoped texture staging/batching and 2048² atlas measurements are recorded in `docs/textures.md`, not full-scene performance evidence (P-007, P-008, P-009, P-012, P-018, P-028).
 - Resolve the P-004 allocator-selection mismatch: `gpu-allocator` covers Vulkan/DX12, while Metal uses a backend-native allocator; either supply equivalent selected evidence and amend the decision or adopt a maintained cross-backend implementation (P-004).
 
 ## Tooling

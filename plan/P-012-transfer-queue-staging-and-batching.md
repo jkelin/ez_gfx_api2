@@ -134,3 +134,15 @@ Reusing staging blocks by GPU timeline status eliminates allocation churn and am
 
 1. Benchmark staging buffer allocation churn and reuse rates under repeated upload stress tests.
 2. Verify batched transfer execution and completion timeline signaling in multi-texture loading scenarios (Example 6 Sponza).
+
+### Implementation and evidence status
+
+Power-of-two staging reuse, independent geometry/texture completion streams, atomic bounded mip-bundle admission, and native cross-texture batches are implemented on Vulkan, DX12, and Metal. Adjacent equal stream stages coalesce without FIFO reordering; repeated writes to one image remain separate. Per-mip completion values remain truthful.
+
+The scheduling implementation deliberately departs from the original no-per-submission-blocking goal: targeted `flush_through` waits only through referenced accepted work, but its native callback may wait for GPU copy/command completion before safely queuing graphics handoff. Later fine-copy waits stay off the graphics queue so ready coarse frames can finish. Failure still drains actual native submissions; an undrainable live context retains GPU-owned state instead of aborting or freeing it early.
+
+RTX 3080 native tests prove shared copy submissions, blocked-fine/coarse-frame overlap, queue-full admission, and failure-safe retirement. The 64-image upload benchmark observed 64→2 Vulkan and 64→5 DX12 native batches; exact timings, staging retention, method, and limitations are in [texture measurements](../docs/textures.md#measured-workloads). These are scoped debug-profile observations, not general throughput claims.
+
+Metal implementation parity is not runtime evidence. Its library is cross-checked for Apple; retained tests require a real Apple SDK before typechecking, then a native GPU runner for execution. That prerequisite remains in root `TODO.md`.
+
+The selected nonblocking-submission goal remains open in root `TODO.md`: remove per-batch GPU completion waits while preserving failure-safe coarse handoffs. The current correctness tradeoff does not complete or replace that requirement.

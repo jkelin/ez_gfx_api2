@@ -142,6 +142,81 @@ pub struct EzGfxTextureDesc {
     /// Specifies the debug-label byte length, or zero when absent.
     pub debug_label_length: usize,
 }
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+/// Decoded bytes for one custom-decoder mip, retained until the release callback.
+pub struct EzGfxDecodedTextureMip {
+    /// Mip width in texels.
+    pub width: u32,
+    /// Mip height in texels.
+    pub height: u32,
+    /// Readable bytes retained until the release callback.
+    pub data: *const u8,
+    /// Exact byte length at `data`.
+    pub data_size: usize,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+/// Custom-decoder output copied before its release callback is invoked.
+pub struct EzGfxDecodedTexture {
+    /// Destination-format code; `Auto` is invalid for decoded output.
+    pub format: u8,
+    /// Number of entries at `mips`.
+    pub mip_count: u32,
+    /// Readable array retained until the release callback.
+    pub mips: *const EzGfxDecodedTextureMip,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+/// Borrowed bytes and destination rectangle for one asynchronous texture update.
+pub struct EzGfxTextureRegionDesc {
+    /// Destination mip level.
+    pub mip_level: u32,
+    /// Destination X offset in texels.
+    pub x: u32,
+    /// Destination Y offset in texels.
+    pub y: u32,
+    /// Region width in texels.
+    pub width: u32,
+    /// Region height in texels.
+    pub height: u32,
+    /// Readable tightly packed texel or compressed-block bytes.
+    pub data: *const u8,
+    /// Exact byte length at `data`.
+    pub data_size: usize,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+/// Monotonic context-wide asynchronous texture pipeline counters.
+pub struct EzGfxTextureUploadTelemetry {
+    /// Aggregate CPU decode/transcode/mip-generation time.
+    pub decode_microseconds: u64,
+    /// Aggregate bytes admitted to native staging.
+    pub staging_bytes: u64,
+    /// Aggregate transfer-owner queue latency.
+    pub queue_latency_microseconds: u64,
+    /// Aggregate transfer-to-graphics handoff latency.
+    pub handoff_latency_microseconds: u64,
+}
+
+/// Custom image decoder invoked concurrently by texture workers.
+pub type EzGfxTextureDecoderCallback = Option<
+    unsafe extern "C" fn(
+        data: *const u8,
+        data_size: usize,
+        compression_support: u8,
+        out_texture: *mut EzGfxDecodedTexture,
+        user_data: *mut c_void,
+    ) -> EzGfxResult,
+>;
+
+/// Releases a custom decoder result after ez-gfx copies every mip.
+pub type EzGfxTextureDecoderReleaseCallback =
+    Option<unsafe extern "C" fn(texture: *const EzGfxDecodedTexture, user_data: *mut c_void)>;
 #[derive(Clone, Copy)]
 #[repr(C)]
 /// Associates a named shader binding with buffer and render-target resources.
@@ -256,7 +331,7 @@ pub struct EzGfxDiagnostic {
 }
 #[cfg(test)]
 mod tests {
-    use crate::{EzGfxResult, sampler_address_from_abi};
+    use crate::{EzGfxResult, texture::sampler_address_from_abi};
     use ez_gfx::SamplerAddressMode;
 
     #[test]

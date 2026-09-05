@@ -188,7 +188,7 @@ impl BufferTransfer for NativeContext {
             blit.endEncoding();
         }
         let value = self.next_transfer_value;
-        self.next_transfer_value = value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
+        let next = value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
         let pending_command = command.clone();
         self.transfer_worker
             .as_ref()
@@ -202,6 +202,9 @@ impl BufferTransfer for NativeContext {
                 ez_gfx_hal::TransferWorkerError::Full => AllocationError::OutOfMemory,
                 ez_gfx_hal::TransferWorkerError::Failed => AllocationError::NativeFailure,
             })?;
+        self.drain_complete = false;
+        // Rejected admission must not create an unsignaled queue highwater.
+        self.next_transfer_value = next;
         self.pending_transfers.push(super::PendingTransfer {
             value,
             command: super::ThreadBound::new(pending_command),
@@ -239,6 +242,19 @@ impl Drop for NativeContext {
         if let Some(mut worker) = self.texture_worker.take() {
             worker.shutdown();
         }
+        if !self.is_drained() {
+            // A failed live-device drain must retain heap backing and every GPU-owned resource.
+            core::mem::forget(self.allocator.take());
+            core::mem::forget(core::mem::take(&mut self.retired));
+            core::mem::forget(core::mem::take(&mut self.deferred));
+            core::mem::forget(core::mem::take(&mut self.frame_slots));
+            core::mem::forget(core::mem::take(&mut self.pending_transfers));
+            core::mem::forget(core::mem::take(&mut self.pending_texture_transfers));
+            for allocation in self.texture_staging.drain() {
+                core::mem::forget(allocation);
+            }
+            return;
+        }
         for allocation in self.texture_staging.drain() {
             let _ = self.free(allocation);
         }
@@ -262,6 +278,7 @@ pub(super) fn map_allocation_hal(error: AllocationError) -> HalError {
         | AllocationError::InvalidAlignment
         | AllocationError::InvalidAliasClass => HalError::InvalidArgument,
         AllocationError::DeviceLost => HalError::DeviceLost,
+        AllocationError::Unsupported => HalError::Unsupported,
         AllocationError::NotHostVisible | AllocationError::NativeFailure => HalError::NativeFailure,
     }
 }

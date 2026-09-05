@@ -2,7 +2,7 @@ use super::{
     AdapterCapabilities, AdapterClass, AdapterInfo, AllocationError, AllocationSizes, Allocator,
     AllocatorCreateDesc, BACKEND, CompressionSupport, DEFAULT_ALLOCATION_BLOCK_POLICY,
     DeferredNativeResource, DeferredResource, FRAMES_IN_FLIGHT, FrameSlot, FrameSlotTracker,
-    HalError, MTLArgumentBuffersTier, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue,
+    HalError, MTLArgumentBuffersTier, MTLCommandBuffer, MTLCommandBufferStatus,
     MTLCreateSystemDefaultDevice, MTLDevice, MemoryAllocator, NativeContext, NativeSurface,
     QueueKind, SemanticProfile, TEXTURE_DESCRIPTOR_CAPACITY, complete_deferred_slot,
     map_allocation_hal, map_allocator, map_allocator_hal,
@@ -19,14 +19,19 @@ impl NativeContext {
         let queue = device.newCommandQueue().ok_or(HalError::NativeFailure)?;
         let transfer_queue = device.newCommandQueue().ok_or(HalError::NativeFailure)?;
         let texture_queue = device.newCommandQueue().ok_or(HalError::NativeFailure)?;
+        let texture_graphics_event = device.newEvent().ok_or(HalError::NativeFailure)?;
+        let texture_completion_event = device.newEvent().ok_or(HalError::NativeFailure)?;
         let tier_two = device.argumentBuffersSupport() == MTLArgumentBuffersTier::Tier2;
         let sampler_capacity =
             u32::try_from(device.maxArgumentBufferSamplerCount()).unwrap_or(u32::MAX);
-        let compression = if device.supportsBCTextureCompression() {
-            CompressionSupport::BC
-        } else {
-            CompressionSupport::ASTC
-        };
+        // BC and ASTC are independent: Apple GPUs can support both families.
+        let mut compression = CompressionSupport::NONE;
+        if device.supportsBCTextureCompression() {
+            compression = compression.union(CompressionSupport::BC);
+        }
+        if device.supportsFamily(objc2_metal::MTLGPUFamily::Apple2) {
+            compression = compression.union(CompressionSupport::ASTC);
+        }
         let capabilities = AdapterCapabilities {
             bindless_sampled_textures: if tier_two {
                 TEXTURE_DESCRIPTOR_CAPACITY.min(sampler_capacity)
@@ -74,13 +79,18 @@ impl NativeContext {
         .map_err(map_allocator_hal)?;
         let transfer_worker =
             super::transfer::start_worker().map_err(|_| HalError::NativeFailure)?;
-        let texture_worker =
-            super::transfer::start_worker().map_err(|_| HalError::NativeFailure)?;
+        let texture_worker = super::transfer::start_texture_worker(
+            texture_queue,
+            texture_graphics_event.clone(),
+            texture_completion_event.clone(),
+        )
+        .map_err(|_| HalError::NativeFailure)?;
         Ok(Self {
             device,
             queue,
             transfer_queue,
-            texture_queue,
+            texture_graphics_event,
+            texture_completion_event,
             allocator: Some(allocator),
             retired: Vec::new(),
             frame_slots: (0..FRAMES_IN_FLIGHT)
@@ -92,6 +102,7 @@ impl NativeContext {
             frame_tracker: FrameSlotTracker::default(),
             deferred: Vec::new(),
             adapter,
+            drain_complete: true,
             next_transfer_value: 1,
             completed_transfer_value: 0,
             pending_transfers: Vec::new(),
@@ -125,41 +136,77 @@ impl NativeContext {
     ///
     /// # Errors
     ///
-    /// Returns an error if a command buffer cannot be created, submitted work fails to complete successfully, or reclaiming a deferred allocation fails.
+    /// Returns an error if submitted work fails or reclaiming a deferred allocation fails.
     pub fn wait_idle(&mut self) -> Result<(), HalError> {
-        self.transfer_worker
+        self.drain_complete = false;
+        let transfer_failed = self
+            .transfer_worker
             .as_ref()
-            .ok_or(HalError::NativeFailure)?
-            .flush()
-            .map_err(|_| HalError::NativeFailure)?;
-        self.texture_worker
+            .is_none_or(|worker| worker.flush().is_err());
+        let texture_failed = self
+            .texture_worker
             .as_ref()
-            .ok_or(HalError::NativeFailure)?
-            .flush()
-            .map_err(|_| HalError::NativeFailure)?;
-        let transfer = self
-            .transfer_queue
-            .commandBuffer()
-            .ok_or(HalError::NativeFailure)?;
-        transfer.commit();
-        transfer.waitUntilCompleted();
-        let transfer_failed =
-            transfer.status() != MTLCommandBufferStatus::Completed || transfer.error().is_some();
-        let texture = self
-            .texture_queue
-            .commandBuffer()
-            .ok_or(HalError::NativeFailure)?;
-        texture.commit();
-        texture.waitUntilCompleted();
-        let texture_failed =
-            texture.status() != MTLCommandBufferStatus::Completed || texture.error().is_some();
-        let command = self.queue.commandBuffer().ok_or(HalError::NativeFailure)?;
-        command.commit();
-        command.waitUntilCompleted();
-        let failed = transfer_failed
-            || texture_failed
-            || command.status() != MTLCommandBufferStatus::Completed
-            || command.error().is_some();
+            .is_none_or(|worker| worker.flush().is_err());
+        // Failed flush can precede worker shutdown; join its actual-command drain before reclaiming.
+        if transfer_failed {
+            if let Some(worker) = self.transfer_worker.as_mut() {
+                worker.shutdown();
+            }
+        }
+        if texture_failed {
+            if let Some(worker) = self.texture_worker.as_mut() {
+                worker.shutdown();
+            }
+        }
+        let mut failed = transfer_failed || texture_failed;
+        for pending in &self.pending_transfers {
+            // Rejected/failed submission may never commit this command.
+            if matches!(
+                pending.command.status(),
+                MTLCommandBufferStatus::Committed | MTLCommandBufferStatus::Scheduled
+            ) {
+                pending.command.waitUntilCompleted();
+            }
+            failed |= pending.command.status() == MTLCommandBufferStatus::Error
+                || pending.command.error().is_some();
+        }
+        // Successful texture flush already waited its committed batches, including graphics releases.
+        for slot in &self.frame_slots {
+            if let Some(command) = &slot.command {
+                command.waitUntilCompleted();
+                failed |= command.status() != MTLCommandBufferStatus::Completed
+                    || command.error().is_some();
+            }
+        }
+        self.drain_complete = (!transfer_failed
+            || self
+                .transfer_worker
+                .as_ref()
+                .is_some_and(ez_gfx_hal::TransferWorker::drained))
+            && (!texture_failed
+                || self
+                    .texture_worker
+                    .as_ref()
+                    .is_some_and(ez_gfx_hal::TransferWorker::drained))
+            && self.pending_transfers.iter().all(|pending| {
+                !matches!(
+                    pending.command.status(),
+                    MTLCommandBufferStatus::Committed | MTLCommandBufferStatus::Scheduled
+                )
+            })
+            && self.frame_slots.iter().all(|slot| {
+                slot.command.as_ref().is_none_or(|command| {
+                    matches!(
+                        command.status(),
+                        MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+                    )
+                })
+            });
+        failed |= !self.drain_complete;
+        if failed {
+            // Drained failures permit destruction, not publication of texture readiness.
+            return Err(HalError::NativeFailure);
+        }
         self.completed_transfer_value = self.next_transfer_value.saturating_sub(1);
         self.reclaim(QueueKind::Transfer, self.completed_transfer_value)
             .map_err(map_allocation_hal)?;
@@ -181,10 +228,12 @@ impl NativeContext {
             self.destroy_deferred_now(resource)
                 .map_err(map_allocation_hal)?;
         }
-        if failed {
-            return Err(HalError::NativeFailure);
-        }
         Ok(())
+    }
+
+    /// Whether the last idle drain proved that no submitted command still owns GPU work.
+    pub fn is_drained(&self) -> bool {
+        self.drain_complete
     }
 
     pub(super) fn complete_frame_slot(&mut self, slot: usize) -> Result<(), HalError> {

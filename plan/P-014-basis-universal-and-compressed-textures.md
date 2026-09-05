@@ -139,3 +139,34 @@ Block-compressed texture formats reduce VRAM footprint by 4:1 (BC7/ASTC 4x4) to 
 
 1. Benchmark transcode throughput (MB/s) for UASTC -> BC7 and ETC1S -> BC1 on target CPU.
 2. Integration test loading `.basis` and KTX2 assets in Example 6 (Sponza KTX2) on Vulkan, DX12, and Metal.
+
+## Implementation evidence
+
+Status on 2026-09-05; the historical selected solution above is unchanged.
+
+- [Runtime decoding](../crates/ez-gfx-runtime/src/texture.rs) now passes explicit native targets for universal KTX2. [Shared selection](../crates/ez-gfx-runtime/src/texture/basis.rs) preserves source sRGB and chooses ETC1S BC1/BC3 or UASTC BC7 on BC devices, ASTC on ASTC-only devices, and RGBA8 otherwise. The private standalone wrapper reads encoding/alpha/sRGB metadata; native BC1/BC3 build support is enabled.
+- [Optional features](../crates/ez-gfx-runtime/Cargo.toml) separate `ktx2` parsing from `basis` native transcoding. Default normal dependencies include neither; combined features include both without a shader compiler or Basis encoder. Native transcoder implementation uses `basisu_c_sys` plus the private standalone bridge rather than the candidate's named `basis-universal` crate.
+- [DDS](../crates/ez-gfx-runtime/src/texture/dds.rs) and [raw](../crates/ez-gfx-runtime/src/texture/raw.rs) ingest supported native mip layouts. ABI 23 reserves sources 8/9; no new export or descriptor layout is required. Direct ingestion validates the whole chain before payload copies. Universal output bounds are checked before native decompression/transcoding.
+- R/Rg KTX2 `Auto` selects canonical RGBA8, preserving channel values and transfer metadata. Explicit compressed R/Rg remains unsupported without expanding the backend swizzle/re-encoding contract. Zstd/Zlib, wider BC/ASTC formats, HDR, arrays/cubes/3D, and native-container conversion are evaluated exclusions; [the texture contract](../docs/textures.md) lists exact restrictions.
+- The runtime still transcodes into owned CPU mip buffers before staging, not directly into mapped staging as the candidate proposed. The existing owner-thread allocation/transfer seam is retained.
+
+### Decoder proof
+
+Scoped runtime texture/transcode tests passed with no features (27 tests), `ktx2` only (29), `basis` only (28), and combined features (38). Coverage includes valid/malformed DDS and raw chains, direct KTX2 geometry, exact explicit targets, actual ETC1S/UASTC R/Rg decoded pixels, source color metadata across standalone/KTX2 containers, and pre-native output bounds. Shared target-policy/unit tests passed (3); standalone metadata validation passed (1). FFI streaming/layout/version tests verify the ABI cutover separately. No GPU sampling claim follows from these decoder results.
+
+### Warm decode measurement
+
+Measured 2026-09-05 on AMD Ryzen 9 5950X, Windows x64, Rust 1.88.0 / LLVM 20.1.5 (`x86_64-pc-windows-msvc`), default Cargo release profile. An isolated development encoder converted the repository's `examples/02_textured_cube/cube.png` (1024×1024) using `basisu_c_sys` 0.9.0 sRGB defaults: UASTC LDR 4×4 without Zstd and ETC1S. Encoding and image loading were outside timing; the encoder feature was not added to runtime dependencies.
+
+Each row timed 128 decodes of retained input bytes on a Rayon pool after one warm-up decode. Times include decode/transcode, output allocation, and scheduling. Output MiB/s means total native mip bytes produced divided by 1,048,576 and elapsed wall time, not compressed-input throughput. UASTC input/output per job: 1,048,768/1,048,576 bytes; ETC1S input/BC1 output: 100,345/524,288 bytes.
+
+| Decode target | Threads | Jobs | Wall ms | Output MiB/s |
+| --- | ---: | ---: | ---: | ---: |
+| UASTC → BC7 | 1 | 128 | 1437.868 | 89.021 |
+| UASTC → BC7 | 4 | 128 | 432.785 | 295.759 |
+| UASTC → BC7 | 8 | 128 | 255.881 | 500.232 |
+| ETC1S → BC1 | 1 | 128 | 444.621 | 143.943 |
+| ETC1S → BC1 | 4 | 128 | 127.984 | 500.061 |
+| ETC1S → BC1 | 8 | 128 | 72.867 | 878.313 |
+
+These are warm, single-machine measurements, not cold-load results, baseline speedup claims, or full Sponza/streaming performance. GPU upload, staging, frame time, and cross-platform integration remain separate evidence. The throwaway harness was removed; two 32×32 derived UASTC fixtures remain for color/channel regressions with generation provenance in the test source.

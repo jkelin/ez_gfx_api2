@@ -131,9 +131,21 @@ Updating a 64x64 glyph sub-region instead of a full 2048x2048 atlas reduces tran
 ### Risks and mitigations
 
 - **Risk:** Partial updates on block-compressed textures (BCn/ASTC) fail if rectangle extents are not 4x4 block-aligned.
-- **Mitigation:** Validate and clamp sub-region coordinates to 4x4 texel boundaries during argument validation.
+- **Mitigation:** Require block-aligned offsets and extents except at the logical mip's right/bottom edge; reject invalid requests rather than clamping caller intent. DX12 rounds staging footprints to physical blocks while preserving logical mip dimensions.
 
 ### Validation actions
 
 1. Benchmark transfer byte reduction and frame time during dynamic font atlas glyph generation in Example 4 (ImGui).
 2. Verify progressive mip readiness order and deferred descriptor binding in background streaming tests.
+
+### Implementation and evidence status
+
+The implementation allocates the complete mip chain, submits coarse levels first with distinct completion values, gates descriptor publication on transfer completion and frame safety, and exposes partial updates and atomic telemetry. `set_texture_residency` changes only the sampled mip range: Vulkan image views, DX12 SRVs, and Metal parent-texture views retain all image storage. Logical eviction does not reclaim GPU memory or stop finer uploads; physical reclamation is outside this selected full-allocation design.
+
+RTX 3080 Vulkan/DX12 regressions verify linear/sRGB BC1/BC3/BC7 and RGBA8 sampling, changed/untouched region pixels, queued and record-before-update ordering, sustained residency changes, and submitted-work unload/reuse. Deterministic native tests hold a submitted fine copy behind a GPU gate while a coarse sampling frame finishes, and hold graphics fences unsignaled to prove retirement safety. Initial publication was reproduced failing through public Vulkan polling and fixed with a shared publication-aware readiness gate. Vulkan validation is clean.
+
+DX12 explicitly returns `Unsupported` for non-block-aligned BC base dimensions, including through the C ABI. Valid 28×12 bases retain a supported 7×3 mip at level two; both clipped edge regions are sampled and updated in the regression. No padded-resource UV workaround is used. Both RTX backends reject ASTC explicitly.
+
+The selected 2048×2048 atlas/64×64 glyph workload completed eight warmup and 64 measured frames on both backends with identical final pixels: dirty regions staged 1 MiB versus 1 GiB for full-image updates. Wall times include CPU/presentation/completion costs and do not establish a general frame-time improvement. See [exact measurements and retained proof](../docs/textures.md#verification-and-remaining-evidence).
+
+Windows evidence above is complete for those scenarios, not all-backend validation. Native Metal/ASTC execution and Apple SDK-backed test compilation remain in root `TODO.md`; Apple library cross-check does not prove its tests compile. Targeted worker callbacks may wait for GPU copies to protect handoff ordering, and failed native drains retain GPU-owned state. Logical eviction still retains full allocation and does not stop fine uploads, as selected.

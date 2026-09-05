@@ -9,7 +9,8 @@ use ez_gfx_hal::{
     BufferTransfer, CompletionToken, CullMode, DEFAULT_ALLOCATION_BLOCK_POLICY,
     DynamicPipelineState, ExecutionBarrier, ExecutionPass, FrontFace, HalError, ImageMip,
     MemoryAllocator, MemoryClass, PrimitiveTopology, QueueKind, ResourceAccess, SamplerAddressMode,
-    SamplerFilter, ShaderBufferLayout, TextureSamplerDesc, TransferWorker, validate_rgba8_mips,
+    SamplerFilter, ShaderBufferLayout, TextureFormat, TextureRegion, TextureSamplerDesc,
+    TransferWorker, validate_texture_mips, validate_texture_region,
 };
 use gpu_allocator::{
     AllocationSizes, MemoryLocation,
@@ -28,9 +29,9 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_BLEND_ZERO, D3D12_CLEAR_FLAG_DEPTH, D3D12_CLEAR_VALUE, D3D12_CLEAR_VALUE_0,
     D3D12_COLOR_WRITE_ENABLE_ALL, D3D12_COMMAND_SIGNATURE_DESC, D3D12_COMPARISON_FUNC_ALWAYS,
     D3D12_COMPARISON_FUNC_LESS, D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_CULL_MODE_BACK,
-    D3D12_CULL_MODE_FRONT, D3D12_CULL_MODE_NONE, D3D12_DEPTH_STENCIL_DESC,
-    D3D12_DEPTH_STENCIL_VALUE, D3D12_DEPTH_STENCILOP_DESC, D3D12_DEPTH_WRITE_MASK_ALL,
-    D3D12_DESCRIPTOR_HEAP_DESC, D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+    D3D12_CULL_MODE_FRONT, D3D12_CULL_MODE_NONE, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+    D3D12_DEPTH_STENCIL_DESC, D3D12_DEPTH_STENCIL_VALUE, D3D12_DEPTH_STENCILOP_DESC,
+    D3D12_DEPTH_WRITE_MASK_ALL, D3D12_DESCRIPTOR_HEAP_DESC, D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
     D3D12_DESCRIPTOR_HEAP_TYPE_DSV, D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
     D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, D3D12_DESCRIPTOR_RANGE,
@@ -58,12 +59,13 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER_TYPE_SRV,
     D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_ROOT_SIGNATURE_DESC,
     D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, D3D12_ROOT_SIGNATURE_FLAG_NONE,
-    D3D12_SAMPLER_DESC, D3D12_SHADER_BYTECODE, D3D12_SHADER_VISIBILITY_ALL, D3D12_STENCIL_OP_KEEP,
-    D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_COPY_LOCATION,
-    D3D12_TEXTURE_COPY_LOCATION_0, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-    D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_VIEWPORT,
-    D3D12SerializeRootSignature, ID3D12CommandSignature, ID3D12DescriptorHeap, ID3D12PipelineState,
-    ID3D12RootSignature,
+    D3D12_SAMPLER_DESC, D3D12_SHADER_BYTECODE, D3D12_SHADER_RESOURCE_VIEW_DESC,
+    D3D12_SHADER_RESOURCE_VIEW_DESC_0, D3D12_SHADER_VISIBILITY_ALL, D3D12_SRV_DIMENSION_TEXTURE2D,
+    D3D12_STENCIL_OP_KEEP, D3D12_TEX2D_SRV, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+    D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
+    D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+    D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_VIEWPORT, D3D12SerializeRootSignature,
+    ID3D12CommandSignature, ID3D12DescriptorHeap, ID3D12PipelineState, ID3D12RootSignature,
 };
 use windows::{
     Win32::{
@@ -223,8 +225,27 @@ pub struct NativePipeline {
 pub struct NativeTexture {
     resource: ID3D12Resource,
     allocation: Allocation,
+    format: TextureFormat,
+    width: u32,
+    height: u32,
+    mip_count: u32,
+    resident_mips: u32,
+    mip_completions: Vec<u64>,
+    cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Slot in the shader-visible texture descriptor heap.
     pub binding: u32,
+}
+
+impl NativeTexture {
+    /// Returns the last transfer value that may reference this texture.
+    pub fn last_transfer_value(&self) -> u64 {
+        self.mip_completions.iter().copied().max().unwrap_or(0)
+    }
+
+    /// Latest copy values ordered from finest to coarsest mip; zero means never submitted.
+    pub fn mip_transfer_values(&self) -> &[u64] {
+        &self.mip_completions
+    }
 }
 
 struct RetiredAllocation {
@@ -317,6 +338,7 @@ pub struct NativeContext {
     texture_worker: Option<TransferWorker<transfer::Dx12TransferJob>>,
     fence_event: HANDLE,
     next_fence: u64,
+    idle_drained: bool,
     next_transfer_fence: u64,
     next_texture_fence: u64,
     allocator: Option<Allocator>,
@@ -349,3 +371,6 @@ mod pipeline;
 mod surface;
 mod texture;
 mod transfer;
+
+#[cfg(test)]
+mod texture_tests;

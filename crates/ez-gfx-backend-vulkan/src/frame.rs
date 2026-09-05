@@ -599,7 +599,6 @@ struct PreparedFrame {
     swapchain: vk::SwapchainKHR,
     slot_index: usize,
     available: vk::Semaphore,
-    finished_handle: vk::Semaphore,
     command_handle: vk::CommandBuffer,
     descriptor_pool: vk::DescriptorPool,
     fence: vk::Fence,
@@ -658,7 +657,6 @@ impl NativeContext {
         }
         let slot = self.frame_slots.get(slot_index).ok_or(HalError::NotReady)?;
         let available = slot.image_available;
-        let finished_handle = slot.render_finished;
         let command_handle = slot.command_buffer;
         let descriptor_pool = slot.descriptor_pool;
         let fence = slot.fence;
@@ -670,7 +668,6 @@ impl NativeContext {
             swapchain,
             slot_index,
             available,
-            finished_handle,
             command_handle,
             descriptor_pool,
             fence,
@@ -696,6 +693,39 @@ impl NativeContext {
         plan: &FramePlan,
         image_index: u32,
     ) -> Result<(), HalError> {
+        // A graphics wait must not precede the worker's graphics release/acquire submissions:
+        // otherwise that wait would block the queue needed to produce its completion value.
+        for queue in [QueueKind::Transfer, QueueKind::TextureTransfer] {
+            if let Some(required) = plan
+                .external_wait
+                .iter()
+                .filter(|token| token.queue == queue)
+                .map(|token| token.value)
+                .max()
+            {
+                let worker = if queue == QueueKind::Transfer {
+                    self.transfer_worker.as_ref()
+                } else {
+                    self.texture_worker.as_ref()
+                };
+                worker
+                    .ok_or(HalError::NotReady)?
+                    .flush_through(required)
+                    .map_err(|_| HalError::NativeFailure)?;
+            }
+        }
+        // Reacquiring this image retires its previous presentation semaphore wait. A frame
+        // fence alone cannot prove that presentation has consumed a slot-owned semaphore.
+        let finished = if plan.presents {
+            Some(
+                *self
+                    .swapchain_finished
+                    .get(image_index as usize)
+                    .ok_or(HalError::NativeFailure)?,
+            )
+        } else {
+            None
+        };
         // SAFETY: `prepared.command_handle` is recording; the queue, fence, semaphores, and conditional swapchain share `prepared.device`, and every submit/present slice remains allocated through its call.
         unsafe {
             prepared
@@ -725,12 +755,12 @@ impl NativeContext {
             let signal_values = [0_u64];
             let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
                 .wait_semaphore_values(&wait_values)
-                .signal_semaphore_values(&signal_values);
+                .signal_semaphore_values(&signal_values[..finished.as_slice().len()]);
             let submit = vk::SubmitInfo::default()
                 .wait_semaphores(&wait_semaphores)
                 .wait_dst_stage_mask(&wait_stages)
                 .command_buffers(core::slice::from_ref(&prepared.command_handle))
-                .signal_semaphores(core::slice::from_ref(&prepared.finished_handle))
+                .signal_semaphores(finished.as_slice())
                 .push_next(&mut timeline);
             prepared
                 .device
@@ -748,7 +778,7 @@ impl NativeContext {
                     .queue_present(
                         prepared.queue,
                         &vk::PresentInfoKHR::default()
-                            .wait_semaphores(core::slice::from_ref(&prepared.finished_handle))
+                            .wait_semaphores(finished.as_slice())
                             .swapchains(core::slice::from_ref(&prepared.swapchain))
                             .image_indices(core::slice::from_ref(&image_index)),
                     )

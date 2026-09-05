@@ -1,15 +1,15 @@
 use super::{
-    AllocationRequest, AsyncTextureState, Backend, CONTEXT_HANDLES, CONTEXTS, CompletionToken,
+    AllocationRequest, Arc, AsyncTextureState, Backend, CONTEXT_HANDLES, CONTEXTS, CompletionToken,
     ContextHandle, ContextIdentity, ContextOptions, ContextState, DEFAULT_STAGING_POLICY,
     DiagnosticLevel, EzGfxResult, FrameRecorder, GeometryAllocation, GeometryManager, HalError,
     HashMap, MemoryClass, NativeAllocation, NativeContext, NativeSurface, Observability, Ordering,
     ResourceKind, RuntimePhase, RuntimeRecord, RuntimeStatus, SurfaceHandle, SurfaceOptions,
-    SurfacePlatform, SurfaceRecord, SurfaceState, TextureRegistry, VulkanContext, VulkanPlatform,
-    allocate_native, completed_transfer_native, context_local, copy_native,
-    destroy_native_pipeline, destroy_native_shader, destroy_native_texture, free_native_allocation,
-    map_allocation, map_frame, map_geometry, map_hal, map_lifecycle, map_native_loss, map_texture,
-    pump_async_textures, result_status, staging_bucket_size, wait_native_idle, with_context_mut,
-    with_surface_mut, write_native,
+    SurfacePlatform, SurfaceRecord, SurfaceState, TextureRegistry, TextureUploadTelemetry,
+    VulkanContext, VulkanPlatform, allocate_native, completed_transfer_native, context_local,
+    copy_native, destroy_native_pipeline, destroy_native_shader, destroy_native_texture,
+    free_native_allocation, map_allocation, map_frame, map_geometry, map_hal, map_lifecycle,
+    map_native_loss, map_texture, pump_async_textures, result_status, staging_bucket_size,
+    wait_native_idle, with_context_mut, with_surface_mut, write_native,
 };
 #[cfg(windows)]
 use super::{Dx12Context, Dx12Surface};
@@ -92,12 +92,19 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle, EzGfxRes
         allocation_ready: HashMap::new(),
         shaders: HashMap::new(),
         textures: HashMap::new(),
+        texture_formats: HashMap::new(),
+        texture_published_mips: HashMap::new(),
+        texture_residency_targets: HashMap::new(),
+        texture_last_transfer: HashMap::new(),
+        retired_textures: Vec::new(),
         pipelines: HashMap::new(),
         graphics_format: None,
         indirects: HashMap::new(),
         texture_registry,
         texture_ready: HashMap::new(),
         pending_textures: HashMap::new(),
+        texture_handoffs: HashMap::new(),
+        texture_telemetry: Arc::new(TextureUploadTelemetry::default()),
         async_textures,
         texture_failures: HashMap::new(),
         geometry: GeometryManager::new(),
@@ -223,9 +230,9 @@ pub fn wait_idle(context: ContextHandle) -> EzGfxResult {
 ///
 /// Device initialization is optional: a context destroyed before `init_device` has no GPU work to
 /// wait for. Once a native device exists, teardown waits for it before releasing resources. The
-/// context is removed even when that wait or a fallible native release fails, so a failed teardown
-/// never leaves a live, partially destroyed context. The first cleanup failure is returned after
-/// all remaining releases are attempted.
+/// context is removed even when a native wait or release fails. If draining cannot establish
+/// completion, the terminal context retains GPU-owned resources rather than destroying live
+/// storage. Otherwise all remaining releases are attempted and the first failure is returned.
 ///
 /// # Errors
 ///
@@ -285,6 +292,20 @@ pub(super) fn cleanup_context_state(
     {
         failure.get_or_insert_with(|| map_native_loss(&owned.identity, error));
     }
+    let drained = match &owned.native {
+        NativeContext::Vulkan(native) => native.is_drained(),
+        #[cfg(windows)]
+        NativeContext::Dx12(native) => native.is_drained(),
+        #[cfg(target_vendor = "apple")]
+        NativeContext::Metal(native) => native.is_drained(),
+    };
+    if !drained {
+        // The handle is already terminal. Keep this bounded owner intact: even shader, frame,
+        // staging, and descriptor resources may still be referenced by an undrained live queue.
+        let result = failure.unwrap_or(EzGfxResult::NativeFailure);
+        std::mem::forget(owned);
+        return result;
+    }
 
     for (_, pipeline) in owned.pipelines.drain() {
         destroy_native_pipeline(&mut owned.native, pipeline);
@@ -301,7 +322,20 @@ pub(super) fn cleanup_context_state(
             failure.get_or_insert_with(|| map_allocation(error));
         }
     }
+    for retired in owned.retired_textures.drain(..) {
+        if let Err(error) = owned.texture_registry.release_retired(retired.id) {
+            failure.get_or_insert_with(|| map_texture(error));
+        }
+        if let Err(error) = destroy_native_texture(&mut owned.native, retired.native) {
+            failure.get_or_insert_with(|| map_allocation(error));
+        }
+    }
+    owned.texture_formats.clear();
+    owned.texture_published_mips.clear();
+    owned.texture_residency_targets.clear();
+    owned.texture_last_transfer.clear();
     owned.texture_ready.clear();
+    owned.texture_handoffs.clear();
     if let Err(error) = owned.texture_registry.clear() {
         failure.get_or_insert_with(|| map_texture(error));
     }

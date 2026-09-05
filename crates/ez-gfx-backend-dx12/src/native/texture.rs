@@ -1,48 +1,117 @@
 use super::{
     Allocation, AllocationCreateDesc, AllocationError, AllocationRequest, CompletionToken,
-    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_FILTER_ANISOTROPIC,
-    D3D12_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
-    D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT,
-    D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-    D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_DESC,
+    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+    D3D12_FILTER_ANISOTROPIC, D3D12_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR,
+    D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_FILTER_MIN_MAG_MIP_POINT,
+    D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
+    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_BARRIER_FLAG_NONE,
+    D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_DESC,
     D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST,
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_TRANSITION_BARRIER,
-    D3D12_SAMPLER_DESC, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-    D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
+    D3D12_SAMPLER_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC_0,
+    D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_TEX2D_SRV, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+    D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
     D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-    D3D12_TEXTURE_LAYOUT_UNKNOWN, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC, DeferredResource,
-    ID3D12CommandAllocator, ID3D12CommandList, ID3D12GraphicsCommandList, ID3D12Resource, INFINITE,
-    ImageMip, Interface, MemoryAllocator, MemoryClass, MemoryLocation, NativeAllocation,
-    NativeContext, NativeTexture, QueueKind, SamplerAddressMode, SamplerFilter,
-    TEXTURE_DESCRIPTOR_CAPACITY, TextureSamplerDesc, WaitForSingleObject, map_allocation_windows,
-    map_allocator, validate_rgba8_mips,
+    D3D12_TEXTURE_LAYOUT_UNKNOWN, DXGI_SAMPLE_DESC, DeferredResource, ID3D12CommandAllocator,
+    ID3D12CommandList, ID3D12GraphicsCommandList, ID3D12Resource, INFINITE, ImageMip, Interface,
+    MemoryAllocator, MemoryClass, MemoryLocation, NativeAllocation, NativeContext, NativeTexture,
+    QueueKind, SamplerAddressMode, SamplerFilter, TEXTURE_DESCRIPTOR_CAPACITY, TextureFormat,
+    TextureRegion, TextureSamplerDesc, WaitForSingleObject, map_allocation_windows, map_allocator,
+    validate_texture_mips, validate_texture_region,
 };
 
-fn validate_texture_request(mips: &[ImageMip<'_>], binding: u32) -> Result<(), AllocationError> {
-    validate_rgba8_mips(mips).map_err(|_| AllocationError::ZeroSize)?;
+fn texture_format_dxgi(
+    format: TextureFormat,
+) -> Option<windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT> {
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC1_UNORM_SRGB, DXGI_FORMAT_BC3_UNORM,
+        DXGI_FORMAT_BC3_UNORM_SRGB, DXGI_FORMAT_BC7_UNORM, DXGI_FORMAT_BC7_UNORM_SRGB,
+        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+    };
+
+    match format {
+        TextureFormat::Rgba8Unorm => Some(DXGI_FORMAT_R8G8B8A8_UNORM),
+        TextureFormat::Rgba8Srgb => Some(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB),
+        TextureFormat::Bc1Unorm => Some(DXGI_FORMAT_BC1_UNORM),
+        TextureFormat::Bc1Srgb => Some(DXGI_FORMAT_BC1_UNORM_SRGB),
+        TextureFormat::Bc3Unorm => Some(DXGI_FORMAT_BC3_UNORM),
+        TextureFormat::Bc3Srgb => Some(DXGI_FORMAT_BC3_UNORM_SRGB),
+        TextureFormat::Bc7Unorm => Some(DXGI_FORMAT_BC7_UNORM),
+        TextureFormat::Bc7Srgb => Some(DXGI_FORMAT_BC7_UNORM_SRGB),
+        // Desktop DXGI has no ASTC resource format.
+        TextureFormat::Astc4x4Unorm | TextureFormat::Astc4x4Srgb => None,
+    }
+}
+fn validate_texture_request(
+    format: TextureFormat,
+    mips: &[ImageMip<'_>],
+    binding: u32,
+) -> Result<(), AllocationError> {
+    validate_texture_mips(format, mips).map_err(|_| AllocationError::ZeroSize)?;
     if binding >= TEXTURE_DESCRIPTOR_CAPACITY {
         return Err(AllocationError::ZeroSize);
     }
+
+    // Only the base must fill BC blocks; smaller mips retain their logical edge dimensions.
+    let [block_width, block_height, _] = format.block();
+    if !mips[0].width.is_multiple_of(block_width) || !mips[0].height.is_multiple_of(block_height) {
+        return Err(AllocationError::Unsupported);
+    }
+
     Ok(())
 }
 
+fn write_texture_view(
+    context: &NativeContext,
+    resource: &ID3D12Resource,
+    format: TextureFormat,
+    binding: u32,
+    mip_count: u32,
+    resident_mips: u32,
+) {
+    // The resident range is always the contiguous coarse suffix of the native mip chain.
+    let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: texture_format_dxgi(format).expect("validated DX12 texture format"),
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_SRV {
+                MostDetailedMip: mip_count - resident_mips,
+                MipLevels: resident_mips,
+                PlaneSlice: 0,
+                ResourceMinLODClamp: 0.0,
+            },
+        },
+    };
+    // SAFETY: the descriptor heap remains live and `binding` was range-checked.
+    let mut handle = unsafe { context.descriptors.GetCPUDescriptorHandleForHeapStart() };
+    handle.ptr += binding as usize * context.descriptor_stride as usize;
+    // SAFETY: the explicit SRV references a live texture and a nonempty in-range mip suffix.
+    unsafe {
+        context
+            .device
+            .CreateShaderResourceView(resource, Some(&raw const view), handle);
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "construction receives the validated native texture contract as one explicit handoff"
+)]
 fn publish_texture(
     context: &NativeContext,
     resource: ID3D12Resource,
     allocation: Allocation,
+    format: TextureFormat,
+    width: u32,
+    height: u32,
     binding: u32,
     sampler_desc: TextureSamplerDesc,
+    cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     completions: Vec<CompletionToken>,
 ) -> (NativeTexture, Vec<CompletionToken>) {
-    // SAFETY: `context.descriptors` retains the `ID3D12DescriptorHeap` COM reference while `GetCPUDescriptorHandleForHeapStart` returns that heap's base CPU handle.
-    let mut handle = unsafe { context.descriptors.GetCPUDescriptorHandleForHeapStart() };
-    handle.ptr += binding as usize * context.descriptor_stride as usize;
-    // SAFETY: `CreateShaderResourceView` receives the resource created by `context.device` and the range-checked `binding` slot in `context.descriptors`; both resource and descriptor heap outlast the call.
-    unsafe {
-        context
-            .device
-            .CreateShaderResourceView(&resource, None, handle);
-    };
+    let mip_count = u32::try_from(completions.len()).expect("validated mip count fits u32");
+    write_texture_view(context, &resource, format, binding, mip_count, 1);
     let filter = if sampler_desc.max_anisotropy > 1.0 {
         D3D12_FILTER_ANISOTROPIC
     } else {
@@ -70,19 +139,27 @@ fn publish_texture(
         MaxLOD: f32::MAX,
         ..Default::default()
     };
-    // SAFETY: `context.samplers` retains the `ID3D12DescriptorHeap` COM reference while `GetCPUDescriptorHandleForHeapStart` returns that heap's base CPU handle.
+    // SAFETY: the sampler heap remains live and `binding` was range-checked.
     let mut sampler_handle = unsafe { context.samplers.GetCPUDescriptorHandleForHeapStart() };
     sampler_handle.ptr += binding as usize * context.sampler_stride as usize;
-    // SAFETY: `CreateSampler` reads the initialized local `sampler` for this call and writes the descriptor to the range-checked `binding` slot in `context.samplers`.
+    // SAFETY: the initialized sampler is written into the range-checked stable binding.
     unsafe {
         context
             .device
             .CreateSampler(&raw const sampler, sampler_handle);
     };
+    let mip_completions = completions.iter().rev().map(|token| token.value).collect();
     (
         NativeTexture {
             resource,
             allocation,
+            format,
+            width,
+            height,
+            mip_count,
+            resident_mips: 1,
+            mip_completions,
+            cancellation,
             binding,
         },
         completions,
@@ -101,6 +178,7 @@ fn anisotropy_u32(value: f32) -> u32 {
 impl NativeContext {
     fn create_texture_resource(
         &mut self,
+        format: TextureFormat,
         mips: &[ImageMip<'_>],
     ) -> Result<(ID3D12Resource, Allocation, D3D12_RESOURCE_DESC), AllocationError> {
         let width = mips[0].width;
@@ -113,7 +191,7 @@ impl NativeContext {
             Height: height,
             DepthOrArraySize: 1,
             MipLevels: mip_count,
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            Format: texture_format_dxgi(format).ok_or(AllocationError::NativeFailure)?,
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -189,16 +267,26 @@ impl NativeContext {
         &mut self,
         mips: &[ImageMip<'_>],
         footprints: &[windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT],
+        row_counts: &[u32],
+        row_sizes: &[u64],
         upload: &mut NativeAllocation,
         upload_size: u64,
     ) -> Result<(), AllocationError> {
         let target = self.mapped_slice_mut(upload)?;
-        for (mip, footprint) in mips.iter().zip(footprints) {
-            let row_bytes = usize::try_from(mip.width)
-                .ok()
-                .and_then(|width| width.checked_mul(4))
-                .ok_or(AllocationError::NativeFailure)?;
-            for row in 0..usize::try_from(mip.height).map_err(|_| AllocationError::NativeFailure)? {
+        for (((mip, footprint), row_count), row_size) in
+            mips.iter().zip(footprints).zip(row_counts).zip(row_sizes)
+        {
+            let row_bytes =
+                usize::try_from(*row_size).map_err(|_| AllocationError::NativeFailure)?;
+            let rows = usize::try_from(*row_count).map_err(|_| AllocationError::NativeFailure)?;
+            if row_bytes
+                .checked_mul(rows)
+                .ok_or(AllocationError::NativeFailure)?
+                != mip.bytes.len()
+            {
+                return Err(AllocationError::NativeFailure);
+            }
+            for row in 0..rows {
                 let source_start = row * row_bytes;
                 let destination_start = usize::try_from(footprint.Offset)
                     .map_err(|_| AllocationError::NativeFailure)?
@@ -210,19 +298,21 @@ impl NativeContext {
         self.flush(upload, 0, upload_size)
     }
 
-    /// Creates an RGBA8 mip chain and submits each level under a distinct fence value.
+    /// Creates a sampled mip chain and submits each level under a distinct fence value.
     ///
     /// # Errors
     ///
-    /// Returns an error for an invalid RGBA8 mip chain or out-of-range binding, failed texture or upload setup, failed D3D12 resource, command, or fence operations, fence-value overflow, or failed synchronization or cleanup.
-    pub fn create_texture_rgba8(
+    /// Returns an error for an invalid mip chain, format, or binding, failed texture/upload setup,
+    /// native resource failure, arithmetic overflow, or failed synchronization.
+    pub fn create_texture(
         &mut self,
+        format: TextureFormat,
         mips: &[ImageMip<'_>],
         binding: u32,
         sampler_desc: TextureSamplerDesc,
     ) -> Result<(NativeTexture, Vec<CompletionToken>), AllocationError> {
-        validate_texture_request(mips, binding)?;
-        let (resource, allocation, desc) = self.create_texture_resource(mips)?;
+        validate_texture_request(format, mips, binding)?;
+        let (resource, allocation, desc) = self.create_texture_resource(format, mips)?;
         let mut footprints = vec![
             windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
             mips.len()
@@ -264,22 +354,194 @@ impl NativeContext {
                     }
                 }
             };
-        if let Err(error) =
-            self.populate_texture_upload(mips, &footprints, &mut upload, upload_size)
-        {
+        if let Err(error) = self.populate_texture_upload(
+            mips,
+            &footprints,
+            &row_counts,
+            &row_sizes,
+            &mut upload,
+            upload_size,
+        ) {
             self.destroy_unpublished_texture(resource, allocation, Some(upload));
             return Err(error);
         }
+        let cancellation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let first = self.next_texture_fence;
-        self.next_texture_fence = first
+        let next = first
             .checked_add(mips.len() as u64)
             .ok_or(AllocationError::NativeFailure)?;
-        let completions = (first..self.next_texture_fence)
+        let completions = (first..next)
             .map(|value| CompletionToken::new(QueueKind::TextureTransfer, value))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| AllocationError::NativeFailure)?;
         let completion = *completions.last().ok_or(AllocationError::NativeFailure)?;
-        let value = completion.value;
+        let worker = self
+            .texture_worker
+            .as_ref()
+            .ok_or(AllocationError::NativeFailure)?;
+        let mut jobs = Vec::with_capacity(mips.len());
+        for ((subresource, footprint), token) in
+            footprints.iter().enumerate().rev().zip(completions.iter())
+        {
+            let subresource =
+                u32::try_from(subresource).map_err(|_| AllocationError::NativeFailure)?;
+            let rows = u64::from(row_counts[subresource as usize]);
+            let bytes = u64::from(footprint.Footprint.RowPitch)
+                .checked_mul(rows)
+                .ok_or(AllocationError::NativeFailure)?;
+            jobs.push(super::transfer::Dx12TransferJob {
+                value: token.value,
+                bytes,
+                cancelled: Some(cancellation.clone()),
+                copy: super::transfer::Dx12TransferCopy::Texture {
+                    source: upload.resource.clone(),
+                    destination: resource.clone(),
+                    footprint: *footprint,
+                    subresource,
+                    destination_x: 0,
+                    destination_y: 0,
+                    transition_from_shader: false,
+                    stream_stage: u32::try_from(token.value - first)
+                        .map_err(|_| AllocationError::NativeFailure)?,
+                },
+            });
+        }
+        // The worker accepts the entire chain or nothing, so rejection has no in-flight resources.
+        if let Err(error) = worker.submit_batch(jobs) {
+            self.destroy_unpublished_texture(resource, allocation, Some(upload));
+            return Err(match error {
+                ez_gfx_hal::TransferWorkerError::Full => AllocationError::OutOfMemory,
+                ez_gfx_hal::TransferWorkerError::Failed => AllocationError::NativeFailure,
+            });
+        }
+        // Commit only admitted values; idle must never wait for rejected uploads.
+        self.next_texture_fence = next;
+        let capacity = upload.allocation.size();
+        self.texture_staging.put(capacity, upload, Some(completion));
+        Ok(publish_texture(
+            self,
+            resource,
+            allocation,
+            format,
+            mips[0].width,
+            mips[0].height,
+            binding,
+            sampler_desc,
+            cancellation,
+            completions,
+        ))
+    }
+
+    /// Copies one validated tightly packed region through reusable upload staging.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid region, staging exhaustion, timeline overflow, or failed
+    /// worker admission. Borrowed bytes are copied before this method returns.
+    pub fn update_texture_region(
+        &mut self,
+        texture: &mut NativeTexture,
+        region: &TextureRegion<'_>,
+    ) -> Result<CompletionToken, AllocationError> {
+        validate_texture_region(
+            texture.format,
+            texture.width,
+            texture.height,
+            texture.mip_count,
+            *region,
+        )
+        .map_err(|_| AllocationError::ZeroSize)?;
+
+        // Footprint queries treat this as a base resource, so clipped mip edges still need
+        // complete physical blocks. The real destination mip keeps its logical dimensions.
+        let [block_width, block_height, _] = texture.format.block();
+        let width = region
+            .width
+            .div_ceil(block_width)
+            .checked_mul(block_width)
+            .ok_or(AllocationError::ZeroSize)?;
+        let height = region
+            .height
+            .div_ceil(block_height)
+            .checked_mul(block_height)
+            .ok_or(AllocationError::ZeroSize)?;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Alignment: 0,
+            Width: u64::from(width),
+            Height: height,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: texture_format_dxgi(texture.format).ok_or(AllocationError::NativeFailure)?,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+        };
+        let mut footprint =
+            windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut rows = 0_u32;
+        let mut row_size = 0_u64;
+        let mut upload_size = 0_u64;
+        // SAFETY: all output pointers reference initialized writable locals for one subresource.
+        unsafe {
+            self.device.GetCopyableFootprints(
+                &raw const desc,
+                0,
+                1,
+                0,
+                Some(&raw mut footprint),
+                Some(&raw mut rows),
+                Some(&raw mut row_size),
+                Some(&raw mut upload_size),
+            );
+        }
+        let row_bytes = usize::try_from(row_size).map_err(|_| AllocationError::NativeFailure)?;
+        let row_count = usize::try_from(rows).map_err(|_| AllocationError::NativeFailure)?;
+        if row_bytes
+            .checked_mul(row_count)
+            .ok_or(AllocationError::NativeFailure)?
+            != region.bytes.len()
+        {
+            return Err(AllocationError::NativeFailure);
+        }
+
+        let bucket =
+            ez_gfx_hal::staging_bucket_size(upload_size, ez_gfx_hal::DEFAULT_STAGING_POLICY)
+                .map_err(|_| AllocationError::OutOfMemory)?;
+        let completed = self.completed_texture_transfer_value()?;
+        for stale in self.texture_staging.trim(completed) {
+            self.free(stale)?;
+        }
+        let request = AllocationRequest::new(bucket, 256, MemoryClass::Upload, true, None)
+            .map_err(|_| AllocationError::ZeroSize)?;
+        let mut upload =
+            if let Some((_, upload)) = self.texture_staging.take(upload_size, completed) {
+                upload
+            } else {
+                self.allocate(request)?
+            };
+        let populate = (|| -> Result<(), AllocationError> {
+            let target = self.mapped_slice_mut(&mut upload)?;
+            for row in 0..row_count {
+                let source_start = row * row_bytes;
+                let destination_start = row * footprint.Footprint.RowPitch as usize;
+                target[destination_start..destination_start + row_bytes]
+                    .copy_from_slice(&region.bytes[source_start..source_start + row_bytes]);
+            }
+            self.flush(&mut upload, 0, upload_size)
+        })();
+        if let Err(error) = populate {
+            self.free(upload)?;
+            return Err(error);
+        }
+
+        let value = self.next_texture_fence;
+        let next = value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
+        let completion = CompletionToken::new(QueueKind::TextureTransfer, value)
+            .map_err(|_| AllocationError::NativeFailure)?;
         let submitted = self
             .texture_worker
             .as_ref()
@@ -287,37 +549,149 @@ impl NativeContext {
             .submit(super::transfer::Dx12TransferJob {
                 value,
                 bytes: upload_size,
+                cancelled: Some(texture.cancellation.clone()),
                 copy: super::transfer::Dx12TransferCopy::Texture {
                     source: upload.resource.clone(),
-                    destination: resource.clone(),
-                    footprints,
+                    destination: texture.resource.clone(),
+                    footprint,
+                    subresource: region.mip_level,
+                    destination_x: region.x,
+                    destination_y: region.y,
+                    transition_from_shader: true,
+                    stream_stage: 0,
                 },
             });
         if let Err(error) = submitted {
-            self.destroy_unpublished_texture(resource, allocation, Some(upload));
+            self.free(upload)?;
             return Err(match error {
                 ez_gfx_hal::TransferWorkerError::Full => AllocationError::OutOfMemory,
                 ez_gfx_hal::TransferWorkerError::Failed => AllocationError::NativeFailure,
             });
         }
+        self.next_texture_fence = next;
         let capacity = upload.allocation.size();
         self.texture_staging.put(capacity, upload, Some(completion));
-        Ok(publish_texture(
-            self,
-            resource,
-            allocation,
-            binding,
-            sampler_desc,
-            completions,
-        ))
+        *texture
+            .mip_completions
+            .get_mut(usize::try_from(region.mip_level).map_err(|_| AllocationError::NativeFailure)?)
+            .ok_or(AllocationError::NativeFailure)? = value;
+        Ok(completion)
     }
 
-    /// Defers texture destruction until every referencing frame completes.
+    /// Rewrites the stable binding to expose exactly the requested contiguous coarse mip range.
     ///
     /// # Errors
     ///
-    /// Returns an error if `defer_resource` fails to queue the texture for deferred destruction.
+    /// Returns an error for an empty/out-of-range range, an unfinished mip transfer, worker
+    /// failure, or device loss.
+    pub fn publish_texture_mips(
+        &mut self,
+        texture: &mut NativeTexture,
+        resident_mips: u32,
+    ) -> Result<(), AllocationError> {
+        if resident_mips == 0 || resident_mips > texture.mip_count {
+            return Err(AllocationError::ZeroSize);
+        }
+        let first = usize::try_from(texture.mip_count - resident_mips)
+            .map_err(|_| AllocationError::NativeFailure)?;
+        let required = texture.mip_completions[first..]
+            .iter()
+            .copied()
+            .max()
+            .ok_or(AllocationError::NativeFailure)?;
+        if self.completed_texture_transfer_value()? < required {
+            return Err(AllocationError::NativeFailure);
+        }
+        // SAFETY: the context retains the graphics fence throughout this nonblocking counter read.
+        let graphics_completed = unsafe { self.fence.GetCompletedValue() };
+        if graphics_completed == u64::MAX {
+            return Err(AllocationError::DeviceLost);
+        }
+        // Shader-visible descriptors cannot be overwritten while an earlier frame may still
+        // consume the slot. Publishing remains nonblocking and can be retried after polling.
+        if graphics_completed < self.next_fence.saturating_sub(1) {
+            return Err(AllocationError::NativeFailure);
+        }
+        if texture.resident_mips == resident_mips {
+            return Ok(());
+        }
+        write_texture_view(
+            self,
+            &texture.resource,
+            texture.format,
+            texture.binding,
+            texture.mip_count,
+            resident_mips,
+        );
+        texture.resident_mips = resident_mips;
+        Ok(())
+    }
+
+    /// Reports whether bindless descriptor rewrites can avoid every submitted frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the graphics completion fence reports device loss.
+    pub fn texture_descriptor_update_ready(&self) -> Result<bool, AllocationError> {
+        // SAFETY: the context retains the graphics fence throughout this counter read.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        if completed == u64::MAX {
+            return Err(AllocationError::DeviceLost);
+        }
+        Ok(self
+            .frame_slots
+            .iter()
+            .all(|frame| frame.fence_value == 0 || frame.fence_value <= completed))
+    }
+
+    /// Prevents transfer-owner jobs not yet recorded by the native queue from copying this texture.
+    pub fn cancel_texture_transfers(texture: &NativeTexture) {
+        texture
+            .cancellation
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Reports whether transfer and graphics-frame users have released a logically dead texture.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either native fence cannot be queried.
+    pub fn texture_retirement_ready(
+        &self,
+        completion: CompletionToken,
+    ) -> Result<bool, AllocationError> {
+        let transfer_done = self.completed_texture_transfer_value()? >= completion.value;
+        // SAFETY: the context retains the graphics fence throughout this counter read.
+        let graphics_completed = unsafe { self.fence.GetCompletedValue() };
+        if graphics_completed == u64::MAX {
+            return Err(AllocationError::DeviceLost);
+        }
+        let frames_done = self
+            .frame_slots
+            .iter()
+            .all(|frame| frame.fence_value == 0 || frame.fence_value <= graphics_completed);
+        Ok(transfer_done && frames_done)
+    }
+
+    /// Defers texture destruction behind both accepted texture transfers and graphics work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if worker submission draining or graphics-fence signaling fails.
     pub fn destroy_texture(&mut self, texture: NativeTexture) -> Result<(), AllocationError> {
+        self.texture_worker
+            .as_ref()
+            .ok_or(AllocationError::NativeFailure)?
+            .flush()
+            .map_err(|_| AllocationError::NativeFailure)?;
+        let retirement = self.next_fence;
+        self.next_fence = retirement
+            .checked_add(1)
+            .ok_or(AllocationError::NativeFailure)?;
+        // SAFETY: worker flush established all prior texture queue handoffs on this graphics
+        // queue, so its following signal retires both those transfers and earlier frame uses.
+        unsafe { self.queue.Signal(&self.fence, retirement) }
+            .map_err(|error| map_allocation_windows(&error))?;
         self.defer_resource(DeferredResource::Texture(texture))
     }
 
@@ -473,5 +847,57 @@ impl NativeContext {
             return Err(AllocationError::DeviceLost);
         }
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn texture_admission_distinguishes_bc_base_alignment_from_mip_edges() {
+        for format in [
+            TextureFormat::Bc1Unorm,
+            TextureFormat::Bc1Srgb,
+            TextureFormat::Bc3Unorm,
+            TextureFormat::Bc3Srgb,
+            TextureFormat::Bc7Unorm,
+            TextureFormat::Bc7Srgb,
+            TextureFormat::Rgba8Unorm,
+            TextureFormat::Rgba8Srgb,
+        ] {
+            // Either base axis can violate BC alignment, including sub-block bases.
+            for (width, height) in [(7, 3), (7, 4), (4, 3), (1, 1), (8, 4)] {
+                let bytes =
+                    vec![0; usize::try_from(format.level_bytes(width, height).unwrap()).unwrap()];
+                let mips = [ImageMip {
+                    width,
+                    height,
+                    bytes: &bytes,
+                }];
+                let expected = if format.is_compressed() && (width % 4 != 0 || height % 4 != 0) {
+                    Err(AllocationError::Unsupported)
+                } else {
+                    Ok(())
+                };
+                assert_eq!(validate_texture_request(format, &mips, 0), expected);
+            }
+
+            // The aligned base permits odd 14x6 and 7x3 mips and a sub-block tail.
+            let dimensions = [(28, 12), (14, 6), (7, 3), (3, 1), (1, 1)];
+            let payloads = dimensions.map(|(width, height)| {
+                vec![0; usize::try_from(format.level_bytes(width, height).unwrap()).unwrap()]
+            });
+            let mips: Vec<_> = dimensions
+                .iter()
+                .zip(&payloads)
+                .map(|(&(width, height), bytes)| ImageMip {
+                    width,
+                    height,
+                    bytes,
+                })
+                .collect();
+            assert_eq!(validate_texture_request(format, &mips, 0), Ok(()));
+        }
     }
 }

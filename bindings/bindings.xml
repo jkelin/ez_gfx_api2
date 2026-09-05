@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<ez-gfx-bindings version="1" abi-version="20" library="ez_gfx_ffi">
+<ez-gfx-bindings version="1" abi-version="23" library="ez_gfx_ffi">
   <description>Public EzGfx C ABI. This file is manually maintained; generated headers and managed bindings are derived from it.</description>
   <handles>
     <handle name="EzGfxContext" doc="Opaque packed u64 context handle (slot+1/generation in bits 0-39)." />
@@ -63,7 +63,7 @@
       <value name="EzGfxSurfacePlatform_GLFW" value="1" doc="GLFW native window handle." />
       <value name="EzGfxSurfacePlatform_MetalLayer" value="2" doc="Borrowed CAMetalLayer pointer." />
     </enum>
-    <enum name="EzGfxSourceTextureFormat" underlying="uint8_t" doc="Source image encoding.">
+    <enum name="EzGfxSourceTextureFormat" underlying="uint8_t" doc="Source image encoding; values 128 through 255 are application decoders.">
       <value name="EzGfxSourceTextureFormat_Rgb" value="0" doc="Raw RGB pixels." />
       <value name="EzGfxSourceTextureFormat_Rgba" value="1" doc="Raw RGBA pixels." />
       <value name="EzGfxSourceTextureFormat_Bmp" value="2" doc="BMP image bytes." />
@@ -71,6 +71,9 @@
       <value name="EzGfxSourceTextureFormat_Png" value="4" doc="PNG image bytes." />
       <value name="EzGfxSourceTextureFormat_Tga" value="5" doc="TGA image bytes." />
       <value name="EzGfxSourceTextureFormat_Ktx2" value="6" doc="KTX2 image bytes." />
+      <value name="EzGfxSourceTextureFormat_Basis" value="7" doc="Optional standalone Basis Universal bytes." />
+      <value name="EzGfxSourceTextureFormat_Dds" value="8" doc="DDS image bytes with a legacy or DX10 header." />
+      <value name="EzGfxSourceTextureFormat_Raw" value="9" doc="Tightly packed mip bytes in the destination storage format; the destination must name a concrete format." />
     </enum>
     <enum name="EzGfxTextureFilter" underlying="uint8_t" doc="Texture sampling filter.">
       <value name="EzGfxTextureFilter_Nearest" value="0" doc="Nearest-neighbor filtering." />
@@ -80,8 +83,18 @@
       <value name="EzGfxTextureAddressMode_Repeat" value="0" doc="Repeat coordinates." />
       <value name="EzGfxTextureAddressMode_ClampToEdge" value="1" doc="Clamp coordinates to the edge." />
     </enum>
-    <enum name="EzGfxTextureDestinationFormat" underlying="uint8_t" doc="Destination texture format.">
-      <value name="EzGfxTextureDestinationFormat_Rgba8Unorm" value="0" doc="8-bit normalized RGBA." />
+    <enum name="EzGfxTextureDestinationFormat" underlying="uint8_t" doc="Requested GPU texture storage.">
+      <value name="EzGfxTextureDestinationFormat_Rgba8Unorm" value="0" doc="Linear 8-bit normalized RGBA." />
+      <value name="EzGfxTextureDestinationFormat_Auto" value="1" doc="Prefer admitted native compression." />
+      <value name="EzGfxTextureDestinationFormat_Rgba8Srgb" value="2" doc="sRGB 8-bit normalized RGBA." />
+      <value name="EzGfxTextureDestinationFormat_Bc1Unorm" value="3" doc="Linear BC1." />
+      <value name="EzGfxTextureDestinationFormat_Bc1Srgb" value="4" doc="sRGB BC1." />
+      <value name="EzGfxTextureDestinationFormat_Bc3Unorm" value="5" doc="Linear BC3." />
+      <value name="EzGfxTextureDestinationFormat_Bc3Srgb" value="6" doc="sRGB BC3." />
+      <value name="EzGfxTextureDestinationFormat_Bc7Unorm" value="7" doc="Linear BC7." />
+      <value name="EzGfxTextureDestinationFormat_Bc7Srgb" value="8" doc="sRGB BC7." />
+      <value name="EzGfxTextureDestinationFormat_Astc4x4Unorm" value="9" doc="Linear ASTC 4x4." />
+      <value name="EzGfxTextureDestinationFormat_Astc4x4Srgb" value="10" doc="sRGB ASTC 4x4." />
     </enum>
     <enum name="EzGfxCullMode" underlying="uint8_t" doc="Pipeline cull mode.">
       <value name="EzGfxCullMode_None" value="0" doc="No face culling." />
@@ -139,9 +152,9 @@
     <struct name="EzGfxTextureDesc" doc="Texture decoding and sampling metadata.">
       <field name="source_format" type="EzGfxSourceTextureFormat" doc="Value from EzGfxSourceTextureFormat." />
       <field name="destination_format" type="EzGfxTextureDestinationFormat" doc="Value from EzGfxTextureDestinationFormat." />
-      <field name="width" type="uint32_t" validation="greater-than-zero" doc="Decoded width for raw pixels." />
-      <field name="height" type="uint32_t" validation="greater-than-zero" doc="Decoded height for raw pixels." />
-      <field name="mip_count" type="uint32_t" doc="Number of mip levels, or zero for decoder defaults." />
+      <field name="width" type="uint32_t" validation="greater-than-zero" doc="Decoded width for raw pixels and Raw ingestion." />
+      <field name="height" type="uint32_t" validation="greater-than-zero" doc="Decoded height for raw pixels and Raw ingestion." />
+      <field name="mip_count" type="uint32_t" doc="Number of mip levels, zero for decoder defaults; Raw requires an explicit nonzero count." />
       <field name="generate_mips" type="uint8_t" doc="Non-zero requests mip generation." />
       <field name="min_filter" type="EzGfxTextureFilter" doc="Value from EzGfxTextureFilter." />
       <field name="mag_filter" type="EzGfxTextureFilter" doc="Value from EzGfxTextureFilter." />
@@ -151,6 +164,32 @@
       <field name="address_mode_w" type="EzGfxTextureAddressMode" doc="Value from EzGfxTextureAddressMode." />
       <field name="debug_label" type="const char *" nullable="true" doc="Optional exact UTF-8 byte range paired with debug_label_length." />
       <field name="debug_label_length" type="size_t" validation="zero-or-at-most-boundary-limit" doc="Debug-label byte length." />
+    </struct>
+    <struct name="EzGfxDecodedTextureMip" doc="One custom-decoder mip retained until release.">
+      <field name="width" type="uint32_t" validation="greater-than-zero" doc="Mip width." />
+      <field name="height" type="uint32_t" validation="greater-than-zero" doc="Mip height." />
+      <field name="data" type="const uint8_t *" nullable="false" doc="Decoded texel or compressed-block bytes." />
+      <field name="data_size" type="size_t" validation="greater-than-zero" doc="Byte count." />
+    </struct>
+    <struct name="EzGfxDecodedTexture" doc="Custom decoder output copied before release.">
+      <field name="format" type="EzGfxTextureDestinationFormat" doc="Concrete decoded GPU format; Auto is invalid." />
+      <field name="mip_count" type="uint32_t" validation="greater-than-zero" doc="Mip array count." />
+      <field name="mips" type="const EzGfxDecodedTextureMip *" nullable="false" doc="Mip array retained until release." />
+    </struct>
+    <struct name="EzGfxTextureRegionDesc" doc="Borrowed bytes and destination rectangle for one asynchronous texture update.">
+      <field name="mip_level" type="uint32_t" doc="Destination mip level." />
+      <field name="x" type="uint32_t" doc="Destination X offset." />
+      <field name="y" type="uint32_t" doc="Destination Y offset." />
+      <field name="width" type="uint32_t" validation="greater-than-zero" doc="Region width." />
+      <field name="height" type="uint32_t" validation="greater-than-zero" doc="Region height." />
+      <field name="data" type="const uint8_t *" nullable="false" doc="Tightly packed texel or compressed-block bytes; retained only for the call." />
+      <field name="data_size" type="size_t" validation="greater-than-zero-at-most-boundary-limit" doc="Input byte count." />
+    </struct>
+    <struct name="EzGfxTextureUploadTelemetry" doc="Monotonic context-wide asynchronous texture pipeline counters.">
+      <field name="decode_microseconds" type="uint64_t" doc="Aggregate CPU decode/transcode/mip-generation time." />
+      <field name="staging_bytes" type="uint64_t" doc="Aggregate bytes admitted to native staging." />
+      <field name="queue_latency_microseconds" type="uint64_t" doc="Aggregate transfer-owner queue latency." />
+      <field name="handoff_latency_microseconds" type="uint64_t" doc="Aggregate transfer-to-graphics handoff latency." />
     </struct>
     <struct name="EzGfxBinding" doc="Shader resource binding.">
       <field name="name" type="const char *" nullable="false" doc="Exactly name_length UTF-8 bytes; no NUL terminator is required." />
@@ -258,15 +297,26 @@
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
       <returns doc="Returns queueing, validation, decode, or support status." />
     </function>
+    <function name="ez_gfx_texture_decoder_register" return="EzGfxResult" doc="Registers one concurrent application decoder for source codes 128 through 255.">
+      <param name="source_format" type="EzGfxSourceTextureFormat" doc="Custom source code." />
+      <param name="callback" type="EzGfxTextureDecoderCallback" nullable="false" doc="Concurrent decode callback." />
+      <param name="release" type="EzGfxTextureDecoderReleaseCallback" nullable="false" doc="Successful-output release callback." />
+      <param name="user_data" type="void *" nullable="true" doc="Application state retained through unregister and accepted work." />
+      <returns doc="Returns Ok or InvalidArgument." />
+    </function>
+    <function name="ez_gfx_texture_decoder_unregister" return="EzGfxResult" doc="Unregisters one custom decoder.">
+      <param name="source_format" type="EzGfxSourceTextureFormat" doc="Custom source code." />
+      <returns doc="Returns Ok or InvalidArgument." />
+    </function>
     <function name="ez_gfx_texture_poll" return="EzGfxResult" context="last" doc="Polls asynchronous decode and GPU transfer readiness without blocking.">
       <param name="texture" type="EzGfxTexture" nullable="false" doc="Texture request handle." />
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
       <returns doc="Returns Ok, NotReady, or the terminal texture failure." />
     </function>
-    <function name="ez_gfx_texture_cancel" return="EzGfxResult" context="last" doc="Cancels a texture before native transfer submission.">
+    <function name="ez_gfx_texture_cancel" return="EzGfxResult" context="last" doc="Cancels a texture before or after transfer-worker admission without waiting for GPU completion.">
       <param name="texture" type="EzGfxTexture" nullable="false" doc="Texture request handle." />
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
-      <returns doc="Returns Ok when cancellation wins, or InvalidArgument after submission." />
+      <returns doc="Returns Ok when cancellation wins, or InvalidArgument for a terminal or stale request." />
     </function>
     <function name="ez_gfx_texture_get_binding" return="EzGfxResult" context="last" doc="Returns the stable binding after upload completion.">
       <param name="texture" type="EzGfxTexture" nullable="false" doc="Texture handle." />
@@ -274,12 +324,29 @@
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
       <returns doc="Returns EzGfxResult_NotReady while upload remains in flight." />
     </function>
+    <function name="ez_gfx_update_texture_region" return="EzGfxResult" context="last" doc="Copies and asynchronously uploads one validated texture sub-rectangle.">
+      <param name="texture" type="EzGfxTexture" nullable="false" doc="Resident texture handle." />
+      <param name="desc" type="const EzGfxTextureRegionDesc *" nullable="false" direction="in" doc="Region and borrowed input bytes." />
+      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
+      <returns doc="Returns Ok on admission, QueueFull for backpressure, or validation/native status." />
+    </function>
+    <function name="ez_gfx_texture_get_upload_telemetry" return="EzGfxResult" context="last" doc="Returns monotonic context-wide asynchronous texture pipeline counters.">
+      <param name="out_telemetry" type="EzGfxTextureUploadTelemetry *" nullable="false" direction="out" doc="Receives a coherent counter snapshot." />
+      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
+      <returns doc="Returns Ok or context/device status." />
+    </function>
     <function name="ez_gfx_texture_get_residency" return="EzGfxResult" context="last" doc="Reports completed mip residency and the immutable decoded mip count.">
       <param name="texture" type="EzGfxTexture" nullable="false" doc="Texture handle." />
       <param name="out_resident_mips" type="uint32_t *" direction="out" doc="Receives completed mip count, possibly zero while uploads are pending." />
       <param name="out_total_mips" type="uint32_t *" direction="out" doc="Receives immutable decoded mip count." />
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
       <returns doc="Returns EzGfxResult_Ok or a validation or handle status." />
+    </function>
+    <function name="ez_gfx_texture_set_residency" return="EzGfxResult" context="last" doc="Sets the contiguous coarse mip count exposed through the stable texture binding.">
+      <param name="texture" type="EzGfxTexture" nullable="false" doc="Texture handle." />
+      <param name="resident_mips" type="uint32_t" validation="greater-than-zero" doc="Requested contiguous coarse mip count." />
+      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
+      <returns doc="Returns Ok when published, NotReady while uploads or safe descriptor rewrites remain pending, or a validation or handle status." />
     </function>
     <function name="ez_gfx_texture_unload" return="void" context="last" doc="Invalidates and releases a texture.">
       <param name="texture" type="EzGfxTexture" nullable="false" doc="Texture handle." />

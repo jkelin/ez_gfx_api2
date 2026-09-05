@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+basis = ["ez-gfx/basis"]
+ktx2 = ["ez-gfx/ktx2"]
+
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
 
@@ -15,6 +20,7 @@ ez-gfx-core.workspace = true
 [dev-dependencies]
 ez-gfx-artifact.workspace = true
 ez-gfx-compiler.workspace = true
+ez-gfx-runtime.workspace = true
 
 
 [target.'cfg(windows)'.dev-dependencies]

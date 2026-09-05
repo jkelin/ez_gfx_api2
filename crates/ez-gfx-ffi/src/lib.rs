@@ -3,24 +3,25 @@
 mod api;
 mod bounded_string;
 mod identity;
+mod texture;
 
 pub use api::*;
 use bounded_string::{
     read_bounded_string, validate_bounded_string, validate_optional_bounded_string,
 };
 pub use identity::*;
+pub use texture::*;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use ez_gfx::{
     Backend, ContextHandle, ContextOptions, DrawIndexedCommand, DynamicPipelineState,
-    IndirectBufferHandle, PublicBinding, RenderTargetHandle, ResourceIdentity, SamplerAddressMode,
-    SamplerFilter, ShaderHandle, StructuredBufferHandle, SurfaceHandle, SurfaceOptions,
-    SurfacePlatform, TextureHandle, TextureSamplerDesc, TextureSource,
+    IndirectBufferHandle, PublicBinding, RenderTargetHandle, ResourceIdentity, ShaderHandle,
+    StructuredBufferHandle, SurfaceHandle, SurfaceOptions, SurfacePlatform, TextureHandle,
 };
 
-/// Identifies C ABI revision 20 for compatibility checks.
-pub const EZ_GFX_ABI_VERSION: u32 = 20;
+/// Identifies C ABI revision 23 for compatibility checks.
+pub const EZ_GFX_ABI_VERSION: u32 = 23;
 /// Caps any caller-provided byte range at 16 MiB.
 pub const EZ_GFX_MAX_BOUNDARY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -32,15 +33,6 @@ macro_rules! try_handle {
         }
     };
 }
-// Unknown ABI bytes fail closed; zero and one retain the public Repeat/ClampToEdge ordering.
-fn sampler_address_from_abi(value: u8) -> Result<SamplerAddressMode, EzGfxResult> {
-    match value {
-        0 => Ok(SamplerAddressMode::Repeat),
-        1 => Ok(SamplerAddressMode::Clamp),
-        _ => Err(EzGfxResult::InvalidArgument),
-    }
-}
-
 #[unsafe(no_mangle)]
 /// Returns the C ABI revision supported by this library.
 pub extern "C" fn ez_gfx_abi_version() -> u32 {
@@ -271,183 +263,6 @@ pub extern "C" fn ez_gfx_shader_destroy(shader: EzGfxShader, context: EzGfxConte
             ShaderHandle::from_raw(shader),
         ) {
             ez_gfx::destroy_shader(context, shader);
-        }
-    });
-}
-
-#[unsafe(no_mangle)]
-/// Loads texture bytes, configures sampling and mip residency, and returns a texture handle.
-///
-/// # Safety
-///
-/// Non-null `data` must be readable for `data_size` bytes, non-null `desc` readable for one aligned descriptor, and non-null `out_texture` writable for one aligned handle. The optional descriptor label must be either null with zero length or non-null and readable for its exact nonzero UTF-8 byte length without embedded NUL bytes.
-pub unsafe extern "C" fn ez_gfx_texture_load(
-    data: *const u8,
-    data_size: usize,
-    desc: *const EzGfxTextureDesc,
-    out_texture: *mut EzGfxTexture,
-    context: EzGfxContext,
-) -> EzGfxResult {
-    catch_status(|| {
-        if data.is_null()
-            || desc.is_null()
-            || out_texture.is_null()
-            || data_size == 0
-            || data_size > EZ_GFX_MAX_BOUNDARY_BYTES
-        {
-            return EzGfxResult::InvalidArgument;
-        }
-        // SAFETY: `desc` is non-null, and the caller keeps readable, properly aligned storage for one `EzGfxTextureDesc` alive through this read.
-        let desc = unsafe { desc.read() };
-        if desc.generate_mips > 1
-            || desc.destination_format != 0
-            || desc.min_filter > 1
-            || desc.mag_filter > 1
-            || !desc.max_anisotropy.is_finite()
-            || !(1.0..=16.0).contains(&desc.max_anisotropy)
-            || validate_optional_bounded_string(desc.debug_label, desc.debug_label_length).is_err()
-        {
-            return EzGfxResult::InvalidArgument;
-        }
-        let source = match desc.source_format {
-            0 => TextureSource::Rgb8 {
-                width: desc.width,
-                height: desc.height,
-            },
-            1 => TextureSource::Rgba8 {
-                width: desc.width,
-                height: desc.height,
-            },
-            2 => TextureSource::Bmp,
-            3 => TextureSource::Jpeg,
-            4 => TextureSource::Png,
-            5 => TextureSource::Tga,
-            6 => TextureSource::Ktx2,
-            _ => return EzGfxResult::InvalidArgument,
-        };
-        // SAFETY: `data_size` is checked in `1..=EZ_GFX_MAX_BOUNDARY_BYTES`; the caller keeps `data` readable for that many `u8` values (alignment 1) through texture loading.
-        let bytes = unsafe { core::slice::from_raw_parts(data, data_size) };
-        let filter = |value| match value {
-            0 => SamplerFilter::Nearest,
-            _ => SamplerFilter::Linear,
-        };
-        let [Ok(address_u), Ok(address_v), Ok(address_w)] = [
-            sampler_address_from_abi(desc.address_mode_u),
-            sampler_address_from_abi(desc.address_mode_v),
-            sampler_address_from_abi(desc.address_mode_w),
-        ] else {
-            return EzGfxResult::InvalidArgument;
-        };
-        let config = ez_gfx::TextureConfig {
-            width: desc.width,
-            height: desc.height,
-            mip_count: desc.mip_count,
-            sampler: TextureSamplerDesc {
-                min_filter: filter(desc.min_filter),
-                mag_filter: filter(desc.mag_filter),
-                max_anisotropy: desc.max_anisotropy,
-                address_u,
-                address_v,
-                address_w,
-            },
-        };
-        let context = try_handle!(ContextHandle, context);
-        match ez_gfx::load_texture(context, source, bytes, desc.generate_mips != 0, &config) {
-            Ok(texture) => {
-                // SAFETY: `out_texture` is non-null, and the caller keeps writable, properly aligned storage for one `EzGfxTexture` alive through this write.
-                unsafe { out_texture.write(texture.into_raw()) };
-                EzGfxResult::Ok
-            }
-            Err(status) => status,
-        }
-    })
-}
-#[unsafe(no_mangle)]
-/// Polls asynchronous decode and transfer readiness for one texture.
-pub extern "C" fn ez_gfx_texture_poll(texture: EzGfxTexture, context: EzGfxContext) -> EzGfxResult {
-    catch_status(|| {
-        let texture = try_handle!(TextureHandle, texture);
-        ez_gfx::poll_texture_load(try_handle!(ContextHandle, context), texture)
-    })
-}
-#[unsafe(no_mangle)]
-/// Cancels a texture request before native transfer submission.
-pub extern "C" fn ez_gfx_texture_cancel(
-    texture: EzGfxTexture,
-    context: EzGfxContext,
-) -> EzGfxResult {
-    catch_status(|| {
-        let texture = try_handle!(TextureHandle, texture);
-        ez_gfx::cancel_texture_load(try_handle!(ContextHandle, context), texture)
-    })
-}
-#[unsafe(no_mangle)]
-/// Queries the binding index assigned to a loaded texture.
-///
-/// # Safety
-///
-/// A non-null `out_binding` must address one writable, aligned `u32` for this call.
-pub unsafe extern "C" fn ez_gfx_texture_get_binding(
-    texture: EzGfxTexture,
-    out_binding: *mut u32,
-    context: EzGfxContext,
-) -> EzGfxResult {
-    catch_status(|| {
-        if out_binding.is_null() {
-            return EzGfxResult::InvalidArgument;
-        }
-        let context = try_handle!(ContextHandle, context);
-        let texture = try_handle!(TextureHandle, texture);
-        match ez_gfx::texture_binding(context, texture) {
-            Ok(binding) => {
-                // SAFETY: `out_binding` is non-null, and the caller keeps writable, properly aligned storage for one `u32` alive through this write.
-                unsafe { out_binding.write(binding) };
-                EzGfxResult::Ok
-            }
-            Err(status) => status,
-        }
-    })
-}
-#[unsafe(no_mangle)]
-/// Queries the resident and total mip counts for a loaded texture.
-///
-/// # Safety
-///
-/// Each non-null output pointer must address one writable, aligned `u32` for this call.
-pub unsafe extern "C" fn ez_gfx_texture_get_residency(
-    texture: EzGfxTexture,
-    out_resident_mips: *mut u32,
-    out_total_mips: *mut u32,
-    context: EzGfxContext,
-) -> EzGfxResult {
-    catch_status(|| {
-        if out_resident_mips.is_null() || out_total_mips.is_null() {
-            return EzGfxResult::InvalidArgument;
-        }
-        let context = try_handle!(ContextHandle, context);
-        let texture = try_handle!(TextureHandle, texture);
-        match ez_gfx::texture_residency(context, texture) {
-            Ok((resident, total)) => {
-                // SAFETY: Both output pointers are non-null; the caller keeps aligned writable storage for one `u32` at each pointer alive through these writes.
-                unsafe {
-                    out_resident_mips.write(resident);
-                    out_total_mips.write(total);
-                };
-                EzGfxResult::Ok
-            }
-            Err(status) => status,
-        }
-    })
-}
-#[unsafe(no_mangle)]
-/// Unloads a texture from the context.
-pub extern "C" fn ez_gfx_texture_unload(texture: EzGfxTexture, context: EzGfxContext) {
-    catch_void(|| {
-        if let (Ok(context), Ok(texture)) = (
-            ContextHandle::from_raw(context),
-            TextureHandle::from_raw(texture),
-        ) {
-            ez_gfx::unload_texture(context, texture);
         }
     });
 }

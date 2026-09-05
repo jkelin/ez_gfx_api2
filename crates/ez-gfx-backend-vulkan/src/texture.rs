@@ -2,21 +2,63 @@ use super::{
     Allocation, AllocationCreateDesc, AllocationError, AllocationRequest, AllocationScheme,
     CompletionToken, DeferredResource, ImageMip, MemoryAllocator, MemoryClass, MemoryLocation,
     NativeAllocation, NativeContext, NativeTexture, QueueKind, SAMPLER_DESCRIPTOR_BINDING,
-    TEXTURE_DESCRIPTOR_BINDING, TEXTURE_DESCRIPTOR_CAPACITY, TextureSamplerDesc, map_allocation_vk,
-    map_allocator, map_vk, sampler_create_info,
+    TEXTURE_DESCRIPTOR_BINDING, TEXTURE_DESCRIPTOR_CAPACITY, TextureFormat, TextureRegion,
+    TextureSamplerDesc, map_allocation_vk, map_allocator, map_vk, sampler_create_info,
     transfer::{VulkanTransferCopy, VulkanTransferJob},
-    validate_rgba8_mips, vk,
+    validate_texture_mips, validate_texture_region, vk,
 };
 
-fn publish_texture(
+fn texture_format_vk(format: TextureFormat) -> vk::Format {
+    match format {
+        TextureFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
+        TextureFormat::Rgba8Srgb => vk::Format::R8G8B8A8_SRGB,
+        TextureFormat::Bc1Unorm => vk::Format::BC1_RGBA_UNORM_BLOCK,
+        TextureFormat::Bc1Srgb => vk::Format::BC1_RGBA_SRGB_BLOCK,
+        TextureFormat::Bc3Unorm => vk::Format::BC3_UNORM_BLOCK,
+        TextureFormat::Bc3Srgb => vk::Format::BC3_SRGB_BLOCK,
+        TextureFormat::Bc7Unorm => vk::Format::BC7_UNORM_BLOCK,
+        TextureFormat::Bc7Srgb => vk::Format::BC7_SRGB_BLOCK,
+        TextureFormat::Astc4x4Unorm => vk::Format::ASTC_4X4_UNORM_BLOCK,
+        TextureFormat::Astc4x4Srgb => vk::Format::ASTC_4X4_SRGB_BLOCK,
+    }
+}
+fn resident_mip_range(mip_count: u32, resident_mips: u32) -> Option<(u32, u32)> {
+    // Zero residency cannot be represented by a Vulkan image view; over-residency would expose
+    // storage outside the allocation's mip chain.
+    (resident_mips != 0 && resident_mips <= mip_count)
+        .then(|| (mip_count - resident_mips, resident_mips))
+}
+fn texture_region_copy(region: &TextureRegion<'_>) -> Result<vk::BufferImageCopy, AllocationError> {
+    Ok(vk::BufferImageCopy::default()
+        // Zero row/image strides specify the tightly packed texel or compressed-block layout
+        // validated before this native description is built.
+        .buffer_row_length(0)
+        .buffer_image_height(0)
+        .image_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: region.mip_level,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .image_offset(vk::Offset3D {
+            x: i32::try_from(region.x).map_err(|_| AllocationError::NativeFailure)?,
+            y: i32::try_from(region.y).map_err(|_| AllocationError::NativeFailure)?,
+            z: 0,
+        })
+        .image_extent(vk::Extent3D {
+            width: region.width,
+            height: region.height,
+            depth: 1,
+        }))
+}
+
+fn write_texture_descriptor(
     device: &ash::Device,
     descriptor_set: vk::DescriptorSet,
     binding: u32,
-    image: vk::Image,
     view: vk::ImageView,
     sampler: vk::Sampler,
-    allocation: Allocation,
-) -> NativeTexture {
+) {
     let image_descriptor = vk::DescriptorImageInfo::default()
         .image_view(view)
         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
@@ -35,21 +77,15 @@ fn publish_texture(
             .descriptor_type(vk::DescriptorType::SAMPLER)
             .image_info(core::slice::from_ref(&sampler_descriptor)),
     ];
-    // SAFETY: the descriptor set and image objects belong to this live device.
+    // SAFETY: the descriptor set, view, and sampler belong to this live device.
     unsafe { device.update_descriptor_sets(&writes, &[]) };
-    NativeTexture {
-        image,
-        view,
-        allocation,
-        sampler,
-        binding,
-    }
 }
 
 struct TextureUpload<'a> {
     mips: &'a [ImageMip<'a>],
     image: vk::Image,
     total: u64,
+    cancellation: &'a std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl NativeContext {
@@ -59,59 +95,75 @@ impl NativeContext {
         request: &TextureUpload<'_>,
     ) -> Result<Vec<CompletionToken>, AllocationError> {
         let target = self.mapped_slice_mut(&mut upload)?;
+        let mut offsets = Vec::with_capacity(request.mips.len());
         let mut offset = 0_usize;
-        let mut regions = Vec::with_capacity(request.mips.len());
-        for (level, mip) in request.mips.iter().enumerate() {
-            target[offset..offset + mip.bytes.len()].copy_from_slice(mip.bytes);
-            regions.push(
-                vk::BufferImageCopy::default()
-                    .buffer_offset(offset as u64)
-                    .image_subresource(vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: u32::try_from(level)
-                            .map_err(|_| AllocationError::NativeFailure)?,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    })
-                    .image_extent(vk::Extent3D {
-                        width: mip.width,
-                        height: mip.height,
-                        depth: 1,
-                    }),
-            );
-            offset += mip.bytes.len();
+        for mip in request.mips {
+            let end = offset
+                .checked_add(mip.bytes.len())
+                .ok_or(AllocationError::NativeFailure)?;
+            target
+                .get_mut(offset..end)
+                .ok_or(AllocationError::NativeFailure)?
+                .copy_from_slice(mip.bytes);
+            offsets.push(offset as u64);
+            offset = end;
         }
         self.flush(&mut upload, 0, request.total)?;
+
         let first = self.next_texture_value;
-        self.next_texture_value = first
+        let next = first
             .checked_add(request.mips.len() as u64)
             .ok_or(AllocationError::NativeFailure)?;
-        let completions = (first..self.next_texture_value)
+        let completions = (first..next)
             .map(|value| CompletionToken::new(QueueKind::TextureTransfer, value))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| AllocationError::NativeFailure)?;
-        let completion = *completions.last().ok_or(AllocationError::NativeFailure)?;
-        let value = completion.value;
-        let submitted = self
+        let worker = self
             .texture_worker
             .as_ref()
-            .ok_or(AllocationError::NativeFailure)?
-            .submit(VulkanTransferJob {
-                value,
-                bytes: request.total,
+            .ok_or(AllocationError::NativeFailure)?;
+        let mut jobs = Vec::with_capacity(request.mips.len());
+        for (resident_index, level) in (0..request.mips.len()).rev().enumerate() {
+            let mip = &request.mips[level];
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(offsets[level])
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: u32::try_from(level).map_err(|_| AllocationError::NativeFailure)?,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width: mip.width,
+                    height: mip.height,
+                    depth: 1,
+                });
+            jobs.push(VulkanTransferJob {
+                value: completions[resident_index].value,
+                bytes: mip.bytes.len() as u64,
+                cancelled: Some(request.cancellation.clone()),
                 copy: VulkanTransferCopy::Texture {
                     source: upload.buffer,
                     destination: request.image,
-                    regions,
+                    region,
+                    initialized: false,
+                    stream_stage: u32::try_from(resident_index)
+                        .map_err(|_| AllocationError::NativeFailure)?,
                 },
             });
-        if let Err(error) = submitted {
-            self.free(upload)?;
+        }
+        // Atomic admission prevents a rejected fine mip from freeing an already-live coarse copy.
+        if let Err(error) = worker.submit_batch(jobs) {
+            self.texture_staging
+                .put(upload.allocation.size(), upload, None);
             return Err(match error {
                 ez_gfx_hal::TransferWorkerError::Full => AllocationError::OutOfMemory,
                 ez_gfx_hal::TransferWorkerError::Failed => AllocationError::NativeFailure,
             });
         }
+        // Rejected chains leave the accepted completion highwater unchanged.
+        self.next_texture_value = next;
+        let completion = *completions.last().ok_or(AllocationError::NativeFailure)?;
         let capacity = upload.allocation.size();
         self.texture_staging.put(capacity, upload, Some(completion));
         Ok(completions)
@@ -148,10 +200,11 @@ impl NativeContext {
         width: u32,
         height: u32,
         mip_count: u32,
+        format: TextureFormat,
     ) -> Result<(vk::Image, Allocation), AllocationError> {
         let create = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::R8G8B8A8_UNORM)
+            .format(texture_format_vk(format))
             .extent(vk::Extent3D {
                 width,
                 height,
@@ -205,26 +258,27 @@ impl NativeContext {
         Ok((image, allocation))
     }
 
-    /// Creates an RGBA8 mip chain and submits each level under a distinct timeline value.
+    /// Creates a sampled mip chain and submits each level under a distinct timeline value.
     ///
     /// # Errors
     ///
-    /// Returns an error if the mip chain or binding is invalid, anisotropy or required context state is unavailable, size or timeline arithmetic overflows, or image creation, upload allocation, synchronization, or Vulkan submission fails.
-    pub fn create_texture_rgba8(
+    /// Returns an error if the mip chain, format, or binding is invalid, required context state is
+    /// unavailable, arithmetic overflows, or native allocation/submission fails.
+    pub fn create_texture(
         &mut self,
+        format: TextureFormat,
         mips: &[ImageMip<'_>],
         binding: u32,
         sampler_desc: TextureSamplerDesc,
     ) -> Result<(NativeTexture, Vec<CompletionToken>), AllocationError> {
-        validate_rgba8_mips(mips).map_err(|_| AllocationError::ZeroSize)?;
+        validate_texture_mips(format, mips).map_err(|_| AllocationError::ZeroSize)?;
         if binding >= TEXTURE_DESCRIPTOR_CAPACITY {
             return Err(AllocationError::ZeroSize);
         }
         if sampler_desc.max_anisotropy > 1.0 && !self.sampler_anisotropy {
             return Err(AllocationError::NativeFailure);
         }
-        let descriptor_set = self
-            .texture_descriptor_set
+        self.texture_descriptor_set
             .ok_or(AllocationError::NativeFailure)?;
         let width = mips[0].width;
         let height = mips[0].height;
@@ -249,18 +303,20 @@ impl NativeContext {
             .as_ref()
             .ok_or(AllocationError::NativeFailure)?
             .clone();
-        let (image, allocation) = self.create_texture_image(&device, width, height, mip_count)?;
-        // SAFETY: `image` is a bound 2D RGBA8 image with `mip_count` levels, and the initialized view-info storage selects exactly that color range for `create_image_view`.
+        let (image, allocation) =
+            self.create_texture_image(&device, width, height, mip_count, format)?;
+        // SAFETY: the image is bound and the view initially selects only its coarsest mip. The
+        // descriptor remains unpublished until that mip's transfer-to-graphics handoff completes.
         let view = match unsafe {
             device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(vk::Format::R8G8B8A8_UNORM)
+                    .format(texture_format_vk(format))
                     .subresource_range(vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: mip_count,
+                        base_mip_level: mip_count - 1,
+                        level_count: 1,
                         base_array_layer: 0,
                         layer_count: 1,
                     }),
@@ -299,30 +355,214 @@ impl NativeContext {
                 }
             }
         };
-        let completions =
-            match self.upload_texture_mips(upload, &TextureUpload { mips, image, total }) {
-                Ok(completions) => completions,
-                Err(error) => {
-                    self.destroy_unpublished_texture(
-                        &device,
-                        image,
-                        Some(view),
-                        Some(sampler),
-                        allocation,
-                    );
-                    return Err(error);
-                }
-            };
-        let texture = publish_texture(
-            &device,
-            descriptor_set,
-            binding,
+        let cancellation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completions = match self.upload_texture_mips(
+            upload,
+            &TextureUpload {
+                mips,
+                image,
+                total,
+                cancellation: &cancellation,
+            },
+        ) {
+            Ok(completions) => completions,
+            Err(error) => {
+                self.destroy_unpublished_texture(
+                    &device,
+                    image,
+                    Some(view),
+                    Some(sampler),
+                    allocation,
+                );
+                return Err(error);
+            }
+        };
+        let texture = NativeTexture {
             image,
             view,
-            sampler,
             allocation,
-        );
+            sampler,
+            format,
+            width,
+            height,
+            mip_count,
+            resident_mips: 0,
+            mip_completions: completions.iter().rev().map(|token| token.value).collect(),
+            cancellation,
+            binding,
+        };
         Ok((texture, completions))
+    }
+    /// Copies one validated tightly packed region into its native mip.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid region, unavailable staging/device state, or failed queue
+    /// submission. Borrowed bytes are copied into reusable staging before this method returns.
+    pub fn update_texture_region(
+        &mut self,
+        texture: &mut NativeTexture,
+        region: &TextureRegion<'_>,
+    ) -> Result<CompletionToken, AllocationError> {
+        validate_texture_region(
+            texture.format,
+            texture.width,
+            texture.height,
+            texture.mip_count,
+            *region,
+        )
+        .map_err(|_| AllocationError::ZeroSize)?;
+        let size = region.bytes.len() as u64;
+        let bucket = ez_gfx_hal::staging_bucket_size(size, ez_gfx_hal::DEFAULT_STAGING_POLICY)
+            .map_err(|_| AllocationError::OutOfMemory)?;
+        let completed = self.completed_texture_transfer_value()?;
+        for stale in self.texture_staging.trim(completed) {
+            self.free(stale)?;
+        }
+        let request = AllocationRequest::new(bucket, 4, MemoryClass::Upload, true, None)
+            .map_err(|_| AllocationError::ZeroSize)?;
+        let mut upload = if let Some((_, upload)) = self.texture_staging.take(size, completed) {
+            upload
+        } else {
+            self.allocate(request)?
+        };
+        self.mapped_slice_mut(&mut upload)?
+            .get_mut(..region.bytes.len())
+            .ok_or(AllocationError::NativeFailure)?
+            .copy_from_slice(region.bytes);
+        self.flush(&mut upload, 0, size)?;
+
+        let value = self.next_texture_value;
+        let next = value.checked_add(1).ok_or(AllocationError::NativeFailure)?;
+        let completion = CompletionToken::new(QueueKind::TextureTransfer, value)
+            .map_err(|_| AllocationError::NativeFailure)?;
+        let copy = texture_region_copy(region)?;
+        let submitted = self
+            .texture_worker
+            .as_ref()
+            .ok_or(AllocationError::NativeFailure)?
+            .submit(VulkanTransferJob {
+                value,
+                bytes: size,
+                cancelled: Some(texture.cancellation.clone()),
+                copy: VulkanTransferCopy::Texture {
+                    source: upload.buffer,
+                    destination: texture.image,
+                    region: copy,
+                    initialized: true,
+                    stream_stage: 0,
+                },
+            });
+        if let Err(error) = submitted {
+            self.texture_staging
+                .put(upload.allocation.size(), upload, None);
+            return Err(match error {
+                ez_gfx_hal::TransferWorkerError::Full => AllocationError::OutOfMemory,
+                ez_gfx_hal::TransferWorkerError::Failed => AllocationError::NativeFailure,
+            });
+        }
+        self.next_texture_value = next;
+        self.texture_staging
+            .put(upload.allocation.size(), upload, Some(completion));
+        // Metadata uses image mip indices, including overwrites outside the current view.
+        texture.mip_completions[region.mip_level as usize] = value;
+        Ok(completion)
+    }
+
+    /// Publishes exactly the requested contiguous coarse mip range after transfer completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the range is invalid, its handoff has not completed, or creating the
+    /// replacement native view fails.
+    pub fn publish_texture_mips(
+        &mut self,
+        texture: &mut NativeTexture,
+        resident_mips: u32,
+    ) -> Result<(), AllocationError> {
+        let (base_mip_level, level_count) = resident_mip_range(texture.mip_count, resident_mips)
+            .ok_or(AllocationError::ZeroSize)?;
+        if resident_mips == texture.resident_mips {
+            return Ok(());
+        }
+        let first = usize::try_from(base_mip_level).map_err(|_| AllocationError::NativeFailure)?;
+        let required = texture.mip_completions[first..]
+            .iter()
+            .copied()
+            .max()
+            .ok_or(AllocationError::NativeFailure)?;
+        if self.completed_texture_transfer_value()? < required {
+            return Err(AllocationError::NativeFailure);
+        }
+        let device = self
+            .device
+            .as_ref()
+            .ok_or(AllocationError::NativeFailure)?
+            .clone();
+        let descriptor_set = self
+            .texture_descriptor_set
+            .ok_or(AllocationError::NativeFailure)?;
+        let view = if resident_mips == 1 && texture.resident_mips == 0 {
+            texture.view
+        } else {
+            // SAFETY: the complete image allocation contains every selected level, and transfer
+            // completion above establishes shader-readable layout and graphics-family ownership.
+            unsafe {
+                device.create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(texture.image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(texture_format_vk(texture.format))
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level,
+                            level_count,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        }),
+                    None,
+                )
+            }
+            .map_err(|error| map_allocation_vk(map_vk(error)))?
+        };
+        write_texture_descriptor(
+            &device,
+            descriptor_set,
+            texture.binding,
+            view,
+            texture.sampler,
+        );
+        if view != texture.view {
+            let old = core::mem::replace(&mut texture.view, view);
+            self.defer_resource(DeferredResource::TextureView(old))?;
+        }
+        texture.resident_mips = resident_mips;
+        Ok(())
+    }
+
+    /// Reports whether bindless descriptor rewrites can avoid every submitted frame.
+    pub fn texture_descriptor_update_ready(&self) -> bool {
+        self.in_flight_mask() == 0
+    }
+
+    /// Prevents transfer-owner jobs not yet recorded by the native queue from copying this texture.
+    pub fn cancel_texture_transfers(texture: &NativeTexture) {
+        texture
+            .cancellation
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Reports whether transfer and graphics-frame users have released a logically dead texture.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when native completion cannot be queried.
+    pub fn texture_retirement_ready(
+        &self,
+        completion: CompletionToken,
+    ) -> Result<bool, AllocationError> {
+        Ok(self.completed_texture_transfer_value()? >= completion.value
+            && self.in_flight_mask() == 0)
     }
 
     /// Defers texture destruction until every referencing frame completes.
@@ -528,8 +768,54 @@ impl NativeContext {
         let timeline = self
             .texture_timeline
             .ok_or(AllocationError::NativeFailure)?;
+
         // SAFETY: the timeline belongs to the retained live device.
         unsafe { device.get_semaphore_counter_value(timeline) }
             .map_err(|error| map_allocation_vk(map_vk(error)))
+    }
+}
+
+#[cfg(test)]
+#[path = "texture_tests.rs"]
+mod texture_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resident_views_expand_from_coarse_to_fine_without_exceeding_chain() {
+        assert_eq!(resident_mip_range(5, 1), Some((4, 1)));
+        assert_eq!(resident_mip_range(5, 3), Some((2, 3)));
+        assert_eq!(resident_mip_range(5, 5), Some((0, 5)));
+        assert_eq!(resident_mip_range(5, 0), None);
+        assert_eq!(resident_mip_range(5, 6), None);
+    }
+
+    #[test]
+    fn tightly_packed_region_preserves_compressed_block_extent_and_offset() {
+        let bytes = [0_u8; 32];
+        let copy = texture_region_copy(&TextureRegion {
+            mip_level: 2,
+            x: 4,
+            y: 8,
+            width: 8,
+            height: 4,
+            bytes: &bytes,
+        })
+        .unwrap();
+
+        assert_eq!(copy.buffer_row_length, 0);
+        assert_eq!(copy.buffer_image_height, 0);
+        assert_eq!(copy.image_subresource.mip_level, 2);
+        assert_eq!(copy.image_offset, vk::Offset3D { x: 4, y: 8, z: 0 });
+        assert_eq!(
+            copy.image_extent,
+            vk::Extent3D {
+                width: 8,
+                height: 4,
+                depth: 1,
+            }
+        );
     }
 }

@@ -642,9 +642,18 @@ impl NativeContext {
         }
         for action in actions {
             if let NativeFrameAction::Wait(token) = action {
+                if token.queue == QueueKind::TextureTransfer {
+                    // Texture work has a GPU event dependency; pending is valid, but fabricated
+                    // values and failed worker submission must fail before command encoding.
+                    self.completed_texture_transfer_value()
+                        .map_err(map_allocation_hal)?;
+                    if token.value >= self.next_texture_value {
+                        return Err(HalError::InvalidArgument);
+                    }
+                    continue;
+                }
                 let completed = match token.queue {
                     QueueKind::Transfer => self.completed_transfer_value(),
-                    QueueKind::TextureTransfer => self.completed_texture_transfer_value(),
                     _ => return Err(HalError::InvalidArgument),
                 }
                 .map_err(map_allocation_hal)?;
@@ -829,6 +838,7 @@ impl NativeContext {
         capture_presented: bool,
         mut surface: Option<&mut NativeSurface>,
     ) -> Result<Option<Vec<u8>>, HalError> {
+        self.drain_complete = false;
         command.commit();
         if readbacks.is_empty() {
             self.frame_slots[slot_index].command = Some(ThreadBound::new(command));
@@ -944,6 +954,24 @@ impl NativeContext {
         };
         let (presents, uses_surface) =
             self.validate_frame_plan(&mut surface, extent, actions, capture_presented)?;
+        // A failed producer must be rejected before allocating frame resources or queuing
+        // an event wait that could otherwise remain permanently unsignaled.
+        if let Some(required) = actions
+            .iter()
+            .filter_map(|action| match action {
+                NativeFrameAction::Wait(token) if token.queue == QueueKind::TextureTransfer => {
+                    Some(token.value)
+                }
+                _ => None,
+            })
+            .max()
+        {
+            self.texture_worker
+                .as_ref()
+                .ok_or(HalError::NotReady)?
+                .flush_through(required)
+                .map_err(|_| HalError::NativeFailure)?;
+        }
         let MetalFrameResources {
             slot_index,
             prepared_arguments,
@@ -972,6 +1000,15 @@ impl NativeContext {
             }
             return Err(HalError::NativeFailure);
         };
+        // Encode waits before opening any encoder. Updates have already committed their
+        // graphics release marker, so this cannot wait ahead of its own producer.
+        for action in actions {
+            if let NativeFrameAction::Wait(token) = action
+                && token.queue == QueueKind::TextureTransfer
+            {
+                command.encodeWaitForEvent_value(&self.texture_completion_event, token.value);
+            }
+        }
         let mut encoder = MetalFrameEncoder {
             command: &command,
             surface: surface.as_deref(),

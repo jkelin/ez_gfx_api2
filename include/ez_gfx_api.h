@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define EZ_GFX_ABI_VERSION 20u
+#define EZ_GFX_ABI_VERSION 23u
 
 #if defined(__clang__)
 #  if __has_attribute(access)
@@ -173,6 +173,9 @@ enum {
  * @EzGfxSourceTextureFormat_Png: PNG image bytes.
  * @EzGfxSourceTextureFormat_Tga: TGA image bytes.
  * @EzGfxSourceTextureFormat_Ktx2: KTX2 image bytes.
+ * @EzGfxSourceTextureFormat_Basis: Standalone Basis Universal bytes when built with optional Basis support.
+ * @EzGfxSourceTextureFormat_Dds: DDS image bytes with a legacy or DX10 header.
+ * @EzGfxSourceTextureFormat_Raw: Tightly packed mip bytes in the destination storage format; the destination must name a concrete format.
  *
  * Source image encoding.
  */
@@ -185,6 +188,9 @@ enum {
     EzGfxSourceTextureFormat_Png = 4,
     EzGfxSourceTextureFormat_Tga = 5,
     EzGfxSourceTextureFormat_Ktx2 = 6,
+    EzGfxSourceTextureFormat_Basis = 7,
+    EzGfxSourceTextureFormat_Dds = 8,
+    EzGfxSourceTextureFormat_Raw = 9,
 };
 
 /**
@@ -215,13 +221,33 @@ enum {
 
 /**
  * EzGfxTextureDestinationFormat:
- * @EzGfxTextureDestinationFormat_Rgba8Unorm: 8-bit normalized RGBA.
+ * @EzGfxTextureDestinationFormat_Rgba8Unorm: Linear 8-bit normalized RGBA.
+ * @EzGfxTextureDestinationFormat_Auto: Prefer an admitted native compressed format.
+ * @EzGfxTextureDestinationFormat_Rgba8Srgb: sRGB 8-bit normalized RGBA.
+ * @EzGfxTextureDestinationFormat_Bc1Unorm: Linear BC1.
+ * @EzGfxTextureDestinationFormat_Bc1Srgb: sRGB BC1.
+ * @EzGfxTextureDestinationFormat_Bc3Unorm: Linear BC3.
+ * @EzGfxTextureDestinationFormat_Bc3Srgb: sRGB BC3.
+ * @EzGfxTextureDestinationFormat_Bc7Unorm: Linear BC7.
+ * @EzGfxTextureDestinationFormat_Bc7Srgb: sRGB BC7.
+ * @EzGfxTextureDestinationFormat_Astc4x4Unorm: Linear ASTC 4x4.
+ * @EzGfxTextureDestinationFormat_Astc4x4Srgb: sRGB ASTC 4x4.
  *
  * Destination texture format.
  */
 typedef uint8_t EzGfxTextureDestinationFormat;
 enum {
     EzGfxTextureDestinationFormat_Rgba8Unorm = 0,
+    EzGfxTextureDestinationFormat_Auto = 1,
+    EzGfxTextureDestinationFormat_Rgba8Srgb = 2,
+    EzGfxTextureDestinationFormat_Bc1Unorm = 3,
+    EzGfxTextureDestinationFormat_Bc1Srgb = 4,
+    EzGfxTextureDestinationFormat_Bc3Unorm = 5,
+    EzGfxTextureDestinationFormat_Bc3Srgb = 6,
+    EzGfxTextureDestinationFormat_Bc7Unorm = 7,
+    EzGfxTextureDestinationFormat_Bc7Srgb = 8,
+    EzGfxTextureDestinationFormat_Astc4x4Unorm = 9,
+    EzGfxTextureDestinationFormat_Astc4x4Srgb = 10,
 };
 
 /**
@@ -359,9 +385,9 @@ typedef struct EzGfxShaderDesc {
  * EzGfxTextureDesc:
  * @source_format: Value from EzGfxSourceTextureFormat.
  * @destination_format: Value from EzGfxTextureDestinationFormat.
- * @width: Decoded width for raw pixels.
- * @height: Decoded height for raw pixels.
- * @mip_count: Number of mip levels, or zero for decoder defaults.
+ * @width: Decoded width for raw pixels and Raw ingestion.
+ * @height: Decoded height for raw pixels and Raw ingestion.
+ * @mip_count: Number of mip levels, zero for decoder defaults; Raw requires an explicit nonzero count.
  * @generate_mips: Non-zero requests mip generation.
  * @min_filter: Value from EzGfxTextureFilter.
  * @mag_filter: Value from EzGfxTextureFilter.
@@ -390,6 +416,56 @@ typedef struct EzGfxTextureDesc {
     const char * debug_label;
     size_t debug_label_length;
 } EzGfxTextureDesc;
+
+/** One decoded custom texture mip retained until the release callback. */
+typedef struct EzGfxDecodedTextureMip {
+    uint32_t width;
+    uint32_t height;
+    const uint8_t *data;
+    size_t data_size;
+} EzGfxDecodedTextureMip;
+
+/** Custom decoder output copied before its release callback is invoked. */
+typedef struct EzGfxDecodedTexture {
+    EzGfxTextureDestinationFormat format;
+    uint32_t mip_count;
+    const EzGfxDecodedTextureMip *mips;
+} EzGfxDecodedTexture;
+
+/** Borrowed bytes and destination rectangle for one asynchronous texture update. */
+typedef struct EzGfxTextureRegionDesc {
+    uint32_t mip_level;
+    uint32_t x;
+    uint32_t y;
+    uint32_t width;
+    uint32_t height;
+    const uint8_t *data;
+    size_t data_size;
+} EzGfxTextureRegionDesc;
+
+/** Monotonic context-wide asynchronous texture pipeline counters. */
+typedef struct EzGfxTextureUploadTelemetry {
+    uint64_t decode_microseconds;
+    uint64_t staging_bytes;
+    uint64_t queue_latency_microseconds;
+    uint64_t handoff_latency_microseconds;
+} EzGfxTextureUploadTelemetry;
+
+/**
+ * Concurrent custom decoder callback. `compression_support` uses bit 0 for BC and bit 1 for ASTC.
+ * On success, output pointers must remain valid until `EzGfxTextureDecoderReleaseCallback`.
+ */
+typedef EzGfxResult (*EzGfxTextureDecoderCallback)(
+    const uint8_t *data,
+    size_t data_size,
+    uint8_t compression_support,
+    EzGfxDecodedTexture *out_texture,
+    void *user_data);
+
+/** Releases one successful custom decoder output after ez-gfx copies it. */
+typedef void (*EzGfxTextureDecoderReleaseCallback)(
+    const EzGfxDecodedTexture *texture,
+    void *user_data);
 
 /**
  * EzGfxBinding:
@@ -588,14 +664,24 @@ EzGfxResult ez_gfx_shader_load_artifact(const uint8_t *data, size_t data_size, E
 void ez_gfx_shader_destroy(EzGfxShader shader, EzGfxContext context);
 /** Decodes validated image/KTX2 bytes, including BasisLZ ETC1S and UASTC payloads, then starts an asynchronous GPU upload. */
 EzGfxResult ez_gfx_texture_load(const uint8_t *data, size_t data_size, const EzGfxTextureDesc *desc, EzGfxTexture *out_texture, EzGfxContext context) EZ_GFX_ACCESS(read_only, 1, 2) EZ_GFX_ACCESS(read_only, 3) EZ_GFX_ACCESS(write_only, 4);
+/** Registers one concurrent custom decoder for a source code in 128..=255. */
+EzGfxResult ez_gfx_texture_decoder_register(EzGfxSourceTextureFormat source_format, EzGfxTextureDecoderCallback callback, EzGfxTextureDecoderReleaseCallback release, void *user_data);
+/** Unregisters a custom decoder; already accepted requests retain their callback. */
+EzGfxResult ez_gfx_texture_decoder_unregister(EzGfxSourceTextureFormat source_format);
+/** Copies and asynchronously uploads one validated texture sub-rectangle. */
+EzGfxResult ez_gfx_update_texture_region(EzGfxTexture texture, const EzGfxTextureRegionDesc *desc, EzGfxContext context) EZ_GFX_ACCESS(read_only, 2);
+/** Returns monotonic context-wide asynchronous texture pipeline counters. */
+EzGfxResult ez_gfx_texture_get_upload_telemetry(EzGfxTextureUploadTelemetry *out_telemetry, EzGfxContext context) EZ_GFX_ACCESS(write_only, 1);
 /** Polls decode and GPU transfer readiness without blocking. */
 EzGfxResult ez_gfx_texture_poll(EzGfxTexture texture, EzGfxContext context);
-/** Cancels a texture before native transfer submission. */
+/** Cancels a texture before or after transfer-worker admission without waiting for GPU completion. */
 EzGfxResult ez_gfx_texture_cancel(EzGfxTexture texture, EzGfxContext context);
 /** Returns the stable bindless index once upload completion makes the texture resident. */
 EzGfxResult ez_gfx_texture_get_binding(EzGfxTexture texture, uint32_t *out_binding, EzGfxContext context) EZ_GFX_ACCESS(write_only, 2);
 /** Reports completed mip residency and the immutable decoded mip count; resident may be zero while transfers are pending. */
 EzGfxResult ez_gfx_texture_get_residency(EzGfxTexture texture, uint32_t *out_resident_mips, uint32_t *out_total_mips, EzGfxContext context) EZ_GFX_ACCESS(write_only, 2) EZ_GFX_ACCESS(write_only, 3);
+/** Sets the contiguous coarse mip count exposed through the stable binding; returns NotReady while required uploads or safe descriptor rewrites remain pending. */
+EzGfxResult ez_gfx_texture_set_residency(EzGfxTexture texture, uint32_t resident_mips, EzGfxContext context);
 /** Invalidates the handle and releases owned GPU storage. */
 void ez_gfx_texture_unload(EzGfxTexture texture, EzGfxContext context);
 /** Begins and resets one presented-surface frame; use instead of ez_gfx_frame_begin. */

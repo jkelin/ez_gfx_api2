@@ -121,6 +121,7 @@ mod renderer {
                 width: 1,
                 height: 1,
                 mip_count: 0,
+                destination: ez_gfx::TextureDestination::Rgba8Unorm,
                 sampler: repeat_sampler,
             };
             let fallback = load_texture(
@@ -149,6 +150,7 @@ mod renderer {
                     width: 0,
                     height: 0,
                     mip_count: 0,
+                    destination: ez_gfx::TextureDestination::Rgba8Unorm,
                     sampler: TextureSamplerDesc {
                         max_anisotropy: 16.0,
                         ..repeat_sampler

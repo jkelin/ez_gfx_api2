@@ -123,6 +123,7 @@ fn initialize_context(
         transfer_worker: Some(transfer_worker),
         texture_worker: Some(texture_worker),
         next_fence: 1,
+        idle_drained: false,
         allocator: Some(allocator),
         next_transfer_fence: 1,
         next_texture_fence: 1,
@@ -278,16 +279,23 @@ impl NativeContext {
     ///
     /// Returns an error if the fence counter overflows, fence signaling or event registration fails, or deferred resource reclamation fails.
     pub fn wait_idle(&mut self) -> Result<(), HalError> {
-        self.transfer_worker
-            .as_ref()
-            .ok_or(HalError::NativeFailure)?
-            .flush()
-            .map_err(|_| HalError::NativeFailure)?;
-        self.texture_worker
-            .as_ref()
-            .ok_or(HalError::NativeFailure)?
-            .flush()
-            .map_err(|_| HalError::NativeFailure)?;
+        self.idle_drained = false;
+        let mut native_drained = true;
+        let mut worker_failed = false;
+        for worker in [&mut self.transfer_worker, &mut self.texture_worker] {
+            if let Some(worker) = worker {
+                if worker.flush().is_err() {
+                    // Terminal cleanup drains actual COPY/DIRECT submissions, not
+                    // the application completion a failed callback never signaled.
+                    worker.shutdown();
+                    native_drained &= worker.drained();
+                    worker_failed = true;
+                }
+            } else {
+                worker_failed = true;
+                native_drained = false;
+            }
+        }
         let value = self.next_fence;
         self.next_fence = self
             .next_fence
@@ -303,8 +311,20 @@ impl NativeContext {
             // SAFETY: WaitForSingleObject receives fence_event, a waitable event HANDLE returned by CreateEventW, and exclusive self access keeps it unclosed for the wait.
             unsafe { WaitForSingleObject(self.fence_event, INFINITE) };
         }
+        // SAFETY: the retained graphics fence reports device removal as u64::MAX.
+        if unsafe { self.fence.GetCompletedValue() } == u64::MAX {
+            return Err(HalError::DeviceLost);
+        }
         // SAFETY: both transfer fences belong to this live device and their workers retain them.
-        let transfer_value = self.next_transfer_fence.saturating_sub(1);
+        let transfer_value = if self
+            .transfer_worker
+            .as_ref()
+            .is_some_and(ez_gfx_hal::TransferWorker::failed)
+        {
+            0
+        } else {
+            self.next_transfer_fence.saturating_sub(1)
+        };
         // SAFETY: the transfer fence remains live while polling its worker's terminal value.
         let mut transfer_completed = unsafe { self.transfer_fence.GetCompletedValue() };
         while transfer_value != 0 && transfer_completed < transfer_value {
@@ -330,10 +350,16 @@ impl NativeContext {
         if transfer_completed == u64::MAX {
             return Err(HalError::DeviceLost);
         }
-        self.reclaim(QueueKind::Transfer, transfer_value)
-            .map_err(|_| HalError::NativeFailure)?;
         // SAFETY: the texture fence remains live while the context owns it.
-        let texture_value = self.next_texture_fence.saturating_sub(1);
+        let texture_value = if self
+            .texture_worker
+            .as_ref()
+            .is_some_and(ez_gfx_hal::TransferWorker::failed)
+        {
+            0
+        } else {
+            self.next_texture_fence.saturating_sub(1)
+        };
         // SAFETY: the texture fence remains live while polling its worker's terminal value.
         let mut texture_completed = unsafe { self.texture_fence.GetCompletedValue() };
         while texture_value != 0 && texture_completed < texture_value {
@@ -359,11 +385,23 @@ impl NativeContext {
         if texture_completed == u64::MAX {
             return Err(HalError::DeviceLost);
         }
+        self.idle_drained = native_drained;
+        if worker_failed {
+            return Err(HalError::NativeFailure);
+        }
+        self.reclaim(QueueKind::Transfer, transfer_value)
+            .map_err(|_| HalError::NativeFailure)?;
         self.reclaim(QueueKind::TextureTransfer, texture_value)
             .map_err(|_| HalError::NativeFailure)?;
         self.reclaim_deferred()
             .map_err(|_| HalError::NativeFailure)?;
         Ok(())
+    }
+
+    /// Reports whether the last idle attempt proved native storage safe to release.
+    /// Call `wait_idle` immediately before consulting this terminal-cleanup status.
+    pub const fn is_drained(&self) -> bool {
+        self.idle_drained
     }
 
     ///
