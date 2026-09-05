@@ -395,18 +395,6 @@ fn native_texture_retirement_ready(
     }
 }
 
-fn native_texture_descriptor_update_ready(
-    context: &NativeContext,
-) -> Result<bool, ez_gfx_hal::AllocationError> {
-    match context {
-        NativeContext::Vulkan(context) => Ok(context.texture_descriptor_update_ready()),
-        #[cfg(windows)]
-        NativeContext::Dx12(context) => context.texture_descriptor_update_ready(),
-        #[cfg(target_vendor = "apple")]
-        NativeContext::Metal(context) => Ok(context.texture_descriptor_update_ready()),
-    }
-}
-
 fn reclaim_retired_textures(context: &mut ContextState) -> Result<(), EzGfxResult> {
     let mut index = 0;
     while index < context.retired_textures.len() {
@@ -490,9 +478,21 @@ fn advance_texture_residency(
             (target != published && ready <= completed).then_some((*handle, target))
         })
         .collect::<Vec<_>>();
-    if !advances.is_empty()
-        && !native_texture_descriptor_update_ready(&context.native).map_err(map_allocation)?
-    {
+    if advances.is_empty() {
+        return Ok(());
+    }
+
+    // Only DX12's descriptor fence query can fail; preserve its device-loss error.
+    let descriptors_ready = match &context.native {
+        NativeContext::Vulkan(context) => context.texture_descriptor_update_ready(),
+        #[cfg(windows)]
+        NativeContext::Dx12(context) => context
+            .texture_descriptor_update_ready()
+            .map_err(map_allocation)?,
+        #[cfg(target_vendor = "apple")]
+        NativeContext::Metal(context) => context.texture_descriptor_update_ready(),
+    };
+    if !descriptors_ready {
         return Ok(());
     }
     for (handle, resident_mips) in advances {

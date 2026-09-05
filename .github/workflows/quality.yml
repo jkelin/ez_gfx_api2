@@ -103,6 +103,8 @@ jobs:
 
       # The implementation currently exposes only Win32 Vulkan surfaces, so Linux
       # proves Lavapipe availability but explicitly compiles, rather than faking, runtime coverage.
+      # Texture GPU regressions require admitted hardware, unavailable on hosted
+      # Lavapipe/SwiftShader. Keep them compiled; execute them on real GPU machines.
       - name: Require Linux Lavapipe capability
         if: matrix.backend == 'vulkan-linux'
         shell: bash
@@ -125,10 +127,11 @@ jobs:
             exit 1
           fi
           VK_DRIVER_FILES="$lavapipe_icd" vulkaninfo --summary
-      - name: Test Linux Vulkan backend; compile unsupported native runtime suites
+      - name: Test Linux Vulkan device-independent contracts; compile native GPU suites
         if: matrix.backend == 'vulkan-linux'
         run: |
-          cargo nextest run -p ez-gfx-backend-vulkan --lib
+          cargo nextest run -p ez-gfx-backend-vulkan --lib -E 'not test(texture::texture_tests::)'
+          cargo nextest run -p ez-gfx-backend-vulkan --lib -E 'test(texture::texture_tests::)' --no-run
           cargo nextest run -p ez-gfx-backend-vulkan --test native_init --no-run
           cargo nextest run -p ez-gfx-examples --test smoke --no-run
           cargo build -p ez-gfx-backend-vulkan
@@ -148,10 +151,12 @@ jobs:
         env:
           VK_DRIVER_FILES: C:\swiftshader\vk_swiftshader_icd.json
         run: vulkaninfoSDK.exe --summary
-      - name: Test Windows Vulkan backend library contracts
+      - name: Test Windows Vulkan device-independent library contracts
         if: matrix.backend == 'vulkan-windows'
         timeout-minutes: 20
-        run: cargo nextest run -p ez-gfx-backend-vulkan --lib
+        run: |
+          cargo nextest run -p ez-gfx-backend-vulkan --lib -E 'not test(texture::texture_tests::)'
+          cargo nextest run -p ez-gfx-backend-vulkan --lib -E 'test(texture::texture_tests::)' --no-run
       - name: Test Windows Vulkan ez-gfx library contracts
         if: matrix.backend == 'vulkan-windows'
         timeout-minutes: 20
