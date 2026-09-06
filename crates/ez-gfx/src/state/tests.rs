@@ -64,6 +64,7 @@ fn graphics_pipeline_keys_include_state_attachment_and_texture_interface() {
     );
 }
 
+#[cfg(windows)]
 fn texture_config() -> TextureConfig {
     TextureConfig {
         width: 1,
@@ -81,6 +82,8 @@ fn texture_config() -> TextureConfig {
     }
 }
 
+// The native Vulkan context currently requires Win32 support.
+#[cfg(windows)]
 #[test]
 fn texture_admission_is_nonblocking_and_pending_cancellation_invalidates_the_handle() {
     let context =
@@ -144,6 +147,8 @@ fn texture_region_validation_and_update_backpressure_are_stable() {
     );
 }
 
+// The native Vulkan context currently requires Win32 support.
+#[cfg(windows)]
 #[test]
 fn first_coarse_publication_records_handoff_telemetry_once() {
     let context =
