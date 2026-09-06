@@ -20,8 +20,8 @@ use ez_gfx::{
     StructuredBufferHandle, SurfaceHandle, SurfaceOptions, SurfacePlatform, TextureHandle,
 };
 
-/// Identifies C ABI revision 23 for compatibility checks.
-pub const EZ_GFX_ABI_VERSION: u32 = 23;
+/// Identifies C ABI revision 24 for compatibility checks.
+pub const EZ_GFX_ABI_VERSION: u32 = 24;
 /// Caps any caller-provided byte range at 16 MiB.
 pub const EZ_GFX_MAX_BOUNDARY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -59,7 +59,8 @@ pub unsafe extern "C" fn ez_gfx_context_create(
             desc.enable_debug,
             desc.enable_validation,
             desc.surface_platform,
-        ) else {
+        )
+        .map(|options| options.with_texture_decode_workers(desc.texture_decode_workers)) else {
             return EzGfxResult::InvalidArgument;
         };
         match ez_gfx::create_context(options) {
@@ -100,7 +101,8 @@ pub unsafe extern "C" fn ez_gfx_context_create_backend(
             desc.enable_validation,
             desc.surface_platform,
             backend,
-        ) else {
+        )
+        .map(|options| options.with_texture_decode_workers(desc.texture_decode_workers)) else {
             return EzGfxResult::InvalidArgument;
         };
         match ez_gfx::create_context(options) {

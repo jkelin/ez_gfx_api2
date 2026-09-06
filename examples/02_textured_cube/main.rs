@@ -248,6 +248,7 @@ impl LifecycleCallbacks for Example {
             enable_validation: env_flag("EZ_GFX_EXAMPLE_VALIDATION")?,
             surface_platform: platform,
             backend,
+            texture_decode_workers: 0,
         })
         .map_err(|error| anyhow::anyhow!("{error:?}"))
         .with_context(|| format!("create {backend_name} context"))?;

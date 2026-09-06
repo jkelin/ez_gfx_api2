@@ -255,7 +255,7 @@ fn exercise_case(
         unload_texture(context, texture);
         assert_abi_odd_base_unsupported(context, &decoder, format, &pixels.initial);
         drop(decoder);
-        exercise_odd_mip(context, quad, format, config);
+        exercise_odd_mip(backend, context, quad, format, config);
         return;
     }
     if backend != 3
@@ -271,33 +271,36 @@ fn exercise_case(
         return;
     }
     assert_eq!(status, EzGfxResult::Ok, "{format:?} upload failed");
+    if format.is_compressed() {
+        // Direct captures have no RGBA texel grid for compressed blocks; sampling
+        // stays available through shaders, but enqueueing must fail identically
+        // on every backend.
+        assert_eq!(
+            frame_enqueue_readback(context, texture),
+            EzGfxResult::InvalidArgument,
+            "{format:?} compressed readback"
+        );
+    }
     quad.draw(texture, true);
     let before = frame_readback(context).unwrap();
     assert_halves(&before, format, 0, width);
+    if format == TextureFormat::Rgba8Unorm {
+        // The direct copy must return the stored texels byte-for-byte.
+        assert_eq!(quad.readback_direct(texture), pixels.initial);
+    }
     #[cfg(target_vendor = "apple")]
     if width == 8 {
         ingestion::direct(context, quad, format, &config, &pixels.initial, &before);
     }
 
     if backend == 1 && format == TextureFormat::Bc1Unorm && width == 8 {
-        // Vulkan retains the submitted slot until owner-thread frame reclamation.
-        // This forces the real descriptor-publication gate even after copies complete.
+        // A submitted frame gates descriptor publication, but finished GPU work must
+        // unblock polling on its own: the shared path reaps completed slots before
+        // consulting the gate, so no wait_idle round-trip is required here.
         quad.draw(texture, false);
         let pending =
             load_texture(context, decoder.source(), &pixels.initial, false, &config).unwrap();
-        let deadline = Instant::now() + Duration::from_millis(100);
-        while Instant::now() < deadline {
-            assert_eq!(poll_texture_load(context, pending), EzGfxResult::NotReady);
-            assert_eq!(
-                texture_binding(context, pending),
-                Err(EzGfxResult::NotReady)
-            );
-            if let Ok((resident, total)) = texture_residency(context, pending) {
-                assert_eq!((resident, total), (0, 1));
-            }
-            std::thread::yield_now();
-        }
-        assert_eq!(wait_idle(context), EzGfxResult::Ok);
+        // The reap must unblock this with polling alone: `await` never idles.
         await_texture(context, pending);
         assert_eq!(texture_residency(context, pending), Ok((1, 1)));
         quad.draw(pending, true);
@@ -308,7 +311,7 @@ fn exercise_case(
     exercise_retirement(context, quad, texture, &decoder, &config, &pixels, &after);
     if backend == 3 && width == 8 && format != TextureFormat::Rgba8Unorm {
         // Exercise real clipped mips independently of whether Metal accepts an odd BC base.
-        exercise_odd_mip(context, quad, format, config);
+        exercise_odd_mip(backend, context, quad, format, config);
     }
 }
 
@@ -565,6 +568,7 @@ fn assert_abi_odd_base_unsupported(
 }
 
 fn exercise_odd_mip(
+    backend: u8,
     context: ContextHandle,
     quad: &Quad,
     format: TextureFormat,
@@ -657,6 +661,66 @@ fn exercise_odd_mip(
         );
         assert_eq!(texture_residency(context, texture), Ok((1, 3)));
     }
+    exercise_promoted_mips(context, quad, texture, format, &after);
+    assert_eq!(wait_idle(context), EzGfxResult::Ok);
+    assert_eq!(set_texture_residency(context, texture, 1), EzGfxResult::Ok);
+    assert_eq!(texture_residency(context, texture), Ok((1, 3)));
+    // Compressed captures fail terminally even while demoted: the terminal
+    // rejection takes precedence over the transient residency state.
+    assert_eq!(
+        frame_enqueue_readback(context, texture),
+        EzGfxResult::InvalidArgument
+    );
+    quad.draw(texture, true);
+    assert_eq!(
+        frame_readback(context).unwrap(),
+        edge,
+        "{format:?} demoted mip pixels"
+    );
+    if backend == 2 {
+        exercise_destroy_fence_retry(context, &decoder, &config, &bytes, texture, format);
+    }
+    quad.draw(texture, false);
+    unload_texture(context, texture);
+    assert_stale(context, texture, &green);
+    assert_eq!(wait_idle(context), EzGfxResult::Ok);
+}
+
+fn exercise_destroy_fence_retry(
+    context: ContextHandle,
+    decoder: &Decoder,
+    config: &TextureConfig,
+    bytes: &[u8],
+    texture: TextureHandle,
+    format: TextureFormat,
+) {
+    // Destroying textures advances the graphics fence independently of submitted
+    // frames. The very next publish races that fence signal: it must stay
+
+    // retryable (`NotReady`, eventually `Ok`) and never surface terminal
+    // `NativeFailure` for transient fence state.
+    for _ in 0..2 {
+        let spare = load_texture(context, decoder.source(), bytes, false, config).unwrap();
+        await_texture(context, spare);
+        unload_texture(context, spare);
+    }
+    assert_ne!(
+        set_texture_residency(context, texture, 3),
+        EzGfxResult::NativeFailure,
+        "{format:?} destroy-driven fence must stay retryable"
+    );
+    assert_eq!(wait_idle(context), EzGfxResult::Ok);
+    assert_eq!(set_texture_residency(context, texture, 3), EzGfxResult::Ok);
+}
+fn exercise_promoted_mips(
+    context: ContextHandle,
+    quad: &Quad,
+    texture: TextureHandle,
+    format: TextureFormat,
+    after: &[u8],
+) {
+    // Promotion must expose uploaded finer mips, not keep sampling the edited coarse mip.
+    // Both finer levels are uniformly green; demotion must preserve both clipped-edge updates.
     for resident in [2, 3] {
         assert_eq!(wait_idle(context), EzGfxResult::Ok);
         assert_eq!(
@@ -669,19 +733,6 @@ fn exercise_odd_mip(
             assert_eq!(pixel, &after[..4], "{format:?} promoted mip pixels");
         }
     }
-    assert_eq!(wait_idle(context), EzGfxResult::Ok);
-    assert_eq!(set_texture_residency(context, texture, 1), EzGfxResult::Ok);
-    assert_eq!(texture_residency(context, texture), Ok((1, 3)));
-    quad.draw(texture, true);
-    assert_eq!(
-        frame_readback(context).unwrap(),
-        edge,
-        "{format:?} demoted mip pixels"
-    );
-    quad.draw(texture, false);
-    unload_texture(context, texture);
-    assert_stale(context, texture, &green);
-    assert_eq!(wait_idle(context), EzGfxResult::Ok);
 }
 
 fn await_texture(context: ContextHandle, texture: TextureHandle) {
@@ -1012,6 +1063,17 @@ impl Quad {
     fn draw(&self, texture: TextureHandle, capture: bool) {
         self.record(texture_binding(self.context, texture).unwrap(), capture);
         assert_eq!(finish_render(self.context), EzGfxResult::Ok);
+    }
+    fn readback_direct(&self, texture: TextureHandle) -> Vec<u8> {
+        // A surfaceless capture exercises the native texture-copy path rather
+        // than surface sampling.
+        assert_eq!(begin_render(self.context, self.surface), EzGfxResult::Ok);
+        assert_eq!(
+            frame_enqueue_readback(self.context, texture),
+            EzGfxResult::Ok
+        );
+        assert_eq!(finish_render(self.context), EzGfxResult::Ok);
+        frame_readback(self.context).unwrap()
     }
 
     fn record(&self, texture_id: u32, capture: bool) {

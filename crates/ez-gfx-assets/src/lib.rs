@@ -416,6 +416,10 @@ impl CpuPool {
             bytes: Arc::new(AtomicUsize::new(0)),
         })
     }
+    /// Returns the worker thread count backing this pool.
+    pub fn thread_count(&self) -> usize {
+        self.pool.current_num_threads()
+    }
     fn permit(&self, bytes: usize) -> Result<JobPermit, AssetError> {
         if bytes > self.max_bytes {
             return Err(AssetError::QueueFull);

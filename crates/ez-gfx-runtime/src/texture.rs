@@ -379,6 +379,11 @@ impl PreparedTextureDecode {
 
 /// Existing RGBA8 mip chains are preserved; one valid level is box-filtered to one pixel.
 ///
+/// Each output texel covers its proportional source extent, so trailing odd
+/// rows and columns contribute instead of being dropped. sRGB channels are
+/// decoded to linear light, averaged, and re-encoded; alpha stays a straight
+/// linear mean under the codebase's straight-alpha policy.
+///
 /// # Errors
 ///
 /// Returns an error if the mip data is invalid, compressed, or exceeds supported limits.
@@ -387,42 +392,86 @@ pub fn generate_mips(texture: DecodedTexture) -> Result<DecodedTexture, TextureE
     if texture.mip_count > 1 {
         return Ok(texture);
     }
-    if !matches!(
-        texture.format,
-        TextureFormat::Rgba8Unorm | TextureFormat::Rgba8Srgb
-    ) {
-        return Err(TextureError::Unsupported);
-    }
-    while texture
-        .mips
-        .last()
-        .is_some_and(|mip| mip.width > 1 || mip.height > 1)
-    {
-        let source = texture.mips.last().ok_or(TextureError::InvalidData)?;
-        let width = (source.width / 2).max(1);
-        let height = (source.height / 2).max(1);
-        let byte_count = (width as usize)
-            .checked_mul(height as usize)
-            .and_then(|pixels| pixels.checked_mul(4))
+    let srgb = match texture.format {
+        TextureFormat::Rgba8Unorm => false,
+        TextureFormat::Rgba8Srgb => true,
+        _ => return Err(TextureError::Unsupported),
+    };
+    // Precompute the generated geometry and validate the full aggregate budget
+    // before allocating any level.
+    let first = texture.mips.first().ok_or(TextureError::InvalidData)?;
+    let mut chain = Vec::with_capacity(16);
+    let mut total = texture
+        .format
+        .level_bytes(first.width, first.height)
+        .ok_or(TextureError::TooLarge)?;
+    let (mut width, mut height) = (first.width, first.height);
+    while width > 1 || height > 1 {
+        width = (width / 2).max(1);
+        height = (height / 2).max(1);
+        let bytes = texture
+            .format
+            .level_bytes(width, height)
             .ok_or(TextureError::TooLarge)?;
+        total = total
+            .checked_add(bytes)
+            .filter(|total| *total <= MAX_TEXTURE_BYTES as u64)
+            .ok_or(TextureError::TooLarge)?;
+        chain.push((width, height, bytes));
+    }
+    // A 256-entry table keeps sRGB decoding exact without per-texel conversion branches.
+    let mut linear_table = [0.0; 256];
+    for (value, slot) in linear_table.iter_mut().enumerate() {
+        let byte = u8::try_from(value).map_err(|_| TextureError::TooLarge)?;
+        *slot = srgb_to_linear(byte);
+    }
+    for (width, height, bytes) in chain {
+        let source = texture.mips.last().ok_or(TextureError::InvalidData)?;
+        let byte_count = usize::try_from(bytes).map_err(|_| TextureError::TooLarge)?;
         let mut rgba8 = Vec::with_capacity(byte_count);
         for y in 0..height {
             for x in 0..width {
-                let mut sum = [0_u32; 4];
+                let (x_start, x_end) = span(x, source.width, width)?;
+                let (y_start, y_end) = span(y, source.height, height)?;
+                let mut sum = [0_u64; 3];
+                let mut linear = [0.0; 3];
+                let mut alpha = 0_u32;
                 let mut samples = 0_u32;
-                for source_y in y * 2..(y * 2 + 2).min(source.height) {
-                    for source_x in x * 2..(x * 2 + 2).min(source.width) {
-                        let offset =
-                            ((source_y as usize * source.width as usize) + source_x as usize) * 4;
+                for source_y in y_start..y_end {
+                    for source_x in x_start..x_end {
+                        let offset = usize::try_from(
+                            (u64::from(source_y) * u64::from(source.width) + u64::from(source_x))
+                                .checked_mul(4)
+                                .ok_or(TextureError::TooLarge)?,
+                        )
+                        .map_err(|_| TextureError::TooLarge)?;
                         for (channel, value) in sum.iter_mut().enumerate() {
-                            *value += u32::from(source.bytes[offset + channel]);
+                            let byte = source.bytes[offset + channel];
+                            *value += u64::from(byte);
+                            if srgb {
+                                linear[channel] += linear_table[usize::from(byte)];
+                            }
                         }
+                        alpha += u32::from(source.bytes[offset + 3]);
                         samples += 1;
                     }
                 }
-                for value in sum {
-                    rgba8.push(u8::try_from(value / samples).map_err(|_| TextureError::TooLarge)?);
+                if samples == 0 {
+                    return Err(TextureError::InvalidData);
                 }
+                let count = u64::from(samples);
+                for (channel, value) in sum.iter().enumerate() {
+                    let encoded = if srgb {
+                        linear_to_srgb(linear[channel] / f64::from(samples))
+                    } else {
+                        // Integer round-half-up matches float round-half-away on
+                        // non-negative means; the quotient cannot exceed 255.
+                        u8::try_from((2 * value + count) / (2 * count))
+                            .map_err(|_| TextureError::TooLarge)?
+                    };
+                    rgba8.push(encoded);
+                }
+                rgba8.push(u8::try_from(alpha / samples).map_err(|_| TextureError::TooLarge)?);
             }
         }
         texture.mips.push(DecodedMip {
@@ -432,7 +481,52 @@ pub fn generate_mips(texture: DecodedTexture) -> Result<DecodedTexture, TextureE
         });
     }
     texture.mip_count = u32::try_from(texture.mips.len()).map_err(|_| TextureError::TooLarge)?;
+
     Ok(texture)
+}
+
+/// Sections one output texel's source span; the final texel in the axis
+/// absorbs any odd remainder so the full extent contributes.
+///
+/// # Errors
+///
+/// Returns [`TextureError::TooLarge`] when a bound exceeds the 32-bit range.
+fn span(index: u32, source: u32, out: u32) -> Result<(u32, u32), TextureError> {
+    let start = u64::from(index) * u64::from(source) / u64::from(out);
+    let end = ((u64::from(index) + 1) * u64::from(source) / u64::from(out)).max(start + 1);
+    Ok((
+        u32::try_from(start).map_err(|_| TextureError::TooLarge)?,
+        u32::try_from(end).map_err(|_| TextureError::TooLarge)?,
+    ))
+}
+
+/// Decodes one sRGB byte to linear light (IEC 61966-2-1).
+fn srgb_to_linear(byte: u8) -> f64 {
+    let value = f64::from(byte) / 255.0;
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Encodes linear light to one sRGB byte, rounded to nearest.
+fn linear_to_srgb(linear: f64) -> u8 {
+    let value = if linear <= 0.003_130_8 {
+        12.92 * linear
+    } else {
+        1.055 * linear.powf(1.0 / 2.4) - 0.055
+    };
+    let clamped = (value * 255.0).round().clamp(0.0, 255.0);
+    // The clamped value lies in [0, 255] by construction, so the float cast
+    // saturates within range instead of truncating or losing sign.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped to [0, 255] above, so the float cast saturates in range"
+    )]
+    let byte = clamped as u8;
+    byte
 }
 
 /// Validates mip dimensions, format-specific byte lengths, and aggregate size.

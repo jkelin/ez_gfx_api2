@@ -16,6 +16,8 @@
 - Finish terminal device-loss behavior for queued CPU jobs, transfers, staging leases, pending handles, and waits; support explicit cross-thread context destruction without cleanup under Windows loader lock (P-023, P-026).
 - Expand runtime events to preserve one correlation across admission/decode/transfer/bind, and add severity, category, sequence/domain, clocks, units, payloads, overflow markers, and cleanup/resource/device-loss outcomes (P-023, P-026, P-028).
 - Remove per-batch GPU completion waits from native transfer owners while preserving failure-safe coarse handoffs, truthful completion, cancellation, and undrainable-context retention. Native cross-texture batching is implemented, but P-012's selected nonblocking-submission goal remains open; current targeted waits are a correctness tradeoff, not scope removal (P-012, P-015).
+- Fix CPU mip generation dropping trailing odd rows/columns; area-weighted box filter must cover the full extent (P-014; implemented in this change with runtime tests).
+- Filter sRGB mips in linear light (decode/filter/encode RGB, alpha linear unchanged) instead of encoded-space averaging (P-014; implemented in this change with runtime tests).
 
 ## P2
 

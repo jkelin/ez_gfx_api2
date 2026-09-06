@@ -117,6 +117,7 @@ impl TestContext {
             enable_validation: u8::from(validation),
             surface_platform: 0,
             backend,
+            texture_decode_workers: 0,
         };
         let mut context = 0;
         assert_eq!(

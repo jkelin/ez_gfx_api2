@@ -95,8 +95,8 @@ jobs:
       - name: Compile ABI v23 header as C11 and C++17
         shell: bash
         run: |
-          printf '#include "ez_gfx_api.h"\n_Static_assert(EZ_GFX_ABI_VERSION == 23u, "ABI version"); int main(void) { return 0; }\n' > "$RUNNER_TEMP/ez_gfx_header.c"
-          printf '#include "ez_gfx_api.h"\nstatic_assert(EZ_GFX_ABI_VERSION == 23u); int main() { return 0; }\n' > "$RUNNER_TEMP/ez_gfx_header.cpp"
+          printf '#include "ez_gfx_api.h"\n_Static_assert(EZ_GFX_ABI_VERSION == 24u, "ABI version"); int main(void) { return 0; }\n' > "$RUNNER_TEMP/ez_gfx_header.c"
+          printf '#include "ez_gfx_api.h"\nstatic_assert(EZ_GFX_ABI_VERSION == 24u); int main() { return 0; }\n' > "$RUNNER_TEMP/ez_gfx_header.cpp"
           clang -std=c11 -Werror -fsyntax-only -Iinclude "$RUNNER_TEMP/ez_gfx_header.c"
           clang++ -std=c++17 -Werror -Wno-ignored-attributes -fsyntax-only -Iinclude "$RUNNER_TEMP/ez_gfx_header.cpp"
 

@@ -6,7 +6,7 @@ The complete [C textured cube](../../examples/c/textured_cube/README.md) compile
 
 ## Compatibility and ownership
 
-Before any other call, read `ez_gfx_abi_version()` and require `EZ_GFX_ABI_VERSION` (ABI v23). Do not call the ABI when the version does not match. Version 23 adds DDS/raw texture sources 8/9 without changing descriptor layout. Universal KTX2 decoding now requires explicit `ktx2,basis` features; see [texture support](../../docs/textures.md#features-and-backend-admission).
+Before any other call, read `ez_gfx_abi_version()` and require `EZ_GFX_ABI_VERSION` (ABI v24). Do not call the ABI when the version does not match. Version 24 appends `texture_decode_workers` to both context creation descriptors (zero selects the default decode topology). Version 23 adds DDS/raw texture sources 8/9 without changing descriptor layout. Universal KTX2 decoding now requires explicit `ktx2,basis` features; see [texture support](../../docs/textures.md#features-and-backend-admission).
 
 `ez_gfx_handle_inspect` decodes a packed handle into its context/child slot and generation fields; it does not validate that the handle is live in a context. `ez_gfx_semantic_id` accepts an exact 1-to-255-byte canonical semantic name and writes its fixed 16-byte identifier. Semantic names are ASCII dot-separated identifiers: every non-empty segment starts with an ASCII letter and continues with ASCII letters, digits, or underscores. Empty segments, non-ASCII bytes, embedded NUL, and terminators included in the supplied length are invalid.
 

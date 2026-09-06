@@ -33,6 +33,16 @@ fn context_backend_and_platform_pairs_are_validated() {
 }
 
 #[test]
+fn context_decode_workers_default_to_zero_and_accept_explicit_counts() {
+    // Zero preserves the default topology; the builder only records the request.
+    let default_options = ContextOptions::new(0, 0, 0).unwrap();
+    assert_eq!(default_options.texture_decode_workers, 0);
+    let explicit = default_options.with_texture_decode_workers(3);
+    assert_eq!(explicit.texture_decode_workers, 3);
+    assert_eq!(default_options.texture_decode_workers, 0);
+}
+
+#[test]
 fn surface_contract_rejects_bad_handles_and_mixed_zero_extent() {
     assert_eq!(
         SurfaceOptions::new(0, 1, SurfacePlatform::Win32, 1, 1, 0),

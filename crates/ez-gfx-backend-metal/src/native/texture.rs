@@ -2,11 +2,11 @@ use super::{
     AllocationCreateDesc, AllocationError, AllocationRequest, CompletionToken, DeferredResource,
     ImageMip, MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
     MTLCommandQueue, MTLDevice, MTLHeap, MTLOrigin, MTLPixelFormat, MTLSamplerAddressMode,
-    MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSize, MTLStorageMode, MTLTexture,
-    MTLTextureDescriptor, MTLTextureUsage, MemoryAllocator, MemoryClass, NSRange, NativeContext,
-    NativeTexture, ProtocolObject, QueueKind, Retained, SamplerAddressMode, SamplerFilter,
-    TEXTURE_DESCRIPTOR_CAPACITY, TextureFormat, TextureRegion, TextureSamplerDesc, ThreadBound,
-    map_allocator, validate_texture_mips, validate_texture_region,
+    MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLSize, MTLStorageMode,
+    MTLTexture, MTLTextureDescriptor, MTLTextureUsage, MemoryAllocator, MemoryClass, NSRange,
+    NativeContext, NativeTexture, ProtocolObject, QueueKind, Retained, SamplerAddressMode,
+    SamplerFilter, TEXTURE_DESCRIPTOR_CAPACITY, TextureFormat, TextureRegion, TextureSamplerDesc,
+    ThreadBound, map_allocator, validate_texture_mips, validate_texture_region,
 };
 
 fn texture_format_metal(format: TextureFormat) -> MTLPixelFormat {
@@ -159,6 +159,12 @@ impl NativeContext {
             sampler_descriptor.setMagFilter(match sampler_desc.mag_filter {
                 SamplerFilter::Nearest => MTLSamplerMinMagFilter::Nearest,
                 SamplerFilter::Linear => MTLSamplerMinMagFilter::Linear,
+            });
+            // `mipFilter` defaults to `notMipmapped`: without this mapping every
+            // minified fragment would sample view level zero regardless of the chain.
+            sampler_descriptor.setMipFilter(match sampler_desc.min_filter {
+                SamplerFilter::Nearest => MTLSamplerMipFilter::Nearest,
+                SamplerFilter::Linear => MTLSamplerMipFilter::Linear,
             });
             let address = |mode| match mode {
                 SamplerAddressMode::Clamp => MTLSamplerAddressMode::ClampToEdge,

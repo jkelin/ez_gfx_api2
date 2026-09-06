@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define EZ_GFX_ABI_VERSION 23u
+#define EZ_GFX_ABI_VERSION 24u
 
 #if defined(__clang__)
 #  if __has_attribute(access)
@@ -317,6 +317,7 @@ enum {
  * @enable_debug: Non-zero enables debug utilities.
  * @enable_validation: Non-zero enables validation layers.
  * @surface_platform: Value from EzGfxSurfacePlatform.
+ * @texture_decode_workers: Async texture decode threads; zero selects the default topology.
  *
  * Context creation options.
  */
@@ -324,6 +325,7 @@ typedef struct EzGfxContextDesc {
     uint8_t enable_debug;
     uint8_t enable_validation;
     EzGfxSurfacePlatform surface_platform;
+    uint32_t texture_decode_workers;
 } EzGfxContextDesc;
 
 /** Backend-selecting context creation options. */
@@ -332,6 +334,7 @@ typedef struct EzGfxBackendContextDesc {
     uint8_t enable_validation;
     EzGfxSurfacePlatform surface_platform;
     EzGfxBackend backend;
+    uint32_t texture_decode_workers;
 } EzGfxBackendContextDesc;
 
 /**

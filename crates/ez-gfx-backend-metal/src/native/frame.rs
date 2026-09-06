@@ -594,6 +594,28 @@ impl NativeContext {
         self.prepare_compute_argument_buffer(slot, dispatch, argument_index)
     }
 
+    /// Level-zero extent of a published Metal texture view.
+    ///
+    /// The view covers the `resident_mips` coarse tail, so its level zero is storage
+    /// mip `mip_count - resident_mips`. Returns `None` when no level is published.
+    fn published_view_extent(
+        width: u32,
+        height: u32,
+        mip_count: u32,
+        resident_mips: u32,
+    ) -> Option<(usize, usize)> {
+        if resident_mips == 0 || resident_mips > mip_count {
+            return None;
+        }
+        let level = mip_count - resident_mips;
+        let extent = |base: u32| {
+            u64::from(base)
+                .checked_shr(level)
+                .map(|value| value.max(1))
+                .and_then(|value| usize::try_from(value).ok())
+        };
+        Some((extent(width)?, extent(height)?))
+    }
     pub(super) fn allocate_frame_readback(
         &mut self,
         width: u32,
@@ -1066,7 +1088,20 @@ impl NativeContext {
                         let blit = command
                             .blitCommandEncoder()
                             .ok_or(HalError::NativeFailure)?;
-                        // SAFETY: the readback action's dimensions bound the source region of `texture.texture`, and its readback buffer has `row_stride * height` bytes with `row_stride >= width * 4`, so the blit's ranges are in bounds and both resources remain referenced through encoding.
+                        // The shared boundary only admits fully resident readbacks, but the
+                        // copy must still honor the published view: a demoted view's level
+                        // zero is a coarser storage mip with a smaller extent.
+                        let (exposed_width, exposed_height) = Self::published_view_extent(
+                            texture.width,
+                            texture.height,
+                            texture.mip_count,
+                            texture.resident_mips,
+                        )
+                        .ok_or(HalError::InvalidArgument)?;
+                        // SAFETY: the copy is clamped to the published view's real level-zero
+                        // extent, and its readback buffer has `row_stride * height` bytes with
+                        // `row_stride >= width * 4`, so the blit's ranges are in bounds and both
+                        // resources remain referenced through encoding.
                         unsafe {
                             blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
                             &texture.texture,
@@ -1074,8 +1109,8 @@ impl NativeContext {
                             0,
                             MTLOrigin { x: 0, y: 0, z: 0 },
                             MTLSize {
-                                width: *width as usize,
-                                height: *height as usize,
+                                width: (*width as usize).min(exposed_width),
+                                height: (*height as usize).min(exposed_height),
                                 depth: 1,
                             },
                             &allocation.buffer,
@@ -1117,7 +1152,7 @@ impl NativeContext {
 
 #[cfg(test)]
 mod tests {
-    use super::{buffer_range_fits, draw_ranges_fit, metal_size};
+    use super::{NativeContext, buffer_range_fits, draw_ranges_fit, metal_size};
     use ez_gfx_hal::BufferRange;
 
     #[test]
@@ -1146,5 +1181,19 @@ mod tests {
     fn reflected_threadgroup_dimensions_reach_metal_dispatch_shape() {
         let size = metal_size([8, 2, 1]);
         assert_eq!((size.width, size.height, size.depth), (8, 2, 1));
+    }
+
+    #[test]
+    fn demoted_view_extent_follows_published_coarse_tail() {
+        use NativeContext as Context;
+        // A fully resident view exposes the stored base extent.
+        assert_eq!(Context::published_view_extent(64, 64, 3, 3), Some((64, 64)));
+        // Demotion drops fine levels: level one of a 64-wide chain is 16 wide.
+        assert_eq!(Context::published_view_extent(64, 64, 3, 1), Some((16, 16)));
+        // Odd edges clamp at one texel rather than shifting to zero.
+        assert_eq!(Context::published_view_extent(7, 3, 3, 1), Some((1, 1)));
+        // An unpublished or over-published view has no readable extent.
+        assert_eq!(Context::published_view_extent(64, 64, 3, 0), None);
+        assert_eq!(Context::published_view_extent(64, 64, 3, 4), None);
     }
 }

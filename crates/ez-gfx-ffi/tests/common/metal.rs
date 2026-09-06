@@ -35,6 +35,7 @@ impl TestContext {
             enable_validation: 0,
             surface_platform: 2,
             backend,
+            texture_decode_workers: 0,
         };
         assert_eq!(
             // SAFETY: The descriptor and output storage remain live and aligned through the call.

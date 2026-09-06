@@ -174,3 +174,105 @@ fn universal_case(context: ContextHandle, quad: &Quad, source: TextureSource, by
         }
     }
 }
+#[cfg(target_vendor = "apple")]
+#[test]
+fn metal_minified_sampling_selects_published_mips() {
+    // A 256px texture on the 64px hidden surface minifies 4:1, forcing mip
+    // selection. mip0 is white and coarser levels are black: without a mip
+    // filter every fragment would sample the white base level.
+    let artifact = compile_shader(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/02_textured_cube/02_textured_cube.slang"),
+        &[Target::Metal],
+        false,
+    )
+    .expect("compile cube shader artifact");
+    let native = TestContext::create(3);
+    let context = ContextHandle::from_raw(native.context).unwrap();
+    let surface = SurfaceHandle::from_raw(native.surface).unwrap();
+    let quad = Quad::create(context, surface, &artifact);
+    let white = [255_u8, 255, 255, 255].repeat(256 * 256);
+    let black = [0_u8, 0, 0, 255].repeat(128 * 128);
+    let mut bytes = white.clone();
+    bytes.extend_from_slice(&black);
+    bytes.extend_from_slice(&[0_u8, 0, 0, 255].repeat(64 * 64));
+    let config = TextureConfig {
+        width: 256,
+        height: 256,
+        mip_count: 3,
+        destination: TextureDestination::Rgba8Unorm,
+        sampler: TextureSamplerDesc {
+            min_filter: SamplerFilter::Nearest,
+            mag_filter: SamplerFilter::Nearest,
+            max_anisotropy: 1.0,
+            address_u: SamplerAddressMode::Clamp,
+            address_v: SamplerAddressMode::Clamp,
+            address_w: SamplerAddressMode::Clamp,
+        },
+    };
+    let texture = load_texture(
+        context,
+        TextureSource::Raw {
+            format: TextureFormat::Rgba8Unorm,
+            width: 256,
+            height: 256,
+            mip_count: 3,
+        },
+        &bytes,
+        false,
+        &config,
+    )
+    .expect("admit minification chain");
+    await_texture(context, texture);
+    // `await` only guarantees the coarse view: force the full chain resident so
+    // the draw truly minifies across mip levels instead of sampling one level.
+    assert_eq!(wait_idle(context), EzGfxResult::Ok);
+    assert_eq!(set_texture_residency(context, texture, 3), EzGfxResult::Ok);
+    assert_eq!(texture_residency(context, texture), Ok((3, 3)));
+    quad.draw(texture, true);
+    let sampled = frame_readback(context).unwrap();
+    assert_eq!(sampled.len(), 64 * 64 * 4);
+    let mean: f64 = sampled
+        .chunks_exact(4)
+        .map(|pixel| f64::from(pixel[0]))
+        .sum::<f64>()
+        / (64.0 * 64.0);
+    // Nearest mip selection at 4:1 minification reads a black coarse level.
+    assert!(mean < 64.0, "minified mean {mean} sampled the base level");
+    // A demoted RGBA view exposes a smaller extent: direct capture waits for
+    // the full chain, then returns the white base level byte-for-byte.
+    assert_eq!(set_texture_residency(context, texture, 1), EzGfxResult::Ok);
+    assert_eq!(
+        frame_enqueue_readback(context, texture),
+        EzGfxResult::NotReady
+    );
+    assert_eq!(wait_idle(context), EzGfxResult::Ok);
+    assert_eq!(set_texture_residency(context, texture, 3), EzGfxResult::Ok);
+    assert_eq!(quad.readback_direct(texture), white);
+    // A submitted frame gates publication, but its completion must unblock
+    // polling on its own: the shared path reaps settled slots before consulting
+    // the gate, so no wait_idle round-trip is required here.
+    quad.draw(texture, false);
+    let pending = load_texture(
+        context,
+        TextureSource::Rgba8 {
+            width: 64,
+            height: 64,
+        },
+        &[128_u8, 128, 128, 255].repeat(64 * 64),
+        false,
+        &TextureConfig {
+            width: 64,
+            height: 64,
+            mip_count: 0,
+            destination: TextureDestination::Rgba8Unorm,
+            sampler: config.sampler,
+        },
+    )
+    .expect("admit reap probe");
+    // Settled-slot reaping must unblock this with polling alone.
+    await_texture(context, pending);
+    unload_texture(context, pending);
+    unload_texture(context, texture);
+    assert_eq!(wait_idle(context), EzGfxResult::Ok);
+}

@@ -55,6 +55,8 @@ pub struct EzGfxContextDesc {
     pub enable_validation: u8,
     /// Selects the native platform used to create presentation surfaces.
     pub surface_platform: u8,
+    /// Async texture decode worker threads; zero selects the default topology.
+    pub texture_decode_workers: u32,
 }
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -68,6 +70,8 @@ pub struct EzGfxBackendContextDesc {
     pub surface_platform: u8,
     /// Selects the graphics backend by its C ABI numeric code.
     pub backend: u8,
+    /// Async texture decode worker threads; zero selects the default topology.
+    pub texture_decode_workers: u32,
 }
 #[derive(Clone, Copy)]
 #[repr(C)]

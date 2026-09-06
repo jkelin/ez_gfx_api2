@@ -259,6 +259,31 @@ impl NativeContext {
         Ok(())
     }
 
+    /// Reaps frame slots whose commands already settled without blocking.
+    ///
+    /// Polling texture paths call this before consulting the descriptor gate so
+    /// completed submissions unblock publication during sustained rendering.
+    /// Settled failures still release the slot: the GPU owns no more work, so
+    /// a dead frame must not pin texture readiness. The slot error itself
+    /// surfaces through the normal frame-submission path, not here.
+    pub fn poll_frame_completion(&mut self) {
+        for slot in 0..self.frame_slots.len() {
+            let settled = self.frame_slots[slot]
+                .command
+                .as_ref()
+                .is_some_and(|command| {
+                    matches!(
+                        command.status(),
+                        MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+                    )
+                });
+            if settled {
+                // `waitUntilCompleted` returns immediately on a settled buffer.
+                let _ = self.complete_frame_slot(slot);
+            }
+        }
+    }
+
     pub(super) fn defer_resource(
         &mut self,
         resource: DeferredResource,

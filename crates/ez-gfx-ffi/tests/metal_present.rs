@@ -53,6 +53,7 @@ fn metal_texture_readback_submits_without_a_surface() {
         enable_validation: 0,
         surface_platform: 2,
         backend: 3,
+        texture_decode_workers: 0,
     };
     let texture_desc = EzGfxTextureDesc {
         source_format: 1,
@@ -139,6 +140,7 @@ fn metal_compute_submits_without_a_surface() {
         enable_validation: 0,
         surface_platform: 2,
         backend: 3,
+        texture_decode_workers: 0,
     };
     let mut context = 0;
     let mut shader = 0;
@@ -295,6 +297,7 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
         enable_validation: 0,
         surface_platform: 2,
         backend: 3,
+        texture_decode_workers: 0,
     };
     let surface_desc = EzGfxSurfaceDesc {
         window: Retained::as_ptr(&layer).cast_mut().cast(),

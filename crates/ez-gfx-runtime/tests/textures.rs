@@ -141,7 +141,8 @@ fn generated_mips_box_filter_odd_edges_and_stop_at_one_pixel() {
         ),
         (2, 1, 1)
     );
-    assert_eq!(generated.mips[1].bytes, vec![5, 10, 15, 20]);
+    // Area-weighted coverage averages all three texels, not just the first two.
+    assert_eq!(generated.mips[1].bytes, vec![37, 47, 57, 66]);
 
     let single = TextureDecoder::decode(
         TextureSource::Rgba8 {
@@ -208,6 +209,137 @@ fn mip_validation_rejects_levels_after_the_terminal_texel() {
         generate_mips(repeated_terminal),
         Err(TextureError::InvalidData)
     );
+}
+
+#[test]
+fn generated_mips_cover_trailing_odd_rows_and_columns() {
+    // 3x3 with a bright last row and column: every texel contributes.
+    let mut base_bytes = Vec::with_capacity(3 * 3 * 4);
+    for y in 0..3 {
+        for x in 0..3 {
+            let value = if x == 2 || y == 2 { 255 } else { 0 };
+            base_bytes.extend_from_slice(&[value, value, value, 255]);
+        }
+    }
+    let generated = generate_mips(DecodedTexture {
+        width: 3,
+        height: 3,
+        mip_count: 1,
+        format: TextureFormat::Rgba8Unorm,
+        mips: vec![DecodedMip {
+            width: 3,
+            height: 3,
+            bytes: base_bytes,
+        }],
+    })
+    .unwrap();
+    assert_eq!(generated.mip_count, 2);
+    // Five bright texels of nine, rounded to nearest: 1275 / 9 = 142.
+    assert_eq!(generated.mips[1].bytes, vec![142, 142, 142, 255]);
+
+    // 5x5 with a bright last row and column exercises every chain stage.
+    let mut wide_bytes = Vec::with_capacity(5 * 5 * 4);
+    for y in 0..5 {
+        for x in 0..5 {
+            let value = if x == 4 || y == 4 { 255 } else { 0 };
+            wide_bytes.extend_from_slice(&[value, value, value, 255]);
+        }
+    }
+    let wide = generate_mips(DecodedTexture {
+        width: 5,
+        height: 5,
+        mip_count: 1,
+        format: TextureFormat::Rgba8Unorm,
+        mips: vec![DecodedMip {
+            width: 5,
+            height: 5,
+            bytes: wide_bytes,
+        }],
+    })
+    .unwrap();
+    assert_eq!(wide.mip_count, 3);
+    assert_eq!((wide.mips[1].width, wide.mips[1].height), (2, 2));
+    // Side windows each see two bright texels of six: 510 / 6 = 85; the
+    // bottom-right 3x3 window sees five of nine: 1275 / 9 = 142.
+    assert_eq!(
+        wide.mips[1].bytes,
+        vec![
+            0, 0, 0, 255, 85, 85, 85, 255, 85, 85, 85, 255, 142, 142, 142, 255
+        ]
+    );
+    // The terminal level averages the full 2x2 above: 312 / 4 = 78.
+    assert_eq!(wide.mips[2].bytes, vec![78, 78, 78, 255]);
+}
+
+#[test]
+fn generated_mips_filter_srgb_in_linear_light_with_linear_alpha() {
+    // Two black and two white texels: linear mean 0.5 encodes to 188 sRGB.
+    let generated = generate_mips(DecodedTexture {
+        width: 2,
+        height: 2,
+        mip_count: 1,
+        format: TextureFormat::Rgba8Srgb,
+        mips: vec![DecodedMip {
+            width: 2,
+            height: 2,
+            bytes: vec![
+                0, 0, 0, 0, 0, 0, 0, 85, 255, 255, 255, 170, 255, 255, 255, 255,
+            ],
+        }],
+    })
+    .unwrap();
+    // Alpha stays a straight linear mean: (0 + 85 + 170 + 255) / 4 = 127.
+    assert_eq!(generated.mips[1].bytes, vec![188, 188, 188, 127]);
+}
+
+#[test]
+fn generated_mips_cover_degenerate_single_texel_axes() {
+    // 1x3 averages all three rows: (10 + 20 + 30) / 3 = 20.
+    let generated = generate_mips(DecodedTexture {
+        width: 1,
+        height: 3,
+        mip_count: 1,
+        format: TextureFormat::Rgba8Unorm,
+        mips: vec![DecodedMip {
+            width: 1,
+            height: 3,
+            bytes: vec![10, 0, 0, 255, 20, 0, 0, 255, 30, 0, 0, 255],
+        }],
+    })
+    .unwrap();
+    assert_eq!((generated.mip_count, generated.mips[1].width), (2, 1));
+    assert_eq!(generated.mips[1].bytes, vec![20, 0, 0, 255]);
+}
+
+#[test]
+fn generated_mips_reject_compressed_input_and_over_budget_chains() {
+    let compressed = DecodedTexture {
+        width: 4,
+        height: 4,
+        mip_count: 1,
+        format: TextureFormat::Bc1Unorm,
+        mips: vec![DecodedMip {
+            width: 4,
+            height: 4,
+            bytes: vec![0; 8],
+        }],
+    };
+    assert_eq!(generate_mips(compressed), Err(TextureError::Unsupported));
+
+    // A 3600x3600 base fits the input budget, but its generated chain exceeds
+    // 64 MiB and must fail before any level allocation.
+    let wide = DecodedTexture {
+        width: 3600,
+        height: 3600,
+        mip_count: 1,
+        format: TextureFormat::Rgba8Unorm,
+        mips: vec![DecodedMip {
+            width: 3600,
+            height: 3600,
+            bytes: vec![0; 3600 * 3600 * 4],
+        }],
+    };
+    assert_eq!(generate_mips(wide), Err(TextureError::TooLarge));
 }
 
 #[cfg(feature = "ktx2")]

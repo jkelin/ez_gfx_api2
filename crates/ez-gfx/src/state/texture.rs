@@ -9,7 +9,7 @@ use super::{
     TextureFormat, TextureHandle, TextureId, TextureRegion, TextureSource,
     TextureUploadTelemetrySnapshot, VulkanContext, completed_texture_transfer_native,
     destroy_native_texture, generate_mips, map_allocation, map_lifecycle, map_texture,
-    runtime_record, with_context_mut,
+    poll_native_frame_completion, runtime_record, with_context_mut,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -27,6 +27,67 @@ pub struct TextureConfig {
     pub sampler: ez_gfx_hal::TextureSamplerDesc,
 }
 
+/// Validates a texture sampler against the shared native contract.
+///
+/// The C boundary rejects non-finite and out-of-range anisotropy; the safe entry
+/// point must enforce the same invariant so native lowering (Vulkan passthrough,
+/// DX12 floor, Metal clamp-to-16) never observes values the C API cannot send.
+///
+/// # Errors
+///
+/// Returns [`EzGfxResult::InvalidArgument`] for non-finite or out-of-range anisotropy.
+pub(super) fn validate_texture_sampler(
+    sampler: &ez_gfx_hal::TextureSamplerDesc,
+) -> Result<(), EzGfxResult> {
+    // 1.0 disables anisotropy everywhere; 16.0 is the largest representable level.
+    if !sampler.max_anisotropy.is_finite() || !(1.0..=16.0).contains(&sampler.max_anisotropy) {
+        return Err(EzGfxResult::InvalidArgument);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod publish_tests {
+    use super::EzGfxResult;
+    use super::publish_advance_step;
+
+    #[test]
+    fn only_fence_gate_contention_stays_retryable() {
+        // DX12's graphics-fence gate reports transient contention as a plain
+        // native failure; the advance path retries it instead of surfacing it.
+        assert_eq!(
+            publish_advance_step(Err(ez_gfx_hal::AllocationError::NativeFailure)),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn allocation_and_capability_errors_stay_terminal() {
+        // OOM, validation, and capability failures must surface terminally
+        // through the shared mapping, never hang in `NotReady`.
+        assert_eq!(
+            publish_advance_step(Err(ez_gfx_hal::AllocationError::ZeroSize)),
+            Err(EzGfxResult::InvalidArgument)
+        );
+        assert_eq!(
+            publish_advance_step(Err(ez_gfx_hal::AllocationError::Unsupported)),
+            Err(EzGfxResult::Unsupported)
+        );
+        assert_eq!(
+            publish_advance_step(Err(ez_gfx_hal::AllocationError::OutOfMemory)),
+            Err(EzGfxResult::NativeFailure)
+        );
+    }
+    #[test]
+    fn publication_success_and_device_loss_pass_through() {
+        assert_eq!(publish_advance_step(Ok(())), Ok(true));
+        assert_eq!(
+            publish_advance_step(Err(ez_gfx_hal::AllocationError::DeviceLost)),
+            Err(EzGfxResult::DeviceLost)
+        );
+    }
+}
+
 /// Queues texture decode, mip generation, and transfer preparation without blocking the caller.
 ///
 /// The input bytes are copied before this function returns; callers retain no asynchronous
@@ -34,7 +95,8 @@ pub struct TextureConfig {
 ///
 /// # Errors
 ///
-/// Returns an error for invalid input, exhausted handles, worker backpressure, or a stale context.
+/// Returns an error for invalid input, an unvalidated sampler, exhausted handles,
+/// worker backpressure, or a stale context.
 pub fn load_texture(
     context: ContextHandle,
     source: TextureSource,
@@ -45,6 +107,7 @@ pub fn load_texture(
     if bytes.is_empty() || bytes.len() > ez_gfx_runtime::texture::MAX_TEXTURE_BYTES {
         return Err(EzGfxResult::InvalidArgument);
     }
+    validate_texture_sampler(&config.sampler)?;
     let owned = bytes.to_vec().into_boxed_slice();
     let config = *config;
 
@@ -438,10 +501,28 @@ fn publish_native_texture_mips(
     }
 }
 
+/// Maps a mip-publication outcome onto residency progress.
+///
+/// Only fence-gate contention is transient: `Ok(false)` keeps the recorded target
+/// and surfaces `NotReady` until the next poll. Allocation, validation, capability,
+/// and device errors stay terminal through the shared mapping.
+fn publish_advance_step(
+    result: Result<(), ez_gfx_hal::AllocationError>,
+) -> Result<bool, EzGfxResult> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(ez_gfx_hal::AllocationError::NativeFailure) => Ok(false),
+        Err(error) => Err(map_allocation(error)),
+    }
+}
+
 fn advance_texture_residency(
     context: &mut ContextState,
     completed: u64,
 ) -> Result<(), EzGfxResult> {
+    // Reap finished frames before consulting the gate: completed submissions must
+    // unblock publication during sustained rendering without wait_idle/readback.
+    poll_native_frame_completion(&mut context.native)?;
     context
         .texture_registry
         .poll(ez_gfx_hal::QueueKind::TextureTransfer, completed)
@@ -500,9 +581,14 @@ fn advance_texture_residency(
             .textures
             .get_mut(&handle)
             .ok_or(EzGfxResult::InvalidContext)?;
-        publish_native_texture_mips(&mut context.native, texture, resident_mips)
-            .map_err(map_allocation)?;
-        context.texture_published_mips.insert(handle, resident_mips);
+        let published = publish_advance_step(publish_native_texture_mips(
+            &mut context.native,
+            texture,
+            resident_mips,
+        ))?;
+        if published {
+            context.texture_published_mips.insert(handle, resident_mips);
+        }
     }
     Ok(())
 }
@@ -539,6 +625,27 @@ pub(super) fn record_texture_ready(
         EzGfxResult::Ok,
     );
     context.observability.push_event(record);
+}
+
+/// Returns the async texture decode worker thread count for a context.
+///
+/// This observes the pool sized at creation from `ContextOptions::texture_decode_workers`
+/// (zero selects the default topology), letting FFI callers verify the C descriptor
+/// value arrived without a C-side query export.
+///
+/// # Errors
+///
+/// Returns an error when the context handle is invalid or stale.
+pub fn texture_decode_worker_count(context: ContextHandle) -> Result<u32, EzGfxResult> {
+    with_context_mut(context, |context| {
+        context
+            .identity
+            .check_thread_and_health()
+            .map_err(map_lifecycle)?;
+        // Pool sizes always fit `u32`; the fallback only guards the conversion.
+        u32::try_from(context.async_textures.pool.thread_count())
+            .map_err(|_| EzGfxResult::NativeFailure)
+    })
 }
 
 /// Returns a texture binding index.
@@ -944,4 +1051,53 @@ pub fn unload_texture(context: ContextHandle, texture: TextureHandle) {
         }
         retire_live_texture(context, texture)
     });
+}
+
+#[cfg(test)]
+mod sampler_tests {
+    use super::*;
+    use ez_gfx_hal::{SamplerAddressMode, SamplerFilter};
+
+    fn sampler(anisotropy: f32) -> ez_gfx_hal::TextureSamplerDesc {
+        ez_gfx_hal::TextureSamplerDesc {
+            min_filter: SamplerFilter::Linear,
+            mag_filter: SamplerFilter::Linear,
+            max_anisotropy: anisotropy,
+            address_u: SamplerAddressMode::Clamp,
+            address_v: SamplerAddressMode::Clamp,
+            address_w: SamplerAddressMode::Clamp,
+        }
+    }
+
+    #[test]
+    fn sampler_validation_rejects_nonfinite_and_out_of_range_anisotropy() {
+        // Mirrors the C boundary (`ez_gfx_texture_load` range check): NaN would
+        // otherwise disable Vulkan anisotropy while Metal clamps it to 16.
+        for anisotropy in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            -1.0,
+            0.999,
+            16.001,
+            17.0,
+        ] {
+            assert_eq!(
+                validate_texture_sampler(&sampler(anisotropy)),
+                Err(EzGfxResult::InvalidArgument),
+                "anisotropy {anisotropy} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn sampler_validation_accepts_shared_boundary_range() {
+        for anisotropy in [1.0, 2.0, 8.0, 16.0] {
+            assert!(
+                validate_texture_sampler(&sampler(anisotropy)).is_ok(),
+                "anisotropy {anisotropy} must be accepted"
+            );
+        }
+    }
 }

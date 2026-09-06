@@ -222,6 +222,36 @@ fn destroy_context_before_device_initialization_is_successful_and_terminal() {
     assert_eq!(destroy_context(context), EzGfxResult::InvalidContext);
 }
 
+#[test]
+fn decode_worker_topology_defaults_and_honors_explicit_counts() {
+    // Zero preserves `available_parallelism - 1`; an explicit count pins the pool.
+    // This exercises pool construction directly so every host covers the topology.
+    let expected_default = std::thread::available_parallelism()
+        .map_or(2, usize::from)
+        .saturating_sub(1)
+        .max(1);
+    let default_state = AsyncTextureState::new_with_workers(0).unwrap();
+    assert_eq!(default_state.worker_count(), expected_default);
+    let explicit_state = AsyncTextureState::new_with_workers(2).unwrap();
+    assert_eq!(explicit_state.worker_count(), 2);
+}
+
+#[cfg(windows)]
+#[test]
+fn context_decode_worker_count_reaches_pool_construction() {
+    // The context option must reach the async texture pool on a real backend.
+    let explicit_options = ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan)
+        .unwrap()
+        .with_texture_decode_workers(2);
+    let explicit_context = create_context(explicit_options).unwrap();
+    let explicit_workers = with_context_mut(explicit_context, |state| {
+        Ok(state.async_textures.worker_count())
+    })
+    .unwrap();
+    assert_eq!(explicit_workers, 2);
+    assert_eq!(destroy_context(explicit_context), EzGfxResult::Ok);
+}
+
 #[cfg(windows)]
 #[test]
 fn destroy_context_reclaims_populated_state_and_invalidates_handles() {

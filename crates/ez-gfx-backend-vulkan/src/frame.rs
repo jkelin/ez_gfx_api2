@@ -364,6 +364,8 @@ fn record_texture_readback(
     pass_active: bool,
 ) -> Result<(), HalError> {
     // SAFETY: the source image and destination allocation remain live through command submission.
+    // Layout comes from the graph's transfer-read barrier, which runs before this
+    // action and restores shader readability afterward; the copy itself needs no barrier.
     unsafe {
         if pass_active {
             return Err(HalError::InvalidArgument);
@@ -390,6 +392,30 @@ fn record_texture_readback(
                 })],
         );
         *readback_index += 1;
+        // The graph emits the entry barrier but no matching restore: leave the
+        // image shader-readable like the present path does for swapchain images.
+        let to_shader = vk::ImageMemoryBarrier::default()
+            .image(texture.image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+        encoding.device.cmd_pipeline_barrier(
+            encoding.command,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            core::slice::from_ref(&to_shader),
+        );
     }
     Ok(())
 }

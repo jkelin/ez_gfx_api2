@@ -70,7 +70,7 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle, EzGfxRes
     .map_err(|_| EzGfxResult::NativeFailure)?;
     let frame = FrameRecorder::new(1024).map_err(|_| EzGfxResult::NativeFailure)?;
     let observability = Observability::new(1024, 256).map_err(|_| EzGfxResult::NativeFailure)?;
-    let async_textures = AsyncTextureState::new()?;
+    let async_textures = AsyncTextureState::new_with_workers(options.texture_decode_workers)?;
     let local = CONTEXT_HANDLES
         .lock()
         .map_err(|_| EzGfxResult::NativeFailure)?

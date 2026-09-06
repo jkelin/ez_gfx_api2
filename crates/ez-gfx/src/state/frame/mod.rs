@@ -10,9 +10,9 @@ use super::{
     NativePipeline, NativeShader, NativeSurface, NativeTexture, NodeDesc, PackedHandle, PassInfo,
     PipelineKey, QueueKind, ResourceAccess, ResourceDesc, ResourceId, ResourceKind,
     ResourceLifetime, ResourceState, RuntimePhase, ShaderHandle, ShaderRecord, ShaderStage,
-    StoreOp, TextureHandle, TextureId, execute_compiled_graph, map_frame, map_hal, map_lifecycle,
-    native_layouts, pipeline_layout_key, result_status, runtime_record, vulkan_bindings,
-    with_context_mut,
+    StoreOp, TextureFormat, TextureHandle, TextureId, execute_compiled_graph, map_frame, map_hal,
+    map_lifecycle, native_layouts, pipeline_layout_key, result_status, runtime_record,
+    vulkan_bindings, with_context_mut,
 };
 type NativeTextureMap = HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>;
 
@@ -283,6 +283,12 @@ fn intern_texture_resource(
 }
 
 /// Enqueues texture readback in the current frame.
+///
+/// Readback captures the full stored image as RGBA8. Block-compressed storage has
+/// no RGBA texel grid, so compressed textures are rejected with
+/// [`EzGfxResult::InvalidArgument`]; sample them through a shader instead.
+/// A logically demoted texture reports [`EzGfxResult::NotReady`] until its full
+/// chain is resident again, so the captured extent always matches the request.
 pub fn frame_enqueue_readback(context: ContextHandle, texture: TextureHandle) -> EzGfxResult {
     result_status(with_context_mut(context, |context| {
         let handle = texture.packed();
@@ -290,6 +296,33 @@ pub fn frame_enqueue_readback(context: ContextHandle, texture: TextureHandle) ->
             .identity
             .resolve(handle, ResourceKind::Texture)
             .map_err(map_lifecycle)?;
+        // Compressed blocks cannot fill an RGBA8 capture; demoted views expose a
+        // smaller extent than the request. Both are boundary rejections, applied
+        // identically before any backend records the copy.
+        if context.pending_textures.contains_key(&texture) {
+            return Err(EzGfxResult::NotReady);
+        }
+        let format = context
+            .texture_formats
+            .get(&texture)
+            .copied()
+            .unwrap_or(TextureFormat::Rgba8Unorm);
+        if format.is_compressed() {
+            return Err(EzGfxResult::InvalidArgument);
+        }
+        let (_, _, _, _, total) = context
+            .textures
+            .get(&texture)
+            .ok_or(EzGfxResult::InvalidContext)?;
+        let total = *total;
+        let resident = context
+            .texture_published_mips
+            .get(&texture)
+            .copied()
+            .unwrap_or(0);
+        if resident != total {
+            return Err(EzGfxResult::NotReady);
+        }
         let resource = intern_texture_resource(context, texture)?;
         let range = ImageRange::all(1, 1).map_err(|_| EzGfxResult::InvalidArgument)?;
         let state = ResourceState::new(

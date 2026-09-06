@@ -197,6 +197,23 @@ pub(super) fn wait_native_idle(context: &mut NativeContext) -> Result<(), HalErr
     }
 }
 
+/// Reaps completed frame slots without blocking so polling texture paths observe
+/// finished GPU work. Vulkan/Metal track submission in software slot state that
+/// otherwise clears only on wrap-around or `wait_idle`; DX12 already consults
+/// the live graphics fence on every gate check.
+pub(super) fn poll_native_frame_completion(context: &mut NativeContext) -> Result<(), EzGfxResult> {
+    match context {
+        NativeContext::Vulkan(context) => {
+            context.poll_frame_completion().map_err(map_allocation)?;
+        }
+        #[cfg(windows)]
+        NativeContext::Dx12(context) => context.poll_frame_completion().map_err(map_hal)?,
+        #[cfg(target_vendor = "apple")]
+        NativeContext::Metal(context) => context.poll_frame_completion(),
+    }
+    Ok(())
+}
+
 pub(super) fn allocate_native(
     context: &mut NativeContext,
     request: AllocationRequest,

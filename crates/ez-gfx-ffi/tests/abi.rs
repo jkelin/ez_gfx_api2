@@ -56,7 +56,7 @@ fn status_values_and_abi_version_are_stable() {
         ],
         [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     );
-    assert_eq!(EZ_GFX_ABI_VERSION, 23);
+    assert_eq!(EZ_GFX_ABI_VERSION, 24);
 }
 
 #[test]
@@ -65,36 +65,40 @@ fn status_values_and_abi_version_are_stable() {
     reason = "one contiguous test keeps every public C layout and field-offset assertion visible as a single ABI contract"
 )]
 fn layouts_are_stable() {
+    // ABI 24 appends the decode-worker count to both creation descriptors. Earlier
+    // fields keep their offsets; the trailing `u32` raises size and alignment.
     assert_eq!(
         (
             size_of::<EzGfxContextDesc>(),
             align_of::<EzGfxContextDesc>()
         ),
-        (3, 1)
+        (8, 4)
     );
     assert_eq!(
         [
             offset_of!(EzGfxContextDesc, enable_debug),
             offset_of!(EzGfxContextDesc, enable_validation),
-            offset_of!(EzGfxContextDesc, surface_platform)
+            offset_of!(EzGfxContextDesc, surface_platform),
+            offset_of!(EzGfxContextDesc, texture_decode_workers)
         ],
-        [0, 1, 2]
+        [0, 1, 2, 4]
     );
     assert_eq!(
         (
             size_of::<EzGfxBackendContextDesc>(),
             align_of::<EzGfxBackendContextDesc>()
         ),
-        (4, 1)
+        (8, 4)
     );
     assert_eq!(
         [
             offset_of!(EzGfxBackendContextDesc, enable_debug),
             offset_of!(EzGfxBackendContextDesc, enable_validation),
             offset_of!(EzGfxBackendContextDesc, surface_platform),
-            offset_of!(EzGfxBackendContextDesc, backend)
+            offset_of!(EzGfxBackendContextDesc, backend),
+            offset_of!(EzGfxBackendContextDesc, texture_decode_workers)
         ],
-        [0, 1, 2, 3]
+        [0, 1, 2, 3, 4]
     );
     assert_eq!(
         (
@@ -647,6 +651,7 @@ fn context_creation_rejects_boundary_inputs_before_native_calls() {
         enable_debug: 2,
         enable_validation: 0,
         surface_platform: 0,
+        texture_decode_workers: 0,
     };
     assert_eq!(
         {
@@ -665,6 +670,7 @@ fn context_lifecycle_rejects_cross_thread_destroy_and_invalidates_destroyed_hand
         enable_debug: 0,
         enable_validation: 0,
         surface_platform: 0,
+        texture_decode_workers: 0,
     };
     let mut context = 0;
     assert_eq!(
@@ -694,6 +700,7 @@ fn explicit_dx12_context_allocates_writes_and_releases_structured_memory() {
         enable_validation: 0,
         surface_platform: 0,
         backend: 2,
+        texture_decode_workers: 0,
     };
     let mut context = 0;
     assert_eq!(
@@ -910,6 +917,7 @@ fn dx12_texture_upload_becomes_resident_and_unload_invalidates_handle() {
         enable_validation: 0,
         surface_platform: 0,
         backend: 2,
+        texture_decode_workers: 0,
     };
     let texture_desc = EzGfxTextureDesc {
         source_format: 1,

@@ -141,6 +141,19 @@ fn initialize_context(
 }
 
 impl NativeContext {
+    /// Notes completed-frame reclamation for the shared polling path.
+    ///
+    /// DX12 needs no software reap: the descriptor gate reads the live graphics
+    /// fence on every poll, so completed submissions already unblock publication.
+    /// This hook keeps the shared dispatch uniform across backends.
+    ///
+    /// # Errors
+    ///
+    /// Never returns an error; the `Result` keeps the shared dispatch uniform.
+    pub fn poll_frame_completion(&mut self) -> Result<(), HalError> {
+        Ok(())
+    }
+
     /// Enumeration exhaustion reports `DXGI_ERROR_UNSUPPORTED`; software adapters are ignored unless explicitly allowed.
     ///
     /// # Errors

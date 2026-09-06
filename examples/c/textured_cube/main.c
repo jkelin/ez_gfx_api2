@@ -9,8 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if EZ_GFX_ABI_VERSION != 23u
-#error "textured_cube requires ez-gfx ABI v23"
+#if EZ_GFX_ABI_VERSION != 24u
+#error "textured_cube requires ez-gfx ABI v24"
 #endif
 
 #define WIDTH 640u
@@ -325,7 +325,7 @@ int main(int argc, char **argv) {
     window = create_window(instance);
     if (window == NULL) goto cleanup;
 
-    context_desc = (EzGfxBackendContextDesc){0, 0, EzGfxSurfacePlatform_Win32, options.backend};
+    context_desc = (EzGfxBackendContextDesc){0, 0, EzGfxSurfacePlatform_Win32, options.backend, 0};
     if (!checked(ez_gfx_context_create_backend(&context_desc, &context), "create context")) goto cleanup;
     surface_desc = (EzGfxSurfaceDesc){window, instance, EzGfxSurfacePlatform_Win32,
         WIDTH, HEIGHT, options.snapshot_path != NULL};

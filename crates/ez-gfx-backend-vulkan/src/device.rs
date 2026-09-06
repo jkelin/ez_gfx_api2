@@ -4,8 +4,9 @@ use super::{
     DEFAULT_ALLOCATION_BLOCK_POLICY, DeferredNativeResource, DeferredResource, DeviceProbe, Entry,
     FrameSlot, HalError, MemoryAllocator, NativeContext, NativeSurface, PendingDevice,
     SemanticProfile, SurfacePlatform, TEXTURE_DESCRIPTOR_CAPACITY, create_frame_slots, khr,
-    map_allocation_hal, map_allocator, map_allocator_hal, map_vk, paired_texture_capacity,
-    texture_descriptor_layout_bindings, texture_heap_rejection, transfer, vk,
+    map_allocation_hal, map_allocation_vk, map_allocator, map_allocator_hal, map_vk,
+    paired_texture_capacity, texture_descriptor_layout_bindings, texture_heap_rejection, transfer,
+    vk,
 };
 
 fn create_device_frame_state(
@@ -666,6 +667,37 @@ impl NativeContext {
                     mask
                 }
             })
+    }
+    /// Reaps frame slots whose fences already signaled without blocking.
+    ///
+    /// Polling texture paths call this before consulting the descriptor gate so
+    /// completed submissions unblock publication during sustained rendering.
+    /// Slot reuse already reclaims the same state on wrap-around; this only
+    /// observes fence status and never waits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the device is missing or fence status cannot be queried.
+    pub fn poll_frame_completion(&mut self) -> Result<(), AllocationError> {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or(AllocationError::NativeFailure)?
+            .clone();
+        for slot_index in 0..self.frame_slots.len() {
+            if !self.frame_slots[slot_index].in_flight {
+                continue;
+            }
+            // SAFETY: the fence belongs to this slot on the retained live device,
+            // and a status query performs no wait and mutates no command state.
+            let signaled = unsafe { device.get_fence_status(self.frame_slots[slot_index].fence) }
+                .map_err(|error| map_allocation_vk(map_vk(error)))?;
+            if signaled {
+                self.frame_slots[slot_index].in_flight = false;
+                self.complete_frame_slot(slot_index)?;
+            }
+        }
+        Ok(())
     }
 
     ///

@@ -22,6 +22,9 @@ pub struct ContextOptions {
     pub surface_platform: SurfacePlatform,
     /// Selects the graphics backend.
     pub backend: Backend,
+    /// Decode worker threads for async texture uploads. Zero selects the default
+    /// topology (`available_parallelism - 1`, at least one thread).
+    pub texture_decode_workers: u32,
 }
 
 impl ContextOptions {
@@ -71,7 +74,17 @@ impl ContextOptions {
             enable_validation: parse_bool(enable_validation)?,
             surface_platform,
             backend,
+            texture_decode_workers: 0,
         })
+    }
+
+    /// Overrides the async texture decode worker count. Zero (the default)
+    /// keeps the default topology; a nonzero value requests exactly that many
+    /// worker threads. The count is validated when the context is created.
+    #[must_use]
+    pub const fn with_texture_decode_workers(mut self, workers: u32) -> Self {
+        self.texture_decode_workers = workers;
+        self
     }
 }
 

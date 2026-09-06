@@ -185,11 +185,17 @@ struct AsyncTextureState {
 }
 
 impl AsyncTextureState {
-    fn new() -> Result<Self, EzGfxResult> {
-        let threads = std::thread::available_parallelism()
-            .map_or(2, usize::from)
-            .saturating_sub(1)
-            .max(1);
+    fn new_with_workers(workers: u32) -> Result<Self, EzGfxResult> {
+        // Zero preserves the historical default topology; an explicit count is
+        // honored verbatim so embedders can pin decode concurrency.
+        let threads = if workers == 0 {
+            std::thread::available_parallelism()
+                .map_or(2, usize::from)
+                .saturating_sub(1)
+                .max(1)
+        } else {
+            usize::try_from(workers).map_err(|_| EzGfxResult::InvalidArgument)?
+        };
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(64);
         Ok(Self {
             pool: ez_gfx_assets::CpuPool::new(
@@ -203,6 +209,11 @@ impl AsyncTextureState {
             #[cfg(test)]
             decode_gate: None,
         })
+    }
+
+    #[cfg(test)]
+    fn worker_count(&self) -> usize {
+        self.pool.thread_count()
     }
 }
 
@@ -339,7 +350,7 @@ use native::{
     allocate_native, completed_texture_transfer_native, completed_transfer_native, copy_native,
     destroy_native_texture, free_native_allocation, map_allocation, map_frame, map_geometry,
     map_hal, map_lifecycle, map_native_loss, map_texture, native_layouts, pipeline_layout_key,
-    result_status, vulkan_bindings, wait_native_idle, write_native,
+    poll_native_frame_completion, result_status, vulkan_bindings, wait_native_idle, write_native,
 };
 mod shader;
 mod texture;
