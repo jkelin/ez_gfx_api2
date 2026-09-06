@@ -48,6 +48,18 @@ impl SubmittedCommands {
         commands.push(TransferCommand::new(command.clone()));
     }
 
+    /// Reports whether any retained buffer already reached error status.
+    ///
+    /// Status queries never block; unsettled buffers simply report no error yet.
+    /// Late failures still surface through per-submission `completed()` polling.
+    fn has_error(&self) -> bool {
+        self.commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|entry| entry.command.status() == MTLCommandBufferStatus::Error)
+    }
+
     fn drain(&self) -> Result<(), ez_gfx_hal::TransferWorkerError> {
         let mut commands = self
             .commands
@@ -271,19 +283,21 @@ pub(super) fn start_texture_worker(
             blit.endEncoding();
             }
             command.encodeSignalEvent_value(&completion_event, last_value);
+            // Fail promptly without blocking when an earlier batch errored: retained
+            // buffers are pruned below, so observe their status before pruning.
+            if submitted.has_error() {
+                return Err(ez_gfx_hal::TransferWorkerError::Failed);
+            }
             // Publish every observer before commit: a poisoned observer cannot orphan live work.
             for job in &jobs {
                 *job.submission.command.lock().map_err(|_| ez_gfx_hal::TransferWorkerError::Failed)? =
                     Some(TransferCommand::new(command.clone()));
             }
             submitted.retain_before_commit(&command);
+            // Ordering and failure observation are GPU-side from here: the completion
+            // event orders graphics waits and `completed()` polls buffer status lazily.
+            // Shutdown and wait-idle drains still join actual GPU work terminally.
             command.commit();
-            // GPU failure must reach flush_through before graphics waits on its event.
-            // Waiting on this dedicated owner preserves independent graphics progress.
-            command.waitUntilCompleted();
-            if command.status() != MTLCommandBufferStatus::Completed || command.error().is_some() {
-                return Err(ez_gfx_hal::TransferWorkerError::Failed);
-            }
             Ok(())
         },
         move || shutdown.drain(),
@@ -297,6 +311,21 @@ mod tests {
         MTLStorageMode, MTLTextureDescriptor,
     };
     use super::*;
+    use objc2_metal::MTLSharedEvent;
+
+    /// Encodes a host-signalable gate wait into a fresh command buffer.
+    #[allow(
+        clippy::semicolon_if_nothing_returned,
+        reason = "a trailing semicolon breaks msg_send return-type inference"
+    )]
+    fn encode_gate_wait(
+        buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        event: &ProtocolObject<dyn MTLSharedEvent>,
+    ) {
+        // SAFETY: `encodeWaitForEvent:value:` is implemented by every Metal command
+        // buffer, and the shared event conforms to `MTLEvent` and outlives the call.
+        let () = unsafe { objc2::msg_send![buffer, encodeWaitForEvent: event, value: 1u64] };
+    }
 
     #[test]
     fn shutdown_drains_partial_commit_after_submission_failure() {
@@ -395,7 +424,8 @@ mod tests {
         }
         worker.submit_batch(jobs).unwrap();
         worker.flush_through(3).unwrap();
-        // Flush must prove GPU completion, not merely commit, before graphics can wait.
+        // Flush proves driver submission, not GPU completion: the completion event
+        // orders the real graphics wait below, which still proves GPU execution.
         // The cancelled-only final batch must unblock a real graphics event wait.
         let graphics = device.newCommandQueue().unwrap();
         let waiter = graphics.commandBuffer().unwrap();
@@ -447,5 +477,214 @@ mod tests {
             assert_eq!(actual, expected);
         }
         worker.shutdown();
+    }
+
+    /// Holds GPU execution behind a host-signaled event; dropping releases it so
+    /// a panic cannot wedge the queue and hang worker shutdown.
+    struct EventGate {
+        event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    }
+
+    impl EventGate {
+        fn release(&self) {
+            self.event.setSignaledValue(1);
+        }
+    }
+
+    impl Drop for EventGate {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    #[test]
+    fn consecutive_texture_batches_submit_without_waiting_for_gpu_completion() {
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device");
+        let queue = device.newCommandQueue().unwrap();
+        let completion_event = device.newEvent().unwrap();
+        let mut worker =
+            start_texture_worker(queue.clone(), device.newEvent().unwrap(), completion_event)
+                .unwrap();
+        // Gate all GPU execution behind a host-signaled event: the gate buffer is
+        // committed first, so every worker submission queues behind it and cannot
+        // execute until release. Host submission flow is fully deterministic.
+        let gate_event = device.newSharedEvent().unwrap();
+        let gate_buffer = queue.commandBuffer().unwrap();
+        encode_gate_wait(&gate_buffer, &gate_event);
+        gate_buffer.commit();
+        let gate = EventGate { event: gate_event };
+        // A 64 MiB first batch keeps the GPU busy after release for good measure.
+        let big_bytes = 4096_usize * 4096 * 4;
+        let big_source = device
+            .newBufferWithLength_options(big_bytes, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        // SAFETY: a 4096x4096 RGBA8 shared texture forms a valid 2D descriptor.
+        let big_desc = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::RGBA8Unorm,
+                4096,
+                4096,
+                false,
+            )
+        };
+        big_desc.setStorageMode(MTLStorageMode::Shared);
+        let big = device.newTextureWithDescriptor(&big_desc).unwrap();
+        let small_source = device
+            .newBufferWithLength_options(4, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        // SAFETY: one RGBA8 pixel and one mip form a valid 2D descriptor.
+        let small_desc = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::RGBA8Unorm,
+                1,
+                1,
+                false,
+            )
+        };
+        small_desc.setStorageMode(MTLStorageMode::Shared);
+        let small = device.newTextureWithDescriptor(&small_desc).unwrap();
+        let big_sub = Arc::new(TextureSubmission::default());
+        let small_sub = Arc::new(TextureSubmission::default());
+        let copy = |source,
+                    destination: &Retained<ProtocolObject<dyn MTLTexture>>,
+                    row_bytes: usize,
+                    image_bytes: usize,
+                    size: MTLSize| TextureCopy {
+            source,
+            destination: destination.clone(),
+            source_offset: 0,
+            row_bytes,
+            image_bytes,
+            size,
+            level: 0,
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+        };
+        worker
+            .submit_batch(vec![TextureTransferJob {
+                value: 1,
+                bytes: u64::try_from(big_bytes).unwrap(),
+                stage: 1,
+                graphics_wait: false,
+                copy: copy(
+                    big_source,
+                    &big,
+                    4096 * 4,
+                    4096 * 4096 * 4,
+                    MTLSize {
+                        width: 4096,
+                        height: 4096,
+                        depth: 1,
+                    },
+                ),
+                cancellation: Arc::new(TransferCancellation::new()),
+                submission: big_sub.clone(),
+            }])
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !big_sub.submitted() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first native copy submission timed out"
+            );
+            std::thread::yield_now();
+        }
+        // Observed submission proves the worker finished the first callback, so the
+        // second batch must not wait for still-executing GPU work.
+        worker
+            .submit_batch(vec![TextureTransferJob {
+                value: 2,
+                bytes: 4,
+                stage: 2,
+                graphics_wait: false,
+                copy: copy(
+                    small_source,
+                    &small,
+                    4,
+                    4,
+                    MTLSize {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
+                ),
+                cancellation: Arc::new(TransferCancellation::new()),
+                submission: small_sub.clone(),
+            }])
+            .unwrap();
+        while !small_sub.submitted() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "second batch submission waited for GPU completion"
+            );
+            std::thread::yield_now();
+        }
+
+        // Both commands reached the driver while GPU execution is still gated: that
+        // is the overlap the removed host wait serialized away. Deterministic, not
+        // timing-dependent, because the gate holds every blit until release.
+        assert!(!big_sub.completed().unwrap());
+        gate.release();
+        while !big_sub.completed().unwrap() || !small_sub.completed().unwrap() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "transfers never completed after submission"
+            );
+            std::thread::yield_now();
+        }
+        worker.shutdown();
+    }
+
+    #[test]
+    fn event_gate_holds_gpu_execution_until_host_signal() {
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device");
+        let queue = device.newCommandQueue().unwrap();
+        let gate_event = device.newSharedEvent().unwrap();
+        let gate_buffer = queue.commandBuffer().unwrap();
+        encode_gate_wait(&gate_buffer, &gate_event);
+        gate_buffer.commit();
+        let gate = EventGate { event: gate_event };
+        // A blit queued behind the gate must stay scheduled, never completed.
+        let source = device
+            .newBufferWithLength_options(4, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        // SAFETY: one RGBA8 pixel and one mip form a valid 2D descriptor.
+        let desc = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::RGBA8Unorm,
+                1,
+                1,
+                false,
+            )
+        };
+        desc.setStorageMode(MTLStorageMode::Shared);
+        let destination = device.newTextureWithDescriptor(&desc).unwrap();
+        let blit = queue.commandBuffer().unwrap();
+        let encoder = blit.blitCommandEncoder().unwrap();
+        // SAFETY: the four shared source bytes and the 1x1 destination are live
+        // through commit, with tight strides and a zero origin.
+        unsafe {
+            encoder.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                &source, 0, 4, 4,
+                MTLSize { width: 1, height: 1, depth: 1 },
+                &destination, 0, 0, MTLOrigin { x: 0, y: 0, z: 0 },
+            );
+        }
+        encoder.endEncoding();
+        blit.commit();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_ne!(
+            blit.status(),
+            MTLCommandBufferStatus::Completed,
+            "unsignaled event wait did not hold later work"
+        );
+        gate.release();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while blit.status() != MTLCommandBufferStatus::Completed {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "released gate never drained"
+            );
+            std::thread::yield_now();
+        }
     }
 }

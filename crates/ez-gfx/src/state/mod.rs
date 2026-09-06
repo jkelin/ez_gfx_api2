@@ -20,14 +20,15 @@ use ez_gfx_core::{
     Backend,
     handle::{
         ContextHandle, GenerationalArena, HandleParts, IndirectBufferHandle, LocalHandle,
-        PackedHandle, ShaderHandle, StructuredBufferHandle, SurfaceHandle, TextureHandle,
+        PackedHandle, RenderTargetHandle, ShaderHandle, StructuredBufferHandle, SurfaceHandle,
+        TextureHandle,
     },
 };
 use ez_gfx_hal::{
     AllocationRequest, BufferRange, BufferTransfer, CompletionToken, DEFAULT_STAGING_POLICY,
     DynamicPipelineState, ExecutionAction, FrameExecutionBackend, FrameExecutionPlan, HalError,
     ImageMip, MemoryAllocator, MemoryClass, QueueKind, ResourceAccess, ResourceState, ShaderStage,
-    TextureFormat, TextureRegion, staging_bucket_size,
+    TextureFormat, TextureRegion, staging_bucket_size, SURFACE_DEFAULT_CLEAR,
 };
 use ez_gfx_runtime::render::{ExecutionError, execute_compiled_graph};
 use ez_gfx_runtime::{
@@ -187,14 +188,21 @@ struct AsyncTextureState {
 impl AsyncTextureState {
     fn new_with_workers(workers: u32) -> Result<Self, EzGfxResult> {
         // Zero preserves the historical default topology; an explicit count is
-        // honored verbatim so embedders can pin decode concurrency.
+        // honored verbatim so embedders can pin decode concurrency. Counts above
+        // the pool admission cap fail here, before Rayon spawns one OS thread
+        // per worker, so both the Rust option and the C descriptor fail fast
+        // with InvalidArgument instead of grinding thread creation.
         let threads = if workers == 0 {
             std::thread::available_parallelism()
                 .map_or(2, usize::from)
                 .saturating_sub(1)
                 .max(1)
         } else {
-            usize::try_from(workers).map_err(|_| EzGfxResult::InvalidArgument)?
+            let threads = usize::try_from(workers).map_err(|_| EzGfxResult::InvalidArgument)?;
+            if threads > ez_gfx_assets::MAX_CPU_POOL_THREADS {
+                return Err(EzGfxResult::InvalidArgument);
+            }
+            threads
         };
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(64);
         Ok(Self {
@@ -230,6 +238,7 @@ enum FrameNativeResource {
     Surface(SurfaceHandle),
     Depth,
     Index,
+    RenderTarget(RenderTargetHandle),
 }
 struct ContextState {
     identity: ContextIdentity,
@@ -241,6 +250,9 @@ struct ContextState {
     shaders: HashMap<ShaderHandle, ShaderRecord>,
     indirects: HashMap<IndirectBufferHandle, IndexedIndirectBuffer>,
     textures: HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>,
+    render_targets: HashMap<RenderTargetHandle, render_target::RenderTargetRecord>,
+    render_target_bindings: Vec<u32>,
+    next_render_target_binding: u32,
     texture_formats: HashMap<TextureHandle, TextureFormat>,
     texture_published_mips: HashMap<TextureHandle, u32>,
     texture_residency_targets: HashMap<TextureHandle, u32>,
@@ -266,9 +278,10 @@ struct ContextState {
     frame_surface: Option<ResourceId>,
     frame_depth: Option<ResourceId>,
     frame_has_graphics: bool,
-    last_readback: Vec<u8>,
-    active_surface: Option<SurfaceHandle>,
     frame_presented: bool,
+    active_surface: Option<SurfaceHandle>,
+    frame_render_target: Option<RenderTargetHandle>,
+    last_readback: Vec<u8>,
     observability: Observability,
 }
 
@@ -349,15 +362,18 @@ use native::metal_bindings;
 use native::{
     allocate_native, completed_texture_transfer_native, completed_transfer_native, copy_native,
     destroy_native_texture, free_native_allocation, map_allocation, map_frame, map_geometry,
-    map_hal, map_lifecycle, map_native_loss, map_texture, native_layouts, pipeline_layout_key,
-    poll_native_frame_completion, result_status, vulkan_bindings, wait_native_idle, write_native,
+    map_hal, map_lifecycle, map_native_loss, map_texture, native_layouts,
+    native_texture_compression, pipeline_layout_key, poll_native_frame_completion, result_status,
+    vulkan_bindings, wait_native_idle, write_native,
 };
+mod render_target;
 mod shader;
 mod texture;
 
 pub use buffers::*;
 pub use context::*;
 pub use frame::*;
+pub use render_target::*;
 pub use shader::*;
 pub use texture::*;
 

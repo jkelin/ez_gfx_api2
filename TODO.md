@@ -3,7 +3,7 @@
 ## P0
 
 - Lower compiled transient alias assignments into Vulkan, DX12, and Metal resource placement, including alias barriers and overlap-safe retirement (P-004, P-008, P-009).
-- Add managed render-target creation, format-capability probing, per-target clears, sampled/storage bindings, resize/history, graph attachment, and lifecycle APIs across Rust/FFI/backends (P-008, P-009, P-010, P-015).
+- Add managed render-target creation, format-capability probing, per-target clears, sampled/storage bindings, resize/history, graph attachment, and lifecycle APIs across Rust/FFI/backends (P-008, P-009, P-010, P-015). Native single-mip sampled creation/probing plus safe create/query/destroy lifecycle are implemented on Vulkan/DX12/Metal without FFI; heap-slot unification, pass attachment, MSAA resolve, and FFI remain open.
 
 ## P1
 
@@ -15,7 +15,7 @@
 - Add bounded, validated host-owned pipeline-cache import/export envelopes with backend/device/driver/schema compatibility; current caches are process-local only (P-007, P-024).
 - Finish terminal device-loss behavior for queued CPU jobs, transfers, staging leases, pending handles, and waits; support explicit cross-thread context destruction without cleanup under Windows loader lock (P-023, P-026).
 - Expand runtime events to preserve one correlation across admission/decode/transfer/bind, and add severity, category, sequence/domain, clocks, units, payloads, overflow markers, and cleanup/resource/device-loss outcomes (P-023, P-026, P-028).
-- Remove per-batch GPU completion waits from native transfer owners while preserving failure-safe coarse handoffs, truthful completion, cancellation, and undrainable-context retention. Native cross-texture batching is implemented, but P-012's selected nonblocking-submission goal remains open; current targeted waits are a correctness tradeoff, not scope removal (P-012, P-015).
+- Design and implement a dedicated transition/acquire queue per transfer worker to remove the remaining Vulkan/DX12 host waits without breaking shared-queue frame order; Metal nonblocking submission is implemented with overlap evidence (P-012, P-015).
 - Fix CPU mip generation dropping trailing odd rows/columns; area-weighted box filter must cover the full extent (P-014; implemented in this change with runtime tests).
 - Filter sRGB mips in linear light (decode/filter/encode RGB, alpha linear unchanged) instead of encoded-space averaging (P-014; implemented in this change with runtime tests).
 

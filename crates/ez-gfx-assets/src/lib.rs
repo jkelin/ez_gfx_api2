@@ -383,6 +383,15 @@ impl Drop for JobPermit {
     }
 }
 
+/// Maximum worker threads admitted to one CPU pool.
+///
+/// Rayon spawns one OS thread per worker eagerly at pool construction, so an
+/// unbounded count grinds thread creation (stack reservation, scheduler load)
+/// instead of failing fast. 256 threads already exceed twice the logical CPUs
+/// of large commodity workstations, beyond which extra workers add only
+/// overhead; any larger request is configuration garbage.
+pub const MAX_CPU_POOL_THREADS: usize = 256;
+
 /// Bounded CPU worker pool for asset processing.
 pub struct CpuPool {
     pool: ThreadPool,
@@ -397,10 +406,14 @@ impl CpuPool {
     ///
     /// # Errors
     ///
-    /// Returns [`AssetError::InvalidPool`] when any budget is zero or the
-    /// worker pool cannot be created.
+    /// Returns [`AssetError::InvalidPool`] when any budget is zero, the thread
+    /// count exceeds [`MAX_CPU_POOL_THREADS`], or the worker pool cannot be
+    /// created.
     pub fn new(threads: usize, max_jobs: usize, max_bytes: usize) -> Result<Self, AssetError> {
         if threads == 0 || max_jobs == 0 || max_bytes == 0 {
+            return Err(AssetError::InvalidPool);
+        }
+        if threads > MAX_CPU_POOL_THREADS {
             return Err(AssetError::InvalidPool);
         }
         let pool = rayon::ThreadPoolBuilder::new()
@@ -776,6 +789,23 @@ mod tests {
         started_rx.recv().unwrap();
         assert_eq!(pool.in_flight_jobs(), 1);
         release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn cpu_pool_rejects_absurd_thread_counts_without_spawning() {
+        // The admission cap precedes ThreadPoolBuilder, so neither rejected call creates threads.
+        assert_eq!(
+            CpuPool::new(usize::MAX, 1, 8).map(|_| ()),
+            Err(AssetError::InvalidPool)
+        );
+        assert_eq!(
+            CpuPool::new(MAX_CPU_POOL_THREADS + 1, 1, 8).map(|_| ()),
+            Err(AssetError::InvalidPool)
+        );
+        assert_eq!(
+            CpuPool::new(MAX_CPU_POOL_THREADS, 1, 8).map(|pool| pool.thread_count()),
+            Ok(MAX_CPU_POOL_THREADS)
+        );
     }
 
     #[test]

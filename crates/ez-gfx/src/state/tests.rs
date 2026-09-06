@@ -236,6 +236,15 @@ fn decode_worker_topology_defaults_and_honors_explicit_counts() {
     assert_eq!(explicit_state.worker_count(), 2);
 }
 
+#[test]
+fn decode_worker_topology_rejects_absurd_counts_before_spawning() {
+    // The admission cap precedes pool construction, so no threads are spawned.
+    assert_eq!(
+        AsyncTextureState::new_with_workers(u32::MAX).map(|_| ()),
+        Err(EzGfxResult::InvalidArgument)
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn context_decode_worker_count_reaches_pool_construction() {
@@ -383,4 +392,109 @@ fn coarse_range_completion_ignores_hidden_fine_updates() {
             expected
         );
     }
+}
+
+// The native Vulkan context currently requires Win32 support.
+#[cfg(windows)]
+#[test]
+fn render_target_lifecycle_rejects_misuse_before_native_work() {
+    use ez_gfx_runtime::target::{ClearValue, TargetDeclaration, TargetUsage};
+    let context =
+        create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).unwrap()).unwrap();
+    let declaration = TargetDeclaration::new(
+        "rt-proof",
+        TargetUsage::Color,
+        1.0,
+        1,
+        vec![Format::Rgba8Unorm],
+        ClearValue::Color([1.0, 0.0, 0.0, 1.0]),
+        true,
+    )
+    .unwrap();
+    // Empty extents fail before leasing allocator state; no device is needed.
+    assert_eq!(
+        create_render_target(context, &declaration, 0, 64),
+        Err(EzGfxResult::InvalidArgument)
+    );
+    // Depth usage is deferred to the pass-attachment slice.
+    let depth = TargetDeclaration::new(
+        "rt-depth",
+        TargetUsage::Depth,
+        1.0,
+        1,
+        vec![Format::Depth32Float],
+        ClearValue::DepthStencil {
+            depth: 1.0,
+            stencil: 0,
+        },
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        create_render_target(context, &depth, 64, 64),
+        Err(EzGfxResult::Unsupported)
+    );
+    // Unknown handles never reach native code. Live-target creation, format,
+    // extent, clear, and destroy need an initialized device, which requires a
+    // real surface; that path is proven by the native allocation tests on
+    // Vulkan, DX12, and Metal instead of here.
+    let phantom = RenderTargetHandle::from_packed(
+        PackedHandle::child(
+            LocalHandle::new(1, 1).unwrap(),
+            LocalHandle::new(7, 1).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        render_target_format(context, phantom),
+        Err(EzGfxResult::InvalidArgument)
+    );
+    assert_eq!(
+        render_target_extent(context, phantom),
+        Err(EzGfxResult::InvalidArgument)
+    );
+    assert_eq!(
+        render_target_clear(context, phantom),
+        Err(EzGfxResult::InvalidArgument)
+    );
+    destroy_render_target(context, phantom);
+}
+
+// The native Vulkan context currently requires Win32 support.
+#[cfg(windows)]
+#[test]
+fn begin_render_target_rejects_foreign_handles() {
+    let context =
+        create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).unwrap()).unwrap();
+    // A forged handle resolves to nothing.
+    let phantom = RenderTargetHandle::from_packed(
+        PackedHandle::child(
+            LocalHandle::new(1, 1).unwrap(),
+            LocalHandle::new(7, 1).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        begin_render_target(context, phantom),
+        EzGfxResult::InvalidContext
+    );
+    // A live texture handle is the wrong kind, never an alias.
+    let texture = load_texture(
+        context,
+        TextureSource::Rgba8 {
+            width: 1,
+            height: 1,
+        },
+        &[1, 2, 3, 4],
+        false,
+        &texture_config(),
+    )
+    .unwrap();
+    let mistaken = RenderTargetHandle::from_packed(texture.packed()).unwrap();
+    assert_eq!(
+        begin_render_target(context, mistaken),
+        EzGfxResult::InvalidContext
+    );
 }

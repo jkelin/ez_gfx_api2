@@ -1,4 +1,5 @@
 use super::*;
+use super::super::{AllocationError, NativeFrameAction, NativeFrameResource, PassAttachment};
 use ez_gfx_compiler::{Target, compile_shader};
 use ez_gfx_runtime::shader::RuntimeShader;
 use std::{
@@ -662,4 +663,155 @@ fn accepted_buffer_wait_orders_a_gpu_gated_copy_before_sampled_frame_completion(
     context.free(source).unwrap();
     context.free(destination).unwrap();
     finish(&mut context, texture, pipeline);
+}
+
+#[test]
+fn device_probe_reports_render_target_roles() {
+    use ez_gfx_runtime::target::{ClearValue, Format, TargetDeclaration, TargetUsage};
+    let context = NativeContext::create_default().unwrap();
+    let formats = context.probe_target_formats().unwrap();
+    // Apple Silicon must admit the core color roles plus depth attachment.
+    for format in [Format::Rgba8Unorm, Format::Bgra8Srgb, Format::Rgba16Float] {
+        let declaration = TargetDeclaration::new(
+            "probe",
+            TargetUsage::Color,
+            1.0,
+            1,
+            vec![format],
+            ClearValue::Color([0.0, 0.0, 0.0, 1.0]),
+            true,
+        )
+        .unwrap();
+        assert_eq!(formats.resolve(&declaration).unwrap(), format);
+    }
+    let depth = TargetDeclaration::new(
+        "depth",
+        TargetUsage::Depth,
+        1.0,
+        1,
+        vec![Format::Depth32Float],
+        ClearValue::DepthStencil {
+            depth: 1.0,
+            stencil: 0,
+        },
+        false,
+    )
+    .unwrap();
+    assert_eq!(formats.resolve(&depth).unwrap(), Format::Depth32Float);
+}
+
+#[test]
+fn render_target_allocation_creates_sampled_color_textures() {
+    use ez_gfx_runtime::target::Format;
+    let mut context = NativeContext::create_default().unwrap();
+    // RGBA8 and RGBA16F color targets allocate single-mip sampled textures.
+    for (binding, format, width, height) in [
+        (7, Format::Rgba8Unorm, 64, 64),
+        (9, Format::Rgba16Float, 32, 16),
+    ] {
+        let target = context
+            .create_render_target(format, width, height, binding)
+            .unwrap();
+        assert_eq!((target.width, target.height), (width, height));
+        assert_eq!(target.mip_count, 1);
+        assert_eq!(target.binding, binding);
+        context.destroy_texture(target).unwrap();
+    }
+    // Depth usage and empty extents fail before native allocation.
+    assert_eq!(
+        context
+            .create_render_target(Format::Depth32Float, 64, 64, 0)
+            .map(|_| ()),
+        Err(AllocationError::Unsupported)
+    );
+    assert_eq!(
+        context
+            .create_render_target(Format::Rgba8Unorm, 0, 64, 0)
+            .map(|_| ()),
+        Err(AllocationError::ZeroSize)
+    );
+    context.wait_idle().unwrap();
+}
+
+#[test]
+fn render_target_clear_applies_attachment_color_on_begin() {
+    use ez_gfx_hal::{
+        AttachmentLoadOp, AttachmentStoreOp, ExecutionBarrier, ExecutionPass, ExecutionRange,
+        ImageSubresources, QueueKind, ResourceAccess, ResourceState, ShaderStage,
+    };
+    use ez_gfx_runtime::target::Format;
+    let mut context = NativeContext::create_default().unwrap();
+    let mut target = context
+        .create_render_target(Format::Rgba8Unorm, 64, 64, 11)
+        .unwrap();
+    let attach = ResourceState::new(
+        QueueKind::Graphics,
+        ShaderStage::AllGraphics,
+        ResourceAccess::ColorAttachmentWrite,
+    )
+    .unwrap();
+    let sampled = ResourceState::new(
+        QueueKind::Graphics,
+        ShaderStage::Fragment,
+        ResourceAccess::SampledRead,
+    )
+    .unwrap();
+    let range = ExecutionRange::Image(ImageSubresources::new(0, 1, 0, 1).unwrap());
+    let pass = ExecutionPass {
+        nodes: vec![],
+        colors: vec![0],
+        depth: None,
+        area: [0, 0, 64, 64],
+        samples: 1,
+        load: AttachmentLoadOp::Clear,
+        store: AttachmentStoreOp::Store,
+    };
+    let actions = vec![
+        NativeFrameAction::Barrier {
+            barrier: ExecutionBarrier {
+                node: 0,
+                resource: 0,
+                range,
+                before: None,
+                after: attach,
+            },
+            resource: NativeFrameResource::RenderTarget(&target),
+        },
+        NativeFrameAction::BeginPass {
+            pass: &pass,
+            colors: vec![PassAttachment {
+                resource: NativeFrameResource::RenderTarget(&target),
+                clear: [0.0, 0.0, 1.0, 1.0],
+            }],
+        },
+        NativeFrameAction::EndPass,
+        NativeFrameAction::Barrier {
+            barrier: ExecutionBarrier {
+                node: 0,
+                resource: 0,
+                range,
+                before: Some(attach),
+                after: sampled,
+            },
+            resource: NativeFrameResource::RenderTarget(&target),
+        },
+    ];
+    context.execute_frame(None, &actions, false).unwrap();
+    let bytes = context.readback_texture_rgba8(&target, 64, 64).unwrap();
+    assert_eq!(bytes.len(), 64 * 64 * 4);
+    for pixel in bytes.chunks_exact(4) {
+        assert_eq!(pixel, [0, 0, 255, 255]);
+    }
+    // Depth pairings stay rejected.
+    let depth_pass = ExecutionPass { depth: Some(0), ..pass.clone() };
+    let depth = NativeFrameAction::BeginPass {
+        pass: &depth_pass,
+        colors: vec![PassAttachment {
+            resource: NativeFrameResource::RenderTarget(&target),
+            clear: [0.0, 0.0, 0.0, 1.0],
+        }],
+    };
+    assert!(context.execute_frame(None, &[depth], false).is_err());
+    context.destroy_texture(target).unwrap();
+    context.wait_idle().unwrap();
 }

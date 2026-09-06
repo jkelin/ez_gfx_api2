@@ -8,6 +8,28 @@ use super::{
     map_allocation_hal, map_allocator, map_allocator_hal,
 };
 
+/// Architecture-guaranteed render-target roles per format.
+///
+/// Metal exposes no runtime renderability query beyond family checks, so these
+/// roles follow the API guarantee rather than a device probe: RGBA8 and BGRA
+/// sRGB render and sample on every Metal device, RGBA16F renders and samples
+/// on Apple GPUs, and D32 float attaches depth everywhere. A device-specific
+/// restriction would surface as native allocation failure, never silent fallback.
+fn target_format_support() -> Vec<ez_gfx_runtime::target::FormatSupport> {
+    use ez_gfx_core::capability::CompressionSupport;
+    use ez_gfx_runtime::target::{Format, FormatSupport};
+    let entry = |format, color, sampled, storage| {
+        FormatSupport::new(format, color, sampled, storage, 1, CompressionSupport::NONE)
+            .expect("single-sample support is always valid")
+    };
+    vec![
+        entry(Format::Rgba8Unorm, true, true, true),
+        entry(Format::Bgra8Srgb, true, true, false),
+        entry(Format::Rgba16Float, true, true, true),
+        entry(Format::Depth32Float, false, true, false),
+    ]
+}
+
 impl NativeContext {
     /// Creates a context on the highest-ranked hardware adapter satisfying the semantic profile.
     ///
@@ -120,6 +142,20 @@ impl NativeContext {
     /// Returns the immutable identity and capabilities of the admitted adapter.
     pub fn adapter_info(&self) -> &AdapterInfo {
         &self.adapter
+    }
+
+    /// Queries render-target format support for the admitted adapter.
+    ///
+    /// Metal reports no per-format renderability query beyond family checks, so
+    /// this returns the architecture-guaranteed table: RGBA8/BGRA-sRGB color
+    /// render plus sampling on every device, RGBA16F color render plus sampling
+    /// on Apple GPUs, and D32 float depth attachment everywhere. Multisample
+    /// counts stay single-sample; resolve targets select separately.
+    pub fn probe_target_formats(
+        &self,
+    ) -> Result<ez_gfx_runtime::target::FormatCapabilities, AllocationError> {
+        ez_gfx_runtime::target::FormatCapabilities::new(target_format_support())
+            .map_err(|_| AllocationError::NativeFailure)
     }
 
     /// Admits the selected adapter and initializes all device-owned queues and descriptor state.
@@ -339,5 +375,37 @@ impl NativeContext {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::target_format_support;
+    use ez_gfx_runtime::target::{Format, FormatSupport};
+
+    #[test]
+    fn static_table_covers_probed_families_once() {
+        let supports = target_format_support();
+        let formats: Vec<Format> = supports.iter().map(|support| support.format).collect();
+        assert_eq!(
+            formats,
+            [
+                Format::Rgba8Unorm,
+                Format::Bgra8Srgb,
+                Format::Rgba16Float,
+                Format::Depth32Float
+            ]
+        );
+        assert!(
+            FormatSupport::new(
+                Format::Rgba8Unorm,
+                true,
+                true,
+                true,
+                1,
+                ez_gfx_core::capability::CompressionSupport::NONE
+            )
+            .is_ok_and(|expected| supports.contains(&expected))
+        );
     }
 }

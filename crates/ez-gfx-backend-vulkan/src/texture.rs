@@ -2,8 +2,9 @@ use super::{
     Allocation, AllocationCreateDesc, AllocationError, AllocationRequest, AllocationScheme,
     CompletionToken, DeferredResource, ImageMip, MemoryAllocator, MemoryClass, MemoryLocation,
     NativeAllocation, NativeContext, NativeTexture, QueueKind, SAMPLER_DESCRIPTOR_BINDING,
-    TEXTURE_DESCRIPTOR_BINDING, TEXTURE_DESCRIPTOR_CAPACITY, TextureFormat, TextureRegion,
-    TextureSamplerDesc, map_allocation_vk, map_allocator, map_vk, sampler_create_info,
+    SamplerAddressMode, SamplerFilter, TEXTURE_DESCRIPTOR_BINDING, TEXTURE_DESCRIPTOR_CAPACITY,
+    TextureFormat, TextureRegion, TextureSamplerDesc, map_allocation_vk, map_allocator, map_vk,
+    sampler_create_info,
     transfer::{VulkanTransferCopy, VulkanTransferJob},
     validate_texture_mips, validate_texture_region, vk,
 };
@@ -22,16 +23,58 @@ fn texture_format_vk(format: TextureFormat) -> vk::Format {
         TextureFormat::Astc4x4Srgb => vk::Format::ASTC_4X4_SRGB_BLOCK,
     }
 }
+
+/// Maps optimal-tiling feature bits onto render-target roles for one format.
+///
+/// Depth formats never report color or storage roles; sampling follows the
+/// sampled-image bit on every format. A depth candidate without attachment
+/// support is omitted so resolution fails with a diagnostic instead of
+/// selecting an unusable format. Multisample counts stay single-sample.
+fn support_for_target_format(
+    format: ez_gfx_runtime::target::Format,
+    features: vk::FormatFeatureFlags,
+) -> Option<ez_gfx_runtime::target::FormatSupport> {
+    use ez_gfx_core::capability::CompressionSupport;
+    use ez_gfx_runtime::target::Format;
+    if format == Format::Depth32Float
+        && !features.contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+    {
+        return None;
+    }
+    let (color, sampled, storage) = match format {
+        Format::Depth32Float => (
+            false,
+            features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE),
+            false,
+        ),
+        _ => (
+            features.contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT),
+            features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE),
+            features.contains(vk::FormatFeatureFlags::STORAGE_IMAGE),
+        ),
+    };
+    // Single-sample support always validates; only the role bits vary per device.
+    Some(
+        ez_gfx_runtime::target::FormatSupport::new(
+            format,
+            color,
+            sampled,
+            storage,
+            1,
+            CompressionSupport::NONE,
+        )
+        .expect("single-sample support is always valid"),
+    )
+}
 fn resident_mip_range(mip_count: u32, resident_mips: u32) -> Option<(u32, u32)> {
     // Zero residency cannot be represented by a Vulkan image view; over-residency would expose
     // storage outside the allocation's mip chain.
     (resident_mips != 0 && resident_mips <= mip_count)
         .then(|| (mip_count - resident_mips, resident_mips))
 }
+
 fn texture_region_copy(region: &TextureRegion<'_>) -> Result<vk::BufferImageCopy, AllocationError> {
     Ok(vk::BufferImageCopy::default()
-        // Zero row/image strides specify the tightly packed texel or compressed-block layout
-        // validated before this native description is built.
         .buffer_row_length(0)
         .buffer_image_height(0)
         .image_subresource(vk::ImageSubresourceLayers {
@@ -201,6 +244,7 @@ impl NativeContext {
         height: u32,
         mip_count: u32,
         format: TextureFormat,
+        usage: vk::ImageUsageFlags,
     ) -> Result<(vk::Image, Allocation), AllocationError> {
         let create = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -214,11 +258,7 @@ impl NativeContext {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(
-                vk::ImageUsageFlags::TRANSFER_DST
-                    | vk::ImageUsageFlags::TRANSFER_SRC
-                    | vk::ImageUsageFlags::SAMPLED,
-            )
+            .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         // SAFETY: `create` is initialized without dangling extension pointers and its stack storage lives through `create_image`; no allocation callbacks are supplied.
@@ -307,8 +347,16 @@ impl NativeContext {
             .as_ref()
             .ok_or(AllocationError::NativeFailure)?
             .clone();
-        let (image, allocation) =
-            self.create_texture_image(&device, width, height, mip_count, format)?;
+        let (image, allocation) = self.create_texture_image(
+            &device,
+            width,
+            height,
+            mip_count,
+            format,
+            vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::SAMPLED,
+        )?;
         // SAFETY: the image is bound and the view initially selects only its coarsest mip. The
         // descriptor remains unpublished until that mip's transfer-to-graphics handoff completes.
         let view = match unsafe {
@@ -396,6 +444,187 @@ impl NativeContext {
             binding,
         };
         Ok((texture, completions))
+    }
+
+    /// Creates an uninitialized single-mip color image for managed render-target use.
+    ///
+    /// The image carries color-attachment, sampled, and transfer roles with no
+    /// initial contents; the first render pass transitions and clears it. The
+    /// returned texture reuses the texture record with inert transfer fields
+    /// (`resident_mips` set, zero completion): route it only through render-target
+    /// entry points, never through upload, publish, or region-update paths. The
+    /// safe layer owns the true format; the stored texture format is the closest
+    /// block-compatible value for record shape only.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero dimensions, excessive aggregate bytes, an
+    /// unsupported (non-color) format, or native allocation failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the allocator handle checked above is concurrently taken,
+    /// which indicates corrupt context-owned state, never caller input.
+    pub fn create_render_target(
+        &mut self,
+        format: ez_gfx_runtime::target::Format,
+        width: u32,
+        height: u32,
+        binding: u32,
+    ) -> Result<NativeTexture, AllocationError> {
+        use ez_gfx_runtime::target::Format;
+        let (vk_format, hal_format, bytes_per_texel) = match format {
+            Format::Rgba8Unorm => (vk::Format::R8G8B8A8_UNORM, TextureFormat::Rgba8Unorm, 4),
+            Format::Bgra8Srgb => (vk::Format::B8G8R8A8_SRGB, TextureFormat::Rgba8Srgb, 4),
+            Format::Rgba16Float => (
+                vk::Format::R16G16B16A16_SFLOAT,
+                TextureFormat::Rgba8Unorm,
+                8,
+            ),
+            _ => return Err(AllocationError::Unsupported),
+        };
+        if width == 0 || height == 0 {
+            return Err(AllocationError::ZeroSize);
+        }
+        if binding >= TEXTURE_DESCRIPTOR_CAPACITY {
+            return Err(AllocationError::ZeroSize);
+        }
+        // A render target holds exactly one mip; bound it by the texture budget.
+        let bytes = u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|pixels| pixels.checked_mul(bytes_per_texel))
+            .ok_or(AllocationError::NativeFailure)?;
+        if bytes > u64::try_from(ez_gfx_runtime::texture::MAX_TEXTURE_BYTES).unwrap_or(u64::MAX) {
+            return Err(AllocationError::OutOfMemory);
+        }
+        if self.allocator.is_none() {
+            return Err(AllocationError::NativeFailure);
+        }
+        let device = self
+            .device
+            .as_ref()
+            .ok_or(AllocationError::NativeFailure)?
+            .clone();
+        let create = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk_format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        // SAFETY: `create` is initialized without dangling pointers and lives through
+        // `create_image`; no allocation callbacks are supplied.
+        let image = unsafe { device.create_image(&create, None) }
+            .map_err(|error| map_allocation_vk(map_vk(error)))?;
+        // SAFETY: the image is the undestroyed result of `create_image`, so requirements
+        // may be queried before binding.
+        let requirements = unsafe { device.get_image_memory_requirements(image) };
+        let allocation = match self
+            .allocator
+            .as_mut()
+            .expect("allocator checked before image creation")
+            .allocate(&AllocationCreateDesc {
+                name: "ez-gfx-render-target",
+                requirements,
+                location: MemoryLocation::GpuOnly,
+                linear: false,
+                allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+            }) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                // SAFETY: allocation failed before binding, publication, or submission.
+                unsafe { device.destroy_image(image, None) };
+                return Err(map_allocator(&error));
+            }
+        };
+        // SAFETY: `allocation` was created from this `image`'s requirements.
+        if let Err(error) =
+            unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset()) }
+        {
+            // SAFETY: binding failed before publication or submission.
+            unsafe { device.destroy_image(image, None) };
+            let _ = self
+                .allocator
+                .as_mut()
+                .expect("allocator initialized")
+                .free(allocation);
+            return Err(map_allocation_vk(map_vk(error)));
+        }
+        // SAFETY: the image is bound; the single-mip view covers the whole target.
+        let view = match unsafe {
+            device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(vk_format)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    }),
+                None,
+            )
+        } {
+            Ok(view) => view,
+            Err(error) => {
+                self.destroy_unpublished_texture(&device, image, None, None, allocation);
+                return Err(map_allocation_vk(map_vk(error)));
+            }
+        };
+        // Render targets sample with fixed nearest filtering until the sampled-binding
+        // slice assigns heap samplers; the sampler is never null.
+        // SAFETY: the descriptor is fully specified with valid filter and clamp modes.
+        let sampler = match unsafe {
+            device.create_sampler(
+                &sampler_create_info(
+                    TextureSamplerDesc {
+                        min_filter: SamplerFilter::Nearest,
+                        mag_filter: SamplerFilter::Nearest,
+                        max_anisotropy: 1.0,
+                        address_u: SamplerAddressMode::Clamp,
+                        address_v: SamplerAddressMode::Clamp,
+                        address_w: SamplerAddressMode::Clamp,
+                    },
+                    1,
+                ),
+                None,
+            )
+        } {
+            Ok(sampler) => sampler,
+            Err(error) => {
+                self.destroy_unpublished_texture(&device, image, Some(view), None, allocation);
+                return Err(map_allocation_vk(map_vk(error)));
+            }
+        };
+        Ok(NativeTexture {
+            image,
+            view,
+            allocation,
+            sampler,
+            format: hal_format,
+            width,
+            height,
+            mip_count: 1,
+            resident_mips: 1,
+            mip_completions: vec![0],
+            cancellation: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            binding,
+        })
     }
     /// Copies one validated tightly packed region into its native mip.
     ///
@@ -547,6 +776,59 @@ impl NativeContext {
     /// Reports whether bindless descriptor rewrites can avoid every submitted frame.
     pub fn texture_descriptor_update_ready(&self) -> bool {
         self.in_flight_mask() == 0
+    }
+
+    /// Queries physical-device format features for render-target formats.
+    ///
+    /// Reports optimal-tiling color, sampled, and storage roles for RGBA8,
+    /// BGRA sRGB, and RGBA16F, plus depth attachment support for D32 float.
+    /// Multisample counts stay single-sample; resolve targets select separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no physical device is selected.
+    pub fn probe_target_formats(
+        &self,
+    ) -> Result<ez_gfx_runtime::target::FormatCapabilities, AllocationError> {
+        use ez_gfx_runtime::target::Format;
+        let physical = self.physical_device.ok_or(AllocationError::NativeFailure)?;
+        // SAFETY: the physical device belongs to this instance for the call.
+        let properties = unsafe {
+            [
+                (
+                    Format::Rgba8Unorm,
+                    self.instance.get_physical_device_format_properties(
+                        physical,
+                        vk::Format::R8G8B8A8_UNORM,
+                    ),
+                ),
+                (
+                    Format::Bgra8Srgb,
+                    self.instance
+                        .get_physical_device_format_properties(physical, vk::Format::B8G8R8A8_SRGB),
+                ),
+                (
+                    Format::Rgba16Float,
+                    self.instance.get_physical_device_format_properties(
+                        physical,
+                        vk::Format::R16G16B16A16_SFLOAT,
+                    ),
+                ),
+                (
+                    Format::Depth32Float,
+                    self.instance
+                        .get_physical_device_format_properties(physical, vk::Format::D32_SFLOAT),
+                ),
+            ]
+        };
+        let supports = properties
+            .into_iter()
+            .filter_map(|(format, queried)| {
+                support_for_target_format(format, queried.optimal_tiling_features)
+            })
+            .collect();
+        ez_gfx_runtime::target::FormatCapabilities::new(supports)
+            .map_err(|_| AllocationError::NativeFailure)
     }
 
     /// Prevents transfer-owner jobs not yet recorded by the native queue from copying this texture.
@@ -820,6 +1102,65 @@ mod tests {
                 height: 4,
                 depth: 1,
             }
+        );
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+    use ez_gfx_runtime::target::{Format, FormatSupport};
+
+    #[test]
+    fn feature_bits_select_color_sampled_and_storage_roles() {
+        // Full optimal features admit every render-target role for RGBA8.
+        let full = vk::FormatFeatureFlags::COLOR_ATTACHMENT
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::STORAGE_IMAGE;
+        let support = support_for_target_format(Format::Rgba8Unorm, full).unwrap();
+        assert_eq!(
+            support,
+            FormatSupport::new(
+                Format::Rgba8Unorm,
+                true,
+                true,
+                true,
+                1,
+                ez_gfx_core::capability::CompressionSupport::NONE
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn missing_bits_withhold_only_their_roles() {
+        // A sampled-only format resolves for sampling but never as a color target.
+        let sampled =
+            support_for_target_format(Format::Rgba8Unorm, vk::FormatFeatureFlags::SAMPLED_IMAGE)
+                .unwrap();
+        assert!(!sampled.color);
+        assert!(sampled.sampled);
+        assert!(!sampled.storage);
+    }
+
+    #[test]
+    fn depth_support_never_reports_color_or_storage() {
+        // Depth aspects carry no color/storage roles regardless of feature bits.
+        let features = vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE;
+        let support = support_for_target_format(Format::Depth32Float, features).unwrap();
+        assert!(!support.color);
+        assert!(!support.storage);
+        assert!(support.sampled);
+    }
+
+    #[test]
+    fn depth_without_attachment_support_is_omitted() {
+        // Omitting the record makes resolution fail with UnsupportedFormat
+        // instead of selecting an unusable depth format.
+        assert!(
+            support_for_target_format(Format::Depth32Float, vk::FormatFeatureFlags::SAMPLED_IMAGE)
+                .is_none()
         );
     }
 }

@@ -46,6 +46,24 @@ pub(super) fn destroy_native_texture(
     }
 }
 
+/// Reports adapter compression support for capability-gated target selection.
+pub(super) fn native_texture_compression(
+    context: &NativeContext,
+) -> ez_gfx_core::capability::CompressionSupport {
+    use ez_gfx_core::capability::CompressionSupport;
+    match context {
+        NativeContext::Vulkan(native) => native
+            .adapter_info()
+            .map_or(CompressionSupport::NONE, |adapter| {
+                adapter.capabilities().compression
+            }),
+        #[cfg(windows)]
+        NativeContext::Dx12(native) => native.adapter_info().capabilities().compression,
+        #[cfg(target_vendor = "apple")]
+        NativeContext::Metal(native) => native.adapter_info().capabilities().compression,
+    }
+}
+
 pub(super) fn native_layouts(
     layout: &ez_gfx_runtime::binding::ReflectedBindings,
 ) -> Result<Vec<ez_gfx_hal::ShaderBufferLayout>, HalError> {

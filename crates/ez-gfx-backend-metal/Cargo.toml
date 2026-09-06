@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 ez-gfx-core.workspace = true
 ez-gfx-hal.workspace = true
+ez-gfx-runtime.workspace = true
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2.workspace = true

@@ -1121,6 +1121,12 @@ pub enum AttachmentStoreOp {
     Discard,
 }
 
+/// Legacy clear color applied to surface passes.
+///
+/// Render targets carry their stored declaration clear instead; surfaces
+/// have no declaration, so every backend preserves this value for them.
+pub const SURFACE_DEFAULT_CLEAR: [f32; 4] = [0.1, 0.1, 0.1, 1.0];
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Ordered render nodes and attachment policy encoded as one native render pass.
 pub struct ExecutionPass {

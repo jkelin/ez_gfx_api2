@@ -13,11 +13,12 @@ use super::{
     D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
     D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
     D3D12_TEXTURE_LAYOUT_UNKNOWN, DXGI_SAMPLE_DESC, DeferredResource, ID3D12CommandAllocator,
-    ID3D12CommandList, ID3D12GraphicsCommandList, ID3D12Resource, INFINITE, ImageMip, Interface,
-    MemoryAllocator, MemoryClass, MemoryLocation, NativeAllocation, NativeContext, NativeTexture,
-    QueueKind, SamplerAddressMode, SamplerFilter, TEXTURE_DESCRIPTOR_CAPACITY, TextureFormat,
-    TextureRegion, TextureSamplerDesc, WaitForSingleObject, map_allocation_windows, map_allocator,
-    validate_texture_mips, validate_texture_region,
+    ID3D12CommandList, ID3D12DescriptorHeap, ID3D12GraphicsCommandList, ID3D12Resource, INFINITE,
+    ImageMip, Interface, MemoryAllocator, MemoryClass, MemoryLocation, NativeAllocation,
+    NativeContext, NativeTexture, QueueKind, SamplerAddressMode, SamplerFilter,
+    TEXTURE_DESCRIPTOR_CAPACITY, TextureFormat, TextureRegion, TextureSamplerDesc,
+    WaitForSingleObject, map_allocation_windows, map_allocator, validate_texture_mips,
+    validate_texture_region,
 };
 
 fn texture_format_dxgi(
@@ -41,6 +42,48 @@ fn texture_format_dxgi(
         // Desktop DXGI has no ASTC resource format.
         TextureFormat::Astc4x4Unorm | TextureFormat::Astc4x4Srgb => None,
     }
+}
+
+/// Maps D3D12 format-support bits onto render-target roles for one format.
+///
+/// Depth formats never report color or storage roles; sampling follows the
+/// texture bit on every format. Multisample counts stay single-sample.
+fn support_for_target_format(
+    format: ez_gfx_runtime::target::Format,
+    support: windows::Win32::Graphics::Direct3D12::D3D12_FORMAT_SUPPORT1,
+) -> Option<ez_gfx_runtime::target::FormatSupport> {
+    use ez_gfx_core::capability::CompressionSupport;
+    use ez_gfx_runtime::target::Format;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL, D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+        D3D12_FORMAT_SUPPORT1_TEXTURE2D, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+    };
+    let flags = support.0;
+    // A depth candidate without attachment support is omitted so resolution
+    // fails with a diagnostic instead of selecting an unusable format.
+    if format == Format::Depth32Float && flags & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL.0 == 0 {
+        return None;
+    }
+    let (color, sampled, storage) = match format {
+        Format::Depth32Float => (false, flags & D3D12_FORMAT_SUPPORT1_TEXTURE2D.0 != 0, false),
+        _ => (
+            flags & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0,
+            flags & D3D12_FORMAT_SUPPORT1_TEXTURE2D.0 != 0,
+            flags & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0,
+        ),
+    };
+    // Single-sample support always validates; only the role bits vary per device.
+    Some(
+        ez_gfx_runtime::target::FormatSupport::new(
+            format,
+            color,
+            sampled,
+            storage,
+            1,
+            CompressionSupport::NONE,
+        )
+        .expect("single-sample support is always valid"),
+    )
 }
 fn validate_texture_request(
     format: TextureFormat,
@@ -161,6 +204,7 @@ fn publish_texture(
             mip_completions,
             cancellation,
             binding,
+            rtv: None,
         },
         completions,
     )
@@ -178,8 +222,9 @@ fn anisotropy_u32(value: f32) -> u32 {
 impl NativeContext {
     fn create_texture_resource(
         &mut self,
-        format: TextureFormat,
         mips: &[ImageMip<'_>],
+        format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+        flags: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAGS,
     ) -> Result<(ID3D12Resource, Allocation, D3D12_RESOURCE_DESC), AllocationError> {
         let width = mips[0].width;
         let height = mips[0].height;
@@ -191,13 +236,13 @@ impl NativeContext {
             Height: height,
             DepthOrArraySize: 1,
             MipLevels: mip_count,
-            Format: texture_format_dxgi(format).ok_or(AllocationError::NativeFailure)?,
+            Format: format,
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
             },
             Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
-            Flags: D3D12_RESOURCE_FLAG_NONE,
+            Flags: flags,
         };
         let allocation_desc = AllocationCreateDesc::from_d3d12_resource_desc(
             self.allocator
@@ -312,7 +357,9 @@ impl NativeContext {
         sampler_desc: TextureSamplerDesc,
     ) -> Result<(NativeTexture, Vec<CompletionToken>), AllocationError> {
         validate_texture_request(format, mips, binding)?;
-        let (resource, allocation, desc) = self.create_texture_resource(format, mips)?;
+        let dxgi = texture_format_dxgi(format).ok_or(AllocationError::NativeFailure)?;
+        let (resource, allocation, desc) =
+            self.create_texture_resource(mips, dxgi, D3D12_RESOURCE_FLAG_NONE)?;
         let mut footprints = vec![
             windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
             mips.len()
@@ -430,6 +477,103 @@ impl NativeContext {
             cancellation,
             completions,
         ))
+    }
+
+    /// Creates an uninitialized single-mip color resource for managed render-target use.
+    ///
+    /// The allocated DXGI format derives from the runtime format directly. The stored
+    /// texture format is the closest block-compatible value for record shape only,
+    /// with inert transfer fields: route the record only through render-target entry
+    /// points, never through upload, publish, or region-update paths. The safe layer
+    /// owns the true format.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero dimensions, excessive aggregate bytes, an
+    /// unsupported (non-color) format, or native allocation failure.
+    pub fn create_render_target(
+        &mut self,
+        format: ez_gfx_runtime::target::Format,
+        width: u32,
+        height: u32,
+        binding: u32,
+    ) -> Result<NativeTexture, AllocationError> {
+        use ez_gfx_runtime::target::Format;
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+        };
+        let (dxgi, hal_format, bytes_per_texel): (_, TextureFormat, u64) = match format {
+            Format::Rgba8Unorm => (DXGI_FORMAT_R8G8B8A8_UNORM, TextureFormat::Rgba8Unorm, 4),
+            Format::Bgra8Srgb => (DXGI_FORMAT_B8G8R8A8_UNORM, TextureFormat::Rgba8Srgb, 4),
+            Format::Rgba16Float => (DXGI_FORMAT_R16G16B16A16_FLOAT, TextureFormat::Rgba8Unorm, 8),
+            _ => return Err(AllocationError::Unsupported),
+        };
+        if width == 0 || height == 0 {
+            return Err(AllocationError::ZeroSize);
+        }
+        if binding >= TEXTURE_DESCRIPTOR_CAPACITY {
+            return Err(AllocationError::ZeroSize);
+        }
+        // A render target holds exactly one mip; bound it by the texture budget.
+        let bytes = u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|pixels| pixels.checked_mul(bytes_per_texel))
+            .ok_or(AllocationError::NativeFailure)?;
+        if bytes > u64::try_from(ez_gfx_runtime::texture::MAX_TEXTURE_BYTES).unwrap_or(u64::MAX) {
+            return Err(AllocationError::OutOfMemory);
+        }
+        // A single mip bypasses block-alignment validation; dimensions stay logical.
+        let mips = [ImageMip {
+            width,
+            height,
+            bytes: &[],
+        }];
+        let (resource, allocation, _) =
+            self.create_texture_resource(&mips, dxgi, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)?;
+        // A private single-entry RTV heap avoids sharing the surface heaps;
+        // the heap drops with the texture record after GPU retirement.
+        let rtv_heap: ID3D12DescriptorHeap = unsafe {
+            self.device.CreateDescriptorHeap(
+                &windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type:
+                        windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 1,
+                    Flags:
+                        windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                    NodeMask: 0,
+                },
+            )
+        }
+        .map_err(|error| map_allocation_windows(&error))?;
+        // SAFETY: the heap retains one CPU descriptor slot for the call.
+        let rtv = unsafe { rtv_heap.GetCPUDescriptorHandleForHeapStart() };
+        let rtv_desc =
+            windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC {
+                Format: dxgi,
+                ViewDimension:
+                    windows::Win32::Graphics::Direct3D12::D3D12_RTV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            };
+        // SAFETY: `rtv` addresses the heap's single slot and `desc` selects a
+        // matching view of the retained resource through the call.
+        unsafe {
+            self.device
+                .CreateRenderTargetView(&resource, Some(&raw const rtv_desc), rtv);
+        }
+        Ok(NativeTexture {
+            resource,
+            allocation,
+            format: hal_format,
+            width,
+            height,
+            mip_count: 1,
+            resident_mips: 1,
+            mip_completions: vec![0],
+            cancellation: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            binding,
+            rtv: Some((rtv_heap, rtv)),
+        })
     }
 
     /// Copies one validated tightly packed region through reusable upload staging.
@@ -627,6 +771,55 @@ impl NativeContext {
         Ok(())
     }
 
+    /// Queries device format support for render-target formats.
+    ///
+    /// Reports render, sampled, and storage roles for RGBA8, BGRA sRGB, and
+    /// RGBA16F plus depth attachment support for D32 float. Multisample counts
+    /// stay single-sample; resolve targets select separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the device rejects the format-support query.
+    pub fn probe_target_formats(
+        &self,
+    ) -> Result<ez_gfx_runtime::target::FormatCapabilities, AllocationError> {
+        use ez_gfx_runtime::target::Format;
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+        };
+        let query = |format, dxgi| {
+            let mut data = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: dxgi,
+                ..Default::default()
+            };
+            // SAFETY: `data` is a live aligned query record sized exactly, and the
+            // device outlives the call.
+            unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut data).cast(),
+                    u32::try_from(core::mem::size_of_val(&data)).unwrap_or(u32::MAX),
+                )
+            }
+            .map_err(|error| map_allocation_windows(&error))?;
+            Ok::<_, AllocationError>(support_for_target_format(format, data.Support1))
+        };
+        let supports = [
+            query(Format::Rgba8Unorm, DXGI_FORMAT_R8G8B8A8_UNORM)?,
+            query(Format::Bgra8Srgb, DXGI_FORMAT_B8G8R8A8_UNORM)?,
+            query(Format::Rgba16Float, DXGI_FORMAT_R16G16B16A16_FLOAT)?,
+            query(Format::Depth32Float, DXGI_FORMAT_D32_FLOAT)?,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        ez_gfx_runtime::target::FormatCapabilities::new(supports)
+            .map_err(|_| AllocationError::NativeFailure)
+    }
     /// Reports whether bindless descriptor rewrites can avoid every submitted frame.
     ///
     /// # Errors
@@ -899,5 +1092,47 @@ mod tests {
                 .collect();
             assert_eq!(validate_texture_request(format, &mips, 0), Ok(()));
         }
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+    use ez_gfx_runtime::target::Format;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL, D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+        D3D12_FORMAT_SUPPORT1_TEXTURE2D, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+    };
+
+    #[test]
+    fn support_bits_select_render_sampled_and_storage_roles() {
+        // Full support admits every render-target role for RGBA8.
+        let full = D3D12_FORMAT_SUPPORT1_RENDER_TARGET
+            | D3D12_FORMAT_SUPPORT1_TEXTURE2D
+            | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+        let support = support_for_target_format(Format::Rgba8Unorm, full).unwrap();
+        assert!(support.color && support.sampled && support.storage);
+    }
+
+    #[test]
+    fn depth_support_never_reports_color() {
+        // Depth aspects carry no color role regardless of support bits.
+        let depth = support_for_target_format(
+            Format::Depth32Float,
+            D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL | D3D12_FORMAT_SUPPORT1_TEXTURE2D,
+        )
+        .unwrap();
+        assert!(!depth.color);
+        assert!(depth.sampled);
+    }
+
+    #[test]
+    fn depth_without_attachment_support_is_omitted() {
+        // Omitting the record makes resolution fail with UnsupportedFormat
+        // instead of selecting an unusable depth format.
+        assert!(
+            support_for_target_format(Format::Depth32Float, D3D12_FORMAT_SUPPORT1_TEXTURE2D)
+                .is_none()
+        );
     }
 }

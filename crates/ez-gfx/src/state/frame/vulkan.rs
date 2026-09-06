@@ -2,15 +2,16 @@ use super::{
     Backend, ContextState, ExecutableNode, ExecutionAction, EzGfxResult, FrameExecutionPlan,
     FrameNativeResource, HashMap, MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext,
     NativePipeline, NativeShader, NativeSurface, NativeTexture, NativeTextureMap, PackedHandle,
-    PipelineKey, ResourceId, ShaderHandle, ShaderRecord, map_hal, native_layouts,
-    pipeline_layout_key, vulkan_bindings,
+    PipelineKey, RenderTargetHandle, RenderTargetRecord, ResourceId, ShaderHandle, ShaderRecord,
+    SURFACE_DEFAULT_CLEAR, map_hal, native_layouts, pipeline_layout_key, vulkan_bindings,
 };
 
 struct VulkanActionState<'a> {
     allocations: &'a HashMap<PackedHandle, (u64, NativeAllocation)>,
     textures: &'a NativeTextureMap,
-    pipelines: &'a HashMap<PipelineKey, NativePipeline>,
+    render_targets: &'a HashMap<RenderTargetHandle, RenderTargetRecord>,
     resources: &'a HashMap<ResourceId, FrameNativeResource>,
+    pipelines: &'a HashMap<PipelineKey, NativePipeline>,
     index: Option<&'a ez_gfx_backend_vulkan::NativeAllocation>,
     extent: (u32, u32),
 }
@@ -284,6 +285,15 @@ fn vulkan_actions<'a>(
                     FrameNativeResource::Surface(_) => {
                         ez_gfx_backend_vulkan::NativeFrameResource::Surface
                     }
+                    FrameNativeResource::RenderTarget(handle) => {
+                        let record = state
+                            .render_targets
+                            .get(&handle)
+                            .ok_or(EzGfxResult::InvalidContext)?;
+                        ez_gfx_backend_vulkan::NativeFrameResource::RenderTarget(
+                            record.native.vulkan()?,
+                        )
+                    }
                     FrameNativeResource::Depth => ez_gfx_backend_vulkan::NativeFrameResource::Depth,
                     FrameNativeResource::Index => {
                         ez_gfx_backend_vulkan::NativeFrameResource::Buffer(
@@ -297,7 +307,40 @@ fn vulkan_actions<'a>(
                 });
             }
             ExecutionAction::BeginPass(pass) => {
-                actions.push(ez_gfx_backend_vulkan::NativeFrameAction::BeginPass(pass));
+                // Resource indices resolve to surface or render-target
+                // attachments here; textures, buffers, and depth images are
+                // never color attachments. Surfaces keep the legacy clear.
+                let mut colors = Vec::with_capacity(pass.colors.len());
+                for index in &pass.colors {
+                    let resource = state
+                        .resources
+                        .get(&ResourceId::from_index(*index))
+                        .ok_or(EzGfxResult::InvalidArgument)?;
+                    colors.push(match *resource {
+                        FrameNativeResource::Surface(_) => {
+                            ez_gfx_backend_vulkan::PassAttachment {
+                                resource: ez_gfx_backend_vulkan::NativeFrameResource::Surface,
+                                clear: SURFACE_DEFAULT_CLEAR,
+                            }
+                        }
+                        FrameNativeResource::RenderTarget(handle) => {
+                            let record = state
+                                .render_targets
+                                .get(&handle)
+                                .ok_or(EzGfxResult::InvalidContext)?;
+                            ez_gfx_backend_vulkan::PassAttachment {
+                                resource: ez_gfx_backend_vulkan::NativeFrameResource::RenderTarget(
+                                    record.native.vulkan()?,
+                                ),
+                                clear: super::super::render_target::render_target_clear_color(
+                                    record,
+                                ),
+                            }
+                        }
+                        _ => return Err(EzGfxResult::InvalidArgument),
+                    });
+                }
+                actions.push(ez_gfx_backend_vulkan::NativeFrameAction::BeginPass { pass, colors });
             }
             ExecutionAction::ExecuteNode(node) => {
                 let index_node = *node as usize;
@@ -402,9 +445,16 @@ pub(super) fn execute_vulkan_frame_plan(
                 .ok_or(EzGfxResult::InvalidContext)
         })
         .transpose()?;
+    // Target-only frames size draws and validations from the target extents.
     let extent = surface
         .as_ref()
         .and_then(|surface| surface.state.extent())
+        .or_else(|| {
+            context
+                .frame_render_target
+                .and_then(|target| context.render_targets.get(&target))
+                .map(|record| (record.width, record.height))
+        })
         .unwrap_or((0, 0));
     let capture = surface
         .as_ref()
@@ -456,6 +506,7 @@ pub(super) fn execute_vulkan_frame_plan(
     let state = VulkanActionState {
         allocations: &context.allocations,
         textures: &context.textures,
+        render_targets: &context.render_targets,
         pipelines: &context.pipelines,
         resources: &context.frame_native_resources,
         index,

@@ -299,6 +299,156 @@ impl NativeContext {
         }
     }
 
+    /// Creates an uninitialized single-mip color texture for managed render-target use.
+    ///
+    /// Storage carries render-target, shader-read, and pixel-format-view usage with
+    /// no initial contents; the first render pass transitions and clears it. The
+    /// returned texture reuses the texture record with inert transfer fields:
+    /// route it only through render-target entry points, never through upload,
+    /// publish, or region-update paths. The safe layer owns the true format.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero dimensions, excessive aggregate bytes, an
+    /// unsupported (non-color) format, or native allocation failure.
+    pub fn create_render_target(
+        &mut self,
+        format: ez_gfx_runtime::target::Format,
+        width: u32,
+        height: u32,
+        binding: u32,
+    ) -> Result<NativeTexture, AllocationError> {
+        use ez_gfx_runtime::target::Format;
+        let (pixel_format, hal_format, bytes_per_texel) = match format {
+            Format::Rgba8Unorm => (MTLPixelFormat::RGBA8Unorm, TextureFormat::Rgba8Unorm, 4),
+            Format::Bgra8Srgb => (MTLPixelFormat::BGRA8Unorm_sRGB, TextureFormat::Rgba8Srgb, 4),
+            Format::Rgba16Float => (MTLPixelFormat::RGBA16Float, TextureFormat::Rgba8Unorm, 8),
+            _ => return Err(AllocationError::Unsupported),
+        };
+        if width == 0 || height == 0 {
+            return Err(AllocationError::ZeroSize);
+        }
+        if binding >= TEXTURE_DESCRIPTOR_CAPACITY {
+            return Err(AllocationError::ZeroSize);
+        }
+        // A render target holds exactly one mip; bound it by the texture budget.
+        let bytes = u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|pixels| pixels.checked_mul(bytes_per_texel))
+            .ok_or(AllocationError::NativeFailure)?;
+        if bytes > u64::try_from(ez_gfx_runtime::texture::MAX_TEXTURE_BYTES).unwrap_or(u64::MAX) {
+            return Err(AllocationError::OutOfMemory);
+        }
+        let texture_width = usize::try_from(width).map_err(|_| AllocationError::NativeFailure)?;
+        let texture_height = usize::try_from(height).map_err(|_| AllocationError::NativeFailure)?;
+        // SAFETY: validated dimensions and a single mip level are consumed during this send.
+        let desc = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                pixel_format,
+                texture_width,
+                texture_height,
+                false,
+            )
+        };
+        // SAFETY: `desc` is live and the single mip count is consumed during this send.
+        unsafe { desc.setMipmapLevelCount(1) };
+        desc.setUsage(
+            MTLTextureUsage::RenderTarget
+                | MTLTextureUsage::ShaderRead
+                | MTLTextureUsage::PixelFormatView,
+        );
+        desc.setStorageMode(MTLStorageMode::Private);
+        let allocation = self
+            .allocator
+            .as_mut()
+            .ok_or(AllocationError::NativeFailure)?
+            .allocate(&AllocationCreateDesc::texture(
+                &self.device,
+                "ez-gfx-render-target",
+                &desc,
+            ))
+            .map_err(map_allocator)?;
+        let Ok(allocation_offset) = usize::try_from(allocation.offset()) else {
+            self.allocator
+                .as_mut()
+                .ok_or(AllocationError::NativeFailure)?
+                .free(&allocation)
+                .map_err(map_allocator)?;
+            return Err(AllocationError::NativeFailure);
+        };
+        // SAFETY: the allocation belongs to this heap and the checked offset describes it.
+        let Some(storage) = (unsafe {
+            allocation
+                .heap()
+                .newTextureWithDescriptor_offset(&desc, allocation_offset)
+        }) else {
+            self.allocator
+                .as_mut()
+                .ok_or(AllocationError::NativeFailure)?
+                .free(&allocation)
+                .map_err(map_allocator)?;
+            return Err(AllocationError::OutOfMemory);
+        };
+        let sampler_descriptor = MTLSamplerDescriptor::new();
+        sampler_descriptor.setMinFilter(MTLSamplerMinMagFilter::Nearest);
+        sampler_descriptor.setMagFilter(MTLSamplerMinMagFilter::Nearest);
+        sampler_descriptor.setMipFilter(MTLSamplerMipFilter::Nearest);
+        sampler_descriptor.setSAddressMode(MTLSamplerAddressMode::ClampToEdge);
+        sampler_descriptor.setTAddressMode(MTLSamplerAddressMode::ClampToEdge);
+        sampler_descriptor.setRAddressMode(MTLSamplerAddressMode::ClampToEdge);
+        sampler_descriptor.setMaxAnisotropy(1);
+        sampler_descriptor.setSupportArgumentBuffers(true);
+        let sampler = match self
+            .device
+            .newSamplerStateWithDescriptor(&sampler_descriptor)
+        {
+            Some(sampler) => sampler,
+            None => {
+                drop(storage);
+                self.allocator
+                    .as_mut()
+                    .ok_or(AllocationError::NativeFailure)?
+                    .free(&allocation)
+                    .map_err(map_allocator)?;
+                return Err(AllocationError::NativeFailure);
+            }
+        };
+        // The view must use the true pixel format, not the record-shape stand-in.
+        // SAFETY: the single-level range is bounded by the one-mip storage, with one slice.
+        let view = match unsafe {
+            storage.newTextureViewWithPixelFormat_textureType_levels_slices(
+                pixel_format,
+                storage.textureType(),
+                NSRange::new(0, 1),
+                NSRange::new(0, 1),
+            )
+        } {
+            Some(view) => view,
+            None => {
+                drop(storage);
+                self.allocator
+                    .as_mut()
+                    .ok_or(AllocationError::NativeFailure)?
+                    .free(&allocation)
+                    .map_err(map_allocator)?;
+                return Err(AllocationError::NativeFailure);
+            }
+        };
+        Ok(NativeTexture {
+            texture: ThreadBound::new(view),
+            allocation: ThreadBound::new(allocation),
+            sampler: ThreadBound::new(sampler),
+            format: hal_format,
+            width,
+            height,
+            mip_count: 1,
+            resident_mips: 1,
+            mip_completions: vec![0],
+            cancellation: std::sync::Arc::new(super::transfer::TransferCancellation::new()),
+            binding,
+        })
+    }
+
     /// Replaces one validated mip subregion through the dedicated texture-transfer queue.
     ///
     /// # Errors

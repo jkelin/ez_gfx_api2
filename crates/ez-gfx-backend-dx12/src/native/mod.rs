@@ -28,11 +28,12 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_ONE, D3D12_BLEND_OP_ADD, D3D12_BLEND_SRC_ALPHA,
     D3D12_BLEND_ZERO, D3D12_CLEAR_FLAG_DEPTH, D3D12_CLEAR_VALUE, D3D12_CLEAR_VALUE_0,
     D3D12_COLOR_WRITE_ENABLE_ALL, D3D12_COMMAND_SIGNATURE_DESC, D3D12_COMPARISON_FUNC_ALWAYS,
-    D3D12_COMPARISON_FUNC_LESS, D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_CULL_MODE_BACK,
-    D3D12_CULL_MODE_FRONT, D3D12_CULL_MODE_NONE, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-    D3D12_DEPTH_STENCIL_DESC, D3D12_DEPTH_STENCIL_VALUE, D3D12_DEPTH_STENCILOP_DESC,
-    D3D12_DEPTH_WRITE_MASK_ALL, D3D12_DESCRIPTOR_HEAP_DESC, D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
-    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+    D3D12_COMPARISON_FUNC_LESS, D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_CPU_DESCRIPTOR_HANDLE,
+    D3D12_CULL_MODE_BACK, D3D12_CULL_MODE_FRONT, D3D12_CULL_MODE_NONE,
+    D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, D3D12_DEPTH_STENCIL_DESC, D3D12_DEPTH_STENCIL_VALUE,
+    D3D12_DEPTH_STENCILOP_DESC, D3D12_DEPTH_WRITE_MASK_ALL, D3D12_DESCRIPTOR_HEAP_DESC,
+    D3D12_DESCRIPTOR_HEAP_FLAG_NONE, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
     D3D12_DESCRIPTOR_HEAP_TYPE_DSV, D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
     D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, D3D12_DESCRIPTOR_RANGE,
     D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,
@@ -166,6 +167,18 @@ pub enum NativeFrameResource<'a> {
     Surface,
     /// Current depth resource.
     Depth,
+    /// Managed single-mip color render target.
+    RenderTarget(&'a NativeTexture),
+}
+
+/// One resolved pass color attachment: its native resource plus the clear
+/// value applied when the pass load op clears. Surfaces carry the legacy
+/// default; render targets carry their stored declaration clear.
+pub struct PassAttachment<'a> {
+    /// Resolved native color resource.
+    pub resource: NativeFrameResource<'a>,
+    /// Clear color applied for a clearing load op.
+    pub clear: [f32; 4],
 }
 
 /// Validated D3D12 action emitted by the frame-plan adapter.
@@ -179,8 +192,13 @@ pub enum NativeFrameAction<'a> {
         /// Resolved resource affected by the barrier.
         resource: NativeFrameResource<'a>,
     },
-    /// Begin the declared render pass.
-    BeginPass(&'a ExecutionPass),
+    /// Begin the declared render pass with resolved color attachments.
+    BeginPass {
+        /// Backend-neutral pass description.
+        pass: &'a ExecutionPass,
+        /// One attachment per pass color, in order.
+        colors: Vec<PassAttachment<'a>>,
+    },
     /// Encode a compute dispatch.
     Compute(NativeComputeDispatch<'a>),
     /// Encode indexed indirect graphics work.
@@ -234,6 +252,9 @@ pub struct NativeTexture {
     cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Slot in the shader-visible texture descriptor heap.
     pub binding: u32,
+    /// Render-target view for managed color targets; `None` for uploads.
+    /// The retaining heap keeps the CPU handle valid until destruction.
+    pub rtv: Option<(ID3D12DescriptorHeap, D3D12_CPU_DESCRIPTOR_HANDLE)>,
 }
 
 impl NativeTexture {

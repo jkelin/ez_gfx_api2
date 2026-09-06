@@ -1,14 +1,15 @@
 use super::{
     Backend, ContextState, ExecutableNode, ExecutionAction, EzGfxResult, FrameExecutionPlan,
     FrameNativeResource, HashMap, MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext,
-    NativePipeline, NativeShader, NativeSurface, NativeTexture, PipelineKey, ResourceId,
-    ShaderRecord, TextureHandle, TextureId, map_hal, metal_bindings, native_layouts,
-    pipeline_layout_key,
+    NativePipeline, NativeShader, NativeSurface, NativeTexture, PipelineKey, RenderTargetHandle,
+    RenderTargetRecord, ResourceId, ShaderRecord, SURFACE_DEFAULT_CLEAR, TextureHandle,
+    TextureId, map_hal, metal_bindings, native_layouts, pipeline_layout_key,
 };
 use ez_gfx_backend_metal::native::{
     NativeAllocation as MetalAllocation, NativeBufferBinding as MetalBufferBinding,
     NativeContext as MetalContext, NativeFrameAction as MetalFrameAction,
     NativeFrameResource as MetalFrameResource, NativeTexture as MetalTexture,
+    PassAttachment as MetalPassAttachment,
 };
 use ez_gfx_core::handle::{PackedHandle, ShaderHandle, SurfaceHandle};
 use ez_gfx_hal::{DynamicPipelineState, ShaderTextureHeapLayout};
@@ -241,6 +242,7 @@ struct MetalActionInputs<'a> {
     payloads: &'a [ExecutableNode],
     allocations: &'a HashMap<PackedHandle, (u64, NativeAllocation)>,
     textures: &'a MetalTextureRecords,
+    render_targets: &'a HashMap<RenderTargetHandle, RenderTargetRecord>,
     pipelines: &'a HashMap<PipelineKey, NativePipeline>,
     frame_resources: &'a HashMap<ResourceId, FrameNativeResource>,
     binding_sets: &'a [Vec<MetalBufferBinding<'a>>],
@@ -389,6 +391,16 @@ fn build_metal_actions<'a>(
                     }
                     FrameNativeResource::Surface(_) => MetalFrameResource::Surface,
                     FrameNativeResource::Depth => MetalFrameResource::Depth,
+                    FrameNativeResource::RenderTarget(handle) => {
+                        let record = inputs
+                            .render_targets
+                            .get(&handle)
+                            .ok_or(EzGfxResult::InvalidContext)?;
+                        let NativeTexture::Metal(texture) = &record.native else {
+                            return Err(EzGfxResult::NativeFailure);
+                        };
+                        MetalFrameResource::RenderTarget(texture)
+                    }
                     FrameNativeResource::Index => {
                         MetalFrameResource::Buffer(inputs.index.ok_or(EzGfxResult::NotReady)?)
                     }
@@ -398,7 +410,40 @@ fn build_metal_actions<'a>(
                     resource,
                 });
             }
-            ExecutionAction::BeginPass(pass) => actions.push(MetalFrameAction::BeginPass(pass)),
+            ExecutionAction::BeginPass(pass) => {
+                // Resource indices resolve to surface or render-target
+                // attachments here; textures, buffers, and depth images are
+                // never color attachments. Surfaces keep the legacy clear.
+                for index in &pass.colors {
+                    let resource = inputs
+                        .frame_resources
+                        .get(&ResourceId::from_index(*index))
+                        .ok_or(EzGfxResult::InvalidArgument)?;
+                    colors.push(match *resource {
+                        FrameNativeResource::Surface(_) => MetalPassAttachment {
+                            resource: MetalFrameResource::Surface,
+                            clear: SURFACE_DEFAULT_CLEAR,
+                        },
+                        FrameNativeResource::RenderTarget(handle) => {
+                            let record = inputs
+                                .render_targets
+                                .get(&handle)
+                                .ok_or(EzGfxResult::InvalidContext)?;
+                            let NativeTexture::Metal(texture) = &record.native else {
+                                return Err(EzGfxResult::NativeFailure);
+                            };
+                            MetalPassAttachment {
+                                resource: MetalFrameResource::RenderTarget(texture),
+                                clear: super::super::render_target::render_target_clear_color(
+                                    record,
+                                ),
+                            }
+                        }
+                        _ => return Err(EzGfxResult::InvalidArgument),
+                    });
+                }
+                actions.push(MetalFrameAction::BeginPass { pass, colors });
+            }
             ExecutionAction::ExecuteNode(node) => actions.push(inputs.node(*node as usize)?),
             ExecutionAction::EndPass => actions.push(MetalFrameAction::EndPass),
         }
@@ -426,9 +471,16 @@ pub(super) fn execute_metal_frame_plan(
                 .ok_or(EzGfxResult::InvalidContext)
         })
         .transpose()?;
+    // Target-only frames size draws and validations from the target extents.
     let extent = surface
         .as_ref()
         .and_then(|surface| surface.state.extent())
+        .or_else(|| {
+            context
+                .frame_render_target
+                .and_then(|target| context.render_targets.get(&target))
+                .map(|record| (record.width, record.height))
+        })
         .unwrap_or((0, 0));
     let capture = surface
         .as_ref()
@@ -477,6 +529,7 @@ pub(super) fn execute_metal_frame_plan(
         payloads,
         allocations: &context.allocations,
         textures: &context.textures,
+        render_targets: &context.render_targets,
         pipelines: &context.pipelines,
         frame_resources: &context.frame_native_resources,
         binding_sets: &binding_sets,

@@ -2,13 +2,14 @@ use super::{
     Backend, ContextState, ExecutableNode, ExecutionAction, EzGfxResult, FrameExecutionPlan,
     FrameNativeResource, HashMap, MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext,
     NativePipeline, NativeShader, NativeSurface, NativeTexture, NativeTextureMap, PackedHandle,
-    PipelineKey, ResourceId, ShaderHandle, ShaderRecord, dx12_bindings, map_hal, native_layouts,
-    pipeline_layout_key,
+    PipelineKey, RenderTargetHandle, RenderTargetRecord, ResourceId, ShaderHandle, ShaderRecord,
+    SURFACE_DEFAULT_CLEAR, dx12_bindings, map_hal, native_layouts, pipeline_layout_key,
 };
 
 struct DxActionState<'a> {
     allocations: &'a HashMap<PackedHandle, (u64, NativeAllocation)>,
     textures: &'a NativeTextureMap,
+    render_targets: &'a HashMap<RenderTargetHandle, RenderTargetRecord>,
     pipelines: &'a HashMap<PipelineKey, NativePipeline>,
     resources: &'a HashMap<ResourceId, FrameNativeResource>,
     index: Option<&'a ez_gfx_backend_dx12::native::NativeAllocation>,
@@ -171,6 +172,16 @@ fn dx12_actions<'a>(
                     FrameNativeResource::Depth => {
                         ez_gfx_backend_dx12::native::NativeFrameResource::Depth
                     }
+                    FrameNativeResource::RenderTarget(handle) => {
+                        let record = state
+                            .render_targets
+                            .get(&handle)
+                            .ok_or(EzGfxResult::InvalidContext)?;
+                        let NativeTexture::Dx12(texture) = &record.native else {
+                            return Err(EzGfxResult::NativeFailure);
+                        };
+                        ez_gfx_backend_dx12::native::NativeFrameResource::RenderTarget(texture)
+                    }
                     FrameNativeResource::Index => {
                         ez_gfx_backend_dx12::native::NativeFrameResource::Buffer(
                             state.index.ok_or(EzGfxResult::NotReady)?,
@@ -183,9 +194,48 @@ fn dx12_actions<'a>(
                 });
             }
             ExecutionAction::BeginPass(pass) => {
-                actions.push(ez_gfx_backend_dx12::native::NativeFrameAction::BeginPass(
+                // Resource indices resolve to surface or render-target
+                // attachments here; textures, buffers, and depth images are
+                // never color attachments. Surfaces keep the legacy clear.
+                let mut colors = Vec::with_capacity(pass.colors.len());
+                for index in &pass.colors {
+                    let resource = state
+                        .resources
+                        .get(&ResourceId::from_index(*index))
+                        .ok_or(EzGfxResult::InvalidArgument)?;
+                    colors.push(match *resource {
+                        FrameNativeResource::Surface(_) => {
+                            ez_gfx_backend_dx12::native::PassAttachment {
+                                resource:
+                                    ez_gfx_backend_dx12::native::NativeFrameResource::Surface,
+                                clear: SURFACE_DEFAULT_CLEAR,
+                            }
+                        }
+                        FrameNativeResource::RenderTarget(handle) => {
+                            let record = state
+                                .render_targets
+                                .get(&handle)
+                                .ok_or(EzGfxResult::InvalidContext)?;
+                            let NativeTexture::Dx12(texture) = &record.native else {
+                                return Err(EzGfxResult::NativeFailure);
+                            };
+                            ez_gfx_backend_dx12::native::PassAttachment {
+                                resource:
+                                    ez_gfx_backend_dx12::native::NativeFrameResource::RenderTarget(
+                                        texture,
+                                    ),
+                                clear: super::super::render_target::render_target_clear_color(
+                                    record,
+                                ),
+                            }
+                        }
+                        _ => return Err(EzGfxResult::InvalidArgument),
+                    });
+                }
+                actions.push(ez_gfx_backend_dx12::native::NativeFrameAction::BeginPass {
                     pass,
-                ));
+                    colors,
+                });
             }
             ExecutionAction::ExecuteNode(node) => {
                 let index_node = *node as usize;
@@ -298,9 +348,16 @@ pub(super) fn execute_dx12_frame_plan(
                 .ok_or(EzGfxResult::InvalidContext)
         })
         .transpose()?;
+    // Target-only frames size draws and validations from the target extents.
     let extent = surface
         .as_ref()
         .and_then(|surface| surface.state.extent())
+        .or_else(|| {
+            context
+                .frame_render_target
+                .and_then(|target| context.render_targets.get(&target))
+                .map(|record| (record.width, record.height))
+        })
         .unwrap_or((0, 0));
     let capture = surface
         .as_ref()
@@ -350,6 +407,7 @@ pub(super) fn execute_dx12_frame_plan(
     let state = DxActionState {
         allocations: &context.allocations,
         textures: &context.textures,
+        render_targets: &context.render_targets,
         pipelines: &context.pipelines,
         resources: &context.frame_native_resources,
         index,

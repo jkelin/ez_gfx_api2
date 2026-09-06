@@ -84,7 +84,8 @@ impl MetalFrameEncoder<'_> {
                     return Err(HalError::InvalidArgument);
                 }
             }
-            NativeFrameResource::Texture(texture) => {
+            NativeFrameResource::Texture(texture)
+            | NativeFrameResource::RenderTarget(texture) => {
                 if !matches!(barrier.range, ez_gfx_hal::ExecutionRange::Image(_))
                     || texture.allocation.size() == 0
                 {
@@ -103,27 +104,60 @@ impl MetalFrameEncoder<'_> {
 
         Ok(())
     }
-    fn begin_pass(&mut self, pass: &super::ExecutionPass) -> Result<(), HalError> {
+    fn begin_pass(
+        &mut self,
+        pass: &super::ExecutionPass,
+        colors: &[super::PassAttachment<'_>],
+    ) -> Result<(), HalError> {
         if self.render_encoder.is_some()
             || pass.colors.len() != 1
+            || colors.len() != 1
             || pass.samples != 1
-            || pass.area[0]
-                .checked_add(pass.area[2])
-                .is_none_or(|end| end > self.extent.0)
+        {
+            return Err(HalError::InvalidArgument);
+        }
+        let attachment = colors.first().ok_or(HalError::InvalidArgument)?;
+        // Textures, buffers, and depth images are never color attachments.
+        enum Target<'a> {
+            Surface(&'a ProtocolObject<dyn MTLTexture>),
+            Target(&'a super::NativeTexture),
+        }
+        let target = match attachment.resource {
+            super::NativeFrameResource::Surface => Target::Surface(
+                self.drawable_texture
+                    .as_ref()
+                    .ok_or(HalError::InvalidArgument)?,
+            ),
+            super::NativeFrameResource::RenderTarget(texture) => {
+                if pass.depth.is_some() {
+                    return Err(HalError::InvalidArgument);
+                }
+                Target::Target(texture)
+            }
+            _ => return Err(HalError::InvalidArgument),
+        };
+        let (target_width, target_height) = match target {
+            Target::Surface(_) => self.extent,
+            Target::Target(texture) => (texture.width, texture.height),
+        };
+        if pass.area[0]
+            .checked_add(pass.area[2])
+            .is_none_or(|end| end > target_width)
             || pass.area[1]
                 .checked_add(pass.area[3])
-                .is_none_or(|end| end > self.extent.1)
+                .is_none_or(|end| end > target_height)
         {
             return Err(HalError::InvalidArgument);
         }
         let descriptor = MTLRenderPassDescriptor::renderPassDescriptor();
         // SAFETY: Metal render-pass descriptors define color-attachment slot 0, so `objectAtIndexedSubscript(0)` is in bounds, and `descriptor` owns that attachment for the descriptor's lifetime.
         let color = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
-        color.setTexture(Some(
-            self.drawable_texture
-                .as_ref()
-                .ok_or(HalError::InvalidArgument)?,
-        ));
+        match target {
+            // SAFETY: the drawable texture is retained by the surface for encoding.
+            Target::Surface(texture) => color.setTexture(Some(texture)),
+            // SAFETY: the render-target texture is retained by its context record for encoding.
+            Target::Target(texture) => color.setTexture(Some(&*texture.texture)),
+        }
         color.setLoadAction(match pass.load {
             AttachmentLoadOp::Load => MTLLoadAction::Load,
             AttachmentLoadOp::Clear => MTLLoadAction::Clear,
@@ -134,10 +168,10 @@ impl MetalFrameEncoder<'_> {
             AttachmentStoreOp::Discard => MTLStoreAction::DontCare,
         });
         color.setClearColor(MTLClearColor {
-            red: 0.1,
-            green: 0.1,
-            blue: 0.1,
-            alpha: 1.0,
+            red: f64::from(attachment.clear[0]),
+            green: f64::from(attachment.clear[1]),
+            blue: f64::from(attachment.clear[2]),
+            alpha: f64::from(attachment.clear[3]),
         });
         if pass.depth.is_some() {
             let depth = self
@@ -647,17 +681,20 @@ impl NativeContext {
         let presents = actions
             .iter()
             .any(|action| matches!(action, NativeFrameAction::Present));
-        let uses_surface = actions.iter().any(|action| {
-            matches!(
-                action,
-                NativeFrameAction::BeginPass(_)
-                    | NativeFrameAction::Graphics(_)
-                    | NativeFrameAction::Present
-                    | NativeFrameAction::Barrier {
-                        resource: NativeFrameResource::Surface | NativeFrameResource::Depth,
-                        ..
-                    }
-            )
+        // Surface use is attachment-precise: render-target-only passes,
+        // barriers, and draws never acquire a drawable. Draws inherit their
+        // pass target, so only surface-attached passes, presents, and
+        // surface/depth barriers require a surface.
+        let uses_surface = actions.iter().any(|action| match action {
+            NativeFrameAction::BeginPass { colors, .. } => colors.iter().any(|attachment| {
+                matches!(attachment.resource, NativeFrameResource::Surface)
+            }),
+            NativeFrameAction::Present => true,
+            NativeFrameAction::Barrier {
+                resource: NativeFrameResource::Surface | NativeFrameResource::Depth,
+                ..
+            } => true,
+            _ => false,
         });
         if uses_surface && surface.is_none() || (uses_surface || capture_presented) && !presents {
             return Err(HalError::InvalidArgument);
@@ -707,7 +744,7 @@ impl NativeContext {
         if actions.iter().any(|action| {
             matches!(
                 action,
-                NativeFrameAction::BeginPass(pass) if pass.depth.is_some()
+                NativeFrameAction::BeginPass { pass, .. } if pass.depth.is_some()
             )
         }) {
             self.ensure_surface_depth(
@@ -752,7 +789,8 @@ impl NativeContext {
                             };
                             buffer_range_fits(allocation.allocation.size(), range)
                         }
-                        NativeFrameResource::Texture(texture) => {
+                        NativeFrameResource::Texture(texture)
+                        | NativeFrameResource::RenderTarget(texture) => {
                             matches!(barrier.range, ez_gfx_hal::ExecutionRange::Image(_))
                                 && texture.allocation.size() != 0
                         }
@@ -766,16 +804,34 @@ impl NativeContext {
                         Ok(None)
                     }
                 }
-                NativeFrameAction::BeginPass(pass) => {
-                    let invalid = pass_active
-                        || pass.colors.len() != 1
-                        || pass.samples != 1
+                NativeFrameAction::BeginPass { pass, colors } => {
+                    // Textures, buffers, and depth images are never color
+                    // attachments; depth with a render target stays unsupported.
+                    let mut target_extent = None;
+                    let mut valid = !pass_active
+                        && pass.colors.len() == 1
+                        && colors.len() == 1
+                        && pass.samples == 1;
+                    if let Some(attachment) = colors.first() {
+                        target_extent = match attachment.resource {
+                            NativeFrameResource::Surface => Some(extent),
+                            NativeFrameResource::RenderTarget(texture) => {
+                                valid &= pass.depth.is_none();
+                                Some((texture.width, texture.height))
+                            }
+                            _ => None,
+                        };
+                    }
+                    let Some((target_width, target_height)) = target_extent else {
+                        return Err(HalError::InvalidArgument);
+                    };
+                    let invalid = !valid
                         || pass.area[0]
                             .checked_add(pass.area[2])
-                            .is_none_or(|end| end > extent.0)
+                            .is_none_or(|end| end > target_width)
                         || pass.area[1]
                             .checked_add(pass.area[3])
-                            .is_none_or(|end| end > extent.1);
+                            .is_none_or(|end| end > target_height);
                     if invalid {
                         Err(HalError::InvalidArgument)
                     } else {
@@ -1072,7 +1128,9 @@ impl NativeContext {
                     NativeFrameAction::Barrier { barrier, resource } => {
                         encoder.encode_barrier(barrier, resource)?;
                     }
-                    NativeFrameAction::BeginPass(pass) => encoder.begin_pass(pass)?,
+                    NativeFrameAction::BeginPass { pass, colors } => {
+                        encoder.begin_pass(pass, colors)?;
+                    }
                     NativeFrameAction::Compute(dispatch) => {
                         encoder.compute(action_index, dispatch)?;
                     }

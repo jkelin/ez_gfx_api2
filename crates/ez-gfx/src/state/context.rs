@@ -3,13 +3,14 @@ use super::{
     ContextHandle, ContextIdentity, ContextOptions, ContextState, DEFAULT_STAGING_POLICY,
     DiagnosticLevel, EzGfxResult, FrameRecorder, GeometryAllocation, GeometryManager, HalError,
     HashMap, MemoryClass, NativeAllocation, NativeContext, NativeSurface, Observability, Ordering,
-    ResourceKind, RuntimePhase, RuntimeRecord, RuntimeStatus, SurfaceHandle, SurfaceOptions,
-    SurfacePlatform, SurfaceRecord, SurfaceState, TextureRegistry, TextureUploadTelemetry,
-    VulkanContext, VulkanPlatform, allocate_native, completed_transfer_native, context_local,
-    copy_native, destroy_native_pipeline, destroy_native_shader, destroy_native_texture,
+    ResourceKind, RenderTargetHandle, RuntimePhase, RuntimeRecord, RuntimeStatus, SurfaceHandle,
+    SurfaceOptions, SurfacePlatform, SurfaceRecord, SurfaceState, TextureRegistry,
+    TextureUploadTelemetry, VulkanContext, VulkanPlatform, allocate_native, completed_transfer_native,
+    context_local, copy_native, destroy_native_pipeline, destroy_native_shader, destroy_native_texture,
     free_native_allocation, map_allocation, map_frame, map_geometry, map_hal, map_lifecycle,
-    map_native_loss, map_texture, pump_async_textures, result_status, staging_bucket_size,
-    wait_native_idle, with_context_mut, with_surface_mut, write_native,
+    map_native_loss, map_texture, pump_async_textures, render_target::destroy_all_render_targets,
+    result_status, staging_bucket_size, wait_native_idle, with_context_mut, with_surface_mut,
+    write_native,
 };
 #[cfg(windows)]
 use super::{Dx12Context, Dx12Surface};
@@ -92,6 +93,9 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle, EzGfxRes
         allocation_ready: HashMap::new(),
         shaders: HashMap::new(),
         textures: HashMap::new(),
+        render_targets: HashMap::new(),
+        render_target_bindings: Vec::new(),
+        next_render_target_binding: ez_gfx_runtime::binding::MAX_TEXTURE_HEAP_CAPACITY,
         texture_formats: HashMap::new(),
         texture_published_mips: HashMap::new(),
         texture_residency_targets: HashMap::new(),
@@ -118,6 +122,7 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle, EzGfxRes
         frame_surface: None,
         frame_depth: None,
         frame_has_graphics: false,
+        frame_render_target: None,
         last_readback: Vec::new(),
         active_surface: None,
         frame_presented: false,
@@ -330,6 +335,7 @@ pub(super) fn cleanup_context_state(
             failure.get_or_insert_with(|| map_allocation(error));
         }
     }
+    destroy_all_render_targets(&mut owned);
     owned.texture_formats.clear();
     owned.texture_published_mips.clear();
     owned.texture_residency_targets.clear();
@@ -576,6 +582,55 @@ pub fn begin_render(context: ContextHandle, surface: SurfaceHandle) -> EzGfxResu
             return Err(EzGfxResult::NotReady);
         }
         context.active_surface = Some(surface);
+        context.frame_render_target = None;
+        context.frame_resources.clear();
+        context.frame_native_resources.clear();
+        context.frame_index = None;
+        context.frame_surface = None;
+        context.frame_depth = None;
+        context.frame_has_graphics = false;
+        context.last_readback.clear();
+        context.frame_presented = false;
+        context.frame.begin().map_err(|error| map_frame(&error))
+    }))
+}
+
+/// Begins rendering to a managed color render target instead of a surface.
+///
+/// The target's stored declaration clear applies to clearing passes; depth,
+/// storage, and multisampled rendering stay unsupported. The frame presents
+/// nothing; sample the target through a later pass or read it back natively.
+///
+/// # Errors
+///
+/// Returns [`EzGfxResult::InvalidArgument`] for an unknown handle,
+/// [`EzGfxResult::InvalidContext`] for a destroyed target, and
+/// [`EzGfxResult::Unsupported`] for a non-color declaration.
+pub fn begin_render_target(
+    context: ContextHandle,
+    target: RenderTargetHandle,
+) -> EzGfxResult {
+    result_status(with_context_mut(context, |context| {
+        context
+            .identity
+            .check_thread_and_health()
+            .map_err(map_lifecycle)?;
+        context
+            .identity
+            .resolve(target.packed(), ResourceKind::RenderTarget)
+            .map_err(map_lifecycle)?;
+        let record = context
+            .render_targets
+            .get(&target)
+            .ok_or(EzGfxResult::InvalidContext)?;
+        if record.declaration.usage() != ez_gfx_runtime::target::TargetUsage::Color {
+            return Err(EzGfxResult::Unsupported);
+        }
+        if record.width == 0 || record.height == 0 {
+            return Err(EzGfxResult::InvalidArgument);
+        }
+        context.active_surface = None;
+        context.frame_render_target = Some(target);
         context.frame_resources.clear();
         context.frame_native_resources.clear();
         context.frame_index = None;

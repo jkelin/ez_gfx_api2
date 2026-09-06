@@ -50,7 +50,7 @@ impl NativeContext {
                         &[],
                     );
                 }
-                NativeFrameResource::Texture(texture) => {
+                NativeFrameResource::Texture(texture) | NativeFrameResource::RenderTarget(texture) => {
                     let ez_gfx_hal::ExecutionRange::Image(range) = barrier.range else {
                         return Err(HalError::InvalidArgument);
                     };
@@ -157,25 +157,50 @@ impl NativeContext {
         &self,
         encoding: &VulkanEncoding<'_>,
         pass: &ez_gfx_hal::ExecutionPass,
+        colors: &[super::PassAttachment<'_>],
         extent: (u32, u32),
         pass_active: bool,
     ) -> Result<(), HalError> {
-        // SAFETY: attachments belong to the current swapchain image and the pass was validated during preflight.
+        // SAFETY: the surface attachment belongs to the current swapchain image,
+        // render-target attachments belong to live context images, and the pass
+        // was validated during preflight.
         unsafe {
-            if pass_active
-                || pass.colors.len() != 1
-                || pass.samples != 1
-                || pass.area[0]
-                    .checked_add(pass.area[2])
-                    .is_none_or(|end| end > extent.0)
+            if pass_active || pass.colors.len() != 1 || colors.len() != 1 || pass.samples != 1 {
+                return Err(HalError::InvalidArgument);
+            }
+            let attachment = colors.first().ok_or(HalError::InvalidArgument)?;
+            // Textures, buffers, and depth images are never color attachments.
+            let (view, clear) = match attachment.resource {
+                super::NativeFrameResource::Surface => (
+                    self.swapchain_views[encoding.image_index as usize],
+                    attachment.clear,
+                ),
+                super::NativeFrameResource::RenderTarget(texture) => {
+                    if pass.depth.is_some() {
+                        return Err(HalError::InvalidArgument);
+                    }
+                    (texture.view, attachment.clear)
+                }
+                _ => return Err(HalError::InvalidArgument),
+            };
+            let (target_width, target_height) = match attachment.resource {
+                super::NativeFrameResource::Surface => extent,
+                super::NativeFrameResource::RenderTarget(texture) => {
+                    (texture.width, texture.height)
+                }
+                _ => return Err(HalError::InvalidArgument),
+            };
+            if pass.area[0]
+                .checked_add(pass.area[2])
+                .is_none_or(|end| end > target_width)
                 || pass.area[1]
                     .checked_add(pass.area[3])
-                    .is_none_or(|end| end > extent.1)
+                    .is_none_or(|end| end > target_height)
             {
                 return Err(HalError::InvalidArgument);
             }
             let color = vk::RenderingAttachmentInfo::default()
-                .image_view(self.swapchain_views[encoding.image_index as usize])
+                .image_view(view)
                 .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .load_op(match pass.load {
                     AttachmentLoadOp::Load => vk::AttachmentLoadOp::LOAD,
@@ -187,9 +212,7 @@ impl NativeContext {
                     AttachmentStoreOp::Discard => vk::AttachmentStoreOp::DONT_CARE,
                 })
                 .clear_value(vk::ClearValue {
-                    color: vk::ClearColorValue {
-                        float32: [0.1, 0.1, 0.1, 1.0],
-                    },
+                    color: vk::ClearColorValue { float32: clear },
                 });
             let depth = pass.depth.map(|_| {
                 let target = self.depth_target.as_ref().expect("preflighted depth");
@@ -867,8 +890,8 @@ impl NativeContext {
                     NativeFrameAction::Barrier { barrier, resource } => {
                         self.record_barrier(&encoding, barrier, resource)?;
                     }
-                    NativeFrameAction::BeginPass(pass) => {
-                        self.begin_render_pass(&encoding, pass, extent, pass_active)?;
+                    NativeFrameAction::BeginPass { pass, colors } => {
+                        self.begin_render_pass(&encoding, pass, colors, extent, pass_active)?;
                         pass_active = true;
                     }
                     NativeFrameAction::Compute(dispatch) => {
@@ -946,17 +969,20 @@ fn validate_frame_plan(
         .filter(|action| matches!(action, NativeFrameAction::Present))
         .count();
     let presents = present_count == 1;
-    let uses_surface = actions.iter().any(|action| {
-        matches!(
-            action,
-            NativeFrameAction::BeginPass(_)
-                | NativeFrameAction::Graphics(_)
-                | NativeFrameAction::Present
-                | NativeFrameAction::Barrier {
-                    resource: NativeFrameResource::Surface | NativeFrameResource::Depth,
-                    ..
-                }
-        )
+    // Surface use is attachment-precise: render-target-only passes, barriers,
+    // and draws never acquire the swapchain. Draws inherit their pass target,
+    // so only surface-attached passes, presents, and surface/depth barriers
+    // require a surface.
+    let uses_surface = actions.iter().any(|action| match action {
+        NativeFrameAction::BeginPass { colors, .. } => colors.iter().any(|attachment| {
+            matches!(attachment.resource, NativeFrameResource::Surface)
+        }),
+        NativeFrameAction::Present => true,
+        NativeFrameAction::Barrier {
+            resource: NativeFrameResource::Surface | NativeFrameResource::Depth,
+            ..
+        } => true,
+        _ => false,
     });
     if present_count > 1
         || uses_surface && !surface_available
@@ -998,21 +1024,40 @@ fn validate_frame_plan(
                 (
                     NativeFrameResource::Texture(_)
                     | NativeFrameResource::Surface
-                    | NativeFrameResource::Depth,
+                    | NativeFrameResource::Depth
+                    | NativeFrameResource::RenderTarget(_),
                     ez_gfx_hal::ExecutionRange::Image(_),
                 ) => {}
                 _ => return Err(HalError::InvalidArgument),
             },
-            NativeFrameAction::BeginPass(pass) => {
-                if pass_active
-                    || pass.colors.len() != 1
-                    || pass.samples != 1
+            NativeFrameAction::BeginPass { pass, colors } => {
+                // Textures, buffers, and depth images are never color
+                // attachments; depth with a render target stays unsupported.
+                let mut target_extent = None;
+                let mut valid = !pass_active
+                    && pass.colors.len() == 1
+                    && colors.len() == 1
+                    && pass.samples == 1;
+                if let Some(attachment) = colors.first() {
+                    target_extent = match attachment.resource {
+                        NativeFrameResource::Surface => Some(extent),
+                        NativeFrameResource::RenderTarget(texture) => {
+                            valid &= pass.depth.is_none();
+                            Some((texture.width, texture.height))
+                        }
+                        _ => None,
+                    };
+                }
+                let Some((target_width, target_height)) = target_extent else {
+                    return Err(HalError::InvalidArgument);
+                };
+                if !valid
                     || pass.area[0]
                         .checked_add(pass.area[2])
-                        .is_none_or(|end| end > extent.0)
+                        .is_none_or(|end| end > target_width)
                     || pass.area[1]
                         .checked_add(pass.area[3])
-                        .is_none_or(|end| end > extent.1)
+                        .is_none_or(|end| end > target_height)
                 {
                     return Err(HalError::InvalidArgument);
                 }
@@ -1112,7 +1157,7 @@ impl NativeContext {
         if actions.iter().any(|action| {
             matches!(
                 action,
-                NativeFrameAction::BeginPass(pass) if pass.depth.is_some()
+                NativeFrameAction::BeginPass { pass, .. } if pass.depth.is_some()
             )
         }) {
             self.ensure_depth_target(self.swapchain_extent)?;

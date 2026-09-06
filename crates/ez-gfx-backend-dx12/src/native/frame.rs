@@ -45,17 +45,20 @@ fn validate_frame_plan(
         .filter(|action| matches!(action, NativeFrameAction::Present))
         .count();
     let presents = present_count == 1;
-    let uses_surface = actions.iter().any(|action| {
-        matches!(
-            action,
-            NativeFrameAction::BeginPass(_)
-                | NativeFrameAction::Graphics(_)
-                | NativeFrameAction::Present
-                | NativeFrameAction::Barrier {
-                    resource: NativeFrameResource::Surface | NativeFrameResource::Depth,
-                    ..
-                }
-        )
+    // Surface use is attachment-precise: render-target-only passes, barriers,
+    // and draws never acquire the swapchain. Draws inherit their pass target,
+    // so only surface-attached passes, presents, and surface/depth barriers
+    // require a surface.
+    let uses_surface = actions.iter().any(|action| match action {
+        NativeFrameAction::BeginPass { colors, .. } => colors.iter().any(|attachment| {
+            matches!(attachment.resource, NativeFrameResource::Surface)
+        }),
+        NativeFrameAction::Present => true,
+        NativeFrameAction::Barrier {
+            resource: NativeFrameResource::Surface | NativeFrameResource::Depth,
+            ..
+        } => true,
+        _ => false,
     });
     if present_count > 1
         || uses_surface && !surface_available
@@ -86,16 +89,34 @@ fn validate_frame_plan(
         }
         match action {
             NativeFrameAction::Wait(_) | NativeFrameAction::Barrier { .. } => {}
-            NativeFrameAction::BeginPass(pass) => {
-                if pass_active
-                    || pass.colors.len() != 1
-                    || pass.samples != 1
+            NativeFrameAction::BeginPass { pass, colors } => {
+                // Textures, buffers, and depth images are never color
+                // attachments; depth with a render target stays unsupported.
+                let mut target_extent = None;
+                let mut valid = !pass_active
+                    && pass.colors.len() == 1
+                    && colors.len() == 1
+                    && pass.samples == 1;
+                if let Some(attachment) = colors.first() {
+                    target_extent = match attachment.resource {
+                        NativeFrameResource::Surface => Some(extent),
+                        NativeFrameResource::RenderTarget(texture) => {
+                            valid &= pass.depth.is_none();
+                            Some((texture.width, texture.height))
+                        }
+                        _ => None,
+                    };
+                }
+                let Some((target_width, target_height)) = target_extent else {
+                    return Err(HalError::InvalidArgument);
+                };
+                if !valid
                     || pass.area[0]
                         .checked_add(pass.area[2])
-                        .is_none_or(|end| end > extent.0)
+                        .is_none_or(|end| end > target_width)
                     || pass.area[1]
                         .checked_add(pass.area[3])
-                        .is_none_or(|end| end > extent.1)
+                        .is_none_or(|end| end > target_height)
                 {
                     return Err(HalError::InvalidArgument);
                 }
@@ -402,7 +423,7 @@ impl NativeContext {
         if actions.iter().any(|action| {
             matches!(
                 action,
-                NativeFrameAction::BeginPass(pass) if pass.depth.is_some()
+                NativeFrameAction::BeginPass { pass, .. } if pass.depth.is_some()
             )
         }) {
             self.ensure_surface_depth(surface.as_deref_mut().ok_or(HalError::InvalidArgument)?)?;
@@ -506,6 +527,7 @@ struct DxFrameEncoder<'a> {
     readbacks: &'a [DxReadback],
     indirect_copies: &'a [Option<NativeAllocation>],
     pass_active: bool,
+    pass_target: Option<super::ID3D12Resource>,
     discard_store: bool,
     discard_depth: bool,
     readback_index: usize,
@@ -519,7 +541,9 @@ impl DxFrameEncoder<'_> {
     ) -> Result<(), HalError> {
         let native = match resource {
             NativeFrameResource::Buffer(allocation) => allocation.resource.clone(),
-            NativeFrameResource::Texture(texture) => texture.resource.clone(),
+            NativeFrameResource::Texture(texture) | NativeFrameResource::RenderTarget(texture) => {
+                texture.resource.clone()
+            }
             NativeFrameResource::Surface => {
                 self.back_buffer.cloned().ok_or(HalError::InvalidArgument)?
             }
@@ -547,21 +571,46 @@ impl DxFrameEncoder<'_> {
 
         Ok(())
     }
-    fn begin_pass(&mut self, pass: &&super::ExecutionPass) -> Result<(), HalError> {
-        if self.pass_active
-            || pass.colors.len() != 1
-            || pass.samples != 1
-            || pass.area[0]
-                .checked_add(pass.area[2])
-                .is_none_or(|end| end > self.extent.0)
+    fn begin_pass(
+        &mut self,
+        pass: &&super::ExecutionPass,
+        colors: &[super::PassAttachment<'_>],
+    ) -> Result<(), HalError> {
+        if self.pass_active || pass.colors.len() != 1 || colors.len() != 1 || pass.samples != 1 {
+            return Err(HalError::InvalidArgument);
+        }
+        let attachment = colors.first().ok_or(HalError::InvalidArgument)?;
+        // Textures, buffers, and depth images are never color attachments.
+        let (rtv, target, target_extent) = match attachment.resource {
+            super::NativeFrameResource::Surface => (
+                self.rtv.ok_or(HalError::InvalidArgument)?,
+                self.back_buffer.cloned().ok_or(HalError::InvalidArgument)?,
+                self.extent,
+            ),
+            super::NativeFrameResource::RenderTarget(texture) => {
+                if pass.depth.is_some() {
+                    return Err(HalError::InvalidArgument);
+                }
+                let (_, rtv) = texture.rtv.as_ref().ok_or(HalError::InvalidArgument)?;
+                (
+                    *rtv,
+                    texture.resource.clone(),
+                    (texture.width, texture.height),
+                )
+            }
+            _ => return Err(HalError::InvalidArgument),
+        };
+        if pass.area[0]
+            .checked_add(pass.area[2])
+            .is_none_or(|end| end > target_extent.0)
             || pass.area[1]
                 .checked_add(pass.area[3])
-                .is_none_or(|end| end > self.extent.1)
+                .is_none_or(|end| end > target_extent.1)
         {
             return Err(HalError::InvalidArgument);
         }
-        let rtv = self.rtv.ok_or(HalError::InvalidArgument)?;
-        // SAFETY: `rtv` and the optional `dsv` are descriptor handles from the retained surface heaps, and their pointer storage remains readable through `OMSetRenderTargets`.
+        // SAFETY: `rtv` and the optional `dsv` are descriptor handles from retained
+        // heaps, and their pointer storage remains readable through `OMSetRenderTargets`.
         unsafe {
             self.list.OMSetRenderTargets(
                 1,
@@ -572,16 +621,14 @@ impl DxFrameEncoder<'_> {
             match pass.load {
                 AttachmentLoadOp::Load => {}
                 AttachmentLoadOp::Clear => {
-                    self.list
-                        .ClearRenderTargetView(rtv, &[0.1, 0.1, 0.1, 1.0], None);
+                    self.list.ClearRenderTargetView(rtv, &attachment.clear, None);
                     if let Some(dsv) = pass.depth.and(self.dsv) {
                         self.list
                             .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
                     }
                 }
                 AttachmentLoadOp::Discard => {
-                    self.list
-                        .DiscardResource(self.back_buffer.ok_or(HalError::InvalidArgument)?, None);
+                    self.list.DiscardResource(&target, None);
                     if pass.depth.is_some()
                         && let Some(depth) = self
                             .surface
@@ -593,6 +640,7 @@ impl DxFrameEncoder<'_> {
                 }
             }
         }
+        self.pass_target = Some(target);
         self.discard_store = pass.store == AttachmentStoreOp::Discard;
         self.discard_depth = pass.depth.is_some();
         self.pass_active = true;
@@ -793,7 +841,7 @@ impl DxFrameEncoder<'_> {
                 NativeFrameAction::Barrier { barrier, resource } => {
                     self.encode_barrier(barrier, resource)?;
                 }
-                NativeFrameAction::BeginPass(pass) => {
+                NativeFrameAction::BeginPass { pass, colors } => {
                     for (draw_index, candidate) in actions.iter().enumerate().skip(action_index + 1)
                     {
                         match candidate {
@@ -804,7 +852,7 @@ impl DxFrameEncoder<'_> {
                             _ => {}
                         }
                     }
-                    self.begin_pass(pass)?;
+                    self.begin_pass(pass, colors)?;
                 }
                 NativeFrameAction::Compute(dispatch) => self.compute(dispatch)?,
                 NativeFrameAction::Graphics(draw) => self.graphics(action_index, draw)?,
@@ -816,10 +864,10 @@ impl DxFrameEncoder<'_> {
                         return Err(HalError::InvalidArgument);
                     }
                     if self.discard_store {
-                        // SAFETY: the encoder retains the command list, back buffer, and optional depth resource through each `DiscardResource` call; no region pointer is supplied.
+                        // SAFETY: the encoder retains the command list, pass target, and optional depth resource through each `DiscardResource` call; no region pointer is supplied.
                         unsafe {
                             self.list.DiscardResource(
-                                self.back_buffer.ok_or(HalError::InvalidArgument)?,
+                                self.pass_target.as_ref().ok_or(HalError::InvalidArgument)?,
                                 None,
                             );
                             if self.discard_depth
@@ -832,6 +880,7 @@ impl DxFrameEncoder<'_> {
                             }
                         }
                     }
+                    self.pass_target = None;
                     self.pass_active = false;
                     self.discard_store = false;
                     self.discard_depth = false;
@@ -946,6 +995,7 @@ impl NativeContext {
             readbacks: &readbacks,
             indirect_copies: &indirect_copies,
             pass_active: false,
+            pass_target: None,
             discard_store: false,
             discard_depth: false,
             readback_index: 0,

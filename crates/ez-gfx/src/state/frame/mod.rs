@@ -8,11 +8,11 @@ use super::{
     FrameExecutionBackend, FrameExecutionPlan, FrameNativeResource, HashMap, ImageRange,
     IndirectBufferHandle, LoadOp, MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext,
     NativePipeline, NativeShader, NativeSurface, NativeTexture, NodeDesc, PackedHandle, PassInfo,
-    PipelineKey, QueueKind, ResourceAccess, ResourceDesc, ResourceId, ResourceKind,
-    ResourceLifetime, ResourceState, RuntimePhase, ShaderHandle, ShaderRecord, ShaderStage,
-    StoreOp, TextureFormat, TextureHandle, TextureId, execute_compiled_graph, map_frame, map_hal,
-    map_lifecycle, native_layouts, pipeline_layout_key, result_status, runtime_record,
-    vulkan_bindings, with_context_mut,
+    PipelineKey, QueueKind, RenderTargetHandle, RenderTargetRecord, ResourceAccess, ResourceDesc,
+    ResourceId, ResourceKind, ResourceLifetime, ResourceState, RuntimePhase, ShaderHandle,
+    ShaderRecord, ShaderStage, StoreOp, SURFACE_DEFAULT_CLEAR, TextureFormat, TextureHandle,
+    TextureId, execute_compiled_graph, map_frame, map_hal, map_lifecycle, native_layouts,
+    pipeline_layout_key, result_status, runtime_record, vulkan_bindings, with_context_mut,
 };
 type NativeTextureMap = HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>;
 
@@ -281,7 +281,6 @@ fn intern_texture_resource(
         .insert(resource, FrameNativeResource::Texture(texture));
     Ok(resource)
 }
-
 /// Enqueues texture readback in the current frame.
 ///
 /// Readback captures the full stored image as RGBA8. Block-compressed storage has
@@ -342,6 +341,47 @@ pub fn frame_enqueue_readback(context: ContextHandle, texture: TextureHandle) ->
         Ok(())
     }))
 }
+/// Interns a managed render target as a frame-graph image resource.
+///
+/// Unlike textures, targets carry no initial state: the first barrier starts
+/// from undefined, and the compiler derives attachment-to-sampled transitions
+/// from pass accesses.
+fn intern_render_target_resource(
+    context: &mut ContextState,
+    target: RenderTargetHandle,
+) -> Result<ResourceId, EzGfxResult> {
+    context
+        .identity
+        .resolve(target.packed(), ResourceKind::RenderTarget)
+        .map_err(map_lifecycle)?;
+    if let Some(resource) = context.frame_resources.get(&target.packed()) {
+        return Ok(*resource);
+    }
+    let record = context
+        .render_targets
+        .get(&target)
+        .ok_or(EzGfxResult::InvalidContext)?;
+    let desc = ResourceDesc::image(
+        record.width,
+        record.height,
+        1,
+        1,
+        record.format,
+        1,
+        ResourceLifetime::External,
+    )
+    .map_err(|_| EzGfxResult::InvalidArgument)?;
+    let resource = context
+        .frame
+        .add_resource(desc)
+        .map_err(|error| map_frame(&error))?;
+    context.frame_resources.insert(target.packed(), resource);
+    context
+        .frame_native_resources
+        .insert(resource, FrameNativeResource::RenderTarget(target));
+    Ok(resource)
+}
+
 // Missing surface/index resources and invalid ranges fail before the frame node is recorded.
 fn graphics_node(
     context: &mut ContextState,
@@ -350,24 +390,42 @@ fn graphics_node(
     indirect: IndirectBufferHandle,
     pipeline_layout: ez_gfx_runtime::binding::PipelineLayout,
 ) -> Result<NodeDesc, EzGfxResult> {
-    let surface = intern_surface_resource(context)?;
-    let depth = if pipeline_layout.depth_required() {
-        Some(intern_depth_resource(context)?)
-    } else {
-        None
+    // A bound render target replaces the surface color attachment; depth
+    // pipelines stay surface-only.
+    let (color, depth, width, height) = match context.frame_render_target {
+        Some(target) => {
+            if pipeline_layout.depth_required() {
+                return Err(EzGfxResult::Unsupported);
+            }
+            let resource = intern_render_target_resource(context, target)?;
+            let record = context
+                .render_targets
+                .get(&target)
+                .ok_or(EzGfxResult::InvalidContext)?;
+            (resource, None, record.width, record.height)
+        }
+        None => {
+            let surface = intern_surface_resource(context)?;
+            let depth = if pipeline_layout.depth_required() {
+                Some(intern_depth_resource(context)?)
+            } else {
+                None
+            };
+            let (width, height) = context
+                .active_surface
+                .and_then(|surface| context.surfaces.get(&surface))
+                .and_then(|surface| surface.state.extent())
+                .ok_or(EzGfxResult::NotReady)?;
+            (surface, depth, width, height)
+        }
     };
-    let (width, height) = context
-        .active_surface
-        .and_then(|surface| context.surfaces.get(&surface))
-        .and_then(|surface| surface.state.extent())
-        .ok_or(EzGfxResult::NotReady)?;
     let load = if context.frame_has_graphics {
         LoadOp::Load
     } else {
         LoadOp::Clear
     };
     let pass = PassInfo::new(
-        vec![surface],
+        vec![color],
         depth,
         [0, 0, width, height],
         1,
@@ -383,7 +441,7 @@ fn graphics_node(
     .map_err(|_| EzGfxResult::InvalidArgument)?;
     let mut node = NodeDesc::new("graphics", QueueKind::Graphics)
         .access(Access::image(
-            surface,
+            color,
             ImageRange::all(1, 1).map_err(|_| EzGfxResult::InvalidArgument)?,
             color_state,
         ))
@@ -655,7 +713,9 @@ pub fn frame_submit(context: ContextHandle) -> EzGfxResult {
                         .map_err(|error| map_frame(&error))?;
                 }
             }
-            if context.frame_has_graphics {
+            // Target-only frames present nothing; the image stays sampled.
+            let presenting = context.frame_has_graphics && context.frame_render_target.is_none();
+            if presenting {
                 let surface = context.active_surface.ok_or(EzGfxResult::NotReady)?;
                 let resource = context.frame_surface.ok_or(EzGfxResult::NotReady)?;
                 let present = ResourceState::new(

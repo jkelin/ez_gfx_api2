@@ -154,6 +154,18 @@ pub enum NativeFrameResource<'a> {
     Surface,
     /// Current depth attachment.
     Depth,
+    /// Managed single-mip color render target.
+    RenderTarget(&'a NativeTexture),
+}
+
+/// One resolved pass color attachment: its native resource plus the clear
+/// value applied when the pass load op clears. Surfaces carry the legacy
+/// default; render targets carry their stored declaration clear.
+pub struct PassAttachment<'a> {
+    /// Resolved native color resource.
+    pub resource: NativeFrameResource<'a>,
+    /// Clear color applied for a clearing load op.
+    pub clear: [f32; 4],
 }
 
 /// Validated Metal action emitted by the frame-plan adapter.
@@ -167,8 +179,13 @@ pub enum NativeFrameAction<'a> {
         /// Resolved resource affected by the barrier.
         resource: NativeFrameResource<'a>,
     },
-    /// Begin the declared render pass.
-    BeginPass(&'a ExecutionPass),
+    /// Begin the declared render pass with resolved color attachments.
+    BeginPass {
+        /// Backend-neutral pass description.
+        pass: &'a ExecutionPass,
+        /// One attachment per pass color, in order.
+        colors: Vec<PassAttachment<'a>>,
+    },
     /// Encode a compute dispatch.
     Compute(NativeComputeDispatch<'a>),
     /// Encode indexed indirect graphics work.
