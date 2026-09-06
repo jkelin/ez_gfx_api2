@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define EZ_GFX_ABI_VERSION 24u
+#define EZ_GFX_ABI_VERSION 26u
 
 #if defined(__clang__)
 #  if __has_attribute(access)
@@ -126,6 +126,14 @@ enum {
     EzGfxBackend_Vulkan = 1,
     EzGfxBackend_Dx12 = 2,
     EzGfxBackend_Metal = 3,
+};
+/** Stable adapter classification for EzGfxAdapterInfo. */
+typedef uint8_t EzGfxAdapterClass;
+enum {
+    EzGfxAdapterClass_Software = 0,
+    EzGfxAdapterClass_Other = 1,
+    EzGfxAdapterClass_Integrated = 2,
+    EzGfxAdapterClass_Discrete = 3,
 };
 
 /** Runtime operation phase carried by EzGfxRuntimeRecord. */
@@ -249,6 +257,43 @@ enum {
     EzGfxTextureDestinationFormat_Astc4x4Unorm = 9,
     EzGfxTextureDestinationFormat_Astc4x4Srgb = 10,
 };
+/**
+ * EzGfxRenderTargetFormat:
+ * @EzGfxRenderTargetFormat_Rgba8Unorm: Four-channel 8-bit normalized RGBA.
+ * @EzGfxRenderTargetFormat_Bgra8Srgb: Four-channel 8-bit sRGB BGRA.
+ * @EzGfxRenderTargetFormat_Rgba16Float: Four-channel 16-bit floating-point RGBA.
+ * @EzGfxRenderTargetFormat_Depth32Float: 32-bit floating-point depth.
+ * @EzGfxRenderTargetFormat_Bc7Unorm: BC7-compressed 8-bit normalized RGBA.
+ * @EzGfxRenderTargetFormat_Astc4x4Unorm: ASTC-compressed 4x4 texel 8-bit normalized RGBA.
+ *
+ * Render-target storage format. Discriminants mirror the runtime format codes.
+ */
+typedef uint8_t EzGfxRenderTargetFormat;
+enum {
+    EzGfxRenderTargetFormat_Rgba8Unorm = 1,
+    EzGfxRenderTargetFormat_Bgra8Srgb = 2,
+    EzGfxRenderTargetFormat_Rgba16Float = 3,
+    EzGfxRenderTargetFormat_Depth32Float = 4,
+    EzGfxRenderTargetFormat_Bc7Unorm = 5,
+    EzGfxRenderTargetFormat_Astc4x4Unorm = 6,
+};
+
+/**
+ * EzGfxRenderTargetUsage:
+ * @EzGfxRenderTargetUsage_Color: Color-rendering output.
+ * @EzGfxRenderTargetUsage_Depth: Depth-rendering output; creation stays unsupported.
+ * @EzGfxRenderTargetUsage_Storage: Storage access; creation stays unsupported.
+ * @EzGfxRenderTargetUsage_Sampled: Texture sampling; creation stays unsupported.
+ *
+ * Render-target access mode.
+ */
+typedef uint8_t EzGfxRenderTargetUsage;
+enum {
+    EzGfxRenderTargetUsage_Color = 0,
+    EzGfxRenderTargetUsage_Depth = 1,
+    EzGfxRenderTargetUsage_Storage = 2,
+    EzGfxRenderTargetUsage_Sampled = 3,
+};
 
 /**
  * EzGfxCullMode:
@@ -313,11 +358,45 @@ enum {
 };
 
 /**
+ * EzGfxAdapterDesc:
+ * @stable_id: Stable 128-bit adapter identity from enumeration.
+ * @allow_software: Non-zero accepts a software-class adapter; zero or one.
+ *
+ * Explicit adapter request selected by stable identity. Requires ABI 26.
+ */
+typedef struct EzGfxAdapterDesc {
+    uint8_t stable_id[16];
+    uint8_t allow_software;
+} EzGfxAdapterDesc;
+
+/**
+ * EzGfxAdapterInfo:
+ * @stable_id: Stable 128-bit adapter identity from enumeration.
+ * @backend: Value from EzGfxBackend.
+ * @adapter_class: Value from EzGfxAdapterClass.
+ * @admitted: Non-zero when the adapter passes admission under the queried policy.
+ * @software_rejected: Non-zero when software policy alone rejects the adapter.
+ * @error_count: Count of unmet profile requirements; zero when admitted.
+ *
+ * Enumerated adapter identity with admission diagnostics. Requires ABI 26.
+ */
+typedef struct EzGfxAdapterInfo {
+    uint8_t stable_id[16];
+    EzGfxBackend backend;
+    EzGfxAdapterClass adapter_class;
+    uint8_t admitted;
+    uint8_t software_rejected;
+    uint32_t error_count;
+} EzGfxAdapterInfo;
+
+/**
  * EzGfxContextDesc:
  * @enable_debug: Non-zero enables debug utilities.
  * @enable_validation: Non-zero enables validation layers.
  * @surface_platform: Value from EzGfxSurfacePlatform.
  * @texture_decode_workers: Async texture decode threads; zero selects the default topology.
+ * @adapter_count: Explicit adapter requests; zero keeps default ranking, one selects by identity. Requires ABI 26.
+ * @adapter (nullable) (array length=adapter_count): Exactly @adapter_count explicit requests; null if and only if zero. Requires ABI 26.
  *
  * Context creation options.
  */
@@ -326,6 +405,8 @@ typedef struct EzGfxContextDesc {
     uint8_t enable_validation;
     EzGfxSurfacePlatform surface_platform;
     uint32_t texture_decode_workers;
+    uint32_t adapter_count;
+    const EzGfxAdapterDesc *adapter;
 } EzGfxContextDesc;
 
 /** Backend-selecting context creation options. */
@@ -335,6 +416,8 @@ typedef struct EzGfxBackendContextDesc {
     EzGfxSurfacePlatform surface_platform;
     EzGfxBackend backend;
     uint32_t texture_decode_workers;
+    uint32_t adapter_count;
+    const EzGfxAdapterDesc *adapter;
 } EzGfxBackendContextDesc;
 
 /**
@@ -445,6 +528,35 @@ typedef struct EzGfxTextureRegionDesc {
     const uint8_t *data;
     size_t data_size;
 } EzGfxTextureRegionDesc;
+
+/**
+ * EzGfxRenderTargetDesc:
+ * @name (not nullable): Exactly @name_length UTF-8 bytes, 1..=255 bytes.
+ * @name_length: Byte length of @name.
+ * @usage: Value from EzGfxRenderTargetUsage.
+ * @relative_scale: Scale factor relative to the reference dimensions; finite and positive.
+ * @samples: Requested multisample count; one of 1, 2, 4, or 8.
+ * @candidate_formats (not nullable) (array length=candidate_count): Exactly @candidate_count format codes from EzGfxRenderTargetFormat.
+ * @candidate_count: Candidate format count, 1..=16.
+ * @sampleable: Non-zero requires texture-sampling support; zero or one.
+ * @use_clear: Non-zero stores @clear_color; zero or one.
+ * @clear_color: Color clear value read only when @use_clear is non-zero.
+ *
+ * Render-target name, usage, format candidates, and clear value. String and
+ * candidate ranges are borrowed only for the creating call.
+ */
+typedef struct EzGfxRenderTargetDesc {
+    const uint8_t *name;
+    size_t name_length;
+    EzGfxRenderTargetUsage usage;
+    float relative_scale;
+    uint8_t samples;
+    const uint8_t *candidate_formats;
+    uint32_t candidate_count;
+    uint8_t sampleable;
+    uint8_t use_clear;
+    float clear_color[4];
+} EzGfxRenderTargetDesc;
 
 /** Monotonic context-wide asynchronous texture pipeline counters. */
 typedef struct EzGfxTextureUploadTelemetry {
@@ -589,6 +701,27 @@ EzGfxResult ez_gfx_context_create(const EzGfxContextDesc * desc, EzGfxContext * 
 
 /** Creates a context for an explicit native backend. */
 EzGfxResult ez_gfx_context_create_backend(const EzGfxBackendContextDesc * desc, EzGfxContext * out_context) EZ_GFX_ACCESS(write_only, 2);
+/**
+ * ez_gfx_adapter_count:
+ * @out_count (out caller-allocates): Receives the number of enumerated adapters.
+ *
+ * Counts adapters without creating anything; no context is required. Requires ABI 26.
+ *
+ * Returns: (transfer none): Returns EzGfxResult_Ok or EzGfxResult_InvalidArgument.
+ */
+EzGfxResult ez_gfx_adapter_count(uint32_t * out_count) EZ_GFX_ACCESS(write_only, 1);
+/**
+ * ez_gfx_adapters_query:
+ * @allow_software: Non-zero admits software-class adapters in the diagnosis; zero or one.
+ * @out_adapters (out caller-allocates) (array length=capacity): Receives at most @capacity entries; null if and only if @capacity is zero.
+ * @capacity: Writable entry count of @out_adapters; zero queries the total with a null buffer.
+ * @out_written (out caller-allocates): Receives entries written, or the total when @capacity is zero.
+ *
+ * Enumerates adapters with admission diagnostics without creating anything; no context is required. Requires ABI 26.
+ *
+ * Returns: (transfer none): Returns EzGfxResult_Ok or EzGfxResult_InvalidArgument.
+ */
+EzGfxResult ez_gfx_adapters_query(uint8_t allow_software, EzGfxAdapterInfo * out_adapters, uint32_t capacity, uint32_t * out_written) EZ_GFX_ACCESS(write_only, 2, 3) EZ_GFX_ACCESS(write_only, 4);
 
 /**
  * ez_gfx_context_wait_idle:
@@ -687,6 +820,20 @@ EzGfxResult ez_gfx_texture_get_residency(EzGfxTexture texture, uint32_t *out_res
 EzGfxResult ez_gfx_texture_set_residency(EzGfxTexture texture, uint32_t resident_mips, EzGfxContext context);
 /** Invalidates the handle and releases owned GPU storage. */
 void ez_gfx_texture_unload(EzGfxTexture texture, EzGfxContext context);
+/** Creates a managed render target from a declaration and explicit extents; depth, storage, and multisample stay unsupported. */
+EzGfxResult ez_gfx_render_target_create(const EzGfxRenderTargetDesc *desc, uint32_t width, uint32_t height, EzGfxRenderTarget *out_target, EzGfxContext context) EZ_GFX_ACCESS(read_only, 1) EZ_GFX_ACCESS(write_only, 4);
+/** Destroys a render target and clears any bound override; stale handles are ignored. */
+void ez_gfx_render_target_destroy(EzGfxRenderTarget target, EzGfxContext context);
+/** Reports the resolved storage format code of a live render target. */
+EzGfxResult ez_gfx_render_target_get_format(EzGfxRenderTarget target, uint8_t *out_format, EzGfxContext context) EZ_GFX_ACCESS(write_only, 2);
+/** Reports the extents of a live render target. */
+EzGfxResult ez_gfx_render_target_get_extent(EzGfxRenderTarget target, uint32_t *out_width, uint32_t *out_height, EzGfxContext context) EZ_GFX_ACCESS(write_only, 2) EZ_GFX_ACCESS(write_only, 3);
+/** Reports the stored clear value: one zero-or-one flag plus four color components. */
+EzGfxResult ez_gfx_render_target_get_clear(EzGfxRenderTarget target, uint8_t *out_use_clear, float *out_color, EzGfxContext context) EZ_GFX_ACCESS(write_only, 2) EZ_GFX_ACCESS(write_only, 3);
+/** Probes whether one format admits a sampled color target at the given sample count; the status is the answer. */
+EzGfxResult ez_gfx_render_target_probe_format(uint8_t format, uint8_t samples, EzGfxContext context);
+/** Begins frame recording against a managed render target instead of a surface. */
+EzGfxResult ez_gfx_begin_render_target(EzGfxRenderTarget target, EzGfxContext context);
 /** Begins and resets one presented-surface frame; use instead of ez_gfx_frame_begin. */
 EzGfxResult ez_gfx_begin_render(EzGfxSurface surface, EzGfxContext context);
 /** Begins one non-presented/headless frame; do not call both begin functions for one frame. */

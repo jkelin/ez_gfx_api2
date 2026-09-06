@@ -43,6 +43,14 @@ pub(super) fn job_group(job: &VulkanTransferJob) -> u64 {
     }
 }
 
+/// Maps a Vulkan submission result onto the worker poison reason without collapsing loss.
+fn map_submit(error: vk::Result) -> TransferWorkerError {
+    if error == vk::Result::ERROR_DEVICE_LOST {
+        TransferWorkerError::DeviceLost
+    } else {
+        TransferWorkerError::Failed
+    }
+}
 #[expect(
     clippy::too_many_arguments,
     reason = "the owner receives the exact immutable Vulkan queue contract it exclusively drives"
@@ -109,27 +117,26 @@ pub(super) fn start_worker(
                     .semaphores(core::slice::from_ref(&completion))
                     .values(core::slice::from_ref(&previous));
                 // SAFETY: the completion timeline belongs to this device and the wait storage spans the call.
-                unsafe { device.wait_semaphores(&wait, u64::MAX) }
-                    .map_err(|_| TransferWorkerError::Failed)?;
+                unsafe { device.wait_semaphores(&wait, u64::MAX) }.map_err(map_submit)?;
             }
             // SAFETY: the completed slot's command buffers belong to their retained pools.
             unsafe {
                 device
                     .reset_command_buffer(transfers[slot], vk::CommandBufferResetFlags::empty())
-                    .map_err(|_| TransferWorkerError::Failed)?;
+                    .map_err(map_submit)?;
                 if let Some(graphics) = &graphics {
                     device
                         .reset_command_buffer(
                             graphics[slot * 2],
                             vk::CommandBufferResetFlags::empty(),
                         )
-                        .map_err(|_| TransferWorkerError::Failed)?;
+                        .map_err(map_submit)?;
                     device
                         .reset_command_buffer(
                             graphics[slot * 2 + 1],
                             vk::CommandBufferResetFlags::empty(),
                         )
-                        .map_err(|_| TransferWorkerError::Failed)?;
+                        .map_err(map_submit)?;
                 }
             }
             submit_batch(
@@ -147,7 +154,7 @@ pub(super) fn start_worker(
                 &graphics_lock,
                 &jobs,
             )
-            .map_err(|_| TransferWorkerError::Failed)?;
+            .map_err(map_submit)?;
             let value = jobs.iter().map(|job| job.value).max().unwrap_or(0);
             slot_values[slot] = value;
             slot = (slot + 1) % COMMAND_SLOTS;
@@ -170,9 +177,7 @@ pub(super) fn start_worker(
                 // SAFETY: the graphics queue is retained and locked independently.
                 unsafe { shutdown_device.queue_wait_idle(graphics_queue) }
             };
-            transfer_result
-                .and(graphics_result)
-                .map_err(|_| TransferWorkerError::Failed)
+            transfer_result.and(graphics_result).map_err(map_submit)
         },
     )
     .map_err(|_| AllocationError::NativeFailure)

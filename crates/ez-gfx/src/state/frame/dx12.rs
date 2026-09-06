@@ -2,8 +2,8 @@ use super::{
     Backend, ContextState, ExecutableNode, ExecutionAction, EzGfxResult, FrameExecutionPlan,
     FrameNativeResource, HashMap, MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext,
     NativePipeline, NativeShader, NativeSurface, NativeTexture, NativeTextureMap, PackedHandle,
-    PipelineKey, RenderTargetHandle, RenderTargetRecord, ResourceId, ShaderHandle, ShaderRecord,
-    SURFACE_DEFAULT_CLEAR, dx12_bindings, map_hal, native_layouts, pipeline_layout_key,
+    PipelineKey, RenderTargetHandle, RenderTargetRecord, ResourceId, SURFACE_DEFAULT_CLEAR,
+    ShaderHandle, ShaderRecord, dx12_bindings, map_hal, native_layouts, pipeline_layout_key,
 };
 
 struct DxActionState<'a> {
@@ -206,8 +206,7 @@ fn dx12_actions<'a>(
                     colors.push(match *resource {
                         FrameNativeResource::Surface(_) => {
                             ez_gfx_backend_dx12::native::PassAttachment {
-                                resource:
-                                    ez_gfx_backend_dx12::native::NativeFrameResource::Surface,
+                                resource: ez_gfx_backend_dx12::native::NativeFrameResource::Surface,
                                 clear: SURFACE_DEFAULT_CLEAR,
                             }
                         }

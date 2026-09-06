@@ -29,10 +29,12 @@ fn texture_format_vk(format: TextureFormat) -> vk::Format {
 /// Depth formats never report color or storage roles; sampling follows the
 /// sampled-image bit on every format. A depth candidate without attachment
 /// support is omitted so resolution fails with a diagnostic instead of
-/// selecting an unusable format. Multisample counts stay single-sample.
+/// selecting an unusable format. The caller supplies the probed multisample
+/// ceiling; declarations above it fail resolution exactly like before.
 fn support_for_target_format(
     format: ez_gfx_runtime::target::Format,
     features: vk::FormatFeatureFlags,
+    max_samples: u8,
 ) -> Option<ez_gfx_runtime::target::FormatSupport> {
     use ez_gfx_core::capability::CompressionSupport;
     use ez_gfx_runtime::target::Format;
@@ -53,18 +55,67 @@ fn support_for_target_format(
             features.contains(vk::FormatFeatureFlags::STORAGE_IMAGE),
         ),
     };
-    // Single-sample support always validates; only the role bits vary per device.
+    // Only the role bits vary per device; the ceiling comes from the image
+    // format query below.
     Some(
         ez_gfx_runtime::target::FormatSupport::new(
             format,
             color,
             sampled,
             storage,
-            1,
+            max_samples,
             CompressionSupport::NONE,
         )
-        .expect("single-sample support is always valid"),
+        .expect("probed sample counts are always valid"),
     )
+}
+
+/// Maps a validated sample count onto its Vulkan flag; other values are rejected by declaration validation before reaching here.
+fn sample_count_flags(samples: u8) -> Option<vk::SampleCountFlags> {
+    match samples {
+        1 => Some(vk::SampleCountFlags::TYPE_1),
+        2 => Some(vk::SampleCountFlags::TYPE_2),
+        4 => Some(vk::SampleCountFlags::TYPE_4),
+        8 => Some(vk::SampleCountFlags::TYPE_8),
+        _ => None,
+    }
+}
+
+/// Queries the highest multisample count the device can attach for one format and usage.
+///
+/// A failed query omits the format so resolution fails with a diagnostic
+/// instead of selecting an unusable count; single-sample stays admissible
+/// whenever the image itself is creatable.
+fn max_sample_count(
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+) -> Option<u8> {
+    // SAFETY: the physical device belongs to this instance for the call.
+    let properties = unsafe {
+        instance.get_physical_device_image_format_properties(
+            physical,
+            format,
+            vk::ImageType::TYPE_2D,
+            vk::ImageTiling::OPTIMAL,
+            usage,
+            vk::ImageCreateFlags::empty(),
+        )
+    }
+    .ok()?;
+    let counts = properties.sample_counts;
+    if counts.contains(vk::SampleCountFlags::TYPE_8) {
+        Some(8)
+    } else if counts.contains(vk::SampleCountFlags::TYPE_4) {
+        Some(4)
+    } else if counts.contains(vk::SampleCountFlags::TYPE_2) {
+        Some(2)
+    } else if counts.contains(vk::SampleCountFlags::TYPE_1) {
+        Some(1)
+    } else {
+        None
+    }
 }
 fn resident_mip_range(mip_count: u32, resident_mips: u32) -> Option<(u32, u32)> {
     // Zero residency cannot be represented by a Vulkan image view; over-residency would expose
@@ -199,10 +250,7 @@ impl NativeContext {
         if let Err(error) = worker.submit_batch(jobs) {
             self.texture_staging
                 .put(upload.allocation.size(), upload, None);
-            return Err(match error {
-                ez_gfx_hal::TransferWorkerError::Full => AllocationError::OutOfMemory,
-                ez_gfx_hal::TransferWorkerError::Failed => AllocationError::NativeFailure,
-            });
+            return Err(error.to_allocation_error());
         }
         // Rejected chains leave the accepted completion highwater unchanged.
         self.next_texture_value = next;
@@ -442,24 +490,27 @@ impl NativeContext {
             mip_completions: completions.iter().rev().map(|token| token.value).collect(),
             cancellation,
             binding,
+            msaa: None,
         };
         Ok((texture, completions))
     }
-
     /// Creates an uninitialized single-mip color image for managed render-target use.
     ///
-    /// The image carries color-attachment, sampled, and transfer roles with no
-    /// initial contents; the first render pass transitions and clears it. The
-    /// returned texture reuses the texture record with inert transfer fields
-    /// (`resident_mips` set, zero completion): route it only through render-target
-    /// entry points, never through upload, publish, or region-update paths. The
-    /// safe layer owns the true format; the stored texture format is the closest
-    /// block-compatible value for record shape only.
+    /// The sampled image carries color-attachment, sampled, and transfer roles
+    /// with no initial contents; the first render pass transitions and clears
+    /// it. With `samples > 1` a second multisampled image renders the pass and
+    /// resolves into the sampled image, which stays the only sampled, readback,
+    /// and descriptor image. The returned texture reuses the texture record
+    /// with inert transfer fields (`resident_mips` set, zero completion):
+    /// route it only through render-target entry points, never through upload,
+    /// publish, or region-update paths. The safe layer owns the true format;
+    /// the stored texture format is the closest block-compatible value for
+    /// record shape only.
     ///
     /// # Errors
     ///
-    /// Returns an error for zero dimensions, excessive aggregate bytes, an
-    /// unsupported (non-color) format, or native allocation failure.
+    /// Returns an error for zero dimensions, an unsupported sample count or
+    /// (non-color) format, excessive aggregate bytes, or native allocation failure.
     ///
     /// # Panics
     ///
@@ -471,6 +522,7 @@ impl NativeContext {
         width: u32,
         height: u32,
         binding: u32,
+        samples: u8,
     ) -> Result<NativeTexture, AllocationError> {
         use ez_gfx_runtime::target::Format;
         let (vk_format, hal_format, bytes_per_texel) = match format {
@@ -483,16 +535,21 @@ impl NativeContext {
             ),
             _ => return Err(AllocationError::Unsupported),
         };
+        let Some(sample_flags) = sample_count_flags(samples) else {
+            return Err(AllocationError::Unsupported);
+        };
         if width == 0 || height == 0 {
             return Err(AllocationError::ZeroSize);
         }
         if binding >= TEXTURE_DESCRIPTOR_CAPACITY {
             return Err(AllocationError::ZeroSize);
         }
-        // A render target holds exactly one mip; bound it by the texture budget.
+        // A render target holds exactly one mip; bound it by the texture budget,
+        // scaled by the sample count for multisampled storage.
         let bytes = u64::from(width)
             .checked_mul(u64::from(height))
             .and_then(|pixels| pixels.checked_mul(bytes_per_texel))
+            .and_then(|single| single.checked_mul(u64::from(samples)))
             .ok_or(AllocationError::NativeFailure)?;
         if bytes > u64::try_from(ez_gfx_runtime::texture::MAX_TEXTURE_BYTES).unwrap_or(u64::MAX) {
             return Err(AllocationError::OutOfMemory);
@@ -551,9 +608,9 @@ impl NativeContext {
             }
         };
         // SAFETY: `allocation` was created from this `image`'s requirements.
-        if let Err(error) =
-            unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset()) }
-        {
+        let bound =
+            unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset()) };
+        if let Err(error) = bound {
             // SAFETY: binding failed before publication or submission.
             unsafe { device.destroy_image(image, None) };
             let _ = self
@@ -588,8 +645,209 @@ impl NativeContext {
         };
         // Render targets sample with fixed nearest filtering until the sampled-binding
         // slice assigns heap samplers; the sampler is never null.
+        let (resolve_sampler, allocation) =
+            self.create_resolve_sampler(&device, image, view, allocation)?;
+        // Single-sample targets render directly into the sampled image; the
+        // multisampled image below stays absent.
+        let (msaa, allocation) = self.create_msaa_storage(
+            vk_format,
+            width,
+            height,
+            samples,
+            sample_flags,
+            (image, view, resolve_sampler, allocation),
+        )?;
+        Ok(NativeTexture {
+            image,
+            view,
+            allocation,
+            sampler: resolve_sampler,
+            format: hal_format,
+            width,
+            height,
+            mip_count: 1,
+            resident_mips: 1,
+            mip_completions: vec![0],
+            cancellation: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            binding,
+            msaa,
+        })
+    }
+    /// Creates multisampled render storage beside an unpublished resolve image.
+    ///
+    /// Single-sample targets need nothing and keep every resolve part; the
+    /// returned allocation always survives for the caller to publish. Failures
+    /// free the unpublished resolve parts before returning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for native image, allocation, binding, or view failure.
+    fn create_msaa_storage(
+        &mut self,
+        vk_format: vk::Format,
+        width: u32,
+        height: u32,
+        samples: u8,
+        sample_flags: vk::SampleCountFlags,
+        resolve: (vk::Image, vk::ImageView, vk::Sampler, Allocation),
+    ) -> Result<(Option<crate::MsaaStorage>, Allocation), AllocationError> {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or(AllocationError::NativeFailure)?
+            .clone();
+        let (image, view, resolve_sampler, allocation) = resolve;
+        // Single-sample targets render directly into the sampled image; the
+        // multisampled image below stays absent.
+        let msaa = if samples == 1 {
+            None
+        } else {
+            let create_msaa = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk_format)
+                .extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(sample_flags)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            // SAFETY: `create_msaa` is initialized without dangling pointers and
+            // lives through `create_image`; no allocation callbacks are supplied.
+            let msaa_image = match unsafe { device.create_image(&create_msaa, None) } {
+                Ok(image) => image,
+                Err(error) => {
+                    self.destroy_unpublished_texture(
+                        &device,
+                        image,
+                        Some(view),
+                        Some(resolve_sampler),
+                        allocation,
+                    );
+                    return Err(map_allocation_vk(map_vk(error)));
+                }
+            };
+            // SAFETY: the image is the undestroyed result of `create_image`, so
+            // requirements may be queried before binding.
+            let msaa_requirements = unsafe { device.get_image_memory_requirements(msaa_image) };
+            let msaa_allocation = match self
+                .allocator
+                .as_mut()
+                .expect("allocator initialized")
+                .allocate(&AllocationCreateDesc {
+                    name: "ez-gfx-render-target-msaa",
+                    requirements: msaa_requirements,
+                    location: MemoryLocation::GpuOnly,
+                    linear: false,
+                    allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+                }) {
+                Ok(allocation) => allocation,
+                Err(error) => {
+                    // SAFETY: allocation failed before binding, publication, or submission.
+                    unsafe { device.destroy_image(msaa_image, None) };
+                    self.destroy_unpublished_texture(
+                        &device,
+                        image,
+                        Some(view),
+                        Some(resolve_sampler),
+                        allocation,
+                    );
+                    return Err(map_allocator(&error));
+                }
+            };
+            // SAFETY: `msaa_allocation` was created from this image's requirements.
+            if let Err(error) = unsafe {
+                device.bind_image_memory(
+                    msaa_image,
+                    msaa_allocation.memory(),
+                    msaa_allocation.offset(),
+                )
+            } {
+                // SAFETY: binding failed before publication or submission.
+                unsafe { device.destroy_image(msaa_image, None) };
+                let _ = self
+                    .allocator
+                    .as_mut()
+                    .expect("allocator initialized")
+                    .free(msaa_allocation);
+                self.destroy_unpublished_texture(
+                    &device,
+                    image,
+                    Some(view),
+                    Some(resolve_sampler),
+                    allocation,
+                );
+                return Err(map_allocation_vk(map_vk(error)));
+            }
+            // SAFETY: the image is bound; the single-mip view covers the whole target.
+            let msaa_view = match unsafe {
+                device.create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(msaa_image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(vk_format)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        }),
+                    None,
+                )
+            } {
+                Ok(view) => view,
+                Err(error) => {
+                    self.destroy_unpublished_texture(
+                        &device,
+                        msaa_image,
+                        None,
+                        None,
+                        msaa_allocation,
+                    );
+                    self.destroy_unpublished_texture(
+                        &device,
+                        image,
+                        Some(view),
+                        Some(resolve_sampler),
+                        allocation,
+                    );
+                    return Err(map_allocation_vk(map_vk(error)));
+                }
+            };
+            Some(crate::MsaaStorage {
+                image: msaa_image,
+                view: msaa_view,
+                allocation: msaa_allocation,
+                samples,
+            })
+        };
+        Ok((msaa, allocation))
+    }
+    /// Creates the fixed nearest sampler for a render target's sampled image.
+    ///
+    /// The returned allocation always survives for the caller to publish;
+    /// failures free the unpublished resolve parts before returning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for native sampler creation failure.
+    fn create_resolve_sampler(
+        &mut self,
+        device: &ash::Device,
+        image: vk::Image,
+        view: vk::ImageView,
+        allocation: Allocation,
+    ) -> Result<(vk::Sampler, Allocation), AllocationError> {
+        // Render targets sample with fixed nearest filtering until the sampled-binding
+        // slice assigns heap samplers; the sampler is never null.
         // SAFETY: the descriptor is fully specified with valid filter and clamp modes.
-        let sampler = match unsafe {
+        let resolve_sampler = match unsafe {
             device.create_sampler(
                 &sampler_create_info(
                     TextureSamplerDesc {
@@ -605,26 +863,13 @@ impl NativeContext {
                 None,
             )
         } {
-            Ok(sampler) => sampler,
+            Ok(resolve_sampler) => resolve_sampler,
             Err(error) => {
-                self.destroy_unpublished_texture(&device, image, Some(view), None, allocation);
+                self.destroy_unpublished_texture(device, image, Some(view), None, allocation);
                 return Err(map_allocation_vk(map_vk(error)));
             }
         };
-        Ok(NativeTexture {
-            image,
-            view,
-            allocation,
-            sampler,
-            format: hal_format,
-            width,
-            height,
-            mip_count: 1,
-            resident_mips: 1,
-            mip_completions: vec![0],
-            cancellation: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            binding,
-        })
+        Ok((resolve_sampler, allocation))
     }
     /// Copies one validated tightly packed region into its native mip.
     ///
@@ -689,10 +934,7 @@ impl NativeContext {
         if let Err(error) = submitted {
             self.texture_staging
                 .put(upload.allocation.size(), upload, None);
-            return Err(match error {
-                ez_gfx_hal::TransferWorkerError::Full => AllocationError::OutOfMemory,
-                ez_gfx_hal::TransferWorkerError::Failed => AllocationError::NativeFailure,
-            });
+            return Err(error.to_allocation_error());
         }
         self.next_texture_value = next;
         self.texture_staging
@@ -782,7 +1024,7 @@ impl NativeContext {
     ///
     /// Reports optimal-tiling color, sampled, and storage roles for RGBA8,
     /// BGRA sRGB, and RGBA16F, plus depth attachment support for D32 float.
-    /// Multisample counts stay single-sample; resolve targets select separately.
+    /// Multisample ceilings come from per-format image queries, not the role bits.
     ///
     /// # Errors
     ///
@@ -792,41 +1034,46 @@ impl NativeContext {
     ) -> Result<ez_gfx_runtime::target::FormatCapabilities, AllocationError> {
         use ez_gfx_runtime::target::Format;
         let physical = self.physical_device.ok_or(AllocationError::NativeFailure)?;
-        // SAFETY: the physical device belongs to this instance for the call.
-        let properties = unsafe {
-            [
-                (
-                    Format::Rgba8Unorm,
-                    self.instance.get_physical_device_format_properties(
-                        physical,
-                        vk::Format::R8G8B8A8_UNORM,
-                    ),
-                ),
-                (
-                    Format::Bgra8Srgb,
-                    self.instance
-                        .get_physical_device_format_properties(physical, vk::Format::B8G8R8A8_SRGB),
-                ),
-                (
-                    Format::Rgba16Float,
-                    self.instance.get_physical_device_format_properties(
-                        physical,
-                        vk::Format::R16G16B16A16_SFLOAT,
-                    ),
-                ),
-                (
-                    Format::Depth32Float,
-                    self.instance
-                        .get_physical_device_format_properties(physical, vk::Format::D32_SFLOAT),
-                ),
-            ]
-        };
-        let supports = properties
-            .into_iter()
-            .filter_map(|(format, queried)| {
-                support_for_target_format(format, queried.optimal_tiling_features)
-            })
-            .collect();
+        // Color formats attach for rendering; depth attaches for depth testing.
+        // A failed sample query omits that format so resolution fails closed.
+        let candidates = [
+            (
+                Format::Rgba8Unorm,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            ),
+            (
+                Format::Bgra8Srgb,
+                vk::Format::B8G8R8A8_SRGB,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            ),
+            (
+                Format::Rgba16Float,
+                vk::Format::R16G16B16A16_SFLOAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            ),
+            (
+                Format::Depth32Float,
+                vk::Format::D32_SFLOAT,
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            ),
+        ];
+        let mut supports = Vec::with_capacity(candidates.len());
+        for (format, vk_format, usage) in candidates {
+            // SAFETY: the physical device belongs to this instance for the call.
+            let features = unsafe {
+                self.instance
+                    .get_physical_device_format_properties(physical, vk_format)
+            }
+            .optimal_tiling_features;
+            // A failed sample query keeps single-sample admission, matching the
+            // Direct3D 12 floor; the role bits still gate the format.
+            let max_samples =
+                max_sample_count(&self.instance, physical, vk_format, usage).unwrap_or(1);
+            if let Some(support) = support_for_target_format(format, features, max_samples) {
+                supports.push(support);
+            }
+        }
         ez_gfx_runtime::target::FormatCapabilities::new(supports)
             .map_err(|_| AllocationError::NativeFailure)
     }
@@ -1043,12 +1290,12 @@ impl NativeContext {
     ///
     /// Returns an error when the texture worker failed or the device timeline is unavailable.
     pub fn completed_texture_transfer_value(&self) -> Result<u64, AllocationError> {
-        if self
+        if let Some(error) = self
             .texture_worker
             .as_ref()
-            .is_some_and(ez_gfx_hal::TransferWorker::failed)
+            .and_then(ez_gfx_hal::TransferWorker::terminal_error)
         {
-            return Err(AllocationError::NativeFailure);
+            return Err(error.to_allocation_error());
         }
         let device = self.device.as_ref().ok_or(AllocationError::NativeFailure)?;
         let timeline = self
@@ -1117,7 +1364,7 @@ mod target_tests {
         let full = vk::FormatFeatureFlags::COLOR_ATTACHMENT
             | vk::FormatFeatureFlags::SAMPLED_IMAGE
             | vk::FormatFeatureFlags::STORAGE_IMAGE;
-        let support = support_for_target_format(Format::Rgba8Unorm, full).unwrap();
+        let support = support_for_target_format(Format::Rgba8Unorm, full, 4).unwrap();
         assert_eq!(
             support,
             FormatSupport::new(
@@ -1125,7 +1372,7 @@ mod target_tests {
                 true,
                 true,
                 true,
-                1,
+                4,
                 ez_gfx_core::capability::CompressionSupport::NONE
             )
             .unwrap()
@@ -1133,10 +1380,55 @@ mod target_tests {
     }
 
     #[test]
+    fn ceiling_above_declaration_admits_multisample_resolution() {
+        use ez_gfx_runtime::target::{ClearValue, TargetDeclaration, TargetUsage};
+        // A ceiling of 4 admits 1/2/4-sample declarations and rejects 8-sample ones.
+        let full = vk::FormatFeatureFlags::COLOR_ATTACHMENT
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::STORAGE_IMAGE;
+        let capabilities = ez_gfx_runtime::target::FormatCapabilities::new(vec![
+            support_for_target_format(Format::Rgba8Unorm, full, 4).unwrap(),
+        ])
+        .unwrap();
+        for samples in [1, 2, 4] {
+            let declaration = TargetDeclaration::new(
+                "msaa",
+                TargetUsage::Color,
+                1.0,
+                samples,
+                vec![Format::Rgba8Unorm],
+                ClearValue::None,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                capabilities.resolve(&declaration).unwrap(),
+                Format::Rgba8Unorm
+            );
+        }
+        let over = TargetDeclaration::new(
+            "msaa",
+            TargetUsage::Color,
+            1.0,
+            8,
+            vec![Format::Rgba8Unorm],
+            ClearValue::None,
+            true,
+        )
+        .unwrap();
+        assert!(
+            capabilities
+                .resolve(&over)
+                .is_err_and(|error| error
+                    == ez_gfx_runtime::target::TargetError::UnsupportedFormat)
+        );
+    }
+
+    #[test]
     fn missing_bits_withhold_only_their_roles() {
         // A sampled-only format resolves for sampling but never as a color target.
         let sampled =
-            support_for_target_format(Format::Rgba8Unorm, vk::FormatFeatureFlags::SAMPLED_IMAGE)
+            support_for_target_format(Format::Rgba8Unorm, vk::FormatFeatureFlags::SAMPLED_IMAGE, 1)
                 .unwrap();
         assert!(!sampled.color);
         assert!(sampled.sampled);
@@ -1148,7 +1440,7 @@ mod target_tests {
         // Depth aspects carry no color/storage roles regardless of feature bits.
         let features = vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
             | vk::FormatFeatureFlags::SAMPLED_IMAGE;
-        let support = support_for_target_format(Format::Depth32Float, features).unwrap();
+        let support = support_for_target_format(Format::Depth32Float, features, 1).unwrap();
         assert!(!support.color);
         assert!(!support.storage);
         assert!(support.sampled);
@@ -1159,8 +1451,12 @@ mod target_tests {
         // Omitting the record makes resolution fail with UnsupportedFormat
         // instead of selecting an unusable depth format.
         assert!(
-            support_for_target_format(Format::Depth32Float, vk::FormatFeatureFlags::SAMPLED_IMAGE)
-                .is_none()
+            support_for_target_format(
+                Format::Depth32Float,
+                vk::FormatFeatureFlags::SAMPLED_IMAGE,
+                1
+            )
+            .is_none()
         );
     }
 }

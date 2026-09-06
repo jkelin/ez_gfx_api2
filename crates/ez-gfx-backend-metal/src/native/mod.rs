@@ -26,7 +26,7 @@ use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTLArgumentBuffersTier, MTLArgumentEncoder, MTLBlendFactor, MTLBlitCommandEncoder, MTLBuffer,
     MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-    MTLCompareFunction, MTLComputeCommandEncoder, MTLComputePipelineState,
+    MTLCompareFunction, MTLComputeCommandEncoder, MTLComputePipelineState, MTLCopyAllDevices,
     MTLCreateSystemDefaultDevice, MTLCullMode, MTLDepthStencilDescriptor, MTLDepthStencilState,
     MTLDevice, MTLEvent, MTLFunction, MTLHeap, MTLIndexType, MTLLibrary, MTLLoadAction, MTLOrigin,
     MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
@@ -223,6 +223,17 @@ pub struct NativeTexture {
     cancellation: std::sync::Arc<transfer::TransferCancellation>,
     /// Slot in the bindless texture argument buffer.
     pub binding: u32,
+    /// Multisampled render storage plus its allocation; `None` for uploads
+    /// and single-sample targets. Only render-target entry points touch this;
+    /// the texture above stays the resolve destination.
+    msaa: Option<MsaaStorage>,
+}
+
+pub struct MsaaStorage {
+    texture: ThreadBound<Retained<ProtocolObject<dyn MTLTexture>>>,
+    allocation: ThreadBound<Allocation>,
+    /// Render sample count; passes must request exactly this count.
+    samples: u8,
 }
 
 impl NativeTexture {

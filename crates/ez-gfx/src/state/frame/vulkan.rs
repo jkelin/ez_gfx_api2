@@ -2,8 +2,8 @@ use super::{
     Backend, ContextState, ExecutableNode, ExecutionAction, EzGfxResult, FrameExecutionPlan,
     FrameNativeResource, HashMap, MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext,
     NativePipeline, NativeShader, NativeSurface, NativeTexture, NativeTextureMap, PackedHandle,
-    PipelineKey, RenderTargetHandle, RenderTargetRecord, ResourceId, ShaderHandle, ShaderRecord,
-    SURFACE_DEFAULT_CLEAR, map_hal, native_layouts, pipeline_layout_key, vulkan_bindings,
+    PipelineKey, RenderTargetHandle, RenderTargetRecord, ResourceId, SURFACE_DEFAULT_CLEAR,
+    ShaderHandle, ShaderRecord, map_hal, native_layouts, pipeline_layout_key, vulkan_bindings,
 };
 
 struct VulkanActionState<'a> {
@@ -317,12 +317,10 @@ fn vulkan_actions<'a>(
                         .get(&ResourceId::from_index(*index))
                         .ok_or(EzGfxResult::InvalidArgument)?;
                     colors.push(match *resource {
-                        FrameNativeResource::Surface(_) => {
-                            ez_gfx_backend_vulkan::PassAttachment {
-                                resource: ez_gfx_backend_vulkan::NativeFrameResource::Surface,
-                                clear: SURFACE_DEFAULT_CLEAR,
-                            }
-                        }
+                        FrameNativeResource::Surface(_) => ez_gfx_backend_vulkan::PassAttachment {
+                            resource: ez_gfx_backend_vulkan::NativeFrameResource::Surface,
+                            clear: SURFACE_DEFAULT_CLEAR,
+                        },
                         FrameNativeResource::RenderTarget(handle) => {
                             let record = state
                                 .render_targets

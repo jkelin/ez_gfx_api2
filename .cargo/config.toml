@@ -1,0 +1,8 @@
+# Bare `cargo test` (libtest) has no per-suite thread knob: the only lever is the
+# RUST_TEST_THREADS env var. Each GPU test in ez-gfx-backend-vulkan /
+# ez-gfx-backend-dx12 creates its own VkDevice/ID3D12Device and >=8 concurrent
+# creations wedge the RTX 3080 Windows driver (0 GPU completions), so force
+# serial libtest threads repo-wide. `cargo nextest` runs are pinned per-suite
+# in .config/nextest.toml instead (nextest manages its own thread pool).
+[env]
+RUST_TEST_THREADS = "1"

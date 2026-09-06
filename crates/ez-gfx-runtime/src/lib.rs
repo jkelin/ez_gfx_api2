@@ -29,13 +29,17 @@ pub mod target;
 /// Texture creation, views, and sampling APIs.
 pub mod texture;
 
-pub use api::{ContextOptions, PublicApiError, SurfaceOptions, SurfacePlatform, SurfaceState};
+pub use api::{
+    AdapterSelection, ContextOptions, PublicApiError, SurfaceOptions, SurfacePlatform, SurfaceState,
+};
 pub use lifecycle::{ContextHealth, ContextIdentity, LifecycleError, ResourceKind};
 
 use core::fmt;
 use std::collections::BTreeSet;
 
-use ez_gfx_core::capability::{AdapterClass, AdapterInfo, SemanticProfile, select_default_adapter};
+use ez_gfx_core::capability::{
+    AdapterClass, AdapterInfo, CapabilityError, SemanticProfile, select_default_adapter,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Validated adapters available for runtime selection.
@@ -196,3 +200,203 @@ impl fmt::Display for RuntimeError {
     }
 }
 impl std::error::Error for RuntimeError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Per-adapter admission diagnosis for rejection reporting.
+pub struct AdapterReport {
+    /// Enumerated adapter this report diagnoses.
+    adapter: AdapterInfo,
+    /// Profile requirements the adapter fails. Empty when admitted.
+    errors: Vec<CapabilityError>,
+    /// Whether software policy alone rejects the adapter.
+    software_rejected: bool,
+}
+
+impl AdapterReport {
+    /// Returns the diagnosed adapter.
+    pub const fn adapter(&self) -> &AdapterInfo {
+        &self.adapter
+    }
+    /// Returns the unmet profile requirements. Empty when admitted.
+    pub fn errors(&self) -> &[CapabilityError] {
+        &self.errors
+    }
+    /// Returns whether software policy alone rejects the adapter.
+    pub const fn software_rejected(&self) -> bool {
+        self.software_rejected
+    }
+    /// Returns whether the adapter passes both policy and profile admission.
+    pub const fn admitted(&self) -> bool {
+        self.errors.is_empty() && !self.software_rejected
+    }
+}
+
+/// Diagnoses one enumerated adapter without ranking or cataloging it.
+///
+/// Software policy is reported separately from profile errors so callers can
+/// distinguish "retry with `allow_software`" from "hardware cannot qualify".
+/// An all-zero stable identity is reported as rejected: it can never enter a
+/// catalog, so it must never read as admitted here.
+#[must_use]
+pub fn admission_report(info: &AdapterInfo, allow_software: bool) -> AdapterReport {
+    let software_rejected = info.class() == AdapterClass::Software && !allow_software;
+    let errors = match SemanticProfile::V1.admit(info.capabilities()) {
+        Ok(()) => Vec::new(),
+        Err(errors) => errors,
+    };
+    AdapterReport {
+        adapter: info.clone(),
+        errors,
+        software_rejected,
+    }
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::*;
+    use ez_gfx_core::Backend;
+    use ez_gfx_core::capability::{AdapterCapabilities, CompressionSupport};
+
+    fn capable() -> AdapterCapabilities {
+        AdapterCapabilities {
+            bindless_sampled_textures: 1024,
+            bindless_storage_resources: 1024,
+            bindless_samplers: 1024,
+            max_indirect_draw_count: 65_535,
+            shader_model: 0x0605,
+            timeline_synchronization: true,
+            resource_aliasing: true,
+            dynamic_rendering: true,
+            presentation: true,
+            compression: CompressionSupport::BC,
+        }
+    }
+
+    fn info(
+        backend: Backend,
+        id: u8,
+        class: AdapterClass,
+        caps: AdapterCapabilities,
+    ) -> AdapterInfo {
+        AdapterInfo::new(
+            backend,
+            [id; 16],
+            format!("adapter-{id}"),
+            format!("driver-{id}"),
+            class,
+            caps,
+        )
+        .expect("synthetic adapter identity is valid")
+    }
+
+    #[test]
+    fn adapter_selection_defaults_to_first_fit() {
+        let options =
+            ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).expect("valid options");
+        assert_eq!(options.adapter_selection, None);
+    }
+
+    #[test]
+    fn with_adapter_records_stable_identity_and_policy() {
+        let options =
+            ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).expect("valid options");
+        let selected = options.with_adapter([7; 16], true);
+        assert_eq!(
+            selected.adapter_selection,
+            Some(AdapterSelection::new([7; 16], true))
+        );
+    }
+
+    #[test]
+    fn explicit_selection_bypasses_ranking_but_keeps_admission() {
+        let weak = AdapterInfo::new(
+            Backend::Vulkan,
+            [9; 16],
+            "weak",
+            "driver",
+            AdapterClass::Discrete,
+            AdapterCapabilities {
+                bindless_sampled_textures: 0,
+                ..capable()
+            },
+        )
+        .expect("synthetic adapter identity is valid");
+        let catalog = AdapterCatalog::new(vec![
+            info(Backend::Vulkan, 1, AdapterClass::Discrete, capable()),
+            info(Backend::Dx12, 2, AdapterClass::Integrated, capable()),
+            weak,
+        ])
+        .expect("unique stable identities");
+        // Lower-ranked but admitted adapter is selectable explicitly.
+        assert_eq!(
+            catalog
+                .select([2; 16], false)
+                .expect("integrated adapter is admitted")
+                .info()
+                .stable_id(),
+            [2; 16]
+        );
+        // Unknown identity fails before admission.
+        assert_eq!(
+            catalog.select([0xFF; 16], false).unwrap_err(),
+            RuntimeError::AdapterNotFound
+        );
+        // Explicit selection never bypasses admission.
+        assert_eq!(
+            catalog.select([9; 16], false).unwrap_err(),
+            RuntimeError::UnsupportedAdapter
+        );
+    }
+
+    #[test]
+    fn software_selection_requires_explicit_opt_in() {
+        let catalog = AdapterCatalog::new(vec![info(
+            Backend::Vulkan,
+            3,
+            AdapterClass::Software,
+            capable(),
+        )])
+        .expect("unique stable identities");
+        assert_eq!(
+            catalog.select([3; 16], false).unwrap_err(),
+            RuntimeError::SoftwareAdapterNotAllowed
+        );
+        assert_eq!(
+            catalog
+                .select([3; 16], true)
+                .expect("opted-in software adapter is admitted")
+                .info()
+                .stable_id(),
+            [3; 16]
+        );
+    }
+
+    #[test]
+    fn admission_report_separates_policy_from_profile() {
+        let capable_software = info(Backend::Vulkan, 4, AdapterClass::Software, capable());
+        let report = admission_report(&capable_software, false);
+        assert!(report.errors().is_empty());
+        assert!(report.software_rejected());
+        assert!(!report.admitted());
+        assert!(admission_report(&capable_software, true).admitted());
+
+        let weak = info(
+            Backend::Dx12,
+            5,
+            AdapterClass::Discrete,
+            AdapterCapabilities {
+                bindless_sampled_textures: 0,
+                ..capable()
+            },
+        );
+        let report = admission_report(&weak, false);
+        assert!(!report.errors().is_empty());
+        assert!(!report.software_rejected());
+        assert!(!report.admitted());
+
+        let strong = info(Backend::Vulkan, 6, AdapterClass::Discrete, capable());
+        let report = admission_report(&strong, false);
+        assert!(report.admitted());
+        assert_eq!(report.adapter().stable_id(), [6; 16]);
+    }
+}

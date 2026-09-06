@@ -12,6 +12,30 @@ pub enum SurfacePlatform {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Explicit adapter request carried by [`ContextOptions`].
+///
+/// `None` (the default) keeps legacy first-fit device selection. `Some`
+/// bypasses ranking but never bypasses admission: the stable identity must
+/// still exist in the enumeration and satisfy the semantic profile.
+pub struct AdapterSelection {
+    /// Stable 128-bit adapter identity from enumeration.
+    pub stable_id: [u8; 16],
+    /// Whether a software-class adapter is acceptable.
+    pub allow_software: bool,
+}
+
+impl AdapterSelection {
+    /// Builds an explicit adapter request. An all-zero identity never matches.
+    #[must_use]
+    pub const fn new(stable_id: [u8; 16], allow_software: bool) -> Self {
+        Self {
+            stable_id,
+            allow_software,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Settings used to initialize a graphics context.
 pub struct ContextOptions {
     /// Enables graphics API debug facilities.
@@ -25,6 +49,8 @@ pub struct ContextOptions {
     /// Decode worker threads for async texture uploads. Zero selects the default
     /// topology (`available_parallelism - 1`, at least one thread).
     pub texture_decode_workers: u32,
+    /// Explicit adapter request. `None` keeps legacy first-fit selection.
+    pub adapter_selection: Option<AdapterSelection>,
 }
 
 impl ContextOptions {
@@ -75,7 +101,19 @@ impl ContextOptions {
             surface_platform,
             backend,
             texture_decode_workers: 0,
+            adapter_selection: None,
         })
+    }
+
+    /// Requests an explicit adapter by stable identity. The request bypasses
+    /// default ranking but never bypasses admission: unknown identities fail
+    /// `InvalidArgument`, disallowed software fails `InvalidArgument`, and
+    /// inadmissible adapters fail `Unsupported`. `None` (the default) keeps
+    /// legacy first-fit selection.
+    #[must_use]
+    pub const fn with_adapter(mut self, stable_id: [u8; 16], allow_software: bool) -> Self {
+        self.adapter_selection = Some(AdapterSelection::new(stable_id, allow_software));
+        self
     }
 
     /// Overrides the async texture decode worker count. Zero (the default)

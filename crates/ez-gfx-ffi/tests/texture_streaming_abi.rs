@@ -163,6 +163,8 @@ fn context_decode_workers_flow_from_c_descriptor_to_creation() {
             surface_platform: 0,
             backend: 2,
             texture_decode_workers: workers,
+            adapter_count: 0,
+            adapter: core::ptr::null(),
         };
         let mut context = 0;
         let mut texture = 0;
@@ -231,6 +233,8 @@ fn context_decode_workers_flow_from_c_descriptor_to_creation() {
         surface_platform: 0,
         backend: 1,
         texture_decode_workers: 2,
+        adapter_count: 0,
+        adapter: core::ptr::null(),
     };
     let mut vulkan = 0;
     assert_eq!(

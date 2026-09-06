@@ -118,6 +118,8 @@ impl TestContext {
             surface_platform: 0,
             backend,
             texture_decode_workers: 0,
+            adapter_count: 0,
+            adapter: core::ptr::null(),
         };
         let mut context = 0;
         assert_eq!(

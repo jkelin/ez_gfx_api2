@@ -140,6 +140,94 @@ fn initialize_context(
     })
 }
 
+/// Probes one DXGI adapter for identity and capabilities, creating a temporary
+/// device for feature queries. The device is returned for context creation;
+/// enumeration drops it. Software adapters classify as `Software` (not by
+/// video memory) so catalog policy can gate them.
+///
+/// # Errors
+///
+/// Returns an error if adapter description, device creation, feature queries,
+/// or adapter metadata construction fails.
+fn describe_adapter(adapter: &IDXGIAdapter4) -> windows::core::Result<(AdapterInfo, ID3D12Device)> {
+    // SAFETY: GetDesc3 uses adapter's retained IDXGIAdapter4 receiver, and windows-rs provides correctly sized DXGI_ADAPTER_DESC3 out storage for the call.
+    let description = unsafe { adapter.GetDesc3() }?;
+    let mut device: Option<ID3D12Device> = None;
+    // SAFETY: D3D12CreateDevice receives adapter through its IDXGIAdapter4 wrapper and a writable, aligned Option<ID3D12Device> out slot that lives through the call.
+    unsafe { D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_1, &raw mut device) }?;
+    let Some(device) = device else {
+        return Err(windows::core::Error::from_hresult(
+            windows::Win32::Foundation::E_FAIL,
+        ));
+    };
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    // SAFETY: CheckFeatureSupport(D3D12_OPTIONS) receives a writable, aligned options pointer with the exact D3D12_FEATURE_DATA_D3D12_OPTIONS size, and options lives through the call.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS,
+            (&raw mut options).cast(),
+            u32::try_from(core::mem::size_of_val(&options)).unwrap_or(u32::MAX),
+        )
+    }?;
+    let mut shader_model = D3D12_FEATURE_DATA_SHADER_MODEL {
+        HighestShaderModel: D3D_SHADER_MODEL_6_5,
+    };
+    // SAFETY: CheckFeatureSupport(SHADER_MODEL) receives a writable, aligned shader_model pointer with the exact D3D12_FEATURE_DATA_SHADER_MODEL size, and shader_model lives through the call.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_SHADER_MODEL,
+            (&raw mut shader_model).cast(),
+            u32::try_from(core::mem::size_of_val(&shader_model)).unwrap_or(u32::MAX),
+        )
+    }?;
+    let capabilities = AdapterCapabilities {
+        bindless_sampled_textures: if options.ResourceBindingTier.0 >= 3 {
+            TEXTURE_DESCRIPTOR_CAPACITY
+        } else {
+            0
+        },
+        bindless_storage_resources: if options.ResourceBindingTier.0 >= 3 {
+            1_000_000
+        } else {
+            0
+        },
+        bindless_samplers: if options.ResourceBindingTier.0 >= 3 {
+            TEXTURE_DESCRIPTOR_CAPACITY
+        } else {
+            0
+        },
+        max_indirect_draw_count: u32::MAX,
+        shader_model: u32::try_from(shader_model.HighestShaderModel.0)
+            .map(|value| ((value >> 4) << 8) | (value & 0x0f))
+            .unwrap_or(0),
+        timeline_synchronization: true,
+        resource_aliasing: true,
+        dynamic_rendering: true,
+        presentation: true,
+        compression: CompressionSupport::BC,
+    };
+    let stable_id = adapter_id(&description);
+    let name = String::from_utf16_lossy(&description.Description)
+        .trim_end_matches('\0')
+        .to_owned();
+    let driver = format!(
+        "luid-{:08x}-{:08x}",
+        description.AdapterLuid.HighPart, description.AdapterLuid.LowPart
+    );
+    // The software flag decides the class: WARP reports no dedicated memory
+    // but must still gate on software policy, never on video-memory heuristics.
+    let class = if description.Flags.contains(DXGI_ADAPTER_FLAG3_SOFTWARE) {
+        AdapterClass::Software
+    } else if description.DedicatedVideoMemory > 0 {
+        AdapterClass::Discrete
+    } else {
+        AdapterClass::Integrated
+    };
+    let adapter_info = AdapterInfo::new(BACKEND, stable_id, name, driver, class, capabilities)
+        .map_err(|_| windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL))?;
+    Ok((adapter_info, device))
+}
+
 impl NativeContext {
     /// Notes completed-frame reclamation for the shared polling path.
     ///
@@ -176,96 +264,97 @@ impl NativeContext {
                 Err(error) => return Err(error),
             };
             index += 1;
-            // SAFETY: GetDesc3 uses adapter's retained IDXGIAdapter4 receiver, and windows-rs provides correctly sized DXGI_ADAPTER_DESC3 out storage for the call.
-            let description = unsafe { adapter.GetDesc3() }?;
-            if !allow_software && description.Flags.contains(DXGI_ADAPTER_FLAG3_SOFTWARE) {
+            // One undescribable adapter skips itself, never the selection.
+            let Ok((adapter_info, device)) = describe_adapter(&adapter) else {
+                continue;
+            };
+            if !allow_software && adapter_info.class() == AdapterClass::Software {
                 continue;
             }
-            let mut device: Option<ID3D12Device> = None;
-            // SAFETY: D3D12CreateDevice receives adapter through its IDXGIAdapter4 wrapper and a writable, aligned Option<ID3D12Device> out slot that lives through the call.
-            if unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_1, &raw mut device) }
+            if SemanticProfile::V1
+                .admit(adapter_info.capabilities())
                 .is_err()
             {
                 continue;
             }
-            let Some(device) = device else {
-                continue;
-            };
-            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
-            // SAFETY: CheckFeatureSupport(D3D12_OPTIONS) receives a writable, aligned options pointer with the exact D3D12_FEATURE_DATA_D3D12_OPTIONS size, and options lives through the call.
-            if unsafe {
-                device.CheckFeatureSupport(
-                    D3D12_FEATURE_D3D12_OPTIONS,
-                    (&raw mut options).cast(),
-                    u32::try_from(core::mem::size_of_val(&options)).unwrap_or(u32::MAX),
-                )
-            }
-            .is_err()
-            {
-                continue;
-            }
-            let mut shader_model = D3D12_FEATURE_DATA_SHADER_MODEL {
-                HighestShaderModel: D3D_SHADER_MODEL_6_5,
-            };
-            // SAFETY: CheckFeatureSupport(SHADER_MODEL) receives a writable, aligned shader_model pointer with the exact D3D12_FEATURE_DATA_SHADER_MODEL size, and shader_model lives through the call.
-            if unsafe {
-                device.CheckFeatureSupport(
-                    D3D12_FEATURE_SHADER_MODEL,
-                    (&raw mut shader_model).cast(),
-                    u32::try_from(core::mem::size_of_val(&shader_model)).unwrap_or(u32::MAX),
-                )
-            }
-            .is_err()
-            {
-                continue;
-            }
-            let capabilities = AdapterCapabilities {
-                bindless_sampled_textures: if options.ResourceBindingTier.0 >= 3 {
-                    TEXTURE_DESCRIPTOR_CAPACITY
-                } else {
-                    0
-                },
-                bindless_storage_resources: if options.ResourceBindingTier.0 >= 3 {
-                    1_000_000
-                } else {
-                    0
-                },
-                bindless_samplers: if options.ResourceBindingTier.0 >= 3 {
-                    TEXTURE_DESCRIPTOR_CAPACITY
-                } else {
-                    0
-                },
-                max_indirect_draw_count: u32::MAX,
-                shader_model: u32::try_from(shader_model.HighestShaderModel.0)
-                    .map(|value| ((value >> 4) << 8) | (value & 0x0f))
-                    .unwrap_or(0),
-                timeline_synchronization: true,
-                resource_aliasing: true,
-                dynamic_rendering: true,
-                presentation: true,
-                compression: CompressionSupport::BC,
-            };
-            if SemanticProfile::V1.admit(&capabilities).is_err() {
-                continue;
-            }
-            let stable_id = adapter_id(&description);
-            let name = String::from_utf16_lossy(&description.Description)
-                .trim_end_matches('\0')
-                .to_owned();
-            let driver = format!(
-                "luid-{:08x}-{:08x}",
-                description.AdapterLuid.HighPart, description.AdapterLuid.LowPart
-            );
-            let class = if description.DedicatedVideoMemory > 0 {
-                AdapterClass::Discrete
-            } else {
-                AdapterClass::Integrated
-            };
-            let adapter_info =
-                AdapterInfo::new(BACKEND, stable_id, name, driver, class, capabilities).map_err(
-                    |_| windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL),
-                )?;
             return initialize_context(adapter, device, adapter_info);
+        }
+    }
+
+    /// Enumerates every describable DXGI adapter, admitted or not.
+    ///
+    /// Rejected adapters stay listed so rejection diagnostics can name them.
+    /// Exhaustion ends the walk; one undescribable adapter skips itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if DXGI factory creation fails.
+    pub fn enumerate_adapters() -> windows::core::Result<Vec<AdapterInfo>> {
+        // SAFETY: CreateDXGIFactory1 takes no input pointers, and windows-rs provides correctly typed IDXGIFactory4 out storage and adopts the returned COM reference.
+        let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory1() }?;
+        let mut adapters = Vec::new();
+        let mut index = 0;
+        loop {
+            // SAFETY: EnumAdapters1 uses factory's retained IDXGIFactory4 receiver, and windows-rs provides correctly typed adapter out storage for the call.
+            let raw = match unsafe { factory.EnumAdapters1(index) } {
+                Ok(adapter) => adapter,
+                Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => return Ok(adapters),
+                Err(error) => return Err(error),
+            };
+            let Ok(adapter) = raw.cast::<IDXGIAdapter4>() else {
+                index += 1;
+                continue;
+            };
+            index += 1;
+            if let Ok((adapter_info, _)) = describe_adapter(&adapter) {
+                adapters.push(adapter_info);
+            }
+        }
+    }
+
+    /// Creates a context for one explicitly selected adapter.
+    ///
+    /// Ranking is bypassed but admission never is: an unknown identity fails
+    /// `InvalidArgument`, disallowed software fails `InvalidArgument`, and a
+    /// matched but inadmissible adapter fails `Unsupported`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if DXGI factory creation, adapter querying, or native
+    /// context initialization fails, or if no enumerated adapter matches the
+    /// requested identity under admission policy.
+    pub fn create_for_adapter(stable_id: [u8; 16], allow_software: bool) -> Result<Self, HalError> {
+        // SAFETY: CreateDXGIFactory1 takes no input pointers, and windows-rs provides correctly typed IDXGIFactory4 out storage and adopts the returned COM reference.
+        let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory1() }.map_err(map_windows)?;
+        let mut index = 0;
+        loop {
+            // SAFETY: EnumAdapters1 uses factory's retained IDXGIFactory4 receiver, and windows-rs provides correctly typed adapter out storage for the call.
+            let adapter = match unsafe { factory.EnumAdapters1(index) } {
+                Ok(adapter) => adapter.cast::<IDXGIAdapter4>().map_err(map_windows)?,
+                Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => {
+                    return Err(HalError::InvalidArgument);
+                }
+                Err(error) => return Err(map_windows(error)),
+            };
+            index += 1;
+            // One undescribable adapter skips itself, never the selection.
+            let Ok((adapter_info, device)) = describe_adapter(&adapter) else {
+                continue;
+            };
+            if adapter_info.stable_id() != stable_id {
+                continue;
+            }
+            // Explicit selection bypasses ranking but never bypasses admission.
+            if adapter_info.class() == AdapterClass::Software && !allow_software {
+                return Err(HalError::InvalidArgument);
+            }
+            if SemanticProfile::V1
+                .admit(adapter_info.capabilities())
+                .is_err()
+            {
+                return Err(HalError::Unsupported);
+            }
+            return initialize_context(adapter, device, adapter_info).map_err(map_windows);
         }
     }
 
@@ -295,14 +384,17 @@ impl NativeContext {
         self.idle_drained = false;
         let mut native_drained = true;
         let mut worker_failed = false;
+        let mut worker_lost = false;
         for worker in [&mut self.transfer_worker, &mut self.texture_worker] {
             if let Some(worker) = worker {
-                if worker.flush().is_err() {
+                if let Err(error) = worker.flush() {
                     // Terminal cleanup drains actual COPY/DIRECT submissions, not
                     // the application completion a failed callback never signaled.
                     worker.shutdown();
                     native_drained &= worker.drained();
                     worker_failed = true;
+                    worker_lost |= error == ez_gfx_hal::TransferWorkerError::DeviceLost
+                        || worker.device_lost();
                 }
             } else {
                 worker_failed = true;
@@ -341,12 +433,12 @@ impl NativeContext {
         // SAFETY: the transfer fence remains live while polling its worker's terminal value.
         let mut transfer_completed = unsafe { self.transfer_fence.GetCompletedValue() };
         while transfer_value != 0 && transfer_completed < transfer_value {
-            if self
+            if let Some(error) = self
                 .transfer_worker
                 .as_ref()
-                .is_some_and(ez_gfx_hal::TransferWorker::failed)
+                .and_then(ez_gfx_hal::TransferWorker::terminal_error)
             {
-                return Err(HalError::NativeFailure);
+                return Err(error.to_hal_error());
             }
             // SAFETY: the worker signals every accepted transfer value, and this short timed wait
             // lets the caller observe worker or device failure rather than hanging indefinitely.
@@ -376,12 +468,12 @@ impl NativeContext {
         // SAFETY: the texture fence remains live while polling its worker's terminal value.
         let mut texture_completed = unsafe { self.texture_fence.GetCompletedValue() };
         while texture_value != 0 && texture_completed < texture_value {
-            if self
+            if let Some(error) = self
                 .texture_worker
                 .as_ref()
-                .is_some_and(ez_gfx_hal::TransferWorker::failed)
+                .and_then(ez_gfx_hal::TransferWorker::terminal_error)
             {
-                return Err(HalError::NativeFailure);
+                return Err(error.to_hal_error());
             }
             // SAFETY: the worker signals every accepted texture-transfer value, and this timed wait
             // lets the caller observe worker or device failure rather than hanging indefinitely.
@@ -400,7 +492,11 @@ impl NativeContext {
         }
         self.idle_drained = native_drained;
         if worker_failed {
-            return Err(HalError::NativeFailure);
+            return Err(if worker_lost {
+                HalError::DeviceLost
+            } else {
+                HalError::NativeFailure
+            });
         }
         self.reclaim(QueueKind::Transfer, transfer_value)
             .map_err(|_| HalError::NativeFailure)?;
@@ -486,6 +582,16 @@ impl NativeContext {
                 Ok(())
             }
             DeferredResource::Texture(texture) => {
+                // The MSAA render storage retires with the sampled image; its
+                // RTV handle needs no destroy, dying with the shared heap.
+                if let Some(msaa) = texture.msaa {
+                    drop(msaa.resource);
+                    self.allocator
+                        .as_mut()
+                        .ok_or(AllocationError::NativeFailure)?
+                        .free(msaa.allocation)
+                        .map_err(|error| map_allocator(&error))?;
+                }
                 drop(texture.resource);
                 self.allocator
                     .as_mut()
@@ -494,5 +600,43 @@ impl NativeContext {
                     .map_err(|error| map_allocator(&error))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn enumeration_reports_unique_named_adapters() {
+        // No surface is created, shown, or activated by this test.
+        let adapters = NativeContext::enumerate_adapters().expect("DXGI enumerates adapters");
+        assert!(!adapters.is_empty());
+        let mut identities = BTreeSet::new();
+        for adapter in &adapters {
+            assert_ne!(adapter.stable_id(), [0; 16]);
+            assert!(!adapter.name().is_empty());
+            assert!(!adapter.driver().is_empty());
+            assert!(identities.insert(adapter.stable_id()));
+        }
+    }
+
+    #[test]
+    fn explicit_selection_rejects_unknown_identity() {
+        // No surface is created, shown, or activated by this test.
+        assert_eq!(
+            NativeContext::create_for_adapter([0xA5; 16], false).map(|_| ()),
+            Err(HalError::InvalidArgument)
+        );
+    }
+    #[test]
+    fn explicit_selection_admits_enumerated_adapter() {
+        // No surface is created, shown, or activated by this test.
+        let adapters = NativeContext::enumerate_adapters().expect("DXGI enumerates adapters");
+        let wanted = adapters.first().expect("at least one adapter").stable_id();
+        let context = NativeContext::create_for_adapter(wanted, false)
+            .expect("enumerated adapter initializes");
+        assert_eq!(context.adapter_info().stable_id(), wanted);
     }
 }

@@ -2,8 +2,8 @@ use super::{
     Backend, ContextState, ExecutableNode, ExecutionAction, EzGfxResult, FrameExecutionPlan,
     FrameNativeResource, HashMap, MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext,
     NativePipeline, NativeShader, NativeSurface, NativeTexture, PipelineKey, RenderTargetHandle,
-    RenderTargetRecord, ResourceId, ShaderRecord, SURFACE_DEFAULT_CLEAR, TextureHandle,
-    TextureId, map_hal, metal_bindings, native_layouts, pipeline_layout_key,
+    RenderTargetRecord, ResourceId, SURFACE_DEFAULT_CLEAR, ShaderRecord, TextureHandle, TextureId,
+    map_hal, metal_bindings, native_layouts, pipeline_layout_key,
 };
 use ez_gfx_backend_metal::native::{
     NativeAllocation as MetalAllocation, NativeBufferBinding as MetalBufferBinding,
@@ -414,6 +414,7 @@ fn build_metal_actions<'a>(
                 // Resource indices resolve to surface or render-target
                 // attachments here; textures, buffers, and depth images are
                 // never color attachments. Surfaces keep the legacy clear.
+                let mut colors = Vec::with_capacity(pass.colors.len());
                 for index in &pass.colors {
                     let resource = inputs
                         .frame_resources

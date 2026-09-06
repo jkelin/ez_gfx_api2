@@ -50,9 +50,9 @@ fn validate_frame_plan(
     // so only surface-attached passes, presents, and surface/depth barriers
     // require a surface.
     let uses_surface = actions.iter().any(|action| match action {
-        NativeFrameAction::BeginPass { colors, .. } => colors.iter().any(|attachment| {
-            matches!(attachment.resource, NativeFrameResource::Surface)
-        }),
+        NativeFrameAction::BeginPass { colors, .. } => colors
+            .iter()
+            .any(|attachment| matches!(attachment.resource, NativeFrameResource::Surface)),
         NativeFrameAction::Present => true,
         NativeFrameAction::Barrier {
             resource: NativeFrameResource::Surface | NativeFrameResource::Depth,
@@ -92,16 +92,23 @@ fn validate_frame_plan(
             NativeFrameAction::BeginPass { pass, colors } => {
                 // Textures, buffers, and depth images are never color
                 // attachments; depth with a render target stays unsupported.
+                // A multisampled pass needs a multisampled target and vice
+                // versa; surfaces stay single-sample.
                 let mut target_extent = None;
                 let mut valid = !pass_active
                     && pass.colors.len() == 1
                     && colors.len() == 1
-                    && pass.samples == 1;
+                    && matches!(pass.samples, 1 | 2 | 4 | 8);
                 if let Some(attachment) = colors.first() {
                     target_extent = match attachment.resource {
-                        NativeFrameResource::Surface => Some(extent),
+                        NativeFrameResource::Surface => {
+                            valid &= pass.samples == 1;
+                            Some(extent)
+                        }
                         NativeFrameResource::RenderTarget(texture) => {
                             valid &= pass.depth.is_none();
+                            valid &= texture.msaa.as_ref().map_or(1, |msaa| msaa.samples)
+                                == pass.samples;
                             Some((texture.width, texture.height))
                         }
                         _ => None,
@@ -410,7 +417,7 @@ impl NativeContext {
                 worker
                     .ok_or(HalError::NotReady)?
                     .flush_through(required)
-                    .map_err(|_| HalError::NativeFailure)?;
+                    .map_err(ez_gfx_hal::TransferWorkerError::to_hal_error)?;
             }
         }
         if uses_surface {
@@ -528,6 +535,13 @@ struct DxFrameEncoder<'a> {
     indirect_copies: &'a [Option<NativeAllocation>],
     pass_active: bool,
     pass_target: Option<super::ID3D12Resource>,
+    /// Pending multisampled resolve `(render, destination, format)` recorded at
+    /// begin of pass; applied at end of pass unless the store is discarded.
+    pass_resolve: Option<(
+        super::ID3D12Resource,
+        super::ID3D12Resource,
+        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    )>,
     discard_store: bool,
     discard_depth: bool,
     readback_index: usize,
@@ -539,21 +553,39 @@ impl DxFrameEncoder<'_> {
         barrier: &super::ExecutionBarrier,
         resource: &super::NativeFrameResource<'_>,
     ) -> Result<(), HalError> {
-        let native = match resource {
-            NativeFrameResource::Buffer(allocation) => allocation.resource.clone(),
+        // A multisampled target transitions its render storage alongside the
+        // sampled resolve image so both stay in the compiler-derived states;
+        // the MSAA image is never sampled.
+        let mut natives = [None, None];
+        let native_count = match resource {
+            NativeFrameResource::Buffer(allocation) => {
+                natives[0] = Some(allocation.resource.clone());
+                1
+            }
             NativeFrameResource::Texture(texture) | NativeFrameResource::RenderTarget(texture) => {
-                texture.resource.clone()
+                natives[0] = Some(texture.resource.clone());
+                if let Some(msaa) = texture.msaa.as_ref() {
+                    natives[1] = Some(msaa.resource.clone());
+                    2
+                } else {
+                    1
+                }
             }
             NativeFrameResource::Surface => {
-                self.back_buffer.cloned().ok_or(HalError::InvalidArgument)?
+                natives[0] = Some(self.back_buffer.cloned().ok_or(HalError::InvalidArgument)?);
+                1
             }
-            NativeFrameResource::Depth => self
-                .surface
-                .as_ref()
-                .and_then(|surface| surface.depth.as_ref())
-                .ok_or(HalError::NotReady)?
-                .resource
-                .clone(),
+            NativeFrameResource::Depth => {
+                natives[0] = Some(
+                    self.surface
+                        .as_ref()
+                        .and_then(|surface| surface.depth.as_ref())
+                        .ok_or(HalError::NotReady)?
+                        .resource
+                        .clone(),
+                );
+                1
+            }
         };
         let before = barrier.before.map_or(D3D12_RESOURCE_STATE_COMMON, |state| {
             dx12_resource_state(state.access)
@@ -562,10 +594,14 @@ impl DxFrameEncoder<'_> {
         // SAFETY: each barrier owns an `ID3D12Resource` clone, retaining its COM object until `ResourceBarrier` copies the barrier array during the call.
         unsafe {
             if before == after && after == D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
-                self.list.ResourceBarrier(&[uav_barrier(native)]);
+                for native in natives.iter().take(native_count).flatten() {
+                    self.list.ResourceBarrier(&[uav_barrier(native.clone())]);
+                }
             } else if before != after {
-                self.list
-                    .ResourceBarrier(&[transition_barrier(native, before, after)]);
+                for native in natives.iter().take(native_count).flatten() {
+                    self.list
+                        .ResourceBarrier(&[transition_barrier(native.clone(), before, after)]);
+                }
             }
         }
 
@@ -576,27 +612,55 @@ impl DxFrameEncoder<'_> {
         pass: &&super::ExecutionPass,
         colors: &[super::PassAttachment<'_>],
     ) -> Result<(), HalError> {
-        if self.pass_active || pass.colors.len() != 1 || colors.len() != 1 || pass.samples != 1 {
+        if self.pass_active
+            || pass.colors.len() != 1
+            || colors.len() != 1
+            || !matches!(pass.samples, 1 | 2 | 4 | 8)
+        {
             return Err(HalError::InvalidArgument);
         }
         let attachment = colors.first().ok_or(HalError::InvalidArgument)?;
-        // Textures, buffers, and depth images are never color attachments.
-        let (rtv, target, target_extent) = match attachment.resource {
-            super::NativeFrameResource::Surface => (
-                self.rtv.ok_or(HalError::InvalidArgument)?,
-                self.back_buffer.cloned().ok_or(HalError::InvalidArgument)?,
-                self.extent,
-            ),
+        // Textures, buffers, and depth images are never color attachments. A
+        // multisampled target renders into its MSAA storage; the resolve into
+        // the sampled resource is stashed for end of pass.
+        let (rtv, target, target_extent, resolve) = match attachment.resource {
+            super::NativeFrameResource::Surface => {
+                if pass.samples != 1 {
+                    return Err(HalError::InvalidArgument);
+                }
+                (
+                    self.rtv.ok_or(HalError::InvalidArgument)?,
+                    self.back_buffer.cloned().ok_or(HalError::InvalidArgument)?,
+                    self.extent,
+                    None,
+                )
+            }
             super::NativeFrameResource::RenderTarget(texture) => {
                 if pass.depth.is_some() {
                     return Err(HalError::InvalidArgument);
                 }
-                let (_, rtv) = texture.rtv.as_ref().ok_or(HalError::InvalidArgument)?;
-                (
-                    *rtv,
-                    texture.resource.clone(),
-                    (texture.width, texture.height),
-                )
+                if let Some(msaa) = texture.msaa.as_ref() {
+                    if msaa.samples != pass.samples {
+                        return Err(HalError::InvalidArgument);
+                    }
+                    (
+                        msaa.rtv,
+                        msaa.resource.clone(),
+                        (texture.width, texture.height),
+                        Some((msaa.resource.clone(), texture.resource.clone(), msaa.format)),
+                    )
+                } else {
+                    if pass.samples != 1 {
+                        return Err(HalError::InvalidArgument);
+                    }
+                    let (_, rtv) = texture.rtv.as_ref().ok_or(HalError::InvalidArgument)?;
+                    (
+                        *rtv,
+                        texture.resource.clone(),
+                        (texture.width, texture.height),
+                        None,
+                    )
+                }
             }
             _ => return Err(HalError::InvalidArgument),
         };
@@ -621,7 +685,8 @@ impl DxFrameEncoder<'_> {
             match pass.load {
                 AttachmentLoadOp::Load => {}
                 AttachmentLoadOp::Clear => {
-                    self.list.ClearRenderTargetView(rtv, &attachment.clear, None);
+                    self.list
+                        .ClearRenderTargetView(rtv, &attachment.clear, None);
                     if let Some(dsv) = pass.depth.and(self.dsv) {
                         self.list
                             .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
@@ -641,6 +706,7 @@ impl DxFrameEncoder<'_> {
             }
         }
         self.pass_target = Some(target);
+        self.pass_resolve = resolve;
         self.discard_store = pass.store == AttachmentStoreOp::Discard;
         self.discard_depth = pass.depth.is_some();
         self.pass_active = true;
@@ -879,8 +945,45 @@ impl DxFrameEncoder<'_> {
                                 self.list.DiscardResource(&depth.resource, None);
                             }
                         }
+                    } else if let Some((render, destination, format)) = self.pass_resolve.take() {
+                        // Resolve the multisampled render into the sampled
+                        // image, then return both to render-target state so the
+                        // compiler-derived barriers keep matching.
+                        // SAFETY: the encoder retains the command list and both
+                        // resources; each barrier array and the resolve call
+                        // complete before their temporaries drop.
+                        unsafe {
+                            use windows::Win32::Graphics::Direct3D12::{
+                                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                                D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
+                            };
+                            self.list.ResourceBarrier(&[transition_barrier(
+                                render.clone(),
+                                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
+                            )]);
+                            self.list.ResourceBarrier(&[transition_barrier(
+                                destination.clone(),
+                                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                            )]);
+                            self.list
+                                .ResolveSubresource(&destination, 0, &render, 0, format);
+                            self.list.ResourceBarrier(&[transition_barrier(
+                                render,
+                                D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
+                                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                            )]);
+                            self.list.ResourceBarrier(&[transition_barrier(
+                                destination,
+                                D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                            )]);
+                        }
                     }
                     self.pass_target = None;
+                    self.pass_resolve = None;
                     self.pass_active = false;
                     self.discard_store = false;
                     self.discard_depth = false;
@@ -996,6 +1099,7 @@ impl NativeContext {
             indirect_copies: &indirect_copies,
             pass_active: false,
             pass_target: None,
+            pass_resolve: None,
             discard_store: false,
             discard_depth: false,
             readback_index: 0,

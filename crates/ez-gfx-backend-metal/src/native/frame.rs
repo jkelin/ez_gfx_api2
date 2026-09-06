@@ -84,8 +84,7 @@ impl MetalFrameEncoder<'_> {
                     return Err(HalError::InvalidArgument);
                 }
             }
-            NativeFrameResource::Texture(texture)
-            | NativeFrameResource::RenderTarget(texture) => {
+            NativeFrameResource::Texture(texture) | NativeFrameResource::RenderTarget(texture) => {
                 if !matches!(barrier.range, ez_gfx_hal::ExecutionRange::Image(_))
                     || texture.allocation.size() == 0
                 {
@@ -112,7 +111,7 @@ impl MetalFrameEncoder<'_> {
         if self.render_encoder.is_some()
             || pass.colors.len() != 1
             || colors.len() != 1
-            || pass.samples != 1
+            || !matches!(pass.samples, 1 | 2 | 4 | 8)
         {
             return Err(HalError::InvalidArgument);
         }
@@ -123,13 +122,25 @@ impl MetalFrameEncoder<'_> {
             Target(&'a super::NativeTexture),
         }
         let target = match attachment.resource {
-            super::NativeFrameResource::Surface => Target::Surface(
-                self.drawable_texture
-                    .as_ref()
-                    .ok_or(HalError::InvalidArgument)?,
-            ),
+            super::NativeFrameResource::Surface => {
+                if pass.samples != 1 {
+                    return Err(HalError::InvalidArgument);
+                }
+                Target::Surface(
+                    self.drawable_texture
+                        .as_ref()
+                        .ok_or(HalError::InvalidArgument)?,
+                )
+            }
             super::NativeFrameResource::RenderTarget(texture) => {
                 if pass.depth.is_some() {
+                    return Err(HalError::InvalidArgument);
+                }
+                // A multisampled texture renders exactly its count and
+                // resolves into the sampled texture; single-sample textures
+                // render directly.
+                let expected = texture.msaa.as_ref().map_or(1, |msaa| msaa.samples);
+                if expected != pass.samples {
                     return Err(HalError::InvalidArgument);
                 }
                 Target::Target(texture)
@@ -140,30 +151,32 @@ impl MetalFrameEncoder<'_> {
             Target::Surface(_) => self.extent,
             Target::Target(texture) => (texture.width, texture.height),
         };
-        if pass.area[0]
-            .checked_add(pass.area[2])
-            .is_none_or(|end| end > target_width)
-            || pass.area[1]
-                .checked_add(pass.area[3])
-                .is_none_or(|end| end > target_height)
-        {
-            return Err(HalError::InvalidArgument);
-        }
         let descriptor = MTLRenderPassDescriptor::renderPassDescriptor();
         // SAFETY: Metal render-pass descriptors define color-attachment slot 0, so `objectAtIndexedSubscript(0)` is in bounds, and `descriptor` owns that attachment for the descriptor's lifetime.
         let color = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
         match target {
             // SAFETY: the drawable texture is retained by the surface for encoding.
             Target::Surface(texture) => color.setTexture(Some(texture)),
-            // SAFETY: the render-target texture is retained by its context record for encoding.
-            Target::Target(texture) => color.setTexture(Some(&*texture.texture)),
+            // SAFETY: the render-target textures are retained by their context
+            // record for encoding.
+            Target::Target(texture) => match texture.msaa.as_ref() {
+                Some(msaa) => {
+                    color.setTexture(Some(&*msaa.texture));
+                    color.setResolveTexture(Some(&*texture.texture));
+                }
+                None => color.setTexture(Some(&*texture.texture)),
+            },
         }
         color.setLoadAction(match pass.load {
             AttachmentLoadOp::Load => MTLLoadAction::Load,
             AttachmentLoadOp::Clear => MTLLoadAction::Clear,
             AttachmentLoadOp::Discard => MTLLoadAction::DontCare,
         });
+        // A multisampled target resolves into the sampled texture instead of
+        // storing its storage.
+        let resolving = matches!(target, Target::Target(texture) if texture.msaa.is_some());
         color.setStoreAction(match pass.store {
+            AttachmentStoreOp::Store if resolving => MTLStoreAction::MultisampleResolve,
             AttachmentStoreOp::Store => MTLStoreAction::Store,
             AttachmentStoreOp::Discard => MTLStoreAction::DontCare,
         });
@@ -686,9 +699,9 @@ impl NativeContext {
         // pass target, so only surface-attached passes, presents, and
         // surface/depth barriers require a surface.
         let uses_surface = actions.iter().any(|action| match action {
-            NativeFrameAction::BeginPass { colors, .. } => colors.iter().any(|attachment| {
-                matches!(attachment.resource, NativeFrameResource::Surface)
-            }),
+            NativeFrameAction::BeginPass { colors, .. } => colors
+                .iter()
+                .any(|attachment| matches!(attachment.resource, NativeFrameResource::Surface)),
             NativeFrameAction::Present => true,
             NativeFrameAction::Barrier {
                 resource: NativeFrameResource::Surface | NativeFrameResource::Depth,
@@ -720,7 +733,7 @@ impl NativeContext {
                     .as_ref()
                     .ok_or(HalError::NotReady)?
                     .flush_through(token.value)
-                    .map_err(|_| HalError::NativeFailure)?;
+                    .map_err(ez_gfx_hal::TransferWorkerError::to_hal_error)?;
                 if let Some(pending) = self
                     .pending_transfers
                     .iter()
@@ -807,16 +820,23 @@ impl NativeContext {
                 NativeFrameAction::BeginPass { pass, colors } => {
                     // Textures, buffers, and depth images are never color
                     // attachments; depth with a render target stays unsupported.
+                    // A multisampled pass needs a multisampled target and vice
+                    // versa; surfaces stay single-sample.
                     let mut target_extent = None;
                     let mut valid = !pass_active
                         && pass.colors.len() == 1
                         && colors.len() == 1
-                        && pass.samples == 1;
+                        && matches!(pass.samples, 1 | 2 | 4 | 8);
                     if let Some(attachment) = colors.first() {
                         target_extent = match attachment.resource {
-                            NativeFrameResource::Surface => Some(extent),
+                            NativeFrameResource::Surface => {
+                                valid &= pass.samples == 1;
+                                Some(extent)
+                            }
                             NativeFrameResource::RenderTarget(texture) => {
                                 valid &= pass.depth.is_none();
+                                valid &= texture.msaa.as_ref().map_or(1, |msaa| msaa.samples)
+                                    == pass.samples;
                                 Some((texture.width, texture.height))
                             }
                             _ => None,
@@ -1068,7 +1088,7 @@ impl NativeContext {
                 .as_ref()
                 .ok_or(HalError::NotReady)?
                 .flush_through(required)
-                .map_err(|_| HalError::NativeFailure)?;
+                .map_err(ez_gfx_hal::TransferWorkerError::to_hal_error)?;
         }
         let MetalFrameResources {
             slot_index,

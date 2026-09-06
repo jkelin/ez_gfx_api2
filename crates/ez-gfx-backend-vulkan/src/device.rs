@@ -255,19 +255,84 @@ impl NativeContext {
     /// # Panics
     ///
     /// Panics if `PendingDevice::new` leaves its `device` field empty.
+    pub fn init_device(
+        &mut self,
+        surface: Option<&NativeSurface>,
+    ) -> Result<AdapterInfo, HalError> {
+        self.init_device_inner(surface, None)
+    }
+
+    /// Creates the device for one explicitly selected adapter.
+    ///
+    /// Ranking is bypassed but admission never is: an unknown identity fails
+    /// `InvalidArgument`, disallowed software fails `InvalidArgument`, and a
+    /// matched but inadmissible adapter fails `Unsupported`. A matched adapter
+    /// lacking core queue features also fails `Unsupported`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if device queries or setup fail or no enumerated
+    /// adapter matches the requested identity under admission policy.
+    pub fn init_device_for_adapter(
+        &mut self,
+        surface: Option<&NativeSurface>,
+        stable_id: [u8; 16],
+        allow_software: bool,
+    ) -> Result<AdapterInfo, HalError> {
+        self.init_device_inner(surface, Some((stable_id, allow_software)))
+    }
+
+    /// Enumerates every physical device with a graphics queue, admitted or not.
+    ///
+    /// Rejected adapters stay listed so rejection diagnostics can name them;
+    /// devices without usable queues or core features are skipped because they
+    /// can never back a context. Surface presentation is checked at
+    /// device-creation time, not here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Vulkan loader is unavailable or physical-device
+    /// enumeration fails.
+    pub fn enumerate_adapters() -> Result<Vec<AdapterInfo>, HalError> {
+        // A throwaway instance suffices: description needs properties, features,
+        // and queue families only. Drop reclaims context state; the instance
+        // handle follows the existing context lifecycle.
+        let probe = NativeContext::create(false, false, SurfacePlatform::Win32)?;
+        // SAFETY: the instance is live and owns returned physical-device handles.
+        let devices = unsafe { probe.instance.enumerate_physical_devices() }.map_err(map_vk)?;
+        let mut adapters = Vec::new();
+        for physical in devices {
+            // One undescribable adapter skips itself, never the enumeration.
+            let Ok(Some(candidate)) = probe.probe_device(physical, None) else {
+                continue;
+            };
+            if !candidate.vertex_storage || !candidate.multi_draw {
+                continue;
+            }
+            adapters.push(candidate.adapter);
+        }
+        Ok(adapters)
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "device admission and rollback remain local across optional native objects"
     )]
-    pub fn init_device(
+    fn init_device_inner(
         &mut self,
         surface: Option<&NativeSurface>,
+        selection: Option<([u8; 16], bool)>,
     ) -> Result<AdapterInfo, HalError> {
         if let (Some(physical), Some(queue_family), Some(adapter)) = (
             self.physical_device,
             self.graphics_queue_family,
             self.adapter_info.as_ref(),
         ) {
+            if let Some((wanted, _)) = selection {
+                if adapter.stable_id() != wanted {
+                    return Err(HalError::InvalidArgument);
+                }
+            }
             if let Some(surface) = surface {
                 // SAFETY: `physical` and `queue_family` come from this instance, but same-instance provenance of the caller-supplied `surface.handle` is not established here.
                 let present = unsafe {
@@ -287,322 +352,346 @@ impl NativeContext {
         // SAFETY: the instance is live and owns returned physical-device handles.
         let devices = unsafe { self.instance.enumerate_physical_devices() }.map_err(map_vk)?;
         for physical in devices {
-            if let Some(DeviceProbe {
+            let Some(candidate) = self.probe_device(physical, surface)? else {
+                continue;
+            };
+            if !candidate.vertex_storage || !candidate.multi_draw {
+                if selection.is_some_and(|(wanted, _)| wanted == candidate.adapter.stable_id()) {
+                    return Err(HalError::Unsupported);
+                }
+                continue;
+            }
+            if let Some((wanted, allow_software)) = selection {
+                if candidate.adapter.stable_id() != wanted {
+                    continue;
+                }
+                // Explicit selection bypasses ranking but never bypasses admission.
+                if candidate.adapter.class() == AdapterClass::Software && !allow_software {
+                    return Err(HalError::InvalidArgument);
+                }
+                if SemanticProfile::V1
+                    .admit(candidate.adapter.capabilities())
+                    .is_err()
+                {
+                    return Err(HalError::Unsupported);
+                }
+            } else if SemanticProfile::V1
+                .admit(candidate.adapter.capabilities())
+                .is_err()
+            {
+                continue;
+            }
+            let DeviceProbe {
                 adapter,
                 queue_family,
                 features12,
                 features13,
                 vertex_storage,
                 multi_draw,
-            }) = self.probe_device(physical, surface)?
-            {
-                if !vertex_storage || !multi_draw {
-                    continue;
-                }
-                if SemanticProfile::V1.admit(adapter.capabilities()).is_err() {
-                    continue;
-                }
-                // Prefer a transfer-only family; otherwise use a second queue from the graphics
-                // family when available, with queue zero as the universal fallback.
-                // SAFETY: the enumerated physical device belongs to this live instance.
-                let queue_properties = unsafe {
-                    self.instance
-                        .get_physical_device_queue_family_properties(physical)
-                };
-                let transfer_family = select_transfer_family(&queue_properties, queue_family);
-                let graphics_queue_count =
-                    queue_properties[queue_family as usize].queue_count.min(3) as usize;
-                let transfer_queue_count = queue_properties[transfer_family as usize]
-                    .queue_count
-                    .min(2) as usize;
-                let priorities = [1.0_f32, 1.0_f32, 1.0_f32];
-                let queue_infos = if transfer_family == queue_family {
-                    vec![
-                        vk::DeviceQueueCreateInfo::default()
-                            .queue_family_index(queue_family)
-                            .queue_priorities(&priorities[..graphics_queue_count]),
-                    ]
+            } = candidate;
+            // Prefer a transfer-only family; otherwise use a second queue from the graphics
+            // family when available, with queue zero as the universal fallback.
+            // SAFETY: the enumerated physical device belongs to this live instance.
+            let queue_properties = unsafe {
+                self.instance
+                    .get_physical_device_queue_family_properties(physical)
+            };
+            let transfer_family = select_transfer_family(&queue_properties, queue_family);
+            let graphics_queue_count =
+                queue_properties[queue_family as usize].queue_count.min(3) as usize;
+            let transfer_queue_count = queue_properties[transfer_family as usize]
+                .queue_count
+                .min(2) as usize;
+            let priorities = [1.0_f32, 1.0_f32, 1.0_f32];
+            let queue_infos = if transfer_family == queue_family {
+                vec![
+                    vk::DeviceQueueCreateInfo::default()
+                        .queue_family_index(queue_family)
+                        .queue_priorities(&priorities[..graphics_queue_count]),
+                ]
+            } else {
+                vec![
+                    vk::DeviceQueueCreateInfo::default()
+                        .queue_family_index(queue_family)
+                        .queue_priorities(&priorities[..1]),
+                    vk::DeviceQueueCreateInfo::default()
+                        .queue_family_index(transfer_family)
+                        .queue_priorities(&priorities[..transfer_queue_count]),
+                ]
+            };
+            let mut enabled12 = vk::PhysicalDeviceVulkan12Features::default()
+                .timeline_semaphore(features12.timeline_semaphore != 0)
+                .buffer_device_address(features12.buffer_device_address != 0)
+                .descriptor_indexing(features12.descriptor_indexing != 0)
+                .runtime_descriptor_array(features12.runtime_descriptor_array != 0)
+                .descriptor_binding_partially_bound(
+                    features12.descriptor_binding_partially_bound != 0,
+                )
+                .descriptor_binding_sampled_image_update_after_bind(
+                    features12.descriptor_binding_sampled_image_update_after_bind != 0,
+                )
+                .descriptor_binding_storage_buffer_update_after_bind(
+                    features12.descriptor_binding_storage_buffer_update_after_bind != 0,
+                )
+                .descriptor_binding_storage_image_update_after_bind(
+                    features12.descriptor_binding_storage_image_update_after_bind != 0,
+                )
+                .shader_sampled_image_array_non_uniform_indexing(
+                    features12.shader_sampled_image_array_non_uniform_indexing != 0,
+                );
+            let mut enabled13 = vk::PhysicalDeviceVulkan13Features::default()
+                .dynamic_rendering(features13.dynamic_rendering != 0)
+                .synchronization2(features13.synchronization2 != 0);
+            let mut enabled11 =
+                vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
+            // SAFETY: `physical` was returned by `self.instance.enumerate_physical_devices` in this initialization pass and remains usable for the feature query.
+            let core_features = unsafe { self.instance.get_physical_device_features(physical) };
+            let enabled_core = vk::PhysicalDeviceFeatures::default()
+                .vertex_pipeline_stores_and_atomics(vertex_storage)
+                .multi_draw_indirect(multi_draw)
+                .sampler_anisotropy(core_features.sampler_anisotropy != 0);
+            let swapchain_extensions = [khr::swapchain::NAME.as_ptr()];
+            let enabled_extensions = swapchain_extensions.as_slice();
+            let create = vk::DeviceCreateInfo::default()
+                .enabled_features(&enabled_core)
+                .enabled_extension_names(enabled_extensions)
+                .queue_create_infos(&queue_infos)
+                .push_next(&mut enabled11)
+                .push_next(&mut enabled12)
+                .push_next(&mut enabled13);
+            // SAFETY: the physical device and queue family were queried from this live instance.
+            let device =
+                unsafe { self.instance.create_device(physical, &create, None) }.map_err(map_vk)?;
+            let mut pending = PendingDevice::new(device);
+            let device = pending
+                .device
+                .as_ref()
+                .expect("pending device is initialized");
+            // SAFETY: queue zero was requested from the selected graphics family above.
+            let graphics_queue = unsafe { device.get_device_queue(queue_family, 0) };
+            let transfer_index =
+                u32::from(transfer_family == queue_family && graphics_queue_count > 1);
+            // SAFETY: the selected transfer family and index were included in `queue_infos`.
+            let transfer_queue =
+                unsafe { device.get_device_queue(transfer_family, transfer_index) };
+            let texture_index = if transfer_family == queue_family {
+                if graphics_queue_count > 2 {
+                    2
                 } else {
-                    vec![
-                        vk::DeviceQueueCreateInfo::default()
-                            .queue_family_index(queue_family)
-                            .queue_priorities(&priorities[..1]),
-                        vk::DeviceQueueCreateInfo::default()
+                    transfer_index
+                }
+            } else {
+                u32::from(transfer_queue_count > 1)
+            };
+            // SAFETY: the selected texture family and index were included in `queue_infos`.
+            let texture_queue = unsafe { device.get_device_queue(transfer_family, texture_index) };
+            pending.allocator = Some(
+                Allocator::new(&AllocatorCreateDesc {
+                    instance: self.instance.clone(),
+                    device: device.clone(),
+                    physical_device: physical,
+                    debug_settings: gpu_allocator::AllocatorDebugSettings::default(),
+                    buffer_device_address: true,
+                    allocation_sizes: AllocationSizes::new(
+                        DEFAULT_ALLOCATION_BLOCK_POLICY.initial_device,
+                        DEFAULT_ALLOCATION_BLOCK_POLICY.initial_host,
+                    )
+                    .with_max_device_memblock_size(DEFAULT_ALLOCATION_BLOCK_POLICY.maximum_device)
+                    .with_max_host_memblock_size(DEFAULT_ALLOCATION_BLOCK_POLICY.maximum_host),
+                })
+                .map_err(|error| map_allocator_hal(&error))?,
+            );
+            pending.command_pool = Some(
+                // SAFETY: `transfer_family` belongs to the physical device used to create
+                // `device`, and the command-pool create-info storage spans the call.
+                unsafe {
+                    device.create_command_pool(
+                        &vk::CommandPoolCreateInfo::default()
                             .queue_family_index(transfer_family)
-                            .queue_priorities(&priorities[..transfer_queue_count]),
-                    ]
-                };
-                let mut enabled12 = vk::PhysicalDeviceVulkan12Features::default()
-                    .timeline_semaphore(features12.timeline_semaphore != 0)
-                    .buffer_device_address(features12.buffer_device_address != 0)
-                    .descriptor_indexing(features12.descriptor_indexing != 0)
-                    .runtime_descriptor_array(features12.runtime_descriptor_array != 0)
-                    .descriptor_binding_partially_bound(
-                        features12.descriptor_binding_partially_bound != 0,
+                            .flags(
+                                vk::CommandPoolCreateFlags::TRANSIENT
+                                    | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+                            ),
+                        None,
                     )
-                    .descriptor_binding_sampled_image_update_after_bind(
-                        features12.descriptor_binding_sampled_image_update_after_bind != 0,
+                }
+                .map_err(map_vk)?,
+            );
+            pending.texture_command_pool = Some(
+                // SAFETY: this pool uses the admitted transfer family and live device.
+                unsafe {
+                    device.create_command_pool(
+                        &vk::CommandPoolCreateInfo::default()
+                            .queue_family_index(transfer_family)
+                            .flags(
+                                vk::CommandPoolCreateFlags::TRANSIENT
+                                    | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+                            ),
+                        None,
                     )
-                    .descriptor_binding_storage_buffer_update_after_bind(
-                        features12.descriptor_binding_storage_buffer_update_after_bind != 0,
+                }
+                .map_err(map_vk)?,
+            );
+            pending.acquire_pool = Some(
+                // SAFETY: `queue_family` belongs to this device and the create-info spans the
+                // call. Same-family texture updates also use this pool for queue handoff.
+                unsafe {
+                    device.create_command_pool(
+                        &vk::CommandPoolCreateInfo::default()
+                            .queue_family_index(queue_family)
+                            .flags(
+                                vk::CommandPoolCreateFlags::TRANSIENT
+                                    | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+                            ),
+                        None,
                     )
-                    .descriptor_binding_storage_image_update_after_bind(
-                        features12.descriptor_binding_storage_image_update_after_bind != 0,
+                }
+                .map_err(map_vk)?,
+            );
+            pending.texture_acquire_pool = Some(
+                // SAFETY: this pool uses the admitted graphics family and live device.
+                unsafe {
+                    device.create_command_pool(
+                        &vk::CommandPoolCreateInfo::default()
+                            .queue_family_index(queue_family)
+                            .flags(
+                                vk::CommandPoolCreateFlags::TRANSIENT
+                                    | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+                            ),
+                        None,
                     )
-                    .shader_sampled_image_array_non_uniform_indexing(
-                        features12.shader_sampled_image_array_non_uniform_indexing != 0,
-                    );
-                let mut enabled13 = vk::PhysicalDeviceVulkan13Features::default()
-                    .dynamic_rendering(features13.dynamic_rendering != 0)
-                    .synchronization2(features13.synchronization2 != 0);
-                let mut enabled11 =
-                    vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
-                // SAFETY: `physical` was returned by `self.instance.enumerate_physical_devices` in this initialization pass and remains usable for the feature query.
-                let core_features = unsafe { self.instance.get_physical_device_features(physical) };
-                let enabled_core = vk::PhysicalDeviceFeatures::default()
-                    .vertex_pipeline_stores_and_atomics(vertex_storage)
-                    .multi_draw_indirect(multi_draw)
-                    .sampler_anisotropy(core_features.sampler_anisotropy != 0);
-                let swapchain_extensions = [khr::swapchain::NAME.as_ptr()];
-                let enabled_extensions = swapchain_extensions.as_slice();
-                let create = vk::DeviceCreateInfo::default()
-                    .enabled_features(&enabled_core)
-                    .enabled_extension_names(enabled_extensions)
-                    .queue_create_infos(&queue_infos)
-                    .push_next(&mut enabled11)
-                    .push_next(&mut enabled12)
-                    .push_next(&mut enabled13);
-                // SAFETY: the physical device and queue family were queried from this live instance.
-                let device = unsafe { self.instance.create_device(physical, &create, None) }
-                    .map_err(map_vk)?;
-                let mut pending = PendingDevice::new(device);
-                let device = pending
-                    .device
-                    .as_ref()
-                    .expect("pending device is initialized");
-                // SAFETY: queue zero was requested from the selected graphics family above.
-                let graphics_queue = unsafe { device.get_device_queue(queue_family, 0) };
-                let transfer_index =
-                    u32::from(transfer_family == queue_family && graphics_queue_count > 1);
-                // SAFETY: the selected transfer family and index were included in `queue_infos`.
-                let transfer_queue =
-                    unsafe { device.get_device_queue(transfer_family, transfer_index) };
-                let texture_index = if transfer_family == queue_family {
-                    if graphics_queue_count > 2 {
-                        2
-                    } else {
-                        transfer_index
-                    }
-                } else {
-                    u32::from(transfer_queue_count > 1)
-                };
-                // SAFETY: the selected texture family and index were included in `queue_infos`.
-                let texture_queue =
-                    unsafe { device.get_device_queue(transfer_family, texture_index) };
-                pending.allocator = Some(
-                    Allocator::new(&AllocatorCreateDesc {
-                        instance: self.instance.clone(),
-                        device: device.clone(),
-                        physical_device: physical,
-                        debug_settings: gpu_allocator::AllocatorDebugSettings::default(),
-                        buffer_device_address: true,
-                        allocation_sizes: AllocationSizes::new(
-                            DEFAULT_ALLOCATION_BLOCK_POLICY.initial_device,
-                            DEFAULT_ALLOCATION_BLOCK_POLICY.initial_host,
-                        )
-                        .with_max_device_memblock_size(
-                            DEFAULT_ALLOCATION_BLOCK_POLICY.maximum_device,
-                        )
-                        .with_max_host_memblock_size(DEFAULT_ALLOCATION_BLOCK_POLICY.maximum_host),
-                    })
-                    .map_err(|error| map_allocator_hal(&error))?,
-                );
-                pending.command_pool = Some(
-                    // SAFETY: `transfer_family` belongs to the physical device used to create
-                    // `device`, and the command-pool create-info storage spans the call.
-                    unsafe {
-                        device.create_command_pool(
-                            &vk::CommandPoolCreateInfo::default()
-                                .queue_family_index(transfer_family)
-                                .flags(
-                                    vk::CommandPoolCreateFlags::TRANSIENT
-                                        | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
-                                ),
-                            None,
-                        )
-                    }
-                    .map_err(map_vk)?,
-                );
-                pending.texture_command_pool = Some(
-                    // SAFETY: this pool uses the admitted transfer family and live device.
-                    unsafe {
-                        device.create_command_pool(
-                            &vk::CommandPoolCreateInfo::default()
-                                .queue_family_index(transfer_family)
-                                .flags(
-                                    vk::CommandPoolCreateFlags::TRANSIENT
-                                        | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
-                                ),
-                            None,
-                        )
-                    }
-                    .map_err(map_vk)?,
-                );
-                pending.acquire_pool = Some(
-                    // SAFETY: `queue_family` belongs to this device and the create-info spans the
-                    // call. Same-family texture updates also use this pool for queue handoff.
-                    unsafe {
-                        device.create_command_pool(
-                            &vk::CommandPoolCreateInfo::default()
-                                .queue_family_index(queue_family)
-                                .flags(
-                                    vk::CommandPoolCreateFlags::TRANSIENT
-                                        | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
-                                ),
-                            None,
-                        )
-                    }
-                    .map_err(map_vk)?,
-                );
-                pending.texture_acquire_pool = Some(
-                    // SAFETY: this pool uses the admitted graphics family and live device.
-                    unsafe {
-                        device.create_command_pool(
-                            &vk::CommandPoolCreateInfo::default()
-                                .queue_family_index(queue_family)
-                                .flags(
-                                    vk::CommandPoolCreateFlags::TRANSIENT
-                                        | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
-                                ),
-                            None,
-                        )
-                    }
-                    .map_err(map_vk)?,
-                );
-                let mut timeline = vk::SemaphoreTypeCreateInfo::default()
-                    .semaphore_type(vk::SemaphoreType::TIMELINE)
-                    .initial_value(0);
-                pending.timeline = Some(
-                    // SAFETY: profile admission required and device creation enabled timeline semaphores, while the `timeline` pNext storage lasts through `create_semaphore`.
-                    unsafe {
-                        device.create_semaphore(
-                            &vk::SemaphoreCreateInfo::default().push_next(&mut timeline),
-                            None,
-                        )
-                    }
-                    .map_err(map_vk)?,
-                );
-                let mut texture_timeline = vk::SemaphoreTypeCreateInfo::default()
-                    .semaphore_type(vk::SemaphoreType::TIMELINE)
-                    .initial_value(0);
-                pending.texture_timeline = Some(
-                    // SAFETY: timeline semaphores are enabled and pNext storage spans the call.
-                    unsafe {
-                        device.create_semaphore(
-                            &vk::SemaphoreCreateInfo::default().push_next(&mut texture_timeline),
-                            None,
-                        )
-                    }
-                    .map_err(map_vk)?,
-                );
-                let mut ownership_timeline = vk::SemaphoreTypeCreateInfo::default()
-                    .semaphore_type(vk::SemaphoreType::TIMELINE)
-                    .initial_value(0);
-                pending.ownership_timeline = Some(
-                    // SAFETY: timeline semaphores were enabled and pNext storage spans the call.
-                    unsafe {
-                        device.create_semaphore(
-                            &vk::SemaphoreCreateInfo::default().push_next(&mut ownership_timeline),
-                            None,
-                        )
-                    }
-                    .map_err(map_vk)?,
-                );
-                let mut texture_ownership_timeline = vk::SemaphoreTypeCreateInfo::default()
-                    .semaphore_type(vk::SemaphoreType::TIMELINE)
-                    .initial_value(0);
-                pending.texture_ownership_timeline = Some(
-                    // SAFETY: the timeline serializes graphics-to-transfer texture updates even
-                    // when both queues belong to the same family.
-                    unsafe {
-                        device.create_semaphore(
-                            &vk::SemaphoreCreateInfo::default()
-                                .push_next(&mut texture_ownership_timeline),
-                            None,
-                        )
-                    }
-                    .map_err(map_vk)?,
-                );
-                let worker_device = device.clone();
-                let transfer_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));
-                let texture_lock = if texture_queue == transfer_queue {
-                    transfer_lock.clone()
-                } else {
-                    std::sync::Arc::new(parking_lot::Mutex::new(()))
-                };
-                let graphics_lock = self.graphics_queue_lock.clone();
-                let (descriptor_set, frame_slots) =
-                    create_device_frame_state(&self.instance, &mut pending, queue_family)?;
+                }
+                .map_err(map_vk)?,
+            );
+            let mut timeline = vk::SemaphoreTypeCreateInfo::default()
+                .semaphore_type(vk::SemaphoreType::TIMELINE)
+                .initial_value(0);
+            pending.timeline = Some(
+                // SAFETY: profile admission required and device creation enabled timeline semaphores, while the `timeline` pNext storage lasts through `create_semaphore`.
+                unsafe {
+                    device.create_semaphore(
+                        &vk::SemaphoreCreateInfo::default().push_next(&mut timeline),
+                        None,
+                    )
+                }
+                .map_err(map_vk)?,
+            );
+            let mut texture_timeline = vk::SemaphoreTypeCreateInfo::default()
+                .semaphore_type(vk::SemaphoreType::TIMELINE)
+                .initial_value(0);
+            pending.texture_timeline = Some(
+                // SAFETY: timeline semaphores are enabled and pNext storage spans the call.
+                unsafe {
+                    device.create_semaphore(
+                        &vk::SemaphoreCreateInfo::default().push_next(&mut texture_timeline),
+                        None,
+                    )
+                }
+                .map_err(map_vk)?,
+            );
+            let mut ownership_timeline = vk::SemaphoreTypeCreateInfo::default()
+                .semaphore_type(vk::SemaphoreType::TIMELINE)
+                .initial_value(0);
+            pending.ownership_timeline = Some(
+                // SAFETY: timeline semaphores were enabled and pNext storage spans the call.
+                unsafe {
+                    device.create_semaphore(
+                        &vk::SemaphoreCreateInfo::default().push_next(&mut ownership_timeline),
+                        None,
+                    )
+                }
+                .map_err(map_vk)?,
+            );
+            let mut texture_ownership_timeline = vk::SemaphoreTypeCreateInfo::default()
+                .semaphore_type(vk::SemaphoreType::TIMELINE)
+                .initial_value(0);
+            pending.texture_ownership_timeline = Some(
+                // SAFETY: the timeline serializes graphics-to-transfer texture updates even
+                // when both queues belong to the same family.
+                unsafe {
+                    device.create_semaphore(
+                        &vk::SemaphoreCreateInfo::default()
+                            .push_next(&mut texture_ownership_timeline),
+                        None,
+                    )
+                }
+                .map_err(map_vk)?,
+            );
+            let worker_device = device.clone();
+            let transfer_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));
+            let texture_lock = if texture_queue == transfer_queue {
+                transfer_lock.clone()
+            } else {
+                std::sync::Arc::new(parking_lot::Mutex::new(()))
+            };
+            let graphics_lock = self.graphics_queue_lock.clone();
+            let (descriptor_set, frame_slots) =
+                create_device_frame_state(&self.instance, &mut pending, queue_family)?;
 
-                let transfer_worker = transfer::start_worker(
-                    worker_device.clone(),
-                    transfer_queue,
-                    graphics_queue,
-                    transfer_family,
-                    queue_family,
-                    pending.command_pool.ok_or(HalError::NativeFailure)?,
-                    pending.acquire_pool,
-                    pending.timeline.ok_or(HalError::NativeFailure)?,
-                    pending.ownership_timeline,
-                    transfer_lock,
-                    graphics_lock.clone(),
-                )
-                .map_err(|_| HalError::NativeFailure)?;
-                let texture_worker = transfer::start_worker(
-                    worker_device.clone(),
-                    texture_queue,
-                    graphics_queue,
-                    transfer_family,
-                    queue_family,
-                    pending
-                        .texture_command_pool
-                        .ok_or(HalError::NativeFailure)?,
-                    pending.texture_acquire_pool,
-                    pending.texture_timeline.ok_or(HalError::NativeFailure)?,
-                    pending.texture_ownership_timeline,
-                    texture_lock,
-                    graphics_lock,
-                )
-                .map_err(|_| HalError::NativeFailure)?;
-                self.physical_device = Some(physical);
-                self.adapter_info = Some(adapter.clone());
-                self.graphics_queue_family = Some(queue_family);
-                self.transfer_queue_family = Some(transfer_family);
-                self.graphics_queue = Some(graphics_queue);
-                self.transfer_queue = Some(transfer_queue);
-                self.allocator = pending.allocator.take();
-                self.sampler_anisotropy = core_features.sampler_anisotropy != 0;
-                self.device = pending.device.take();
-                self.transfer_timeline = pending.timeline.take();
-                self.transfer_worker = Some(transfer_worker);
-                self.transfer_command_pool = pending.command_pool.take();
-                self.transfer_acquire_pool = pending.acquire_pool.take();
-                self.transfer_ownership_timeline = pending.ownership_timeline.take();
-                self.texture_timeline = pending.texture_timeline.take();
-                self.texture_worker = Some(texture_worker);
-                self.texture_command_pool = pending.texture_command_pool.take();
-                self.texture_acquire_pool = pending.texture_acquire_pool.take();
-                self.texture_ownership_timeline = pending.texture_ownership_timeline.take();
-                self.texture_descriptor_pool = pending.descriptor_pool.take();
-                self.texture_descriptor_layout = pending.descriptor_layout.take();
-                self.texture_descriptor_set = Some(descriptor_set);
-                self.swapchain_loader = pending.swapchain_loader.take();
-                self.image_available = pending.image_available.take();
-                self.frame_slots = frame_slots;
-                return Ok(adapter);
-            }
+            let transfer_worker = transfer::start_worker(
+                worker_device.clone(),
+                transfer_queue,
+                graphics_queue,
+                transfer_family,
+                queue_family,
+                pending.command_pool.ok_or(HalError::NativeFailure)?,
+                pending.acquire_pool,
+                pending.timeline.ok_or(HalError::NativeFailure)?,
+                pending.ownership_timeline,
+                transfer_lock,
+                graphics_lock.clone(),
+            )
+            .map_err(|_| HalError::NativeFailure)?;
+            let texture_worker = transfer::start_worker(
+                worker_device.clone(),
+                texture_queue,
+                graphics_queue,
+                transfer_family,
+                queue_family,
+                pending
+                    .texture_command_pool
+                    .ok_or(HalError::NativeFailure)?,
+                pending.texture_acquire_pool,
+                pending.texture_timeline.ok_or(HalError::NativeFailure)?,
+                pending.texture_ownership_timeline,
+                texture_lock,
+                graphics_lock,
+            )
+            .map_err(|_| HalError::NativeFailure)?;
+            self.physical_device = Some(physical);
+            self.adapter_info = Some(adapter.clone());
+            self.graphics_queue_family = Some(queue_family);
+            self.transfer_queue_family = Some(transfer_family);
+            self.graphics_queue = Some(graphics_queue);
+            self.transfer_queue = Some(transfer_queue);
+            self.allocator = pending.allocator.take();
+            self.sampler_anisotropy = core_features.sampler_anisotropy != 0;
+            self.device = pending.device.take();
+            self.transfer_timeline = pending.timeline.take();
+            self.transfer_worker = Some(transfer_worker);
+            self.transfer_command_pool = pending.command_pool.take();
+            self.transfer_acquire_pool = pending.acquire_pool.take();
+            self.transfer_ownership_timeline = pending.ownership_timeline.take();
+            self.texture_timeline = pending.texture_timeline.take();
+            self.texture_worker = Some(texture_worker);
+            self.texture_command_pool = pending.texture_command_pool.take();
+            self.texture_acquire_pool = pending.texture_acquire_pool.take();
+            self.texture_ownership_timeline = pending.texture_ownership_timeline.take();
+            self.texture_descriptor_pool = pending.descriptor_pool.take();
+            self.texture_descriptor_layout = pending.descriptor_layout.take();
+            self.texture_descriptor_set = Some(descriptor_set);
+            self.swapchain_loader = pending.swapchain_loader.take();
+            self.image_available = pending.image_available.take();
+            self.frame_slots = frame_slots;
+            return Ok(adapter);
         }
-        Err(HalError::Unsupported)
+        // An unmatched explicit identity names no adapter; default first-fit
+        // keeps the legacy admission failure.
+        Err(if selection.is_some() {
+            HalError::InvalidArgument
+        } else {
+            HalError::Unsupported
+        })
     }
     /// Waits for submitted native work and reclaims completed deferred resources.
     ///
@@ -613,13 +702,16 @@ impl NativeContext {
         self.idle_drained = self.device.is_none();
         let device = self.device.as_ref().ok_or(HalError::NotReady)?.clone();
         let mut worker_failed = false;
+        let mut worker_lost = false;
         for worker in [&mut self.transfer_worker, &mut self.texture_worker] {
             if let Some(worker) = worker {
-                if worker.flush().is_err() {
+                if let Err(error) = worker.flush() {
                     // Join terminal cleanup before native idle; failed callbacks may
                     // have submitted only the first half of a queue handoff.
                     worker.shutdown();
                     worker_failed = true;
+                    worker_lost |= error == ez_gfx_hal::TransferWorkerError::DeviceLost
+                        || worker.device_lost();
                 }
             } else {
                 worker_failed = true;
@@ -629,7 +721,11 @@ impl NativeContext {
         unsafe { device.device_wait_idle() }.map_err(map_vk)?;
         self.idle_drained = true;
         if worker_failed {
-            return Err(HalError::NativeFailure);
+            return Err(if worker_lost {
+                HalError::DeviceLost
+            } else {
+                HalError::NativeFailure
+            });
         }
         self.reclaim(ez_gfx_hal::QueueKind::Transfer, u64::MAX)
             .map_err(map_allocation_hal)?;
@@ -789,17 +885,32 @@ impl NativeContext {
                 Ok(())
             }
             DeferredResource::Texture(texture) => {
+                // The MSAA render storage is never sampled or described, so
+                // only its view and image retire alongside the sampled image.
+                let msaa = texture.msaa;
                 // SAFETY: the deferred texture is consumed after its pending frame-slot mask clears; its view and sampler are destroyed before its image and allocation storage.
                 unsafe {
                     device.destroy_image_view(texture.view, None);
                     device.destroy_sampler(texture.sampler, None);
                     device.destroy_image(texture.image, None);
+                    if let Some(storage) = msaa.as_ref() {
+                        device.destroy_image_view(storage.view, None);
+                        device.destroy_image(storage.image, None);
+                    }
                 }
                 self.allocator
                     .as_mut()
                     .ok_or(AllocationError::NativeFailure)?
                     .free(texture.allocation)
-                    .map_err(|error| map_allocator(&error))
+                    .map_err(|error| map_allocator(&error))?;
+                if let Some(storage) = msaa {
+                    self.allocator
+                        .as_mut()
+                        .ok_or(AllocationError::NativeFailure)?
+                        .free(storage.allocation)
+                        .map_err(|error| map_allocator(&error))?;
+                }
+                Ok(())
             }
         }
     }
@@ -992,5 +1103,49 @@ mod tests {
         ];
 
         assert_eq!(select_transfer_family(&families, 0), 0);
+    }
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn enumeration_reports_unique_named_adapters() {
+        // No surface is created, shown, or activated by this test.
+        let adapters = NativeContext::enumerate_adapters().expect("Vulkan enumerates adapters");
+        assert!(!adapters.is_empty());
+        let mut identities = BTreeSet::new();
+        for adapter in &adapters {
+            assert_ne!(adapter.stable_id(), [0; 16]);
+            assert!(!adapter.name().is_empty());
+            assert!(!adapter.driver().is_empty());
+            assert!(identities.insert(adapter.stable_id()));
+        }
+    }
+
+    #[test]
+    fn explicit_selection_rejects_unknown_identity() {
+        // No surface is created, shown, or activated by this test.
+        let mut context =
+            NativeContext::create(false, false, SurfacePlatform::Win32).expect("Vulkan instance");
+        assert_eq!(
+            context.init_device_for_adapter(None, [0xA5; 16], false),
+            Err(HalError::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn explicit_selection_admits_enumerated_adapter() {
+        // No surface is created, shown, or activated by this test.
+        let adapters = NativeContext::enumerate_adapters().expect("Vulkan enumerates adapters");
+        let wanted = adapters.first().expect("at least one adapter").stable_id();
+        let mut context =
+            NativeContext::create(false, false, SurfacePlatform::Win32).expect("Vulkan instance");
+        let admitted = context
+            .init_device_for_adapter(None, wanted, false)
+            .expect("enumerated adapter initializes");
+        assert_eq!(admitted.stable_id(), wanted);
     }
 }

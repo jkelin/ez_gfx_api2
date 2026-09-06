@@ -1,16 +1,17 @@
 use super::{
-    AllocationRequest, Arc, AsyncTextureState, Backend, CONTEXT_HANDLES, CONTEXTS, CompletionToken,
-    ContextHandle, ContextIdentity, ContextOptions, ContextState, DEFAULT_STAGING_POLICY,
-    DiagnosticLevel, EzGfxResult, FrameRecorder, GeometryAllocation, GeometryManager, HalError,
-    HashMap, MemoryClass, NativeAllocation, NativeContext, NativeSurface, Observability, Ordering,
-    ResourceKind, RenderTargetHandle, RuntimePhase, RuntimeRecord, RuntimeStatus, SurfaceHandle,
-    SurfaceOptions, SurfacePlatform, SurfaceRecord, SurfaceState, TextureRegistry,
-    TextureUploadTelemetry, VulkanContext, VulkanPlatform, allocate_native, completed_transfer_native,
-    context_local, copy_native, destroy_native_pipeline, destroy_native_shader, destroy_native_texture,
-    free_native_allocation, map_allocation, map_frame, map_geometry, map_hal, map_lifecycle,
-    map_native_loss, map_texture, pump_async_textures, render_target::destroy_all_render_targets,
-    result_status, staging_bucket_size, wait_native_idle, with_context_mut, with_surface_mut,
-    write_native,
+    AdapterCatalog, AdapterInfo, AdapterReport, AdapterSelection, AllocationRequest, Arc,
+    AsyncTextureState, Backend, CONTEXT_HANDLES, CONTEXTS, CompletionToken, ContextHandle,
+    ContextIdentity, ContextOptions, ContextState, DEFAULT_STAGING_POLICY, DiagnosticLevel,
+    EzGfxResult, FrameRecorder, GeometryAllocation, GeometryManager, HalError, HashMap,
+    MemoryClass, NativeAllocation, NativeContext, NativeSurface, Observability, Ordering,
+    RenderTargetHandle, ResourceKind, RuntimeError, RuntimePhase, RuntimeRecord, RuntimeStatus,
+    SurfaceHandle, SurfaceOptions, SurfacePlatform, SurfaceRecord, SurfaceState, TextureRegistry,
+    TextureUploadTelemetry, VulkanContext, VulkanPlatform, admission_report, allocate_native,
+    completed_transfer_native, context_local, copy_native, destroy_native_pipeline,
+    destroy_native_shader, destroy_native_texture, free_native_allocation, map_allocation,
+    map_frame, map_geometry, map_hal, map_lifecycle, map_native_loss, map_texture,
+    pump_async_textures, render_target::destroy_all_render_targets, result_status,
+    staging_bucket_size, wait_native_idle, with_context_mut, with_surface_mut, write_native,
 };
 #[cfg(windows)]
 use super::{Dx12Context, Dx12Surface};
@@ -23,46 +24,9 @@ use super::{MetalContext, MetalSurface};
 ///
 /// Returns an error when the backend/platform pair is unsupported or native context creation fails.
 pub fn create_context(options: ContextOptions) -> Result<ContextHandle, EzGfxResult> {
-    let native = match options.backend {
-        Backend::Vulkan if options.surface_platform == SurfacePlatform::Win32 => {
-            NativeContext::Vulkan(Box::new(
-                VulkanContext::create(
-                    options.enable_debug,
-                    options.enable_validation,
-                    VulkanPlatform::Win32,
-                )
-                .map_err(map_hal)?,
-            ))
-        }
-        Backend::Vulkan => return Err(EzGfxResult::Unsupported),
-        Backend::Dx12 => {
-            if options.surface_platform != SurfacePlatform::Win32 {
-                return Err(EzGfxResult::InvalidArgument);
-            }
-            #[cfg(windows)]
-            {
-                NativeContext::Dx12(Box::new(
-                    Dx12Context::create_default(false).map_err(|_| EzGfxResult::NativeFailure)?,
-                ))
-            }
-            #[cfg(not(windows))]
-            {
-                return Err(EzGfxResult::Unsupported);
-            }
-        }
-        Backend::Metal => {
-            if options.surface_platform != SurfacePlatform::MetalLayer {
-                return Err(EzGfxResult::InvalidArgument);
-            }
-            #[cfg(target_vendor = "apple")]
-            {
-                NativeContext::Metal(Box::new(MetalContext::create_default().map_err(map_hal)?))
-            }
-            #[cfg(not(target_vendor = "apple"))]
-            {
-                return Err(EzGfxResult::Unsupported);
-            }
-        }
+    let native = match options.adapter_selection {
+        Some(selection) => build_native_context_for_adapter(&options, selection)?,
+        None => build_native_context(&options)?,
     };
     let texture_registry = TextureRegistry::new(
         ez_gfx_runtime::binding::MAX_TEXTURE_HEAP_CAPACITY,
@@ -94,8 +58,6 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle, EzGfxRes
         shaders: HashMap::new(),
         textures: HashMap::new(),
         render_targets: HashMap::new(),
-        render_target_bindings: Vec::new(),
-        next_render_target_binding: ez_gfx_runtime::binding::MAX_TEXTURE_HEAP_CAPACITY,
         texture_formats: HashMap::new(),
         texture_published_mips: HashMap::new(),
         texture_residency_targets: HashMap::new(),
@@ -145,6 +107,188 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle, EzGfxRes
         return Err(error);
     }
     Ok(handle)
+}
+
+/// Builds the backend-native context with legacy first-fit device selection.
+///
+/// # Errors
+///
+/// Returns an error when the backend/platform pair is unsupported or native context creation fails.
+fn build_native_context(options: &ContextOptions) -> Result<NativeContext, EzGfxResult> {
+    Ok(match options.backend {
+        Backend::Vulkan if options.surface_platform == SurfacePlatform::Win32 => {
+            NativeContext::Vulkan(Box::new(
+                VulkanContext::create(
+                    options.enable_debug,
+                    options.enable_validation,
+                    VulkanPlatform::Win32,
+                )
+                .map_err(map_hal)?,
+            ))
+        }
+        Backend::Vulkan => return Err(EzGfxResult::Unsupported),
+        Backend::Dx12 => {
+            if options.surface_platform != SurfacePlatform::Win32 {
+                return Err(EzGfxResult::InvalidArgument);
+            }
+            #[cfg(windows)]
+            {
+                NativeContext::Dx12(Box::new(
+                    Dx12Context::create_default(false).map_err(|_| EzGfxResult::NativeFailure)?,
+                ))
+            }
+            #[cfg(not(windows))]
+            {
+                return Err(EzGfxResult::Unsupported);
+            }
+        }
+        Backend::Metal => {
+            if options.surface_platform != SurfacePlatform::MetalLayer {
+                return Err(EzGfxResult::InvalidArgument);
+            }
+            #[cfg(target_vendor = "apple")]
+            {
+                NativeContext::Metal(Box::new(MetalContext::create_default().map_err(map_hal)?))
+            }
+            #[cfg(not(target_vendor = "apple"))]
+            {
+                return Err(EzGfxResult::Unsupported);
+            }
+        }
+    })
+}
+
+/// Builds the backend-native context for one explicitly selected adapter.
+///
+/// The request bypasses ranking but never bypasses admission: the catalog
+/// resolves the stable identity first, so unknown identities fail
+/// `InvalidArgument` before any native call. Vulkan creates its instance here
+/// and enforces the selection at device initialization; DX12 and Metal create
+/// the selected device directly.
+///
+/// # Errors
+///
+/// Returns an error when the backend/platform pair is unsupported, the
+/// stable identity is unknown or rejected by admission policy, enumeration
+/// fails, or native context creation fails.
+fn build_native_context_for_adapter(
+    options: &ContextOptions,
+    selection: AdapterSelection,
+) -> Result<NativeContext, EzGfxResult> {
+    Ok(match options.backend {
+        Backend::Vulkan if options.surface_platform == SurfacePlatform::Win32 => {
+            let catalog =
+                AdapterCatalog::new(backend_adapters(Backend::Vulkan)).map_err(map_runtime)?;
+            catalog
+                .select(selection.stable_id, selection.allow_software)
+                .map_err(map_runtime)?;
+            NativeContext::Vulkan(Box::new(
+                VulkanContext::create(
+                    options.enable_debug,
+                    options.enable_validation,
+                    VulkanPlatform::Win32,
+                )
+                .map_err(map_hal)?,
+            ))
+        }
+        Backend::Vulkan => return Err(EzGfxResult::Unsupported),
+        Backend::Dx12 => {
+            if options.surface_platform != SurfacePlatform::Win32 {
+                return Err(EzGfxResult::InvalidArgument);
+            }
+            #[cfg(windows)]
+            {
+                let catalog =
+                    AdapterCatalog::new(backend_adapters(Backend::Dx12)).map_err(map_runtime)?;
+                catalog
+                    .select(selection.stable_id, selection.allow_software)
+                    .map_err(map_runtime)?;
+                NativeContext::Dx12(Box::new(
+                    Dx12Context::create_for_adapter(selection.stable_id, selection.allow_software)
+                        .map_err(map_hal)?,
+                ))
+            }
+            #[cfg(not(windows))]
+            {
+                return Err(EzGfxResult::Unsupported);
+            }
+        }
+        Backend::Metal => {
+            if options.surface_platform != SurfacePlatform::MetalLayer {
+                return Err(EzGfxResult::InvalidArgument);
+            }
+            #[cfg(target_vendor = "apple")]
+            {
+                let catalog =
+                    AdapterCatalog::new(backend_adapters(Backend::Metal)).map_err(map_runtime)?;
+                catalog
+                    .select(selection.stable_id, selection.allow_software)
+                    .map_err(map_runtime)?;
+                NativeContext::Metal(Box::new(
+                    MetalContext::create_for_adapter(selection.stable_id).map_err(map_hal)?,
+                ))
+            }
+            #[cfg(not(target_vendor = "apple"))]
+            {
+                return Err(EzGfxResult::Unsupported);
+            }
+        }
+    })
+}
+
+/// Enumerates adapters for one backend. Backends that fail discovery
+/// contribute nothing; cross-backend enumeration never fails because of one
+/// missing loader.
+fn backend_adapters(backend: Backend) -> Vec<AdapterInfo> {
+    match backend {
+        Backend::Vulkan => VulkanContext::enumerate_adapters().unwrap_or_default(),
+        #[cfg(windows)]
+        Backend::Dx12 => Dx12Context::enumerate_adapters().unwrap_or_default(),
+        #[cfg(not(windows))]
+        Backend::Dx12 => Vec::new(),
+        #[cfg(target_vendor = "apple")]
+        Backend::Metal => MetalContext::enumerate_adapters().unwrap_or_default(),
+        #[cfg(not(target_vendor = "apple"))]
+        Backend::Metal => Vec::new(),
+    }
+}
+
+/// Maps catalog admission failures to safe results. Unknown identities and
+/// disallowed software are caller errors; inadmissible hardware is
+/// unsupported. A duplicate identity across backends is a native defect.
+fn map_runtime(error: RuntimeError) -> EzGfxResult {
+    match error {
+        RuntimeError::AdapterNotFound | RuntimeError::SoftwareAdapterNotAllowed => {
+            EzGfxResult::InvalidArgument
+        }
+        RuntimeError::UnsupportedAdapter | RuntimeError::NoAdmittedAdapter => {
+            EzGfxResult::Unsupported
+        }
+        RuntimeError::DuplicateAdapterIdentity => EzGfxResult::NativeFailure,
+    }
+}
+
+/// Enumerates every adapter visible to the supported backends in backend
+/// order (Vulkan, DX12, Metal). Backends that fail discovery contribute
+/// nothing. Admitted or not, every entry carries its normalized limits so
+/// [`query_adapter_report`] can diagnose rejections.
+#[must_use]
+pub fn enumerate_adapters() -> Vec<AdapterInfo> {
+    let mut adapters = backend_adapters(Backend::Vulkan);
+    adapters.extend(backend_adapters(Backend::Dx12));
+    adapters.extend(backend_adapters(Backend::Metal));
+    adapters
+}
+
+/// Diagnoses every enumerated adapter against admission policy without
+/// ranking or creating anything. Reports with empty errors and no software
+/// rejection are admissible; all others name the exact unmet requirements.
+#[must_use]
+pub fn query_adapter_report(allow_software: bool) -> Vec<AdapterReport> {
+    enumerate_adapters()
+        .iter()
+        .map(|info| admission_report(info, allow_software))
+        .collect()
 }
 
 pub(super) fn runtime_status(status: EzGfxResult) -> RuntimeStatus {
@@ -238,6 +382,11 @@ pub fn wait_idle(context: ContextHandle) -> EzGfxResult {
 /// context is removed even when a native wait or release fails. If draining cannot establish
 /// completion, the terminal context retains GPU-owned resources rather than destroying live
 /// storage. Otherwise all remaining releases are attempted and the first failure is returned.
+///
+/// Thread affinity is kept: call only on the creator thread. Callers under Windows loader
+/// lock (DllMain/TLS teardown) must use the abandon path only (thread-exit invalidation,
+/// which forgets GPU owners without native cleanup or joins) and never call this or
+/// `wait_idle` there.
 ///
 /// # Errors
 ///
@@ -458,10 +607,18 @@ pub fn init_device(context: ContextHandle, surface: SurfaceHandle) -> EzGfxResul
             .get(&surface)
             .ok_or(EzGfxResult::InvalidContext)?;
         let first_initialization = context.active_surface.is_none();
+        // Explicit selection is enforced at device creation: Vulkan instances
+        // are adapter-agnostic, so the stable identity resolves here.
+        let selection = context.options.adapter_selection;
         let adapter = match (&mut context.native, &record.native) {
-            (NativeContext::Vulkan(native), NativeSurface::Vulkan(surface)) => {
-                native.init_device(Some(surface))
-            }
+            (NativeContext::Vulkan(native), NativeSurface::Vulkan(surface)) => match selection {
+                Some(selected) => native.init_device_for_adapter(
+                    Some(surface),
+                    selected.stable_id,
+                    selected.allow_software,
+                ),
+                None => native.init_device(Some(surface)),
+            },
             #[cfg(windows)]
             (NativeContext::Dx12(native), NativeSurface::Dx12(surface)) => {
                 native.init_device(surface)
@@ -598,7 +755,7 @@ pub fn begin_render(context: ContextHandle, surface: SurfaceHandle) -> EzGfxResu
 /// Begins rendering to a managed color render target instead of a surface.
 ///
 /// The target's stored declaration clear applies to clearing passes; depth,
-/// storage, and multisampled rendering stay unsupported. The frame presents
+/// storage, and multisampled draws stay unsupported. The frame presents
 /// nothing; sample the target through a later pass or read it back natively.
 ///
 /// # Errors
@@ -606,10 +763,7 @@ pub fn begin_render(context: ContextHandle, surface: SurfaceHandle) -> EzGfxResu
 /// Returns [`EzGfxResult::InvalidArgument`] for an unknown handle,
 /// [`EzGfxResult::InvalidContext`] for a destroyed target, and
 /// [`EzGfxResult::Unsupported`] for a non-color declaration.
-pub fn begin_render_target(
-    context: ContextHandle,
-    target: RenderTargetHandle,
-) -> EzGfxResult {
+pub fn begin_render_target(context: ContextHandle, target: RenderTargetHandle) -> EzGfxResult {
     result_status(with_context_mut(context, |context| {
         context
             .identity
@@ -883,6 +1037,9 @@ pub fn upload_indices(
     })
 }
 
+/// Public uploads copy caller slices here, so no mapped lease exists today. A P-011
+/// zero-copy staging lease hooking in at this seam MUST bind the `ContextIdentity`
+/// epoch and fail `DeviceLost`/`InvalidContext` on use-after-loss, never fallback bytes.
 pub(super) fn stage_upload(
     context: &mut NativeContext,
     pool: &mut ez_gfx_hal::ReusableStagingPool<NativeAllocation>,

@@ -256,6 +256,19 @@ pub enum NativeFrameAction<'a> {
 pub struct NativeShader {
     modules: Vec<vk::ShaderModule>,
 }
+/// Multisampled color storage owned by a managed render target.
+///
+/// The single-sample `NativeTexture` image stays the sampled/resolve image, so
+/// barriers, readback, descriptors, and destruction keep working unchanged;
+/// only the render pass binds this storage and resolves into the sampled image.
+pub struct MsaaStorage {
+    image: vk::Image,
+    view: vk::ImageView,
+    allocation: Allocation,
+    /// Render sample count; passes must request exactly this count.
+    samples: u8,
+}
+
 /// Image, view, sampler, and allocation published as one texture.
 pub struct NativeTexture {
     image: vk::Image,
@@ -271,6 +284,10 @@ pub struct NativeTexture {
     cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Slot in the bindless texture descriptor heap.
     pub binding: u32,
+    /// Multisampled render storage plus its view and allocation; `None` for
+    /// uploads and single-sample targets. Only render-target entry points
+    /// touch this; the sampled image above stays the resolve destination.
+    msaa: Option<MsaaStorage>,
 }
 
 impl NativeTexture {

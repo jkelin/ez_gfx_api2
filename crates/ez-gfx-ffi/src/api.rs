@@ -57,6 +57,49 @@ pub struct EzGfxContextDesc {
     pub surface_platform: u8,
     /// Async texture decode worker threads; zero selects the default topology.
     pub texture_decode_workers: u32,
+    /// Explicit adapter requests; zero keeps default ranking, one selects by identity.
+    pub adapter_count: u32,
+    /// Exactly `adapter_count` explicit requests; null if and only if zero.
+    pub adapter: *const EzGfxAdapterDesc,
+}
+#[derive(Clone, Copy)]
+#[repr(C)]
+/// Explicit adapter request selected by stable identity.
+pub struct EzGfxAdapterDesc {
+    /// Stable 128-bit adapter identity from enumeration.
+    pub stable_id: [u8; 16],
+    /// Whether a software-class adapter is acceptable; zero or one.
+    pub allow_software: u8,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+/// C ABI adapter classification; discriminants mirror core `AdapterClass`.
+pub enum EzGfxAdapterClass {
+    /// Software renderer.
+    Software = 0,
+    /// Adapter with no stronger classification.
+    Other = 1,
+    /// Integrated GPU.
+    Integrated = 2,
+    /// Discrete GPU.
+    Discrete = 3,
+}
+#[derive(Clone, Copy)]
+#[repr(C)]
+/// Enumerated adapter identity with admission diagnostics under one software policy.
+pub struct EzGfxAdapterInfo {
+    /// Stable 128-bit adapter identity from enumeration.
+    pub stable_id: [u8; 16],
+    /// Backend code from `EzGfxBackend`.
+    pub backend: u8,
+    /// Class code from `EzGfxAdapterClass`.
+    pub adapter_class: u8,
+    /// Whether the adapter passes admission under the queried policy; zero or one.
+    pub admitted: u8,
+    /// Whether software policy alone rejects the adapter; zero or one.
+    pub software_rejected: u8,
+    /// Count of unmet profile requirements; zero when admitted.
+    pub error_count: u32,
 }
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -72,6 +115,10 @@ pub struct EzGfxBackendContextDesc {
     pub backend: u8,
     /// Async texture decode worker threads; zero selects the default topology.
     pub texture_decode_workers: u32,
+    /// Explicit adapter requests; zero keeps default ranking, one selects by identity.
+    pub adapter_count: u32,
+    /// Exactly `adapter_count` explicit requests; null if and only if zero.
+    pub adapter: *const EzGfxAdapterDesc,
 }
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -145,6 +192,63 @@ pub struct EzGfxTextureDesc {
     pub debug_label: *const u8,
     /// Specifies the debug-label byte length, or zero when absent.
     pub debug_label_length: usize,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+/// C ABI render-target storage format; discriminants mirror runtime `Format`.
+pub enum EzGfxRenderTargetFormat {
+    /// Four-channel 8-bit normalized RGBA format.
+    Rgba8Unorm = 1,
+    /// Four-channel 8-bit sRGB BGRA format.
+    Bgra8Srgb = 2,
+    /// Four-channel 16-bit floating-point RGBA format.
+    Rgba16Float = 3,
+    /// 32-bit floating-point depth format.
+    Depth32Float = 4,
+    /// BC7-compressed 8-bit normalized RGBA format.
+    Bc7Unorm = 5,
+    /// ASTC-compressed 4-by-4 texel 8-bit normalized RGBA format.
+    Astc4x4Unorm = 6,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+/// C ABI render-target access mode.
+pub enum EzGfxRenderTargetUsage {
+    /// Supports color-rendering output.
+    Color = 0,
+    /// Supports depth-rendering output; creation stays unsupported.
+    Depth = 1,
+    /// Supports storage access; creation stays unsupported.
+    Storage = 2,
+    /// Supports texture sampling; creation stays unsupported.
+    Sampled = 3,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+/// Describes render-target name, usage, format candidates, and clear value.
+pub struct EzGfxRenderTargetDesc {
+    /// Points to exactly `name_length` UTF-8 bytes; required, 1..=255 bytes.
+    pub name: *const u8,
+    /// Specifies the target-name byte length.
+    pub name_length: usize,
+    /// Selects the access mode by its C ABI numeric code.
+    pub usage: u8,
+    /// Scale factor relative to the reference dimensions; finite and positive.
+    pub relative_scale: f32,
+    /// Requested multisample count; one of 1, 2, 4, or 8.
+    pub samples: u8,
+    /// Points to exactly `candidate_count` format codes; required, 1..=16 entries.
+    pub candidate_formats: *const u8,
+    /// Specifies the candidate format count.
+    pub candidate_count: u32,
+    /// Non-zero requires texture-sampling support; must be zero or one.
+    pub sampleable: u8,
+    /// Non-zero stores `clear_color`; must be zero or one.
+    pub use_clear: u8,
+    /// Color clear value read only when `use_clear` is non-zero.
+    pub clear_color: [f32; 4],
 }
 
 #[derive(Clone, Copy)]

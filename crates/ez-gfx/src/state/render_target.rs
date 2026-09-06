@@ -1,17 +1,18 @@
 //! Managed render-target lifecycle: allocation, format probing, and teardown.
 //!
 //! Slice 1 owns creation, per-target clear storage, and destruction over the
-//! native single-mip sampled-image constructors. No heap writes, pass
-//! attachments, or MSAA resolve happen here; the stored declaration (including
-//! its clear value) feeds the render-pass slice, which will also unify the
-//! interim top-down binding allocator with texture heap slots.
+//! native single-mip sampled-image constructors, plus multisampled render
+//! storage that resolves into the sampled image. No heap writes or pass
+//! attachments happen here; the stored declaration (including its clear value
+//! and sample count) feeds the render-pass slice. Render targets lease heap
 
 use super::{
     ContextHandle, ContextState, EzGfxResult, NativeTexture, RenderTargetHandle, ResourceKind,
-    destroy_native_texture, map_allocation, map_lifecycle, native_texture_compression,
-    with_context_mut,
+    destroy_native_texture, map_allocation, map_lifecycle, map_texture, native_texture_compression,
+    result_status, with_context_mut,
 };
 use ez_gfx_runtime::target::{Format, TargetDeclaration, TargetError, TargetUsage};
+use ez_gfx_runtime::texture::TextureId;
 
 /// Resolves the clear color applied when a pass clears this target.
 ///
@@ -30,14 +31,19 @@ pub(super) struct RenderTargetRecord {
     pub(super) format: Format,
     pub(super) width: u32,
     pub(super) height: u32,
-    pub(super) binding: u32,
+    /// Heap slot leased from the shared texture registry. Its index is the
+    /// descriptor binding, so textures and targets draw from one free-list
+    /// and can never collide.
+    pub(super) id: TextureId,
 }
 
 /// Creates a sampled color render target from a declaration and explicit extents.
 ///
 /// Probes the active adapter, admits BC/ASTC compression like texture uploads,
-/// and stores the declaration (including its clear value) for the render-pass
-/// slice. Depth, storage, and sampled-only declarations are deferred.
+/// and stores the declaration (including its clear value and sample count)
+/// for the render-pass slice. Multisampled declarations allocate render
+/// storage that resolves into the sampled image at end of pass. Depth,
+/// storage, and sampled-only declarations are deferred.
 /// # Errors
 /// Returns [`EzGfxResult::InvalidArgument`] for empty extents or a malformed
 /// declaration, [`EzGfxResult::Unsupported`] for non-color usage or an
@@ -89,44 +95,55 @@ pub fn create_render_target(
         let bytes = u64::from(width)
             .checked_mul(u64::from(height))
             .and_then(|pixels| pixels.checked_mul(bytes_per_texel))
+            .and_then(|single| single.checked_mul(u64::from(declaration.samples())))
             .ok_or(EzGfxResult::NativeFailure)?;
         if bytes > ez_gfx_runtime::texture::MAX_TEXTURE_BYTES as u64 {
             return Err(EzGfxResult::NativeFailure);
         }
-        let binding = lease_render_target_binding(context)?;
+        let id = context
+            .texture_registry
+            .begin_upload()
+            .map_err(map_texture)?;
+        let binding = match context.texture_registry.reserved_binding(id) {
+            Ok(binding) => binding,
+            Err(error) => {
+                release_heap_slot(context, id);
+                return Err(map_texture(error));
+            }
+        };
         let native = match (&mut context.native, format) {
             (super::NativeContext::Vulkan(native), format) => native
-                .create_render_target(format, width, height, binding)
+                .create_render_target(format, width, height, binding, declaration.samples())
                 .map(NativeTexture::Vulkan)
                 .map_err(map_allocation),
             #[cfg(windows)]
             (super::NativeContext::Dx12(native), format) => native
-                .create_render_target(format, width, height, binding)
+                .create_render_target(format, width, height, binding, declaration.samples())
                 .map(NativeTexture::Dx12)
                 .map_err(map_allocation),
             #[cfg(target_vendor = "apple")]
             (super::NativeContext::Metal(native), format) => native
-                .create_render_target(format, width, height, binding)
+                .create_render_target(format, width, height, binding, declaration.samples())
                 .map(NativeTexture::Metal)
                 .map_err(map_allocation),
         };
         let native = match native {
             Ok(native) => native,
             Err(error) => {
-                release_render_target_binding(context, binding);
+                release_heap_slot(context, id);
                 return Err(error);
             }
         };
         let handle = match context.identity.insert(ResourceKind::RenderTarget) {
             Ok(handle) => handle,
             Err(error) => {
-                release_render_target_binding(context, binding);
+                release_heap_slot(context, id);
                 let _ = destroy_native_texture(&mut context.native, native);
                 return Err(map_lifecycle(error));
             }
         };
         let Ok(typed) = RenderTargetHandle::from_packed(handle) else {
-            release_render_target_binding(context, binding);
+            release_heap_slot(context, id);
             let _ = destroy_native_texture(&mut context.native, native);
             return Err(EzGfxResult::NativeFailure);
         };
@@ -138,7 +155,7 @@ pub fn create_render_target(
                 format,
                 width,
                 height,
-                binding,
+                id,
             },
         );
         Ok(typed)
@@ -151,6 +168,11 @@ pub fn create_render_target(
 /// infallible, mirroring texture unload.
 pub fn destroy_render_target(context: ContextHandle, target: RenderTargetHandle) {
     let _ = with_context_mut(context, |context| {
+        // A destroyed target must never stay bound: clear the override even
+        // when the handle is already gone so no stale binding survives.
+        if context.frame_render_target == Some(target) {
+            context.frame_render_target = None;
+        }
         let Some(record) = context.render_targets.remove(&target) else {
             return Ok(());
         };
@@ -158,7 +180,7 @@ pub fn destroy_render_target(context: ContextHandle, target: RenderTargetHandle)
             .identity
             .remove(target.into(), ResourceKind::RenderTarget)
             .map_err(map_lifecycle)?;
-        release_render_target_binding(context, record.binding);
+        release_heap_slot(context, record.id);
         destroy_native_texture(&mut context.native, record.native).map_err(map_allocation)?;
         Ok(())
     });
@@ -232,36 +254,81 @@ pub fn render_target_clear(
             .ok_or(EzGfxResult::InvalidArgument)
     })
 }
+/// Probes whether one format admits a sampled color target at the given sample count.
+///
+/// Builds a single-candidate color declaration and resolves it against the
+/// active adapter, so depth, storage, above-ceiling sample, and compression
+/// rejections surface here exactly as they would at creation time. Probing
+/// leases nothing from the shared heap.
+///
+/// # Errors
+///
+/// Returns [`EzGfxResult::InvalidArgument`] for a sample count outside
+/// `1 | 2 | 4 | 8`, [`EzGfxResult::Unsupported`] when no candidate satisfies
+/// the declaration, and [`EzGfxResult::NativeFailure`] when the device cannot
+/// be probed.
+pub fn probe_render_target_format(
+    context: ContextHandle,
+    format: Format,
+    samples: u8,
+) -> EzGfxResult {
+    result_status(with_context_mut(context, |context| {
+        context
+            .identity
+            .check_thread_and_health()
+            .map_err(map_lifecycle)?;
+        if !matches!(samples, 1 | 2 | 4 | 8) {
+            return Err(EzGfxResult::InvalidArgument);
+        }
+        let compression = native_texture_compression(&context.native);
+        let capabilities = match &context.native {
+            super::NativeContext::Vulkan(native) => native
+                .probe_target_formats()
+                .map_err(|_| EzGfxResult::NativeFailure)?,
+            #[cfg(windows)]
+            super::NativeContext::Dx12(native) => native
+                .probe_target_formats()
+                .map_err(|_| EzGfxResult::NativeFailure)?,
+            #[cfg(target_vendor = "apple")]
+            super::NativeContext::Metal(native) => native
+                .probe_target_formats()
+                .map_err(|_| EzGfxResult::NativeFailure)?,
+        };
+        let declaration = TargetDeclaration::new(
+            "probe",
+            TargetUsage::Color,
+            1.0,
+            samples,
+            vec![format],
+            ez_gfx_runtime::target::ClearValue::None,
+            true,
+        )
+        .map_err(map_target_error)?;
+        capabilities
+            .resolve_with_compression(&declaration, compression)
+            .map(|_| ())
+            .map_err(map_target_error)
+    }))
+}
 
 pub(super) fn destroy_all_render_targets(context: &mut ContextState) {
-    for (handle, record) in context.render_targets.drain() {
+    context.frame_render_target = None;
+    let records: Vec<_> = context.render_targets.drain().collect();
+    for (handle, record) in records {
         let _ = context
             .identity
             .remove(handle.into(), ResourceKind::RenderTarget);
-        context.render_target_bindings.push(record.binding);
+        release_heap_slot(context, record.id);
         let _ = destroy_native_texture(&mut context.native, record.native);
     }
-    context.render_target_bindings.clear();
-    context.next_render_target_binding = ez_gfx_runtime::binding::MAX_TEXTURE_HEAP_CAPACITY;
 }
 
-/// Leases one bindless slot from the top of the heap range.
+/// Returns one heap slot to the shared texture registry.
 ///
-/// Texture slots grow from zero, so render targets allocate downward to avoid
-/// collision until the heap-registration slice unifies both allocators.
-fn lease_render_target_binding(context: &mut ContextState) -> Result<u32, EzGfxResult> {
-    if let Some(binding) = context.render_target_bindings.pop() {
-        return Ok(binding);
-    }
-    if context.next_render_target_binding == 0 {
-        return Err(EzGfxResult::NativeFailure);
-    }
-    context.next_render_target_binding -= 1;
-    Ok(context.next_render_target_binding)
-}
-
-fn release_render_target_binding(context: &mut ContextState, binding: u32) {
-    context.render_target_bindings.push(binding);
+/// Slots stay in the `Allocated` state for the whole target lifetime, so
+/// `cancel_upload` releases them without emitting texture unload events.
+fn release_heap_slot(context: &mut ContextState, id: TextureId) {
+    let _ = context.texture_registry.cancel_upload(id);
 }
 
 fn map_target_error(error: TargetError) -> EzGfxResult {

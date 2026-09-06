@@ -1,12 +1,13 @@
 use super::{
-    AllocationCreateDesc, AllocationError, AllocationRequest, CompletionToken, DeferredResource,
-    ImageMip, MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
-    MTLCommandQueue, MTLDevice, MTLHeap, MTLOrigin, MTLPixelFormat, MTLSamplerAddressMode,
-    MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLSize, MTLStorageMode,
-    MTLTexture, MTLTextureDescriptor, MTLTextureUsage, MemoryAllocator, MemoryClass, NSRange,
-    NativeContext, NativeTexture, ProtocolObject, QueueKind, Retained, SamplerAddressMode,
-    SamplerFilter, TEXTURE_DESCRIPTOR_CAPACITY, TextureFormat, TextureRegion, TextureSamplerDesc,
-    ThreadBound, map_allocator, validate_texture_mips, validate_texture_region,
+    Allocation, AllocationCreateDesc, AllocationError, AllocationRequest, CompletionToken,
+    DeferredResource, ImageMip, MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandBufferStatus,
+    MTLCommandEncoder, MTLCommandQueue, MTLDevice, MTLHeap, MTLOrigin, MTLPixelFormat,
+    MTLSamplerAddressMode, MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
+    MTLSamplerState, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
+    MemoryAllocator, MemoryClass, NSRange, NativeContext, NativeTexture, ProtocolObject, QueueKind,
+    Retained, SamplerAddressMode, SamplerFilter, TEXTURE_DESCRIPTOR_CAPACITY, TextureFormat,
+    TextureRegion, TextureSamplerDesc, ThreadBound, map_allocator, validate_texture_mips,
+    validate_texture_region,
 };
 
 fn texture_format_metal(format: TextureFormat) -> MTLPixelFormat {
@@ -45,6 +46,25 @@ fn texture_view(
         )
     }
     .ok_or(AllocationError::NativeFailure)
+}
+
+/// Releases the published resolve-texture parts when multisampled setup fails.
+///
+/// The resolve storage, view, and sampler never published, so they drop
+/// immediately; the allocation frees through the context allocator.
+fn release_resolve_parts(
+    context: &mut NativeContext,
+    view: Retained<ProtocolObject<dyn MTLTexture>>,
+    storage: Retained<ProtocolObject<dyn MTLTexture>>,
+    sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
+    allocation: Allocation,
+) {
+    drop(view);
+    drop(storage);
+    drop(sampler);
+    if let Some(allocator) = context.allocator.as_mut() {
+        let _ = allocator.free(&allocation);
+    }
 }
 
 impl NativeContext {
@@ -251,10 +271,7 @@ impl NativeContext {
                 .as_ref()
                 .ok_or(AllocationError::NativeFailure)?
                 .submit_batch(jobs)
-                .map_err(|error| match error {
-                    ez_gfx_hal::TransferWorkerError::Full => AllocationError::OutOfMemory,
-                    ez_gfx_hal::TransferWorkerError::Failed => AllocationError::NativeFailure,
-                })?;
+                .map_err(ez_gfx_hal::TransferWorkerError::to_allocation_error)?;
             self.drain_complete = false;
             // Rejected admission owns no completion value.
             self.next_texture_value = next;
@@ -282,6 +299,7 @@ impl NativeContext {
                         mip_completions,
                         cancellation,
                         binding,
+                        msaa: None,
                     },
                     completions,
                 ))
@@ -301,22 +319,26 @@ impl NativeContext {
 
     /// Creates an uninitialized single-mip color texture for managed render-target use.
     ///
-    /// Storage carries render-target, shader-read, and pixel-format-view usage with
-    /// no initial contents; the first render pass transitions and clears it. The
-    /// returned texture reuses the texture record with inert transfer fields:
-    /// route it only through render-target entry points, never through upload,
-    /// publish, or region-update paths. The safe layer owns the true format.
+    /// The sampled texture carries render-target, shader-read, and
+    /// pixel-format-view usage with no initial contents; the first render pass
+    /// transitions and clears it. With `samples > 1` a second multisampled
+    /// texture renders the pass and resolves into the sampled texture, which
+    /// stays the only sampled, readback, and descriptor texture. The returned
+    /// texture reuses the texture record with inert transfer fields: route it
+    /// only through render-target entry points, never through upload, publish,
+    /// or region-update paths. The safe layer owns the true format.
     ///
     /// # Errors
     ///
-    /// Returns an error for zero dimensions, excessive aggregate bytes, an
-    /// unsupported (non-color) format, or native allocation failure.
+    /// Returns an error for zero dimensions, an unsupported sample count or
+    /// (non-color) format, excessive aggregate bytes, or native allocation failure.
     pub fn create_render_target(
         &mut self,
         format: ez_gfx_runtime::target::Format,
         width: u32,
         height: u32,
         binding: u32,
+        samples: u8,
     ) -> Result<NativeTexture, AllocationError> {
         use ez_gfx_runtime::target::Format;
         let (pixel_format, hal_format, bytes_per_texel) = match format {
@@ -325,16 +347,22 @@ impl NativeContext {
             Format::Rgba16Float => (MTLPixelFormat::RGBA16Float, TextureFormat::Rgba8Unorm, 8),
             _ => return Err(AllocationError::Unsupported),
         };
+        // 8-sample render targets stay out of scope on Metal hardware.
+        if !matches!(samples, 1 | 2 | 4) {
+            return Err(AllocationError::Unsupported);
+        }
         if width == 0 || height == 0 {
             return Err(AllocationError::ZeroSize);
         }
         if binding >= TEXTURE_DESCRIPTOR_CAPACITY {
             return Err(AllocationError::ZeroSize);
         }
-        // A render target holds exactly one mip; bound it by the texture budget.
+        // A render target holds exactly one mip; bound it by the texture budget,
+        // scaled by the sample count for multisampled storage.
         let bytes = u64::from(width)
             .checked_mul(u64::from(height))
             .and_then(|pixels| pixels.checked_mul(bytes_per_texel))
+            .and_then(|single| single.checked_mul(u64::from(samples)))
             .ok_or(AllocationError::NativeFailure)?;
         if bytes > u64::try_from(ez_gfx_runtime::texture::MAX_TEXTURE_BYTES).unwrap_or(u64::MAX) {
             return Err(AllocationError::OutOfMemory);
@@ -434,6 +462,71 @@ impl NativeContext {
                 return Err(AllocationError::NativeFailure);
             }
         };
+        // Single-sample targets render directly into the sampled texture; the
+        // multisampled texture below stays absent.
+        let msaa = if samples == 1 {
+            None
+        } else {
+            // SAFETY: validated dimensions and a single mip level are consumed during this send.
+            let msaa_desc = unsafe {
+                MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                    pixel_format,
+                    texture_width,
+                    texture_height,
+                    false,
+                )
+            };
+            msaa_desc.setTextureType(MTLTextureType::MTLTextureType2DMultisample);
+            // SAFETY: 2 and 4 are valid Metal sample counts, checked above.
+            unsafe { msaa_desc.setSampleCount(usize::from(samples)) };
+            // SAFETY: `msaa_desc` is live and the single mip count is consumed during this send.
+            unsafe { msaa_desc.setMipmapLevelCount(1) };
+            msaa_desc.setUsage(MTLTextureUsage::RenderTarget);
+            msaa_desc.setStorageMode(MTLStorageMode::Private);
+            let msaa_allocation = match self
+                .allocator
+                .as_mut()
+                .ok_or(AllocationError::NativeFailure)?
+                .allocate(&AllocationCreateDesc::texture(
+                    &self.device,
+                    "ez-gfx-render-target-msaa",
+                    &msaa_desc,
+                )) {
+                Ok(allocation) => allocation,
+                Err(error) => {
+                    release_resolve_parts(self, view, storage, sampler, allocation);
+                    return Err(map_allocator(error));
+                }
+            };
+            let Ok(msaa_offset) = usize::try_from(msaa_allocation.offset()) else {
+                self.allocator
+                    .as_mut()
+                    .ok_or(AllocationError::NativeFailure)?
+                    .free(&msaa_allocation)
+                    .map_err(map_allocator)?;
+                release_resolve_parts(self, view, storage, sampler, allocation);
+                return Err(AllocationError::NativeFailure);
+            };
+            // SAFETY: the allocation belongs to this heap and the checked offset describes it.
+            let Some(msaa_storage) = (unsafe {
+                msaa_allocation
+                    .heap()
+                    .newTextureWithDescriptor_offset(&msaa_desc, msaa_offset)
+            }) else {
+                self.allocator
+                    .as_mut()
+                    .ok_or(AllocationError::NativeFailure)?
+                    .free(&msaa_allocation)
+                    .map_err(map_allocator)?;
+                release_resolve_parts(self, view, storage, sampler, allocation);
+                return Err(AllocationError::OutOfMemory);
+            };
+            Some(super::MsaaStorage {
+                texture: ThreadBound::new(msaa_storage),
+                allocation: ThreadBound::new(msaa_allocation),
+                samples,
+            })
+        };
         Ok(NativeTexture {
             texture: ThreadBound::new(view),
             allocation: ThreadBound::new(allocation),
@@ -446,6 +539,7 @@ impl NativeContext {
             mip_completions: vec![0],
             cancellation: std::sync::Arc::new(super::transfer::TransferCancellation::new()),
             binding,
+            msaa,
         })
     }
 
@@ -543,10 +637,7 @@ impl NativeContext {
                     cancellation: texture.cancellation.clone(),
                     submission: submission.clone(),
                 })
-                .map_err(|error| match error {
-                    ez_gfx_hal::TransferWorkerError::Full => AllocationError::OutOfMemory,
-                    ez_gfx_hal::TransferWorkerError::Failed => AllocationError::NativeFailure,
-                })?;
+                .map_err(ez_gfx_hal::TransferWorkerError::to_allocation_error)?;
             self.drain_complete = false;
             self.next_texture_value = next;
             // Commit the producer before any subsequent graphics frame can wait on the copy.
@@ -729,12 +820,12 @@ impl NativeContext {
     ///
     /// Returns an error when worker submission or a committed command buffer failed.
     pub fn completed_texture_transfer_value(&self) -> Result<u64, AllocationError> {
-        if self
+        if let Some(error) = self
             .texture_worker
             .as_ref()
-            .is_some_and(ez_gfx_hal::TransferWorker::failed)
+            .and_then(ez_gfx_hal::TransferWorker::terminal_error)
         {
-            return Err(AllocationError::NativeFailure);
+            return Err(error.to_allocation_error());
         }
         let mut completed = self.completed_texture_value;
         for pending in &self.pending_texture_transfers {

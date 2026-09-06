@@ -267,22 +267,19 @@ impl BufferTransfer for NativeContext {
                     size,
                 },
             })
-            .map_err(|error| match error {
-                ez_gfx_hal::TransferWorkerError::Full => AllocationError::OutOfMemory,
-                ez_gfx_hal::TransferWorkerError::Failed => AllocationError::NativeFailure,
-            })?;
+            .map_err(ez_gfx_hal::TransferWorkerError::to_allocation_error)?;
         // Rejected work must not leave an unsignalable idle-wait target.
         self.next_transfer_fence = next;
         CompletionToken::new(QueueKind::Transfer, value).map_err(|_| AllocationError::NativeFailure)
     }
 
     fn completed_transfer_value(&self) -> Result<u64, AllocationError> {
-        if self
+        if let Some(error) = self
             .transfer_worker
             .as_ref()
-            .is_some_and(ez_gfx_hal::TransferWorker::failed)
+            .and_then(ez_gfx_hal::TransferWorker::terminal_error)
         {
-            return Err(AllocationError::NativeFailure);
+            return Err(error.to_allocation_error());
         }
         // SAFETY: the transfer fence is retained by this context.
         let value = unsafe { self.transfer_fence.GetCompletedValue() };

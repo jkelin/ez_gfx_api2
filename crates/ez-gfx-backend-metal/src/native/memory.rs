@@ -198,10 +198,7 @@ impl BufferTransfer for NativeContext {
                 bytes: size,
                 command: super::transfer::TransferCommand::new(command),
             })
-            .map_err(|error| match error {
-                ez_gfx_hal::TransferWorkerError::Full => AllocationError::OutOfMemory,
-                ez_gfx_hal::TransferWorkerError::Failed => AllocationError::NativeFailure,
-            })?;
+            .map_err(ez_gfx_hal::TransferWorkerError::to_allocation_error)?;
         self.drain_complete = false;
         // Rejected admission must not create an unsignaled queue highwater.
         self.next_transfer_value = next;
@@ -213,12 +210,12 @@ impl BufferTransfer for NativeContext {
     }
 
     fn completed_transfer_value(&self) -> Result<u64, AllocationError> {
-        if self
+        if let Some(error) = self
             .transfer_worker
             .as_ref()
-            .is_some_and(ez_gfx_hal::TransferWorker::failed)
+            .and_then(ez_gfx_hal::TransferWorker::terminal_error)
         {
-            return Err(AllocationError::NativeFailure);
+            return Err(error.to_allocation_error());
         }
         let mut completed = self.completed_transfer_value;
         for pending in &self.pending_transfers {

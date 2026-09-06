@@ -9,10 +9,10 @@ use super::{
     IndirectBufferHandle, LoadOp, MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext,
     NativePipeline, NativeShader, NativeSurface, NativeTexture, NodeDesc, PackedHandle, PassInfo,
     PipelineKey, QueueKind, RenderTargetHandle, RenderTargetRecord, ResourceAccess, ResourceDesc,
-    ResourceId, ResourceKind, ResourceLifetime, ResourceState, RuntimePhase, ShaderHandle,
-    ShaderRecord, ShaderStage, StoreOp, SURFACE_DEFAULT_CLEAR, TextureFormat, TextureHandle,
-    TextureId, execute_compiled_graph, map_frame, map_hal, map_lifecycle, native_layouts,
-    pipeline_layout_key, result_status, runtime_record, vulkan_bindings, with_context_mut,
+    ResourceId, ResourceKind, ResourceLifetime, ResourceState, RuntimePhase, SURFACE_DEFAULT_CLEAR,
+    ShaderHandle, ShaderRecord, ShaderStage, StoreOp, TextureFormat, TextureHandle, TextureId,
+    execute_compiled_graph, map_frame, map_hal, map_lifecycle, native_layouts, pipeline_layout_key,
+    result_status, runtime_record, vulkan_bindings, with_context_mut,
 };
 type NativeTextureMap = HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>;
 
@@ -28,6 +28,7 @@ pub fn frame_begin(context: ContextHandle) -> EzGfxResult {
         context.frame_native_resources.clear();
         context.frame_index = None;
         context.frame_surface = None;
+        context.frame_render_target = None;
         context.frame_depth = None;
         context.frame_has_graphics = false;
         context.last_readback.clear();
@@ -367,7 +368,7 @@ fn intern_render_target_resource(
         1,
         1,
         record.format,
-        1,
+        record.declaration.samples(),
         ResourceLifetime::External,
     )
     .map_err(|_| EzGfxResult::InvalidArgument)?;
@@ -391,33 +392,41 @@ fn graphics_node(
     pipeline_layout: ez_gfx_runtime::binding::PipelineLayout,
 ) -> Result<NodeDesc, EzGfxResult> {
     // A bound render target replaces the surface color attachment; depth
-    // pipelines stay surface-only.
-    let (color, depth, width, height) = match context.frame_render_target {
-        Some(target) => {
-            if pipeline_layout.depth_required() {
-                return Err(EzGfxResult::Unsupported);
-            }
-            let resource = intern_render_target_resource(context, target)?;
-            let record = context
-                .render_targets
-                .get(&target)
-                .ok_or(EzGfxResult::InvalidContext)?;
-            (resource, None, record.width, record.height)
+    // pipelines stay surface-only. Draws into multisampled targets stay
+    // unsupported until pipelines carry sample counts; clears resolve without
+    // any draw.
+    let (color, depth, width, height, samples) = if let Some(target) = context.frame_render_target {
+        if pipeline_layout.depth_required() {
+            return Err(EzGfxResult::Unsupported);
         }
-        None => {
-            let surface = intern_surface_resource(context)?;
-            let depth = if pipeline_layout.depth_required() {
-                Some(intern_depth_resource(context)?)
-            } else {
-                None
-            };
-            let (width, height) = context
-                .active_surface
-                .and_then(|surface| context.surfaces.get(&surface))
-                .and_then(|surface| surface.state.extent())
-                .ok_or(EzGfxResult::NotReady)?;
-            (surface, depth, width, height)
+        let resource = intern_render_target_resource(context, target)?;
+        let record = context
+            .render_targets
+            .get(&target)
+            .ok_or(EzGfxResult::InvalidContext)?;
+        if record.declaration.samples() != 1 {
+            return Err(EzGfxResult::Unsupported);
         }
+        (
+            resource,
+            None,
+            record.width,
+            record.height,
+            record.declaration.samples(),
+        )
+    } else {
+        let surface = intern_surface_resource(context)?;
+        let depth = if pipeline_layout.depth_required() {
+            Some(intern_depth_resource(context)?)
+        } else {
+            None
+        };
+        let (width, height) = context
+            .active_surface
+            .and_then(|surface| context.surfaces.get(&surface))
+            .and_then(|surface| surface.state.extent())
+            .ok_or(EzGfxResult::NotReady)?;
+        (surface, depth, width, height, 1)
     };
     let load = if context.frame_has_graphics {
         LoadOp::Load
@@ -428,7 +437,7 @@ fn graphics_node(
         vec![color],
         depth,
         [0, 0, width, height],
-        1,
+        samples,
         load,
         StoreOp::Store,
     )

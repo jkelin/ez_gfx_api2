@@ -1,15 +1,19 @@
 //! C ABI for the ez-gfx runtime.
 
+mod adapter;
 mod api;
 mod bounded_string;
 mod identity;
+mod render_target;
 mod texture;
 
+pub use adapter::*;
 pub use api::*;
 use bounded_string::{
     read_bounded_string, validate_bounded_string, validate_optional_bounded_string,
 };
 pub use identity::*;
+pub use render_target::*;
 pub use texture::*;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -19,9 +23,8 @@ use ez_gfx::{
     IndirectBufferHandle, PublicBinding, RenderTargetHandle, ResourceIdentity, ShaderHandle,
     StructuredBufferHandle, SurfaceHandle, SurfaceOptions, SurfacePlatform, TextureHandle,
 };
-
-/// Identifies C ABI revision 24 for compatibility checks.
-pub const EZ_GFX_ABI_VERSION: u32 = 24;
+/// Identifies C ABI revision 26 for compatibility checks.
+pub const EZ_GFX_ABI_VERSION: u32 = 26;
 /// Caps any caller-provided byte range at 16 MiB.
 pub const EZ_GFX_MAX_BOUNDARY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -61,6 +64,11 @@ pub unsafe extern "C" fn ez_gfx_context_create(
             desc.surface_platform,
         )
         .map(|options| options.with_texture_decode_workers(desc.texture_decode_workers)) else {
+            return EzGfxResult::InvalidArgument;
+        };
+        let Ok(options) =
+            adapter::apply_adapter_selection(options, desc.adapter_count, desc.adapter)
+        else {
             return EzGfxResult::InvalidArgument;
         };
         match ez_gfx::create_context(options) {
@@ -103,6 +111,11 @@ pub unsafe extern "C" fn ez_gfx_context_create_backend(
             backend,
         )
         .map(|options| options.with_texture_decode_workers(desc.texture_decode_workers)) else {
+            return EzGfxResult::InvalidArgument;
+        };
+        let Ok(options) =
+            adapter::apply_adapter_selection(options, desc.adapter_count, desc.adapter)
+        else {
             return EzGfxResult::InvalidArgument;
         };
         match ez_gfx::create_context(options) {

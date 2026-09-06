@@ -230,6 +230,24 @@ fn fail_texture_job(
     record_texture_failure(context, handle, error);
 }
 
+/// Synchronously cancels every queued decode, reusing destroy's drain loop.
+///
+/// Terminal loss calls this once so later polls observe `DeviceLost` through the
+/// health check instead of `NotReady`-until-each-transfer-fails. Recorded
+/// per-texture failures are kept: diagnostics survive until destruction.
+pub(super) fn cancel_all_pending_textures(context: &mut ContextState) {
+    for (_, pending) in context.pending_textures.drain() {
+        pending.cancelled.store(true, Ordering::Release);
+        let _ = context.texture_registry.cancel_upload(pending.id);
+    }
+}
+
+/// Marks terminal loss once and sweeps queued decodes for fast `DeviceLost` polls.
+pub(super) fn note_device_lost(context: &mut ContextState) {
+    let _ = context.identity.mark_lost();
+    cancel_all_pending_textures(context);
+}
+
 pub(super) fn pump_async_textures(context: &mut ContextState) -> Result<usize, EzGfxResult> {
     reclaim_retired_textures(context)?;
     let mut completed = 0;
@@ -291,7 +309,13 @@ pub(super) fn pump_async_textures(context: &mut ContextState) -> Result<usize, E
         let (native, completions) = match created {
             Ok(created) => created,
             Err(error) => {
-                fail_texture_job(context, job.handle, pending.id, map_allocation(error));
+                // Pump records per-job failures without returning, so a loss observed
+                // here must sweep directly or siblings would stay NotReady.
+                let mapped = map_allocation(error);
+                fail_texture_job(context, job.handle, pending.id, mapped);
+                if mapped == EzGfxResult::DeviceLost {
+                    note_device_lost(context);
+                }
                 completed += 1;
                 continue;
             }

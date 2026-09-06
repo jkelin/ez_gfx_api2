@@ -33,9 +33,8 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, D3D12_DEPTH_STENCIL_DESC, D3D12_DEPTH_STENCIL_VALUE,
     D3D12_DEPTH_STENCILOP_DESC, D3D12_DEPTH_WRITE_MASK_ALL, D3D12_DESCRIPTOR_HEAP_DESC,
     D3D12_DESCRIPTOR_HEAP_FLAG_NONE, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-    D3D12_DESCRIPTOR_HEAP_TYPE_DSV, D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-    D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, D3D12_DESCRIPTOR_RANGE,
+    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+    D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, D3D12_DESCRIPTOR_RANGE,
     D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,
     D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_FEATURE_DATA_SHADER_MODEL, D3D12_FEATURE_SHADER_MODEL,
     D3D12_FILL_MODE_SOLID, D3D12_FILTER_ANISOTROPIC, D3D12_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR,
@@ -239,6 +238,20 @@ pub struct NativePipeline {
     buffer_writable: Vec<bool>,
 }
 
+/// Multisampled render storage owned by a managed render target.
+///
+/// The single-sample `NativeTexture` resource stays the resolve destination,
+/// so barriers, readback, descriptors, and destruction keep working unchanged;
+/// only the render pass binds this storage and resolves into it at end of pass.
+pub struct MsaaStorage {
+    resource: ID3D12Resource,
+    allocation: Allocation,
+    rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
+    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    /// Render sample count; passes must request exactly this count.
+    samples: u8,
+}
+
 /// Texture resource and allocator ownership record.
 pub struct NativeTexture {
     resource: ID3D12Resource,
@@ -255,6 +268,10 @@ pub struct NativeTexture {
     /// Render-target view for managed color targets; `None` for uploads.
     /// The retaining heap keeps the CPU handle valid until destruction.
     pub rtv: Option<(ID3D12DescriptorHeap, D3D12_CPU_DESCRIPTOR_HANDLE)>,
+    /// Multisampled render storage plus its view and allocation; `None` for
+    /// uploads and single-sample targets. Only render-target entry points
+    /// touch this; the resource above stays the resolve destination.
+    msaa: Option<MsaaStorage>,
 }
 
 impl NativeTexture {

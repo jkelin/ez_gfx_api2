@@ -223,7 +223,8 @@ pub(super) fn start_worker(
                     // SAFETY: the closure retains this private fence until both queues drain.
                     let completed = unsafe { shutdown_fence.GetCompletedValue() };
                     if completed == u64::MAX {
-                        return Err(ez_gfx_hal::TransferWorkerError::Failed);
+                        // The device reports removal with the same sentinel as the idle waits.
+                        return Err(ez_gfx_hal::TransferWorkerError::DeviceLost);
                     }
                     if completed >= value {
                         break;

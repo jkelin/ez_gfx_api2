@@ -374,6 +374,28 @@ mod tests {
                 .expect("native shutdown must run after failed submission");
         }
     }
+    #[test]
+    fn device_loss_poison_reports_device_lost_not_generic_failure() {
+        let worker = TransferWorker::new_ordered_with_shutdown(
+            4,
+            StagingPolicy::new(1, 8, 1, 1).unwrap(),
+            |_| 1,
+            |_| 1,
+            |value: &u64| *value,
+            move |_| Err(TransferWorkerError::DeviceLost),
+            || Ok(()),
+        )
+        .unwrap();
+        worker.submit(1).unwrap();
+        assert_eq!(
+            worker.flush_through(1),
+            Err(TransferWorkerError::DeviceLost)
+        );
+        assert!(worker.device_lost());
+        assert!(worker.failed());
+        assert_eq!(worker.submit(2), Err(TransferWorkerError::DeviceLost));
+        assert_eq!(worker.flush(), Err(TransferWorkerError::DeviceLost));
+    }
 
     #[test]
     fn bundles_consume_job_credits_not_one_channel_slot() {

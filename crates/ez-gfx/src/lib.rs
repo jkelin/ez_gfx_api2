@@ -5,6 +5,7 @@ mod state;
 
 pub use api::*;
 pub use ez_gfx_artifact::Stage;
+pub use ez_gfx_core::capability::{AdapterClass, AdapterInfo, CapabilityError};
 pub use ez_gfx_core::handle::{
     ContextHandle, IndirectBufferHandle, RenderTargetHandle, ShaderHandle, StructuredBufferHandle,
     SurfaceHandle, TextureHandle,
@@ -16,12 +17,16 @@ pub use ez_gfx_hal::{
 };
 pub use ez_gfx_runtime::binding::{PublicBinding, ResourceIdentity};
 pub use ez_gfx_runtime::indirect::DrawIndexedCommand;
+pub use ez_gfx_runtime::target::{ClearValue, Format, TargetDeclaration, TargetError, TargetUsage};
 pub use ez_gfx_runtime::texture::{
     DecodedMip, DecodedTexture, TextureDecodeCallback, TextureDestination, TextureError,
     TextureSource, TextureUploadTelemetrySnapshot, register_texture_decoder,
     unregister_texture_decoder,
 };
-pub use ez_gfx_runtime::{ContextOptions, SurfaceOptions, SurfacePlatform};
+pub use ez_gfx_runtime::{
+    AdapterReport, AdapterSelection, ContextOptions, SurfaceOptions, SurfacePlatform,
+    admission_report,
+};
 pub use state::*;
 
 /// Submits the recorded frame and presents its active surface; a failed submission is never followed by presentation.

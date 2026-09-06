@@ -50,32 +50,45 @@ impl NativeContext {
                         &[],
                     );
                 }
-                NativeFrameResource::Texture(texture) | NativeFrameResource::RenderTarget(texture) => {
+                NativeFrameResource::Texture(texture)
+                | NativeFrameResource::RenderTarget(texture) => {
                     let ez_gfx_hal::ExecutionRange::Image(range) = barrier.range else {
                         return Err(HalError::InvalidArgument);
                     };
-                    let image = vk::ImageMemoryBarrier::default()
-                        .src_access_mask(src_access)
-                        .dst_access_mask(dst_access)
-                        .old_layout(old_layout)
-                        .new_layout(new_layout)
-                        .image(texture.image)
-                        .subresource_range(vk::ImageSubresourceRange {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            base_mip_level: range.first_mip,
-                            level_count: range.mip_count,
-                            base_array_layer: range.first_layer,
-                            layer_count: range.layer_count,
-                        });
-                    encoding.device.cmd_pipeline_barrier(
-                        encoding.command,
-                        src_stage,
-                        dst_stage,
-                        vk::DependencyFlags::empty(),
-                        &[],
-                        &[],
-                        core::slice::from_ref(&image),
-                    );
+                    // A multisampled target transitions its render storage
+                    // alongside the sampled resolve image so both stay in the
+                    // compiler-derived layouts; the MSAA image is never sampled.
+                    let mut images = [texture.image; 2];
+                    let image_count = if let Some(msaa) = texture.msaa.as_ref() {
+                        images[1] = msaa.image;
+                        2
+                    } else {
+                        1
+                    };
+                    for image in images.iter().take(image_count) {
+                        let barrier_image = vk::ImageMemoryBarrier::default()
+                            .src_access_mask(src_access)
+                            .dst_access_mask(dst_access)
+                            .old_layout(old_layout)
+                            .new_layout(new_layout)
+                            .image(*image)
+                            .subresource_range(vk::ImageSubresourceRange {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                base_mip_level: range.first_mip,
+                                level_count: range.mip_count,
+                                base_array_layer: range.first_layer,
+                                layer_count: range.layer_count,
+                            });
+                        encoding.device.cmd_pipeline_barrier(
+                            encoding.command,
+                            src_stage,
+                            dst_stage,
+                            vk::DependencyFlags::empty(),
+                            &[],
+                            &[],
+                            core::slice::from_ref(&barrier_image),
+                        );
+                    }
                 }
                 NativeFrameResource::Surface => {
                     let first_present = barrier
@@ -165,21 +178,42 @@ impl NativeContext {
         // render-target attachments belong to live context images, and the pass
         // was validated during preflight.
         unsafe {
-            if pass_active || pass.colors.len() != 1 || colors.len() != 1 || pass.samples != 1 {
+            if pass_active || pass.colors.len() != 1 || colors.len() != 1 {
+                return Err(HalError::InvalidArgument);
+            }
+            if !matches!(pass.samples, 1 | 2 | 4 | 8) {
                 return Err(HalError::InvalidArgument);
             }
             let attachment = colors.first().ok_or(HalError::InvalidArgument)?;
             // Textures, buffers, and depth images are never color attachments.
-            let (view, clear) = match attachment.resource {
-                super::NativeFrameResource::Surface => (
-                    self.swapchain_views[encoding.image_index as usize],
-                    attachment.clear,
-                ),
+            // A multisampled target renders into its MSAA storage and resolves
+            // into the sampled image; single-sample targets render directly.
+            let (view, resolve_view, clear) = match attachment.resource {
+                super::NativeFrameResource::Surface => {
+                    if pass.samples != 1 {
+                        return Err(HalError::InvalidArgument);
+                    }
+                    (
+                        self.swapchain_views[encoding.image_index as usize],
+                        None,
+                        attachment.clear,
+                    )
+                }
                 super::NativeFrameResource::RenderTarget(texture) => {
                     if pass.depth.is_some() {
                         return Err(HalError::InvalidArgument);
                     }
-                    (texture.view, attachment.clear)
+                    if let Some(msaa) = texture.msaa.as_ref() {
+                        if msaa.samples != pass.samples {
+                            return Err(HalError::InvalidArgument);
+                        }
+                        (msaa.view, Some(texture.view), attachment.clear)
+                    } else {
+                        if pass.samples != 1 {
+                            return Err(HalError::InvalidArgument);
+                        }
+                        (texture.view, None, attachment.clear)
+                    }
                 }
                 _ => return Err(HalError::InvalidArgument),
             };
@@ -199,7 +233,7 @@ impl NativeContext {
             {
                 return Err(HalError::InvalidArgument);
             }
-            let color = vk::RenderingAttachmentInfo::default()
+            let mut color = vk::RenderingAttachmentInfo::default()
                 .image_view(view)
                 .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .load_op(match pass.load {
@@ -214,6 +248,14 @@ impl NativeContext {
                 .clear_value(vk::ClearValue {
                     color: vk::ClearColorValue { float32: clear },
                 });
+            // A resolve view is present exactly when the attachment renders
+            // multisampled; the pass then averages into the sampled image.
+            if let Some(resolve) = resolve_view {
+                color = color
+                    .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+                    .resolve_image_view(resolve)
+                    .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+            }
             let depth = pass.depth.map(|_| {
                 let target = self.depth_target.as_ref().expect("preflighted depth");
                 vk::RenderingAttachmentInfo::default()
@@ -760,7 +802,7 @@ impl NativeContext {
                 worker
                     .ok_or(HalError::NotReady)?
                     .flush_through(required)
-                    .map_err(|_| HalError::NativeFailure)?;
+                    .map_err(ez_gfx_hal::TransferWorkerError::to_hal_error)?;
             }
         }
         // Reacquiring this image retires its previous presentation semaphore wait. A frame
@@ -958,6 +1000,20 @@ struct FramePlan {
     external_wait: Vec<CompletionToken>,
 }
 
+/// Requires exact sample-count agreement between a pass and its color target.
+///
+/// Surfaces stay single-sample; a multisampled pass needs a multisampled
+/// target rendering at exactly the pass count, and vice versa.
+fn samples_agree(resource: &NativeFrameResource<'_>, samples: u8) -> bool {
+    match resource {
+        NativeFrameResource::Surface => samples == 1,
+        NativeFrameResource::RenderTarget(texture) => {
+            texture.msaa.as_ref().map_or(1, |msaa| msaa.samples) == samples
+        }
+        _ => false,
+    }
+}
+
 fn validate_frame_plan(
     actions: &[NativeFrameAction<'_>],
     extent: (u32, u32),
@@ -974,9 +1030,9 @@ fn validate_frame_plan(
     // so only surface-attached passes, presents, and surface/depth barriers
     // require a surface.
     let uses_surface = actions.iter().any(|action| match action {
-        NativeFrameAction::BeginPass { colors, .. } => colors.iter().any(|attachment| {
-            matches!(attachment.resource, NativeFrameResource::Surface)
-        }),
+        NativeFrameAction::BeginPass { colors, .. } => colors
+            .iter()
+            .any(|attachment| matches!(attachment.resource, NativeFrameResource::Surface)),
         NativeFrameAction::Present => true,
         NativeFrameAction::Barrier {
             resource: NativeFrameResource::Surface | NativeFrameResource::Depth,
@@ -1033,12 +1089,15 @@ fn validate_frame_plan(
             NativeFrameAction::BeginPass { pass, colors } => {
                 // Textures, buffers, and depth images are never color
                 // attachments; depth with a render target stays unsupported.
+                // A multisampled pass needs a multisampled target and vice
+                // versa; surfaces stay single-sample.
                 let mut target_extent = None;
                 let mut valid = !pass_active
                     && pass.colors.len() == 1
                     && colors.len() == 1
-                    && pass.samples == 1;
+                    && matches!(pass.samples, 1 | 2 | 4 | 8);
                 if let Some(attachment) = colors.first() {
+                    valid &= samples_agree(&attachment.resource, pass.samples);
                     target_extent = match attachment.resource {
                         NativeFrameResource::Surface => Some(extent),
                         NativeFrameResource::RenderTarget(texture) => {

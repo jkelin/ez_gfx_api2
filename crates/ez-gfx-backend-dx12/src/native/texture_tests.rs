@@ -825,21 +825,22 @@ fn render_target_allocation_creates_sampled_color_resources() {
         (9_u32, Format::Rgba16Float, 32, 16),
     ] {
         let target = context
-            .create_render_target(format, width, height, binding)
+            .create_render_target(format, width, height, binding, 1)
             .unwrap();
         assert_eq!(target.binding, binding);
+        assert!(target.msaa.is_none());
         context.destroy_texture(target).unwrap();
     }
     // Depth usage and empty extents fail before native allocation.
     assert_eq!(
         context
-            .create_render_target(Format::Depth32Float, 64, 64, 0)
+            .create_render_target(Format::Depth32Float, 64, 64, 0, 1)
             .map(|_| ()),
         Err(AllocationError::Unsupported)
     );
     assert_eq!(
         context
-            .create_render_target(Format::Rgba8Unorm, 0, 64, 0)
+            .create_render_target(Format::Rgba8Unorm, 0, 64, 0, 1)
             .map(|_| ()),
         Err(AllocationError::ZeroSize)
     );
@@ -854,8 +855,8 @@ fn render_target_clear_applies_attachment_color_on_begin() {
     };
     use ez_gfx_runtime::target::Format;
     let mut context = NativeContext::create_default(false).unwrap();
-    let mut target = context
-        .create_render_target(Format::Rgba8Unorm, 64, 64, 11)
+    let target = context
+        .create_render_target(Format::Rgba8Unorm, 64, 64, 11, 1)
         .unwrap();
     assert!(target.rtv.is_some());
     let attach = ResourceState::new(
@@ -917,7 +918,10 @@ fn render_target_clear_applies_attachment_color_on_begin() {
         assert_eq!(pixel, [0, 255, 0, 255]);
     }
     // Depth pairings stay rejected.
-    let depth_pass = ExecutionPass { depth: Some(0), ..pass.clone() };
+    let depth_pass = ExecutionPass {
+        depth: Some(0),
+        ..pass.clone()
+    };
     let depth = NativeFrameAction::BeginPass {
         pass: &depth_pass,
         colors: vec![PassAttachment {
@@ -927,5 +931,114 @@ fn render_target_clear_applies_attachment_color_on_begin() {
     };
     assert!(context.execute_frame(None, &[depth], false).is_err());
     context.destroy_texture(target).unwrap();
+    context.wait_idle().unwrap();
+}
+
+#[test]
+fn render_target_msaa_clear_resolves_into_sampled_resource() {
+    use ez_gfx_hal::{
+        AttachmentLoadOp, AttachmentStoreOp, ExecutionBarrier, ExecutionPass, ExecutionRange,
+        ImageSubresources, QueueKind, ResourceAccess, ResourceState, ShaderStage,
+    };
+    use ez_gfx_runtime::target::Format;
+    let mut context = NativeContext::create_default(false).unwrap();
+    // The multisample count follows the probed ceiling so the test stays
+    // meaningful on adapters below 4-sample support; single-sample-only
+    // adapters skip the resolve path they cannot exercise.
+    let formats = context.probe_target_formats().unwrap();
+    let msaa_samples = [4_u8, 2].into_iter().find(|msaa_samples| {
+        ez_gfx_runtime::target::TargetDeclaration::new(
+            "msaa",
+            ez_gfx_runtime::target::TargetUsage::Color,
+            1.0,
+            *msaa_samples,
+            vec![Format::Rgba8Unorm],
+            ez_gfx_runtime::target::ClearValue::None,
+            true,
+        )
+        .is_ok_and(|declaration| formats.resolve(&declaration).is_ok())
+    });
+    let Some(msaa_samples) = msaa_samples else {
+        eprintln!("skipping MSAA resolve: adapter admits single-sample only");
+        return;
+    };
+    let target = context
+        .create_render_target(Format::Rgba8Unorm, 64, 64, 17, msaa_samples)
+        .unwrap();
+    assert!(target.msaa.is_some());
+    let attach = ResourceState::new(
+        QueueKind::Graphics,
+        ShaderStage::AllGraphics,
+        ResourceAccess::ColorAttachmentWrite,
+    )
+    .unwrap();
+    let sampled_state = ResourceState::new(
+        QueueKind::Graphics,
+        ShaderStage::Fragment,
+        ResourceAccess::SampledRead,
+    )
+    .unwrap();
+    let range = ExecutionRange::Image(ImageSubresources::new(0, 1, 0, 1).unwrap());
+    let pass = ExecutionPass {
+        nodes: vec![],
+        colors: vec![0],
+        depth: None,
+        area: [0, 0, 64, 64],
+        samples: msaa_samples,
+        load: AttachmentLoadOp::Clear,
+        store: AttachmentStoreOp::Store,
+    };
+    let actions = vec![
+        NativeFrameAction::Barrier {
+            barrier: ExecutionBarrier {
+                node: 0,
+                resource: 0,
+                range,
+                before: None,
+                after: attach,
+            },
+            resource: NativeFrameResource::RenderTarget(&target),
+        },
+        NativeFrameAction::BeginPass {
+            pass: &pass,
+            colors: vec![PassAttachment {
+                resource: NativeFrameResource::RenderTarget(&target),
+                clear: [0.0, 0.0, 1.0, 1.0],
+            }],
+        },
+        NativeFrameAction::EndPass,
+        NativeFrameAction::Barrier {
+            barrier: ExecutionBarrier {
+                node: 0,
+                resource: 0,
+                range,
+                before: Some(attach),
+                after: sampled_state,
+            },
+            resource: NativeFrameResource::RenderTarget(&target),
+        },
+    ];
+    context.execute_frame(None, &actions, false).unwrap();
+    // The pass clears multisampled storage; the end-of-pass resolve writes the
+    // exact clear color into the sampled resource that readback copies.
+    let bytes = context.readback_texture_rgba8(&target, 64, 64).unwrap();
+    assert_eq!(bytes.len(), 64 * 64 * 4);
+    for pixel in bytes.chunks_exact(4) {
+        assert_eq!(pixel, [0, 0, 255, 255]);
+    }
+    // A 4-sample pass against a single-sample target is rejected.
+    let single = context
+        .create_render_target(Format::Rgba8Unorm, 64, 64, 19, 1)
+        .unwrap();
+    let mismatch = NativeFrameAction::BeginPass {
+        pass: &pass,
+        colors: vec![PassAttachment {
+            resource: NativeFrameResource::RenderTarget(&single),
+            clear: [0.0, 0.0, 0.0, 1.0],
+        }],
+    };
+    assert!(context.execute_frame(None, &[mismatch], false).is_err());
+    context.destroy_texture(target).unwrap();
+    context.destroy_texture(single).unwrap();
     context.wait_idle().unwrap();
 }

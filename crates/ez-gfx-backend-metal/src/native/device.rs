@@ -2,10 +2,10 @@ use super::{
     AdapterCapabilities, AdapterClass, AdapterInfo, AllocationError, AllocationSizes, Allocator,
     AllocatorCreateDesc, BACKEND, CompressionSupport, DEFAULT_ALLOCATION_BLOCK_POLICY,
     DeferredNativeResource, DeferredResource, FRAMES_IN_FLIGHT, FrameSlot, FrameSlotTracker,
-    HalError, MTLArgumentBuffersTier, MTLCommandBuffer, MTLCommandBufferStatus,
+    HalError, MTLArgumentBuffersTier, MTLCommandBuffer, MTLCommandBufferStatus, MTLCopyAllDevices,
     MTLCreateSystemDefaultDevice, MTLDevice, MemoryAllocator, NativeContext, NativeSurface,
-    QueueKind, SemanticProfile, TEXTURE_DESCRIPTOR_CAPACITY, complete_deferred_slot,
-    map_allocation_hal, map_allocator, map_allocator_hal,
+    ProtocolObject, QueueKind, Retained, SemanticProfile, TEXTURE_DESCRIPTOR_CAPACITY,
+    complete_deferred_slot, map_allocation_hal, map_allocator, map_allocator_hal,
 };
 
 /// Architecture-guaranteed render-target roles per format.
@@ -14,20 +14,88 @@ use super::{
 /// roles follow the API guarantee rather than a device probe: RGBA8 and BGRA
 /// sRGB render and sample on every Metal device, RGBA16F renders and samples
 /// on Apple GPUs, and D32 float attaches depth everywhere. A device-specific
-/// restriction would surface as native allocation failure, never silent fallback.
-fn target_format_support() -> Vec<ez_gfx_runtime::target::FormatSupport> {
+fn target_format_support(max_color_samples: u8) -> Vec<ez_gfx_runtime::target::FormatSupport> {
     use ez_gfx_core::capability::CompressionSupport;
     use ez_gfx_runtime::target::{Format, FormatSupport};
-    let entry = |format, color, sampled, storage| {
-        FormatSupport::new(format, color, sampled, storage, 1, CompressionSupport::NONE)
-            .expect("single-sample support is always valid")
+    let color = |format, storage| {
+        FormatSupport::new(
+            format,
+            true,
+            true,
+            storage,
+            max_color_samples,
+            CompressionSupport::NONE,
+        )
+        .expect("probed sample counts are always valid")
+    };
+    let single = |format, color_role, sampled, storage| {
+        FormatSupport::new(
+            format,
+            color_role,
+            sampled,
+            storage,
+            1,
+            CompressionSupport::NONE,
+        )
+        .expect("single-sample support is always valid")
     };
     vec![
-        entry(Format::Rgba8Unorm, true, true, true),
-        entry(Format::Bgra8Srgb, true, true, false),
-        entry(Format::Rgba16Float, true, true, true),
-        entry(Format::Depth32Float, false, true, false),
+        color(Format::Rgba8Unorm, true),
+        color(Format::Rgba16Float, true),
+        single(Format::Depth32Float, false, true, false),
     ]
+}
+
+/// Describes one Metal device for identity and capabilities without creating queues.
+///
+/// The stable identity derives from the registry ID and maximum buffer length,
+/// matching context creation so explicit selection resolves to the same bytes.
+///
+/// # Errors
+///
+/// Returns an error if adapter metadata construction fails.
+fn describe_device(device: &ProtocolObject<dyn MTLDevice>) -> Result<AdapterInfo, HalError> {
+    let tier_two = device.argumentBuffersSupport() == MTLArgumentBuffersTier::Tier2;
+    let sampler_capacity =
+        u32::try_from(device.maxArgumentBufferSamplerCount()).unwrap_or(u32::MAX);
+    // BC and ASTC are independent: Apple GPUs can support both families.
+    let mut compression = CompressionSupport::NONE;
+    if device.supportsBCTextureCompression() {
+        compression = compression.union(CompressionSupport::BC);
+    }
+    if device.supportsFamily(objc2_metal::MTLGPUFamily::Apple2) {
+        compression = compression.union(CompressionSupport::ASTC);
+    }
+    let capabilities = AdapterCapabilities {
+        bindless_sampled_textures: if tier_two {
+            TEXTURE_DESCRIPTOR_CAPACITY.min(sampler_capacity)
+        } else {
+            0
+        },
+        bindless_storage_resources: if tier_two { 1024 } else { 0 },
+        bindless_samplers: sampler_capacity,
+        max_indirect_draw_count: u32::MAX,
+        shader_model: 0x0605,
+        timeline_synchronization: true,
+        resource_aliasing: true,
+        dynamic_rendering: true,
+        presentation: true,
+        compression,
+    };
+    let registry = device.registryID();
+    let mut stable_id = [0_u8; 16];
+    stable_id[..8].copy_from_slice(&registry.to_le_bytes());
+    stable_id[8..].copy_from_slice(&device.maxBufferLength().to_le_bytes());
+    let name = device.name().to_string();
+    AdapterInfo::new(
+        BACKEND,
+        stable_id,
+        name,
+        format!("registry-{registry:016x}"),
+        AdapterClass::Integrated,
+        capabilities,
+    )
+    .map_err(|_| HalError::Unsupported)
 }
 
 impl NativeContext {
@@ -38,55 +106,78 @@ impl NativeContext {
     /// Returns an error if no default Metal device or command queue is available, the adapter does not satisfy the semantic profile, adapter metadata is invalid, or allocator creation fails.
     pub fn create_default() -> Result<Self, HalError> {
         let device = MTLCreateSystemDefaultDevice().ok_or(HalError::Unsupported)?;
+        let adapter = describe_device(&device)?;
+        SemanticProfile::V1
+            .admit(adapter.capabilities())
+            .map_err(|_| HalError::Unsupported)?;
+        Self::initialize(device, adapter)
+    }
+
+    /// Enumerates every describable Metal device, admitted or not.
+    ///
+    /// Rejected adapters stay listed so rejection diagnostics can name them;
+    /// an empty array is a valid empty enumeration, not a failure. Metal
+    /// leaves the power/device decision to the caller, so enumeration never
+    /// switches devices the way the system default can.
+    ///
+    /// # Errors
+    ///
+    /// This query cannot fail today; the `Result` keeps the shared dispatch
+    /// uniform across backends.
+    pub fn enumerate_adapters() -> Result<Vec<AdapterInfo>, HalError> {
+        let mut adapters = Vec::new();
+        for device in MTLCopyAllDevices().to_vec() {
+            // One undescribable device skips itself, never the enumeration.
+            if let Ok(adapter) = describe_device(&device) {
+                adapters.push(adapter);
+            }
+        }
+        Ok(adapters)
+    }
+
+    /// Creates a context for one explicitly selected adapter.
+    ///
+    /// Ranking is bypassed but admission never is: an unknown identity fails
+    /// `InvalidArgument` and a matched but inadmissible adapter fails
+    /// `Unsupported`. Metal exposes no software adapters (every enumerated
+    /// device is hardware), so no software policy applies here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no enumerated adapter matches the requested
+    /// identity, the adapter fails the semantic profile, adapter metadata is
+    /// invalid, or native context initialization fails.
+    pub fn create_for_adapter(stable_id: [u8; 16]) -> Result<Self, HalError> {
+        for device in MTLCopyAllDevices().to_vec() {
+            // One undescribable device skips itself, never the selection.
+            let Ok(adapter) = describe_device(&device) else {
+                continue;
+            };
+            if adapter.stable_id() != stable_id {
+                continue;
+            }
+            // Explicit selection bypasses ranking but never bypasses admission.
+            SemanticProfile::V1
+                .admit(adapter.capabilities())
+                .map_err(|_| HalError::Unsupported)?;
+            return Self::initialize(device, adapter);
+        }
+        Err(HalError::InvalidArgument)
+    }
+    /// Initializes device-owned queues, allocator, and workers for an admitted adapter.
+    ///
+    /// Shared by default construction and explicit adapter selection so both
+    /// entry points build the identical context.
+    ///
+    fn initialize(
+        device: Retained<ProtocolObject<dyn MTLDevice>>,
+        adapter: AdapterInfo,
+    ) -> Result<Self, HalError> {
         let queue = device.newCommandQueue().ok_or(HalError::NativeFailure)?;
         let transfer_queue = device.newCommandQueue().ok_or(HalError::NativeFailure)?;
         let texture_queue = device.newCommandQueue().ok_or(HalError::NativeFailure)?;
         let texture_graphics_event = device.newEvent().ok_or(HalError::NativeFailure)?;
         let texture_completion_event = device.newEvent().ok_or(HalError::NativeFailure)?;
-        let tier_two = device.argumentBuffersSupport() == MTLArgumentBuffersTier::Tier2;
-        let sampler_capacity =
-            u32::try_from(device.maxArgumentBufferSamplerCount()).unwrap_or(u32::MAX);
-        // BC and ASTC are independent: Apple GPUs can support both families.
-        let mut compression = CompressionSupport::NONE;
-        if device.supportsBCTextureCompression() {
-            compression = compression.union(CompressionSupport::BC);
-        }
-        if device.supportsFamily(objc2_metal::MTLGPUFamily::Apple2) {
-            compression = compression.union(CompressionSupport::ASTC);
-        }
-        let capabilities = AdapterCapabilities {
-            bindless_sampled_textures: if tier_two {
-                TEXTURE_DESCRIPTOR_CAPACITY.min(sampler_capacity)
-            } else {
-                0
-            },
-            bindless_storage_resources: if tier_two { 1024 } else { 0 },
-            bindless_samplers: sampler_capacity,
-            max_indirect_draw_count: u32::MAX,
-            shader_model: 0x0605,
-            timeline_synchronization: true,
-            resource_aliasing: true,
-            dynamic_rendering: true,
-            presentation: true,
-            compression,
-        };
-        SemanticProfile::V1
-            .admit(&capabilities)
-            .map_err(|_| HalError::Unsupported)?;
-        let registry = device.registryID();
-        let mut stable_id = [0_u8; 16];
-        stable_id[..8].copy_from_slice(&registry.to_le_bytes());
-        stable_id[8..].copy_from_slice(&device.maxBufferLength().to_le_bytes());
-        let name = device.name().to_string();
-        let adapter = AdapterInfo::new(
-            BACKEND,
-            stable_id,
-            name,
-            format!("registry-{registry:016x}"),
-            AdapterClass::Integrated,
-            capabilities,
-        )
-        .map_err(|_| HalError::Unsupported)?;
         let allocator = Allocator::new(&AllocatorCreateDesc {
             device: device.clone(),
             debug_settings: gpu_allocator::AllocatorDebugSettings::default(),
@@ -149,12 +240,22 @@ impl NativeContext {
     /// Metal reports no per-format renderability query beyond family checks, so
     /// this returns the architecture-guaranteed table: RGBA8/BGRA-sRGB color
     /// render plus sampling on every device, RGBA16F color render plus sampling
-    /// on Apple GPUs, and D32 float depth attachment everywhere. Multisample
-    /// counts stay single-sample; resolve targets select separately.
+    /// on Apple GPUs, and D32 float depth attachment everywhere. The color
+    /// multisample ceiling follows the device-wide sample-count query and is
+    /// eye-reviewed only until a Mac run confirms it.
     pub fn probe_target_formats(
         &self,
     ) -> Result<ez_gfx_runtime::target::FormatCapabilities, AllocationError> {
-        ez_gfx_runtime::target::FormatCapabilities::new(target_format_support())
+        // Device-wide support gates every color format equally; 8-sample
+        // render targets stay out of scope on Metal hardware.
+        let ceiling = if self.device.supportsTextureSampleCount(4) {
+            4
+        } else if self.device.supportsTextureSampleCount(2) {
+            2
+        } else {
+            1
+        };
+        ez_gfx_runtime::target::FormatCapabilities::new(target_format_support(ceiling))
             .map_err(|_| AllocationError::NativeFailure)
     }
 
@@ -177,14 +278,10 @@ impl NativeContext {
     /// Returns an error if submitted work fails or reclaiming a deferred allocation fails.
     pub fn wait_idle(&mut self) -> Result<(), HalError> {
         self.drain_complete = false;
-        let transfer_failed = self
-            .transfer_worker
-            .as_ref()
-            .is_none_or(|worker| worker.flush().is_err());
-        let texture_failed = self
-            .texture_worker
-            .as_ref()
-            .is_none_or(|worker| worker.flush().is_err());
+        let transfer_flush = self.transfer_worker.as_ref().map(|worker| worker.flush());
+        let transfer_failed = transfer_flush.as_ref().is_none_or(|result| result.is_err());
+        let texture_flush = self.texture_worker.as_ref().map(|worker| worker.flush());
+        let texture_failed = texture_flush.as_ref().is_none_or(|result| result.is_err());
         // Failed flush can precede worker shutdown; join its actual-command drain before reclaiming.
         if transfer_failed && let Some(worker) = self.transfer_worker.as_mut() {
             worker.shutdown();
@@ -239,7 +336,24 @@ impl NativeContext {
         failed |= !self.drain_complete;
         if failed {
             // Drained failures permit destruction, not publication of texture readiness.
-            return Err(HalError::NativeFailure);
+            // A loss-poisoned worker names device loss instead of a generic failure.
+            let lost = transfer_flush.is_some_and(|result| {
+                matches!(result, Err(ez_gfx_hal::TransferWorkerError::DeviceLost))
+            }) || texture_flush.is_some_and(|result| {
+                matches!(result, Err(ez_gfx_hal::TransferWorkerError::DeviceLost))
+            }) || self
+                .transfer_worker
+                .as_ref()
+                .is_some_and(|worker| worker.device_lost())
+                || self
+                    .texture_worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.device_lost());
+            return Err(if lost {
+                HalError::DeviceLost
+            } else {
+                HalError::NativeFailure
+            });
         }
         self.completed_transfer_value = self.next_transfer_value.saturating_sub(1);
         self.reclaim(QueueKind::Transfer, self.completed_transfer_value)
@@ -350,6 +464,15 @@ impl NativeContext {
                     .map_err(map_allocator)
             }
             DeferredResource::Texture(texture) => {
+                // The MSAA render storage retires with the sampled texture.
+                if let Some(msaa) = texture.msaa {
+                    drop(msaa.texture);
+                    self.allocator
+                        .as_mut()
+                        .ok_or(AllocationError::NativeFailure)?
+                        .free(&msaa.allocation)
+                        .map_err(map_allocator)?;
+                }
                 drop(texture.texture);
                 drop(texture.sampler);
                 self.allocator
@@ -385,7 +508,7 @@ mod target_tests {
 
     #[test]
     fn static_table_covers_probed_families_once() {
-        let supports = target_format_support();
+        let supports = target_format_support(4);
         let formats: Vec<Format> = supports.iter().map(|support| support.format).collect();
         assert_eq!(
             formats,
@@ -402,6 +525,18 @@ mod target_tests {
                 true,
                 true,
                 true,
+                4,
+                ez_gfx_core::capability::CompressionSupport::NONE
+            )
+            .is_ok_and(|expected| supports.contains(&expected))
+        );
+        // Depth stays single-sample while color formats share the ceiling.
+        assert!(
+            FormatSupport::new(
+                Format::Depth32Float,
+                false,
+                true,
+                false,
                 1,
                 ez_gfx_core::capability::CompressionSupport::NONE
             )

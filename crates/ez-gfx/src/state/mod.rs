@@ -18,6 +18,7 @@ use ez_gfx_backend_vulkan::{
 };
 use ez_gfx_core::{
     Backend,
+    capability::AdapterInfo,
     handle::{
         ContextHandle, GenerationalArena, HandleParts, IndirectBufferHandle, LocalHandle,
         PackedHandle, RenderTargetHandle, ShaderHandle, StructuredBufferHandle, SurfaceHandle,
@@ -27,13 +28,14 @@ use ez_gfx_core::{
 use ez_gfx_hal::{
     AllocationRequest, BufferRange, BufferTransfer, CompletionToken, DEFAULT_STAGING_POLICY,
     DynamicPipelineState, ExecutionAction, FrameExecutionBackend, FrameExecutionPlan, HalError,
-    ImageMip, MemoryAllocator, MemoryClass, QueueKind, ResourceAccess, ResourceState, ShaderStage,
-    TextureFormat, TextureRegion, staging_bucket_size, SURFACE_DEFAULT_CLEAR,
+    ImageMip, MemoryAllocator, MemoryClass, QueueKind, ResourceAccess, ResourceState,
+    SURFACE_DEFAULT_CLEAR, ShaderStage, TextureFormat, TextureRegion, staging_bucket_size,
 };
 use ez_gfx_runtime::render::{ExecutionError, execute_compiled_graph};
 use ez_gfx_runtime::{
-    ContextIdentity, ContextOptions, LifecycleError, ResourceKind, SurfaceOptions, SurfacePlatform,
-    SurfaceState,
+    AdapterCatalog, AdapterReport, AdapterSelection, ContextIdentity, ContextOptions,
+    LifecycleError, ResourceKind, RuntimeError, SurfaceOptions, SurfacePlatform, SurfaceState,
+    admission_report,
     frame::{ExecutableNode, FrameRecorder},
     geometry::{GeometryError, GeometryManager},
     graph::{
@@ -251,8 +253,6 @@ struct ContextState {
     indirects: HashMap<IndirectBufferHandle, IndexedIndirectBuffer>,
     textures: HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>,
     render_targets: HashMap<RenderTargetHandle, render_target::RenderTargetRecord>,
-    render_target_bindings: Vec<u32>,
-    next_render_target_binding: u32,
     texture_formats: HashMap<TextureHandle, TextureFormat>,
     texture_published_mips: HashMap<TextureHandle, u32>,
     texture_residency_targets: HashMap<TextureHandle, u32>,
@@ -320,6 +320,7 @@ impl ThreadContexts {
         {
             for (_, state) in self.states.drain() {
                 // Windows TLS destructors run under loader lock; native cleanup or joining can deadlock.
+                // Loader-lock callers must use this abandon path only, never destroy/wait_idle.
                 std::mem::forget(state);
             }
             result
@@ -413,7 +414,13 @@ fn with_context_mut<T>(
             .states
             .get_mut(&local)
             .ok_or(EzGfxResult::InvalidContext)?;
-        operation(context)
+        let result = operation(context);
+        if matches!(&result, Err(EzGfxResult::DeviceLost)) {
+            // Terminal-loss sweep: the first DeviceLost synchronously cancels queued
+            // decodes so later polls return DeviceLost fast instead of NotReady.
+            texture::note_device_lost(context);
+        }
+        result
     })
 }
 fn context_local(handle: ContextHandle) -> Result<(LocalHandle, PackedHandle), EzGfxResult> {

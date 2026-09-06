@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<ez-gfx-bindings version="1" abi-version="24" library="ez_gfx_ffi">
+<ez-gfx-bindings version="1" abi-version="26" library="ez_gfx_ffi">
   <description>Public EzGfx C ABI. This file is manually maintained; generated headers and managed bindings are derived from it.</description>
   <handles>
     <handle name="EzGfxContext" doc="Opaque packed u64 context handle (slot+1/generation in bits 0-39)." />
@@ -42,6 +42,12 @@
       <value name="EzGfxBackend_Vulkan" value="1" doc="Vulkan 1.3 backend." />
       <value name="EzGfxBackend_Dx12" value="2" doc="Direct3D 12 backend." />
       <value name="EzGfxBackend_Metal" value="3" doc="Metal backend." />
+    </enum>
+    <enum name="EzGfxAdapterClass" underlying="uint8_t" doc="Stable adapter classification.">
+      <value name="EzGfxAdapterClass_Software" value="0" doc="Software renderer." />
+      <value name="EzGfxAdapterClass_Other" value="1" doc="Adapter with no stronger classification." />
+      <value name="EzGfxAdapterClass_Integrated" value="2" doc="Integrated GPU." />
+      <value name="EzGfxAdapterClass_Discrete" value="3" doc="Discrete GPU." />
     </enum>
     <enum name="EzGfxRuntimePhase" underlying="uint8_t" doc="Runtime operation phase.">
       <value name="EzGfxRuntimePhase_Admission" value="1" doc="Adapter or device admission." />
@@ -96,6 +102,20 @@
       <value name="EzGfxTextureDestinationFormat_Astc4x4Unorm" value="9" doc="Linear ASTC 4x4." />
       <value name="EzGfxTextureDestinationFormat_Astc4x4Srgb" value="10" doc="sRGB ASTC 4x4." />
     </enum>
+    <enum name="EzGfxRenderTargetFormat" underlying="uint8_t" doc="Render-target storage format; discriminants mirror the runtime format codes.">
+      <value name="EzGfxRenderTargetFormat_Rgba8Unorm" value="1" doc="Four-channel 8-bit normalized RGBA." />
+      <value name="EzGfxRenderTargetFormat_Bgra8Srgb" value="2" doc="Four-channel 8-bit sRGB BGRA." />
+      <value name="EzGfxRenderTargetFormat_Rgba16Float" value="3" doc="Four-channel 16-bit floating-point RGBA." />
+      <value name="EzGfxRenderTargetFormat_Depth32Float" value="4" doc="32-bit floating-point depth." />
+      <value name="EzGfxRenderTargetFormat_Bc7Unorm" value="5" doc="BC7-compressed 8-bit normalized RGBA." />
+      <value name="EzGfxRenderTargetFormat_Astc4x4Unorm" value="6" doc="ASTC-compressed 4x4 texel 8-bit normalized RGBA." />
+    </enum>
+    <enum name="EzGfxRenderTargetUsage" underlying="uint8_t" doc="Render-target access mode.">
+      <value name="EzGfxRenderTargetUsage_Color" value="0" doc="Color-rendering output." />
+      <value name="EzGfxRenderTargetUsage_Depth" value="1" doc="Depth-rendering output; creation stays unsupported." />
+      <value name="EzGfxRenderTargetUsage_Storage" value="2" doc="Storage access; creation stays unsupported." />
+      <value name="EzGfxRenderTargetUsage_Sampled" value="3" doc="Texture sampling; creation stays unsupported." />
+    </enum>
     <enum name="EzGfxCullMode" underlying="uint8_t" doc="Pipeline cull mode.">
       <value name="EzGfxCullMode_None" value="0" doc="No face culling." />
       <value name="EzGfxCullMode_Front" value="1" doc="Cull front-facing primitives." />
@@ -119,11 +139,25 @@
     </enum>
   </enums>
   <structs>
+    <struct name="EzGfxAdapterDesc" doc="Explicit adapter request selected by stable identity. Requires ABI 26.">
+      <field name="stable_id" type="uint8_t" array-length="16" doc="Stable 128-bit adapter identity from enumeration." />
+      <field name="allow_software" type="uint8_t" doc="Non-zero accepts a software-class adapter; zero or one." />
+    </struct>
+    <struct name="EzGfxAdapterInfo" doc="Enumerated adapter identity with admission diagnostics. Requires ABI 26.">
+      <field name="stable_id" type="uint8_t" array-length="16" doc="Stable 128-bit adapter identity from enumeration." />
+      <field name="backend" type="EzGfxBackend" doc="Value from EzGfxBackend." />
+      <field name="adapter_class" type="EzGfxAdapterClass" doc="Value from EzGfxAdapterClass." />
+      <field name="admitted" type="uint8_t" doc="Non-zero when the adapter passes admission under the queried policy." />
+      <field name="software_rejected" type="uint8_t" doc="Non-zero when software policy alone rejects the adapter." />
+      <field name="error_count" type="uint32_t" doc="Count of unmet profile requirements; zero when admitted." />
+    </struct>
     <struct name="EzGfxContextDesc" doc="Context creation options.">
       <field name="enable_debug" type="uint8_t" doc="Non-zero enables debug utilities." />
       <field name="enable_validation" type="uint8_t" doc="Non-zero enables validation layers." />
       <field name="surface_platform" type="EzGfxSurfacePlatform" doc="Value from EzGfxSurfacePlatform." />
       <field name="texture_decode_workers" type="uint32_t" doc="Async texture decode threads; zero selects the default topology." />
+      <field name="adapter_count" type="uint32_t" doc="Explicit adapter requests; zero keeps default ranking, one selects by identity. Requires ABI 26." />
+      <field name="adapter" type="const EzGfxAdapterDesc *" nullable="true" doc="Exactly adapter_count explicit requests; null if and only if zero. Requires ABI 26." />
     </struct>
     <struct name="EzGfxBackendContextDesc" doc="Backend-selecting context creation options.">
       <field name="enable_debug" type="uint8_t" doc="Non-zero enables debug utilities." />
@@ -131,6 +165,8 @@
       <field name="surface_platform" type="EzGfxSurfacePlatform" doc="Value from EzGfxSurfacePlatform." />
       <field name="backend" type="EzGfxBackend" doc="Value from EzGfxBackend." />
       <field name="texture_decode_workers" type="uint32_t" doc="Async texture decode threads; zero selects the default topology." />
+      <field name="adapter_count" type="uint32_t" doc="Explicit adapter requests; zero keeps default ranking, one selects by identity. Requires ABI 26." />
+      <field name="adapter" type="const EzGfxAdapterDesc *" nullable="true" doc="Exactly adapter_count explicit requests; null if and only if zero. Requires ABI 26." />
     </struct>
     <struct name="EzGfxSurfaceDesc" doc="Caller-owned native window or Metal layer used to create a presentation surface.">
       <field name="window" type="void *" nullable="false" doc="Native HWND or CAMetalLayer pointer." />
@@ -186,6 +222,18 @@
       <field name="height" type="uint32_t" validation="greater-than-zero" doc="Region height." />
       <field name="data" type="const uint8_t *" nullable="false" doc="Tightly packed texel or compressed-block bytes; retained only for the call." />
       <field name="data_size" type="size_t" validation="greater-than-zero-at-most-boundary-limit" doc="Input byte count." />
+    </struct>
+    <struct name="EzGfxRenderTargetDesc" doc="Render-target name, usage, format candidates, and clear value.">
+      <field name="name" type="const uint8_t *" nullable="false" doc="Exactly name_length UTF-8 bytes, 1..=255 bytes; no NUL terminator is required." />
+      <field name="name_length" type="size_t" validation="greater-than-zero-at-most-boundary-limit" doc="Target-name byte length." />
+      <field name="usage" type="EzGfxRenderTargetUsage" doc="Value from EzGfxRenderTargetUsage." />
+      <field name="relative_scale" type="float" doc="Scale factor relative to the reference dimensions; finite and positive." />
+      <field name="samples" type="uint8_t" doc="Requested multisample count; one of 1, 2, 4, or 8." />
+      <field name="candidate_formats" type="const uint8_t *" nullable="false" doc="Exactly candidate_count format codes from EzGfxRenderTargetFormat." />
+      <field name="candidate_count" type="uint32_t" validation="greater-than-zero" doc="Candidate format count, 1..=16." />
+      <field name="sampleable" type="uint8_t" doc="Non-zero requires texture-sampling support; zero or one." />
+      <field name="use_clear" type="uint8_t" doc="Non-zero stores clear_color; zero or one." />
+      <field name="clear_color" type="float" array-length="4" doc="Color clear value read only when use_clear is non-zero." />
     </struct>
     <struct name="EzGfxTextureUploadTelemetry" doc="Monotonic context-wide asynchronous texture pipeline counters.">
       <field name="decode_microseconds" type="uint64_t" doc="Aggregate CPU decode/transcode/mip-generation time." />
@@ -252,6 +300,16 @@
       <param name="desc" type="const EzGfxBackendContextDesc *" nullable="false" direction="in" doc="Backend context options." />
       <param name="out_context" type="EzGfxContext *" direction="out" doc="Receives the opaque context handle." />
       <returns doc="Returns EzGfxResult_Ok or a validation, admission, or native error." />
+    </function>
+    <function name="ez_gfx_adapter_count" return="EzGfxResult" doc="Counts enumerated adapters without creating anything. Requires ABI 26.">
+      <param name="out_count" type="uint32_t *" direction="out" doc="Receives the number of enumerated adapters." />
+      <returns doc="Returns EzGfxResult_Ok or EzGfxResult_InvalidArgument." />
+    </function>
+    <function name="ez_gfx_adapters_query" return="EzGfxResult" doc="Enumerates adapters with admission diagnostics without creating anything. Requires ABI 26.">
+      <param name="allow_software" type="uint8_t" doc="Non-zero admits software-class adapters in the diagnosis; zero or one." />
+      <param name="out_adapters" type="EzGfxAdapterInfo *" direction="out" array-length="capacity" doc="Receives at most capacity entries; null if and only if capacity is zero." />
+      <param name="capacity" type="uint32_t" doc="Writable entry count of out_adapters; zero queries the total with a null buffer." />
+      <param name="out_written" type="uint32_t *" direction="out" doc="Receives entries written, or the total when capacity is zero." />
     </function>
     <function name="ez_gfx_context_wait_idle" return="EzGfxResult" context="last" doc="Waits for all context GPU work to become idle without destroying resources.">
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
@@ -354,6 +412,50 @@
       <param name="texture" type="EzGfxTexture" nullable="false" doc="Texture handle." />
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
       <returns doc="No return value; null or stale handles are ignored." />
+    </function>
+    <function name="ez_gfx_render_target_create" return="EzGfxResult" context="last" doc="Creates a managed render target from a declaration and explicit extents.">
+      <param name="desc" type="const EzGfxRenderTargetDesc *" nullable="false" direction="in" doc="Target name, usage, candidates, and clear value." />
+      <param name="width" type="uint32_t" validation="greater-than-zero" doc="Target width in pixels." />
+      <param name="height" type="uint32_t" validation="greater-than-zero" doc="Target height in pixels." />
+      <param name="out_target" type="EzGfxRenderTarget *" direction="out" doc="Receives the opaque render-target handle." />
+      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
+      <returns doc="Returns Ok, Unsupported for depth/storage/multisample, or validation/native status." />
+    </function>
+    <function name="ez_gfx_render_target_destroy" return="void" context="last" doc="Destroys a render target and clears any bound override.">
+      <param name="target" type="EzGfxRenderTarget" doc="Render target to destroy." />
+      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
+      <returns doc="No return value; null or stale handles are ignored." />
+    </function>
+    <function name="ez_gfx_render_target_get_format" return="EzGfxResult" context="last" doc="Reports the resolved storage format code of a live render target.">
+      <param name="target" type="EzGfxRenderTarget" nullable="false" doc="Render target to query." />
+      <param name="out_format" type="uint8_t *" direction="out" doc="Receives the format code from EzGfxRenderTargetFormat." />
+      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
+      <returns doc="Returns EzGfxResult_Ok or a validation or handle status." />
+    </function>
+    <function name="ez_gfx_render_target_get_extent" return="EzGfxResult" context="last" doc="Reports the extents of a live render target.">
+      <param name="target" type="EzGfxRenderTarget" nullable="false" doc="Render target to query." />
+      <param name="out_width" type="uint32_t *" direction="out" doc="Receives width in pixels." />
+      <param name="out_height" type="uint32_t *" direction="out" doc="Receives height in pixels." />
+      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
+      <returns doc="Returns EzGfxResult_Ok or a validation or handle status." />
+    </function>
+    <function name="ez_gfx_render_target_get_clear" return="EzGfxResult" context="last" doc="Reports the stored clear value of a live render target.">
+      <param name="target" type="EzGfxRenderTarget" nullable="false" doc="Render target to query." />
+      <param name="out_use_clear" type="uint8_t *" direction="out" doc="Receives zero or one." />
+      <param name="out_color" type="float *" direction="out" array-length="4" doc="Receives four color components; zeros when no clear is stored." />
+      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
+      <returns doc="Returns EzGfxResult_Ok or a validation or handle status." />
+    </function>
+    <function name="ez_gfx_render_target_probe_format" return="EzGfxResult" context="last" doc="Probes whether one format admits a sampled color target at the given sample count.">
+      <param name="format" type="uint8_t" doc="Format code from EzGfxRenderTargetFormat." />
+      <param name="samples" type="uint8_t" doc="Requested multisample count; one of 1, 2, 4, or 8." />
+      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
+      <returns doc="Returns Ok when resolvable, Unsupported otherwise, or validation status." />
+    </function>
+    <function name="ez_gfx_begin_render_target" return="EzGfxResult" context="last" doc="Begins frame recording against a managed render target instead of a surface.">
+      <param name="target" type="EzGfxRenderTarget" nullable="false" doc="Render target to render into." />
+      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
+      <returns doc="Returns state, handle, or capability status." />
     </function>
     <function name="ez_gfx_begin_render" return="EzGfxResult" context="last" doc="Begins rendering to a surface.">
       <param name="surface" type="EzGfxSurface" nullable="false" doc="Surface to acquire." />

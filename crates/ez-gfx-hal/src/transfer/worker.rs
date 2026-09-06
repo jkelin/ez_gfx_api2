@@ -19,6 +19,28 @@ pub enum TransferWorkerError {
     Full,
     /// The worker stopped, the request is invalid, or submission failed.
     Failed,
+    /// Native submission reported device loss; the worker is poisoned with the loss reason.
+    DeviceLost,
+}
+
+impl TransferWorkerError {
+    /// Maps a worker rejection onto the portable backend failure without collapsing loss.
+    pub fn to_hal_error(self) -> crate::HalError {
+        match self {
+            TransferWorkerError::Full => crate::HalError::OutOfMemory,
+            TransferWorkerError::Failed => crate::HalError::NativeFailure,
+            TransferWorkerError::DeviceLost => crate::HalError::DeviceLost,
+        }
+    }
+
+    /// Maps a worker rejection onto the allocation failure without collapsing loss.
+    pub fn to_allocation_error(self) -> super::AllocationError {
+        match self {
+            TransferWorkerError::Full => super::AllocationError::OutOfMemory,
+            TransferWorkerError::Failed => super::AllocationError::NativeFailure,
+            TransferWorkerError::DeviceLost => super::AllocationError::DeviceLost,
+        }
+    }
 }
 
 enum Message<J> {
@@ -43,6 +65,7 @@ struct SubmissionProgress {
 struct WorkerExit {
     progress: Arc<SubmissionProgress>,
     failed: Arc<AtomicBool>,
+    lost: Arc<AtomicBool>,
     clean: bool,
 }
 
@@ -108,6 +131,7 @@ impl<J> Inbox<J> {
 pub struct TransferWorker<J> {
     sender: Option<SyncSender<Message<J>>>,
     failed: Arc<AtomicBool>,
+    lost: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     capacity: usize,
     queued: Arc<AtomicUsize>,
@@ -166,9 +190,11 @@ impl<J: Send + 'static> TransferWorker<J> {
         }
         let (sender, receiver) = sync_channel(capacity);
         let failed = Arc::new(AtomicBool::new(false));
+        let lost = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(SubmissionProgress::default());
         let worker_progress = progress.clone();
         let worker_failed = failed.clone();
+        let worker_lost = lost.clone();
         let queued = Arc::new(AtomicUsize::new(0));
         let worker_queued = queued.clone();
         let thread = thread::Builder::new()
@@ -177,6 +203,7 @@ impl<J: Send + 'static> TransferWorker<J> {
                 let mut exit = WorkerExit {
                     progress: worker_progress,
                     failed: worker_failed,
+                    lost: worker_lost,
                     clean: false,
                 };
                 let mut inbox = Inbox {
@@ -242,6 +269,13 @@ impl<J: Send + 'static> TransferWorker<J> {
                     Ok::<(), TransferWorkerError>(())
                 }));
                 let submission_failed = !matches!(submitted, Ok(Ok(())));
+                // Only a native `DeviceLost` return poisons the latch with loss; a callback
+                // panic stays a generic failure (its payload carries no loss reason).
+                let submission_lost = matches!(submitted, Ok(Err(TransferWorkerError::DeviceLost)));
+                if submission_lost {
+                    // Sticky loss reason: later admissions report DeviceLost, not NativeFailure.
+                    exit.lost.store(true, Ordering::Release);
+                }
                 if submission_failed {
                     exit.failed.store(true, Ordering::Release);
                     let _state = exit
@@ -254,6 +288,10 @@ impl<J: Send + 'static> TransferWorker<J> {
                 // Callback captures retain native allocators until cleanup drains even partial work.
                 let drained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut shutdown));
                 let drain_failed = !matches!(drained, Ok(Ok(())));
+                // A loss-reporting drain poisons the latch like a loss-reporting submit.
+                if matches!(drained, Ok(Err(TransferWorkerError::DeviceLost))) {
+                    exit.lost.store(true, Ordering::Release);
+                }
                 {
                     let mut state = exit
                         .progress
@@ -274,6 +312,7 @@ impl<J: Send + 'static> TransferWorker<J> {
         Ok(Self {
             sender: Some(sender),
             failed,
+            lost,
             thread: Some(thread),
             capacity,
             queued,
@@ -281,6 +320,14 @@ impl<J: Send + 'static> TransferWorker<J> {
             accepted: Mutex::new(0),
             progress,
         })
+    }
+
+    /// Reports the sticky admission failure: loss outranks generic failure.
+    fn admission_error(&self) -> TransferWorkerError {
+        if self.device_lost() {
+            return TransferWorkerError::DeviceLost;
+        }
+        TransferWorkerError::Failed
     }
 
     fn send(
@@ -292,7 +339,7 @@ impl<J: Send + 'static> TransferWorker<J> {
     ) -> Result<(), TransferWorkerError> {
         // Rejected admission never advances the accepted watermark.
         if self.failed() {
-            return Err(TransferWorkerError::Failed);
+            return Err(self.admission_error());
         }
         let sender = self.sender.as_ref().ok_or(TransferWorkerError::Failed)?;
         self.queued
@@ -306,7 +353,8 @@ impl<J: Send + 'static> TransferWorker<J> {
             self.queued.fetch_sub(count, Ordering::Release);
             return Err(match error {
                 TrySendError::Full(_) => TransferWorkerError::Full,
-                TrySendError::Disconnected(_) => TransferWorkerError::Failed,
+                // The owner may have exited with loss between admission and send.
+                TrySendError::Disconnected(_) => self.admission_error(),
             });
         }
         *accepted = highwater;
@@ -316,7 +364,8 @@ impl<J: Send + 'static> TransferWorker<J> {
     /// Enqueues one request without waiting for worker progress.
     ///
     /// # Errors
-    /// Returns `Full` for backpressure or `Failed` for stopped/invalid ordered admission.
+    /// Returns `Full` for backpressure, `Failed` for stopped/invalid ordered admission,
+    /// or `DeviceLost` once native submission has reported device loss.
     pub fn submit(&self, job: J) -> Result<(), TransferWorkerError> {
         // Serialize watermark validation with channel admission when callers share the worker.
         let mut accepted = self
@@ -334,6 +383,7 @@ impl<J: Send + 'static> TransferWorker<J> {
     ///
     /// # Errors
     /// Empty or out-of-order bundles return `Failed`; oversized/full admission returns `Full`.
+    /// A loss-poisoned worker returns `DeviceLost`.
     pub fn submit_batch(&self, jobs: Vec<J>) -> Result<(), TransferWorkerError> {
         if jobs.is_empty() {
             return Err(TransferWorkerError::Failed);
@@ -364,6 +414,7 @@ impl<J: Send + 'static> TransferWorker<J> {
     ///
     /// # Errors
     /// Returns `Failed` for a token beyond accepted work, owner failure, or premature shutdown.
+    /// A loss-poisoned worker returns `DeviceLost`.
     pub fn flush_through(&self, value: u64) -> Result<(), TransferWorkerError> {
         if value
             > *self
@@ -380,14 +431,14 @@ impl<J: Send + 'static> TransferWorker<J> {
             .map_err(|_| TransferWorkerError::Failed)?;
         loop {
             if self.failed() {
-                return Err(TransferWorkerError::Failed);
+                return Err(self.admission_error());
             }
             // Zero and already-submitted tokens require no queue message or drain.
             if state.submitted >= value {
                 return Ok(());
             }
             if state.stopped {
-                return Err(TransferWorkerError::Failed);
+                return Err(self.admission_error());
             }
             state = self
                 .progress
@@ -400,10 +451,10 @@ impl<J: Send + 'static> TransferWorker<J> {
     /// Blocks until all requests accepted before this call have been submitted.
     ///
     /// # Errors
-    /// Returns `Failed` if the owner has stopped.
+    /// Returns `Failed` if the owner has stopped, or `DeviceLost` once loss has poisoned it.
     pub fn flush(&self) -> Result<(), TransferWorkerError> {
         if self.failed() {
-            return Err(TransferWorkerError::Failed);
+            return Err(self.admission_error());
         }
         let (ready_tx, ready_rx) = channel();
         self.sender
@@ -411,12 +462,29 @@ impl<J: Send + 'static> TransferWorker<J> {
             .ok_or(TransferWorkerError::Failed)?
             .send(Message::Flush(ready_tx))
             .map_err(|_| TransferWorkerError::Failed)?;
-        ready_rx.recv().map_err(|_| TransferWorkerError::Failed)
+        ready_rx.recv().map_err(|_| self.admission_error())
     }
 
-    /// Reports whether the submission handler failed.
+    /// Reports whether the submission handler failed for any reason, including device loss.
     pub fn failed(&self) -> bool {
-        self.failed.load(Ordering::Acquire)
+        self.failed.load(Ordering::Acquire) || self.device_lost()
+    }
+
+    /// Reports whether native submission failed with device loss.
+    pub fn device_lost(&self) -> bool {
+        self.lost.load(Ordering::Acquire)
+    }
+
+    /// Sticky terminal rejection for a failed worker, or `None` while healthy.
+    /// Loss outranks generic failure so diagnostics name the cause.
+    pub fn terminal_error(&self) -> Option<TransferWorkerError> {
+        if self.device_lost() {
+            Some(TransferWorkerError::DeviceLost)
+        } else if self.failed.load(Ordering::Acquire) {
+            Some(TransferWorkerError::Failed)
+        } else {
+            None
+        }
     }
 
     /// Reports whether the stopped owner successfully drained all actual native submissions.

@@ -232,10 +232,7 @@ impl BufferTransfer for NativeContext {
                     },
                 },
             })
-            .map_err(|error| match error {
-                ez_gfx_hal::TransferWorkerError::Full => AllocationError::OutOfMemory,
-                ez_gfx_hal::TransferWorkerError::Failed => AllocationError::NativeFailure,
-            })?;
+            .map_err(ez_gfx_hal::TransferWorkerError::to_allocation_error)?;
         // Rejected work does not consume a completion value.
         self.next_transfer_value = next;
         CompletionToken::new(QueueKind::Transfer, value).map_err(|_| AllocationError::NativeFailure)
