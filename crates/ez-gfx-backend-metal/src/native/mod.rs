@@ -292,11 +292,13 @@ impl NativeSurface {
         if layer.is_null() {
             return Err(HalError::InvalidArgument);
         }
+        // SAFETY: the non-null layer is retained by the caller for this surface's lifetime.
+        let metal_layer = unsafe { &*(layer as *const CAMetalLayer) };
+        // Every surface graph resource is BGRA8 sRGB; there is no linear fallback.
+        metal_layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm_sRGB);
         // Capture needs shader-readable drawable textures; set this before nextDrawable.
         if capture_presented {
-            // SAFETY: `layer` was checked non-null and the caller guarantees its `CAMetalLayer` storage outlives this dereference and `setFramebufferOnly` message send.
-            let layer = unsafe { &*(layer as *const CAMetalLayer) };
-            layer.setFramebufferOnly(false);
+            metal_layer.setFramebufferOnly(false);
         }
         Ok(Self {
             layer: layer as usize,
@@ -334,6 +336,8 @@ pub struct NativeContext {
     pending_texture_transfers: Vec<transfer::PendingTextureTransfer>,
     texture_worker: Option<ez_gfx_hal::TransferWorker<transfer::TextureTransferJob>>,
     texture_staging: ez_gfx_hal::ReusableStagingPool<NativeAllocation>,
+    #[cfg(test)]
+    buffer_wait_observer: Option<std::sync::mpsc::Sender<()>>,
 }
 
 // Metal device and command-queue protocol objects are `Send + Sync` in objc2-metal. Every
@@ -347,3 +351,6 @@ mod pipeline;
 mod surface;
 mod texture;
 mod transfer;
+
+#[cfg(test)]
+mod texture_tests;

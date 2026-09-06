@@ -187,8 +187,7 @@ struct AsyncTextureState {
 impl AsyncTextureState {
     fn new() -> Result<Self, EzGfxResult> {
         let threads = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(2)
+            .map_or(2, usize::from)
             .saturating_sub(1)
             .max(1);
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(64);

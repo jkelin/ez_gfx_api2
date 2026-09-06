@@ -104,6 +104,8 @@ impl NativeContext {
             adapter,
             drain_complete: true,
             next_transfer_value: 1,
+            #[cfg(test)]
+            buffer_wait_observer: None,
             completed_transfer_value: 0,
             pending_transfers: Vec::new(),
             transfer_worker: Some(transfer_worker),
@@ -148,15 +150,11 @@ impl NativeContext {
             .as_ref()
             .is_none_or(|worker| worker.flush().is_err());
         // Failed flush can precede worker shutdown; join its actual-command drain before reclaiming.
-        if transfer_failed {
-            if let Some(worker) = self.transfer_worker.as_mut() {
-                worker.shutdown();
-            }
+        if transfer_failed && let Some(worker) = self.transfer_worker.as_mut() {
+            worker.shutdown();
         }
-        if texture_failed {
-            if let Some(worker) = self.texture_worker.as_mut() {
-                worker.shutdown();
-            }
+        if texture_failed && let Some(worker) = self.texture_worker.as_mut() {
+            worker.shutdown();
         }
         let mut failed = transfer_failed || texture_failed;
         for pending in &self.pending_transfers {

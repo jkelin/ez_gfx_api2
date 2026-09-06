@@ -141,3 +141,8 @@ Minimization detection eliminates rendering and swapchain acquire work while the
 1. Test window resizing, minimization, and restoration across all 6 examples with zero GPU validation layer warnings.
 2. Verify that attempting to bind the swapchain as a shader sampled read produces an explicit `InvalidShaderResourceUsage` error during graph compilation.
 
+### Native surface color evidence
+
+The frame graph advertises BGRA8 sRGB. Metal layer creation/acquisition and graphics pipeline attachments now lower that same format; sampled-texture formats remain independent. Captured RGBA bytes preserve hardware sRGB encoding, with only BGRA channel reordering and no second gamma conversion.
+
+Apple M2 Pro headless render/readback tests verify a linear 0.1 clear becomes `[89, 89, 89, 255]`, not the former linear `[26, 26, 26, 255]`, alongside separated color/depth passes and compressed midtone sampling. This corrects visible Metal output; it does not establish resize/minimize or every presentation-mode requirement.

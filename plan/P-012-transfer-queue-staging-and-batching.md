@@ -143,6 +143,6 @@ The scheduling implementation deliberately departs from the original no-per-subm
 
 RTX 3080 native tests prove shared copy submissions, blocked-fine/coarse-frame overlap, queue-full admission, and failure-safe retirement. The 64-image upload benchmark observed 64→2 Vulkan and 64→5 DX12 native batches; exact timings, staging retention, method, and limitations are in [texture measurements](../docs/textures.md#measured-workloads). These are scoped debug-profile observations, not general throughput claims.
 
-Metal implementation parity is not runtime evidence. Its library is cross-checked for Apple; retained tests require a real Apple SDK before typechecking, then a native GPU runner for execution. That prerequisite remains in root `TODO.md`.
+Apple M2 Pro native execution now proves shared texture command buffers, cancelled-only completion signaling, GPU-gated fine-copy/coarse-frame overlap, submitted retirement, rejected updates, and drain-safe partial buffer failure. Ordered buffer admission and targeted producer completion fix a real pending-copy frame rejection. Metal may block the caller through a referenced buffer command; no later transfers are drained. See [native evidence](../docs/textures.md#verification-and-remaining-evidence). Apple performance was not benchmarked.
 
 The selected nonblocking-submission goal remains open in root `TODO.md`: remove per-batch GPU completion waits while preserving failure-safe coarse handoffs. The current correctness tradeoff does not complete or replace that requirement.

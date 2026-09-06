@@ -119,11 +119,12 @@ pub(super) fn start_worker() -> Result<ez_gfx_hal::TransferWorker<MetalTransferJ
     let mut last_value = 0_u64;
     let submitted = Arc::new(SubmittedCommands::default());
     let shutdown = submitted.clone();
-    ez_gfx_hal::TransferWorker::new_grouped_with_shutdown(
+    ez_gfx_hal::TransferWorker::new_ordered_with_shutdown(
         64,
         ez_gfx_hal::DEFAULT_STAGING_POLICY,
         job_bytes,
         |_| 0,
+        |job| job.value,
         move |jobs| {
             for job in jobs {
                 if job.value <= last_value {
@@ -163,6 +164,22 @@ pub(super) struct TextureSubmission {
 }
 
 impl TextureSubmission {
+    #[cfg(test)]
+    pub(super) fn submitted(&self) -> bool {
+        // The command is retained before commit; status distinguishes actual GPU admission.
+        self.command.lock().is_ok_and(|command| {
+            command.as_ref().is_some_and(|command| {
+                matches!(
+                    command.command.status(),
+                    MTLCommandBufferStatus::Committed
+                        | MTLCommandBufferStatus::Scheduled
+                        | MTLCommandBufferStatus::Completed
+                        | MTLCommandBufferStatus::Error
+                )
+            })
+        })
+    }
+
     pub(super) fn completed(&self) -> Result<bool, AllocationError> {
         if self.skipped.load(Ordering::Acquire) {
             return Ok(true);
@@ -295,7 +312,7 @@ mod tests {
                     command: TransferCommand::new(command.clone()),
                 },
                 MetalTransferJob {
-                    value: 1,
+                    value: 0,
                     bytes: 1,
                     command: TransferCommand::new(queue.commandBuffer().unwrap()),
                 },
@@ -328,7 +345,11 @@ mod tests {
                 .unwrap();
             // SAFETY: the shared buffer is four writable bytes and no work references it yet.
             unsafe {
-                core::ptr::copy_nonoverlapping(pixel.as_ptr(), source.contents().as_ptr().cast(), 4)
+                core::ptr::copy_nonoverlapping(
+                    pixel.as_ptr(),
+                    source.contents().as_ptr().cast(),
+                    4,
+                );
             };
             // SAFETY: one RGBA8 pixel and one mip form a valid 2D descriptor.
             let desc = unsafe {
@@ -398,8 +419,8 @@ mod tests {
             let first = submissions[0].command.lock().unwrap();
             let second = submissions[1].command.lock().unwrap();
             assert!(core::ptr::eq(
-                &*first.as_ref().unwrap().command,
-                &*second.as_ref().unwrap().command,
+                &raw const *first.as_ref().unwrap().command,
+                &raw const *second.as_ref().unwrap().command,
             ));
         }
         for (texture, expected) in textures

@@ -652,13 +652,33 @@ impl NativeContext {
                     }
                     continue;
                 }
-                let completed = match token.queue {
-                    QueueKind::Transfer => self.completed_transfer_value(),
-                    _ => return Err(HalError::InvalidArgument),
-                }
-                .map_err(map_allocation_hal)?;
-                if token.value > completed {
+                if token.queue != QueueKind::Transfer || token.value >= self.next_transfer_value {
                     return Err(HalError::InvalidArgument);
+                }
+                // Buffer admission is asynchronous. Finish only this accepted producer before
+                // graphics reads its destination; later queued copies need not complete.
+                self.transfer_worker
+                    .as_ref()
+                    .ok_or(HalError::NotReady)?
+                    .flush_through(token.value)
+                    .map_err(|_| HalError::NativeFailure)?;
+                if let Some(pending) = self
+                    .pending_transfers
+                    .iter()
+                    .find(|pending| pending.value == token.value)
+                {
+                    #[cfg(test)]
+                    if let Some(observer) = self.buffer_wait_observer.take() {
+                        let _ = observer.send(());
+                    }
+                    pending.command.waitUntilCompleted();
+                }
+                if token.value
+                    > self
+                        .completed_transfer_value()
+                        .map_err(map_allocation_hal)?
+                {
+                    return Err(HalError::NativeFailure);
                 }
             }
         }
@@ -916,7 +936,7 @@ impl NativeContext {
             // SAFETY: `NativeSurface::layer` is a non-null, properly aligned pointer to a `CAMetalLayer` retained by `surface`, so dereferencing it for the lifetime of this shared surface borrow is sound.
             let layer = unsafe { &*(surface.layer as *const CAMetalLayer) };
             layer.setDevice(Some(&self.device));
-            layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+            layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm_sRGB);
             let drawable = layer.nextDrawable().ok_or(HalError::NotReady)?;
             let texture = drawable.texture();
             if texture.width()

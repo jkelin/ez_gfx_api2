@@ -35,7 +35,8 @@ fn metal_separated_passes_preserve_color_and_depth() {
 
     let cached = render(&artifact, true);
     assert_eq!(cached.len(), WIDTH as usize * HEIGHT as usize * 4);
-    assert_eq!(pixel(&cached, 2, 2), [26, 26, 26, 255]);
+    // The surface contract encodes a linear 0.1 clear as sRGB, without changing alpha.
+    assert_eq!(pixel(&cached, 2, 2), [89, 89, 89, 255]);
     let left = pixel(&cached, WIDTH / 4, HEIGHT / 2);
     assert!(left[0] > left[1]);
     assert_eq!(left[3], 255);
@@ -95,6 +96,8 @@ fn metal_texture_readback_submits_without_a_surface() {
         },
         EzGfxResult::Ok
     );
+    // Admission is asynchronous; readback requires the decoded native texture to be ready.
+    assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
     assert_eq!(ez_gfx_frame_begin(context), EzGfxResult::Ok);
     assert_eq!(
         ez_gfx_graph_enqueue_texture_readback(texture, context),
@@ -281,7 +284,7 @@ fn submit_render_nodes(context: u64, surface: u64, shader: u64, indirect: u64) {
 // The retained layer outlives surface destruction; disabled caching must leave readback empty.
 fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
     let layer = CAMetalLayer::new();
-    layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+    layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm_sRGB);
     layer.setDrawableSize(CGSize {
         width: f64::from(WIDTH),
         height: f64::from(HEIGHT),

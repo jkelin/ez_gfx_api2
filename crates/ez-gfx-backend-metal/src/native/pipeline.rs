@@ -113,7 +113,7 @@ impl NativeContext {
         descriptor.setFragmentFunction(Some(&fragment));
         // SAFETY: Metal defines eight color-attachment slots, so index 0 is valid, and `descriptor` keeps the attachment-array storage allocated through `objectAtIndexedSubscript:`.
         let color = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
-        color.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+        color.setPixelFormat(MTLPixelFormat::BGRA8Unorm_sRGB);
         if depth_required {
             descriptor.setDepthAttachmentPixelFormat(MTLPixelFormat::Depth32Float);
         }

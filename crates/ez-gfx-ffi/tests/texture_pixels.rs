@@ -1,7 +1,14 @@
 //! Hidden native compressed sampling, edge-update, and submitted-frame retirement regression.
-#![cfg(windows)]
+#![cfg(any(windows, target_vendor = "apple"))]
 
+#[cfg(windows)]
 mod common;
+#[cfg(target_vendor = "apple")]
+#[path = "common/metal.rs"]
+mod common;
+#[cfg(target_vendor = "apple")]
+#[path = "texture_pixels/ingestion.rs"]
+mod ingestion;
 
 use std::{
     sync::{Arc, LazyLock},
@@ -12,6 +19,7 @@ use common::TestContext;
 use ez_gfx::*;
 use ez_gfx_compiler::{Target, compile_shader};
 
+#[cfg(windows)]
 #[test]
 fn vulkan_bc_pixels_survive_region_updates_and_unload() {
     const CHILD: &str = "EZ_GFX_TEXTURE_PIXELS_VALIDATION_CHILD";
@@ -22,11 +30,19 @@ fn vulkan_bc_pixels_survive_region_updates_and_unload() {
     }
 }
 
+#[cfg(windows)]
 #[test]
 fn dx12_bc_pixels_survive_region_updates_and_unload() {
     exercise_backend(2);
 }
 
+#[cfg(target_vendor = "apple")]
+#[test]
+fn metal_compressed_pixels_survive_region_updates_and_unload() {
+    exercise_backend(3);
+}
+
+#[cfg(windows)]
 fn assert_validation_clean(child_marker: &str) {
     use std::{
         io::{Read, Write},
@@ -101,24 +117,34 @@ fn assert_validation_clean(child_marker: &str) {
 fn exercise_backend(backend: u8) {
     // One compilation avoids concurrent compiler artifact writes by the backend tests.
     static ARTIFACT: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        #[cfg(windows)]
+        let targets = &[Target::Spirv, Target::Dxil, Target::Metal];
+        #[cfg(target_vendor = "apple")]
+        let targets = &[Target::Metal];
         compile_shader(
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../examples/02_textured_cube/02_textured_cube.slang"),
-            &[Target::Spirv, Target::Dxil, Target::Metal],
-            true,
+            targets,
+            // Apple runtime accepts offline metallib, never development MSL source.
+            cfg!(windows),
         )
         .expect("compile cube shader artifact")
     });
+    #[cfg(windows)]
     // A missing Vulkan validation layer is a failure, never a silent unvalidated run.
     let native = if backend == 1 {
         TestContext::create_with_validation(backend, true)
     } else {
         TestContext::create(backend)
     };
+    #[cfg(target_vendor = "apple")]
+    let native = TestContext::create(backend);
     let context = ContextHandle::from_raw(native.context).unwrap();
     let surface = SurfaceHandle::from_raw(native.surface).unwrap();
     assert_eq!(surface_extent(context, surface).unwrap(), (64, 64));
     let quad = Quad::create(context, surface, &ARTIFACT);
+    #[cfg(all(target_vendor = "apple", feature = "basis"))]
+    ingestion::universal(context, &quad);
 
     for (width, height) in [(8, 4), (7, 3)] {
         for (format, destination) in [
@@ -195,10 +221,11 @@ fn exercise_case(
     let texture = match load_texture(context, decoder.source(), &pixels.initial, false, &config) {
         Ok(texture) => texture,
         Err(status)
-            if matches!(
-                format,
-                TextureFormat::Astc4x4Unorm | TextureFormat::Astc4x4Srgb
-            ) =>
+            if backend != 3
+                && matches!(
+                    format,
+                    TextureFormat::Astc4x4Unorm | TextureFormat::Astc4x4Srgb
+                ) =>
         {
             // Explicit ASTC admission consults native compression support; never fall back.
             assert_eq!(status, EzGfxResult::Unsupported);
@@ -228,13 +255,15 @@ fn exercise_case(
         unload_texture(context, texture);
         assert_abi_odd_base_unsupported(context, &decoder, format, &pixels.initial);
         drop(decoder);
-        exercise_dx12_odd_mip(context, quad, format, config);
+        exercise_odd_mip(context, quad, format, config);
         return;
     }
-    if matches!(
-        format,
-        TextureFormat::Astc4x4Unorm | TextureFormat::Astc4x4Srgb
-    ) && status == EzGfxResult::Unsupported
+    if backend != 3
+        && matches!(
+            format,
+            TextureFormat::Astc4x4Unorm | TextureFormat::Astc4x4Srgb
+        )
+        && status == EzGfxResult::Unsupported
     {
         // Custom decoders reveal their format asynchronously; rejection can follow admission.
         unload_texture(context, texture);
@@ -245,6 +274,10 @@ fn exercise_case(
     quad.draw(texture, true);
     let before = frame_readback(context).unwrap();
     assert_halves(&before, format, 0, width);
+    #[cfg(target_vendor = "apple")]
+    if width == 8 {
+        ingestion::direct(context, quad, format, &config, &pixels.initial, &before);
+    }
 
     if backend == 1 && format == TextureFormat::Bc1Unorm && width == 8 {
         // Vulkan retains the submitted slot until owner-thread frame reclamation.
@@ -273,6 +306,10 @@ fn exercise_case(
     }
     let after = exercise_updates(context, quad, texture, format, &config, &pixels, &before);
     exercise_retirement(context, quad, texture, &decoder, &config, &pixels, &after);
+    if backend == 3 && width == 8 && format != TextureFormat::Rgba8Unorm {
+        // Exercise real clipped mips independently of whether Metal accepts an odd BC base.
+        exercise_odd_mip(context, quad, format, config);
+    }
 }
 
 fn exercise_updates(
@@ -494,8 +531,8 @@ fn assert_abi_odd_base_unsupported(
         debug_label_length: 0,
     };
     let mut texture = 0;
-    // SAFETY: Input/descriptor remain readable and the output handle writable through the call.
     assert_eq!(
+        // SAFETY: Input/descriptor remain readable and the output handle writable through the call.
         unsafe {
             ez_gfx_texture_load(
                 bytes.as_ptr(),
@@ -527,7 +564,7 @@ fn assert_abi_odd_base_unsupported(
     ez_gfx_texture_unload(texture, context.into_raw());
 }
 
-fn exercise_dx12_odd_mip(
+fn exercise_odd_mip(
     context: ContextHandle,
     quad: &Quad,
     format: TextureFormat,
@@ -608,6 +645,39 @@ fn exercise_dx12_odd_mip(
         };
         assert_eq!(pixel, expected, "{format:?} mip2 edge pixel {index}");
     }
+    // Promotion must expose uploaded finer mips, not keep sampling the edited coarse mip.
+    // Both finer levels are uniformly green; demotion must preserve both clipped-edge updates.
+    #[cfg(target_vendor = "apple")]
+    {
+        // A submitted frame prevents descriptor mutation even after all uploads finish.
+        quad.draw(texture, false);
+        assert_eq!(
+            set_texture_residency(context, texture, 2),
+            EzGfxResult::NotReady
+        );
+        assert_eq!(texture_residency(context, texture), Ok((1, 3)));
+    }
+    for resident in [2, 3] {
+        assert_eq!(wait_idle(context), EzGfxResult::Ok);
+        assert_eq!(
+            set_texture_residency(context, texture, resident),
+            EzGfxResult::Ok
+        );
+        assert_eq!(texture_residency(context, texture), Ok((resident, 3)));
+        quad.draw(texture, true);
+        for pixel in frame_readback(context).unwrap().chunks_exact(4) {
+            assert_eq!(pixel, &after[..4], "{format:?} promoted mip pixels");
+        }
+    }
+    assert_eq!(wait_idle(context), EzGfxResult::Ok);
+    assert_eq!(set_texture_residency(context, texture, 1), EzGfxResult::Ok);
+    assert_eq!(texture_residency(context, texture), Ok((1, 3)));
+    quad.draw(texture, true);
+    assert_eq!(
+        frame_readback(context).unwrap(),
+        edge,
+        "{format:?} demoted mip pixels"
+    );
     quad.draw(texture, false);
     unload_texture(context, texture);
     assert_stale(context, texture, &green);
@@ -729,7 +799,7 @@ impl Decoder {
     }
 
     fn register_chain(id: u8, format: TextureFormat) -> Self {
-        // Three real BC mips use ceil-divided block counts, including both clipped mip2 edges.
+        // Three real compressed mips use ceil-divided block counts, including clipped mip2 edges.
         let block_bytes = solid_block(format, 0).len();
         register_texture_decoder(
             id,

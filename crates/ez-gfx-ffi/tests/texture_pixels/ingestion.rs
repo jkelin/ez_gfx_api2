@@ -1,0 +1,176 @@
+use super::*;
+
+pub(super) fn direct(
+    context: ContextHandle,
+    quad: &Quad,
+    format: TextureFormat,
+    config: &TextureConfig,
+    bytes: &[u8],
+    expected: &[u8],
+) {
+    // Raw carries native format metadata; no custom decoder participates in this admission.
+    let texture = load_texture(
+        context,
+        TextureSource::Raw {
+            format,
+            width: config.width,
+            height: config.height,
+            mip_count: 1,
+        },
+        bytes,
+        false,
+        config,
+    )
+    .unwrap();
+    await_texture(context, texture);
+    quad.draw(texture, true);
+    assert_eq!(
+        frame_readback(context).unwrap(),
+        expected,
+        "{format:?} raw ingestion pixels"
+    );
+    unload_texture(context, texture);
+
+    if format == TextureFormat::Bc1Unorm {
+        // Minimal legacy DDS: one 8x4 DXT1 level, no array, volume, or cubemap flags.
+        let mut words = [0_u32; 31];
+        words[0] = 124;
+        words[1] = 0x1 | 0x2 | 0x4 | 0x1000;
+        words[2] = config.height;
+        words[3] = config.width;
+        words[18] = 32;
+        words[19] = 0x4;
+        words[20] = u32::from_le_bytes(*b"DXT1");
+        words[26] = 0x1000;
+        let mut dds = Vec::from(*b"DDS ");
+        dds.extend(words.into_iter().flat_map(u32::to_le_bytes));
+        dds.extend_from_slice(bytes);
+        let texture = load_texture(context, TextureSource::Dds, &dds, false, config).unwrap();
+        await_texture(context, texture);
+        quad.draw(texture, true);
+        assert_eq!(
+            frame_readback(context).unwrap(),
+            expected,
+            "DDS ingestion pixels"
+        );
+        unload_texture(context, texture);
+    }
+}
+
+#[cfg(feature = "basis")]
+pub(super) fn universal(context: ContextHandle, quad: &Quad) {
+    // Both standalone payload encodings must reach native sampling through canonical dispatch.
+    for bytes in [
+        include_bytes!("../../../ez-gfx-runtime/tests/fixtures/rust-logo-etc.basis").as_slice(),
+        include_bytes!("../../../ez-gfx-runtime/tests/fixtures/cube-uastc-srgb.basis").as_slice(),
+    ] {
+        universal_case(context, quad, TextureSource::Basis, bytes);
+    }
+    #[cfg(feature = "ktx2")]
+    for bytes in [
+        include_bytes!("../../../ez-gfx-runtime/tests/fixtures/alpha_simple_basis.ktx2").as_slice(),
+        include_bytes!("../../../ez-gfx-runtime/tests/fixtures/cube-uastc-srgb.ktx2").as_slice(),
+    ] {
+        universal_case(context, quad, TextureSource::Ktx2, bytes);
+    }
+}
+
+#[cfg(feature = "basis")]
+fn universal_case(context: ContextHandle, quad: &Quad, source: TextureSource, bytes: &[u8]) {
+    use ez_gfx_core::capability::CompressionSupport;
+    use ez_gfx_runtime::texture::TextureDecoder;
+
+    for (rgba, destinations) in [
+        (
+            TextureDestination::Rgba8Unorm,
+            [
+                TextureDestination::Bc7Unorm,
+                TextureDestination::Astc4x4Unorm,
+            ],
+        ),
+        (
+            TextureDestination::Rgba8Srgb,
+            [TextureDestination::Bc7Srgb, TextureDestination::Astc4x4Srgb],
+        ),
+    ] {
+        // Decode independently to RGBA, then sample that reference with identical UV and transfer
+        // semantics. Comparison tolerates lossy block encoding, never orientation or blank output.
+        let decoded =
+            TextureDecoder::decode_for_destination(source, bytes, CompressionSupport::NONE, rgba)
+                .unwrap();
+        let mut config = TextureConfig {
+            width: decoded.width,
+            height: decoded.height,
+            mip_count: decoded.mip_count,
+            destination: rgba,
+            sampler: TextureSamplerDesc {
+                min_filter: SamplerFilter::Nearest,
+                mag_filter: SamplerFilter::Nearest,
+                max_anisotropy: 1.0,
+                address_u: SamplerAddressMode::Clamp,
+                address_v: SamplerAddressMode::Clamp,
+                address_w: SamplerAddressMode::Clamp,
+            },
+        };
+        let rgba_bytes: Vec<u8> = decoded
+            .mips
+            .iter()
+            .flat_map(|mip| mip.bytes.iter().copied())
+            .collect();
+        let reference = load_texture(
+            context,
+            TextureSource::Raw {
+                format: decoded.format,
+                width: decoded.width,
+                height: decoded.height,
+                mip_count: decoded.mip_count,
+            },
+            &rgba_bytes,
+            false,
+            &config,
+        )
+        .unwrap();
+        await_texture(context, reference);
+        // Initial readiness exposes only the coarse tail; image comparison requires every mip.
+        assert_eq!(wait_idle(context), EzGfxResult::Ok);
+        assert_eq!(
+            texture_residency(context, reference),
+            Ok((decoded.mip_count, decoded.mip_count))
+        );
+        quad.draw(reference, true);
+        let expected = frame_readback(context).unwrap();
+        unload_texture(context, reference);
+
+        for destination in destinations {
+            config.destination = destination;
+            let texture = load_texture(context, source, bytes, false, &config).unwrap();
+            await_texture(context, texture);
+            assert_eq!(wait_idle(context), EzGfxResult::Ok);
+            assert_eq!(
+                texture_residency(context, texture),
+                Ok((decoded.mip_count, decoded.mip_count))
+            );
+            quad.draw(texture, true);
+            let actual = frame_readback(context).unwrap();
+            assert_eq!(actual.len(), expected.len());
+            let mut error = [0_u64; 4];
+            for (actual, expected) in actual.chunks_exact(4).zip(expected.chunks_exact(4)) {
+                for channel in 0..4 {
+                    error[channel] += u64::from(actual[channel].abs_diff(expected[channel]));
+                }
+            }
+            // Average per-channel error is bounded to 8/255 over the entire sampled image.
+            // This covers lossy BC7/ASTC differences while rejecting wrong colors and alpha.
+            for (channel, error) in error.into_iter().enumerate() {
+                assert!(
+                    error <= 8 * 64 * 64,
+                    "{source:?} {destination:?} channel {channel} total error {error}"
+                );
+            }
+            quad.draw(texture, false);
+            unload_texture(context, texture);
+            assert_stale(context, texture, &[0; 16]);
+            assert_eq!(wait_idle(context), EzGfxResult::Ok);
+        }
+    }
+}

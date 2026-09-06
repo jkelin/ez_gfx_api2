@@ -154,6 +154,8 @@ Status on 2026-09-05; the historical selected solution above is unchanged.
 
 Scoped runtime texture/transcode tests passed with no features (27 tests), `ktx2` only (29), `basis` only (28), and combined features (38). Coverage includes valid/malformed DDS and raw chains, direct KTX2 geometry, exact explicit targets, actual ETC1S/UASTC R/Rg decoded pixels, source color metadata across standalone/KTX2 containers, and pre-native output bounds. Shared target-policy/unit tests passed (3); standalone metadata validation passed (1). FFI streaming/layout/version tests verify the ABI cutover separately. No GPU sampling claim follows from these decoder results.
 
+Apple M2 Pro native evidence is now separate and positive: retained ETC1S/UASTC `.basis` and KTX2 fixtures reach actual Metal BC7/ASTC linear/sRGB sampling and readback, compared against independently RGBA-decoded rendered references. Raw native chains and DDS DXT1 also reach sampled pixels. Combined-feature Apple decoder tests pass 38; ABI tests and actual dylib import/export audits pass. The runtime remains compiler-free; the test client emits offline metallib. See [exact GPU scope](../docs/textures.md#verification-and-remaining-evidence). No Apple transcode or full-scene performance claim follows.
+
 ### Warm decode measurement
 
 Measured 2026-09-05 on AMD Ryzen 9 5950X, Windows x64, Rust 1.88.0 / LLVM 20.1.5 (`x86_64-pc-windows-msvc`), default Cargo release profile. An isolated development encoder converted the repository's `examples/02_textured_cube/cube.png` (1024×1024) using `basisu_c_sys` 0.9.0 sRGB defaults: UASTC LDR 4×4 without Zstd and ETC1S. Encoding and image loading were outside timing; the encoder feature was not added to runtime dependencies.
