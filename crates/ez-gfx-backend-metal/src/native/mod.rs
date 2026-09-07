@@ -229,6 +229,7 @@ pub struct NativeTexture {
     msaa: Option<MsaaStorage>,
 }
 
+/// Private multisampled storage resolved into a render target's sampled texture.
 pub struct MsaaStorage {
     texture: ThreadBound<Retained<ProtocolObject<dyn MTLTexture>>>,
     allocation: ThreadBound<Allocation>,

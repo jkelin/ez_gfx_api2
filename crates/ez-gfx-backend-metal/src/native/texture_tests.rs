@@ -1,5 +1,5 @@
-use super::super::{AllocationError, NativeFrameAction, NativeFrameResource, PassAttachment};
 use super::*;
+use super::{AllocationError, NativeFrameAction, NativeFrameResource, PassAttachment};
 use ez_gfx_compiler::{Target, compile_shader};
 use ez_gfx_runtime::shader::RuntimeShader;
 use std::{
