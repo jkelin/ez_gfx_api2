@@ -15,6 +15,12 @@ host_var="REMOTE_TEST_${platform_key}_HOST"
 path_var="REMOTE_TEST_${platform_key}_PATH"
 host=${!host_var:-}
 remote_path=${!path_var:-}
+timeout_seconds=${REMOTE_TEST_TIMEOUT_SECONDS:-60}
+if [[ ! "$timeout_seconds" =~ ^[0-9]+$ || "${#timeout_seconds}" -gt 4 ]] || (( 10#$timeout_seconds < 1 || 10#$timeout_seconds > 3600 )); then
+  printf 'REMOTE_TEST_TIMEOUT_SECONDS must be an integer from 1 through 3600\n' >&2
+  exit 64
+fi
+timeout_seconds=$((10#$timeout_seconds))
 
 if [[ -z "$host" ]]; then
   printf '%s is required; define it in .env\n' "$host_var" >&2
@@ -138,7 +144,7 @@ then
   printf 'source synchronization failed; remote tests were not started\n' >&2
   exit 74
 fi
-remote_env="export EZ_GFX_EXAMPLE_HIDDEN=1 RUST_TEST_THREADS=1 PATH=\"\$HOME/.cargo/bin:\$PATH\""
+remote_env="export EZ_GFX_EXAMPLE_HIDDEN=1 RUST_TEST_THREADS=1 REMOTE_TEST_TIMEOUT_SECONDS=$timeout_seconds PATH=\"\$HOME/.cargo/bin:\$PATH\""
 slang_setup=""
 metadata_command="set -eu; cd $remote_path_q; $remote_env; cargo metadata --no-deps --format-version 1 >/dev/null"
 if [[ "$platform" == macos ]]; then
@@ -154,10 +160,10 @@ fi
 
 case "$platform" in
   windows)
-    tests='cargo test -p ez-gfx-hal -p ez-gfx-backend-vulkan -p ez-gfx-backend-dx12 -p ez-gfx --lib'
+    tests='bash scripts/remote-cargo-test.sh ez-gfx-hal ez-gfx-backend-vulkan ez-gfx-backend-dx12 ez-gfx'
     ;;
   linux)
-    tests='cargo test -p ez-gfx-hal -p ez-gfx-backend-vulkan -p ez-gfx --lib'
+    tests='bash scripts/remote-cargo-test.sh ez-gfx-hal ez-gfx-backend-vulkan ez-gfx'
     remote_env+=' VK_LOADER_LAYERS_DISABLE=~implicit~'
     if [[ -n "${REMOTE_TEST_LINUX_SLANG_DIR:-}" ]]; then
       printf -v slang_dir_q '%q' "$REMOTE_TEST_LINUX_SLANG_DIR"
@@ -169,7 +175,7 @@ case "$platform" in
     fi
     ;;
   macos)
-    tests='cargo test -p ez-gfx-hal -p ez-gfx-backend-metal -p ez-gfx --lib'
+    tests='bash scripts/remote-cargo-test.sh ez-gfx-hal ez-gfx-backend-metal ez-gfx'
     if [[ -n "${REMOTE_TEST_MACOS_SLANG_DIR:-}" ]]; then
       printf -v slang_dir_q '%q' "$REMOTE_TEST_MACOS_SLANG_DIR"
       remote_env+=" SLANG_DIR=$slang_dir_q"
