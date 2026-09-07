@@ -160,23 +160,37 @@ fn exercises_async_texture_batches(backend: u8) {
         }
 
         for texture in textures {
-            let mut resident = 0;
-            let mut total = 0;
-            assert_eq!(
-                {
-                    // SAFETY: both outputs are live writable u32 storage and the handles remain live.
-                    unsafe {
-                        ez_gfx_texture_get_residency(
-                            texture,
-                            &raw mut resident,
-                            &raw mut total,
-                            context,
-                        )
-                    }
-                },
-                EzGfxResult::Ok
-            );
-            assert_eq!((resident, total), (3, 3));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let (mut resident, mut total) = loop {
+                match ez_gfx_texture_poll(texture, context) {
+                    EzGfxResult::Ok | EzGfxResult::NotReady => {}
+                    error => panic!("updated texture failed: {error:?}"),
+                }
+                let mut resident = 0;
+                let mut total = 0;
+                assert_eq!(
+                    {
+                        // SAFETY: both outputs are live writable u32 storage and the handles remain live.
+                        unsafe {
+                            ez_gfx_texture_get_residency(
+                                texture,
+                                &raw mut resident,
+                                &raw mut total,
+                                context,
+                            )
+                        }
+                    },
+                    EzGfxResult::Ok
+                );
+                if (resident, total) == (3, 3) {
+                    break (resident, total);
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "updated texture did not restore full residency: {resident}/{total}"
+                );
+                std::thread::yield_now();
+            };
             assert_eq!(
                 ez_gfx_texture_set_residency(texture, 0, context),
                 EzGfxResult::InvalidArgument

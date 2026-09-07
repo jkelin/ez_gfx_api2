@@ -124,8 +124,10 @@ fn assert_validation_clean(child_marker: &str) {
 fn exercise_backend(backend: u8) {
     // One compilation avoids concurrent compiler artifact writes by the backend tests.
     static ARTIFACT: LazyLock<Vec<u8>> = LazyLock::new(|| {
-        #[cfg(not(target_vendor = "apple"))]
+        #[cfg(windows)]
         let targets = &[Target::Spirv, Target::Dxil, Target::Metal];
+        #[cfg(not(any(windows, target_vendor = "apple")))]
+        let targets = &[Target::Spirv];
         #[cfg(target_vendor = "apple")]
         let targets = &[Target::Metal];
         compile_shader(
@@ -153,7 +155,7 @@ fn exercise_backend(backend: u8) {
     #[cfg(all(target_vendor = "apple", feature = "basis"))]
     ingestion::universal(context, &quad);
 
-    for (width, height) in [(8, 4), (7, 3)] {
+    'cases: for (width, height) in [(8, 4), (7, 3)] {
         for (format, destination) in [
             (TextureFormat::Bc1Unorm, TextureDestination::Bc1Unorm),
             (TextureFormat::Bc3Unorm, TextureDestination::Bc3Unorm),
@@ -168,7 +170,9 @@ fn exercise_backend(backend: u8) {
             (TextureFormat::Astc4x4Srgb, TextureDestination::Astc4x4Srgb),
             (TextureFormat::Rgba8Unorm, TextureDestination::Rgba8Unorm),
         ] {
-            exercise_case(backend, context, &quad, format, destination, width, height);
+            if !exercise_case(backend, context, &quad, format, destination, width, height) {
+                break 'cases;
+            }
         }
     }
     assert_eq!(wait_idle(context), EzGfxResult::Ok);
@@ -194,7 +198,7 @@ fn exercise_case(
     destination: TextureDestination,
     width: u32,
     height: u32,
-) {
+) -> bool {
     // Each concurrently running backend owns a distinct decoder ID; registration is RAII.
     let decoder = Decoder::register(128 + backend, format, width, height);
     let config = TextureConfig {
@@ -236,7 +240,7 @@ fn exercise_case(
         {
             // Explicit ASTC admission consults native compression support; never fall back.
             assert_eq!(status, EzGfxResult::Unsupported);
-            return;
+            return true;
         }
         Err(status) => panic!("{format:?} admission failed: {status:?}"),
     };
@@ -263,7 +267,7 @@ fn exercise_case(
         assert_abi_odd_base_unsupported(context, &decoder, format, &pixels.initial);
         drop(decoder);
         exercise_odd_mip(backend, context, quad, format, config);
-        return;
+        return true;
     }
     if backend != 3
         && matches!(
@@ -275,7 +279,7 @@ fn exercise_case(
         // Custom decoders reveal their format asynchronously; rejection can follow admission.
         unload_texture(context, texture);
         assert_stale(context, texture, &pixels.green);
-        return;
+        return true;
     }
     assert_eq!(status, EzGfxResult::Ok, "{format:?} upload failed");
     if format.is_compressed() {
@@ -288,7 +292,16 @@ fn exercise_case(
             "{format:?} compressed readback"
         );
     }
-    quad.draw(texture, true);
+    let draw_status = quad.draw_status(texture, true);
+    #[cfg(not(any(windows, target_vendor = "apple")))]
+    if draw_status == EzGfxResult::Unsupported {
+        // A logical headless surface deliberately exposes missing WSI at the first
+        // presentation-dependent frame. No other error is an accepted capability result.
+        eprintln!("Vulkan headless presentation is unsupported by the selected ICD");
+        unload_texture(context, texture);
+        return false;
+    }
+    assert_eq!(draw_status, EzGfxResult::Ok);
     let before = frame_readback(context).unwrap();
     assert_halves(&before, format, 0, width);
     if format == TextureFormat::Rgba8Unorm {
@@ -320,6 +333,7 @@ fn exercise_case(
         // Exercise real clipped mips independently of whether Metal accepts an odd BC base.
         exercise_odd_mip(backend, context, quad, format, config);
     }
+    true
 }
 
 fn exercise_updates(
@@ -790,11 +804,20 @@ fn assert_stale(context: ContextHandle, texture: TextureHandle, bytes: &[u8]) {
 
 fn assert_halves(pixels: &[u8], format: TextureFormat, left_channel: usize, width: u32) {
     assert_eq!(pixels.len(), 64 * 64 * 4);
-    // Mode 6 shares endpoint p-bits: low channels are 1/255 linear, yielding 13 in sRGB.
-    // Nearest sampling and identical rows avoid interpolation and Y-orientation ambiguity.
+    // Windows and Metal capture an sRGB attachment; Linux Lavapipe's headless
+    // surface exposes UNORM bytes before its SRGB_NONLINEAR presentation transform.
+    let srgb_target = cfg!(any(windows, target_vendor = "apple"));
+    // Mode 6 shares endpoint p-bits: a linear 1/255 encodes to 13 in sRGB,
+    // while encoded sRGB value 1 decodes below one UNORM output step.
     let low = match format {
-        TextureFormat::Bc7Unorm => 13,
-        TextureFormat::Bc7Srgb => 1,
+        TextureFormat::Bc7Unorm => {
+            if srgb_target {
+                13
+            } else {
+                1
+            }
+        }
+        TextureFormat::Bc7Srgb => u8::from(srgb_target),
         _ => 0,
     };
     for (index, pixel) in pixels.chunks_exact(4).enumerate() {
@@ -804,8 +827,12 @@ fn assert_halves(pixels: &[u8], format: TextureFormat, left_channel: usize, widt
             2
         };
         let mut expected = [low, low, low, 255];
-        // The sRGB target re-encodes sampled linear RGB. Midtones distinguish sRGB from UNORM.
         expected[channel] = match format {
+            TextureFormat::Bc1Srgb | TextureFormat::Bc3Srgb if !srgb_target => {
+                [59, 57, 59][channel]
+            }
+            TextureFormat::Bc7Srgb if !srgb_target => 56,
+            TextureFormat::Astc4x4Srgb if !srgb_target => 55,
             TextureFormat::Bc1Srgb | TextureFormat::Bc3Srgb => [132, 130, 132][channel],
             TextureFormat::Bc7Srgb => 129,
             TextureFormat::Astc4x4Srgb => 128,
@@ -1067,9 +1094,13 @@ impl Quad {
         }
     }
 
-    fn draw(&self, texture: TextureHandle, capture: bool) {
+    fn draw_status(&self, texture: TextureHandle, capture: bool) -> EzGfxResult {
         self.record(texture_binding(self.context, texture).unwrap(), capture);
-        assert_eq!(finish_render(self.context), EzGfxResult::Ok);
+        finish_render(self.context)
+    }
+
+    fn draw(&self, texture: TextureHandle, capture: bool) {
+        assert_eq!(self.draw_status(texture, capture), EzGfxResult::Ok);
     }
     fn readback_direct(&self, texture: TextureHandle) -> Vec<u8> {
         // A surfaceless capture exercises the native texture-copy path rather

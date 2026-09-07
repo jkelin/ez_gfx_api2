@@ -312,7 +312,14 @@ fn thread_exit_context() -> ContextHandle {
 
 #[cfg(not(any(windows, target_vendor = "apple")))]
 fn thread_exit_context() -> ContextHandle {
-    create_context(vulkan_options().unwrap()).unwrap()
+    let context = create_context(vulkan_options().unwrap()).unwrap();
+    let surface = create_surface(
+        context,
+        SurfaceOptions::new(0, 0, SurfacePlatform::Headless, 1, 1, 0).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(init_device(context, surface), EzGfxResult::Ok);
+    context
 }
 
 #[cfg(not(target_vendor = "apple"))]
@@ -754,14 +761,14 @@ fn explicit_selection_rejects_unknown_identity_before_native_calls() {
 #[test]
 fn explicit_selection_creates_context_for_enumerated_adapter() {
     // No surface is created, shown, or activated by this test.
-    let wanted = query_adapter_report(false)
+    let wanted = query_adapter_report(true)
         .into_iter()
         .filter(|report| report.adapter().backend() == Backend::Vulkan)
         .find(ez_gfx_runtime::AdapterReport::admitted)
-        .expect("at least one admissible Vulkan adapter")
+        .expect("at least one profile-admitted Vulkan adapter")
         .adapter()
         .stable_id();
-    let options = vulkan_options().unwrap().with_adapter(wanted, false);
+    let options = vulkan_options().unwrap().with_adapter(wanted, true);
     let context = create_context(options).expect("enumerated adapter creates a context");
     assert_eq!(destroy_context(context), EzGfxResult::Ok);
 }

@@ -1,7 +1,8 @@
 use super::{
     AllocationRequest, AttachmentLoadOp, AttachmentStoreOp, CompletionToken, FRAMES_IN_FLIGHT,
     HalError, MemoryAllocator, MemoryClass, NativeContext, NativeFrameAction, NativeFrameResource,
-    NativeSurface, QueueKind, ResourceAccess, map_allocation_hal, map_vk, vk, vulkan_state,
+    NativeSurface, NativeTexture, QueueKind, ResourceAccess, map_allocation_hal, map_vk, vk,
+    vulkan_state,
 };
 #[path = "frame_record.rs"]
 mod record;
@@ -53,45 +54,13 @@ impl NativeContext {
                     );
                 }
                 NativeFrameResource::Texture(texture)
-                | NativeFrameResource::RenderTarget(texture) => {
-                    let ez_gfx_hal::ExecutionRange::Image(range) = barrier.range else {
-                        return Err(HalError::InvalidArgument);
-                    };
-                    // A multisampled target transitions its render storage
-                    // alongside the sampled resolve image so both stay in the
-                    // compiler-derived layouts; the MSAA image is never sampled.
-                    let mut images = [texture.image; 2];
-                    let image_count = if let Some(msaa) = texture.msaa.as_ref() {
-                        images[1] = msaa.image;
-                        2
-                    } else {
-                        1
-                    };
-                    for image in images.iter().take(image_count) {
-                        let barrier_image = vk::ImageMemoryBarrier::default()
-                            .src_access_mask(src_access)
-                            .dst_access_mask(dst_access)
-                            .old_layout(old_layout)
-                            .new_layout(new_layout)
-                            .image(*image)
-                            .subresource_range(vk::ImageSubresourceRange {
-                                aspect_mask: vk::ImageAspectFlags::COLOR,
-                                base_mip_level: range.first_mip,
-                                level_count: range.mip_count,
-                                base_array_layer: range.first_layer,
-                                layer_count: range.layer_count,
-                            });
-                        encoding.device.cmd_pipeline_barrier(
-                            encoding.command,
-                            src_stage,
-                            dst_stage,
-                            vk::DependencyFlags::empty(),
-                            &[],
-                            &[],
-                            core::slice::from_ref(&barrier_image),
-                        );
-                    }
-                }
+                | NativeFrameResource::RenderTarget(texture) => Self::record_texture_barrier(
+                    encoding,
+                    barrier,
+                    texture,
+                    (src_stage, src_access, old_layout),
+                    (dst_stage, dst_access, new_layout),
+                )?,
                 NativeFrameResource::Surface => {
                     let first_present = barrier
                         .before
@@ -161,6 +130,83 @@ impl NativeContext {
                         core::slice::from_ref(&image),
                     );
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn record_texture_barrier(
+        encoding: &VulkanEncoding<'_>,
+        barrier: &ez_gfx_hal::ExecutionBarrier,
+        texture: &NativeTexture,
+        before: (vk::PipelineStageFlags, vk::AccessFlags, vk::ImageLayout),
+        after: (vk::PipelineStageFlags, vk::AccessFlags, vk::ImageLayout),
+    ) -> Result<(), HalError> {
+        let ez_gfx_hal::ExecutionRange::Image(range) = barrier.range else {
+            return Err(HalError::InvalidArgument);
+        };
+        let (src_stage, src_access, old_layout) = before;
+        let (dst_stage, dst_access, new_layout) = after;
+        let subresource_range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: range.first_mip,
+            level_count: range.mip_count,
+            base_array_layer: range.first_layer,
+            layer_count: range.layer_count,
+        };
+        let sampled_image = vk::ImageMemoryBarrier::default()
+            .src_access_mask(src_access)
+            .dst_access_mask(dst_access)
+            .old_layout(old_layout)
+            .new_layout(new_layout)
+            .image(texture.image)
+            .subresource_range(subresource_range);
+        // SAFETY: both images belong to `texture`; the validated range covers
+        // their single color layer and only the sampled image exposes mips.
+        unsafe {
+            encoding.device.cmd_pipeline_barrier(
+                encoding.command,
+                src_stage,
+                dst_stage,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                core::slice::from_ref(&sampled_image),
+            );
+            // MSAA storage is never sampled: it enters color-attachment
+            // layout before rendering and stays there after resolve.
+            if let Some(msaa) = texture.msaa.as_ref()
+                && new_layout == vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+            {
+                let first_use = old_layout == vk::ImageLayout::UNDEFINED;
+                let msaa_image = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(if first_use {
+                        vk::AccessFlags::empty()
+                    } else {
+                        vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                    })
+                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .old_layout(if first_use {
+                        vk::ImageLayout::UNDEFINED
+                    } else {
+                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+                    })
+                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .image(msaa.image)
+                    .subresource_range(subresource_range);
+                encoding.device.cmd_pipeline_barrier(
+                    encoding.command,
+                    if first_use {
+                        vk::PipelineStageFlags::TOP_OF_PIPE
+                    } else {
+                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    },
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    core::slice::from_ref(&msaa_image),
+                );
             }
         }
         Ok(())

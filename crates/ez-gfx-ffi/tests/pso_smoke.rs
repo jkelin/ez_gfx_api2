@@ -48,12 +48,15 @@ void main(uint3 id: SV_DispatchThreadID) { values[id.x] += 1; }
     )
     .unwrap();
 
-    let artifact =
-        match compile_shader(&source, &[Target::Spirv, Target::Dxil, Target::Metal], true) {
-            Ok(artifact) => artifact,
-            Err(CompilerError::NativeUnavailable) => return,
-            Err(error) => panic!("shader compilation failed: {error}"),
-        };
+    #[cfg(windows)]
+    let targets = &[Target::Spirv, Target::Dxil, Target::Metal];
+    #[cfg(not(windows))]
+    let targets = &[Target::Spirv];
+    let artifact = match compile_shader(&source, targets, cfg!(windows)) {
+        Ok(artifact) => artifact,
+        Err(CompilerError::NativeUnavailable) => return,
+        Err(error) => panic!("shader compilation failed: {error}"),
+    };
 
     let native = TestContext::create(backend);
     let context = native.context;

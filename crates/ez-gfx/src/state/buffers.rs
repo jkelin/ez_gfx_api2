@@ -2,7 +2,7 @@ use super::{
     AllocationRequest, ContextHandle, ContextState, DrawIndexedCommand, EzGfxResult,
     IndexedIndirectBuffer, IndirectBufferHandle, MemoryClass, ResourceKind, StructuredBufferHandle,
     allocate_native, free_native_allocation, map_allocation, map_lifecycle, result_status,
-    stage_upload, with_context_mut,
+    retire_native_allocation, stage_upload, with_context_mut,
 };
 
 /// Allocates a structured upload buffer.
@@ -146,12 +146,18 @@ pub fn release_indirect(context: ContextHandle, indirect: IndirectBufferHandle) 
             .indirects
             .remove(&indirect)
             .ok_or(EzGfxResult::InvalidContext)?;
-        context.allocation_ready.remove(&handle);
+        let ready = context.allocation_ready.remove(&handle);
         let (_, allocation) = context
             .allocations
             .remove(&handle)
             .ok_or(EzGfxResult::InvalidContext)?;
-        free_native_allocation(&mut context.native, allocation).map_err(map_allocation)
+        match ready {
+            Some(completion) => {
+                retire_native_allocation(&mut context.native, allocation, completion)
+            }
+            None => free_native_allocation(&mut context.native, allocation),
+        }
+        .map_err(map_allocation)
     });
 }
 /// Uploads bytes to a structured buffer.
@@ -197,11 +203,17 @@ pub fn release_structured(context: ContextHandle, structured: StructuredBufferHa
             .identity
             .remove(handle, ResourceKind::Structured)
             .map_err(map_lifecycle)?;
-        context.allocation_ready.remove(&handle);
+        let ready = context.allocation_ready.remove(&handle);
         let (_, allocation) = context
             .allocations
             .remove(&handle)
             .ok_or(EzGfxResult::InvalidContext)?;
-        free_native_allocation(&mut context.native, allocation).map_err(map_allocation)
+        match ready {
+            Some(completion) => {
+                retire_native_allocation(&mut context.native, allocation, completion)
+            }
+            None => free_native_allocation(&mut context.native, allocation),
+        }
+        .map_err(map_allocation)
     });
 }

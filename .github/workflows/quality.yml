@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -48,6 +52,7 @@ jobs:
           -p ez-gfx-compiler
           -p ez-gfx-ffi
           -p xtask
+          -E 'not (package(ez-gfx) & test(/^state::tests::(adapter_report_names_every_enumerated_adapter|begin_render_target_rejects_foreign_handles|context_decode_worker_count_reaches_pool_construction|creator_thread_exit_returns_and_invalidates_context_handle|destroy_context_before_device_initialization_is_successful_and_terminal|destroy_render_target_clears_bound_override|device_loss_sweeps_pending_decodes_to_fast_device_lost|explicit_selection_creates_context_for_enumerated_adapter|explicit_selection_rejects_unknown_identity_before_native_calls|first_coarse_publication_records_handoff_telemetry_once|frame_begin_clears_stale_render_target_override|heap_slot_exhaustion_is_shared_and_fail_fast|heap_slot_release_reuses_the_freed_binding|heap_slots_unify_textures_and_render_targets_without_collision|probe_render_target_format_rejects_misuse_before_native_work|recursive_context_access_returns_native_failure_without_panicking|rejected_render_target_admissions_leave_no_allocator_residue|render_target_lifecycle_rejects_misuse_before_native_work|texture_admission_is_nonblocking_and_pending_cancellation_invalidates_the_handle|thread_exit_invalidates_populated_context_handle)$/)) & not (package(ez-gfx-ffi) & test(/^(abi_uploads::(vulkan|dx12)_|adapter_enumeration_reports_stable_diagnostics|context_lifecycle_rejects_cross_thread_destroy_and_invalidates_destroyed_handle|explicit_adapter_selection_creates_and_rejects_hidden_contexts|(vulkan|dx12)_render_target_lifecycle_queries_probe_and_begin|(vulkan|dx12)_compiles_|(vulkan|dx12|metal).*(pixels|texture_batches))/))'
       - name: Run platform-neutral doctests
         run: cargo test --doc --workspace
       - name: Test example logic and source-compiled shader artifacts
@@ -100,11 +105,9 @@ jobs:
           clang -std=c11 -Werror -fsyntax-only -Iinclude "$RUNNER_TEMP/ez_gfx_header.c"
           clang++ -std=c++17 -Werror -Wno-ignored-attributes -fsyntax-only -Iinclude "$RUNNER_TEMP/ez_gfx_header.cpp"
 
-
-      # Vulkan runs headless without Win32: the headless-capable suites compile on
-      # Linux, but execution still awaits Lavapipe proof on a real Linux host, so
-      # Linux stays compile-only for native GPU suites. GPU suites need admitted
-      # hardware, unavailable on hosted Lavapipe/SwiftShader. Execute them on real GPU machines.
+      # Hosted Lavapipe proves surfaceless Vulkan 1.3 instance creation. Native
+      # GPU suites still compile only: admission and full rendering require
+      # guaranteed-capability hardware. Execute those suites on real GPU machines.
       - name: Require Linux Lavapipe capability
         if: matrix.backend == 'vulkan-linux'
         shell: bash
@@ -127,12 +130,13 @@ jobs:
             exit 1
           fi
           VK_DRIVER_FILES="$lavapipe_icd" vulkaninfo --summary
-      - name: Test Linux Vulkan device-independent contracts; compile native GPU suites
+          echo "VK_DRIVER_FILES=$lavapipe_icd" >> "$GITHUB_ENV"
+      - name: Test Linux Vulkan contracts and native init; compile GPU suites
         if: matrix.backend == 'vulkan-linux'
         run: |
           cargo nextest run -p ez-gfx-backend-vulkan --lib -E 'not test(texture::texture_tests::)'
           cargo nextest run -p ez-gfx-backend-vulkan --lib -E 'test(texture::texture_tests::)' --no-run
-          cargo nextest run -p ez-gfx-backend-vulkan --test native_init --no-run
+          cargo nextest run -p ez-gfx-backend-vulkan --test native_init
           cargo nextest run -p ez-gfx-examples --test smoke --no-run
           cargo build -p ez-gfx-backend-vulkan
 

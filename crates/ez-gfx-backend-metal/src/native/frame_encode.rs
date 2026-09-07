@@ -1,9 +1,9 @@
 //! Metal frame graphics-draw encoding on one render command encoder.
 
 use super::{
-    CullMode, FrontFace, HalError, MTLCullMode, MTLIndexType, MTLPrimitiveType, MTLRenderStages,
-    MTLResource, MTLResourceUsage, MTLTexture, MTLWinding, MetalFrameEncoder, NativePipeline,
-    PrimitiveTopology, ProtocolObject, c_void,
+    CullMode, FrontFace, HalError, MTLCullMode, MTLIndexType, MTLPrimitiveType,
+    MTLRenderCommandEncoder, MTLRenderStages, MTLResource, MTLResourceUsage, MTLTexture,
+    MTLWinding, MetalFrameEncoder, NativePipeline, PrimitiveTopology, ProtocolObject, c_void,
 };
 
 impl MetalFrameEncoder<'_> {

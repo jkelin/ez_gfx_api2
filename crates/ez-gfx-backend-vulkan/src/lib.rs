@@ -108,7 +108,7 @@ fn sampler_create_info(desc: TextureSamplerDesc, mip_count: u32) -> vk::SamplerC
 pub enum SurfacePlatform {
     /// A Win32 window and application instance.
     Win32,
-    /// A windowless headless surface; carries no native handles.
+    /// A logical surfaceless target; no WSI extension or native surface is required.
     Headless,
 }
 
@@ -122,6 +122,11 @@ impl NativeSurface {
     /// Returns the owned Vulkan surface handle.
     pub const fn handle(&self) -> vk::SurfaceKHR {
         self.handle
+    }
+
+    /// Returns whether this logical target has no native presentation surface.
+    pub fn is_headless(&self) -> bool {
+        self.handle == vk::SurfaceKHR::null()
     }
 
     /// Empty before the first cached presentation; successful draws replace the complete RGBA8 frame.
@@ -451,6 +456,7 @@ pub struct NativeContext {
     entry_loader: Entry,
     instance: Instance,
     surface_loader: khr::surface::Instance,
+    headless_surface_enabled: bool,
     physical_device: Option<vk::PhysicalDevice>,
     adapter_info: Option<AdapterInfo>,
     device: Option<ash::Device>,

@@ -366,7 +366,7 @@ use native::{
     destroy_native_texture, free_native_allocation, map_allocation, map_frame, map_geometry,
     map_hal, map_lifecycle, map_native_loss, map_texture, native_layouts,
     native_texture_compression, pipeline_layout_key, poll_native_frame_completion, result_status,
-    vulkan_bindings, wait_native_idle, write_native,
+    retire_native_allocation, vulkan_bindings, wait_native_idle, write_native,
 };
 mod render_target;
 mod shader;

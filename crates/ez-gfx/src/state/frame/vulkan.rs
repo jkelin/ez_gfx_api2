@@ -482,6 +482,14 @@ pub(super) fn execute_vulkan_frame_plan(
         }
         return Err(EzGfxResult::NativeFailure);
     }
+    if surface.as_ref().is_some_and(
+        |surface| matches!(&surface.native, NativeSurface::Vulkan(native) if native.is_headless()),
+    ) {
+        if let (Some(handle), Some(surface)) = (surface_handle, surface) {
+            context.surfaces.insert(handle, surface);
+        }
+        return Err(EzGfxResult::Unsupported);
+    }
     let mut native_surface = surface
         .as_mut()
         .map(|surface| surface.native.vulkan_mut())

@@ -4,6 +4,30 @@ use super::{
 };
 
 impl NativeContext {
+    /// Creates a headless target without native host handles.
+    ///
+    /// Uses `VK_EXT_headless_surface` when the active ICD exposes it. Otherwise
+    /// the returned logical target supports device initialization and target-only
+    /// work but not presentation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an advertised headless-surface creation call fails.
+    pub fn create_headless_surface(&self) -> Result<NativeSurface, HalError> {
+        let handle = if self.headless_surface_enabled {
+            let loader =
+                ash::ext::headless_surface::Instance::new(&self.entry_loader, &self.instance);
+            let create = vk::HeadlessSurfaceCreateInfoEXT::default();
+            // SAFETY: the instance enabled the advertised headless extension and `create` spans the call.
+            unsafe { loader.create_headless_surface(&create, None) }.map_err(map_vk)?
+        } else {
+            vk::SurfaceKHR::null()
+        };
+        Ok(NativeSurface {
+            handle,
+            presented_rgba8: Vec::new(),
+        })
+    }
     /// Acquires and presents one surface image; zero extents remain minimized.
     ///
     /// # Errors

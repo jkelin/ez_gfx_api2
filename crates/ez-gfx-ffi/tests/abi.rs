@@ -1101,7 +1101,7 @@ fn explicit_adapter_selection_creates_and_rejects_hidden_contexts() {
     let mut written = 0;
     assert_eq!(
         // SAFETY: The buffer names exactly `capacity` writable aligned entries; the written output is live and aligned.
-        unsafe { ez_gfx_adapters_query(0, infos.as_mut_ptr(), total, &raw mut written) },
+        unsafe { ez_gfx_adapters_query(1, infos.as_mut_ptr(), total, &raw mut written) },
         EzGfxResult::Ok
     );
     assert_eq!(written, total);
@@ -1113,7 +1113,7 @@ fn explicit_adapter_selection_creates_and_rejects_hidden_contexts() {
 
     let request = EzGfxAdapterDesc {
         stable_id: wanted,
-        allow_software: 0,
+        allow_software: 1,
     };
     let desc = EzGfxBackendContextDesc {
         enable_debug: 0,

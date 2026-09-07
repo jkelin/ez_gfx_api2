@@ -115,14 +115,32 @@ impl NativeContext {
             .engine_version(vk::make_api_version(0, 0, 1, 0))
             .api_version(vk::API_VERSION_1_3);
 
-        let mut extensions = vec![khr::surface::NAME.as_ptr()];
+        let headless_surface_enabled = if platform == SurfacePlatform::Headless {
+            // SAFETY: successful `Entry::load` initialized instance-extension enumeration.
+            unsafe { entry.enumerate_instance_extension_properties(None) }
+                .map_err(map_vk)?
+                .iter()
+                .any(|extension| {
+                    // SAFETY: Vulkan guarantees a NUL-terminated fixed-size extension name.
+                    (unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) })
+                        == ash::ext::headless_surface::NAME
+                })
+        } else {
+            false
+        };
+        let mut extensions = Vec::new();
         match platform {
-            SurfacePlatform::Win32 => extensions.push(khr::win32_surface::NAME.as_ptr()),
-            // Windowless contexts still create headless surfaces, so the
-            // instance enables the headless extension instead of a WSI one.
-            SurfacePlatform::Headless => {
+            SurfacePlatform::Win32 => {
+                extensions.push(khr::surface::NAME.as_ptr());
+                extensions.push(khr::win32_surface::NAME.as_ptr());
+            }
+            SurfacePlatform::Headless if headless_surface_enabled => {
+                extensions.push(khr::surface::NAME.as_ptr());
                 extensions.push(ash::ext::headless_surface::NAME.as_ptr());
             }
+            // Capable drivers may omit VK_EXT_headless_surface. Contexts remain
+            // usable for target-only work through a logical surfaceless target.
+            SurfacePlatform::Headless => {}
         }
         if enable_debug {
             extensions.push(ash::ext::debug_utils::NAME.as_ptr());
@@ -157,6 +175,7 @@ impl NativeContext {
             entry_loader: entry,
             instance,
             surface_loader,
+            headless_surface_enabled,
             physical_device: None,
             device: None,
             idle_drained: true,
@@ -226,22 +245,6 @@ impl NativeContext {
             .hinstance(display as isize);
         // SAFETY: validated handles are borrowed from the host and Vulkan copies them during creation.
         let handle = unsafe { loader.create_win32_surface(&create, None) }.map_err(map_vk)?;
-        Ok(NativeSurface {
-            handle,
-            presented_rgba8: Vec::new(),
-        })
-    }
-
-    /// Creates a windowless Vulkan headless surface on any host with driver support.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the headless extension is unavailable or surface creation fails.
-    pub fn create_headless_surface(&self) -> Result<NativeSurface, HalError> {
-        let loader = ash::ext::headless_surface::Instance::new(&self.entry_loader, &self.instance);
-        let create = vk::HeadlessSurfaceCreateInfoEXT::default();
-        // SAFETY: the instance enabled the headless extension at creation, and the create-info outlives the call.
-        let handle = unsafe { loader.create_headless_surface(&create, None) }.map_err(map_vk)?;
         Ok(NativeSurface {
             handle,
             presented_rgba8: Vec::new(),
@@ -355,10 +358,10 @@ impl NativeContext {
             self.graphics_queue_family,
             self.adapter_info.as_ref(),
         ) {
-            if let Some((wanted, _)) = selection {
-                if adapter.stable_id() != wanted {
-                    return Err(HalError::InvalidArgument);
-                }
+            if let Some((wanted, _)) = selection
+                && adapter.stable_id() != wanted
+            {
+                return Err(HalError::InvalidArgument);
             }
             if let Some(surface) = surface {
                 // SAFETY: `physical` and `queue_family` come from this instance, but same-instance provenance of the caller-supplied `surface.handle` is not established here.
@@ -478,7 +481,11 @@ impl NativeContext {
                 .multi_draw_indirect(multi_draw)
                 .sampler_anisotropy(core_features.sampler_anisotropy != 0);
             let swapchain_extensions = [khr::swapchain::NAME.as_ptr()];
-            let enabled_extensions = swapchain_extensions.as_slice();
+            let enabled_extensions = if surface.is_some() {
+                swapchain_extensions.as_slice()
+            } else {
+                &[]
+            };
             let create = vk::DeviceCreateInfo::default()
                 .enabled_features(&enabled_core)
                 .enabled_extension_names(enabled_extensions)
@@ -966,8 +973,10 @@ impl NativeContext {
         self.swapchain_format = vk::Format::UNDEFINED;
         self.swapchain_initialized.clear();
         self.swapchain_extent = vk::Extent2D::default();
-        // SAFETY: the host window is still live and no swapchain references this surface.
-        unsafe { self.surface_loader.destroy_surface(surface.handle, None) };
+        if surface.handle != vk::SurfaceKHR::null() {
+            // SAFETY: the host window is still live and no swapchain references this surface.
+            unsafe { self.surface_loader.destroy_surface(surface.handle, None) };
+        }
         drop(surface);
     }
 
@@ -1181,7 +1190,7 @@ mod adapter_tests {
         let wanted = adapters.first().expect("at least one adapter").stable_id();
         let mut context = NativeContext::create(false, false, platform).expect("Vulkan instance");
         let admitted = context
-            .init_device_for_adapter(None, wanted, false)
+            .init_device_for_adapter(None, wanted, true)
             .expect("enumerated adapter initializes");
         assert_eq!(admitted.stable_id(), wanted);
     }

@@ -639,14 +639,17 @@ pub fn init_device(context: ContextHandle, surface: SurfaceHandle) -> EzGfxResul
         // are adapter-agnostic, so the stable identity resolves here.
         let selection = context.options.adapter_selection;
         let adapter = match (&mut context.native, &record.native) {
-            (NativeContext::Vulkan(native), NativeSurface::Vulkan(surface)) => match selection {
-                Some(selected) => native.init_device_for_adapter(
-                    Some(surface),
-                    selected.stable_id,
-                    selected.allow_software,
-                ),
-                None => native.init_device(Some(surface)),
-            },
+            (NativeContext::Vulkan(native), NativeSurface::Vulkan(surface)) => {
+                let presentation_surface = (!surface.is_headless()).then_some(surface);
+                match selection {
+                    Some(selected) => native.init_device_for_adapter(
+                        presentation_surface,
+                        selected.stable_id,
+                        selected.allow_software,
+                    ),
+                    None => native.init_device(presentation_surface),
+                }
+            }
             #[cfg(windows)]
             (NativeContext::Dx12(native), NativeSurface::Dx12(surface)) => {
                 native.init_device(surface)
@@ -840,6 +843,11 @@ pub fn present(context: ContextHandle) -> EzGfxResult {
         let result = match record.state.extent() {
             None => Err(HalError::NotReady),
             Some((width, height)) => match (&mut context.native, &mut record.native) {
+                (NativeContext::Vulkan(_), NativeSurface::Vulkan(surface))
+                    if surface.is_headless() =>
+                {
+                    Err(HalError::Unsupported)
+                }
                 (NativeContext::Vulkan(native), NativeSurface::Vulkan(surface)) => {
                     native.acquire_present(surface, width, height)
                 }

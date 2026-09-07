@@ -385,6 +385,28 @@ pub(super) fn free_native_allocation(
         _ => Err(ez_gfx_hal::AllocationError::NativeFailure),
     }
 }
+
+pub(super) fn retire_native_allocation(
+    context: &mut NativeContext,
+    allocation: NativeAllocation,
+    completion: CompletionToken,
+) -> Result<(), ez_gfx_hal::AllocationError> {
+    match (context, allocation) {
+        (NativeContext::Vulkan(context), NativeAllocation::Vulkan(allocation)) => {
+            context.retire(allocation, completion)
+        }
+        #[cfg(windows)]
+        (NativeContext::Dx12(context), NativeAllocation::Dx12(allocation)) => {
+            context.retire(allocation, completion)
+        }
+        #[cfg(target_vendor = "apple")]
+        (NativeContext::Metal(context), NativeAllocation::Metal(allocation)) => {
+            context.retire(allocation, completion)
+        }
+        #[cfg(any(windows, target_vendor = "apple"))]
+        _ => Err(ez_gfx_hal::AllocationError::NativeFailure),
+    }
+}
 pub(super) fn map_allocation(error: ez_gfx_hal::AllocationError) -> EzGfxResult {
     match error {
         ez_gfx_hal::AllocationError::ZeroSize
