@@ -2,10 +2,13 @@
 
 #[path = "abi/abi_layouts.rs"]
 mod abi_layouts;
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[path = "abi/abi_uploads.rs"]
 mod abi_uploads;
 #[cfg(windows)]
+mod common;
+#[cfg(not(any(windows, target_vendor = "apple")))]
+#[path = "common/headless.rs"]
 mod common;
 
 use core::{
@@ -65,7 +68,7 @@ fn status_values_and_abi_version_are_stable() {
         ],
         [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     );
-    assert_eq!(EZ_GFX_ABI_VERSION, 26);
+    assert_eq!(EZ_GFX_ABI_VERSION, 27);
 }
 
 #[test]
@@ -102,6 +105,52 @@ fn adapter_codes_are_stable() {
         ],
         [0, 1, 2, 3]
     );
+}
+
+#[test]
+fn headless_platform_rejects_non_vulkan_backends_before_native_calls() {
+    // Platform code 3 is headless (ABI 27): Vulkan-only with no native handles.
+    // Rejection happens in descriptor validation before any native call, on every host.
+    for backend in [2, 3] {
+        let desc = EzGfxBackendContextDesc {
+            enable_debug: 0,
+            enable_validation: 0,
+            surface_platform: 3,
+            backend,
+            texture_decode_workers: 0,
+            adapter_count: 0,
+            adapter: core::ptr::null(),
+        };
+        let mut context = 0;
+        assert_eq!(
+            {
+                // SAFETY: descriptor and output storage are live and aligned through the call.
+                unsafe { ez_gfx_context_create_backend(&raw const desc, &raw mut context) }
+            },
+            EzGfxResult::InvalidArgument,
+            "backend={backend}"
+        );
+        assert_eq!(context, 0);
+    }
+    // Unknown platform codes fail closed the same way.
+    let unknown = EzGfxBackendContextDesc {
+        enable_debug: 0,
+        enable_validation: 0,
+        surface_platform: 9,
+        backend: 1,
+        texture_decode_workers: 0,
+        adapter_count: 0,
+        adapter: core::ptr::null(),
+    };
+    let mut context = 0;
+    assert_eq!(
+        {
+            // SAFETY: descriptor and output storage are live and aligned through the call.
+            unsafe { ez_gfx_context_create_backend(&raw const unknown, &raw mut context) }
+        },
+        EzGfxResult::InvalidArgument
+    );
+    assert_eq!(context, 0);
 }
 
 #[test]
@@ -584,13 +633,14 @@ fn context_creation_rejects_boundary_inputs_before_native_calls() {
     assert_eq!(context, 99);
 }
 
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn context_lifecycle_rejects_cross_thread_destroy_and_invalidates_destroyed_handle() {
     let desc = EzGfxContextDesc {
         enable_debug: 0,
         enable_validation: 0,
-        surface_platform: 0,
+        // Win32 contexts need a Win32 host; every other non-Apple host runs headless.
+        surface_platform: if cfg!(windows) { 0 } else { 3 },
         texture_decode_workers: 0,
         adapter_count: 0,
         adapter: core::ptr::null(),
@@ -829,7 +879,7 @@ fn malformed_handles_fail_without_touching_output() {
 ///
 /// Adapters below 4-sample support skip the resolve path they cannot exercise;
 /// no frame begins here since the caller owns the test's frame lifecycle.
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 fn msaa_target_lifecycle(context: ffi::EzGfxContext, base: EzGfxRenderTargetDesc) {
     // A 4-sample RGBA8 probe follows the device ceiling; the RTX runners admit
     // it, and a multisampled target then passes the full lifecycle below.
@@ -865,7 +915,7 @@ fn msaa_target_lifecycle(context: ffi::EzGfxContext, base: EzGfxRenderTargetDesc
     clippy::float_cmp,
     reason = "stored clear values round-trip exactly; no arithmetic is compared"
 )]
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 fn render_target_lifecycle_queries_probe_and_begin_on_hidden_context(backend: u8) {
     use common::TestContext;
 
@@ -1018,7 +1068,7 @@ fn render_target_lifecycle_queries_probe_and_begin_on_hidden_context(backend: u8
     drop(native);
 }
 
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn vulkan_render_target_lifecycle_queries_probe_and_begin() {
     render_target_lifecycle_queries_probe_and_begin_on_hidden_context(1);
@@ -1029,7 +1079,7 @@ fn vulkan_render_target_lifecycle_queries_probe_and_begin() {
 fn dx12_render_target_lifecycle_queries_probe_and_begin() {
     render_target_lifecycle_queries_probe_and_begin_on_hidden_context(2);
 }
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn explicit_adapter_selection_creates_and_rejects_hidden_contexts() {
     // No surface is created, shown, or activated by this test.
@@ -1068,7 +1118,8 @@ fn explicit_adapter_selection_creates_and_rejects_hidden_contexts() {
     let desc = EzGfxBackendContextDesc {
         enable_debug: 0,
         enable_validation: 0,
-        surface_platform: 0,
+        // Win32 contexts need a Win32 host; every other non-Apple host runs headless.
+        surface_platform: if cfg!(windows) { 0 } else { 3 },
         backend: 1,
         texture_decode_workers: 0,
         adapter_count: 1,

@@ -36,6 +36,8 @@ impl TestContext {
             surface_platform: 2,
             backend,
             texture_decode_workers: 0,
+            adapter_count: 0,
+            adapter: core::ptr::null(),
         };
         assert_eq!(
             // SAFETY: The descriptor and output storage remain live and aligned through the call.

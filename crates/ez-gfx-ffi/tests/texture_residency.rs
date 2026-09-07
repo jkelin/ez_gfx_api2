@@ -1,6 +1,10 @@
 //! Progressive native texture-residency tests through the C ABI.
-#![cfg(windows)]
+#![cfg(not(target_vendor = "apple"))]
 
+#[cfg(windows)]
+mod common;
+#[cfg(not(any(windows, target_vendor = "apple")))]
+#[path = "common/headless.rs"]
 mod common;
 
 use common::TestContext;
@@ -56,7 +60,7 @@ fn cancel_after_native_admission(context: u64, bytes: &[u8], desc: &EzGfxTexture
     );
 }
 
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[expect(
     clippy::cognitive_complexity,
     clippy::too_many_lines,
@@ -330,7 +334,7 @@ fn exercises_async_texture_batches(backend: u8) {
     drop(native);
 }
 
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn vulkan_async_texture_batches_reach_full_residency() {
     exercises_async_texture_batches(1);

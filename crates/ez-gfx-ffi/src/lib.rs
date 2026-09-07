@@ -23,8 +23,8 @@ use ez_gfx::{
     IndirectBufferHandle, PublicBinding, RenderTargetHandle, ResourceIdentity, ShaderHandle,
     StructuredBufferHandle, SurfaceHandle, SurfaceOptions, SurfacePlatform, TextureHandle,
 };
-/// Identifies C ABI revision 26 for compatibility checks.
-pub const EZ_GFX_ABI_VERSION: u32 = 26;
+/// Identifies C ABI revision 27 for compatibility checks.
+pub const EZ_GFX_ABI_VERSION: u32 = 27;
 /// Caps any caller-provided byte range at 16 MiB.
 pub const EZ_GFX_MAX_BOUNDARY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -593,6 +593,7 @@ pub unsafe extern "C" fn ez_gfx_surface_create(
             0 => SurfacePlatform::Win32,
             1 => SurfacePlatform::Glfw,
             2 => SurfacePlatform::MetalLayer,
+            3 => SurfacePlatform::Headless,
             _ => return EzGfxResult::InvalidArgument,
         };
         let Ok(options) = SurfaceOptions::new(

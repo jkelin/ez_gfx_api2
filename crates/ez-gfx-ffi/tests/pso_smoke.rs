@@ -1,6 +1,10 @@
 //! Native Vulkan and DX12 compute-pipeline smoke tests through the C ABI.
-#![cfg(windows)]
+#![cfg(not(target_vendor = "apple"))]
 
+#[cfg(windows)]
+mod common;
+#[cfg(not(any(windows, target_vendor = "apple")))]
+#[path = "common/headless.rs"]
 mod common;
 
 use common::TestContext;
@@ -11,7 +15,7 @@ use ez_gfx_ffi::{
     ez_gfx_structured_acquire, ez_gfx_structured_release, ez_gfx_structured_write,
 };
 
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn vulkan_compiles_binds_and_executes_compute_pipeline() {
     run_compute_pipeline(1);
@@ -24,6 +28,7 @@ fn dx12_compiles_sm65_pso_and_dispatches_on_hardware() {
 }
 
 /// Each backend uses a distinct temporary directory so parallel native tests cannot race artifact output.
+#[cfg(not(target_vendor = "apple"))]
 fn run_compute_pipeline(backend: u8) {
     let root = std::env::temp_dir().join(format!("ez-gfx-pso-{}-{backend}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();

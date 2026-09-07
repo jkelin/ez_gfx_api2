@@ -9,6 +9,8 @@ pub enum SurfacePlatform {
     Glfw,
     /// Uses a Core Animation Metal layer.
     MetalLayer,
+    /// Uses a windowless Vulkan headless surface; carries no native handles.
+    Headless,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,7 +75,7 @@ impl ContextOptions {
     }
 
     /// Backend/platform pairs are closed: DX12 requires Win32, Metal requires a layer, and Vulkan
-    /// accepts host-window platforms but never a Metal layer.
+    /// accepts host-window platforms and headless, but never a Metal layer.
     ///
     /// # Errors
     ///
@@ -89,7 +91,7 @@ impl ContextOptions {
             (backend, surface_platform),
             (
                 Backend::Vulkan,
-                SurfacePlatform::Win32 | SurfacePlatform::Glfw
+                SurfacePlatform::Win32 | SurfacePlatform::Glfw | SurfacePlatform::Headless
             ) | (Backend::Dx12, SurfacePlatform::Win32)
                 | (Backend::Metal, SurfacePlatform::MetalLayer)
         ) {
@@ -144,7 +146,7 @@ pub struct SurfaceOptions {
 }
 
 impl SurfaceOptions {
-    /// GLFW may omit display; Win32 requires both borrowed handles; Metal accepts a borrowed `CAMetalLayer`.
+    /// GLFW may omit display; Win32 requires both borrowed handles; headless carries none.
     ///
     /// # Errors
     ///
@@ -157,7 +159,9 @@ impl SurfaceOptions {
         height: u32,
         cache: u8,
     ) -> Result<Self, PublicApiError> {
-        if window == 0 || (platform == SurfacePlatform::Win32 && display == 0) {
+        if (window == 0 && platform != SurfacePlatform::Headless)
+            || (platform == SurfacePlatform::Win32 && display == 0)
+        {
             return Err(PublicApiError::MissingNativeHandle);
         }
         validate_extent(width, height)?;
@@ -289,6 +293,7 @@ fn parse_platform(value: u8) -> Result<SurfacePlatform, PublicApiError> {
         0 => Ok(SurfacePlatform::Win32),
         1 => Ok(SurfacePlatform::Glfw),
         2 => Ok(SurfacePlatform::MetalLayer),
+        3 => Ok(SurfacePlatform::Headless),
         _ => Err(PublicApiError::InvalidPlatform),
     }
 }

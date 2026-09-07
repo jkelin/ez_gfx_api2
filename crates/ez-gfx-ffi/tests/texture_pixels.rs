@@ -1,10 +1,13 @@
 //! Hidden native compressed sampling, edge-update, and submitted-frame retirement regression.
-#![cfg(any(windows, target_vendor = "apple"))]
+#![cfg(not(target_vendor = "apple"))]
 
 #[cfg(windows)]
 mod common;
 #[cfg(target_vendor = "apple")]
 #[path = "common/metal.rs"]
+mod common;
+#[cfg(not(any(windows, target_vendor = "apple")))]
+#[path = "common/headless.rs"]
 mod common;
 #[cfg(target_vendor = "apple")]
 #[path = "texture_pixels/ingestion.rs"]
@@ -19,7 +22,7 @@ use common::TestContext;
 use ez_gfx::*;
 use ez_gfx_compiler::{Target, compile_shader};
 
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn vulkan_bc_pixels_survive_region_updates_and_unload() {
     const CHILD: &str = "EZ_GFX_TEXTURE_PIXELS_VALIDATION_CHILD";
@@ -42,25 +45,29 @@ fn metal_compressed_pixels_survive_region_updates_and_unload() {
     exercise_backend(3);
 }
 
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 fn assert_validation_clean(child_marker: &str) {
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
     use std::{
         io::{Read, Write},
-        os::windows::process::CommandExt,
         process::{Command, Stdio},
     };
 
     // The validation layer writes directly to native stdout/stderr, outside Rust's test capture.
-    // A hidden child makes those messages test failures even when the rendered pixels look right.
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "vulkan_bc_pixels_survive_region_updates_and_unload",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(child_marker, "1")
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW: never create or activate a console.
+    // A child process makes those messages test failures even when the rendered pixels look right.
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command.args([
+        "--exact",
+        "vulkan_bc_pixels_survive_region_updates_and_unload",
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    command.env(child_marker, "1");
+    // CREATE_NO_WINDOW: never create or activate a console.
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -117,7 +124,7 @@ fn assert_validation_clean(child_marker: &str) {
 fn exercise_backend(backend: u8) {
     // One compilation avoids concurrent compiler artifact writes by the backend tests.
     static ARTIFACT: LazyLock<Vec<u8>> = LazyLock::new(|| {
-        #[cfg(windows)]
+        #[cfg(not(target_vendor = "apple"))]
         let targets = &[Target::Spirv, Target::Dxil, Target::Metal];
         #[cfg(target_vendor = "apple")]
         let targets = &[Target::Metal];
@@ -130,7 +137,7 @@ fn exercise_backend(backend: u8) {
         )
         .expect("compile cube shader artifact")
     });
-    #[cfg(windows)]
+    #[cfg(not(target_vendor = "apple"))]
     // A missing Vulkan validation layer is a failure, never a silent unvalidated run.
     let native = if backend == 1 {
         TestContext::create_with_validation(backend, true)

@@ -1,6 +1,12 @@
 use super::*;
 use std::collections::HashSet;
 
+#[cfg(not(target_vendor = "apple"))]
+fn vulkan_options() -> Result<ContextOptions, ez_gfx_runtime::PublicApiError> {
+    // Win32 contexts need a Win32 host; every other non-Apple host runs headless.
+    ContextOptions::new_for_backend(0, 0, if cfg!(windows) { 0 } else { 3 }, Backend::Vulkan)
+}
+
 fn shader() -> ShaderHandle {
     ShaderHandle::from_packed(
         PackedHandle::child(
@@ -64,7 +70,7 @@ fn graphics_pipeline_keys_include_state_attachment_and_texture_interface() {
     );
 }
 
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 fn texture_config() -> TextureConfig {
     TextureConfig {
         width: 1,
@@ -82,12 +88,10 @@ fn texture_config() -> TextureConfig {
     }
 }
 
-// The native Vulkan context currently requires Win32 support.
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn texture_admission_is_nonblocking_and_pending_cancellation_invalidates_the_handle() {
-    let context =
-        create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).unwrap()).unwrap();
+    let context = create_context(vulkan_options().unwrap()).unwrap();
     let gate = Arc::new(std::sync::Barrier::new(2));
     with_context_mut(context, |state| {
         state.async_textures.decode_gate = Some(gate.clone());
@@ -147,12 +151,10 @@ fn texture_region_validation_and_update_backpressure_are_stable() {
     );
 }
 
-// The native Vulkan context currently requires Win32 support.
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn first_coarse_publication_records_handoff_telemetry_once() {
-    let context =
-        create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).unwrap()).unwrap();
+    let context = create_context(vulkan_options().unwrap()).unwrap();
     let texture = with_context_mut(context, |state| {
         let packed = state
             .identity
@@ -211,11 +213,10 @@ fn first_coarse_publication_records_handoff_telemetry_once() {
 fn dx12_context() -> ContextHandle {
     create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Dx12).unwrap()).unwrap()
 }
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn destroy_context_before_device_initialization_is_successful_and_terminal() {
-    let context =
-        create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).unwrap()).unwrap();
+    let context = create_context(vulkan_options().unwrap()).unwrap();
 
     assert_eq!(destroy_context(context), EzGfxResult::Ok);
     assert_eq!(wait_idle(context), EzGfxResult::InvalidContext);
@@ -245,13 +246,11 @@ fn decode_worker_topology_rejects_absurd_counts_before_spawning() {
     );
 }
 
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn context_decode_worker_count_reaches_pool_construction() {
     // The context option must reach the async texture pool on a real backend.
-    let explicit_options = ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan)
-        .unwrap()
-        .with_texture_decode_workers(2);
+    let explicit_options = vulkan_options().unwrap().with_texture_decode_workers(2);
     let explicit_context = create_context(explicit_options).unwrap();
     let explicit_workers = with_context_mut(explicit_context, |state| {
         Ok(state.async_textures.worker_count())
@@ -311,7 +310,12 @@ fn thread_exit_context() -> ContextHandle {
     create_context(ContextOptions::new_for_backend(0, 0, 2, Backend::Metal).unwrap()).unwrap()
 }
 
-#[cfg(any(windows, target_vendor = "apple"))]
+#[cfg(not(any(windows, target_vendor = "apple")))]
+fn thread_exit_context() -> ContextHandle {
+    create_context(vulkan_options().unwrap()).unwrap()
+}
+
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn recursive_context_access_returns_native_failure_without_panicking() {
     let context = thread_exit_context();
@@ -324,7 +328,7 @@ fn recursive_context_access_returns_native_failure_without_panicking() {
     assert_eq!(destroy_context(context), EzGfxResult::Ok);
 }
 
-#[cfg(any(windows, target_vendor = "apple"))]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn thread_exit_invalidates_populated_context_handle() {
     let context = thread_exit_context();
@@ -334,7 +338,7 @@ fn thread_exit_invalidates_populated_context_handle() {
     assert_eq!(cleanup, EzGfxResult::Ok);
     assert_eq!(wait_idle(context), EzGfxResult::InvalidContext);
 }
-#[cfg(any(windows, target_vendor = "apple"))]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn creator_thread_exit_returns_and_invalidates_context_handle() {
     let stale = std::thread::spawn(thread_exit_context).join().unwrap();
@@ -375,11 +379,10 @@ fn lost_context_can_still_be_destroyed_terminally() {
     assert_eq!(wait_idle(context), EzGfxResult::InvalidContext);
 }
 
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn device_loss_sweeps_pending_decodes_to_fast_device_lost() {
-    let context =
-        create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).unwrap()).unwrap();
+    let context = create_context(vulkan_options().unwrap()).unwrap();
     let gate = Arc::new(std::sync::Barrier::new(2));
     with_context_mut(context, |state| {
         state.async_textures.decode_gate = Some(gate.clone());
@@ -439,13 +442,11 @@ fn coarse_range_completion_ignores_hidden_fine_updates() {
     }
 }
 
-// The native Vulkan context currently requires Win32 support.
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn render_target_lifecycle_rejects_misuse_before_native_work() {
     use ez_gfx_runtime::target::{ClearValue, TargetDeclaration, TargetUsage};
-    let context =
-        create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).unwrap()).unwrap();
+    let context = create_context(vulkan_options().unwrap()).unwrap();
     let declaration = TargetDeclaration::new(
         "rt-proof",
         TargetUsage::Color,
@@ -506,12 +507,10 @@ fn render_target_lifecycle_rejects_misuse_before_native_work() {
     destroy_render_target(context, phantom);
 }
 
-// The native Vulkan context currently requires Win32 support.
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn probe_render_target_format_rejects_misuse_before_native_work() {
-    let context =
-        create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).unwrap()).unwrap();
+    let context = create_context(vulkan_options().unwrap()).unwrap();
     // Sample counts outside the closed set fail before probing any device.
     assert_eq!(
         probe_render_target_format(context, Format::Rgba8Unorm, 3),
@@ -526,12 +525,10 @@ fn probe_render_target_format_rejects_misuse_before_native_work() {
     );
 }
 
-// The native Vulkan context currently requires Win32 support.
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn begin_render_target_rejects_foreign_handles() {
-    let context =
-        create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).unwrap()).unwrap();
+    let context = create_context(vulkan_options().unwrap()).unwrap();
     // A forged handle resolves to nothing.
     let phantom = RenderTargetHandle::from_packed(
         PackedHandle::child(
@@ -575,12 +572,10 @@ fn stale_target() -> RenderTargetHandle {
     .unwrap()
 }
 
-// The native Vulkan context currently requires Win32 support.
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn frame_begin_clears_stale_render_target_override() {
-    let context =
-        create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).unwrap()).unwrap();
+    let context = create_context(vulkan_options().unwrap()).unwrap();
     with_context_mut(context, |context| {
         context.frame_render_target = Some(stale_target());
         Ok(())
@@ -594,12 +589,10 @@ fn frame_begin_clears_stale_render_target_override() {
     .unwrap();
 }
 
-// The native Vulkan context currently requires Win32 support.
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn destroy_render_target_clears_bound_override() {
-    let context =
-        create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).unwrap()).unwrap();
+    let context = create_context(vulkan_options().unwrap()).unwrap();
     with_context_mut(context, |context| {
         context.frame_render_target = Some(stale_target());
         Ok(())
@@ -614,13 +607,11 @@ fn destroy_render_target_clears_bound_override() {
     .unwrap();
 }
 
-// The native Vulkan context currently requires Win32 support.
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn heap_slots_unify_textures_and_render_targets_without_collision() {
     use std::collections::HashSet;
-    let context =
-        create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).unwrap()).unwrap();
+    let context = create_context(vulkan_options().unwrap()).unwrap();
     with_context_mut(context, |context| {
         // Textures (`begin_upload`) and render targets (same call in
         // `create_render_target`) draw from one free-list, so interleaved
@@ -644,13 +635,10 @@ fn heap_slots_unify_textures_and_render_targets_without_collision() {
     })
     .unwrap();
 }
-
-// The native Vulkan context currently requires Win32 support.
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn heap_slot_release_reuses_the_freed_binding() {
-    let context =
-        create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).unwrap()).unwrap();
+    let context = create_context(vulkan_options().unwrap()).unwrap();
     with_context_mut(context, |context| {
         // `destroy_render_target` releases via `cancel_upload`; the next lease
         // must reuse the freed slot instead of growing the heap.
@@ -668,13 +656,11 @@ fn heap_slot_release_reuses_the_freed_binding() {
     .unwrap();
 }
 
-// The native Vulkan context currently requires Win32 support.
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn heap_slot_exhaustion_is_shared_and_fail_fast() {
     let capacity = ez_gfx_runtime::binding::MAX_TEXTURE_HEAP_CAPACITY as usize;
-    let context =
-        create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).unwrap()).unwrap();
+    let context = create_context(vulkan_options().unwrap()).unwrap();
     with_context_mut(context, |context| {
         // Textures and targets share one cap: filling it with texture leases
         // leaves no room for a target lease, mapping to `NativeFailure` like
@@ -697,13 +683,11 @@ fn heap_slot_exhaustion_is_shared_and_fail_fast() {
     .unwrap();
 }
 
-// The native Vulkan context currently requires Win32 support.
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn rejected_render_target_admissions_leave_no_allocator_residue() {
     use ez_gfx_runtime::target::{ClearValue, TargetDeclaration, TargetUsage};
-    let context =
-        create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).unwrap()).unwrap();
+    let context = create_context(vulkan_options().unwrap()).unwrap();
     let color = TargetDeclaration::new(
         "rt-residue",
         TargetUsage::Color,
@@ -763,9 +747,7 @@ fn rejected_render_target_admissions_leave_no_allocator_residue() {
 #[test]
 fn explicit_selection_rejects_unknown_identity_before_native_calls() {
     // No surface is created, shown, or activated by this test.
-    let options = ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan)
-        .unwrap()
-        .with_adapter([0xA5; 16], false);
+    let options = vulkan_options().unwrap().with_adapter([0xA5; 16], false);
     assert_eq!(create_context(options), Err(EzGfxResult::InvalidArgument));
 }
 
@@ -779,9 +761,7 @@ fn explicit_selection_creates_context_for_enumerated_adapter() {
         .expect("at least one admissible Vulkan adapter")
         .adapter()
         .stable_id();
-    let options = ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan)
-        .unwrap()
-        .with_adapter(wanted, false);
+    let options = vulkan_options().unwrap().with_adapter(wanted, false);
     let context = create_context(options).expect("enumerated adapter creates a context");
     assert_eq!(destroy_context(context), EzGfxResult::Ok);
 }

@@ -126,6 +126,16 @@ fn build_native_context(options: &ContextOptions) -> Result<NativeContext, EzGfx
                 .map_err(map_hal)?,
             ))
         }
+        Backend::Vulkan if options.surface_platform == SurfacePlatform::Headless => {
+            NativeContext::Vulkan(Box::new(
+                VulkanContext::create(
+                    options.enable_debug,
+                    options.enable_validation,
+                    VulkanPlatform::Headless,
+                )
+                .map_err(map_hal)?,
+            ))
+        }
         Backend::Vulkan => return Err(EzGfxResult::Unsupported),
         Backend::Dx12 => {
             if options.surface_platform != SurfacePlatform::Win32 {
@@ -187,6 +197,21 @@ fn build_native_context_for_adapter(
                     options.enable_debug,
                     options.enable_validation,
                     VulkanPlatform::Win32,
+                )
+                .map_err(map_hal)?,
+            ))
+        }
+        Backend::Vulkan if options.surface_platform == SurfacePlatform::Headless => {
+            let catalog =
+                AdapterCatalog::new(backend_adapters(Backend::Vulkan)).map_err(map_runtime)?;
+            catalog
+                .select(selection.stable_id, selection.allow_software)
+                .map_err(map_runtime)?;
+            NativeContext::Vulkan(Box::new(
+                VulkanContext::create(
+                    options.enable_debug,
+                    options.enable_validation,
+                    VulkanPlatform::Headless,
                 )
                 .map_err(map_hal)?,
             ))
@@ -553,12 +578,15 @@ pub fn create_surface(
         if options.platform != context.options.surface_platform {
             return Err(EzGfxResult::InvalidArgument);
         }
+        let headless = options.platform == SurfacePlatform::Headless;
         let native = match &mut context.native {
-            NativeContext::Vulkan(native) => NativeSurface::Vulkan(
+            NativeContext::Vulkan(native) => NativeSurface::Vulkan(if headless {
+                native.create_headless_surface().map_err(map_hal)?
+            } else {
                 native
                     .create_win32_surface(options.window as *mut _, options.display as *mut _)
-                    .map_err(map_hal)?,
-            ),
+                    .map_err(map_hal)?
+            }),
             #[cfg(windows)]
             NativeContext::Dx12(_) => {
                 NativeSurface::Dx12(Dx12Surface::new(options.window as *mut _).map_err(map_hal)?)

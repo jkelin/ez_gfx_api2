@@ -2,7 +2,7 @@
 
 use super::*;
 
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 fn geometry_uploads_use_real_device_buffers_and_transfer_fence(backend: u8) {
     let native = common::TestContext::create(backend);
     let context = native.context;
@@ -66,7 +66,7 @@ fn geometry_uploads_use_real_device_buffers_and_transfer_fence(backend: u8) {
     drop(native);
 }
 
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn vulkan_geometry_uploads_use_real_device_buffers_and_transfer_timeline() {
     geometry_uploads_use_real_device_buffers_and_transfer_fence(1);
@@ -160,7 +160,7 @@ fn dx12_texture_upload_becomes_resident_and_unload_invalidates_handle() {
     ez_gfx_context_destroy(context);
 }
 
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
     let native = common::TestContext::create(backend);
     let context = native.context;
@@ -272,7 +272,7 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
     drop(native);
 }
 
-#[cfg(windows)]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn vulkan_frame_uploads_indirect_compiles_graph_and_reads_back_texture() {
     frame_uploads_indirect_compiles_graph_and_reads_back_texture(1);

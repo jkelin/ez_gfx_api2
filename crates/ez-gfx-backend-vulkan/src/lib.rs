@@ -108,6 +108,8 @@ fn sampler_create_info(desc: TextureSamplerDesc, mip_count: u32) -> vk::SamplerC
 pub enum SurfacePlatform {
     /// A Win32 window and application instance.
     Win32,
+    /// A windowless headless surface; carries no native handles.
+    Headless,
 }
 
 /// Borrowed Vulkan presentation surface and optional captured frame.

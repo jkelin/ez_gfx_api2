@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<ez-gfx-bindings version="1" abi-version="26" library="ez_gfx_ffi">
+<ez-gfx-bindings version="1" abi-version="27" library="ez_gfx_ffi">
   <description>Public EzGfx C ABI. This file is manually maintained; generated headers and managed bindings are derived from it.</description>
   <handles>
     <handle name="EzGfxContext" doc="Opaque packed u64 context handle (slot+1/generation in bits 0-39)." />
@@ -68,6 +68,7 @@
       <value name="EzGfxSurfacePlatform_Win32" value="0" doc="Win32 HWND and HINSTANCE handles." />
       <value name="EzGfxSurfacePlatform_GLFW" value="1" doc="GLFW native window handle." />
       <value name="EzGfxSurfacePlatform_MetalLayer" value="2" doc="Borrowed CAMetalLayer pointer." />
+      <value name="EzGfxSurfacePlatform_Headless" value="3" doc="Windowless Vulkan headless surface; no native handles. Requires ABI 27." />
     </enum>
     <enum name="EzGfxSourceTextureFormat" underlying="uint8_t" doc="Source image encoding; values 128 through 255 are application decoders.">
       <value name="EzGfxSourceTextureFormat_Rgb" value="0" doc="Raw RGB pixels." />

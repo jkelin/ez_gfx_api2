@@ -33,6 +33,30 @@ fn context_backend_and_platform_pairs_are_validated() {
 }
 
 #[test]
+fn headless_platform_serves_windowless_vulkan_only() {
+    assert!(ContextOptions::new_for_backend(0, 0, 3, Backend::Vulkan).is_ok());
+    assert_eq!(
+        ContextOptions::new_for_backend(0, 0, 3, Backend::Dx12),
+        Err(PublicApiError::InvalidPlatform)
+    );
+    assert_eq!(
+        ContextOptions::new_for_backend(0, 0, 3, Backend::Metal),
+        Err(PublicApiError::InvalidPlatform)
+    );
+    assert_eq!(
+        SurfaceOptions::new(0, 0, SurfacePlatform::Headless, 64, 64, 0),
+        Ok(SurfaceOptions {
+            window: 0,
+            display: 0,
+            platform: SurfacePlatform::Headless,
+            width: 64,
+            height: 64,
+            cache_presented_snapshots: false
+        })
+    );
+}
+
+#[test]
 fn context_decode_workers_default_to_zero_and_accept_explicit_counts() {
     // Zero preserves the default topology; the builder only records the request.
     let default_options = ContextOptions::new(0, 0, 0).unwrap();

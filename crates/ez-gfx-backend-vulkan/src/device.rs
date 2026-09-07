@@ -118,6 +118,11 @@ impl NativeContext {
         let mut extensions = vec![khr::surface::NAME.as_ptr()];
         match platform {
             SurfacePlatform::Win32 => extensions.push(khr::win32_surface::NAME.as_ptr()),
+            // Windowless contexts still create headless surfaces, so the
+            // instance enables the headless extension instead of a WSI one.
+            SurfacePlatform::Headless => {
+                extensions.push(ash::ext::headless_surface::NAME.as_ptr());
+            }
         }
         if enable_debug {
             extensions.push(ash::ext::debug_utils::NAME.as_ptr());
@@ -227,6 +232,22 @@ impl NativeContext {
         })
     }
 
+    /// Creates a windowless Vulkan headless surface on any host with driver support.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the headless extension is unavailable or surface creation fails.
+    pub fn create_headless_surface(&self) -> Result<NativeSurface, HalError> {
+        let loader = ash::ext::headless_surface::Instance::new(&self.entry_loader, &self.instance);
+        let create = vk::HeadlessSurfaceCreateInfoEXT::default();
+        // SAFETY: the instance enabled the headless extension at creation, and the create-info outlives the call.
+        let handle = unsafe { loader.create_headless_surface(&create, None) }.map_err(map_vk)?;
+        Ok(NativeSurface {
+            handle,
+            presented_rgba8: Vec::new(),
+        })
+    }
+
     #[cfg(not(windows))]
     /// Creates a Vulkan surface from borrowed Win32 handles.
     ///
@@ -297,7 +318,13 @@ impl NativeContext {
         // A throwaway instance suffices: description needs properties, features,
         // and queue families only. Drop reclaims context state; the instance
         // handle follows the existing context lifecycle.
-        let probe = NativeContext::create(false, false, SurfacePlatform::Win32)?;
+        // Win32 instances need a Win32 loader; every other host probes headless.
+        let platform = if cfg!(windows) {
+            SurfacePlatform::Win32
+        } else {
+            SurfacePlatform::Headless
+        };
+        let probe = NativeContext::create(false, false, platform)?;
         // SAFETY: the instance is live and owns returned physical-device handles.
         let devices = unsafe { probe.instance.enumerate_physical_devices() }.map_err(map_vk)?;
         let mut adapters = Vec::new();
@@ -1128,8 +1155,13 @@ mod adapter_tests {
     #[test]
     fn explicit_selection_rejects_unknown_identity() {
         // No surface is created, shown, or activated by this test.
-        let mut context =
-            NativeContext::create(false, false, SurfacePlatform::Win32).expect("Vulkan instance");
+        // Win32 instances need a Win32 loader; every other host probes headless.
+        let platform = if cfg!(windows) {
+            SurfacePlatform::Win32
+        } else {
+            SurfacePlatform::Headless
+        };
+        let mut context = NativeContext::create(false, false, platform).expect("Vulkan instance");
         assert_eq!(
             context.init_device_for_adapter(None, [0xA5; 16], false),
             Err(HalError::InvalidArgument)
@@ -1139,10 +1171,15 @@ mod adapter_tests {
     #[test]
     fn explicit_selection_admits_enumerated_adapter() {
         // No surface is created, shown, or activated by this test.
+        // Win32 instances need a Win32 loader; every other host probes headless.
+        let platform = if cfg!(windows) {
+            SurfacePlatform::Win32
+        } else {
+            SurfacePlatform::Headless
+        };
         let adapters = NativeContext::enumerate_adapters().expect("Vulkan enumerates adapters");
         let wanted = adapters.first().expect("at least one adapter").stable_id();
-        let mut context =
-            NativeContext::create(false, false, SurfacePlatform::Win32).expect("Vulkan instance");
+        let mut context = NativeContext::create(false, false, platform).expect("Vulkan instance");
         let admitted = context
             .init_device_for_adapter(None, wanted, false)
             .expect("enumerated adapter initializes");

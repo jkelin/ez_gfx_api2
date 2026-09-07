@@ -32,6 +32,7 @@ This repository is a Rust/Cargo migration of `ez_gfx_api`. Preserve the recogniz
 - Keep architecture decisions and status evidence current in the existing plan documents and `TODO.md`; do not duplicate or silently rewrite canonical decisions. Record new cross-module architectural work in root `TODO.md` and remove it when resolved.
 - Treat `docs/textures.md` as the canonical texture contract. Update it with every texture machinery, public API, backend behavior, synchronization, or lifecycle change.
 - In personal-project implementations, comment edge cases local to the function being changed. Keep comments operational and specific; avoid speculative completion claims.
+- You can also read `VERIFICATION_HOSTS.md` to get addresses for ssh boxes to use for cross platform verification.
 
 ## Verification
 

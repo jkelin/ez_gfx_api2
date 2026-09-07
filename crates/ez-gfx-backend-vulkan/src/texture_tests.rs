@@ -109,7 +109,13 @@ impl Drop for ShaderSource {
 
 fn context() -> NativeContext {
     // No surface is created, shown, or activated by these tests.
-    let mut context = NativeContext::create(false, false, SurfacePlatform::Win32).unwrap();
+    // Win32 instances need a Win32 loader; every other host probes headless.
+    let platform = if cfg!(windows) {
+        SurfacePlatform::Win32
+    } else {
+        SurfacePlatform::Headless
+    };
+    let mut context = NativeContext::create(false, false, platform).unwrap();
     context.init_device(None).unwrap();
     context
 }

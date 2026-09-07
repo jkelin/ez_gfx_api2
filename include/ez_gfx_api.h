@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define EZ_GFX_ABI_VERSION 26u
+#define EZ_GFX_ABI_VERSION 27u
 
 #if defined(__clang__)
 #  if __has_attribute(access)
@@ -161,6 +161,7 @@ enum {
  * EzGfxSurfacePlatform:
  * @EzGfxSurfacePlatform_Win32: Win32 HWND and HINSTANCE handles.
  * @EzGfxSurfacePlatform_GLFW: GLFW native window handle.
+ * @EzGfxSurfacePlatform_Headless: Windowless Vulkan headless surface; no native handles. Requires ABI 27.
  *
  * Native surface platform.
  */
@@ -171,6 +172,8 @@ enum {
 };
 /* Borrowed CAMetalLayer pointer in EzGfxSurfaceDesc.window. */
 #define EzGfxSurfacePlatform_MetalLayer 2
+/* Windowless headless surface; EzGfxSurfaceDesc.window and EzGfxSurfaceDesc.display are null. Requires ABI 27. */
+#define EzGfxSurfacePlatform_Headless 3
 
 /**
  * EzGfxSourceTextureFormat:
@@ -422,8 +425,8 @@ typedef struct EzGfxBackendContextDesc {
 
 /**
  * EzGfxSurfaceDesc:
- * @window (not nullable): Native HWND or CAMetalLayer pointer.
- * @display (nullable): Native HINSTANCE; null for Metal and permitted for GLFW.
+ * @window (nullable for Headless): Native HWND or CAMetalLayer pointer; null for Headless.
+ * @display (nullable): Native HINSTANCE; null for Metal and Headless, permitted for GLFW.
  * @platform: Value from EzGfxSurfacePlatform.
  * @width: Initial framebuffer width.
  * @height: Initial framebuffer height.
