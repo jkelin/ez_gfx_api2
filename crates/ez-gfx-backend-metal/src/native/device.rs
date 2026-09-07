@@ -41,6 +41,9 @@ fn target_format_support(max_color_samples: u8) -> Vec<ez_gfx_runtime::target::F
     };
     vec![
         color(Format::Rgba8Unorm, true),
+        // Every surface graph resource is BGRA8 sRGB and the native
+        // constructor lowers it, so the probe must advertise the family.
+        color(Format::Bgra8Srgb, true),
         color(Format::Rgba16Float, true),
         single(Format::Depth32Float, false, true, false),
     ]
