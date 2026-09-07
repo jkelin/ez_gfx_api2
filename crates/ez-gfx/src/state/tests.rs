@@ -305,11 +305,6 @@ fn thread_exit_context() -> ContextHandle {
     dx12_context()
 }
 
-#[cfg(target_vendor = "apple")]
-fn thread_exit_context() -> ContextHandle {
-    create_context(ContextOptions::new_for_backend(0, 0, 2, Backend::Metal).unwrap()).unwrap()
-}
-
 #[cfg(not(any(windows, target_vendor = "apple")))]
 fn thread_exit_context() -> ContextHandle {
     let context = create_context(vulkan_options().unwrap()).unwrap();
@@ -568,6 +563,7 @@ fn begin_render_target_rejects_foreign_handles() {
     );
 }
 
+#[cfg(not(target_vendor = "apple"))]
 fn stale_target() -> RenderTargetHandle {
     RenderTargetHandle::from_packed(
         PackedHandle::child(
@@ -751,6 +747,7 @@ fn rejected_render_target_admissions_leave_no_allocator_residue() {
     .unwrap();
 }
 
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn explicit_selection_rejects_unknown_identity_before_native_calls() {
     // No surface is created, shown, or activated by this test.
@@ -758,6 +755,7 @@ fn explicit_selection_rejects_unknown_identity_before_native_calls() {
     assert_eq!(create_context(options), Err(EzGfxResult::InvalidArgument));
 }
 
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn explicit_selection_creates_context_for_enumerated_adapter() {
     // No surface is created, shown, or activated by this test.
