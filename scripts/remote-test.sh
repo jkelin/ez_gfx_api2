@@ -62,7 +62,7 @@ printf -v remote_path_q '%q' "$remote_path"
 remote_validation="set -eu; destination=$remote_path_q; mkdir -p \"\$destination\"; cd \"\$destination\"; resolved=\$(pwd -P); home=\$(cd \"\$HOME\" && pwd -P); remainder=\${resolved#/}; case \"\$resolved\" in /|\"\$home\"|/[A-Za-z]|/cygdrive/[A-Za-z]) printf '%s\\n' 'remote test destination resolves to an unsafe root' >&2; exit 64;; esac; case \"\$remainder\" in */*) :;; *) printf '%s\\n' 'remote test destination resolves to a top-level directory' >&2; exit 64;; esac"
 ssh "$host" "$remote_validation"
 
-rsync \
+if ! rsync \
   --archive \
   --compress \
   --delete \
@@ -86,6 +86,14 @@ rsync \
   -- \
   "$project_root/" \
   "$host:$remote_path/"
+then
+  printf 'source synchronization failed; remote tests were not started\n' >&2
+  exit 74
+fi
+if ! ssh "$host" "test -f $remote_path_q/Cargo.toml"; then
+  printf 'source synchronization did not produce a Cargo workspace; remote tests were not started\n' >&2
+  exit 74
+fi
 
 remote_env="export EZ_GFX_EXAMPLE_HIDDEN=1 RUST_TEST_THREADS=1"
 case "$platform" in
@@ -105,4 +113,11 @@ case "$platform" in
     ;;
 esac
 
-ssh "$host" "set -eu; cd $remote_path_q; $remote_env; $tests"
+remote_command="set -eu; cd $remote_path_q; $remote_env; $tests"
+if [[ "$platform" == macos ]]; then
+  # Non-interactive macOS SSH omits Homebrew from PATH; a login zsh loads the configured toolchain.
+  printf -v remote_command_q '%q' "$remote_command"
+  ssh "$host" "zsh -lc $remote_command_q"
+else
+  ssh "$host" "$remote_command"
+fi
