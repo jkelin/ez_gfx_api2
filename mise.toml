@@ -65,6 +65,21 @@ run = "cargo run -p ez-gfx-examples --bin 05_helmet"
 [tasks.example-6]
 run = "cargo run -p ez-gfx-examples --bin 06_sponza_ktx2"
 
+[tasks.remote-test-windows]
+description = "Sync the working tree and run Windows Vulkan and DX12 backend tests"
+env = { _.file = { path = ".env", redact = true }, REMOTE_TEST_WINDOWS_HOST = { required = true }, REMOTE_TEST_WINDOWS_PATH = { required = true } }
+run = "bash scripts/remote-test.sh windows"
+
+[tasks.remote-test-linux]
+description = "Sync the working tree and run Linux Vulkan backend tests"
+env = { _.file = { path = ".env", redact = true }, REMOTE_TEST_LINUX_HOST = { required = true }, REMOTE_TEST_LINUX_PATH = { required = true } }
+run = "bash scripts/remote-test.sh linux"
+
+[tasks.remote-test-macos]
+description = "Sync the working tree and run macOS Metal backend tests"
+env = { _.file = { path = ".env", redact = true }, REMOTE_TEST_MACOS_HOST = { required = true }, REMOTE_TEST_MACOS_PATH = { required = true } }
+run = "bash scripts/remote-test.sh macos"
+
 [tasks.package]
 description = "Build and package runtime/compiler products; append target, version, and output arguments after --"
 run = "cargo run -p xtask -- package"
