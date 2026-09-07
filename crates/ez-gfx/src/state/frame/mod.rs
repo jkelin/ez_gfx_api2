@@ -4,13 +4,14 @@ use super::dx12_bindings;
 use super::metal_bindings;
 use super::{
     Access, Backend, BufferRange, ContextHandle, ContextState, DiagnosticLevel,
-    DynamicPipelineState, ExecutableNode, ExecutionAction, ExecutionError, EzGfxResult, Format,
-    FrameExecutionBackend, FrameExecutionPlan, FrameNativeResource, HashMap, ImageRange,
-    IndirectBufferHandle, LoadOp, MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext,
-    NativePipeline, NativeShader, NativeSurface, NativeTexture, NodeDesc, PackedHandle, PassInfo,
-    PipelineKey, QueueKind, RenderTargetHandle, RenderTargetRecord, ResourceAccess, ResourceDesc,
-    ResourceId, ResourceKind, ResourceLifetime, ResourceState, RuntimePhase, SURFACE_DEFAULT_CLEAR,
-    ShaderHandle, ShaderRecord, ShaderStage, StoreOp, TextureFormat, TextureHandle, TextureId,
+    DynamicPipelineState, ExecutableNode, ExecutionAction, ExecutionBarrier, ExecutionError,
+    ExecutionPass, EzGfxResult, Format, FrameExecutionBackend, FrameExecutionPlan,
+    FrameNativeResource, HashMap, ImageRange, IndirectBufferHandle, LoadOp,
+    MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext, NativePipeline, NativeShader,
+    NativeSurface, NativeTexture, NodeDesc, PackedHandle, PassInfo, PipelineKey, QueueKind,
+    RenderTargetHandle, RenderTargetRecord, ResourceAccess, ResourceDesc, ResourceId, ResourceKind,
+    ResourceLifetime, ResourceState, RuntimePhase, SURFACE_DEFAULT_CLEAR, ShaderHandle,
+    ShaderRecord, ShaderStage, StoreOp, TextureFormat, TextureHandle, TextureId,
     execute_compiled_graph, map_frame, map_hal, map_lifecycle, native_layouts, pipeline_layout_key,
     result_status, runtime_record, vulkan_bindings, with_context_mut,
 };

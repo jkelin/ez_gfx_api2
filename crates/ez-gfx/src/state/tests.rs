@@ -775,7 +775,7 @@ fn explicit_selection_creates_context_for_enumerated_adapter() {
     let wanted = query_adapter_report(false)
         .into_iter()
         .filter(|report| report.adapter().backend() == Backend::Vulkan)
-        .find(|report| report.admitted())
+        .find(ez_gfx_runtime::AdapterReport::admitted)
         .expect("at least one admissible Vulkan adapter")
         .adapter()
         .stable_id();

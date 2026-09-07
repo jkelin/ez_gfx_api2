@@ -27,9 +27,10 @@ use ez_gfx_core::{
 };
 use ez_gfx_hal::{
     AllocationRequest, BufferRange, BufferTransfer, CompletionToken, DEFAULT_STAGING_POLICY,
-    DynamicPipelineState, ExecutionAction, FrameExecutionBackend, FrameExecutionPlan, HalError,
-    ImageMip, MemoryAllocator, MemoryClass, QueueKind, ResourceAccess, ResourceState,
-    SURFACE_DEFAULT_CLEAR, ShaderStage, TextureFormat, TextureRegion, staging_bucket_size,
+    DynamicPipelineState, ExecutionAction, ExecutionBarrier, ExecutionPass, FrameExecutionBackend,
+    FrameExecutionPlan, HalError, ImageMip, MemoryAllocator, MemoryClass, QueueKind,
+    ResourceAccess, ResourceState, SURFACE_DEFAULT_CLEAR, ShaderStage, TextureFormat,
+    TextureRegion, staging_bucket_size,
 };
 use ez_gfx_runtime::render::{ExecutionError, execute_compiled_graph};
 use ez_gfx_runtime::{

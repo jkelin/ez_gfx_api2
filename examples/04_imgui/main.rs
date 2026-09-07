@@ -436,6 +436,7 @@ impl LifecycleCallbacks for Example {
             surface_platform: platform,
             backend,
             texture_decode_workers: 0,
+            adapter_selection: None,
         })
         .map_err(|error| anyhow::anyhow!("{error:?}"))
         .with_context(|| format!("create {backend_name} context"))?;

@@ -1,9 +1,10 @@
 use super::{
-    Backend, ContextState, ExecutableNode, ExecutionAction, EzGfxResult, FrameExecutionPlan,
-    FrameNativeResource, HashMap, MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext,
-    NativePipeline, NativeShader, NativeSurface, NativeTexture, NativeTextureMap, PackedHandle,
-    PipelineKey, RenderTargetHandle, RenderTargetRecord, ResourceId, SURFACE_DEFAULT_CLEAR,
-    ShaderHandle, ShaderRecord, dx12_bindings, map_hal, native_layouts, pipeline_layout_key,
+    Backend, ContextState, ExecutableNode, ExecutionAction, ExecutionBarrier, ExecutionPass,
+    EzGfxResult, FrameExecutionPlan, FrameNativeResource, HashMap, MAX_PIPELINE_CACHE_ENTRIES,
+    NativeAllocation, NativeContext, NativePipeline, NativeShader, NativeSurface, NativeTexture,
+    NativeTextureMap, PackedHandle, PipelineKey, RenderTargetHandle, RenderTargetRecord,
+    ResourceId, SURFACE_DEFAULT_CLEAR, ShaderHandle, ShaderRecord, dx12_bindings, map_hal,
+    native_layouts, pipeline_layout_key,
 };
 
 struct DxActionState<'a> {
@@ -123,6 +124,97 @@ fn prepare_dx12_pipelines(
     Ok(pipeline_keys)
 }
 
+// Barrier resource indices resolve to the native buffer, texture, surface,
+// depth, render-target, or index resource transitioned before submission.
+fn dx12_barrier_resource<'a>(
+    state: &'a DxActionState<'a>,
+    barrier: &ExecutionBarrier,
+) -> Result<ez_gfx_backend_dx12::native::NativeFrameResource<'a>, EzGfxResult> {
+    let resource = state
+        .resources
+        .get(&ResourceId::from_index(barrier.resource))
+        .ok_or(EzGfxResult::InvalidArgument)?;
+    Ok(match *resource {
+        FrameNativeResource::Buffer(handle) => {
+            let NativeAllocation::Dx12(allocation) = &state
+                .allocations
+                .get(&handle)
+                .ok_or(EzGfxResult::InvalidContext)?
+                .1
+            else {
+                return Err(EzGfxResult::NativeFailure);
+            };
+            ez_gfx_backend_dx12::native::NativeFrameResource::Buffer(allocation)
+        }
+        FrameNativeResource::Texture(handle) => {
+            let (_, NativeTexture::Dx12(texture), _, _, _) = state
+                .textures
+                .get(&handle)
+                .ok_or(EzGfxResult::InvalidContext)?
+            else {
+                return Err(EzGfxResult::NativeFailure);
+            };
+            ez_gfx_backend_dx12::native::NativeFrameResource::Texture(texture)
+        }
+        FrameNativeResource::Surface(_) => {
+            ez_gfx_backend_dx12::native::NativeFrameResource::Surface
+        }
+        FrameNativeResource::Depth => ez_gfx_backend_dx12::native::NativeFrameResource::Depth,
+        FrameNativeResource::RenderTarget(handle) => {
+            let record = state
+                .render_targets
+                .get(&handle)
+                .ok_or(EzGfxResult::InvalidContext)?;
+            let NativeTexture::Dx12(texture) = &record.native else {
+                return Err(EzGfxResult::NativeFailure);
+            };
+            ez_gfx_backend_dx12::native::NativeFrameResource::RenderTarget(texture)
+        }
+        FrameNativeResource::Index => ez_gfx_backend_dx12::native::NativeFrameResource::Buffer(
+            state.index.ok_or(EzGfxResult::NotReady)?,
+        ),
+    })
+}
+
+// Pass color indices resolve to surface or render-target attachments here;
+// textures, buffers, and depth images are never color attachments. Surfaces
+// keep the legacy clear.
+fn dx12_pass_colors<'a>(
+    state: &'a DxActionState<'a>,
+    pass: &ExecutionPass,
+) -> Result<Vec<ez_gfx_backend_dx12::native::PassAttachment<'a>>, EzGfxResult> {
+    let mut colors = Vec::with_capacity(pass.colors.len());
+    for index in &pass.colors {
+        let resource = state
+            .resources
+            .get(&ResourceId::from_index(*index))
+            .ok_or(EzGfxResult::InvalidArgument)?;
+        colors.push(match *resource {
+            FrameNativeResource::Surface(_) => ez_gfx_backend_dx12::native::PassAttachment {
+                resource: ez_gfx_backend_dx12::native::NativeFrameResource::Surface,
+                clear: SURFACE_DEFAULT_CLEAR,
+            },
+            FrameNativeResource::RenderTarget(handle) => {
+                let record = state
+                    .render_targets
+                    .get(&handle)
+                    .ok_or(EzGfxResult::InvalidContext)?;
+                let NativeTexture::Dx12(texture) = &record.native else {
+                    return Err(EzGfxResult::NativeFailure);
+                };
+                ez_gfx_backend_dx12::native::PassAttachment {
+                    resource: ez_gfx_backend_dx12::native::NativeFrameResource::RenderTarget(
+                        texture,
+                    ),
+                    clear: super::super::render_target::render_target_clear_color(record),
+                }
+            }
+            _ => return Err(EzGfxResult::InvalidArgument),
+        });
+    }
+    Ok(colors)
+}
+
 // Missing resources and mismatched backend variants abort action construction before submission.
 fn dx12_actions<'a>(
     state: &'a DxActionState<'a>,
@@ -140,97 +232,14 @@ fn dx12_actions<'a>(
                 }
             }
             ExecutionAction::Barrier(barrier) => {
-                let resource = state
-                    .resources
-                    .get(&ResourceId::from_index(barrier.resource))
-                    .ok_or(EzGfxResult::InvalidArgument)?;
-                let resource = match *resource {
-                    FrameNativeResource::Buffer(handle) => {
-                        let NativeAllocation::Dx12(allocation) = &state
-                            .allocations
-                            .get(&handle)
-                            .ok_or(EzGfxResult::InvalidContext)?
-                            .1
-                        else {
-                            return Err(EzGfxResult::NativeFailure);
-                        };
-                        ez_gfx_backend_dx12::native::NativeFrameResource::Buffer(allocation)
-                    }
-                    FrameNativeResource::Texture(handle) => {
-                        let (_, NativeTexture::Dx12(texture), _, _, _) = state
-                            .textures
-                            .get(&handle)
-                            .ok_or(EzGfxResult::InvalidContext)?
-                        else {
-                            return Err(EzGfxResult::NativeFailure);
-                        };
-                        ez_gfx_backend_dx12::native::NativeFrameResource::Texture(texture)
-                    }
-                    FrameNativeResource::Surface(_) => {
-                        ez_gfx_backend_dx12::native::NativeFrameResource::Surface
-                    }
-                    FrameNativeResource::Depth => {
-                        ez_gfx_backend_dx12::native::NativeFrameResource::Depth
-                    }
-                    FrameNativeResource::RenderTarget(handle) => {
-                        let record = state
-                            .render_targets
-                            .get(&handle)
-                            .ok_or(EzGfxResult::InvalidContext)?;
-                        let NativeTexture::Dx12(texture) = &record.native else {
-                            return Err(EzGfxResult::NativeFailure);
-                        };
-                        ez_gfx_backend_dx12::native::NativeFrameResource::RenderTarget(texture)
-                    }
-                    FrameNativeResource::Index => {
-                        ez_gfx_backend_dx12::native::NativeFrameResource::Buffer(
-                            state.index.ok_or(EzGfxResult::NotReady)?,
-                        )
-                    }
-                };
+                let resource = dx12_barrier_resource(state, barrier)?;
                 actions.push(ez_gfx_backend_dx12::native::NativeFrameAction::Barrier {
                     barrier: *barrier,
                     resource,
                 });
             }
             ExecutionAction::BeginPass(pass) => {
-                // Resource indices resolve to surface or render-target
-                // attachments here; textures, buffers, and depth images are
-                // never color attachments. Surfaces keep the legacy clear.
-                let mut colors = Vec::with_capacity(pass.colors.len());
-                for index in &pass.colors {
-                    let resource = state
-                        .resources
-                        .get(&ResourceId::from_index(*index))
-                        .ok_or(EzGfxResult::InvalidArgument)?;
-                    colors.push(match *resource {
-                        FrameNativeResource::Surface(_) => {
-                            ez_gfx_backend_dx12::native::PassAttachment {
-                                resource: ez_gfx_backend_dx12::native::NativeFrameResource::Surface,
-                                clear: SURFACE_DEFAULT_CLEAR,
-                            }
-                        }
-                        FrameNativeResource::RenderTarget(handle) => {
-                            let record = state
-                                .render_targets
-                                .get(&handle)
-                                .ok_or(EzGfxResult::InvalidContext)?;
-                            let NativeTexture::Dx12(texture) = &record.native else {
-                                return Err(EzGfxResult::NativeFailure);
-                            };
-                            ez_gfx_backend_dx12::native::PassAttachment {
-                                resource:
-                                    ez_gfx_backend_dx12::native::NativeFrameResource::RenderTarget(
-                                        texture,
-                                    ),
-                                clear: super::super::render_target::render_target_clear_color(
-                                    record,
-                                ),
-                            }
-                        }
-                        _ => return Err(EzGfxResult::InvalidArgument),
-                    });
-                }
+                let colors = dx12_pass_colors(state, pass)?;
                 actions.push(ez_gfx_backend_dx12::native::NativeFrameAction::BeginPass {
                     pass,
                     colors,

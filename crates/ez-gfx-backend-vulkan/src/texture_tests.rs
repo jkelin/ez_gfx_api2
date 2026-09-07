@@ -976,3 +976,44 @@ fn render_target_msaa_clear_resolves_into_sampled_image() {
     context.destroy_texture(single).unwrap();
     context.wait_idle().unwrap();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resident_views_expand_from_coarse_to_fine_without_exceeding_chain() {
+        assert_eq!(resident_mip_range(5, 1), Some((4, 1)));
+        assert_eq!(resident_mip_range(5, 3), Some((2, 3)));
+        assert_eq!(resident_mip_range(5, 5), Some((0, 5)));
+        assert_eq!(resident_mip_range(5, 0), None);
+        assert_eq!(resident_mip_range(5, 6), None);
+    }
+
+    #[test]
+    fn tightly_packed_region_preserves_compressed_block_extent_and_offset() {
+        let bytes = [0_u8; 32];
+        let copy = texture_region_copy(&TextureRegion {
+            mip_level: 2,
+            x: 4,
+            y: 8,
+            width: 8,
+            height: 4,
+            bytes: &bytes,
+        })
+        .unwrap();
+
+        assert_eq!(copy.buffer_row_length, 0);
+        assert_eq!(copy.buffer_image_height, 0);
+        assert_eq!(copy.image_subresource.mip_level, 2);
+        assert_eq!(copy.image_offset, vk::Offset3D { x: 4, y: 8, z: 0 });
+        assert_eq!(
+            copy.image_extent,
+            vk::Extent3D {
+                width: 8,
+                height: 4,
+                depth: 1,
+            }
+        );
+    }
+}
