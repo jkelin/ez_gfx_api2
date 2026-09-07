@@ -3,11 +3,11 @@ use super::{
     DeferredResource, ImageMip, MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandBufferStatus,
     MTLCommandEncoder, MTLCommandQueue, MTLDevice, MTLHeap, MTLOrigin, MTLPixelFormat,
     MTLSamplerAddressMode, MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
-    MTLSamplerState, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
-    MemoryAllocator, MemoryClass, NSRange, NativeContext, NativeTexture, ProtocolObject, QueueKind,
-    Retained, SamplerAddressMode, SamplerFilter, TEXTURE_DESCRIPTOR_CAPACITY, TextureFormat,
-    TextureRegion, TextureSamplerDesc, ThreadBound, map_allocator, validate_texture_mips,
-    validate_texture_region,
+    MTLSamplerState, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
+    MTLTextureUsage, MemoryAllocator, MemoryClass, NSRange, NativeContext, NativeTexture,
+    ProtocolObject, QueueKind, Retained, SamplerAddressMode, SamplerFilter,
+    TEXTURE_DESCRIPTOR_CAPACITY, TextureFormat, TextureRegion, TextureSamplerDesc, ThreadBound,
+    map_allocator, validate_texture_mips, validate_texture_region,
 };
 
 fn texture_format_metal(format: TextureFormat) -> MTLPixelFormat {
@@ -476,7 +476,7 @@ impl NativeContext {
                     false,
                 )
             };
-            msaa_desc.setTextureType(MTLTextureType::MTLTextureType2DMultisample);
+            msaa_desc.setTextureType(MTLTextureType::Type2DMultisample);
             // SAFETY: 2 and 4 are valid Metal sample counts, checked above.
             unsafe { msaa_desc.setSampleCount(usize::from(samples)) };
             // SAFETY: `msaa_desc` is live and the single mip count is consumed during this send.

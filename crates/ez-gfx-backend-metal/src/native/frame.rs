@@ -147,10 +147,6 @@ impl MetalFrameEncoder<'_> {
             }
             _ => return Err(HalError::InvalidArgument),
         };
-        let (target_width, target_height) = match target {
-            Target::Surface(_) => self.extent,
-            Target::Target(texture) => (texture.width, texture.height),
-        };
         let descriptor = MTLRenderPassDescriptor::renderPassDescriptor();
         // SAFETY: Metal render-pass descriptors define color-attachment slot 0, so `objectAtIndexedSubscript(0)` is in bounds, and `descriptor` owns that attachment for the descriptor's lifetime.
         let color = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
