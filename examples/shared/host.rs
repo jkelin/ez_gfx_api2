@@ -1,4 +1,3 @@
-#[cfg(any(windows, target_vendor = "apple"))]
 use ez_gfx::{Backend, SurfacePlatform};
 #[cfg(any(windows, target_vendor = "apple"))]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
