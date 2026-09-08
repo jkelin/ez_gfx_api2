@@ -4,9 +4,10 @@
     reason = "Standalone examples and smoke tests use different subsets; host and asset values cross fixed OS and file-format widths."
 )]
 pub mod data;
+mod error;
+mod example;
 pub mod host;
 pub mod input;
-pub mod lifecycle;
 pub mod math;
 pub mod mesh;
 pub mod observability;
@@ -16,13 +17,17 @@ pub mod observability;
     reason = "Standalone examples use different shared interfaces."
 )]
 pub use data::{byte_len, bytes_of, slice_bytes};
+pub use error::{Error, Result};
 #[allow(
     unused_imports,
     reason = "Standalone examples use different shared interfaces."
 )]
-pub use host::{
-    BackendConfig, HostSurface, NativePlatform, NativeSurface, backend_config, backend_name, clip_y,
-};
+pub use example::{Example, ExampleConfig, run};
+#[allow(
+    unused_imports,
+    reason = "Standalone examples use different shared interfaces."
+)]
+pub use host::{BackendConfig, HostSurface, NativePlatform, NativeSurface, backend_config, clip_y};
 #[allow(
     unused_imports,
     reason = "Standalone examples use different shared interfaces."
@@ -32,14 +37,11 @@ pub use input::{FrameInput, SceneInput, SceneKey, dispatch_window_input};
     unused_imports,
     reason = "Standalone examples use different shared interfaces."
 )]
-pub use lifecycle::{LifecycleCallbacks, LifecycleConfig, run};
-#[allow(
-    unused_imports,
-    reason = "Standalone examples use different shared interfaces."
-)]
 pub use observability::{ObservationCounts, drain_bounded};
 
-use std::{ffi::OsString, path::Path, process::Command, time::Instant};
+use clap::Parser;
+use ez_gfx::Backend;
+use std::{ffi::OsString, num::NonZeroU32, path::Path, process::Command, time::Instant};
 /// Captured terminal frame and neutral observability totals.
 #[derive(Debug)]
 pub struct PresentedFrame {
@@ -123,26 +125,78 @@ pub struct ProgramReport {
     pub benchmark: Option<BenchmarkReport>,
 }
 
-/// Runs one configured example and emits stable snapshot/benchmark reports.
-pub fn run_program(
+#[derive(Debug, Parser)]
+#[command(disable_help_subcommand = true)]
+struct Cli {
+    #[arg(long)]
+    backend: Option<String>,
+    #[arg(long)]
+    max_frames: Option<NonZeroU32>,
+    #[arg(long)]
+    hidden: bool,
+    #[arg(long)]
+    report: bool,
+    #[arg(long)]
+    snapshot: Option<OsString>,
+    #[arg(long)]
+    update_snapshots: bool,
+    #[arg(long)]
+    debug: bool,
+    #[arg(long)]
+    validation: bool,
+    #[arg(long)]
+    benchmark: bool,
+    #[arg(long)]
+    benchmark_warmup: Option<NonZeroU32>,
+    #[arg(long)]
+    benchmark_frames: Option<NonZeroU32>,
+}
+
+#[derive(Debug)]
+struct ProgramOptions {
+    backend: Backend,
+    frame_limit: Option<u32>,
+    benchmark: Option<BenchmarkConfig>,
+    visible: bool,
+    report: bool,
+    snapshot: Option<OsString>,
+    update_snapshots: bool,
+    debug: bool,
+    validation: bool,
+}
+
+/// Parses one process configuration, runs one example, and emits stable reports.
+pub fn run_program<E>(
     identity: &str,
-    backend: &str,
-    run: impl FnOnce(Option<u32>, Option<BenchmarkConfig>) -> anyhow::Result<Option<ProgramReport>>,
-) {
-    let requested_limit = max_frames_from_env().unwrap_or_else(|error| exit_config(error));
-    let benchmark = benchmark_from_env().unwrap_or_else(|error| exit_config(error));
-    let frame_limit = benchmark.map_or(requested_limit, |config| {
-        Some(benchmark_frame_limit(config).unwrap_or_else(|error| exit_config(error)))
-    });
-    let report = run(frame_limit, benchmark).unwrap_or_else(|error| {
+    width: u32,
+    height: u32,
+    title: &'static str,
+    run: impl FnOnce(ExampleConfig) -> std::result::Result<Option<ProgramReport>, E>,
+) where
+    E: std::fmt::Display,
+{
+    let options = program_options().unwrap_or_else(|error| exit_config(error));
+    let backend_name = host::backend_name_for(options.backend);
+    let report = run(ExampleConfig {
+        width,
+        height,
+        title,
+        frame_limit: options.frame_limit,
+        benchmark: options.benchmark,
+        backend: options.backend,
+        visible: options.visible,
+        debug: options.debug,
+        validation: options.validation,
+    })
+    .unwrap_or_else(|error| {
         eprintln!("example failed: {error}");
         std::process::exit(1)
     });
     let Some(report) = report else { return };
     let frame = report.frame;
     publish_snapshot(
-        std::env::var_os("EZ_GFX_EXAMPLE_SNAPSHOT"),
-        std::env::var("EZ_GFX_UPDATE_SNAPSHOTS").ok().as_deref() == Some("1"),
+        options.snapshot,
+        options.update_snapshots,
         frame.width,
         frame.height,
         frame.frames,
@@ -150,72 +204,164 @@ pub fn run_program(
         frame.runtime_events,
         frame.diagnostics,
         frame.dropped_observations,
+        options.report,
     );
     if let Some(benchmark) = report.benchmark {
         let frame_time_ns = benchmark.elapsed_ns as f64 / f64::from(benchmark.measured_frames);
         let fps = 1_000_000_000.0 / frame_time_ns;
         println!(
-            "{{\"benchmark\":\"{identity}\",\"backend\":\"{backend}\",\"warmup_frames\":{},\"measured_frames\":{},\"elapsed_ns\":{},\"frame_time_ns\":{frame_time_ns:.3},\"fps\":{fps:.3}}}",
+            "{{\"benchmark\":\"{identity}\",\"backend\":\"{backend_name}\",\"warmup_frames\":{},\"measured_frames\":{},\"elapsed_ns\":{},\"frame_time_ns\":{frame_time_ns:.3},\"fps\":{fps:.3}}}",
             benchmark.warmup_frames, benchmark.measured_frames, benchmark.elapsed_ns,
         );
     }
 }
 
-fn exit_config(error: anyhow::Error) -> ! {
+fn exit_config(error: impl std::fmt::Display) -> ! {
     eprintln!("{error}");
     std::process::exit(2)
 }
-
-/// Reads an optional environment flag that accepts only `0` or `1`.
-pub fn env_flag(name: &str) -> anyhow::Result<bool> {
-    match std::env::var(name) {
-        Ok(value) => parse_env_flag(name, Some(&value)),
-        Err(std::env::VarError::NotPresent) => parse_env_flag(name, None),
-        Err(error) => Err(error.into()),
-    }
+fn program_options() -> Result<ProgramOptions> {
+    let cli = Cli::try_parse().map_err(Error::from)?;
+    program_options_from(cli, |name| std::env::var_os(name))
 }
 
-fn parse_env_flag(name: &str, value: Option<&str>) -> anyhow::Result<bool> {
+fn program_options_from(
+    cli: Cli,
+    env: impl Fn(&str) -> Option<OsString>,
+) -> Result<ProgramOptions> {
+    fn reject_conflict(
+        present: bool,
+        env_name: &str,
+        env: &impl Fn(&str) -> Option<OsString>,
+    ) -> Result<()> {
+        if present && env(env_name).is_some() {
+            return Err(Error::message(format!(
+                "CLI option conflicts with {env_name}"
+            )));
+        }
+        Ok(())
+    }
+    fn env_text(name: &str, env: &impl Fn(&str) -> Option<OsString>) -> Result<Option<String>> {
+        env(name)
+            .map(|value| {
+                value
+                    .into_string()
+                    .map_err(|_| Error::message(format!("{name} must be valid Unicode")))
+            })
+            .transpose()
+    }
+
+    reject_conflict(cli.backend.is_some(), "EZ_GFX_BACKEND", &env)?;
+    reject_conflict(cli.max_frames.is_some(), "EZ_GFX_EXAMPLE_MAX_FRAMES", &env)?;
+    reject_conflict(cli.hidden, "EZ_GFX_EXAMPLE_HIDDEN", &env)?;
+    reject_conflict(cli.report, "EZ_GFX_EXAMPLE_REPORT", &env)?;
+    reject_conflict(cli.snapshot.is_some(), "EZ_GFX_EXAMPLE_SNAPSHOT", &env)?;
+    reject_conflict(cli.update_snapshots, "EZ_GFX_UPDATE_SNAPSHOTS", &env)?;
+    reject_conflict(cli.debug, "EZ_GFX_EXAMPLE_DEBUG", &env)?;
+    reject_conflict(cli.validation, "EZ_GFX_EXAMPLE_VALIDATION", &env)?;
+    reject_conflict(cli.benchmark, "EZ_GFX_EXAMPLE_BENCHMARK", &env)?;
+    reject_conflict(
+        cli.benchmark_warmup.is_some(),
+        "EZ_GFX_EXAMPLE_BENCHMARK_WARMUP",
+        &env,
+    )?;
+    reject_conflict(
+        cli.benchmark_frames.is_some(),
+        "EZ_GFX_EXAMPLE_BENCHMARK_FRAMES",
+        &env,
+    )?;
+
+    let backend_text = cli.backend.or(env_text("EZ_GFX_BACKEND", &env)?);
+    let backend = host::parse_backend(backend_text.as_deref())?;
+    let requested_limit = match cli.max_frames {
+        Some(value) => Some(value.get()),
+        None => env_text("EZ_GFX_EXAMPLE_MAX_FRAMES", &env)?
+            .map(|value| value.parse::<u32>())
+            .transpose()?
+            .map(|value| {
+                NonZeroU32::new(value)
+                    .ok_or_else(|| Error::message("EZ_GFX_EXAMPLE_MAX_FRAMES must be positive"))
+                    .map(NonZeroU32::get)
+            })
+            .transpose()?,
+    };
+    let benchmark_enabled =
+        cli.benchmark || env_text("EZ_GFX_EXAMPLE_BENCHMARK", &env)?.as_deref() == Some("1");
+    let benchmark = if benchmark_enabled {
+        let warmup_frames = cli.benchmark_warmup.map_or_else(
+            || {
+                positive_env_value(
+                    "EZ_GFX_EXAMPLE_BENCHMARK_WARMUP",
+                    env_text("EZ_GFX_EXAMPLE_BENCHMARK_WARMUP", &env)?.as_deref(),
+                    120,
+                )
+            },
+            |value| Ok(value.get()),
+        )?;
+        let measured_frames = cli.benchmark_frames.map_or_else(
+            || {
+                positive_env_value(
+                    "EZ_GFX_EXAMPLE_BENCHMARK_FRAMES",
+                    env_text("EZ_GFX_EXAMPLE_BENCHMARK_FRAMES", &env)?.as_deref(),
+                    600,
+                )
+            },
+            |value| Ok(value.get()),
+        )?;
+        Some(BenchmarkConfig {
+            warmup_frames,
+            measured_frames,
+        })
+    } else {
+        None
+    };
+    let frame_limit = benchmark.map_or(Ok(requested_limit), |config| {
+        benchmark_frame_limit(config).map(Some)
+    })?;
+
+    let env_flag_value = |name| -> Result<bool> {
+        let value = env_text(name, &env)?;
+        parse_env_flag(name, value.as_deref())
+    };
+    Ok(ProgramOptions {
+        backend,
+        frame_limit,
+        benchmark,
+        visible: !(cli.hidden || env_flag_value("EZ_GFX_EXAMPLE_HIDDEN")?),
+        report: cli.report || env("EZ_GFX_EXAMPLE_REPORT").is_some(),
+        snapshot: cli.snapshot.or_else(|| env("EZ_GFX_EXAMPLE_SNAPSHOT")),
+        update_snapshots: cli.update_snapshots
+            || env_text("EZ_GFX_UPDATE_SNAPSHOTS", &env)?.as_deref() == Some("1"),
+        debug: cli.debug || env_flag_value("EZ_GFX_EXAMPLE_DEBUG")?,
+        validation: cli.validation || env_flag_value("EZ_GFX_EXAMPLE_VALIDATION")?,
+    })
+}
+
+fn positive_env_value(name: &str, value: Option<&str>, default: u32) -> Result<u32> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(default);
+    };
+    let parsed = value.parse::<u32>()?;
+    NonZeroU32::new(parsed)
+        .map(NonZeroU32::get)
+        .ok_or_else(|| Error::message(format!("{name} must be positive")))
+}
+
+fn parse_env_flag(name: &str, value: Option<&str>) -> Result<bool> {
     match value {
         None | Some("0") => Ok(false),
         Some("1") => Ok(true),
-        Some(_) => Err(anyhow::anyhow!("{name} must be 0 or 1")),
+        Some(_) => Err(Error::message(format!("{name} must be 0 or 1"))),
     }
-}
-
-/// Reads the optional positive frame cap; malformed and zero values are errors.
-pub fn max_frames_from_env() -> anyhow::Result<Option<u32>> {
-    match std::env::var("EZ_GFX_EXAMPLE_MAX_FRAMES") {
-        Ok(value) => {
-            let frames = value.parse::<u32>()?;
-            if frames == 0 {
-                anyhow::bail!("EZ_GFX_EXAMPLE_MAX_FRAMES must be positive");
-            }
-            Ok(Some(frames))
-        }
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-/// Parses benchmark settings while preserving the historical defaults and opt-in flag.
-pub fn benchmark_from_env() -> anyhow::Result<Option<BenchmarkConfig>> {
-    if std::env::var("EZ_GFX_EXAMPLE_BENCHMARK").ok().as_deref() != Some("1") {
-        return Ok(None);
-    }
-    Ok(Some(BenchmarkConfig {
-        warmup_frames: positive_env("EZ_GFX_EXAMPLE_BENCHMARK_WARMUP", 120)?,
-        measured_frames: positive_env("EZ_GFX_EXAMPLE_BENCHMARK_FRAMES", 600)?,
-    }))
 }
 
 /// Includes one uncaptured terminal frame so the snapshot cache is populated outside timing.
-pub fn benchmark_frame_limit(config: BenchmarkConfig) -> anyhow::Result<u32> {
+pub fn benchmark_frame_limit(config: BenchmarkConfig) -> Result<u32> {
     config
         .warmup_frames
         .checked_add(config.measured_frames)
         .and_then(|frames| frames.checked_add(1))
-        .ok_or_else(|| anyhow::anyhow!("benchmark frame counts exceed u32 limit"))
+        .ok_or_else(|| Error::message(format!("benchmark frame counts exceed u32 limit")))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -269,6 +415,7 @@ pub fn publish_snapshot(
     runtime_events: u32,
     diagnostics: u32,
     dropped_observations: u64,
+    report: bool,
 ) {
     if let Some(path) = path {
         if update {
@@ -313,7 +460,7 @@ pub fn publish_snapshot(
             }
         }
     }
-    if std::env::var_os("EZ_GFX_EXAMPLE_REPORT").is_some() {
+    if report {
         println!(
             "ez-gfx-snapshot {width} {height} {frames} {} {runtime_events} {diagnostics} {dropped_observations}",
             blake3::hash(rgba8)
@@ -334,21 +481,14 @@ pub fn snapshot_command(binary: &str, path: &Path, backend: &str) -> Command {
     command
 }
 
-fn positive_env(name: &str, default: u32) -> anyhow::Result<u32> {
-    // Empty means default; zero and malformed input must never silently measure no frames.
-    let value = std::env::var(name).unwrap_or_default();
-    if value.is_empty() {
-        return Ok(default);
-    }
-    let parsed = value.parse::<u32>()?;
-    (parsed > 0)
-        .then_some(parsed)
-        .ok_or_else(|| anyhow::anyhow!("{name} must be positive"))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{BenchmarkConfig, benchmark_frame_limit, parse_env_flag, snapshot_mismatch};
+    use super::{
+        BenchmarkConfig, Cli, benchmark_frame_limit, parse_env_flag, program_options_from,
+        snapshot_mismatch,
+    };
+    use clap::Parser;
+    use std::{collections::HashMap, ffi::OsString};
     #[test]
     fn snapshot_comparison_accepts_equal_bytes() {
         assert!(snapshot_mismatch(b"same", b"same").is_none());
@@ -407,6 +547,76 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "FLAG must be 0 or 1"
+        );
+    }
+    #[test]
+    fn cli_parser_builds_automation_and_benchmark_config() {
+        let backend = if cfg!(target_vendor = "apple") {
+            "metal"
+        } else {
+            "vulkan"
+        };
+        let cli = Cli::try_parse_from([
+            "example",
+            "--backend",
+            backend,
+            "--max-frames",
+            "9",
+            "--hidden",
+            "--benchmark",
+            "--benchmark-warmup",
+            "2",
+            "--benchmark-frames",
+            "4",
+        ])
+        .unwrap();
+        let options = program_options_from(cli, |_| None).unwrap();
+
+        assert!(!options.visible);
+        assert_eq!(options.frame_limit, Some(7));
+        assert_eq!(
+            options.benchmark,
+            Some(BenchmarkConfig {
+                warmup_frames: 2,
+                measured_frames: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn smoke_environment_defaults_are_preserved() {
+        let backend = if cfg!(target_vendor = "apple") {
+            "metal"
+        } else {
+            "vulkan"
+        };
+        let env = HashMap::from([
+            ("EZ_GFX_BACKEND", OsString::from(backend)),
+            ("EZ_GFX_EXAMPLE_MAX_FRAMES", OsString::from("1")),
+            ("EZ_GFX_EXAMPLE_HIDDEN", OsString::from("1")),
+            ("EZ_GFX_EXAMPLE_REPORT", OsString::from("1")),
+            ("EZ_GFX_EXAMPLE_SNAPSHOT", OsString::from("capture.png")),
+        ]);
+        let cli = Cli::try_parse_from(["example"]).unwrap();
+        let options = program_options_from(cli, |name| env.get(name).cloned()).unwrap();
+
+        assert_eq!(options.frame_limit, Some(1));
+        assert!(!options.visible);
+        assert!(options.report);
+        assert_eq!(options.snapshot, Some(OsString::from("capture.png")));
+    }
+
+    #[test]
+    fn cli_and_environment_conflicts_are_rejected() {
+        let cli = Cli::try_parse_from(["example", "--hidden"]).unwrap();
+        let error = program_options_from(cli, |name| {
+            (name == "EZ_GFX_EXAMPLE_HIDDEN").then(|| OsString::from("0"))
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "CLI option conflicts with EZ_GFX_EXAMPLE_HIDDEN"
         );
     }
 }

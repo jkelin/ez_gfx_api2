@@ -19,7 +19,13 @@ use std::{
 };
 
 use common::TestContext;
-use ez_gfx::*;
+use ez_gfx::raw::*;
+use ez_gfx::{
+    DecodedMip, DecodedTexture, DrawIndexedCommand, DynamicPipelineState, Error, LifecycleError,
+    SamplerAddressMode, SamplerFilter, TextureDestination, TextureError, TextureFormat,
+    TextureRegion, TextureSamplerDesc, TextureSource, register_texture_decoder,
+    unregister_texture_decoder,
+};
 use ez_gfx_compiler::{Target, compile_shader};
 use ez_gfx_ffi::EzGfxResult;
 

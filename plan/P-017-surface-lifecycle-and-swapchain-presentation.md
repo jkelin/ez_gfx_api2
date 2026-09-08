@@ -21,10 +21,9 @@ Additional evidence: `AGENTS.md` ("Window lifetime, input, resize/minimize obser
 - Incoming dependency: `P-017` depends on `P-003` (HAL surface & swapchain).
 - Outgoing dependency: `P-008` and `P-019` depend on `P-017` for frame presentation and screenshot readback.
 
-## Unresolved questions
+## Resolved interface
 
-- How should minimized window state (`0x0` dimensions) signal `NotReady` back to callers across safe Rust and C ABI boundaries?
-- What swapchain present modes (`Fifo`, `Mailbox`, `Immediate`) should be exposed as defaults?
+Zero extent returns `NotReady` from `begin_frame`. Presentation mode remains a validated `Surface` construction option.
 
 ## Candidate solutions
 
@@ -32,10 +31,9 @@ Additional evidence: `AGENTS.md` ("Window lifetime, input, resize/minimize obser
 
 #### Approach and integration
 
-Implement surface creation in Rust accepting types implementing `raw_window_handle::HasDisplayHandle + raw_window_handle::HasWindowHandle` (with C FFI adapters accepting raw `HWND`/`NSWindow`/`wl_surface` pointers). Surface management:
-1. **Minimization & Resizing:** When framebuffer dimensions query as `0x0` (minimized window), `begin_render()` returns `EzGfxResult::NotReady` immediately, skipping GPU command recording and swapchain acquire calls. On size change, swapchain recreation uses `old_swapchain` recycling to prevent window flickering.
-2. **Swapchain Shader Write-Only Enforcement:** Graph validation scans all shader target declarations; if any node references `"swapchain"` with read access (`Sampled`, `RWTexture2D` read), compilation fast-fails with `InvalidShaderResourceUsage`. Screenshot readbacks use a transfer blit (`vkCmdCopyImage`/`CopyResource`) from swapchain image to a host-visible staging buffer.
-3. **Presentation Modes:** Negotiate `Mailbox` (uncapped low latency) or `Fifo` (vsync locked) based on caller configuration and hardware support.
+Construct an owning `Surface` from borrowed host-native handles. The wrapper retains `Rc<ContextInner>` and its resource lease until `Drop`; the host keeps the actual window/display objects alive for that interval. Construction is atomic: native surface creation, device initialization, and initial resize either all succeed or destroy the unpublished raw surface and return the original error without retaining a safe wrapper.
+
+`begin_frame(&Context, &Surface)` returns `NotReady` without recording or acquisition for zero drawable extent. Recording uses `&mut Frame`; `Frame::finish(self)` submits and presents, while `Frame::drop` aborts. Resize/out-of-date handling stays behind the surface seam. Graph validation rejects shader reads from the presentation target; screenshots use transfer readback.
 
 #### Performance evidence
 
@@ -111,11 +109,12 @@ Maintain original Odin descriptor: `EzGfxSurfaceDesc` with raw `void* window`, `
 
 ### Selection rationale
 
-`S-P-017-raw-window-handle-surface-and-guarded-swapchain` directly adheres to all project windowing constraints and TODO policies:
-1. It implements standard Rust window interoperability via `raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle` (v0.6) for seamless integration with `winit`, `sdl2`, or custom windowing layers, while providing C FFI wrappers for raw HWND/NSWindow pointers.
-2. It respects parent application window ownership (as required by `AGENTS.md`), avoiding internal event loop hijacking.
-3. It detects 0x0 minimization state and returns `EzGfxResult::NotReady`, preventing unnecessary GPU rendering work.
-4. It enforces the swapchain shader write-only policy during graph compilation, directing readback requests to transfer screenshot commands.
+The selected surface lifecycle:
+1. accepts standard borrowed native handles while an owning `Surface` retains its context/resource lease;
+2. leaves OS window, event-loop, resize observation, and input ownership with the host;
+3. destroys the unpublished raw surface after any native-creation, initialization, or initial-resize failure;
+4. returns `NotReady` from `begin_frame` for zero drawable extent; and
+5. presents only through `Frame::finish(self)`, preserving the exact submit or present error.
 
 ### Rejected alternatives
 
@@ -128,18 +127,18 @@ Minimization detection eliminates rendering and swapchain acquire work while the
 
 ### Key assumptions
 
-- Parent applications handle OS window event polling and forward resize events to the surface API.
-- The underlying display subsystem supports `VK_KHR_swapchain` / `IDXGISwapChain` / `CAMetalLayer`.
+- The host keeps native window/display objects alive while `Surface` exists and forwards observed resize state.
+- The underlying display subsystem supports the selected backend's presentation mechanism.
 
 ### Risks and mitigations
 
-- **Risk:** Continuous window dragging on Linux compositors triggers out-of-date swapchain errors.
-- **Mitigation:** Handle `VK_SUBOPTIMAL_KHR` or `VK_ERROR_OUT_OF_DATE_KHR` with guarded deferred swapchain recreation.
+- **Risk:** partial surface construction leaks a native object or publishes a half-initialized wrapper.
+- **Mitigation:** inject failure after native creation, initialization, and initial resize; verify cleanup and the original error.
 
 ### Validation actions
 
-1. Test window resizing, minimization, and restoration across all 6 examples with zero GPU validation layer warnings.
-2. Verify that attempting to bind the swapchain as a shader sampled read produces an explicit `InvalidShaderResourceUsage` error during graph compilation.
+1. Test construction rollback, wrapper drop-order permutations, resize, minimization, restoration, and DPI changes.
+2. Verify exact `Frame::finish` errors and rejection of presentation-target shader reads.
 
 ### Native surface color evidence
 

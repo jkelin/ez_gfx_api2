@@ -2,6 +2,36 @@
 
 use super::*;
 
+fn begin_offscreen_frame(context: u64) -> (u64, u64) {
+    let name = b"readback-target";
+    let format = 1_u8;
+    let desc = EzGfxRenderTargetDesc {
+        name: name.as_ptr(),
+        name_length: name.len(),
+        usage: 0,
+        relative_scale: 1.0,
+        samples: 1,
+        candidate_formats: &raw const format,
+        candidate_count: 1,
+        sampleable: 0,
+        use_clear: 0,
+        clear_color: [0.0; 4],
+    };
+    let mut target = 0;
+    assert_eq!(
+        // SAFETY: descriptor, format, and output storage remain live through the call.
+        unsafe { ez_gfx_render_target_create(&raw const desc, 1, 1, &raw mut target, context) },
+        EzGfxResult::Ok
+    );
+    let mut frame = 0;
+    assert_eq!(
+        // SAFETY: frame output storage is live and aligned.
+        unsafe { ez_gfx_render_target_frame_begin(context, target, &raw mut frame) },
+        EzGfxResult::Ok
+    );
+    (frame, target)
+}
+
 #[cfg(not(target_vendor = "apple"))]
 fn geometry_uploads_use_real_device_buffers_and_transfer_fence(backend: u8) {
     let native = common::TestContext::create(backend);
@@ -281,7 +311,7 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
         EzGfxResult::Ok
     );
     assert_eq!(binding, 0);
-    assert_eq!(ez_gfx_frame_begin(context), EzGfxResult::Ok);
+    let (frame, target) = begin_offscreen_frame(context);
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
@@ -291,7 +321,7 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
                     debug_name.as_ptr(),
                     debug_name.len(),
                     &raw mut indirect,
-                    context,
+                    frame,
                 )
             }
         },
@@ -300,15 +330,15 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_indirect_write_draws(indirect, 0, &raw const command, 1, context) }
+            unsafe { ez_gfx_indirect_write_draws(indirect, 0, &raw const command, 1, frame) }
         },
         EzGfxResult::Ok
     );
     assert_eq!(
-        ez_gfx_graph_enqueue_texture_readback(texture, context),
+        ez_gfx_graph_enqueue_texture_readback(texture, frame),
         EzGfxResult::Ok
     );
-    assert_eq!(ez_gfx_frame_submit(context), EzGfxResult::Ok);
+    assert_eq!(ez_gfx_frame_end(frame), EzGfxResult::Ok);
     let mut size = 0;
     assert_eq!(
         {
@@ -328,7 +358,7 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
         EzGfxResult::Ok
     );
     assert_eq!(actual, pixels);
-    ez_gfx_indirect_release(indirect, context);
+    ez_gfx_render_target_destroy(target, context);
     ez_gfx_texture_unload(texture, context);
     drop(native);
 }

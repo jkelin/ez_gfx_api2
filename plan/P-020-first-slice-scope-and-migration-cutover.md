@@ -106,14 +106,13 @@ Treat compiler output validation, serialized reflection, API-shape checks, and C
 
 ### Selection
 
-`S-P-020-vulkan-first-vertical-slice`: Vulkan-first vertical slice with staged backend expansion.
+`S-P-020-vulkan-first-vertical-slice`, followed by a completed clean ownership cutover.
 
 ### Selection rationale
 
-`S-P-020-vulkan-first-vertical-slice` ranks first for delivery because it creates an end-to-end executable proof before expanding the platform matrix:
-1. It exercises the compiler/runtime boundary, backend execution, render graph, resource uploads, MDI, and snapshot testing in one bounded path.
-2. It provides early visual regression evidence while retaining later milestones for DX12, Metal, Basis Universal, streaming, and remaining TODO work.
-3. It avoids the high prerequisite cost of requiring all target platform toolchains and hardware before any end-to-end validation.
+The initial vertical slice established an end-to-end executable path before backend expansion. Final Rust examples converge on shared `run_program`, which parses CLI state once, resolves environment conflicts, builds `ExampleConfig`, and enters `run(config, setup)`. The host owns winit inversion, native window, `Context`, `Surface`, resize, input, pacing, benchmark, capture, and reporting. Setup returns a per-frame closure that begins and records an owning `Frame`; `Example::handle_frame(Frame)` consumes it.
+
+The safe cutover is ownership-only: resources release through `Drop`, `Frame::finish(self)` is consuming, unfinished frames abort on `Drop`, and no compatibility aliases retain manual safe destruction or the former multiple begin/end paths. ABI 31 keeps explicit C lifecycle functions over opaque generational handles.
 
 ### Rejected alternatives
 
@@ -136,5 +135,5 @@ Delivery latency and defect-rate comparisons remain unknown until measured. The 
 
 ### Validation actions
 
-1. Pass the first-slice end-to-end snapshot gate with a representative original example.
-2. Add staged gates for all six examples, C ABI/Rust API parity, DX12/Metal backend coverage, and every inherited TODO before final cutover.
+1. Exercise all six renderers through the shared `Example` host and its owned frame lifecycle.
+2. Gate ABI 31 frame end/abort, opaque-handle validation, Rust wrapper drop order, and required Vulkan/DX12/Metal behavior.

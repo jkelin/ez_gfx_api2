@@ -1,23 +1,17 @@
 # Geometry
 
-Geometry uses named device-local vertex heaps and one context-wide device-local `u32` index heap. Structured and indirect buffers are separate transient per-frame resources.
+Geometry uses owning named vertex heaps and one singleton context-owned device-local `u32` index heap. Their allocation wrappers retain both the shared `Rc<ContextInner>` and the parent resource lease. Structured and indirect buffers are separate frame transients.
 
 ## Public path
 
-1. Create each vertex heap with a unique semantic name, byte capacity, and stride; retain the returned `VertexHeapHandle`.
-2. Create the index heap with a byte capacity divisible by four.
-3. Upload a typed `Pod` vertex slice through its heap handle, or `&[u32]` indices. Uploads infer count/bytes and return typed owner- and generation-validated allocation handles.
-4. Query allocation ranges for indirect draw offsets.
+1. Create each vertex heap with a unique semantic name, byte capacity, and stride; retain its owning `VertexHeap`.
+2. Create the context's singleton index heap with a byte capacity divisible by four. A second live index heap is rejected.
+3. Call `upload_vertices(&VertexHeap, &[T])` or `upload_indices(&Context, &[u32])`; each returns an owning, generation-validated allocation.
+4. Query `VertexAllocation::range` or `IndexAllocation::range` for indirect draw offsets.
 5. Poll upload events until empty once per frame.
-6. Remove allocations before destroying their typed heap handle.
+6. Drop heaps and allocations independently. Allocation leases keep their parent heap and context alive until cleanup is safe.
 
-The safe API exports:
-
-- `create_vertex_heap`, `upload_vertices`, `vertex_allocation_range`, `remove_vertices`, `destroy_vertex_heap`;
-- `create_index_heap`, `upload_indices`, `index_allocation_range`, `remove_indices`, `destroy_index_heap`;
-- `poll_upload_event`.
-
-The C ABI mirrors these operations with opaque `EzGfxVertexHeap`, `EzGfxVertexAllocation`, and `EzGfxIndexAllocation` handles. Semantic names are used only at heap creation and internal shader reflection lookup.
+The safe interface exposes an owning `VertexHeap`, owning vertex/index allocations, and a context-owned singleton index heap rather than public destroy, remove, release, or free functions. Dropping an allocation retires its range; dropping a vertex heap retires it after every child lease and GPU use. C mirrors the lifecycle with opaque generational `EzGfxVertexHeap`, `EzGfxVertexAllocation`, and `EzGfxIndexAllocation` handles; index-heap creation/destruction remains explicit against `EzGfxContext`.
 
 ```mermaid
 sequenceDiagram
@@ -25,9 +19,9 @@ sequenceDiagram
     participant Gfx as ez-gfx
     participant Queue as Upload queue
     participant GPU as Backend transfer
-    App->>Gfx: create heap
+    App->>Gfx: create owning heap
     App->>Gfx: upload typed slice
-    Gfx->>Gfx: validate count/stride/bytes and reserve
+    Gfx->>Gfx: validate count/stride/bytes and reserve lease
     Gfx->>GPU: copy owned staging to device heap
     Gfx->>Queue: SourceStaged
     App->>Queue: drain once per frame
@@ -35,11 +29,10 @@ sequenceDiagram
         GPU-->>Gfx: completion
         Gfx->>Queue: DeviceReady
         App->>Gfx: query range and use
-        App->>Gfx: remove allocation
-        App->>Gfx: destroy heap
+        App->>Gfx: drop allocation and heap
     else transfer fails or is cancelled
         Gfx->>Queue: Failed or Cancelled
-        App->>Gfx: remove allocation
+        App->>Gfx: drop allocation
     end
 ```
 
@@ -58,22 +51,21 @@ The global index heap remains a native index-buffer binding. `DrawIndexedCommand
 
 ## Allocation and removal
 
-Each heap uses an ordered range free list. Allocation validates stride, capacity, arithmetic, heap ownership, handle owner, resource kind, and generation. Allocation handles record their heap owner, so removal needs no caller-supplied name and rejects stale, foreign, and wrong-kind handles.
+Each heap uses an ordered range free list. Allocation validates stride, capacity, arithmetic, heap ownership, handle owner, resource kind, and generation. An allocation lease retains its parent heap, so stale, foreign, wrong-kind, and duplicate C releases are rejected while safe Rust cleanup remains single-owner `Drop`.
 
-Removal waits for native idle before returning a range to the free list. Heap destruction is rejected internally while allocations are live or that heap is referenced by the current recorded frame; the void public destruction call leaves the heap intact on rejection.
-
+The index heap is a context singleton, not a freely creatable family of named heaps. Range retirement remains gated by native completion; parent resources remain leased until their children and recorded uses are gone.
 ## Upload events
 
-`upload_vertices<T: Pod>` and `upload_indices(&[u32])` enqueue lossless typed transitions:
+`upload_vertices(&VertexHeap, &[T])` and `upload_indices(&Context, &[u32])` enqueue lossless typed transitions:
 
 - `SourceStaged`: caller bytes were copied into runtime-owned mapped staging and may be released;
 - `DeviceReady`: the device-local allocation completed transfer;
 - `Failed(status)`: terminal upload failure;
 - `Cancelled`: terminal cancellation where supported.
 
-The queue is unbounded and never shares the bounded diagnostic queue. Poll until `None` every frame to avoid retaining events indefinitely. Context destruction drops remaining events after draining owned work.
+The queue is unbounded and never shares the bounded diagnostic queue. Poll until empty every frame to avoid retaining events indefinitely. The last context/resource owner drops remaining events after draining owned work.
 
-A heap-level maximum readiness token is still used when a frame imports a named heap. It may wait for a later allocation in the same heap, but never permits early use.
+A heap-level maximum readiness token is used when a frame imports a named heap. It may wait for a later allocation in the same heap, but never permits early use.
 
 ## Admission and copies
 
@@ -83,14 +75,14 @@ The typed slice upload API derives and checks count, stride, multiplication, and
 
 ## Transient frame buffers
 
-After beginning a frame, applications acquire fresh structured and indirect handles. `acquire_structured<T: Pod>` derives stride and capacity; `write_structured` validates type stride and a checked element range. `write_indirect` accepts a slice and advances the active count to the maximum written end, so CPU-written commands need no separate count call.
+Applications call `Frame::acquire_structured<T>(element_count)` and `Frame::acquire_indirect(capacity)` through `&mut Frame`. `StructuredBuffer::write(&mut Frame, start_index, values)` and `IndirectBuffer::write(&mut Frame, start_index, commands)` validate frame ownership and checked ranges; indirect writes advance the active count to the maximum written end.
 
-Compute-generated indirect bytes cannot update CPU publication metadata. `publish_compute_indirect_count` narrowly supplies that known count before compute and graphics share the handle in one frame. Once a transient is recorded, CPU writes/releases fail; after successful submission its handle is stale. Native storage is pooled against the exact graphics completion token, trimmed only after completion, and quarantined until context teardown if a failed submission cannot prove idle.
+Compute-generated indirect bytes cannot update CPU publication metadata, so callers publish the known indirect count before compute and graphics share the buffer in one frame. Transient wrappers may outlive the borrow that created them, but become invalid immediately when their frame finishes or aborts. Native reuse remains completion-gated or, after indeterminate failure, quarantined.
+
+## Frame ownership
+
+`begin_frame(&Context, &Surface)` returns an owning `Frame`; all recording methods take `&mut Frame`. `Frame::finish(self)` preserves exact submission or presentation errors. `Drop` aborts an unfinished frame, so the safe interface exposes no frame-end, frame-abort, or transient-release functions. ABI 31 keeps those operations explicit for C through opaque generational `EzGfxFrame` handles.
 
 ## Examples
 
-All Rust examples acquire structured and indirect buffers inside each frame. Vertex heap handles and geometry allocations remain persistent. ImGui keeps the immutable identity sequence in the global index heap while refreshing its transient command metadata and indirect commands per frame.
-
-## Verification
-
-Proof on 2026-09-08: workspace nextest 555/555 plus doc tests, hidden examples 32/32, focused ABI 29/29, error 2/2, and Vulkan/DX12 PSO 2/2 passed. Local Windows proof passed the 60-second per-case HAL/Vulkan/DX12/safe-facade matrix 94/94, ABI 30 C11/C++17 header probes, export parity for 64 functions and all declarations/layouts, and the MSVC C textured-cube build. Exact remote matrices passed on Linux Vulkan 73/73 and macOS Metal 51/51. Source-line limits, strict workspace all-target/all-feature Clippy with warnings denied, and final formatting also passed.
+The shared `Example` host owns `Context`, `Surface`, resize/input/automation, and frame completion. Each renderer closure begins and records an owning `Frame`, acquires fresh transients through `&mut Frame`, and returns the frame to `Example::handle_frame` for consuming completion.

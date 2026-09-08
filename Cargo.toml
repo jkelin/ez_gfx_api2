@@ -57,6 +57,7 @@ anyhow = "1.0.104"
 thiserror = "2.0.18"
 clap = { version = "4.6.6", features = ["derive"] }
 tempfile = "3.27.0"
+static_assertions = "1.1.0"
 ash = { version = "0.38.0", default-features = false, features = ["loaded", "std"] }
 windows = { version = "0.62.2", default-features = false }
 objc2 = { version = "0.6.2", default-features = false, features = ["std"] }

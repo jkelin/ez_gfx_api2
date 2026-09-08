@@ -131,6 +131,10 @@ pub fn create_index_heap(context: ContextHandle, capacity: u64) -> Result<()> {
 }
 
 /// Destroys the context index heap.
+#[allow(
+    dead_code,
+    reason = "the C raw seam explicitly destroys the singleton heap"
+)]
 pub fn destroy_index_heap(context: ContextHandle) {
     let _ = with_context_mut(context, |context| {
         if context.frame_index.is_some() {

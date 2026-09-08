@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
-use ez_gfx::{
-    ContextHandle, SamplerAddressMode, SamplerFilter, TextureHandle, TextureSamplerDesc,
-    TextureSource,
-};
+use ez_gfx::raw::{ContextHandle, TextureHandle};
+use ez_gfx::{SamplerAddressMode, SamplerFilter, TextureSamplerDesc, TextureSource, raw};
 
 use super::{
     EZ_GFX_MAX_BOUNDARY_BYTES, EzGfxContext, EzGfxDecodedTexture, EzGfxResult, EzGfxTexture,
@@ -278,7 +276,7 @@ pub unsafe extern "C" fn ez_gfx_texture_load(
             Ok(context) => context,
             Err(error) => return error,
         };
-        match ez_gfx::load_texture(context, source, bytes, desc.generate_mips != 0, &config) {
+        match raw::load_texture(context, source, bytes, desc.generate_mips != 0, &config) {
             Ok(texture) => {
                 // SAFETY: `out_texture` is non-null and writable for this call.
                 unsafe { out_texture.write(texture.into_raw()) };
@@ -304,7 +302,7 @@ pub extern "C" fn ez_gfx_texture_cancel(
             Ok(context) => context,
             Err(error) => return error,
         };
-        ez_gfx::cancel_texture_load(context, texture).into_ffi_result()
+        raw::cancel_texture_load(context, texture).into_ffi_result()
     })
 }
 
@@ -331,7 +329,7 @@ pub unsafe extern "C" fn ez_gfx_texture_get_binding(
             Ok(value) => value,
             Err(error) => return error,
         };
-        match ez_gfx::texture_binding(context, texture) {
+        match raw::texture_binding(context, texture) {
             Ok(binding) => {
                 // SAFETY: `out_binding` is non-null and writable for this call.
                 unsafe { out_binding.write(binding) };
@@ -366,7 +364,7 @@ pub unsafe extern "C" fn ez_gfx_texture_get_residency(
             Ok(value) => value,
             Err(error) => return error,
         };
-        match ez_gfx::texture_residency(context, texture) {
+        match raw::texture_residency(context, texture) {
             Ok((resident, total)) => {
                 // SAFETY: Both output pointers are non-null and writable for this call.
                 unsafe {
@@ -396,7 +394,7 @@ pub extern "C" fn ez_gfx_texture_set_residency(
             Ok(value) => value,
             Err(error) => return error,
         };
-        ez_gfx::set_texture_residency(context, texture, resident_mips).into_ffi_result()
+        raw::set_texture_residency(context, texture, resident_mips).into_ffi_result()
     })
 }
 #[unsafe(no_mangle)]
@@ -431,7 +429,7 @@ pub unsafe extern "C" fn ez_gfx_update_texture_region(
             Ok(value) => value,
             Err(error) => return error,
         };
-        ez_gfx::update_texture_region(
+        raw::update_texture_region(
             context,
             texture,
             ez_gfx::TextureRegion {
@@ -465,7 +463,7 @@ pub unsafe extern "C" fn ez_gfx_texture_get_upload_telemetry(
             Ok(value) => value,
             Err(error) => return error,
         };
-        match ez_gfx::texture_upload_telemetry(context) {
+        match raw::texture_upload_telemetry(context) {
             Ok(snapshot) => {
                 // SAFETY: The output is non-null and writable for this call.
                 unsafe {
@@ -488,7 +486,7 @@ pub unsafe extern "C" fn ez_gfx_texture_get_upload_telemetry(
 pub extern "C" fn ez_gfx_texture_unload(texture: EzGfxTexture, context: EzGfxContext) {
     catch_void(|| {
         if let (Ok(context), Ok(texture)) = (context_handle(context), texture_handle(texture)) {
-            ez_gfx::unload_texture(context, texture);
+            raw::unload_texture(context, texture);
         }
     });
 }

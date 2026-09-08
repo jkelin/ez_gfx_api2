@@ -4,27 +4,19 @@
 
 ## Lifecycle
 
-Keep the owning context handle with every surface and resource, and follow this order:
+`create_context` returns the creator-thread-affine `Context`. `create_surface(&context, options)` atomically creates the native surface, initializes the device, and applies the initial extent; failure rolls back the unpublished surface. Persistent resources retain the context and their parent resource leases. Their `Drop` implementations delegate release to the internal raw seam, so safe Rust exposes no destroy, release, remove, or free functions.
 
-1. Create a context, then a compatible surface, then initialize the device for that surface.
-2. Load persistent shaders, textures, and typed geometry heaps/allocations.
-3. Begin a frame, acquire fresh structured and indirect buffers, write or publish their active ranges, record compute/graphics work, and submit. Successful recording transfers transient ownership to the frame; successful submission invalidates their handles and recycles native storage only after GPU completion.
-4. On recording failure, release unconsumed transient handles or destroy the context. Submission rollback restores handles only after no native work started or an idle drain succeeds; uncertain native failures quarantine storage until terminal context cleanup.
+`begin_frame(&context, &surface)` returns one owning recording transaction. Recording and frame-local acquisition require `&mut Frame`. `Frame::finish(self)` consumes the transaction and preserves exact submission or presentation errors. Dropping an unfinished frame aborts and rolls back because `Drop` cannot return errors.
 
-`destroy_context` is terminal once cleanup begins. It returns the first initialized-device wait or release failure after attempting every remaining release; the context and all child handles are stale even when teardown reports an error. Invalid, stale, repeated, and wrong-thread destroys return `Err(Error::InvalidContext)` without consuming a live context.
+Frame-local `StructuredBuffer<T>` and `IndirectBuffer` values share transaction state. Successful completion or abort invalidates them. Native storage is recycled only after GPU completion; indeterminate native failures quarantine it until terminal context cleanup. A `VertexAllocation` retains its `VertexHeap`, and a recording frame retains every referenced persistent allocation through completion.
 
-## API and handles
+## API and ownership
 
-Import public items from the crate root. Types such as `PublicBinding`, `ResourceIdentity`, `DrawIndexedCommand`, and `TextureSource` have no nested compatibility paths. `load_shader(context, bytes)` selects the artifact-owned entry point for each available stage.
+Import public items from the crate root. `Context`, `Surface`, `Shader`, `Texture`, `RenderTarget`, `VertexHeap`, `VertexAllocation`, `IndexAllocation`, `StructuredBuffer<T>`, and `IndirectBuffer` are non-`Copy`, non-`Send`, and non-`Sync` owners. Raw handles and explicit lifecycle functions are doc-hidden and reserved for `ez-gfx-ffi`.
 
-Contexts and resources use distinct transparent Rust handle types, including `VertexHeapHandle`. Each preserves the packed `u64` C representation and exposes explicit boundary conversion. Resource handles encode owner and generation; validated operations reject zero, malformed, stale, foreign, and kind-mismatched handles. Reflection resolves heap semantic names internally; public uploads and destruction use the typed heap handle, never a name.
+The context-owned index heap remains a singleton behind `upload_indices`. Vertex uploads accept `&[T]` where `T: Pod`; index uploads accept `&[u32]`. `Frame::acquire_structured<T: Pod>` infers stride and capacity. Transient writes validate element ranges, and indirect writes publish the maximum written command count. GPU-generated commands use `IndirectBuffer::publish_compute_count`.
 
-A globally synchronized generational arena allocates unique context handles. Context state stays in creator-thread-local storage, and every context/resource operation remains creator-thread-affine. Independent creator threads do not share a state mutex. Normal creator-thread TLS teardown invalidates remaining handles; `ExitProcess` may terminate other threads without running their TLS destructors. Windows TLS teardown cannot safely run or join DX12/COM cleanup under loader lock, so it deliberately retains the entire remaining context until process termination; use explicit `destroy_context` for any earlier reclamation or observable cleanup. Non-Windows normal TLS teardown retains synchronous best-effort cleanup.
-
-Fallible operations return the crate-root `Result<T, Error>`. `Error` is the single `thiserror` facade and preserves lifecycle/capability sources where they cross the public boundary; C status codes exist only in `ez-gfx-ffi`. Vertex uploads accept `&[T]` where `T: Pod`, and index uploads accept `&[u32]`; both infer count and byte layout, return typed allocation handles, and must be removed before heap destruction.
-`acquire_structured<T: Pod>(context, element_count)` infers stride and capacity; `write_structured` validates that stride and writes an indexed element range. `write_indirect` writes a command slice and advances the active count to the maximum written end. GPU-generated commands use the narrow `publish_compute_indirect_count` path because current backends require a CPU-known draw count.
-
-`load_texture` copies caller bytes and schedules unbounded CPU admission subject to real allocation failure. `poll_upload_event` is the lossless authoritative progress path for texture, vertex, and index uploads and must be drained once per frame. `cancel_texture_load` invalidates work before initial readiness; residency and unload retain their completion-safe behavior. See the [texture](../../docs/textures.md) and [geometry](../../docs/geometry.md) guides.
+`load_shader` accepts owned validated artifact bytes. `load_texture` copies caller bytes before returning and schedules CPU work. Context polling methods expose the lossless upload/runtime queues; applications drain them once per frame on the creator thread. See the [texture](../../docs/textures.md) and [geometry](../../docs/geometry.md) guides.
 
 ## Shader artifacts
 
@@ -40,4 +32,4 @@ Fallible operations return the crate-root `Result<T, Error>`. `Error` is the sin
 | [04 Dear ImGui](https://github.com/jkelin/ez_gfx_api2/blob/main/examples/04_imgui/README.md) | Dynamic UI buffers and per-command clipping |
 | [05 Helmet](https://github.com/jkelin/ez_gfx_api2/blob/main/examples/05_helmet/README.md) | GLB geometry and depth-tested rendering |
 | [06 Sponza KTX2](https://github.com/jkelin/ez_gfx_api2/blob/main/examples/06_sponza_ktx2/README.md) | KTX2 materials and compute-to-graphics flow |
-| [C textured cube](../../examples/c/textured_cube/README.md) | ABI 30 typed-heap, transient compute-to-graphics indexed-indirect cube |
+| [C textured cube](../../examples/c/textured_cube/README.md) | ABI 31 typed-heap, transient compute-to-graphics indexed-indirect cube |

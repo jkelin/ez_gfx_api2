@@ -21,7 +21,7 @@ use ez_gfx_ffi::{
 };
 #[cfg(all(feature = "ktx2", feature = "basis"))]
 use ez_gfx_ffi::{
-    ez_gfx_frame_begin, ez_gfx_frame_readback, ez_gfx_frame_submit,
+    ez_gfx_frame_begin, ez_gfx_frame_end, ez_gfx_frame_readback,
     ez_gfx_graph_enqueue_texture_readback,
 };
 fn poll_texture_ready(context: u64, texture: u64) -> EzGfxResult {
@@ -324,12 +324,24 @@ fn exercises_async_texture_batches(backend: u8) {
             ez_gfx_ffi::ez_gfx_context_wait_idle(context),
             EzGfxResult::Ok
         );
-        assert_eq!(ez_gfx_frame_begin(context), EzGfxResult::Ok);
+        let mut frame = 0;
         assert_eq!(
-            ez_gfx_graph_enqueue_texture_readback(compressed, context),
+            // SAFETY: frame output storage is live and aligned.
+            unsafe { ez_gfx_frame_begin(context, native.surface, &raw mut frame) },
             EzGfxResult::Ok
         );
-        assert_eq!(ez_gfx_frame_submit(context), EzGfxResult::Ok);
+        assert_eq!(
+            ez_gfx_graph_enqueue_texture_readback(compressed, frame),
+            EzGfxResult::Ok
+        );
+        assert_eq!(
+            ez_gfx_frame_end(frame),
+            if cfg!(windows) {
+                EzGfxResult::Ok
+            } else {
+                EzGfxResult::Unsupported
+            }
+        );
         let mut size = 0;
         assert_eq!(
             // SAFETY: The size output remains live and writable through the query.

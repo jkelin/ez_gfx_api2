@@ -89,10 +89,10 @@ No candidate has comparable descriptor-update, cache-startup, memory, or content
 
 **Selected: `S-P-007-global-table-plus-frame-local-arenas`.**
 
-Use a device-level bindless registry for stable resource indices and one transient linear arena per in-flight frame; reset only after completion. PSO/cache records own layouts and backend pipeline objects, never descriptor pools/sets. Persist backend-native cache data under keys including shader/interface, attachment state, backend, device/driver, and schema identity.
+Use a device-level bindless registry for stable resource indices and one transient linear arena per owning `Frame`. `Frame::finish` and abort invalidate its transient descriptors immediately; native arena reuse waits for GPU completion or remains quarantined after an indeterminate failure. PSO/cache records own layouts and backend pipeline objects, never descriptor pools/sets.
 
 **Rejected:** the incumbent violates the required decoupling. A global-only table is incomplete for transient/dynamic descriptor lifetimes and becomes preferable only if all descriptors can be proven stable and persistent.
 
 **Assumptions and risks:** required indexing tiers and capacities exist on supported hardware; slot generations and deferred reuse prevent stale handles. Pool exhaustion, early reset, heap switching, cache incompatibility, and differing sampler/resource rules remain risks. Performance is unknown.
 
-**Validation:** query and snapshot backend limits; stress maximum live and per-frame descriptors across frames in flight; test slot retirement and arena reset against delayed GPU completion; corrupt/invalidate cache blobs; measure update latency, allocations, memory, cache hit/miss startup, and heap switches on each backend.
+**Validation:** stress maximum live and frame-transient descriptors; test finish/abort invalidation and delayed-completion reuse; corrupt/invalidate cache blobs; measure update latency, allocations, memory, cache startup, and heap switches on each backend.

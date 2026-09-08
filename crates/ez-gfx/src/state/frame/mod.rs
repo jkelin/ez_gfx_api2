@@ -28,34 +28,63 @@ type NativeTextureMap = HashMap<TextureHandle, (TextureId, NativeTexture, u32, u
 /// # Errors
 ///
 /// Returns an error when validation, handle ownership, readiness, or a backend operation fails.
+#[cfg_attr(
+    not(any(feature = "ffi", test)),
+    allow(
+        dead_code,
+        reason = "the C raw seam begins target-less readback frames"
+    )
+)]
 pub fn frame_begin(context: ContextHandle) -> Result<()> {
-    result_status(with_context_mut(context, |context| {
+    result_status(with_context_mut(context, start_recording))
+}
+
+pub(super) fn start_recording(context: &mut ContextState) -> Result<()> {
+    context
+        .identity
+        .check_thread_and_health()
+        .map_err(map_lifecycle)?;
+    let frame_serial = context
+        .frame_serial
+        .checked_add(1)
+        .ok_or(Error::NativeFailure)?;
+    context.frame.begin().map_err(|error| map_frame(&error))?;
+    if let Err(error) = super::buffers::reclaim_available_transients(context) {
+        context.frame.abort();
+        return Err(error);
+    }
+    context.frame_serial = frame_serial;
+    context.frame_resources.clear();
+    context.frame_native_resources.clear();
+    context.frame_vertex_heaps.clear();
+    context.frame_index = None;
+    context.frame_surface = None;
+    context.frame_render_target = None;
+    context.frame_depth = None;
+    context.frame_has_graphics = false;
+    context.last_readback.clear();
+    context.frame_presented = false;
+    Ok(())
+}
+
+/// Returns the serial of the currently recording raw transaction.
+///
+/// # Errors
+///
+/// Returns an error when the context is stale, foreign, unhealthy, or not recording.
+#[cfg(feature = "ffi")]
+#[doc(hidden)]
+pub fn current_frame_serial(context: ContextHandle) -> Result<u64> {
+    with_context_mut(context, |context| {
         context
             .identity
             .check_thread_and_health()
             .map_err(map_lifecycle)?;
-        let frame_serial = context
-            .frame_serial
-            .checked_add(1)
-            .ok_or(Error::NativeFailure)?;
-        context.frame.begin().map_err(|error| map_frame(&error))?;
-        if let Err(error) = super::buffers::reclaim_available_transients(context) {
-            context.frame.abort();
-            return Err(error);
+        if context.frame.state() != ez_gfx_runtime::frame::FrameState::Recording {
+            return Err(Error::NotReady);
         }
-        context.frame_serial = frame_serial;
-        context.frame_resources.clear();
-        context.frame_native_resources.clear();
-        context.frame_vertex_heaps.clear();
-        context.frame_index = None;
-        context.frame_surface = None;
-        context.frame_render_target = None;
-        context.frame_depth = None;
-        context.frame_has_graphics = false;
-        context.last_readback.clear();
-        context.frame_presented = false;
-        Ok(())
-    }))
+        Ok(context.frame_serial)
+    })
 }
 
 fn intern_buffer_resource(context: &mut ContextState, handle: PackedHandle) -> Result<ResourceId> {
@@ -906,6 +935,34 @@ pub fn frame_submit(context: ContextHandle) -> Result<()> {
                 .push_diagnostic(DiagnosticLevel::Error, record);
         }
         result
+    }))
+}
+/// Aborts the current recording transaction without submitting it.
+///
+/// Interned transient buffers return to their pre-recording state. No backend
+/// work starts, so rollback never needs an idle wait or quarantine path.
+///
+/// # Errors
+///
+/// Returns an error for a stale, foreign, or wrong-thread context.
+pub fn frame_abort(context: ContextHandle) -> Result<()> {
+    result_status(with_context_mut(context, |context| {
+        context
+            .identity
+            .check_thread_and_health()
+            .map_err(map_lifecycle)?;
+        context.frame.abort();
+        rollback_transient_internment(context);
+        context.frame_resources.clear();
+        context.frame_native_resources.clear();
+        context.frame_vertex_heaps.clear();
+        context.frame_index = None;
+        context.frame_surface = None;
+        context.frame_render_target = None;
+        context.frame_depth = None;
+        context.frame_has_graphics = false;
+        context.frame_presented = false;
+        Ok(())
     }))
 }
 

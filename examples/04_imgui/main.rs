@@ -1,490 +1,286 @@
-//! `ImGui` using safe ez-gfx context, resource, and frame APIs.
-mod renderer {
-    use crate::shared::{input::*, *};
-    use ez_gfx::*;
-    use imgui::{Condition, DrawCmd, Key, MouseButton, TextureId};
-
-    const IDENTITY_INDEX_COUNT: usize = 65_536;
-    #[repr(C)]
-    #[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
-    struct ImGuiVertex {
-        pos: [f32; 2],
-        uv: [f32; 2],
-        col: u32,
-        padding: [u32; 3],
-    }
-    #[repr(C)]
-    #[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
-    struct ImGuiCommand {
-        clip_rect: [f32; 4],
-        texture_id: u32,
-        idx_offset: u32,
-        vtx_offset: u32,
-        padding: u32,
-    }
-    #[repr(C)]
-    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-    struct Push {
-        display_size: [f32; 2],
-        vertical_sign: f32,
-        padding: f32,
-    }
-
-    pub(super) struct ImGuiScene {
-        imgui: imgui::Context,
-        shader: ShaderHandle,
-        identity_start: u32,
-        vertices_heap: VertexHeapHandle,
-        indices_heap: VertexHeapHandle,
-        vertices: Option<VertexAllocationHandle>,
-        indices: Option<VertexAllocationHandle>,
-        _identity_indices: IndexAllocationHandle,
-        cpu_vertices: Vec<ImGuiVertex>,
-        cpu_indices: Vec<u32>,
-        cpu_commands: Vec<ImGuiCommand>,
-        uploaded_vertices: Vec<ImGuiVertex>,
-        uploaded_indices: Vec<u32>,
-        draw_counts: Vec<u32>,
-        push: Push,
-    }
-
-    impl ImGuiScene {
-        pub(super) fn create(context: ContextHandle, backend: Backend) -> anyhow::Result<Self> {
-            let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("examples package has no workspace parent"))?;
-            let shader_bytes = ez_gfx_compiler::compile_shader(
-                &workspace_root.join("examples/04_imgui/04_imgui.slang"),
-                &[
-                    ez_gfx_compiler::Target::Spirv,
-                    ez_gfx_compiler::Target::Dxil,
-                    ez_gfx_compiler::Target::Metal,
-                ],
-                !cfg!(target_vendor = "apple"),
-            )?;
-            let mut imgui = imgui::Context::create();
-            imgui.set_ini_filename(None);
-            let identity = (0..IDENTITY_INDEX_COUNT as u32).collect::<Vec<_>>();
-            let index_bytes = byte_len(&identity)? as u64;
-            let vertex_bytes = IDENTITY_INDEX_COUNT
-                .checked_mul(std::mem::size_of::<ImGuiVertex>())
-                .ok_or_else(|| anyhow::anyhow!("ImGui vertex heap size overflow"))?
-                as u64;
-            let atlas = imgui.fonts().build_rgba32_texture();
-            let config = TextureConfig {
-                width: atlas.width,
-                height: atlas.height,
-                mip_count: 0,
-                destination: ez_gfx::TextureDestination::Rgba8Unorm,
-                sampler: TextureSamplerDesc {
-                    min_filter: SamplerFilter::Linear,
-                    mag_filter: SamplerFilter::Linear,
-                    max_anisotropy: 1.0,
-                    address_u: SamplerAddressMode::Clamp,
-                    address_v: SamplerAddressMode::Clamp,
-                    address_w: SamplerAddressMode::Clamp,
-                },
-            };
-            let texture = load_texture(
-                context,
-                TextureSource::Rgba8 {
-                    width: atlas.width,
-                    height: atlas.height,
-                },
-                atlas.data,
-                false,
-                &config,
-            )?;
-            wait_idle(context)?;
-            let texture_id = texture_binding(context, texture)?;
-            imgui.fonts().tex_id = TextureId::new(texture_id as usize);
-            create_index_heap(context, index_bytes)?;
-            let identity_indices = upload_indices(context, &identity)?;
-            let identity_start = index_allocation_range(context, identity_indices)?.0;
-            let vertices_heap = create_vertex_heap(
-                context,
-                "imgui_vertices",
-                vertex_bytes,
-                std::mem::size_of::<ImGuiVertex>() as u64,
-            )?;
-            let indices_heap = create_vertex_heap(context, "imgui_indices", index_bytes, 4)?;
-            let shader = load_shader(context, &shader_bytes)?;
-            Ok(Self {
-                imgui,
-                shader,
-                identity_start,
-                vertices_heap,
-                indices_heap,
-                vertices: None,
-                indices: None,
-                _identity_indices: identity_indices,
-                cpu_vertices: Vec::new(),
-                cpu_indices: Vec::new(),
-                cpu_commands: Vec::new(),
-                draw_counts: Vec::new(),
-                uploaded_vertices: Vec::new(),
-                uploaded_indices: Vec::new(),
-                push: Push {
-                    display_size: [640.0, 480.0],
-                    vertical_sign: if backend == Backend::Vulkan {
-                        1.0
-                    } else {
-                        -1.0
-                    },
-                    padding: 0.0,
-                },
-            })
-        }
-
-        fn rebuild_draw_data(&mut self) -> anyhow::Result<()> {
-            self.cpu_vertices.clear();
-            self.cpu_indices.clear();
-            self.cpu_commands.clear();
-            self.draw_counts.clear();
-            let draw = self.imgui.render();
-            for list in draw.draw_lists() {
-                let vertex_base = self.cpu_vertices.len() as u32;
-                let index_base = self.cpu_indices.len() as u32;
-                self.cpu_vertices
-                    .extend(list.vtx_buffer().iter().map(|vertex| ImGuiVertex {
-                        pos: vertex.pos,
-                        uv: vertex.uv,
-                        col: u32::from(vertex.col[0])
-                            | (u32::from(vertex.col[1]) << 8)
-                            | (u32::from(vertex.col[2]) << 16)
-                            | (u32::from(vertex.col[3]) << 24),
-                        padding: [0; 3],
-                    }));
-                self.cpu_indices
-                    .extend(list.idx_buffer().iter().map(|index| u32::from(*index)));
-                for command in list.commands() {
-                    if let DrawCmd::Elements { count, cmd_params } = command {
-                        self.cpu_commands.push(ImGuiCommand {
-                            clip_rect: cmd_params.clip_rect,
-                            texture_id: cmd_params.texture_id.id() as u32,
-                            idx_offset: index_base + cmd_params.idx_offset as u32,
-                            vtx_offset: vertex_base + cmd_params.vtx_offset as u32,
-                            padding: 0,
-                        });
-                        self.draw_counts.push(count as u32);
-                    }
-                }
-            }
-            if self.cpu_vertices.is_empty()
-                || self.cpu_indices.is_empty()
-                || self.cpu_commands.is_empty()
-            {
-                anyhow::bail!("ImGui produced no drawable commands");
-            }
-            Ok(())
-        }
-
-        fn upload_heap<T: bytemuck::Pod>(
-            context: ContextHandle,
-            heap: VertexHeapHandle,
-            values: &[T],
-            allocation: &mut Option<VertexAllocationHandle>,
-        ) -> anyhow::Result<()> {
-            // A dedicated ImGui heap has one live range; removal restores its full zero-based range.
-            if let Some(previous) = allocation.take() {
-                remove_vertices(context, previous)?;
-            }
-            let uploaded = ez_gfx::upload_vertices(context, heap, values)?;
-            *allocation = Some(uploaded);
-            Ok(())
-        }
-    }
-
-    impl ImGuiScene {
-        pub(super) fn handle_input(&mut self, input: SceneInput) {
-            let io = self.imgui.io_mut();
-            match input {
-                SceneInput::CursorMoved { x, y } => io.add_mouse_pos_event([x as f32, y as f32]),
-                SceneInput::PrimaryButton(value) => {
-                    io.add_mouse_button_event(MouseButton::Left, value)
-                }
-                SceneInput::ScrollLines(lines) => io.add_mouse_wheel_event([0.0, lines]),
-                SceneInput::Character(value) => io.add_input_character(value),
-                SceneInput::Key { key, pressed } => {
-                    if let Some(key) = imgui_key(key) {
-                        io.add_key_event(key, pressed);
-                    }
-                }
-            }
-        }
-        pub(super) fn update(&mut self, frame: FrameInput) -> anyhow::Result<()> {
-            let display_size = [frame.width as f32, frame.height as f32];
-            {
-                let io = self.imgui.io_mut();
-                io.display_size = display_size;
-                io.delta_time = frame.delta_seconds.max(1.0 / 1000.0);
-            }
-            let ui = self.imgui.frame();
-            ui.window("Dear ImGui Demo")
-                .position([20.0, 20.0], Condition::Always)
-                .size([550.0, 440.0], Condition::Always)
-                .build(|| {});
-            let mut open = true;
-            ui.show_demo_window(&mut open);
-            self.push.display_size = display_size;
-            self.rebuild_draw_data()
-        }
-        pub(super) fn record(&mut self, context: ContextHandle) -> anyhow::Result<()> {
-            if self.cpu_vertices != self.uploaded_vertices {
-                Self::upload_heap(
-                    context,
-                    self.vertices_heap,
-                    &self.cpu_vertices,
-                    &mut self.vertices,
-                )?;
-                let first = vertex_allocation_range(
-                    context,
-                    self.vertices
-                        .ok_or_else(|| anyhow::anyhow!("ImGui vertex allocation unavailable"))?,
-                )?
-                .0;
-                anyhow::ensure!(
-                    first == 0,
-                    "dedicated ImGui vertex heap did not restart at zero"
-                );
-                std::mem::swap(&mut self.cpu_vertices, &mut self.uploaded_vertices);
-            }
-            if self.cpu_indices != self.uploaded_indices {
-                Self::upload_heap(
-                    context,
-                    self.indices_heap,
-                    &self.cpu_indices,
-                    &mut self.indices,
-                )?;
-                let first = vertex_allocation_range(
-                    context,
-                    self.indices.ok_or_else(|| {
-                        anyhow::anyhow!("ImGui index-data allocation unavailable")
-                    })?,
-                )?
-                .0;
-                anyhow::ensure!(
-                    first == 0,
-                    "dedicated ImGui index-data heap did not restart at zero"
-                );
-                std::mem::swap(&mut self.cpu_indices, &mut self.uploaded_indices);
-            }
-
-            let commands = acquire_structured::<ImGuiCommand>(context, self.cpu_commands.len())?;
-            write_structured(context, commands, 0, &self.cpu_commands)?;
-            let indirect = acquire_indirect(context, self.draw_counts.len() as u32)?;
-            let draws = self
-                .draw_counts
-                .iter()
-                .copied()
-                .enumerate()
-                .map(|(index, count)| DrawIndexedCommand {
-                    index_count: count,
-                    instance_count: 1,
-                    first_index: self.identity_start,
-                    vertex_offset: 0,
-                    first_instance: index as u32,
-                })
-                .collect::<Vec<_>>();
-            write_indirect(context, indirect, 0, &draws)?;
-
-            let bindings = [PublicBinding {
-                name: "imgui_commands".to_owned(),
-                resource: ResourceIdentity::Structured(commands),
-            }];
-            render_add_graphics(
-                context,
-                self.shader,
-                indirect,
-                &bindings,
-                DynamicPipelineState::from_abi(0, 0, 0, 1).unwrap(),
-                bytes_of(&self.push),
-            )?;
-            Ok(())
-        }
-    }
-
-    fn imgui_key(key: SceneKey) -> Option<Key> {
-        Some(match key {
-            SceneKey::Tab => Key::Tab,
-            SceneKey::Left => Key::LeftArrow,
-            SceneKey::Right => Key::RightArrow,
-            SceneKey::Up => Key::UpArrow,
-            SceneKey::Down => Key::DownArrow,
-            SceneKey::PageUp => Key::PageUp,
-            SceneKey::PageDown => Key::PageDown,
-            SceneKey::Home => Key::Home,
-            SceneKey::End => Key::End,
-            SceneKey::Insert => Key::Insert,
-            SceneKey::Delete => Key::Delete,
-            SceneKey::Backspace => Key::Backspace,
-            SceneKey::Space => Key::Space,
-            SceneKey::Enter => Key::Enter,
-            SceneKey::Escape => Key::Escape,
-            SceneKey::Other => return None,
-        })
-    }
-}
-
+//! `ImGui` using safe ez-gfx context, resource, and frame interfaces.
 #[path = "../shared/mod.rs"]
 mod shared;
 
 use ez_gfx::*;
-use renderer::ImGuiScene as ExampleScene;
-use shared::*;
+use imgui::{Condition, DrawCmd, Key, MouseButton, TextureId};
+use shared::{input::*, *};
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
 
-struct Example {
-    resources: Option<ExampleScene>,
-    context: Option<ContextHandle>,
-    surface: Option<SurfaceHandle>,
-    benchmark: BenchmarkRunner,
+const IDENTITY_INDEX_COUNT: usize = 65_536;
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+struct ImGuiVertex {
+    pos: [f32; 2],
+    uv: [f32; 2],
+    col: u32,
+    padding: [u32; 3],
+}
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+struct ImGuiCommand {
+    clip_rect: [f32; 4],
+    texture_id: u32,
+    idx_offset: u32,
+    vtx_offset: u32,
+    padding: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Push {
+    display_size: [f32; 2],
+    vertical_sign: f32,
+    padding: f32,
 }
 
-impl Example {
-    fn new(benchmark: Option<BenchmarkConfig>) -> Self {
-        Self {
-            resources: None,
-            context: None,
-            surface: None,
-            benchmark: BenchmarkRunner::new(benchmark),
+fn rebuild_draw_data(
+    imgui: &mut imgui::Context,
+    cpu_vertices: &mut Vec<ImGuiVertex>,
+    cpu_indices: &mut Vec<u32>,
+    cpu_commands: &mut Vec<ImGuiCommand>,
+    draw_counts: &mut Vec<u32>,
+) -> anyhow::Result<()> {
+    cpu_vertices.clear();
+    cpu_indices.clear();
+    cpu_commands.clear();
+    draw_counts.clear();
+    let draw = imgui.render();
+    for list in draw.draw_lists() {
+        let vertex_base = cpu_vertices.len() as u32;
+        let index_base = cpu_indices.len() as u32;
+        cpu_vertices.extend(list.vtx_buffer().iter().map(|vertex| ImGuiVertex {
+            pos: vertex.pos,
+            uv: vertex.uv,
+            col: u32::from(vertex.col[0])
+                | (u32::from(vertex.col[1]) << 8)
+                | (u32::from(vertex.col[2]) << 16)
+                | (u32::from(vertex.col[3]) << 24),
+            padding: [0; 3],
+        }));
+        cpu_indices.extend(list.idx_buffer().iter().map(|index| u32::from(*index)));
+        for command in list.commands() {
+            if let DrawCmd::Elements { count, cmd_params } = command {
+                cpu_commands.push(ImGuiCommand {
+                    clip_rect: cmd_params.clip_rect,
+                    texture_id: cmd_params.texture_id.id() as u32,
+                    idx_offset: index_base + cmd_params.idx_offset as u32,
+                    vtx_offset: vertex_base + cmd_params.vtx_offset as u32,
+                    padding: 0,
+                });
+                draw_counts.push(count as u32);
+            }
         }
     }
-
-    fn context_handle(&self) -> ContextHandle {
-        self.context.expect("example context is initialized")
-    }
-
-    fn surface(&self) -> SurfaceHandle {
-        self.surface.expect("example surface is initialized")
-    }
+    anyhow::ensure!(
+        !cpu_vertices.is_empty() && !cpu_indices.is_empty() && !cpu_commands.is_empty(),
+        "ImGui produced no drawable commands"
+    );
+    Ok(())
 }
 
-impl LifecycleCallbacks for Example {
-    type Report = ProgramReport;
+fn imgui_key(key: SceneKey) -> Option<Key> {
+    Some(match key {
+        SceneKey::Tab => Key::Tab,
+        SceneKey::Left => Key::LeftArrow,
+        SceneKey::Right => Key::RightArrow,
+        SceneKey::Up => Key::UpArrow,
+        SceneKey::Down => Key::DownArrow,
+        SceneKey::PageUp => Key::PageUp,
+        SceneKey::PageDown => Key::PageDown,
+        SceneKey::Home => Key::Home,
+        SceneKey::End => Key::End,
+        SceneKey::Insert => Key::Insert,
+        SceneKey::Delete => Key::Delete,
+        SceneKey::Backspace => Key::Backspace,
+        SceneKey::Space => Key::Space,
+        SceneKey::Enter => Key::Enter,
+        SceneKey::Escape => Key::Escape,
+        SceneKey::Other => return None,
+    })
+}
 
-    fn initialize(&mut self, native: NativeSurface, width: u32, height: u32) -> anyhow::Result<()> {
-        let config = backend_config(native.platform)?;
-        let backend = config.backend;
-
-        let platform = config.platform;
-        let context = create_context(ContextOptions {
-            enable_debug: env_flag("EZ_GFX_EXAMPLE_DEBUG")?,
-            enable_validation: env_flag("EZ_GFX_EXAMPLE_VALIDATION")?,
-            surface_platform: platform,
-            backend,
-            texture_decode_workers: 0,
-            adapter_selection: None,
-        })?;
-        self.context = Some(context);
-        let surface = create_surface(
+fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
+    run(config, move |context, _surface, backend| {
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("examples package has no workspace parent"))?;
+        let shader_bytes = ez_gfx_compiler::compile_shader(
+            &workspace_root.join("examples/04_imgui/04_imgui.slang"),
+            &[
+                ez_gfx_compiler::Target::Spirv,
+                ez_gfx_compiler::Target::Dxil,
+                ez_gfx_compiler::Target::Metal,
+            ],
+            !cfg!(target_vendor = "apple"),
+        )?;
+        let mut imgui = imgui::Context::create();
+        imgui.set_ini_filename(None);
+        let identity = (0..IDENTITY_INDEX_COUNT as u32).collect::<Vec<_>>();
+        let index_bytes = byte_len(&identity)? as u64;
+        let vertex_bytes = IDENTITY_INDEX_COUNT
+            .checked_mul(std::mem::size_of::<ImGuiVertex>())
+            .ok_or_else(|| anyhow::anyhow!("ImGui vertex heap size overflow"))?
+            as u64;
+        let atlas = imgui.fonts().build_rgba32_texture();
+        let config = TextureConfig {
+            width: atlas.width,
+            height: atlas.height,
+            mip_count: 0,
+            destination: ez_gfx::TextureDestination::Rgba8Unorm,
+            sampler: TextureSamplerDesc {
+                min_filter: SamplerFilter::Linear,
+                mag_filter: SamplerFilter::Linear,
+                max_anisotropy: 1.0,
+                address_u: SamplerAddressMode::Clamp,
+                address_v: SamplerAddressMode::Clamp,
+                address_w: SamplerAddressMode::Clamp,
+            },
+        };
+        let texture = load_texture(
             context,
-            SurfaceOptions {
-                window: native.window,
-                display: native.display,
-                platform,
-                width,
-                height,
-                cache_presented_snapshots: false,
+            TextureSource::Rgba8 {
+                width: atlas.width,
+                height: atlas.height,
             },
+            atlas.data,
+            false,
+            &config,
         )?;
-        self.surface = Some(surface);
-        init_device(self.context_handle(), self.surface())?;
-        resize_surface(self.context_handle(), self.surface(), width, height)?;
-        self.resources = Some(ExampleScene::create(self.context_handle(), backend)?);
-        Ok(())
-    }
-
-    fn resize(&mut self, width: u32, height: u32) -> anyhow::Result<()> {
-        resize_surface(self.context_handle(), self.surface(), width, height)?;
-        Ok(())
-    }
-
-    fn input(&mut self, input: SceneInput) {
-        if let Some(resources) = &mut self.resources {
-            resources.handle_input(input);
-        }
-    }
-
-    fn render(
-        &mut self,
-        frame: FrameInput,
-        terminal: bool,
-        frame_index: u32,
-    ) -> anyhow::Result<()> {
-        self.benchmark.begin_frame(frame_index);
-        let context = self.context_handle();
-        let surface = self.surface();
-        if terminal {
-            set_snapshot_cache(context, surface, true)?;
-        }
-        let resources = self
-            .resources
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("example resources are unavailable"))?;
-        resources.update(frame)?;
-        begin_render(context, surface)?;
-        resources.record(context)?;
-        finish_render(context)?;
-        self.benchmark.end_frame(frame_index.saturating_add(1));
-        Ok(())
-    }
-
-    fn capture(&mut self, width: u32, height: u32, frames: u32) -> anyhow::Result<ProgramReport> {
-        let rgba8 = frame_readback(self.context_handle())?;
-        let counts = drain_bounded(
-            4096,
-            || {
-                poll_runtime_event(self.context_handle())
-                    .map(|(record, dropped)| (record.is_some(), dropped))
-            },
-            || {
-                poll_diagnostic(self.context_handle())
-                    .map(|(record, dropped)| (record.is_some(), dropped))
-            },
+        context.wait_idle()?;
+        let texture_id = texture.binding()?;
+        imgui.fonts().tex_id = TextureId::new(texture_id as usize);
+        create_index_heap(context, index_bytes)?;
+        let identity_indices = upload_indices(context, &identity)?;
+        let identity_start = identity_indices.range()?.0;
+        let vertices_heap = create_vertex_heap(
+            context,
+            "imgui_vertices",
+            vertex_bytes,
+            std::mem::size_of::<ImGuiVertex>() as u64,
         )?;
-        Ok(ProgramReport {
-            frame: PresentedFrame {
-                width,
-                height,
-                frames,
-                rgba8,
-                runtime_events: counts.runtime_events,
-                diagnostics: counts.diagnostics,
-                dropped_observations: counts.dropped,
+        let indices_heap = create_vertex_heap(context, "imgui_indices", index_bytes, 4)?;
+        let shader = load_shader(context, &shader_bytes)?;
+        let mut vertices = None;
+        let mut indices = None;
+        let mut cpu_vertices = Vec::new();
+        let mut cpu_indices = Vec::new();
+        let mut cpu_commands = Vec::new();
+        let mut uploaded_vertices = Vec::new();
+        let mut uploaded_indices = Vec::new();
+        let mut draw_counts = Vec::new();
+        let mut push = Push {
+            display_size: [640.0, 480.0],
+            vertical_sign: if backend == Backend::Vulkan {
+                1.0
+            } else {
+                -1.0
             },
-            benchmark: self.benchmark.report(),
-        })
-    }
+            padding: 0.0,
+        };
 
-    fn shutdown(&mut self) {
-        if let Some(context) = self.context.take() {
-            let _ = destroy_context(context);
-        }
-    }
-}
+        Ok(
+            move |context: &Context,
+                  surface: &Surface,
+                  input: FrameInput,
+                  events: &[SceneInput]| {
+                let mut frame = begin_frame(context, surface)?;
+                for &event in events {
+                    let io = imgui.io_mut();
+                    match event {
+                        SceneInput::CursorMoved { x, y } => {
+                            io.add_mouse_pos_event([x as f32, y as f32])
+                        }
+                        SceneInput::PrimaryButton(value) => {
+                            io.add_mouse_button_event(MouseButton::Left, value)
+                        }
+                        SceneInput::ScrollLines(lines) => io.add_mouse_wheel_event([0.0, lines]),
+                        SceneInput::Character(value) => io.add_input_character(value),
+                        SceneInput::Key { key, pressed } => {
+                            if let Some(key) = imgui_key(key) {
+                                io.add_key_event(key, pressed);
+                            }
+                        }
+                    }
+                }
+                let display_size = [input.width as f32, input.height as f32];
+                {
+                    let io = imgui.io_mut();
+                    io.display_size = display_size;
+                    io.delta_time = input.delta_seconds.max(1.0 / 1000.0);
+                }
+                let ui = imgui.frame();
+                ui.window("Dear ImGui Demo")
+                    .position([20.0, 20.0], Condition::Always)
+                    .size([550.0, 440.0], Condition::Always)
+                    .build(|| {});
+                let mut open = true;
+                ui.show_demo_window(&mut open);
+                push.display_size = display_size;
+                rebuild_draw_data(
+                    &mut imgui,
+                    &mut cpu_vertices,
+                    &mut cpu_indices,
+                    &mut cpu_commands,
+                    &mut draw_counts,
+                )?;
 
-fn run_example_with_benchmark(
-    frame_limit: Option<u32>,
-    benchmark: Option<BenchmarkConfig>,
-) -> anyhow::Result<Option<ProgramReport>> {
-    run(
-        LifecycleConfig {
-            width: WIDTH,
-            height: HEIGHT,
-            title: "ez_gfx_api2",
-            frame_limit,
-        },
-        Example::new(benchmark),
-    )
+                if cpu_vertices != uploaded_vertices {
+                    drop(vertices.take());
+                    vertices = Some(upload_vertices(&vertices_heap, &cpu_vertices)?);
+                    anyhow::ensure!(
+                        vertices.as_ref().expect("just assigned").range()?.0 == 0,
+                        "dedicated ImGui vertex heap did not restart at zero"
+                    );
+                    std::mem::swap(&mut cpu_vertices, &mut uploaded_vertices);
+                }
+                if cpu_indices != uploaded_indices {
+                    drop(indices.take());
+                    indices = Some(upload_vertices(&indices_heap, &cpu_indices)?);
+                    anyhow::ensure!(
+                        indices.as_ref().expect("just assigned").range()?.0 == 0,
+                        "dedicated ImGui index-data heap did not restart at zero"
+                    );
+                    std::mem::swap(&mut cpu_indices, &mut uploaded_indices);
+                }
+                let commands = frame.acquire_structured::<ImGuiCommand>(cpu_commands.len())?;
+                commands.write(&mut frame, 0, &cpu_commands)?;
+                let indirect = frame.acquire_indirect(draw_counts.len() as u32)?;
+                let draws = draw_counts
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(index, count)| DrawIndexedCommand {
+                        index_count: count,
+                        instance_count: 1,
+                        first_index: identity_start,
+                        vertex_offset: 0,
+                        first_instance: index as u32,
+                    })
+                    .collect::<Vec<_>>();
+                indirect.write(&mut frame, 0, &draws)?;
+                frame.retain_texture(&texture)?;
+                frame.retain_index_allocation(&identity_indices)?;
+                frame.retain_vertex_allocation(
+                    vertices.as_ref().expect("uploaded ImGui vertices"),
+                )?;
+                frame
+                    .retain_vertex_allocation(indices.as_ref().expect("uploaded ImGui indices"))?;
+                let bindings = [Binding::structured("imgui_commands", &commands)];
+                frame.add_graphics(
+                    &shader,
+                    &indirect,
+                    &bindings,
+                    DynamicPipelineState::from_abi(0, 0, 0, 1).unwrap(),
+                    bytes_of(&push),
+                )?;
+                Ok::<_, anyhow::Error>(frame)
+            },
+        )
+    })
 }
 
 fn main() {
-    let backend = backend_name().unwrap_or_else(|error| {
-        eprintln!("{error:#}");
-        std::process::exit(2);
-    });
-    run_program("04_imgui", backend, run_example_with_benchmark);
+    run_program("04_imgui", WIDTH, HEIGHT, "ez_gfx_api2", run_example);
 }

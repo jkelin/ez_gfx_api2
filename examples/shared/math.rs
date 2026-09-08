@@ -13,7 +13,7 @@ pub fn perspective(
     near: f32,
     far: f32,
     clip_y: ClipY,
-) -> anyhow::Result<Mat4> {
+) -> crate::shared::Result<Mat4> {
     // Zero, reversed, non-finite, and half-turn projection bounds would produce infinities or inverted depth.
     if ![fovy, aspect, near, far].into_iter().all(f32::is_finite)
         || fovy <= 0.0
@@ -22,7 +22,9 @@ pub fn perspective(
         || near <= 0.0
         || far <= near
     {
-        anyhow::bail!("invalid perspective parameters");
+        return Err(crate::shared::Error::message(format!(
+            "invalid perspective parameters"
+        )));
     }
 
     let focal = 1.0 / (fovy * 0.5).tan();
@@ -42,7 +44,7 @@ pub fn perspective(
     ]))
 }
 
-pub fn look_at(eye: Vec3, target: Vec3, up: Vec3) -> anyhow::Result<Mat4> {
+pub fn look_at(eye: Vec3, target: Vec3, up: Vec3) -> crate::shared::Result<Mat4> {
     let forward = target - eye;
     // Coincident points, non-finite coordinates, and a parallel up vector do not define a camera basis.
     if !eye.is_finite()
@@ -51,7 +53,9 @@ pub fn look_at(eye: Vec3, target: Vec3, up: Vec3) -> anyhow::Result<Mat4> {
         || forward.length_squared() <= f32::EPSILON * f32::EPSILON
         || forward.cross(up).length_squared() <= f32::EPSILON * f32::EPSILON
     {
-        anyhow::bail!("cannot construct a degenerate look-at matrix");
+        return Err(crate::shared::Error::message(format!(
+            "cannot construct a degenerate look-at matrix"
+        )));
     }
     let forward = forward / forward.length();
     let side = forward.cross(up);
@@ -66,12 +70,14 @@ pub fn look_at(eye: Vec3, target: Vec3, up: Vec3) -> anyhow::Result<Mat4> {
     ]))
 }
 
-pub fn normal_transform(matrix: Mat4) -> anyhow::Result<Mat3> {
+pub fn normal_transform(matrix: Mat4) -> crate::shared::Result<Mat3> {
     let linear = Mat3::from_mat4(matrix);
     let determinant = linear.determinant();
     // Singular and non-finite transforms have no inverse-transpose normal transform.
     if !matrix.is_finite() || !determinant.is_finite() || determinant.abs() <= f32::EPSILON {
-        anyhow::bail!("cannot transform normals with a singular matrix");
+        return Err(crate::shared::Error::message(format!(
+            "cannot transform normals with a singular matrix"
+        )));
     }
     Ok(linear.inverse().transpose())
 }
@@ -136,7 +142,7 @@ impl OrbitCamera {
         self.distance = (self.distance * 0.85_f32.powf(lines)).clamp(0.1, 100.0);
     }
 
-    pub fn view(&self, target: Vec3) -> anyhow::Result<Mat4> {
+    pub fn view(&self, target: Vec3) -> crate::shared::Result<Mat4> {
         let cos_pitch = self.pitch.cos();
         let eye = target
             + Vec3::new(

@@ -8,7 +8,7 @@ This repository is a Rust/Cargo migration of `ez_gfx_api`. Preserve the recogniz
 
 - Keep `ez-gfx` safe: it owns runtime behavior, resource lifetimes, graph semantics, and typed errors. `ez-gfx-ffi` is a narrow boundary that validates, converts, delegates, and contains panics; it must not reimplement behavior.
 - Treat Vulkan, DX12, and Metal as one synchronized contract. Any backend-facing abstraction, implementation, test, or documented behavior change must be assessed and updated consistently across all three, or explicitly record why a backend is unsupported.
-- Keep backend-native handles, state lowering, and physical shader layouts private. Public Rust resources use typed handles; the stable C ABI uses opaque `uint64_t`/`u64` handles with generation/owner validation.
+- Keep backend-native handles, state lowering, and physical shader layouts private. Public Rust resources are owning wrappers; raw handles are doc-hidden and reserved for the stable C ABI, which uses opaque `uint64_t`/`u64` values with generation/owner validation.
 - Keep compiler/runtime dependency isolation absolute: runtime crates and distributions contain no Slang, DXC, compiler crates, native compiler libraries, source compilation, JIT, or shader fallback. The non-distributed Rust examples are development compiler clients that compile adjacent Slang source paths with target lists and development mode, then load owned validated artifact bytes; runtime packages remain compiler-free.
 
 ## Shader and artifact contracts

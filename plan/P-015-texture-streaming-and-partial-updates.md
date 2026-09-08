@@ -108,11 +108,11 @@ Maintain original Odin behavior: every texture upload transfers all mips in a si
 
 ### Selection rationale
 
-`S-P-015-progressive-mip-streamer-and-subregion-updates` comprehensively fulfills all four texture management requirements from TODO.md:
-1. It introduces `ez_gfx_update_texture_region` for partial sub-rectangle uploads, eliminating full 16.78 MB font atlas re-uploads when Dear ImGui dynamically adds glyphs.
-2. It enables progressive mip streaming, allowing coarse mips to become sample-ready and render immediately while high-resolution base mips stream in asynchronously.
-3. It defers bindless descriptor heap population until the GPU layout transition to `SHADER_READ_ONLY_OPTIMAL` is completed, eliminating data hazard race conditions.
-4. It provides lock-free atomic profiling counters to track decode latency, staging bytes, queue latency, and handoff duration without mutex contention.
+`S-P-015-progressive-mip-streamer-and-subregion-updates` provides:
+1. validated partial sub-rectangle uploads through `Texture::update_region`;
+2. progressive mip streaming, allowing coarse mips to become sample-ready before finer levels;
+3. deferred bindless descriptor publication after transfer and frame safety; and
+4. upload telemetry without changing the owning `Texture` lifecycle.
 
 ### Rejected alternatives
 
@@ -140,9 +140,9 @@ Updating a 64x64 glyph sub-region instead of a full 2048x2048 atlas reduces tran
 
 ### Implementation and evidence status
 
-The implementation allocates the complete mip chain, submits coarse levels first with distinct completion values, gates descriptor publication on transfer completion and frame safety, and exposes partial updates and atomic telemetry. `set_texture_residency` changes only the sampled mip range: Vulkan image views, DX12 SRVs, and Metal parent-texture views retain all image storage. Logical eviction does not reclaim GPU memory or stop finer uploads; physical reclamation is outside this selected full-allocation design.
+The implementation allocates the complete mip chain, submits coarse levels first with distinct completion values, gates descriptor publication on transfer completion and frame safety, and exposes partial updates and telemetry. `Texture::set_residency` changes only the sampled mip range: native views retain all image storage. Logical eviction does not reclaim GPU memory or stop finer uploads.
 
-RTX 3080 Vulkan/DX12 regressions verify linear/sRGB BC1/BC3/BC7 and RGBA8 sampling, changed/untouched region pixels, queued and record-before-update ordering, sustained residency changes, and submitted-work unload/reuse. Deterministic native tests hold a submitted fine copy behind a GPU gate while a coarse sampling frame finishes, and hold graphics fences unsignaled to prove retirement safety. Initial publication was reproduced failing through public Vulkan polling and fixed with a shared publication-aware readiness gate. Vulkan validation is clean.
+RTX 3080 Vulkan/DX12 regressions verify format sampling, region updates, queued ordering, residency changes, and submitted-work retirement/reuse. These backend tests predate the owning-wrapper cutover and do not verify dropping `Texture`.
 
 DX12 explicitly returns `Unsupported` for non-block-aligned BC base dimensions, including through the C ABI. Valid 28×12 bases retain a supported 7×3 mip at level two; both clipped edge regions are sampled and updated in the regression. No padded-resource UV workaround is used. Both RTX backends reject ASTC explicitly.
 

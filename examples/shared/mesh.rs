@@ -42,7 +42,7 @@ pub struct MeshData {
 pub fn basic_primitives(
     mesh: &MeshData,
     uploaded_first_index: u32,
-) -> anyhow::Result<Vec<BasicPrimitive>> {
+) -> crate::shared::Result<Vec<BasicPrimitive>> {
     mesh.primitives
         .iter()
         .map(|primitive| {
@@ -50,7 +50,9 @@ pub fn basic_primitives(
                 first_index: primitive
                     .first_index
                     .checked_add(uploaded_first_index)
-                    .ok_or_else(|| anyhow::anyhow!("primitive index offset exceeds u32"))?,
+                    .ok_or_else(|| {
+                        crate::shared::Error::message(format!("primitive index offset exceeds u32"))
+                    })?,
                 index_count: primitive.index_count,
                 vertex_offset: primitive.vertex_offset,
                 normal_offset: primitive.normal_offset,
@@ -60,20 +62,19 @@ pub fn basic_primitives(
         .collect()
 }
 
-pub fn load_geometry_glb(bytes: &[u8]) -> anyhow::Result<MeshData> {
+pub fn load_geometry_glb(bytes: &[u8]) -> crate::shared::Result<MeshData> {
     load_glb(bytes, false)
 }
 
-pub fn load_textured_glb(bytes: &[u8]) -> anyhow::Result<MeshData> {
+pub fn load_textured_glb(bytes: &[u8]) -> crate::shared::Result<MeshData> {
     load_glb(bytes, true)
 }
 
-fn load_glb(bytes: &[u8], textured: bool) -> anyhow::Result<MeshData> {
+fn load_glb(bytes: &[u8], textured: bool) -> crate::shared::Result<MeshData> {
     let gltf = gltf::Gltf::from_slice(bytes)?;
-    let blob = gltf
-        .blob
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("GLB has no embedded binary buffer"))?;
+    let blob = gltf.blob.as_deref().ok_or_else(|| {
+        crate::shared::Error::message(format!("GLB has no embedded binary buffer"))
+    })?;
     let (images, image_map) = if textured {
         embedded_images(&gltf, blob)?
     } else {
@@ -106,13 +107,15 @@ fn load_glb(bytes: &[u8], textured: bool) -> anyhow::Result<MeshData> {
         )?;
     }
     if result.primitives.is_empty() || result.positions.is_empty() || result.indices.is_empty() {
-        anyhow::bail!("GLB contains no indexed mesh primitives");
+        return Err(crate::shared::Error::message(format!(
+            "GLB contains no indexed mesh primitives"
+        )));
     }
     normalize_scene(&mut result, 3.0)?;
     Ok(result)
 }
 
-fn normalize_scene(mesh: &mut MeshData, target_extent: f32) -> anyhow::Result<()> {
+fn normalize_scene(mesh: &mut MeshData, target_extent: f32) -> crate::shared::Result<()> {
     let mut minimum = Vec3::splat(f32::INFINITY);
     let mut maximum = Vec3::splat(f32::NEG_INFINITY);
 
@@ -140,7 +143,9 @@ fn normalize_scene(mesh: &mut MeshData, target_extent: f32) -> anyhow::Result<()
         || !largest.is_finite()
         || largest <= f32::EPSILON
     {
-        anyhow::bail!("GLB mesh bounds cannot be normalized");
+        return Err(crate::shared::Error::message(format!(
+            "GLB mesh bounds cannot be normalized"
+        )));
     }
 
     let scale = target_extent / largest;
@@ -164,7 +169,7 @@ fn append_node(
     textured: bool,
     image_map: &[Option<usize>],
     result: &mut MeshData,
-) -> anyhow::Result<()> {
+) -> crate::shared::Result<()> {
     let transform = parent * from_gltf(node.transform().matrix());
     if let Some(mesh) = node.mesh() {
         for primitive in mesh.primitives() {
@@ -184,17 +189,19 @@ fn append_primitive(
     textured: bool,
     image_map: &[Option<usize>],
     result: &mut MeshData,
-) -> anyhow::Result<()> {
+) -> crate::shared::Result<()> {
     let reader = primitive.reader(|buffer| match buffer.source() {
         gltf::buffer::Source::Bin => Some(blob),
         gltf::buffer::Source::Uri(_) => None,
     });
     let positions = reader
         .read_positions()
-        .ok_or_else(|| anyhow::anyhow!("mesh primitive has no positions"))?
+        .ok_or_else(|| crate::shared::Error::message(format!("mesh primitive has no positions")))?
         .collect::<Vec<_>>();
     if positions.is_empty() {
-        anyhow::bail!("mesh primitive has no vertices");
+        return Err(crate::shared::Error::message(format!(
+            "mesh primitive has no vertices"
+        )));
     }
     let normals = reader
         .read_normals()
@@ -217,7 +224,9 @@ fn append_primitive(
             .iter()
             .any(|index| *index as usize >= positions.len())
     {
-        anyhow::bail!("mesh primitive contains invalid indices");
+        return Err(crate::shared::Error::message(format!(
+            "mesh primitive contains invalid indices"
+        )));
     }
     let vertex_offset = u32::try_from(result.positions.len())?;
     let normal_offset = u32::try_from(result.normals.len())?;
@@ -279,30 +288,32 @@ fn append_primitive(
 fn embedded_images(
     gltf: &gltf::Gltf,
     blob: &[u8],
-) -> anyhow::Result<(Vec<ImageData>, Vec<Option<usize>>)> {
+) -> crate::shared::Result<(Vec<ImageData>, Vec<Option<usize>>)> {
     let mut images = Vec::new();
     let mut map = vec![None; gltf.images().len()];
     for image in gltf.images() {
         let gltf::image::Source::View { view, mime_type } = image.source() else {
-            anyhow::bail!("external GLB image URIs are unsupported");
+            return Err(crate::shared::Error::message(format!(
+                "external GLB image URIs are unsupported"
+            )));
         };
         let mime_type = match mime_type {
             "image/ktx2" => "image/ktx2",
             "image/png" => "image/png",
             "image/jpeg" => "image/jpeg",
             _ => {
-                return Err(anyhow::anyhow!(
+                return Err(crate::shared::Error::message(format!(
                     "unsupported embedded image format `{mime_type}`"
-                ));
+                )));
             }
         };
         let end = view
             .offset()
             .checked_add(view.length())
-            .ok_or_else(|| anyhow::anyhow!("image range overflow"))?;
-        let bytes = blob
-            .get(view.offset()..end)
-            .ok_or_else(|| anyhow::anyhow!("embedded image exceeds GLB buffer"))?;
+            .ok_or_else(|| crate::shared::Error::message(format!("image range overflow")))?;
+        let bytes = blob.get(view.offset()..end).ok_or_else(|| {
+            crate::shared::Error::message(format!("embedded image exceeds GLB buffer"))
+        })?;
         map[image.index()] = Some(images.len());
         images.push(ImageData {
             bytes: bytes.to_vec(),

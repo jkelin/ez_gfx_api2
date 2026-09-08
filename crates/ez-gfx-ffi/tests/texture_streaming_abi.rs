@@ -190,9 +190,9 @@ fn context_decode_workers_flow_from_c_descriptor_to_creation() {
         } else {
             workers
         };
-        let handle = ez_gfx::ContextHandle::from_raw(context).unwrap();
+        let handle = ez_gfx::raw::ContextHandle::from_raw(context).unwrap();
         assert_eq!(
-            ez_gfx::texture_decode_worker_count(handle).unwrap(),
+            ez_gfx::raw::texture_decode_worker_count(handle).unwrap(),
             expected,
             "workers={workers}"
         );

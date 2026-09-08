@@ -1,12 +1,12 @@
-use ez_gfx::{
-    ContextHandle, IndexAllocationHandle, StructuredBufferHandle, VertexAllocationHandle,
+use ez_gfx::raw::{
+    self, ContextHandle, IndexAllocationHandle, StructuredBufferHandle, VertexAllocationHandle,
     VertexHeapHandle,
 };
 
 use super::{
-    EZ_GFX_MAX_BOUNDARY_BYTES, EzGfxContext, EzGfxIndexAllocation, EzGfxResult,
+    EZ_GFX_MAX_BOUNDARY_BYTES, EzGfxContext, EzGfxFrame, EzGfxIndexAllocation, EzGfxResult,
     EzGfxStructuredBuffer, EzGfxVertexAllocation, EzGfxVertexHeap, IntoFfiResult, catch_status,
-    catch_void, read_bounded_string, validate_bounded_string,
+    catch_void, frame, read_bounded_string, validate_bounded_string,
 };
 
 #[unsafe(no_mangle)]
@@ -32,7 +32,7 @@ pub unsafe extern "C" fn ez_gfx_vertex_heap_create(
             return EzGfxResult::InvalidArgument;
         }
         let context = try_handle!(ContextHandle, context);
-        match ez_gfx::create_vertex_heap(context, &name, capacity, stride) {
+        match raw::create_vertex_heap(context, &name, capacity, stride) {
             Ok(handle) => {
                 // SAFETY: the validated caller-owned output remains writable for this call.
                 unsafe { out_heap.write(handle.into_raw()) };
@@ -51,7 +51,7 @@ pub extern "C" fn ez_gfx_vertex_heap_destroy(heap: EzGfxVertexHeap, context: EzG
             ContextHandle::from_raw(context),
             VertexHeapHandle::from_raw(heap),
         ) {
-            ez_gfx::destroy_vertex_heap(context, heap);
+            raw::destroy_vertex_heap(context, heap);
         }
     });
 }
@@ -73,7 +73,7 @@ pub unsafe extern "C" fn ez_gfx_index_heap_create(
             return EzGfxResult::InvalidArgument;
         }
         let context = try_handle!(ContextHandle, context);
-        ez_gfx::create_index_heap(context, capacity).into_ffi_result()
+        raw::create_index_heap(context, capacity).into_ffi_result()
     })
 }
 
@@ -82,7 +82,7 @@ pub unsafe extern "C" fn ez_gfx_index_heap_create(
 pub extern "C" fn ez_gfx_index_heap_destroy(context: EzGfxContext) {
     catch_void(|| {
         if let Ok(context) = ContextHandle::from_raw(context) {
-            ez_gfx::destroy_index_heap(context);
+            raw::destroy_index_heap(context);
         }
     });
 }
@@ -110,7 +110,7 @@ pub unsafe extern "C" fn ez_gfx_vertex_upload_indices(
         // SAFETY: the checked nonzero caller range remains readable through this call.
         let bytes = unsafe { core::slice::from_raw_parts(data.cast::<u8>(), size) };
         let context = try_handle!(ContextHandle, context);
-        match ez_gfx::upload_indices_raw(context, count, bytes) {
+        match raw::upload_indices_raw(context, count, bytes) {
             Ok(handle) => {
                 // SAFETY: the validated out pointer remains writable through this call.
                 unsafe { out_allocation.write(handle.into_raw()) };
@@ -154,7 +154,7 @@ pub unsafe extern "C" fn ez_gfx_vertex_upload(
         let bytes = unsafe { core::slice::from_raw_parts(data.cast::<u8>(), size) };
         let context = try_handle!(ContextHandle, context);
         let heap = try_handle!(VertexHeapHandle, heap);
-        match ez_gfx::upload_vertices_raw(context, heap, element_count, element_size, bytes) {
+        match raw::upload_vertices_raw(context, heap, element_count, element_size, bytes) {
             Ok(handle) => {
                 // SAFETY: the validated out pointer remains writable through this call.
                 unsafe { out_allocation.write(handle.into_raw()) };
@@ -183,7 +183,7 @@ pub unsafe extern "C" fn ez_gfx_vertex_allocation_get_range(
         }
         let context = try_handle!(ContextHandle, context);
         let allocation = try_handle!(VertexAllocationHandle, allocation);
-        match ez_gfx::vertex_allocation_range(context, allocation) {
+        match raw::vertex_allocation_range(context, allocation) {
             Ok((first, count)) => {
                 // SAFETY: both output pointers were validated for this call.
                 unsafe {
@@ -215,7 +215,7 @@ pub unsafe extern "C" fn ez_gfx_index_allocation_get_range(
         }
         let context = try_handle!(ContextHandle, context);
         let allocation = try_handle!(IndexAllocationHandle, allocation);
-        match ez_gfx::index_allocation_range(context, allocation) {
+        match raw::index_allocation_range(context, allocation) {
             Ok((first, count)) => {
                 // SAFETY: both output pointers were validated for this call.
                 unsafe {
@@ -238,7 +238,7 @@ pub extern "C" fn ez_gfx_vertex_allocation_remove(
     catch_status(|| {
         let context = try_handle!(ContextHandle, context);
         let allocation = try_handle!(VertexAllocationHandle, allocation);
-        ez_gfx::remove_vertices(context, allocation).into_ffi_result()
+        raw::remove_vertices(context, allocation).into_ffi_result()
     })
 }
 
@@ -251,7 +251,7 @@ pub extern "C" fn ez_gfx_index_allocation_remove(
     catch_status(|| {
         let context = try_handle!(ContextHandle, context);
         let allocation = try_handle!(IndexAllocationHandle, allocation);
-        ez_gfx::remove_indices(context, allocation).into_ffi_result()
+        raw::remove_indices(context, allocation).into_ffi_result()
     })
 }
 
@@ -268,7 +268,7 @@ pub unsafe extern "C" fn ez_gfx_structured_acquire(
     debug_name: *const u8,
     debug_name_length: usize,
     out_structured: *mut EzGfxStructuredBuffer,
-    context: EzGfxContext,
+    frame: EzGfxFrame,
 ) -> EzGfxResult {
     catch_status(|| {
         let byte_size = u64::from(element_size) * u64::from(element_count);
@@ -278,12 +278,13 @@ pub unsafe extern "C" fn ez_gfx_structured_acquire(
                 .ok()
                 .is_none_or(|size| size > EZ_GFX_MAX_BOUNDARY_BYTES)
             || out_structured.is_null()
+            || !out_structured.is_aligned()
             || validate_bounded_string(debug_name, debug_name_length).is_err()
         {
             return EzGfxResult::InvalidArgument;
         }
-        let context = try_handle!(ContextHandle, context);
-        match ez_gfx::acquire_structured_raw(context, element_size, element_count) {
+        let context = try_frame!(frame);
+        match raw::acquire_structured_raw(context, element_size, element_count) {
             Ok(handle) => {
                 // SAFETY: the validated caller-owned output remains writable for this call.
                 unsafe { out_structured.write(handle.into_raw()) };
@@ -307,7 +308,7 @@ pub unsafe extern "C" fn ez_gfx_structured_write(
     data: *const std::ffi::c_void,
     element_count: u32,
     element_size: u32,
-    context: EzGfxContext,
+    frame: EzGfxFrame,
 ) -> EzGfxResult {
     catch_status(|| {
         let byte_size = match u64::from(element_count)
@@ -326,8 +327,8 @@ pub unsafe extern "C" fn ez_gfx_structured_write(
             // SAFETY: the checked non-null caller range remains readable for this call.
             unsafe { core::slice::from_raw_parts(data.cast::<u8>(), byte_size) }
         };
-        ez_gfx::write_structured_raw(
-            try_handle!(ContextHandle, context),
+        raw::write_structured_raw(
+            try_frame!(frame),
             try_handle!(StructuredBufferHandle, structured),
             start_index,
             element_count,
@@ -340,16 +341,13 @@ pub unsafe extern "C" fn ez_gfx_structured_write(
 
 #[unsafe(no_mangle)]
 /// Releases a structured upload buffer.
-pub extern "C" fn ez_gfx_structured_release(
-    structured: EzGfxStructuredBuffer,
-    context: EzGfxContext,
-) {
+pub extern "C" fn ez_gfx_structured_release(structured: EzGfxStructuredBuffer, frame: EzGfxFrame) {
     catch_void(|| {
-        if let (Ok(context), Ok(structured)) = (
-            ContextHandle::from_raw(context),
+        if let (Ok(entry), Ok(structured)) = (
+            frame::get(frame),
             StructuredBufferHandle::from_raw(structured),
         ) {
-            ez_gfx::release_structured(context, structured);
+            raw::release_structured(entry.owner, structured);
         }
     });
 }

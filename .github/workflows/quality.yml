@@ -97,11 +97,11 @@ jobs:
           vulkan_version: ${{ env.VULKAN_SDK_VERSION }}
           install_swiftshader: ${{ matrix.backend == 'vulkan-windows' }}
           cache: true
-      - name: Compile ABI v30 header as C11 and C++17
+      - name: Compile ABI v31 header as C11 and C++17
         shell: bash
         run: |
-          printf '#include "ez_gfx_api.h"\n_Static_assert(EZ_GFX_ABI_VERSION == 30u, "ABI version"); int main(void) { return 0; }\n' > "$RUNNER_TEMP/ez_gfx_header.c"
-          printf '#include "ez_gfx_api.h"\nstatic_assert(EZ_GFX_ABI_VERSION == 30u); int main() { return 0; }\n' > "$RUNNER_TEMP/ez_gfx_header.cpp"
+          printf '#include "ez_gfx_api.h"\n_Static_assert(EZ_GFX_ABI_VERSION == 31u, "ABI version"); int main(void) { return 0; }\n' > "$RUNNER_TEMP/ez_gfx_header.c"
+          printf '#include "ez_gfx_api.h"\nstatic_assert(EZ_GFX_ABI_VERSION == 31u); int main() { return 0; }\n' > "$RUNNER_TEMP/ez_gfx_header.cpp"
           clang -std=c11 -Werror -fsyntax-only -Iinclude "$RUNNER_TEMP/ez_gfx_header.c"
           clang++ -std=c++17 -Werror -Wno-ignored-attributes -fsyntax-only -Iinclude "$RUNNER_TEMP/ez_gfx_header.cpp"
 

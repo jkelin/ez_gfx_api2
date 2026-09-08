@@ -1,10 +1,10 @@
 # Textures
 
-Texture loading is asynchronous. The context owns handles and native resources, a Rayon pool performs decode/mip work, and backend transfer owners submit device copies.
+Texture loading is asynchronous. Each safe `Texture` is an owning wrapper whose lease retains the shared `Rc<ContextInner>` and native texture until `Drop`; a Rayon pool performs decode/mip work and backend transfer owners submit device copies.
 
 ## Public path
 
-`load_texture` validates the request, copies caller source before returning, reserves a generational handle, and schedules CPU work. The context-wide lossless upload queue is authoritative; the removed per-texture poll API remains absent from ABI 30.
+`load_texture` validates the request, copies caller source before returning, reserves a generational lease, and schedules CPU work. The context-wide lossless upload queue is authoritative in ABI 31.
 
 Poll until the queue is empty once per frame on the context creator thread. Polling also drains decoded work, admits native transfers, publishes completed texture views, and reports owner-thread failures.
 
@@ -15,7 +15,7 @@ Events identify a typed texture, vertex allocation, or index allocation and repo
 - `Failed(status)`: terminal failure;
 - `Cancelled`: terminal cancellation.
 
-The upload queue is unbounded and lossless. It is separate from bounded runtime diagnostics. Applications must drain it regularly; otherwise queued records retain memory until polling or context destruction.
+The upload queue is unbounded and lossless. It is separate from bounded runtime diagnostics. Applications must drain it regularly; otherwise queued records retain memory until polling or the last owning context/resource wrapper is dropped.
 
 ```mermaid
 sequenceDiagram
@@ -33,23 +33,23 @@ sequenceDiagram
     alt upload and publication succeed
         GPU-->>Gfx: completion
         Gfx->>Queue: DeviceReady
-        App->>Gfx: texture_binding and use
-        App->>Gfx: unload_texture
+        App->>Gfx: Texture::binding and use
+        App->>Gfx: drop Texture
         Gfx->>GPU: retire after completion
     else failure
         Gfx->>Queue: Failed
-        App->>Gfx: unload_texture
+        App->>Gfx: drop Texture
     else cancel before readiness
-        App->>Gfx: cancel_texture_load
+        App->>Gfx: Texture::cancel_load
         Gfx->>Queue: Cancelled
     end
 ```
 
 ## Texture lifecycle
 
-After a texture `DeviceReady` event, call `texture_binding` to obtain its stable bindless index. Use a resident fallback until then. `texture_binding`, `texture_residency`, and `set_texture_residency` each perform a nonblocking owner-thread progress pass that drains completed decode work, admits transfers, and publishes completed residency. `wait_idle` drains native work, then performs the same publication pass. None dequeues upload events or replaces event consumption.
+After a texture `DeviceReady` event, obtain its stable bindless index from the owning `Texture`. Use a resident fallback until then. Binding, residency, and residency updates each perform a nonblocking owner-thread progress pass that drains completed decode work, admits transfers, and publishes completed residency. `Context::wait_idle` drains native work, then performs the same publication pass. None dequeues upload events or replaces event consumption.
 
-`cancel_texture_load` wins only before initial readiness and emits `Cancelled`. `unload_texture` invalidates the handle and retires native storage safely. Context destruction cancels queued decode work, drains native work where possible, then drops remaining events and resources.
+Cancellation wins only before initial readiness and emits `Cancelled`. Dropping `Texture` invalidates its lease and retires native storage safely; no public safe unload or destroy operation exists. Dropping the last context/resource owner cancels queued decode work, drains native work where possible, then drops remaining events and resources.
 
 Device loss is terminal. Textures still in decode or awaiting transfer completion receive a terminal `Failed(DeviceLost)` event. Textures whose readiness was already published are not in that pending set and do not receive a retroactive upload failure.
 
@@ -57,7 +57,7 @@ Device loss is terminal. Textures still in decode or awaiting transfer completio
 
 Initial readiness requires a completed coarse mip range and a frame-safe published descriptor. Finer mips may continue transferring after `DeviceReady`.
 
-`texture_residency` returns the exposed contiguous coarse mip count and immutable total. `set_texture_residency` accepts `1..=total`; growth returns `NotReady` until required transfers and descriptor publication complete. `update_texture_region` validates mip bounds, block alignment, row pitch, and byte length before scheduling a copy.
+`Texture::residency` returns the exposed contiguous coarse mip count and immutable total. `Texture::set_residency` accepts `1..=total`; growth returns `NotReady` until required transfers and descriptor publication complete. `Texture::update_region` validates mip bounds, block alignment, row pitch, and byte length before scheduling a copy.
 
 ## Admission and memory
 
@@ -82,11 +82,15 @@ Slang requires a compile-time static array length for the cross-target `Paramete
 
 C calls copy borrowed source bytes during the call, preserving asynchronous lifetime safety. Encoded input must remain decode-owned until decoding finishes. Decoded/native payloads are copied into mapped staging before device transfer. The current texture API does not expose a caller-writable mapped staging lease, so it must not be described as zero-copy.
 
-## C ABI 30
+## Frame ownership
+
+Texture bindings are recorded only through `&mut Frame`. `begin_frame(&Context, &Surface)` returns the frame owner; `Frame::finish(self)` submits and presents while preserving exact errors, and dropping an unfinished frame aborts. Any structured or indirect buffers used alongside textures are transient and become invalid on finish or abort.
+
+## C ABI 31
 
 Use `ez_gfx_poll_upload_event(&event, &present, context)` until `present == 0` each frame. When `event.resource_kind == EzGfxUploadResourceKind_Texture`, compare `event.resource` with the retained texture handle. On `EzGfxUploadStatus_DeviceReady`, resolve the binding. On `Failed` or `Cancelled`, retire the request or continue with a fallback. Convert result codes with `ez_gfx_print_error` into caller-owned storage.
 
-`ez_gfx_texture_poll` was removed. `ez_gfx_texture_load`, cancellation, binding, residency, region updates, telemetry, and unload remain.
+`ez_gfx_texture_poll` remains absent. C retains explicit texture load, cancellation, binding, residency, region-update, telemetry, and unload functions because RAII is available only through the safe Rust interface.
 
 ## Synchronization
 
@@ -94,4 +98,4 @@ Frame recording imports only resources referenced by active work. Texture descri
 
 ## Verification and remaining evidence
 
-Pure queue and allocator transitions are covered by runtime tests. ABI layout/export tests cover event records, typed heap/allocation handles, transient buffer signatures, and ABI 30 parity. Native backend behavior requires the Linux Vulkan, Windows DX12, and macOS Metal remote matrices.
+Pure queue and allocator transitions are covered by runtime tests. ABI layout/export tests cover event records, typed heap/allocation handles, transient buffer signatures, and ABI 31 parity. Native backend behavior requires the Linux Vulkan, Windows DX12, and macOS Metal remote matrices.

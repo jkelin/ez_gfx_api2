@@ -352,9 +352,9 @@ fn all_public_export_signatures_are_stable() {
     let _: unsafe extern "C" fn(Handle, *mut u8, *mut f32, Handle) -> Status =
         ffi::ez_gfx_render_target_get_clear;
     let _: extern "C" fn(u8, u8, Handle) -> Status = ffi::ez_gfx_render_target_probe_format;
-    let _: extern "C" fn(Handle, Handle) -> Status = ffi::ez_gfx_begin_render_target;
-    let _: extern "C" fn(Handle, Handle) -> Status = ffi::ez_gfx_begin_render;
-    let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_frame_begin;
+    let _: unsafe extern "C" fn(Handle, Handle, *mut Handle) -> Status =
+        ffi::ez_gfx_render_target_frame_begin;
+    let _: unsafe extern "C" fn(Handle, Handle, *mut Handle) -> Status = ffi::ez_gfx_frame_begin;
     let _: unsafe extern "C" fn(u32, *const u8, usize, *mut Handle, Handle) -> Status =
         ffi::ez_gfx_acquire_indirect;
     let _: unsafe extern "C" fn(
@@ -389,14 +389,14 @@ fn all_public_export_signatures_are_stable() {
         Handle,
     ) -> Status = ffi::ez_gfx_render_add_compute_pipeline;
     let _: extern "C" fn(Handle, Handle) -> Status = ffi::ez_gfx_graph_enqueue_texture_readback;
-    let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_frame_submit;
+    let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_frame_end;
+    let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_frame_abort;
     let _: unsafe extern "C" fn(*mut EzGfxRuntimeRecord, *mut u8, *mut u64, Handle) -> Status =
         ffi::ez_gfx_poll_runtime_event;
     let _: unsafe extern "C" fn(*mut EzGfxUploadEvent, *mut u8, Handle) -> Status =
         ffi::ez_gfx_poll_upload_event;
     let _: unsafe extern "C" fn(*mut EzGfxDiagnostic, *mut u8, *mut u64, Handle) -> Status =
         ffi::ez_gfx_poll_diagnostic;
-    let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_finish_render;
     let _: unsafe extern "C" fn(*mut u8, usize, *mut usize, Handle) -> Status =
         ffi::ez_gfx_frame_readback;
     let _: unsafe extern "C" fn(*const u8, usize, u64, u64, *mut Handle, Handle) -> Status =

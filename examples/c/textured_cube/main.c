@@ -9,8 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if EZ_GFX_ABI_VERSION != 30u
-#error "textured_cube requires ez-gfx ABI v30"
+#if EZ_GFX_ABI_VERSION != 31u
+#error "textured_cube requires ez-gfx ABI v31"
 #endif
 
 #define WIDTH 640u
@@ -299,7 +299,8 @@ int main(int argc, char **argv) {
     EzGfxVertexAllocation positions = 0, normals = 0;
     EzGfxIndexAllocation indices = 0;
     EzGfxIndirectBuffer indirect = 0;
-    uint32_t first_index = 0, index_count = 0, frame;
+    EzGfxFrame active_frame = 0;
+    uint32_t first_index = 0, index_count = 0, frame_index;
     int success = 0;
     EzGfxBackendContextDesc context_desc;
     EzGfxSurfaceDesc surface_desc;
@@ -342,25 +343,38 @@ int main(int argc, char **argv) {
     dynamic_state = (EzGfxDynamicState){EzGfxCullMode_None, EzGfxFrontFace_CounterClockwise,
         EzGfxPrimitiveType_TriangleList, EzGfxBlendMode_None};
 
-    for (frame = 0; frame < options.max_frames && g_running; ++frame) {
+    for (frame_index = 0; frame_index < options.max_frames && g_running; ++frame_index) {
         while (PeekMessageA(&message, NULL, 0, 0, PM_REMOVE)) {
             if (message.message == WM_QUIT) { g_running = 0; break; }
             TranslateMessage(&message);
             DispatchMessageA(&message);
         }
         if (!g_running) break;
-        if (!checked(ez_gfx_begin_render(surface, context), "begin render")) goto cleanup;
-        if (!checked(ez_gfx_structured_acquire(sizeof(Primitive), 1, "primitives", sizeof("primitives") - 1, &primitives, context), "acquire primitives")) goto cleanup;
-        if (!checked(ez_gfx_structured_write(primitives, 0, &primitive, 1, sizeof(Primitive), context), "write primitives")) goto cleanup;
-        if (!checked(ez_gfx_acquire_indirect(1, "draw commands", sizeof("draw commands") - 1, &indirect, context), "acquire indirect")) goto cleanup;
-        if (!checked(ez_gfx_indirect_publish_compute_count(indirect, 1, context), "publish compute indirect count")) goto cleanup;
+        if (!checked(ez_gfx_frame_begin(context, surface, &active_frame), "begin frame")) goto cleanup;
+        if (!checked(ez_gfx_structured_acquire(sizeof(Primitive), 1, "primitives", sizeof("primitives") - 1, &primitives, active_frame), "acquire primitives")) {
+            (void)ez_gfx_frame_abort(active_frame); goto cleanup;
+        }
+        if (!checked(ez_gfx_structured_write(primitives, 0, &primitive, 1, sizeof(Primitive), active_frame), "write primitives")) {
+            (void)ez_gfx_frame_abort(active_frame); goto cleanup;
+        }
+        if (!checked(ez_gfx_acquire_indirect(1, "draw commands", sizeof("draw commands") - 1, &indirect, active_frame), "acquire indirect")) {
+            (void)ez_gfx_frame_abort(active_frame); goto cleanup;
+        }
+        if (!checked(ez_gfx_indirect_publish_compute_count(indirect, 1, active_frame), "publish compute indirect count")) {
+            (void)ez_gfx_frame_abort(active_frame); goto cleanup;
+        }
         bindings[0] = (EzGfxBinding){"primitives", sizeof("primitives") - 1, primitives, 0, 0};
         bindings[1] = (EzGfxBinding){"draw_commands", sizeof("draw_commands") - 1, 0, indirect, 0};
         if (!checked(ez_gfx_render_add_compute_pipeline(shader, 1, 1, 1, bindings, 2,
-                NULL, 0, context), "record compute")) goto cleanup;
+                NULL, 0, active_frame), "record compute")) {
+            (void)ez_gfx_frame_abort(active_frame); goto cleanup;
+        }
         if (!checked(ez_gfx_render_add_vertex_pipeline(shader, indirect, bindings, 2,
-                &dynamic_state, NULL, 0, context), "record graphics")) goto cleanup;
-        frame_result = ez_gfx_finish_render(context);
+                &dynamic_state, NULL, 0, active_frame), "record graphics")) {
+            (void)ez_gfx_frame_abort(active_frame); goto cleanup;
+        }
+        frame_result = ez_gfx_frame_end(active_frame);
+        active_frame = 0;
         if (!checked(frame_result, "submit and present")) {
             (void)poll_observability(context);
             goto cleanup;
@@ -369,7 +383,7 @@ int main(int argc, char **argv) {
         indirect = 0;
         if (!poll_observability(context)) goto cleanup;
     }
-    if (frame == 0) {
+    if (frame_index == 0) {
         fprintf(stderr, "no frame was presented\n");
         goto cleanup;
     }
@@ -384,10 +398,11 @@ int main(int argc, char **argv) {
         if (!checked(ez_gfx_frame_readback(snapshot, snapshot_size, &snapshot_size, context), "read snapshot")) goto cleanup;
         if (!write_snapshot(options.snapshot_path, snapshot, snapshot_size)) goto cleanup;
     }
-    printf("rendered %u frame(s) with %s\n", frame, options.backend_name);
+    printf("rendered %u frame(s) with %s\n", frame_index, options.backend_name);
     success = 1;
 
 cleanup:
+    if (active_frame != 0) (void)ez_gfx_frame_abort(active_frame);
     if (context != 0) ez_gfx_context_destroy(context);
     if (window != NULL && IsWindow(window)) DestroyWindow(window);
     if (window != NULL) UnregisterClassA(class_name, instance);

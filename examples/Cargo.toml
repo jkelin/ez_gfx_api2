@@ -38,6 +38,7 @@ path = "tests/shader_artifacts.rs"
 
 [dependencies]
 anyhow.workspace = true
+clap = { workspace = true, features = ["env"] }
 bytemuck = { version = "1.23", features = ["derive"] }
 blake3.workspace = true
 image.workspace = true
@@ -47,6 +48,7 @@ gltf = { version = "1.4", features = ["import", "extensions", "allow_empty_textu
 glam.workspace = true
 imgui = "0.12"
 raw-window-handle = "0.6"
+thiserror.workspace = true
 winit = "0.30"
 
 [target.'cfg(target_vendor = "apple")'.dependencies]

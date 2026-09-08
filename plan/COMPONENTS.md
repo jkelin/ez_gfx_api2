@@ -13,7 +13,7 @@ Migrate the original Odin/Vulkan `ez_gfx_api` to Rust/Cargo while roughly preser
 - Runtime packages must not depend on or bundle the Slang compiler.
 - Vulkan, DX12, and Metal are required; Vulkan-only abstractions are incomplete.
 - Explicit shader target attributes are authoritative for target intent.
-- Original concepts and C/C# path remain recognizable where practical; exact ABI compatibility is a decision recorded by P-002.
+- Rust uses the clean ownership interface; C/C# use the explicit ABI 31 lifecycle through the dedicated FFI seam.
 - External inputs and binary artifacts require validation; no panic crosses FFI.
 - OpenGL, DX11, software rasterizers, a custom shader DSL, and a custom window system are out of scope.
 - `gpu-allocator` 0.28 is the selected cross-backend Rust allocator.
@@ -27,9 +27,9 @@ Migrate the original Odin/Vulkan `ez_gfx_api` to Rust/Cargo while roughly preser
 
 A virtual workspace separates core types, runtime/artifact loading, offline in-process Slang compiler bindings, FFI, backend dependencies, and optional decoders. Runtime dependency audits prevent compiler leakage; feature resolution follows the selected MSRV.
 
-### P-002: Public API and C ABI bindings — Layered Rust facade and FFI
+### P-002: Public API and C ABI bindings — Owning Rust facade and raw FFI
 
-A safe Rust facade preserves recognizable resource/graph concepts. A dedicated FFI layer preserves the existing ABI path where compatibility is confirmed, validates pointer/count/UTF-8/handles/ownership, and contains panics.
+`Context` owns `Rc<ContextInner>`; owning resources retain context/resource leases and release through `Drop`. `begin_frame` and `begin_render_target_frame` return owning `Frame` values; recording borrows them mutably, `Frame::finish(self)` preserves exact submit/present errors, and `Drop` aborts. ABI 31 alone exposes explicit lifecycle calls and opaque generational `u64` handles, including `EzGfxFrame`.
 
 ### P-003: Multi-backend hardware abstraction — Custom static raw HAL
 
@@ -47,9 +47,9 @@ Offline Slang compilation through `shader-slang`/slang-rs emits native SPIR-V, D
 
 A bounded, versioned `.ezgfxshader` file uses a fixed little-endian frame around one bytechecked `rkyv` payload. It stores stage-grouped target products, reflection, compiler provenance, and an execution digest. Runtime validates and loads it without JIT/compiler fallback.
 
-### P-007: Pipeline caching and descriptors — Global table plus frame-local arenas
+### P-007: Pipeline caching and descriptors — Global table plus frame-owned arenas
 
-Stable generation-checked bindless indices are independent of PSO ownership; transient descriptors use GPU-completion-safe frame arenas. Persistent cache keys include shader/interface, state, backend, device/driver, and schema.
+Stable generation-checked bindless indices are independent of PSO ownership. Transient descriptors belong to the owning `Frame` and are invalidated on completion or abort; native reuse remains GPU-completion-safe.
 
 ### P-008: Render-graph hazards — Precise subresource state compiler
 
@@ -63,17 +63,17 @@ Compatible adjacent nodes merge; first/last-use intervals assign compatible tran
 
 Canonical target metadata preserves kind, usage, scale, sampleability, load/store, abstract format candidates, and clears. Device capability queries resolve physical formats and report unsupported intent.
 
-### P-011: Vertex and index geometry heaps — Generation free-list with mapped staging leases
+### P-011: Vertex and index geometry heaps — Owning generation-checked leases
 
-Named vertex and global index heaps use range free-lists plus generation-checked handles. Frame-bounded mapped staging leases enable direct procedural writes and retire by completion token.
+Named vertex heaps and the singleton context-owned index heap use range free lists plus generation-checked allocation leases. Safe wrappers retain parent/context ownership and release through `Drop`; C retains explicit handle release.
 
 ### P-012: Transfer staging and batching — Timeline-recycled bucket pools with adaptive batches
 
 Size-classed staging pools recycle after completion; a transfer owner batches copies and flushes on explicit readiness/frame/threshold events. Independent ordered timeline domains avoid manager serialization.
 
-### P-013: Frame-level upload readiness policy
+### P-013: Explicit frame ownership
 
-One immutable begin configuration defaults geometry waits on and `TextureMipWait` to `Coarsest`. `wait_for_geometry_uploads = false` and `TextureMipWait::None` independently disable their frame submission waits; applications then gate geometry and first texture visibility through `DeviceReady`/fallback and finer texture residency through `set_texture_residency`/`texture_residency`. `ThroughLevel(level)` selects a required minimum mip. Submission applies at most one reachable prefix per enabled transfer domain outside graph node/resource scheduling, while polling, descriptor publication, recycling, progressive uploads, and loss handling continue.
+Presented and managed-target begin functions return an owning `Frame`. Recording requires `&mut Frame`; `Frame::finish(self)` consumes it, returns recording/submit/present errors unchanged, and `Drop` aborts. Every terminal path invalidates frame transients.
 
 ### P-014: Basis Universal and compressed textures — Feature-gated official transcoder wrapper
 
@@ -87,9 +87,9 @@ Coarse mips become sample-ready first; stable descriptors publish after handoff.
 
 Standard indirect records pair with validated viewport/scissor side tables. Consecutive equal-state ranges batch native dynamic state updates while retaining compute-filled MDI.
 
-### P-017: Surface and swapchain lifecycle — `raw-window-handle` with guarded presentation
+### P-017: Owning surface and guarded presentation
 
-Host-owned native handles feed guarded swapchain lifecycle. Zero extent returns `NotReady`; out-of-date events schedule recreation; presentation targets reject shader reads and use transfer readback.
+An owning `Surface` retains its context lease while the host retains the native window. Construction is atomic and rolls back partial native/init state. Zero extent returns `NotReady`; consuming frame completion presents; presentation targets reject shader reads and use transfer readback.
 
 ### P-018: Async workers — Scoped Rayon compute pool and bounded transfer channel
 
@@ -99,9 +99,9 @@ A library-owned CPU pool decodes/transcodes; a bounded channel feeds one transfe
 
 Backend-specific offscreen/readback fixtures provide PNG goldens and tolerances; deterministic IR/unit tests complement them. Missing required adapters are unavailable, never passing.
 
-### P-020: Migration cutover — Vulkan-first vertical slice with staged parity gates
+### P-020: Migration cutover — Clean ownership cutover
 
-A Vulkan vertical path proves contracts and an end-to-end snapshot first, followed by backend conformance, asset/UI work, and optimizations. Final cutover requires six examples, ABI gates, required backend snapshots, and a disposition for every TODO.
+The final cutover uses the shared `Example` host for winit inversion, context/surface ownership, resize, input, automation, and consuming frame dispatch. Rust exposes no compatibility aliases or manual frame/resource release; ABI 31 preserves the explicit C lifecycle.
 
 ### P-021: Cross-backend shader execution semantics — Target-native layouts with canonical semantic ABI
 
@@ -151,7 +151,7 @@ Target-native release CI builds pinned sources and publishes separate runtime/FF
 - Graph compiler -> HAL command recording and diagnostics: converts semantic declarations/resources into order, barriers, waits, merges, clears, alias boundaries, and correlated schedule events.
 - Worker orchestration -> texture/geometry ingestion -> event queue and frame policy: bounded jobs and payloads cross into transfer ownership; completion/error events flow to hosts, while submitted aggregate prefixes feed frame readiness.
 - Runtime event/diagnostic boundary -> host: all components publish bounded owned events; the host chooses polling thread/cadence, while overflow/loss/shutdown are explicit.
-- Surface/presentation -> HAL and validation: host handles and observed extents enter; acquire/present/readback/loss results leave.
+- Surface/presentation -> HAL and validation: an owning `Surface` retains its context lease; borrowed host handles and observed extents enter, while atomic construction rollback and acquire/present/readback/loss results leave.
 - Validation/cutover -> release artifacts and every component: executes contracts, records adapter/driver/profile/provenance evidence, compares goldens, audits binary imports/signatures, and gates publication.
 
 ## End-to-end flows
@@ -166,7 +166,7 @@ The API validates encoded bytes and submits a bounded job. Workers decode/transc
 
 ### Windowed frame, resize, and screenshot
 
-The host supplies borrowed native handles and observed extent. Surface returns `NotReady` for zero extent or acquires a swapchain image. Graph validates write-only presentation use and emits dependencies; HAL presents. Out-of-date/suboptimal results schedule guarded recreation. Screenshot requests copy the image to readback staging and never sample the presentation image in a shader.
+The host supplies borrowed native handles and observed extent. `Surface` construction either returns an owning wrapper or destroys the unpublished raw surface after any native/init/resize failure. `begin_frame(&Context, &Surface)` returns `NotReady` for zero extent or an owning `Frame`. Graph validation enforces write-only presentation use; `Frame::finish(self)` submits then presents with exact errors, while `Drop` aborts. Screenshot requests use transfer readback.
 
 ### Migration validation and cutover
 
@@ -174,7 +174,7 @@ Unit/property fixtures test handles, artifacts, allocators, graph states, queues
 
 ### Device loss and host recreation
 
-A fatal acquire/submit/transfer/present result atomically poisons the context. HAL stops native work; allocator/resource owners invalidate GPU state; outstanding tokens, leases, jobs, and callbacks publish exactly one terminal event without GPU waits. The host drains diagnostics, destroys the lost context, creates a new admitted adapter/runtime, reloads authenticated artifacts/resources, and may supply matching cache blobs. No handle, timeline, or native cache object crosses the loss boundary.
+A fatal acquire/submit/transfer/present result atomically poisons `ContextInner`. Outstanding owners invalidate GPU state without waiting for lost progress. The host drains diagnostics, drops lost resource wrappers, creates a fresh admitted context/surface, and reloads resources. No frame, handle, timeline, or native cache object crosses the loss boundary.
 
 ### Host event, diagnostics, and cache loop
 
@@ -491,7 +491,7 @@ Reject malformed containers, unsupported admitted formats, block/row/mip errors,
 
 ### Responsibility and boundary
 
-Own host native handles, surface/swapchain lifecycle, extent/DPI/minimize, presentation, readback, and presentation-side loss reporting. It never owns host windows/event loops.
+Own safe surface/context leases, atomic surface construction rollback, extent/DPI/minimize, presentation, readback, and presentation-side loss reporting. It never owns host windows/event loops.
 
 ### Problems and selected solutions
 
@@ -499,7 +499,7 @@ Realizes P-017/P-023/P-026/P-028 and presentation portions of P-019/P-002: guard
 
 ### Interfaces and connections
 
-Borrowed handles, resize/pending, acquire/present/readback connect host to HAL/graph/FFI/events/snapshots.
+Owning `Surface`, `begin_frame`, `Frame::finish`, borrowed host handles, resize state, and readback connect host to HAL/graph/FFI/events/snapshots.
 
 ### Data and persistence
 
@@ -511,11 +511,11 @@ Swapchain images/recreation/readback are runtime-local; host window lifetime is 
 
 ### Lifecycle and performance
 
-Zero extent returns `NotReady`; resize retires safely. Fatal acquire/present poisons context and publishes one event; no recreation is attempted on the lost device. Measure acquire/present/recreate/event/loss latency and minimized work.
+Zero extent returns `NotReady`; resize retires safely. Begin returns acquisition errors, `Frame::finish` preserves submit/present errors, and `Frame::drop` aborts. Measure acquire/present/recreate/event/loss latency and minimized work.
 
 ### Failures and trust
 
-Validate handle lifetime/tags, out-of-date/suboptimal paths, swapchain read rejection, destruction order, and exactly-once loss propagation.
+Validate atomic construction rollback, host-handle lifetime, out-of-date/suboptimal paths, swapchain-read rejection, wrapper drop order, and exactly-once loss propagation.
 
 
 ## Component: Async task and transfer orchestration

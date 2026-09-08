@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<ez-gfx-bindings version="1" abi-version="30" library="ez_gfx_ffi">
+<ez-gfx-bindings version="1" abi-version="31" library="ez_gfx_ffi">
   <description>Public EzGfx C ABI. This file is manually maintained; generated headers and managed bindings are derived from it.</description>
   <handles>
     <handle name="EzGfxContext" doc="Opaque packed u64 context handle (slot+1/generation in bits 0-39)." />
     <handle name="EzGfxSurface" doc="Opaque packed u64 surface handle; child bits index the context identity arena and resolve only as Surface." />
+    <handle name="EzGfxFrame" doc="Opaque generation-, kind-, and owner-validated live frame handle." />
     <handle name="EzGfxShader" doc="Opaque packed u64 shader handle; child bits index the context identity arena and resolve only as Shader." />
     <handle name="EzGfxIndirectBuffer" doc="Opaque packed u64 indirect-buffer handle; child bits index the context identity arena and resolve only as Indirect." />
     <handle name="EzGfxStructuredBuffer" doc="Opaque packed u64 structured-buffer handle; child bits index the context identity arena and resolve only as Structured." />
@@ -313,7 +314,7 @@
     <function name="ez_gfx_abi_version" return="uint32_t" doc="Returns the ABI version implemented by the native library.">
       <returns doc="ABI version; no context is required." />
     </function>
-    <function name="ez_gfx_print_error" return="EzGfxResult" doc="Writes the stable message for a result code into caller-owned storage. Requires ABI 30.">
+    <function name="ez_gfx_print_error" return="EzGfxResult" doc="Writes the stable message for a result code into caller-owned storage.">
       <param name="result" type="EzGfxResult" doc="Result byte to describe; unknown values produce 'unknown error'." />
       <param name="buffer" type="char *" nullable="true" direction="out" array-length="capacity" doc="Caller-owned UTF-8 output; null only for a zero-capacity size query." />
       <param name="capacity" type="size_t" doc="Writable output bytes, or zero for a size query." />
@@ -476,48 +477,46 @@
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
       <returns doc="Returns Ok when resolvable, Unsupported otherwise, or validation status." />
     </function>
-    <function name="ez_gfx_begin_render_target" return="EzGfxResult" context="last" doc="Begins frame recording against a managed render target instead of a surface.">
-      <param name="target" type="EzGfxRenderTarget" nullable="false" doc="Render target to render into." />
+    <function name="ez_gfx_render_target_frame_begin" return="EzGfxResult" doc="Begins frame recording against a managed render target.">
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
+      <param name="target" type="EzGfxRenderTarget" nullable="false" doc="Render target to render into." />
+      <param name="out_frame" type="EzGfxFrame *" direction="out" doc="Receives the live frame handle." />
       <returns doc="Returns state, handle, or capability status." />
     </function>
-    <function name="ez_gfx_begin_render" return="EzGfxResult" context="last" doc="Begins rendering to a surface.">
-      <param name="surface" type="EzGfxSurface" nullable="false" doc="Surface to acquire." />
+    <function name="ez_gfx_frame_begin" return="EzGfxResult" doc="Begins one presented-surface frame.">
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
+      <param name="surface" type="EzGfxSurface" nullable="false" doc="Surface to acquire." />
+      <param name="out_frame" type="EzGfxFrame *" direction="out" doc="Receives the live frame handle." />
       <returns doc="Returns readiness or handle status." />
     </function>
-    <function name="ez_gfx_frame_begin" return="EzGfxResult" context="last" doc="Begins one backend-neutral frame recording interval.">
-      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
-      <returns doc="Returns state or context status." />
-    </function>
-    <function name="ez_gfx_acquire_indirect" return="EzGfxResult" context="last" doc="Acquires a transient indexed-indirect buffer for the active frame.">
+    <function name="ez_gfx_acquire_indirect" return="EzGfxResult" doc="Acquires a transient indexed-indirect buffer for a live frame.">
       <param name="capacity" type="uint32_t" validation="greater-than-zero" doc="Command capacity." />
       <param name="debug_name" type="const char *" nullable="false" direction="in" array-length="debug_name_length" doc="Exact UTF-8 debug-name bytes." />
       <param name="debug_name_length" type="size_t" validation="greater-than-zero-at-most-boundary-limit" doc="Debug-name byte length." />
       <param name="out_indirect" type="EzGfxIndirectBuffer *" direction="out" doc="Receives the transient handle." />
-      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context with active frame recording." />
-      <returns doc="Returns validation, recording-state, or allocation status." />
+      <param name="frame" type="EzGfxFrame" nullable="false" doc="Live owning frame." />
+      <returns doc="Returns validation, frame-state, or allocation status." />
     </function>
-    <function name="ez_gfx_indirect_write_draws" return="EzGfxResult" context="last" doc="Writes a contiguous command range and publishes its written prefix.">
+    <function name="ez_gfx_indirect_write_draws" return="EzGfxResult" doc="Writes a contiguous command range and publishes its written prefix.">
       <param name="indirect" type="EzGfxIndirectBuffer" nullable="false" doc="Transient indirect buffer." />
       <param name="start_index" type="uint32_t" doc="First command slot." />
       <param name="commands" type="const EzGfxDrawIndexedCommand *" nullable="true" direction="in" array-length="command_count" doc="Contiguous command data; null only when count is zero." />
       <param name="command_count" type="uint32_t" validation="at-most-boundary-limit" doc="Number of commands." />
-      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
+      <param name="frame" type="EzGfxFrame" nullable="false" doc="Live owning frame." />
       <returns doc="Returns state, ownership, overflow, or bounds status." />
     </function>
-    <function name="ez_gfx_indirect_publish_compute_count" return="EzGfxResult" context="last" doc="Publishes a CPU-known count for commands generated by a compute node.">
+    <function name="ez_gfx_indirect_publish_compute_count" return="EzGfxResult" doc="Publishes a CPU-known count for commands generated by a compute node.">
       <param name="indirect" type="EzGfxIndirectBuffer" nullable="false" doc="Transient indirect buffer." />
       <param name="count" type="uint32_t" doc="Known generated-command count." />
-      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
+      <param name="frame" type="EzGfxFrame" nullable="false" doc="Live owning frame." />
       <returns doc="Returns state, ownership, or bounds status." />
     </function>
-    <function name="ez_gfx_indirect_release" return="void" context="last" doc="Invalidates an unsubmitted transient indirect handle.">
+    <function name="ez_gfx_indirect_release" return="void" doc="Invalidates an unsubmitted transient indirect handle.">
       <param name="indirect" type="EzGfxIndirectBuffer" nullable="true" doc="Transient indirect buffer." />
-      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
-      <returns doc="No return value; submitted, stale, and zero handles are ignored." />
+      <param name="frame" type="EzGfxFrame" nullable="false" doc="Live owning frame." />
+      <returns doc="No return value; stale and zero handles are ignored." />
     </function>
-    <function name="ez_gfx_render_add_vertex_pipeline" return="EzGfxResult" context="last" doc="Records a graphics pipeline and indexed-indirect draw.">
+    <function name="ez_gfx_render_add_vertex_pipeline" return="EzGfxResult" doc="Records a graphics pipeline and indexed-indirect draw.">
       <param name="shader" type="EzGfxShader" nullable="false" doc="Graphics shader." />
       <param name="indirect" type="EzGfxIndirectBuffer" nullable="false" doc="Indirect commands." />
       <param name="bindings" type="const EzGfxBinding *" nullable="true" direction="in" array-length="binding_count" doc="Resource bindings." />
@@ -525,10 +524,10 @@
       <param name="dynamic_state" type="const EzGfxDynamicState *" nullable="true" direction="in" doc="Optional state." />
       <param name="push_constants" type="const void *" nullable="true" direction="in" array-length="push_constant_size" doc="Push bytes." />
       <param name="push_constant_size" type="uint32_t" doc="Push byte count." />
-      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
+      <param name="frame" type="EzGfxFrame" nullable="false" doc="Live owning frame." />
       <returns doc="Returns validation or native status." />
     </function>
-    <function name="ez_gfx_render_add_compute_pipeline" return="EzGfxResult" context="last" doc="Records a compute pipeline dispatch.">
+    <function name="ez_gfx_render_add_compute_pipeline" return="EzGfxResult" doc="Records a compute pipeline dispatch.">
       <param name="shader" type="EzGfxShader" nullable="false" doc="Compute shader." />
       <param name="dispatch_x" type="uint32_t" doc="X groups." />
       <param name="dispatch_y" type="uint32_t" doc="Y groups." />
@@ -537,23 +536,43 @@
       <param name="binding_count" type="uint32_t" doc="Binding count." />
       <param name="push_constants" type="const void *" nullable="true" direction="in" array-length="push_constant_size" doc="Push bytes." />
       <param name="push_constant_size" type="uint32_t" doc="Push byte count." />
-      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
+      <param name="frame" type="EzGfxFrame" nullable="false" doc="Live owning frame." />
       <returns doc="Returns validation or native status." />
     </function>
-    <function name="ez_gfx_graph_enqueue_texture_readback" return="EzGfxResult" context="last" doc="Compiles and enqueues a texture-readback graph node.">
+    <function name="ez_gfx_graph_enqueue_texture_readback" return="EzGfxResult" doc="Compiles and enqueues a texture-readback graph node.">
       <param name="texture" type="EzGfxTexture" nullable="false" doc="Texture to read back." />
-      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
+      <param name="frame" type="EzGfxFrame" nullable="false" doc="Live owning frame." />
       <returns doc="Returns graph or handle status." />
     </function>
-    <function name="ez_gfx_frame_submit" return="EzGfxResult" context="last" doc="Uploads indirect commands, submits graph work, and completes readback.">
-      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
-      <returns doc="Returns submission status." />
+    <function name="ez_gfx_frame_end" return="EzGfxResult" doc="Consumes, submits, and conditionally presents a live frame.">
+      <param name="frame" type="EzGfxFrame" nullable="false" doc="Live frame to consume." />
+      <returns doc="Returns submission or presentation status; every result invalidates the handle." />
     </function>
-    <function name="ez_gfx_finish_render" return="EzGfxResult" context="last" doc="Submits the active frame and presents its surface.">
-      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
-      <returns doc="Returns submission or presentation status." />
+    <function name="ez_gfx_frame_abort" return="EzGfxResult" doc="Consumes a live frame without submitting it.">
+      <param name="frame" type="EzGfxFrame" nullable="false" doc="Live frame to abort." />
+      <returns doc="Returns abort status; every result invalidates the handle." />
     </function>
-    <function name="ez_gfx_frame_readback" return="EzGfxResult" context="last" doc="Copies last readback; zero capacity queries size.">
+    <function name="ez_gfx_poll_runtime_event" return="EzGfxResult" context="last" doc="Polls one bounded runtime record and reports overflow.">
+      <param name="out_record" type="EzGfxRuntimeRecord *" direction="out" doc="Receives a record when present." />
+      <param name="out_present" type="uint8_t *" direction="out" doc="Receives zero or one." />
+      <param name="out_dropped" type="uint64_t *" direction="out" doc="Receives dropped count." />
+      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
+      <returns doc="Returns EzGfxResult_Ok or context status." />
+    </function>
+    <function name="ez_gfx_poll_upload_event" return="EzGfxResult" context="last" doc="Polls one lossless upload transition and progresses owner-thread texture work.">
+      <param name="out_event" type="EzGfxUploadEvent *" direction="out" doc="Receives an event when present." />
+      <param name="out_present" type="uint8_t *" direction="out" doc="Receives zero or one." />
+      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
+      <returns doc="Returns EzGfxResult_Ok or context status." />
+    </function>
+    <function name="ez_gfx_poll_diagnostic" return="EzGfxResult" context="last" doc="Polls one bounded local diagnostic and reports overflow.">
+      <param name="out_diagnostic" type="EzGfxDiagnostic *" direction="out" doc="Receives a diagnostic when present." />
+      <param name="out_present" type="uint8_t *" direction="out" doc="Receives zero or one." />
+      <param name="out_dropped" type="uint64_t *" direction="out" doc="Receives dropped count." />
+      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
+      <returns doc="Returns EzGfxResult_Ok or context status." />
+    </function>
+    <function name="ez_gfx_frame_readback" return="EzGfxResult" context="last" doc="Copies last completed readback; zero capacity queries size.">
       <param name="data" type="uint8_t *" nullable="true" direction="out" array-length="capacity" doc="Destination bytes." />
       <param name="capacity" type="size_t" doc="Destination capacity." />
       <param name="out_size" type="size_t *" direction="out" doc="Required byte count." />
@@ -644,48 +663,28 @@
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
       <returns doc="Returns validation or ownership status." />
     </function>
-    <function name="ez_gfx_structured_acquire" return="EzGfxResult" context="last" managed="utf8-string" doc="Acquires a transient structured buffer for the active frame.">
+    <function name="ez_gfx_structured_acquire" return="EzGfxResult" managed="utf8-string" doc="Acquires a transient structured buffer for a live frame.">
       <param name="element_size" type="uint32_t" validation="greater-than-zero" doc="Element stride in bytes." />
       <param name="element_count" type="uint32_t" validation="greater-than-zero" doc="Element capacity." />
       <param name="debug_name" type="const char *" nullable="false" direction="in" array-length="debug_name_length" doc="Exact UTF-8 debug-name bytes." />
       <param name="debug_name_length" type="size_t" validation="greater-than-zero-at-most-boundary-limit" doc="Debug-name byte length." />
       <param name="out_structured" type="EzGfxStructuredBuffer *" direction="out" doc="Receives the transient handle." />
-      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context with active frame recording." />
-      <returns doc="Returns validation, allocation, recording-state, or device status." />
+      <param name="frame" type="EzGfxFrame" nullable="false" doc="Live owning frame." />
+      <returns doc="Returns validation, allocation, frame-state, or device status." />
     </function>
-    <function name="ez_gfx_structured_write" return="EzGfxResult" context="last" managed="structured-write" doc="Copies a validated element range into a transient structured buffer.">
+    <function name="ez_gfx_structured_write" return="EzGfxResult" managed="structured-write" doc="Copies a validated element range into a transient structured buffer.">
       <param name="structured" type="EzGfxStructuredBuffer" doc="Structured buffer handle." />
       <param name="start_index" type="uint32_t" doc="First destination element." />
       <param name="data" type="const void *" nullable="true" direction="in" array-length="element_count" array-byte-size="element_size" doc="Element bytes; null only when count is zero." />
       <param name="element_count" type="uint32_t" doc="Number of elements to copy." />
       <param name="element_size" type="uint32_t" validation="greater-than-zero" doc="Must equal the acquired stride." />
-      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
+      <param name="frame" type="EzGfxFrame" nullable="false" doc="Live owning frame." />
       <returns doc="Returns validation, ownership, state, range, or native status." />
     </function>
-    <function name="ez_gfx_structured_release" return="void" context="last" doc="Invalidates an unsubmitted transient structured handle.">
+    <function name="ez_gfx_structured_release" return="void" doc="Invalidates an unsubmitted transient structured handle.">
       <param name="structured" type="EzGfxStructuredBuffer" doc="Structured buffer handle; null is ignored." />
-      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
-      <returns doc="Submitted and stale handles are ignored; native storage is reclaimed after frame completion." />
-    </function>
-    <function name="ez_gfx_poll_runtime_event" return="EzGfxResult" context="last" doc="Polls one bounded runtime outcome.">
-      <param name="out_record" type="EzGfxRuntimeRecord *" direction="out" doc="Receives a record when out_present is one." />
-      <param name="out_present" type="uint8_t *" direction="out" doc="Receives zero or one." />
-      <param name="out_dropped" type="uint64_t *" direction="out" doc="Receives overflow count since the prior poll." />
-      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
-      <returns doc="Returns context validation status." />
-    </function>
-    <function name="ez_gfx_poll_upload_event" return="EzGfxResult" context="last" doc="Polls one lossless upload transition and progresses owner-thread texture work.">
-      <param name="out_event" type="EzGfxUploadEvent *" direction="out" doc="Receives an event when out_present is one." />
-      <param name="out_present" type="uint8_t *" direction="out" doc="Receives zero or one." />
-      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
-      <returns doc="Returns progress or context status when no event is queued." />
-    </function>
-    <function name="ez_gfx_poll_diagnostic" return="EzGfxResult" context="last" doc="Polls one bounded local diagnostic.">
-      <param name="out_diagnostic" type="EzGfxDiagnostic *" direction="out" doc="Receives a diagnostic when out_present is one." />
-      <param name="out_present" type="uint8_t *" direction="out" doc="Receives zero or one." />
-      <param name="out_dropped" type="uint64_t *" direction="out" doc="Receives overflow count since the prior poll." />
-      <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
-      <returns doc="Returns context validation status." />
+      <param name="frame" type="EzGfxFrame" nullable="false" doc="Live owning frame." />
+      <returns doc="Stale handles are ignored; native storage is reclaimed after frame completion." />
     </function>
     <function name="ez_gfx_surface_destroy" return="void" context="last" doc="Destroys a surface while leaving its parent window untouched.">
       <param name="surface" type="EzGfxSurface" doc="Surface to destroy." />

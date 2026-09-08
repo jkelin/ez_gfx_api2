@@ -8,14 +8,15 @@ use ez_gfx_artifact::{
     Provenance, Stage, Target, TargetCompatibility, TargetVariant,
 };
 use ez_gfx_ffi::{
-    EzGfxBackendContextDesc, EzGfxDrawIndexedCommand, EzGfxDynamicState, EzGfxResult,
-    EzGfxSurfaceDesc, EzGfxTextureDesc, ez_gfx_acquire_indirect, ez_gfx_begin_render,
+    EzGfxBackendContextDesc, EzGfxDrawIndexedCommand, EzGfxDynamicState, EzGfxRenderTargetDesc,
+    EzGfxResult, EzGfxSurfaceDesc, EzGfxTextureDesc, ez_gfx_acquire_indirect,
     ez_gfx_context_create_backend, ez_gfx_context_destroy, ez_gfx_context_init_device,
-    ez_gfx_context_wait_idle, ez_gfx_finish_render, ez_gfx_frame_begin, ez_gfx_frame_readback,
-    ez_gfx_frame_submit, ez_gfx_graph_enqueue_texture_readback, ez_gfx_index_allocation_get_range,
+    ez_gfx_context_wait_idle, ez_gfx_frame_begin, ez_gfx_frame_end, ez_gfx_frame_readback,
+    ez_gfx_graph_enqueue_texture_readback, ez_gfx_index_allocation_get_range,
     ez_gfx_index_heap_create, ez_gfx_index_heap_destroy, ez_gfx_indirect_release,
     ez_gfx_indirect_write_draws, ez_gfx_render_add_compute_pipeline,
-    ez_gfx_render_add_vertex_pipeline, ez_gfx_shader_destroy, ez_gfx_shader_load_artifact,
+    ez_gfx_render_add_vertex_pipeline, ez_gfx_render_target_create, ez_gfx_render_target_destroy,
+    ez_gfx_render_target_frame_begin, ez_gfx_shader_destroy, ez_gfx_shader_load_artifact,
     ez_gfx_surface_create, ez_gfx_surface_destroy, ez_gfx_texture_load, ez_gfx_texture_unload,
     ez_gfx_vertex_upload_indices,
 };
@@ -26,6 +27,36 @@ use objc2_quartz_core::CAMetalLayer;
 
 const WIDTH: u32 = 64;
 const HEIGHT: u32 = 64;
+
+fn begin_offscreen_frame(context: u64) -> (u64, u64) {
+    let name = b"metal-target";
+    let format = 1_u8;
+    let desc = EzGfxRenderTargetDesc {
+        name: name.as_ptr(),
+        name_length: name.len(),
+        usage: 0,
+        relative_scale: 1.0,
+        samples: 1,
+        candidate_formats: &raw const format,
+        candidate_count: 1,
+        sampleable: 0,
+        use_clear: 0,
+        clear_color: [0.0; 4],
+    };
+    let mut target = 0;
+    // SAFETY: descriptor, format, and output storage remain live through the call.
+    assert_eq!(
+        unsafe { ez_gfx_render_target_create(&raw const desc, 1, 1, &raw mut target, context) },
+        EzGfxResult::Ok
+    );
+    let mut frame = 0;
+    // SAFETY: frame output storage is live and aligned.
+    assert_eq!(
+        unsafe { ez_gfx_render_target_frame_begin(context, target, &raw mut frame) },
+        EzGfxResult::Ok
+    );
+    (frame, target)
+}
 
 #[test]
 fn metal_separated_passes_preserve_color_and_depth() {
@@ -101,12 +132,13 @@ fn metal_texture_readback_submits_without_a_surface() {
     );
     // Admission is asynchronous; readback requires the decoded native texture to be ready.
     assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
-    assert_eq!(ez_gfx_frame_begin(context), EzGfxResult::Ok);
+    let (frame, target) = begin_offscreen_frame(context);
     assert_eq!(
-        ez_gfx_graph_enqueue_texture_readback(texture, context),
+        ez_gfx_graph_enqueue_texture_readback(texture, frame),
         EzGfxResult::Ok
     );
-    assert_eq!(ez_gfx_frame_submit(context), EzGfxResult::Ok);
+    assert_eq!(ez_gfx_frame_end(frame), EzGfxResult::Ok);
+    ez_gfx_render_target_destroy(target, context);
 
     let mut size = 0;
     assert_eq!(
@@ -170,7 +202,7 @@ fn metal_compute_submits_without_a_surface() {
         },
         EzGfxResult::Ok
     );
-    assert_eq!(ez_gfx_frame_begin(context), EzGfxResult::Ok);
+    let (frame, target) = begin_offscreen_frame(context);
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
@@ -184,20 +216,21 @@ fn metal_compute_submits_without_a_surface() {
                     0,
                     core::ptr::null(),
                     0,
-                    context,
+                    frame,
                 )
             }
         },
         EzGfxResult::Ok
     );
-    assert_eq!(ez_gfx_frame_submit(context), EzGfxResult::Ok);
+    assert_eq!(ez_gfx_frame_end(frame), EzGfxResult::Ok);
+    ez_gfx_render_target_destroy(target, context);
 
     ez_gfx_shader_destroy(shader, context);
     ez_gfx_context_destroy(context);
     let _ = std::fs::remove_dir_all(root);
 }
 
-fn submit_render_nodes(context: u64, surface: u64, shader: u64, indirect: u64) {
+fn submit_render_nodes(context: u64, frame: u64, shader: u64, indirect: u64) {
     let left = [-0.45_f32, 0.0, 0.2, 0.0, 1.0, 0.0, 0.0, 0.5];
     let right = [0.45_f32, 0.0, 0.2, 0.0, 0.0, 1.0, 0.0, 1.0];
     let occluded = [-0.45_f32, 0.0, 0.8, 0.0, 0.0, 0.0, 1.0, 1.0];
@@ -219,7 +252,7 @@ fn submit_render_nodes(context: u64, surface: u64, shader: u64, indirect: u64) {
                     &raw const alpha_blend,
                     left.as_ptr().cast(),
                     u32::try_from(core::mem::size_of_val(&left)).unwrap(),
-                    context,
+                    frame,
                 )
             }
         },
@@ -239,7 +272,7 @@ fn submit_render_nodes(context: u64, surface: u64, shader: u64, indirect: u64) {
                     0,
                     core::ptr::null(),
                     0,
-                    context,
+                    frame,
                 )
             }
         },
@@ -257,7 +290,7 @@ fn submit_render_nodes(context: u64, surface: u64, shader: u64, indirect: u64) {
                     core::ptr::null(),
                     right.as_ptr().cast(),
                     u32::try_from(core::mem::size_of_val(&right)).unwrap(),
-                    context,
+                    frame,
                 )
             }
         },
@@ -276,13 +309,13 @@ fn submit_render_nodes(context: u64, surface: u64, shader: u64, indirect: u64) {
                     core::ptr::null(),
                     occluded.as_ptr().cast(),
                     u32::try_from(core::mem::size_of_val(&occluded)).unwrap(),
-                    context,
+                    frame,
                 )
             }
         },
         EzGfxResult::Ok
     );
-    assert_eq!(ez_gfx_finish_render(context), EzGfxResult::Ok);
+    assert_eq!(ez_gfx_frame_end(frame), EzGfxResult::Ok);
     assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
 }
 
@@ -397,13 +430,18 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
         EzGfxResult::Ok
     );
     assert_eq!(index_count, 3);
-    assert_eq!(ez_gfx_begin_render(surface, context), EzGfxResult::Ok);
+    let mut frame = 0;
+    assert_eq!(
+        // SAFETY: frame output storage is live and aligned.
+        unsafe { ez_gfx_frame_begin(context, surface, &raw mut frame) },
+        EzGfxResult::Ok
+    );
     let mut indirect = 0;
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_acquire_indirect(1, label.as_ptr(), label.len(), &raw mut indirect, context)
+                ez_gfx_acquire_indirect(1, label.as_ptr(), label.len(), &raw mut indirect, frame)
             }
         },
         EzGfxResult::Ok
@@ -418,12 +456,12 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_indirect_write_draws(indirect, 0, &raw const command, 1, context) }
+            unsafe { ez_gfx_indirect_write_draws(indirect, 0, &raw const command, 1, frame) }
         },
         EzGfxResult::Ok
     );
 
-    submit_render_nodes(context, surface, shader, indirect);
+    submit_render_nodes(context, frame, shader, indirect);
 
     let mut size = 0;
     let status = {
@@ -450,7 +488,6 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
         Vec::new()
     };
 
-    ez_gfx_indirect_release(indirect, context);
     ez_gfx_index_heap_destroy(context);
     ez_gfx_shader_destroy(shader, context);
     ez_gfx_surface_destroy(surface, context);

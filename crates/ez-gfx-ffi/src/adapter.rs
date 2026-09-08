@@ -1,4 +1,4 @@
-use ez_gfx::{AdapterClass, AdapterInfo, AdapterReport, Backend, ContextOptions};
+use ez_gfx::{AdapterClass, AdapterInfo, AdapterReport, Backend, ContextOptions, raw};
 
 use super::{EzGfxAdapterDesc, EzGfxAdapterInfo, EzGfxResult, catch_status};
 
@@ -66,7 +66,7 @@ pub unsafe extern "C" fn ez_gfx_adapter_count(out_count: *mut u32) -> EzGfxResul
         }
         // SAFETY: `out_count` is non-null, and the caller keeps writable,
         // properly aligned storage for one `u32` alive through this write.
-        unsafe { out_count.write(saturating_count(ez_gfx::enumerate_adapters().len())) };
+        unsafe { out_count.write(saturating_count(raw::enumerate_adapters().len())) };
         EzGfxResult::Ok
     })
 }
@@ -100,14 +100,14 @@ pub unsafe extern "C" fn ez_gfx_adapters_query(
             }
             // SAFETY: `out_written` is non-null with live aligned `u32` storage.
             unsafe {
-                out_written.write(saturating_count(ez_gfx::enumerate_adapters().len()));
+                out_written.write(saturating_count(raw::enumerate_adapters().len()));
             }
             return EzGfxResult::Ok;
         }
         if out_adapters.is_null() {
             return EzGfxResult::InvalidArgument;
         }
-        let reports = ez_gfx::query_adapter_report(allow_software == 1);
+        let reports = raw::query_adapter_report(allow_software == 1);
         let writable = usize::try_from(capacity)
             .unwrap_or(usize::MAX)
             .min(reports.len());

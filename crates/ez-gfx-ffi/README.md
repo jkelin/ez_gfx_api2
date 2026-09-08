@@ -2,15 +2,15 @@
 
 `ez-gfx-ffi` is the C ABI boundary for the `ez-gfx` runtime. C and other foreign-language clients must include [`include/ez_gfx_api.h`](../../include/ez_gfx_api.h); the declarations and numeric values in that header are canonical. Rust clients should depend on `ez-gfx`, not `ez-gfx-ffi`.
 
-The complete [C textured cube](../../examples/c/textured_cube/README.md) exercises ABI 30 typed heap/allocation handles, transient compute-to-graphics buffers, presentation, stable error printing, and snapshot readback on Win32.
+The complete [C textured cube](../../examples/c/textured_cube/README.md) exercises ABI 31 typed heap/allocation handles, transient compute-to-graphics buffers, presentation, stable error printing, and snapshot readback on Win32.
 
 ## Compatibility and ownership
 
-Before any other call, require `ez_gfx_abi_version() == EZ_GFX_ABI_VERSION` (ABI 30). Version 30 adds `EzGfxVertexHeap`, replaces name-based heap mutation with typed handles, batches indirect writes, and makes structured/indirect buffers frame-transient. Version 29 made `EzGfxResult` C-ABI-only and added `ez_gfx_print_error`; version 28 added typed geometry allocations and upload events.
+Before any other call, require `ez_gfx_abi_version() == EZ_GFX_ABI_VERSION` (ABI 31). Version 31 adds explicit generation-, kind-, owner-, state-, and frame-serial-validated `EzGfxFrame` handles and makes recording and transient operations frame-scoped. Version 30 added typed vertex heaps, batched indirect writes, and frame-transient structured/indirect buffers; version 29 made `EzGfxResult` C-ABI-only and added `ez_gfx_print_error`; version 28 added typed geometry allocations and upload events.
 
 `ez_gfx_handle_inspect` decodes a packed handle into its context/child slot and generation fields; it does not validate that the handle is live in a context. `ez_gfx_semantic_id` accepts an exact 1-to-255-byte canonical semantic name and writes its fixed 16-byte identifier. Semantic names are ASCII dot-separated identifiers: every non-empty segment starts with an ASCII letter and continues with ASCII letters, digits, or underscores. Empty segments, non-ASCII bytes, embedded NUL, and terminators included in the supplied length are invalid.
 
-The context and all context/resource operations, including teardown, are creator-thread-affine in the delegated runtime. A call from another thread is rejected; a void destruction call cannot report that failure, so perform destruction on the creator thread. The host owns the native window/display/connection or `CAMetalLayer` pointers supplied in `EzGfxSurfaceDesc` and must keep them valid until the returned surface is destroyed. The runtime owns created surfaces, shaders, textures, buffers, heaps, and their native graphics objects; the host owns the opaque handle values and must release them through this ABI.
+The context and all context/resource operations, including teardown, are creator-thread-affine in the delegated runtime. Frame handles are also thread-local: every recording or transient operation requires its live frame, and `ez_gfx_frame_end` or `ez_gfx_frame_abort` consumes it on every result. Context destruction aborts its live descendant frames before teardown. The host owns native surface pointers until surface destruction; the runtime owns created graphics resources and native objects.
 
 ## Call order
 
@@ -19,9 +19,9 @@ The context and all context/resource operations, including teardown, are creator
 1. Create a context with `ez_gfx_context_create` or `ez_gfx_context_create_backend`.
 2. Create a presentation surface with `ez_gfx_surface_create`, then initialize its device with `ez_gfx_context_init_device`.
 3. Create/load persistent resources. Heap creation returns `EzGfxVertexHeap`; vertex upload and heap destruction require it. Geometry allocation handles retain their heap owner internally.
-4. Before each frame, drain upload/runtime/diagnostic queues, then begin the frame and acquire fresh structured and indirect handles. Write structured element ranges or indirect command batches; compute-generated commands require the explicit CPU-known count publication call.
-5. Record and submit. Successful recording transfers transient ownership; successful submission makes their public handles stale. Native allocations enter completion-token pools and cannot be reused early.
-6. Remove live geometry allocations before destroying typed heaps. Destroy the context on its creator thread.
+4. Begin a surface frame with `ez_gfx_frame_begin(context, surface, out_frame)` or an offscreen frame with `ez_gfx_render_target_frame_begin(context, target, out_frame)`. Pass that frame to every recording and transient-buffer operation.
+5. Consume the frame with `ez_gfx_frame_end`; it submits and presents surface frames. On early exit, consume it with `ez_gfx_frame_abort`. Terminal calls invalidate the frame even when submission, presentation, or abort reports an error.
+6. Remove live geometry allocations before destroying typed heaps. Destroying the context aborts any remaining descendant frame, then tears down on the creator thread.
 
 Texture loading copies caller bytes and schedules unbounded CPU work subject to real allocation failure. `ez_gfx_poll_upload_event` reports source ownership transfer, device readiness, cancellation, and terminal failure. Custom decoder callbacks may execute concurrently; successful output remains valid until ez-gfx copies it and calls the paired release callback.
 

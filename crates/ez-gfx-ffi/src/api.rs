@@ -6,6 +6,8 @@ pub type EzGfxHandle = u64;
 pub type EzGfxContext = EzGfxHandle;
 /// Opaque identifier for a presentation surface.
 pub type EzGfxSurface = EzGfxHandle;
+/// Opaque identifier for one live frame recording interval.
+pub type EzGfxFrame = EzGfxHandle;
 /// Opaque identifier for a compiled shader resource.
 pub type EzGfxShader = EzGfxHandle;
 /// Opaque identifier for a buffer containing indirect draw commands.

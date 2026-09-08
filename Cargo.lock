@@ -694,6 +694,7 @@ dependencies = [
  "ez-gfx-core",
  "ez-gfx-hal",
  "ez-gfx-runtime",
+ "static_assertions",
  "thiserror 2.0.20",
 ]
 
@@ -796,6 +797,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "bytemuck",
+ "clap",
  "ez-gfx",
  "ez-gfx-artifact",
  "ez-gfx-compiler",
@@ -810,6 +812,7 @@ dependencies = [
  "objc2-quartz-core 0.3.2",
  "raw-window-handle",
  "serde_json",
+ "thiserror 2.0.20",
  "winit",
 ]
 
@@ -2315,6 +2318,12 @@ checksum = "0134f9043ed38b087ac4f7d4af44c79e2c9e5094421fe3164f435ce585953b10"
 dependencies = [
  "portable-atomic",
 ]
+
+[[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "strict-num"

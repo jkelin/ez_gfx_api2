@@ -1,11 +1,9 @@
-use ez_gfx::{
-    ClearValue, ContextHandle, Format, RenderTargetHandle, TargetDeclaration, TargetError,
-    TargetUsage,
-};
+use ez_gfx::raw::{ContextHandle, RenderTargetHandle};
+use ez_gfx::{ClearValue, Format, TargetDeclaration, TargetError, TargetUsage, raw};
 
 use super::{
-    EzGfxContext, EzGfxRenderTarget, EzGfxRenderTargetDesc, EzGfxResult, IntoFfiResult,
-    catch_status, catch_void, read_bounded_string,
+    EzGfxContext, EzGfxFrame, EzGfxRenderTarget, EzGfxRenderTargetDesc, EzGfxResult, IntoFfiResult,
+    catch_status, catch_void, frame, read_bounded_string,
 };
 
 // Zero/stale/wrong-kind packed handles fail before any context access.
@@ -130,7 +128,7 @@ pub unsafe extern "C" fn ez_gfx_render_target_create(
             Ok(context) => context,
             Err(error) => return error,
         };
-        match ez_gfx::create_render_target(context, &declaration, width, height) {
+        match raw::create_render_target(context, &declaration, width, height) {
             Ok(target) => {
                 // SAFETY: `out_target` is non-null and writable for this call.
                 unsafe { out_target.write(target.into_raw()) };
@@ -146,7 +144,7 @@ pub unsafe extern "C" fn ez_gfx_render_target_create(
 pub extern "C" fn ez_gfx_render_target_destroy(target: EzGfxRenderTarget, context: EzGfxContext) {
     catch_void(|| {
         if let (Ok(context), Ok(target)) = (context_handle(context), render_target_handle(target)) {
-            ez_gfx::destroy_render_target(context, target);
+            raw::destroy_render_target(context, target);
         }
     });
 }
@@ -174,7 +172,7 @@ pub unsafe extern "C" fn ez_gfx_render_target_get_format(
             Ok(context) => context,
             Err(error) => return error,
         };
-        match ez_gfx::render_target_format(context, target) {
+        match raw::render_target_format(context, target) {
             Ok(format) => {
                 // SAFETY: `out_format` is non-null and writable for this call.
                 unsafe { out_format.write(format as u8) };
@@ -209,7 +207,7 @@ pub unsafe extern "C" fn ez_gfx_render_target_get_extent(
             Ok(context) => context,
             Err(error) => return error,
         };
-        match ez_gfx::render_target_extent(context, target) {
+        match raw::render_target_extent(context, target) {
             Ok((width, height)) => {
                 // SAFETY: both outputs are non-null and writable for this call.
                 unsafe {
@@ -251,7 +249,7 @@ pub unsafe extern "C" fn ez_gfx_render_target_get_clear(
             Ok(context) => context,
             Err(error) => return error,
         };
-        match ez_gfx::render_target_clear(context, target) {
+        match raw::render_target_clear(context, target) {
             Ok(clear) => {
                 let (flag, color) = match clear {
                     ClearValue::Color(values) => (1, values),
@@ -296,17 +294,25 @@ pub extern "C" fn ez_gfx_render_target_probe_format(
             Ok(context) => context,
             Err(error) => return error,
         };
-        ez_gfx::probe_render_target_format(context, format, samples).into_ffi_result()
+        raw::probe_render_target_format(context, format, samples).into_ffi_result()
     })
 }
 
 #[unsafe(no_mangle)]
-/// Begins frame recording against a managed render target instead of a surface.
-pub extern "C" fn ez_gfx_begin_render_target(
-    target: EzGfxRenderTarget,
+/// Begins one render-target frame and returns its explicit owner handle.
+///
+/// # Safety
+///
+/// `out_frame` must address one writable, aligned handle for this call.
+pub unsafe extern "C" fn ez_gfx_render_target_frame_begin(
     context: EzGfxContext,
+    target: EzGfxRenderTarget,
+    out_frame: *mut EzGfxFrame,
 ) -> EzGfxResult {
     catch_status(|| {
+        if out_frame.is_null() || !out_frame.is_aligned() {
+            return EzGfxResult::InvalidArgument;
+        }
         let target = match render_target_handle(target) {
             Ok(target) => target,
             Err(error) => return error,
@@ -315,6 +321,25 @@ pub extern "C" fn ez_gfx_begin_render_target(
             Ok(context) => context,
             Err(error) => return error,
         };
-        ez_gfx::begin_render_target(context, target).into_ffi_result()
+        if let Err(status) = raw::begin_render_target(context, target) {
+            return status.into();
+        }
+        let serial = match raw::current_frame_serial(context) {
+            Ok(serial) => serial,
+            Err(status) => {
+                let _ = raw::frame_abort(context);
+                return status.into();
+            }
+        };
+        let frame = match frame::insert(context, frame::FrameKind::RenderTarget, serial) {
+            Ok(frame) => frame,
+            Err(status) => {
+                let _ = raw::frame_abort(context);
+                return status;
+            }
+        };
+        // SAFETY: `out_frame` was validated and remains caller-owned through this write.
+        unsafe { out_frame.write(frame) };
+        EzGfxResult::Ok
     })
 }

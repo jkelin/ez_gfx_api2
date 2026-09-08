@@ -34,7 +34,7 @@ The migrated library has safe Rust and FFI surfaces, CPU workers, a dedicated tr
 
 #### Approach and integration
 
-Workers publish owned events to a bounded per-context queue. The host calls `poll_events` or `drain_events` from its chosen thread; event payloads remain valid until the poll result is released. Resource operations are thread-safe only where documented, while frame recording remains context-affine.
+Workers publish owned events to a bounded per-context queue. Rust polling returns owned values that release through `Drop`; C/C# retains explicit payload release. Frame recording remains context-affine through `&mut Frame`.
 
 #### Performance evidence
 
@@ -103,7 +103,7 @@ Reliable delivery for hosts without an event loop, but callback thread affinity 
 
 ### Selection rationale
 
-This best fits the lightweight library and host-owned event-loop constraints. It gives Rust and C# callers explicit control over when callbacks/events are observed, keeps payload ownership deterministic, and reuses a bounded queue rather than adding a runtime callback thread. Public affinity rules can keep frame recording context-affine while permitting documented resource queries from other threads.
+This best fits the lightweight library and host-owned event-loop constraints. Rust receives owned event values whose lifetime ends by `Drop`; C/C# retain explicit payload release at the FFI seam. Frame recording remains context-affine and operates only through `&mut Frame`.
 
 ### Rejected alternatives and reversal conditions
 
@@ -116,12 +116,12 @@ Rust bounded channels provide ordered, bounded transport; event latency, overflo
 
 ### Assumptions and risks
 
-- Hosts pump events at a documented cadence and release owned event payloads.
+- Hosts pump events at a documented cadence. Rust drops owned payloads; C/C# releases them explicitly.
 - Queue overflow must be observable and non-blocking; a stopped host may delay notifications.
-- Registration/unregistration uses a shutdown barrier to prevent callback-after-free.
+- Dropping the last context/resource owner closes production and prevents callback-after-free.
 
 ### Validation actions
 
 1. Test ordering, overflow, cancellation, shutdown, reentrancy, and a host that stops polling.
-2. Exercise Rust and C# callback/payload ownership through finalization and context destruction.
+2. Exercise Rust `Drop` and C/C# explicit callback/payload ownership through finalization and last-owner teardown.
 3. Measure event latency, queue bytes, wakeups, contention, and render-thread impact under bounded mixed upload workloads.

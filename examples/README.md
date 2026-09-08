@@ -1,6 +1,6 @@
 # Rust examples
 
-The six numbered directories are standalone development programs that own their `ez-gfx` callbacks, scenes, Slang shader sources, and assets. Each binary calls `ez-gfx-compiler` once during resource initialization with its source path, SPIR-V/DXIL/Metal targets, and development mode, then passes validated artifact bytes to `load_shader`; no `build.rs` or generated `.ezgfxshader` is used. On Apple the compiler emits metallib; elsewhere it emits portable MSL alongside SPIR-V and DXIL. These non-distributed binaries intentionally carry Slang/DXC compiler tooling. `ez-gfx`, runtime/FFI crates, and packaged runtime distributions remain compiler-free. Every shader imports the root [`ez_gfx_api.slang`](../ez_gfx_api.slang) module and remains free of backend-specific syntax.
+The six numbered directories are procedural development renderers hosted by the shared `Example` lifecycle. Each main calls `run_program(identity, width, height, title, run_example)`; the wrapper derives `clap::Parser` once, resolves CLI/environment conflicts, builds `ExampleConfig`, then calls `run(config, setup)`. The host owns winit inversion, native window/context/surface construction, resize, input queuing, pacing, benchmark, capture, and reporting. `setup(&Context, &Surface, Backend)` returns a per-frame closure that begins, records, and returns an owning `Frame`; `Example::handle_frame(Frame)` consumes it with `Frame::finish`.
 
 - [01 Triangle](01_triangle/README.md)
 - [02 Textured Cube](02_textured_cube/README.md)
@@ -11,7 +11,7 @@ The six numbered directories are standalone development programs that own their 
 
 The Rust examples enable `ktx2` and `basis`; the Sponza example therefore retains universal decoding. Library/FFI default builds omit those decoders. Enable both for universal KTX2, `ktx2` for native blocks, or `basis` for standalone Basis; see [texture admission](../docs/textures.md#admission-and-memory).
 
-The Win32 [`C textured cube`](c/textured_cube/README.md) is a separate ABI 30 flow using typed heap/allocation handles, per-frame transient buffers, and stable result printing.
+The Win32 [`C textured cube`](c/textured_cube/README.md) is a separate ABI 31 flow. C uses an opaque generational `EzGfxFrame` and must explicitly call `ez_gfx_frame_end` or `ez_gfx_frame_abort`; Rust examples never use those raw completion functions.
 
 | Binary | Complete renderer | Owned inputs |
 | --- | --- | --- |
@@ -22,9 +22,9 @@ The Win32 [`C textured cube`](c/textured_cube/README.md) is a separate ABI 30 fl
 | `05_helmet` | `05_helmet/main.rs` | Slang source, target list, GLB |
 | `06_sponza_ktx2` | `06_sponza_ktx2/main.rs` | Slang source, target list |
 
-The original Sponza GLB is the only shared Rust asset: examples 03 and 06 consume `shared/assets/sponza.glb`. Shared support is split into [`shared/data.rs`](shared/data.rs) (neutral Pod byte views), [`shared/host.rs`](shared/host.rs) (native window handles and Metal layer), [`shared/input.rs`](shared/input.rs) (winit input translation), [`shared/lifecycle.rs`](shared/lifecycle.rs) (event-loop and callback orchestration), [`shared/observability.rs`](shared/observability.rs) (bounded runtime/diagnostic draining), [`shared/math.rs`](shared/math.rs) (`glam`-backed projection/camera adapters), and [`shared/mesh.rs`](shared/mesh.rs) (`gltf` decoding, `glam` transforms, normalization, and neutral primitive records). `shared/mod.rs` re-exports these helpers and owns environment parsing, benchmark timing, snapshot readback, and external PNG comparison.
+The original Sponza GLB is the only shared Rust asset: examples 03 and 06 consume `shared/assets/sponza.glb`. Shared support owns neutral data, native window attachment, input translation, observability, math, and mesh decoding. `shared/example.rs` is the single host for `ApplicationHandler`, native window, `Context`, `Surface`, resize, queued input, frame pacing, benchmark, capture, and reporting; `shared/error.rs` provides host errors.
 
-`shared/` owns neutral support. Each `main.rs` remains its complete renderer: persistent geometry uses typed heap/allocation handles, while structured and indirect handles are freshly acquired after each frame begins and become stale after successful submission. Context destruction remains the terminal cascading cleanup path.
+Persistent resources are owning wrappers whose leases retain their context until `Drop`. The context owns the singleton index heap. Structured and indirect buffers are acquired from `&mut Frame` and become stale on every terminal frame path, including implicit abort by `Drop`; no renderer manually destroys or releases safe resources.
 
 Benchmark mode is available on every binary. Stable JSON identities are `01_triangle`, `02_textured_cube`, `03_compute_structured`, `04_imgui`, `05_helmet`, and `06_sponza_ktx2`; benchmark frame limits always override the ordinary max-frame setting with warmup + measured + one terminal capture frame.
 

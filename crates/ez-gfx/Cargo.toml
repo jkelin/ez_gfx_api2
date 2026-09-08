@@ -23,6 +23,9 @@ crossbeam-channel.workspace = true
 ez-gfx-backend-vulkan = { path = "../ez-gfx-backend-vulkan" }
 
 thiserror.workspace = true
+
+[dev-dependencies]
+static_assertions.workspace = true
 [target.'cfg(windows)'.dependencies]
 ez-gfx-backend-dx12 = { path = "../ez-gfx-backend-dx12" }
 

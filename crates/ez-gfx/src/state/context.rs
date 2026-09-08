@@ -10,7 +10,7 @@ use super::{
     TextureUploadTelemetry, UploadEvent, UploadResource, UploadStatus, VertexAllocationHandle,
     VulkanContext, VulkanPlatform, admission_report, completed_transfer_native, context_local,
     destroy_native_pipeline, destroy_native_shader, destroy_native_texture, free_native_allocation,
-    map_allocation, map_frame, map_hal, map_lifecycle, map_native_loss, map_texture,
+    map_allocation, map_hal, map_lifecycle, map_native_loss, map_texture,
     progress_texture_upload_events, pump_async_textures, render_target::destroy_all_render_targets,
     result_status, wait_native_idle, with_context_mut, with_surface_mut,
 };
@@ -686,13 +686,20 @@ pub fn create_surface(context: ContextHandle, options: SurfaceOptions) -> Result
                 return Err(map_lifecycle(error));
             }
         };
-        let state = SurfaceState::new(
+        let Ok(state) = SurfaceState::new(
             options.width,
             options.height,
             options.cache_presented_snapshots,
-        )
-        .map_err(|_| Error::InvalidArgument)?;
-        let handle = SurfaceHandle::from_packed(handle).map_err(|_| Error::NativeFailure)?;
+        ) else {
+            let _ = context.identity.remove(handle, ResourceKind::Surface);
+            destroy_native_surface(&mut context.native, native);
+            return Err(Error::InvalidArgument);
+        };
+        let Ok(handle) = SurfaceHandle::from_packed(handle) else {
+            let _ = context.identity.remove(handle, ResourceKind::Surface);
+            destroy_native_surface(&mut context.native, native);
+            return Err(Error::NativeFailure);
+        };
         context
             .surfaces
             .insert(handle, SurfaceRecord { native, state });
@@ -861,18 +868,10 @@ pub fn begin_render(context: ContextHandle, surface: SurfaceHandle) -> Result<()
         if record.state.extent().is_none() {
             return Err(Error::NotReady);
         }
+        super::frame::start_recording(context)?;
         context.active_surface = Some(surface);
         context.frame_render_target = None;
-        context.frame_resources.clear();
-        context.frame_native_resources.clear();
-        context.frame_index = None;
-        context.frame_vertex_heaps.clear();
-        context.frame_surface = None;
-        context.frame_depth = None;
-        context.frame_has_graphics = false;
-        context.last_readback.clear();
-        context.frame_presented = false;
-        context.frame.begin().map_err(|error| map_frame(&error))
+        Ok(())
     }))
 }
 
@@ -907,18 +906,10 @@ pub fn begin_render_target(context: ContextHandle, target: RenderTargetHandle) -
         if record.width == 0 || record.height == 0 {
             return Err(Error::InvalidArgument);
         }
+        super::frame::start_recording(context)?;
         context.active_surface = None;
         context.frame_render_target = Some(target);
-        context.frame_resources.clear();
-        context.frame_native_resources.clear();
-        context.frame_index = None;
-        context.frame_surface = None;
-        context.frame_vertex_heaps.clear();
-        context.frame_depth = None;
-        context.frame_has_graphics = false;
-        context.last_readback.clear();
-        context.frame_presented = false;
-        context.frame.begin().map_err(|error| map_frame(&error))
+        Ok(())
     }))
 }
 

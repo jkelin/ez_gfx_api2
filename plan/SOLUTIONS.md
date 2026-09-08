@@ -13,14 +13,14 @@ Migrate the original Odin/Vulkan `ez_gfx_api` into a Rust/Cargo implementation t
 - Shipping runtime packages must not depend on or bundle the Slang compiler.
 - Vulkan, DX12, and Metal are required; Vulkan-only designs are incomplete.
 - Explicit shader target attributes remain the source of truth for render-target intent.
-- The original API should remain recognizable, including its existing C/C# path where practical.
+- Rust exposes only the ownership-based interface. C/C# use the explicit ABI 31 lifecycle through `ez-gfx-ffi`.
 - External inputs and binary artifacts require boundary validation.
 - Measurements from different or unspecified workloads are not averaged. Missing performance data remains unknown.
 - OpenGL, DX11, software rasterizers, a custom shader DSL, and a custom window system are out of scope.
 
 ### Assumptions
 
-- “Roughly maintain the original API” includes preserving the existing C/C# consumer path through a dedicated FFI package. If compatibility is explicitly dropped, P-002 can be simplified.
+- ABI 31 is the non-Rust compatibility seam; it does not dictate safe Rust ownership or retain safe compatibility aliases.
 - Supported hardware exposes sufficient modern bindless/indexing features. Devices below the declared capability floor receive an explicit unsupported error.
 - Slang, DXC/signing tools, and Apple Metal tools are available in compiler/build environments, not runtime deployments.
 - No repository-specific performance baseline exists for P-001 through P-020; every selected design carries explicit measurement actions.
@@ -56,35 +56,29 @@ Runtime throughput is not expected to differ from a feature-gated monolith, but 
 - Risk—package seams slow builds or drift: record clean/incremental times and validate shared artifact schemas.
 - Validate runtime, compiler, decoder-disabled, and each backend package on its supported target.
 
-## P-002: Public API and C ABI bindings — Layered Rust facade and FFI
+## P-002: Public API and C ABI bindings — Owning Rust facade and raw FFI
 
 ### Problem and required outcome
 
-Provide a safe Rust API with RAII, typed errors, and slices while keeping original concepts and the maintained C/C# contract recognizable. Depends on P-001; supplies handles and signatures to graph, geometry, texture, and drawing components.
+Provide a safe ownership-based Rust interface while keeping a validated C seam. P-002 supplies lifecycle and identity semantics to graph, geometry, texture, surface, and drawing modules.
 
 ### Decision
 
-Expose safe Rust resource types over a private core. Put all `extern "C"` exports in `ez-gfx-ffi`; preserve `bindings.xml` names, ABI probe, fixed-width layouts, packed handle semantics, and explicit destroy/status behavior. Validate pointer/count pairs, arithmetic, UTF-8, handle generation/owner, out-parameters, and async ownership. Prevent panics from unwinding across the ABI.
+`Context` owns `Rc<ContextInner>`. Every owning resource wrapper retains context and resource leases; `Drop` invalidates public identity and arranges deferred native retirement. The safe interface exposes no public destroy, release, or free functions.
+
+`begin_frame(&Context, &Surface)` returns an owning presented `Frame`; `begin_render_target_frame` returns its managed-target counterpart. Recording takes `&mut Frame`. `Frame::finish(self)` consumes the owner, returns submission errors unchanged without presenting, and returns presentation errors unchanged after successful submission. Dropping an unfinished frame aborts and invalidates every frame transient.
+
+`ez-gfx-ffi` remains a validated adapter. ABI 31 uses opaque generation- and owner-checked `u64` handles, including `EzGfxFrame`. Surface and managed-target begin functions return explicit frame owners; `ez_gfx_frame_end` and `ez_gfx_frame_abort` invalidate on every result, while context destruction aborts descendants. Validate pointer/count pairs, arithmetic, UTF-8, layouts, handles, out-pointers, and asynchronous ownership; contain every panic.
+
+Surface construction is transactional: a native creation, device-initialization, or initial-resize failure destroys the unpublished raw surface and returns the original error without retaining a safe wrapper.
 
 ### Performance and tradeoffs
 
-Bulk slices need not copy, but call, validation, marshalling, handle-check, allocation, and submission costs are unmeasured. Maintaining Rust and C surfaces plus binding generation costs more than Rust-only delivery, but preserves existing consumers and confines unsafe input handling.
+The safe interface gains lifetime locality at the cost of `Rc` increments and internal deferred retirement. Boundary validation and reference-count costs are unmeasured. Maintaining Rust ownership and C explicit lifecycles is intentional; compatibility aliases inside the safe facade are not.
 
-### Rejected alternatives
+### Risks and validation
 
-- Rust-only conceptual parity: rejects existing C/C# consumers. Reconsider only if non-Rust compatibility is explicitly removed.
-
-### Evidence
-
-- [Rust Nomicon FFI](https://doc.rust-lang.org/nomicon/ffi.html) describes safe wrappers over pointer/count interfaces.
-- [Rust layout rules](https://doc.rust-lang.org/reference/type-layout.html) require explicit C-compatible representation.
-- Original `bindings/bindings.xml` and `csharp/` define the incumbent ABI and managed ownership behavior.
-
-### Assumptions, risks, and validation
-
-- Assumption—rough parity includes C/C# continuity; if false, the FFI package can become optional.
-- Risks include enum/layout drift, invalid pointers, stale handles, finalizer races, borrowed async data, and panic mode.
-- Diff generated exports/layouts against `bindings.xml`, run C# smoke consumers, fuzz invalid calls, and benchmark empty calls, handle checks, uploads, and submission separately.
+Validate wrapper drop order, absence of reference cycles, exact submit/present errors, implicit abort, transient invalidation on every terminal path, atomic surface rollback, stale/foreign/generation rejection, ABI 31 header/XML/export parity, layout probes, invalid calls, and panic containment.
 
 ## P-003: Multi-backend hardware abstraction — Custom static raw HAL
 
@@ -334,36 +328,27 @@ Probe time, clear cost, and frame impact are unknown. D16 has fewer raw bytes pe
 - Risks include D24 portability, aspect loss, unsupported usage/sample combinations, reflection stripping, and pipeline-key mismatch.
 - Build a backend capability matrix; test candidate ordering and diagnostics; snapshot metadata; measure probe time, allocated bytes, clear GPU time, and equivalent D16/D24/D32 workloads.
 
-## P-011: Vertex and index geometry heaps — Generation free-list with mapped staging leases
+## P-011: Vertex and index geometry heaps — Owning generation-checked leases
 
 ### Problem and required outcome
 
-Manage named bindless vertex heaps and a global index heap with validated stride/capacity, deterministic stale/double-free detection, and a direct mapped staging-write path for generated geometry. Depends on P-004 and supplies geometry staging to P-012.
+Manage named bindless vertex heaps and one singleton context-owned index heap with validated stride/capacity and deterministic stale, foreign, and duplicate raw-handle rejection.
 
 ### Decision
 
-Use an ordered range free-list for GPU heap space plus a generation-indexed slot table for public allocation handles. A staging lease reserves a frame-bounded mapped slice, exposes it for direct generation, and can be committed or cancelled exactly once. Submission transfers the lease range and retires staging storage by timeline completion. Heap ownership, allocation validation, and lease state belong to the geometry manager.
+GPU ranges use ordered free lists and generation-indexed identities. Safe heap and allocation wrappers retain their context and parent-resource leases; dropping an allocation retires its range, and dropping a heap retires it after child leases and recorded uses. The safe interface has no remove, destroy, release, or free operation. ABI 31 retains explicit opaque-handle release for C.
+
+Structured and indirect buffers belong to `Frame`, are accessed through `&mut Frame`, and become invalid on consuming completion or abort. Native reuse remains completion-gated or quarantined after an indeterminate failure.
+
+The slice upload path copies caller bytes into runtime-owned mapped staging. A direct caller-writable staging lease is not part of the implemented public interface and is not claimed here.
 
 ### Performance and tradeoffs
 
-Indexed handle validation is constant-time by data-structure design, and direct generation removes one CPU-to-CPU copy relative to caller-buffer copying. Neither end-to-end latency nor memory-bandwidth savings have been measured. Range free-lists avoid buddy power-of-two waste but can fragment externally; leases add head/tail and GPU-retirement state.
+Indexed validation is constant-time by data-structure design. Range free lists can fragment externally, and reference-count/resource leases defer parent reclamation while children remain live. No end-to-end latency or memory-bandwidth benefit is claimed.
 
-### Rejected alternatives
+### Risks and validation
 
-- Raw offset free-list with copied staging: cannot reliably detect stale/double frees and retains the extra copy.
-- Buddy allocator: predictable coalescing, but power-of-two rounding can waste irregular geometry ranges. Reconsider only if measured free-list fragmentation exceeds buddy waste on real traces.
-
-### Evidence
-
-- [Vulkan vertex input guidance](https://docs.vulkan.org/guide/latest/vertex_input_data_processing.html) covers staged vertex data flow.
-- [AMD GPU memory management guidance](https://gpuopen.com/learn/vulkan-memory-management/) discusses suballocation and fragmentation.
-- Original `src/vertex_manager.odin` and `TODO.md` identify direct writes and allocation-ownership diagnostics.
-
-### Assumptions, risks, and validation
-
-- Assumption—callers can keep staging leases frame-bounded; long-held leases can exhaust the ring/pool.
-- Risks include generation rollover, range overlap, failed-upload rollback, external fragmentation, and premature staging reuse.
-- Property-test allocation/free/coalescing and stale/double-free behavior; test commit/cancel/failure paths; compare copied versus direct generated uploads and record bytes copied, CPU time, peak free-list fragmentation, and stalls.
+Test singleton index-heap admission, allocation/drop/coalescing, parent-before-child drop, generation rollover, failed-upload rollback, stale/foreign C handles, transient invalidation after submit and abort, and no native reuse before completion.
 
 ## P-012: Transfer staging and batching — Timeline-recycled bucket pools with adaptive batches
 
@@ -396,25 +381,19 @@ Pooling removes repeated allocation/destruction by construction; batching reduce
 - Risks include high-water memory retention, starvation behind batch thresholds, oversize churn, non-coherent flush errors, and completion-domain mixups.
 - Stress repeated mixed-size uploads; verify no reuse before completion; compare allocations, submits, staging bytes/capacity, queue latency, readiness latency, and CPU recording time across threshold policies; test idle trimming.
 
-## P-013: Frame-level upload readiness policy
-
-### Problem and required outcome
-
-Configure upload visibility once per frame without coupling asset readiness to graph nodes, resource discovery, or draw batching. Depends on P-003/P-012/P-015 and feeds P-016.
+## P-013: Explicit frame ownership
 
 ### Decision
 
-One immutable `FrameBeginConfig` serves surface, render-target, and headless begin paths. Geometry upload waits default on and cover vertex plus index heaps; `wait_for_geometry_uploads = false` transfers visible-use scheduling to `DeviceReady` consumers. `TextureMipWait` defaults to `Coarsest`; `None` disables frame submission texture-upload waits only, while `ThroughLevel(level)` requires readiness through the selected minimum mip, where mip 0 is finest and higher numeric levels are coarser and uploaded first. Under `None`, applications gate first texture visibility through `DeviceReady` or a fallback and finer residency through `set_texture_residency`/`texture_residency`.
+Presented and managed-target begin functions return owning `Frame` values; all recording requires `&mut Frame`.
 
-Submission applies enabled reachable readiness once as at most one aggregate prefix per active transfer domain for the whole frame. It never attaches asset-upload waits to particular textures, allocations, draws, graph resources, or graph nodes. `TextureMipWait::None` does not stop polling, completion-gated descriptor publication, recycling, progressive uploads, events, or loss handling. Generic graph hazards/barriers and frame-local synchronization remain intact.
+`Frame::finish(self)` aborts and returns any prior recording error unchanged, otherwise submits and presents surface frames only after successful submission. It preserves the exact error from each phase. Dropping an unfinished frame aborts. Every terminal path invalidates structured and indirect transients; backing storage remains completion-gated or quarantined internally.
 
-### Superseded design
+ABI 31 exposes opaque generational `EzGfxFrame` handles from surface or managed-target begin. C terminates them with `ez_gfx_frame_end` or `ez_gfx_frame_abort`; every result invalidates the frame, and context destruction aborts descendants.
 
-Per-resource and per-draw GPU timeline dependency collection is retired. Named heap imports, indirect commands, graph reordering, and transfer batching make exact asset-to-node wait placement disproportionately complex. The current heap-maximum and first-texture-ready waits are safe historical implementation facts to replace with the frame-level policy.
+### Risks and validation
 
-### Assumptions, risks, and validation
-
-Only submitted, reachable transfer prefixes selected by the frame policy may enter its snapshot. Applications selecting either manual mode must honor `DeviceReady`; texture users must retain a fallback until first publication and use the residency APIs for finer levels. Delayed texture descriptor publication remains part of readiness even under `None`. Validate defaults, all texture-policy tags and mip ranges, manual geometry and texture scheduling, mixed chains, during-recording uploads, continued polling/recycling/progressive upload, failure/loss, all begin paths, Rust/C ABI parity, and all three backends. Prove at most one aggregate prefix per enabled active transfer domain and no asset-specific graph wait actions.
+Validate exact recording/submit/present errors, implicit abort, transient invalidation after every terminal path, stale/foreign/double-completed C frames, and Rust/C/header/XML/export/layout parity.
 
 ## P-014: Basis Universal and compressed textures — Feature-gated official transcoder wrapper
 
@@ -510,36 +489,25 @@ Hardware scissors prevent fragment work outside the rectangle by rasterization s
 - Risks include invalid negative/overflowed rectangles, wrong framebuffer scaling, state leakage, unsupported command counts, and excess batching.
 - Clamp/validate rectangles; snapshot scaled/offscreen/UI output; test CPU- and compute-filled indirect buffers; measure batches, state changes, recording time, indirect count, fragment invocations, and GPU pass time against discard clipping.
 
-## P-017: Surface and swapchain lifecycle — `raw-window-handle` with guarded presentation
+## P-017: Surface lifecycle and swapchain presentation — Owning surface with guarded presentation
 
 ### Problem and required outcome
 
-Interoperate with host-owned Win32/Cocoa/X11/Wayland windows, handle resize/minimize/DPI changes, present without unsafe zero-extent work, and enforce a shader-write-only swapchain. Depends on P-003; supplies presentation/readback to P-008/P-019.
+Interoperate with host-owned native windows, keep safe context/surface lifetimes valid in either drop order, roll back partial construction, handle resize/minimize, and preserve exact presentation errors.
 
 ### Decision
 
-The Rust API accepts `raw-window-handle` 0.6 display/window traits; FFI adapters accept validated native handles while retaining explicit host lifetime requirements. A zero drawable extent returns `NotReady` without acquire/record/submit. Resize/out-of-date events schedule guarded swapchain recreation using old resources until safe retirement. Graph validation rejects sampled/storage reads from the presentation target; screenshots use transfer readback. The host owns events, input, and window lifetime.
+An owning `Surface` retains `Rc<ContextInner>` and its resource lease while the host retains the native window/display. Construction is atomic: native creation, device initialization, and initial resize either succeed together or destroy the unpublished raw surface and return the original error without retaining a safe wrapper.
+
+`begin_frame(&Context, &Surface)` returns `NotReady` for zero drawable extent without recording or acquisition. `Frame::finish(self)` submits and then presents, preserving exact errors; dropping the frame aborts. Resize/out-of-date recreation remains internal. Presentation targets reject shader reads and use transfer readback.
 
 ### Performance and tradeoffs
 
-Skipping zero-extent work is deterministic, but resize flicker, present latency, and recreation cost are unmeasured. Standard handles improve ecosystem integration while FFI native handles remain lifetime-unsafe unless host contracts are enforced.
+Skipping zero-extent work is deterministic. Recreation cost and presentation latency remain unmeasured. Resource leases prevent safe dangling context/surface relationships but cannot own the host's native window.
 
-### Rejected alternatives
+### Risks and validation
 
-- Embedded `winit` ownership: hard failure against host-owned event-loop constraints.
-- C-only raw pointer descriptor as the Rust API: fragile and unidiomatic; retained only as an FFI adapter.
-
-### Evidence
-
-- [`raw-window-handle` 0.6](https://docs.rs/raw-window-handle/latest/raw_window_handle/) defines portable borrowed native handles.
-- [Vulkan swapchain recreation](https://docs.vulkan.org/guide/latest/swapchain_recreation.html) covers resize/out-of-date handling.
-- Original `AGENTS.md`, `bindings.xml`, `src/swapchain.odin`, and `TODO.md` define host ownership and write-only policy.
-
-### Assumptions, risks, and validation
-
-- Assumption—the host keeps native window/display objects alive through surface destruction.
-- Risks include dangling FFI handles, DPI/extent mismatch, recreation races, compositor-specific out-of-date loops, and accidental swapchain reads.
-- Exercise resize/minimize/restore/DPI and surface destruction on each window system/backend; inject out-of-date/suboptimal results; verify invalid graph diagnostics and screenshot readback; measure acquire/present/recreate latency and idle work.
+Inject every construction failure point; verify complete rollback, original errors, and drop-order safety. Exercise resize/minimize/restore/DPI and exact submit/present errors. Verify presentation-target shader-read rejection and screenshot readback.
 
 ## P-018: Async workers — Scoped Rayon compute pool and bounded transfer channel
 
@@ -612,7 +580,7 @@ Sequence all P-001 through P-019 decisions into bounded milestones, obtain execu
 
 ### Decision
 
-Start with a Vulkan vertical slice that already uses backend-neutral API, reflection, artifact, and graph contracts: workspace boundary, offline Slang bundle, device/resource/upload path, one representative graph/draw, and an offscreen snapshot. Follow with DX12 and Metal conformance gates, then compressed assets/streaming/UI and remaining TODO optimizations. Final cutover requires all six original examples, Rust and C ABI compatibility gates, backend-required snapshots, every inherited TODO disposition, and removal of obsolete Odin-runtime delivery paths.
+Start with one end-to-end backend-neutral vertical slice, then require Vulkan, DX12, and Metal conformance, compressed assets/streaming/UI, and remaining selected work. Final cutover uses the shared `Example` host for winit inversion, owning context/surface, resize, input, automation, and consuming frame dispatch. It requires all six examples, ABI 31 gates, backend-required snapshots, every inherited TODO disposition, and no obsolete safe handle/free or multi-begin compatibility path.
 
 ### Performance and tradeoffs
 
@@ -793,7 +761,7 @@ Define context/resource affinity and async completion, error, cancellation, and 
 
 ### Decision
 
-Each context owns a bounded event queue. Workers enqueue owned events; hosts call `poll_events`/`drain_events` from a chosen thread and release returned payloads explicitly. Frame recording remains context-affine; other operations are `Send`/`Sync` only when documented. Overflow is observable and non-blocking. Context destruction closes production, completes/cancels pending events, and waits on a CPU shutdown barrier so no payload or callback outlives its owner. The host owns pump cadence and callback execution context.
+Each context owns a bounded event queue. Workers enqueue owned events; Rust hosts poll owned values that release through `Drop`, while C/C# releases returned payloads explicitly. Frame recording remains context-affine through `&mut Frame`. Overflow is observable and non-blocking. Dropping the last context/resource owner closes production, completes or cancels pending events, and waits on a CPU shutdown barrier so no payload or callback outlives its owner.
 
 ### Performance and tradeoffs
 

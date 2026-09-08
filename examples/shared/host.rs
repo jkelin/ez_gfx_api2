@@ -1,3 +1,4 @@
+use clap::ValueEnum;
 use ez_gfx::{Backend, SurfacePlatform};
 #[cfg(any(windows, target_vendor = "apple"))]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -16,18 +17,13 @@ pub struct BackendConfig {
     pub platform: SurfacePlatform,
 }
 
-/// Resolves the host-compatible backend and native surface platform.
-///
-/// An omitted backend defaults to Vulkan off Apple and Metal on Apple.
-/// Explicit backends unsupported by this host fail rather than silently falling
-/// back; this also keeps the environment boundary deterministic for examples.
-pub fn backend_config(native: NativePlatform) -> anyhow::Result<BackendConfig> {
-    let backend = parse_backend(std::env::var("EZ_GFX_BACKEND").ok().as_deref())?;
-    Ok(BackendConfig {
+/// Builds the native backend configuration selected at the process boundary.
+pub fn backend_config(native: NativePlatform, backend: Backend) -> BackendConfig {
+    BackendConfig {
         backend,
         name: backend_name_for(backend),
         platform: surface_platform(native),
-    })
+    }
 }
 
 const fn surface_platform(native: NativePlatform) -> SurfacePlatform {
@@ -37,19 +33,36 @@ const fn surface_platform(native: NativePlatform) -> SurfacePlatform {
     }
 }
 
-fn parse_backend(value: Option<&str>) -> anyhow::Result<Backend> {
-    match value {
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BackendArgument {
+    Vulkan,
+    Dx12,
+    Metal,
+}
+
+pub(crate) fn parse_backend(value: Option<&str>) -> crate::shared::Result<Backend> {
+    let requested = value
+        .map(|value| {
+            BackendArgument::from_str(value, false).map_err(|_| {
+                crate::shared::Error::message(format!("unsupported EZ_GFX_BACKEND `{value}`"))
+            })
+        })
+        .transpose()?;
+    match requested {
         #[cfg(target_vendor = "apple")]
-        None | Some("metal") => Ok(Backend::Metal),
+        None | Some(BackendArgument::Metal) => Ok(Backend::Metal),
         #[cfg(not(target_vendor = "apple"))]
-        None | Some("vulkan") => Ok(Backend::Vulkan),
+        None | Some(BackendArgument::Vulkan) => Ok(Backend::Vulkan),
         #[cfg(windows)]
-        Some("dx12") => Ok(Backend::Dx12),
-        Some(value) => Err(anyhow::anyhow!("unsupported EZ_GFX_BACKEND `{value}`")),
+        Some(BackendArgument::Dx12) => Ok(Backend::Dx12),
+        Some(_) => Err(crate::shared::Error::message(format!(
+            "unsupported EZ_GFX_BACKEND `{}`",
+            value.expect("a rejected backend was explicitly provided")
+        ))),
     }
 }
 
-const fn backend_name_for(backend: Backend) -> &'static str {
+pub const fn backend_name_for(backend: Backend) -> &'static str {
     match backend {
         Backend::Vulkan => "Vulkan",
         Backend::Dx12 => "DX12",
@@ -66,16 +79,6 @@ pub const fn clip_y(backend: Backend) -> crate::shared::math::ClipY {
     }
 }
 
-/// Returns the selected backend's stable display name for process reports.
-pub fn backend_name() -> anyhow::Result<&'static str> {
-    let native = if cfg!(target_vendor = "apple") {
-        NativePlatform::MetalLayer
-    } else {
-        NativePlatform::Win32
-    };
-    Ok(backend_config(native)?.name)
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct NativeSurface {
     pub window: usize,
@@ -90,7 +93,7 @@ pub struct HostSurface {
 }
 
 impl HostSurface {
-    pub fn attach(window: &Window, width: u32, height: u32) -> anyhow::Result<Self> {
+    pub fn attach(window: &Window, width: u32, height: u32) -> crate::shared::Result<Self> {
         #[cfg(not(target_vendor = "apple"))]
         let _ = (width, height);
         #[cfg(not(any(windows, target_vendor = "apple")))]
@@ -99,9 +102,9 @@ impl HostSurface {
         let raw = window.window_handle()?.as_raw();
         #[cfg(windows)]
         if let RawWindowHandle::Win32(handle) = raw {
-            let display = handle
-                .hinstance
-                .ok_or_else(|| anyhow::anyhow!("Win32 handle omitted its module instance"))?;
+            let display = handle.hinstance.ok_or_else(|| {
+                crate::shared::Error::message(format!("Win32 handle omitted its module instance"))
+            })?;
             return Ok(Self {
                 descriptor: NativeSurface {
                     window: handle.hwnd.get() as usize,
@@ -135,9 +138,9 @@ impl HostSurface {
                 metal_layer: layer,
             });
         }
-        Err(anyhow::anyhow!(
+        Err(crate::shared::Error::message(format!(
             "unsupported native window handle for example host"
-        ))
+        )))
     }
 
     pub const fn descriptor(&self) -> NativeSurface {

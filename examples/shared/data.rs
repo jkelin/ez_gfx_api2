@@ -1,7 +1,7 @@
 use bytemuck::Pod;
 use std::mem::size_of_val;
 
-pub fn byte_len<T>(values: &[T]) -> anyhow::Result<u64> {
+pub fn byte_len<T>(values: &[T]) -> crate::shared::Result<u64> {
     Ok(u64::try_from(size_of_val(values))?)
 }
 
