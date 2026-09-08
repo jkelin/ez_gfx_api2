@@ -120,7 +120,6 @@ fn capture_uploads(context: &mut NativeContext) -> mpsc::Receiver<Vec<transfer::
     let (sent, received) = mpsc::channel();
     context.texture_worker = Some(
         TransferWorker::new_grouped_with_shutdown(
-            64,
             ez_gfx_hal::DEFAULT_STAGING_POLICY,
             transfer::job_bytes,
             transfer::job_group,
@@ -561,57 +560,6 @@ fn unsignaled_graphics_fence_retains_texture_until_descriptor_reuse_is_safe() {
     context.wait_idle().unwrap();
 }
 
-struct AdmissionGate(Option<mpsc::Sender<()>>);
-impl Drop for AdmissionGate {
-    fn drop(&mut self) {
-        // Release a blocked callback before the context drops or replaces its worker.
-        if let Some(release) = self.0.take() {
-            let _ = release.send(());
-        }
-    }
-}
-
-fn full_worker(
-    source: &NativeAllocation,
-    destination: &NativeAllocation,
-) -> (TransferWorker<transfer::Dx12TransferJob>, AdmissionGate) {
-    let (release, blocked) = mpsc::channel();
-    let (entered, reached) = mpsc::channel();
-    let mut first = true;
-    let worker = TransferWorker::new(
-        1,
-        ez_gfx_hal::DEFAULT_STAGING_POLICY,
-        transfer::job_bytes,
-        move |_| {
-            // These synthetic occupancy jobs never touch a native queue or context timeline.
-            if first {
-                first = false;
-                entered.send(()).unwrap();
-                blocked.recv().unwrap();
-            }
-            Ok(())
-        },
-    )
-    .unwrap();
-    let gate = AdmissionGate(Some(release));
-    let job = || transfer::Dx12TransferJob {
-        value: 0,
-        bytes: 4,
-        cancelled: None,
-        copy: transfer::Dx12TransferCopy::Buffer {
-            source: source.resource.clone(),
-            destination: destination.resource.clone(),
-            source_offset: 0,
-            destination_offset: 0,
-            size: 4,
-        },
-    };
-    worker.submit(job()).unwrap();
-    reached.recv_timeout(Duration::from_secs(5)).unwrap();
-    worker.submit(job()).unwrap();
-    (worker, gate)
-}
-
 fn bounded_idle(
     mut context: NativeContext,
     gate: Option<QueueGate>,
@@ -640,83 +588,6 @@ fn bounded_idle(
         .expect("idle waited for a completion that rejected/failed work cannot signal");
     waiting.join().unwrap();
     result
-}
-
-#[test]
-fn full_texture_and_buffer_admission_does_not_strand_idle() {
-    let mut context = NativeContext::create_default(false).unwrap();
-    let pipeline = sampling_pipeline(&context);
-    let (mut texture, completion) = context
-        .create_texture(
-            TextureFormat::Rgba8Unorm,
-            &[ImageMip {
-                width: 1,
-                height: 1,
-                bytes: &RED,
-            }],
-            0,
-            SAMPLER,
-        )
-        .unwrap();
-    wait_fence(&context.texture_fence, completion[0].value);
-    context.publish_texture_mips(&mut texture, 1).unwrap();
-    context.wait_idle().unwrap();
-    let source = context
-        .allocate(AllocationRequest::new(4, 4, MemoryClass::Upload, true, None).unwrap())
-        .unwrap();
-    let destination = context
-        .allocate(AllocationRequest::new(4, 4, MemoryClass::Readback, true, None).unwrap())
-        .unwrap();
-    let (texture_worker, texture_gate) = full_worker(&source, &destination);
-    let (buffer_worker, buffer_gate) = full_worker(&source, &destination);
-    let original_texture = context.texture_worker.replace(texture_worker);
-    let original_buffer = context.transfer_worker.replace(buffer_worker);
-
-    assert!(matches!(
-        context.create_texture(
-            TextureFormat::Rgba8Unorm,
-            &[ImageMip {
-                width: 1,
-                height: 1,
-                bytes: &GREEN
-            }],
-            1,
-            SAMPLER
-        ),
-        Err(AllocationError::OutOfMemory)
-    ));
-    assert!(matches!(
-        context.update_texture_region(
-            &mut texture,
-            &TextureRegion {
-                mip_level: 0,
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-                bytes: &GREEN,
-            }
-        ),
-        Err(AllocationError::OutOfMemory)
-    ));
-    assert!(matches!(
-        context.copy_buffer(&source, &destination, 0, 0, 4),
-        Err(AllocationError::OutOfMemory)
-    ));
-
-    drop(texture_gate);
-    drop(buffer_gate);
-    context.texture_worker = original_texture;
-    context.transfer_worker = original_buffer;
-    let (mut context, idle) = bounded_idle(context, None);
-    idle.unwrap();
-    let sample = enqueue_sample(&mut context, &texture, &pipeline);
-    assert_eq!(sampled_pixel(&mut context, sample), RED);
-    context.free(source).unwrap();
-    context.free(destination).unwrap();
-    context.destroy_texture(texture).unwrap();
-    context.destroy_pipeline(pipeline);
-    context.wait_idle().unwrap();
 }
 
 #[test]

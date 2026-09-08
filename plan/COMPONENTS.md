@@ -71,9 +71,9 @@ Named vertex and global index heaps use range free-lists plus generation-checked
 
 Size-classed staging pools recycle after completion; a transfer owner batches copies and flushes on explicit readiness/frame/threshold events. Independent ordered timeline domains avoid manager serialization.
 
-### P-013: Upload synchronization — Per-resource GPU timeline dependencies
+### P-013: Frame-level upload readiness policy
 
-Uploaded resources publish reachable completion tokens. Graph compilation coalesces only compatible waits and emits queue-side dependencies, eliminating unrelated CPU waits.
+One immutable begin configuration defaults geometry waits on and `TextureMipWait` to `Coarsest`. `wait_for_geometry_uploads = false` and `TextureMipWait::None` independently disable their frame submission waits; applications then gate geometry and first texture visibility through `DeviceReady`/fallback and finer texture residency through `set_texture_residency`/`texture_residency`. `ThroughLevel(level)` selects a required minimum mip. Submission applies at most one reachable prefix per enabled transfer domain outside graph node/resource scheduling, while polling, descriptor publication, recycling, progressive uploads, and loss handling continue.
 
 ### P-014: Basis Universal and compressed textures — Feature-gated official transcoder wrapper
 
@@ -149,7 +149,7 @@ Target-native release CI builds pinned sources and publishes separate runtime/FF
 - Allocator -> geometry, textures, staging, transient graph targets: owns memory classes, mapping, retirement, alias compatibility, and terminal lost-device invalidation.
 - Pipeline/cache -> host cache blob boundary, graph, and draw submission: maps target-native reflection to PSOs/descriptors; imports/exports validated native cache envelopes without filesystem ownership.
 - Graph compiler -> HAL command recording and diagnostics: converts semantic declarations/resources into order, barriers, waits, merges, clears, alias boundaries, and correlated schedule events.
-- Worker orchestration -> texture/geometry ingestion -> event queue: bounded jobs and payloads cross into transfer ownership; completion/error events and readiness tokens flow to host/graph.
+- Worker orchestration -> texture/geometry ingestion -> event queue and frame policy: bounded jobs and payloads cross into transfer ownership; completion/error events flow to hosts, while submitted aggregate prefixes feed frame readiness.
 - Runtime event/diagnostic boundary -> host: all components publish bounded owned events; the host chooses polling thread/cadence, while overflow/loss/shutdown are explicit.
 - Surface/presentation -> HAL and validation: host handles and observed extents enter; acquire/present/readback/loss results leave.
 - Validation/cutover -> release artifacts and every component: executes contracts, records adapter/driver/profile/provenance evidence, compares goldens, audits binary imports/signatures, and gates publication.
@@ -162,7 +162,7 @@ The compiler receives a backend-agnostic Slang source importing the root shared 
 
 ### Asynchronous texture load
 
-The API validates encoded bytes and submits a bounded job. Workers decode/transcode and choose a format admitted by the selected device floor; texture ownership creates mip resources and sends validated payloads to pooled staging. Transfer signals readiness; graph dependencies observe it; descriptors publish only after sample-ready transition. Typed progress/completion/error diagnostics enter the bounded context event stream and are observed only when the host polls. Cancellation, overflow, shutdown, and device loss complete deterministically.
+The API validates encoded bytes and submits a bounded job. Workers decode/transcode and choose a format admitted by the selected device floor; texture ownership creates mip resources and sends validated payloads to pooled staging. Transfers submit higher/coarser mips first; descriptor publication follows sample-ready completion, and the frame policy may wait through a configured minimum mip using an aggregate prefix. Typed progress/completion/error diagnostics enter the bounded context event stream and are observed only when the host polls. Cancellation, overflow, shutdown, and device loss complete deterministically.
 
 ### Windowed frame, resize, and screenshot
 
@@ -402,11 +402,11 @@ Own frame DAG construction, semantic resource declarations, subresource hazards,
 
 ### Problems and selected solutions
 
-Realizes P-008/P-009/P-010/P-013/P-021/P-022/P-023/P-028 and graph portions of P-016/P-017: precise state, target-native semantic reflection, one admitted profile, greedy optimization, per-resource waits, and correlated diagnostics.
+Realizes P-008/P-009/P-010/P-021/P-022/P-023/P-028 and graph portions of P-016/P-017: precise state, target-native semantic reflection, one admitted profile, greedy optimization, and correlated diagnostics.
 
 ### Interfaces and connections
 
-Semantic node/declaration registration -> schedule with order, transitions, waits, physical targets, clears, merges, aliases, and diagnostic correlation IDs. Consumes selected target reflection, API resources, descriptors, readiness tokens, and context health; emits HAL work/events.
+Semantic node/declaration registration -> schedule with order, transitions, generic waits, physical targets, clears, merges, aliases, and diagnostic correlation IDs. Consumes selected target reflection, API resources, descriptors, and context health; emits HAL work/events.
 
 ### Data and persistence
 
@@ -433,11 +433,11 @@ Own named geometry heaps, generation handles, mapped leases, pooled staging, tra
 
 ### Problems and selected solutions
 
-Realizes P-011/P-012/P-013/P-023/P-028: generation free-list/leases, timeline pools/batches, per-resource waits, terminal cancellation, and correlated transfer events.
+Realizes P-011/P-012/P-023/P-028: generation free-list/leases, timeline pools/batches, terminal cancellation, and correlated transfer events.
 
 ### Interfaces and connections
 
-Allocation/free, lease commit/cancel, upload/flush, readiness token, and owned diagnostic/completion event connect API/workers to allocator/HAL/graph/events.
+Allocation/free, lease commit/cancel, upload/flush, submitted aggregate prefix, and owned diagnostic/completion events connect API/workers to allocator, HAL, frame policy, and hosts.
 
 ### Data and persistence
 
@@ -464,11 +464,11 @@ Own optional image/Basis/KTX2 decode, admitted-format selection, mip readiness, 
 
 ### Problems and selected solutions
 
-Realizes P-014/P-015/P-022/P-023/P-028 and texture portions of P-018/P-012/P-013: feature-gated transcoding, progressive streaming, one capability floor with per-format probes, deferred descriptors, and correlated events.
+Realizes P-014/P-015/P-022/P-023/P-028 and texture portions of P-018/P-012: feature-gated transcoding, progressive streaming, one capability floor with per-format probes, deferred descriptors, and correlated events.
 
 ### Interfaces and connections
 
-Decode/transcode -> validated payload; admitted capability -> format; region update -> validated layout; readiness/progress/error events connect workers/transfer/allocator/descriptors/graph/host.
+Decode/transcode -> validated payload; admitted capability -> format; region update -> validated layout; readiness/progress/error events connect workers, transfers, descriptors, frame policy, and hosts.
 
 ### Data and persistence
 
@@ -621,7 +621,7 @@ One semantic floor covers bindless/indexing, indirect drawing, synchronization, 
 
 ### Ownership and synchronization
 
-Resources flow API -> manager -> allocator/HAL; readiness flows transfer -> graph -> descriptors/draws. Timelines are domain-specific. One lifecycle owner performs terminal loss fan-out and exactly-once completion. Hosts own windows/event loops, event polling, artifact authenticity, and durable cache bytes; runtime owns bounded live queues and cache validation only.
+Resources flow API -> manager -> allocator/HAL; submitted prefixes flow from transfers to frame policy, while completion drives descriptors and events. Timelines are domain-specific. One lifecycle owner performs terminal loss fan-out and exactly-once completion. Hosts own windows/event loops, event polling, artifact authenticity, and durable cache bytes; runtime owns bounded live queues and cache validation only.
 
 ### Validation and release policy
 

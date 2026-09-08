@@ -11,7 +11,7 @@ struct Push {
 [push_constant]
 ConstantBuffer<Push> push;
 
-[StructuredBuffer("positions")]
+[VertexHeap("positions")]
 StructuredBuffer<float4> positions;
 
 [BindlessTextureHeap(EZ_GFX_MAX_TEXTURES)]

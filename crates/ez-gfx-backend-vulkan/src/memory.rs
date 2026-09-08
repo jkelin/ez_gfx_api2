@@ -594,6 +594,7 @@ pub(super) fn create_frame_slot(
             fence,
             descriptor_pool,
             in_flight: false,
+            submission_value: 0,
         })
     })();
     if created.is_err() {

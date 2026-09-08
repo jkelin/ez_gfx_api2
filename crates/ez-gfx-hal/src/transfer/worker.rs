@@ -3,10 +3,7 @@ use std::{
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc::{
-            Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, channel,
-            sync_channel,
-        },
+        mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -127,13 +124,12 @@ impl<J> Inbox<J> {
     }
 }
 
-/// Dedicated owner thread that drains bounded requests into adaptive native batches.
+/// Dedicated owner thread that drains an unbounded request stream into adaptive native batches.
 pub struct TransferWorker<J> {
-    sender: Option<SyncSender<Message<J>>>,
+    sender: Option<Sender<Message<J>>>,
     failed: Arc<AtomicBool>,
     lost: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    capacity: usize,
     queued: Arc<AtomicUsize>,
     completion: fn(&J) -> u64,
     accepted: Mutex<u64>,
@@ -144,29 +140,27 @@ impl<J: Send + 'static> TransferWorker<J> {
     /// Starts one transfer-owner thread.
     ///
     /// # Errors
-    /// Returns `Failed` for zero capacity or thread creation failure.
+    /// Returns `Failed` for thread creation failure.
     pub fn new(
-        capacity: usize,
         policy: StagingPolicy,
         bytes: fn(&J) -> u64,
         submit: impl FnMut(Vec<J>) -> Result<(), TransferWorkerError> + Send + 'static,
     ) -> Result<Self, TransferWorkerError> {
-        Self::new_grouped_with_shutdown(capacity, policy, bytes, |_| 0, submit, || Ok(()))
+        Self::new_grouped_with_shutdown(policy, bytes, |_| 0, submit, || Ok(()))
     }
 
     /// Starts an owner that separates adjacent group keys and drains on shutdown.
     ///
     /// # Errors
-    /// Returns `Failed` for zero capacity or thread creation failure.
+    /// Returns `Failed` for thread creation failure.
     pub fn new_grouped_with_shutdown(
-        capacity: usize,
         policy: StagingPolicy,
         bytes: fn(&J) -> u64,
         group: fn(&J) -> u64,
         submit: impl FnMut(Vec<J>) -> Result<(), TransferWorkerError> + Send + 'static,
         shutdown: impl FnMut() -> Result<(), TransferWorkerError> + Send + 'static,
     ) -> Result<Self, TransferWorkerError> {
-        Self::new_ordered_with_shutdown(capacity, policy, bytes, group, |_| 0, submit, shutdown)
+        Self::new_ordered_with_shutdown(policy, bytes, group, |_| 0, submit, shutdown)
     }
 
     /// Starts an owner with monotonically increasing submission tokens.
@@ -175,9 +169,8 @@ impl<J: Send + 'static> TransferWorker<J> {
     /// The callback must return only after all batch jobs have been submitted or safely skipped.
     ///
     /// # Errors
-    /// Returns `Failed` for zero capacity or thread creation failure.
+    /// Returns `Failed` for thread creation failure.
     pub fn new_ordered_with_shutdown(
-        capacity: usize,
         policy: StagingPolicy,
         bytes: fn(&J) -> u64,
         group: fn(&J) -> u64,
@@ -185,10 +178,7 @@ impl<J: Send + 'static> TransferWorker<J> {
         mut submit: impl FnMut(Vec<J>) -> Result<(), TransferWorkerError> + Send + 'static,
         mut shutdown: impl FnMut() -> Result<(), TransferWorkerError> + Send + 'static,
     ) -> Result<Self, TransferWorkerError> {
-        if capacity == 0 {
-            return Err(TransferWorkerError::Failed);
-        }
-        let (sender, receiver) = sync_channel(capacity);
+        let (sender, receiver) = channel();
         let failed = Arc::new(AtomicBool::new(false));
         let lost = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(SubmissionProgress::default());
@@ -314,7 +304,6 @@ impl<J: Send + 'static> TransferWorker<J> {
             failed,
             lost,
             thread: Some(thread),
-            capacity,
             queued,
             completion,
             accepted: Mutex::new(0),
@@ -337,25 +326,21 @@ impl<J: Send + 'static> TransferWorker<J> {
         accepted: &mut u64,
         count: usize,
     ) -> Result<(), TransferWorkerError> {
-        // Rejected admission never advances the accepted watermark.
+        // Rejected admission never advances the accepted watermark. The queue
+        // itself is unbounded; only integer exhaustion or allocation failure can
+        // prevent ownership from being retained after this point.
         if self.failed() {
             return Err(self.admission_error());
         }
         let sender = self.sender.as_ref().ok_or(TransferWorkerError::Failed)?;
         self.queued
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-                queued
-                    .checked_add(count)
-                    .filter(|total| *total <= self.capacity)
+                queued.checked_add(count)
             })
             .map_err(|_| TransferWorkerError::Full)?;
-        if let Err(error) = sender.try_send(message) {
+        if sender.send(message).is_err() {
             self.queued.fetch_sub(count, Ordering::Release);
-            return Err(match error {
-                TrySendError::Full(_) => TransferWorkerError::Full,
-                // The owner may have exited with loss between admission and send.
-                TrySendError::Disconnected(_) => self.admission_error(),
-            });
+            return Err(self.admission_error());
         }
         *accepted = highwater;
         Ok(())
@@ -364,8 +349,8 @@ impl<J: Send + 'static> TransferWorker<J> {
     /// Enqueues one request without waiting for worker progress.
     ///
     /// # Errors
-    /// Returns `Full` for backpressure, `Failed` for stopped/invalid ordered admission,
-    /// or `DeviceLost` once native submission has reported device loss.
+    /// Returns `Failed` for stopped/invalid ordered admission, `Full` only for
+    /// counter exhaustion, or `DeviceLost` after native device loss.
     pub fn submit(&self, job: J) -> Result<(), TransferWorkerError> {
         // Serialize watermark validation with channel admission when callers share the worker.
         let mut accepted = self
@@ -382,14 +367,11 @@ impl<J: Send + 'static> TransferWorker<J> {
     /// Atomically admits a FIFO bundle; native batches still split at stage and policy boundaries.
     ///
     /// # Errors
-    /// Empty or out-of-order bundles return `Failed`; oversized/full admission returns `Full`.
-    /// A loss-poisoned worker returns `DeviceLost`.
+    /// Empty or out-of-order bundles return `Failed`; counter exhaustion returns
+    /// `Full`; a loss-poisoned worker returns `DeviceLost`.
     pub fn submit_batch(&self, jobs: Vec<J>) -> Result<(), TransferWorkerError> {
         if jobs.is_empty() {
             return Err(TransferWorkerError::Failed);
-        }
-        if jobs.len() > self.capacity {
-            return Err(TransferWorkerError::Full);
         }
         let mut accepted = self
             .accepted

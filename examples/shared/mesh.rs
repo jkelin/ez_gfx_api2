@@ -1,5 +1,5 @@
 use super::math::{from_gltf, row_major};
-use anyhow::Context as _;
+
 use glam::{Mat4, Vec3};
 
 #[derive(Clone, Debug)]
@@ -69,7 +69,7 @@ pub fn load_textured_glb(bytes: &[u8]) -> anyhow::Result<MeshData> {
 }
 
 fn load_glb(bytes: &[u8], textured: bool) -> anyhow::Result<MeshData> {
-    let gltf = gltf::Gltf::from_slice(bytes).context("decode GLB")?;
+    let gltf = gltf::Gltf::from_slice(bytes)?;
     let blob = gltf
         .blob
         .as_deref()
@@ -219,15 +219,14 @@ fn append_primitive(
     {
         anyhow::bail!("mesh primitive contains invalid indices");
     }
-    let vertex_offset =
-        u32::try_from(result.positions.len()).context("vertex offset exceeds ABI")?;
-    let normal_offset = u32::try_from(result.normals.len()).context("normal offset exceeds ABI")?;
+    let vertex_offset = u32::try_from(result.positions.len())?;
+    let normal_offset = u32::try_from(result.normals.len())?;
     let uv_offset = if textured {
-        u32::try_from(result.uvs.len()).context("UV offset exceeds ABI")?
+        u32::try_from(result.uvs.len())?
     } else {
         0
     };
-    let first_index = u32::try_from(result.indices.len()).context("index offset exceeds ABI")?;
+    let first_index = u32::try_from(result.indices.len())?;
     result.positions.extend(
         positions
             .iter()

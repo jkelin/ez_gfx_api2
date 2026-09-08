@@ -1,6 +1,6 @@
 # C textured cube
 
-Minimal ABI v23 example: static cube positions, normals, indices, and one primitive record are uploaded through `include/ez_gfx_api.h`. Compute writes the indexed-indirect command; graphics consumes it and presents a normal-colored cube.
+Minimal ABI 30 example: positions and normals use typed heap handles, indices use a typed global allocation, and structured/indirect handles are freshly acquired each frame. Compute writes the indirect command after explicit CPU-known count publication; graphics consumes it in the same frame.
 
 ## Build
 

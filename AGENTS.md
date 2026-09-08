@@ -31,13 +31,15 @@ This repository is a Rust/Cargo migration of `ez_gfx_api`. Preserve the recogniz
 
 - Keep architecture decisions and status evidence current in the existing plan documents and `TODO.md`; do not duplicate or silently rewrite canonical decisions. Record new cross-module architectural work in root `TODO.md` and remove it when resolved.
 - Treat `docs/textures.md` as the canonical texture contract. Update it with every texture machinery, public API, backend behavior, synchronization, or lifecycle change.
+- Treat `docs/geometry.md` as the canonical living vertex and geometry contract. Update it with every vertex/index heap, structured vertex buffer, upload, shader binding, render usage, backend behavior, synchronization, lifecycle, or parity-status change.
 - In personal-project implementations, comment edge cases local to the function being changed. Keep comments operational and specific; avoid speculative completion claims.
+- Examples propagate routine failures with direct `?`. They must not use `.context(...)`; avoid `.with_context(...)` as well when direct propagation or a concise standalone `anyhow!` keeps the call readable.
 - You can also read `VERIFICATION_HOSTS.md` to get addresses for ssh boxes to use for cross platform verification.
 
 ## Verification
 
 - Test the changed contract within its blast radius, then run applicable source-line checks, Clippy, and formatting in that order at handoff. Use backend-matrix tests where behavior crosses HAL boundaries; include ABI and artifact validation tests for corresponding contract changes. Do not regenerate immutable snapshots without an explicit requirement.
-- Backend changes MUST be verified through the remote mise tasks, which sync the current working tree and run each libtest case in its own `cargo test` process with a 60-second default timeout: Vulkan-facing changes use `remote-test-linux` and `remote-test-windows`; DX12 uses `remote-test-windows`; Metal uses `remote-test-macos`; cross-backend texture or HAL changes use all three. Windows requires POSIX-capable rsync locally and remotely plus a POSIX SSH shell.
+- Backend changes MUST be verified through the backend matrix, which runs each libtest case in its own `cargo test` process with a 60-second default timeout: Vulkan-facing changes use `remote-test-linux` and local Windows Vulkan suites; DX12 uses local Windows suites; Metal uses `remote-test-macos`; cross-backend texture or HAL changes use all three. When the development workstation itself hosts a backend (Windows for Vulkan/Direct3D 12), running the corresponding suites locally satisfies that backend's matrix requirement; Linux and macOS coverage remains remote. The remote tasks sync the current working tree first; Windows remotes additionally require POSIX-capable rsync locally and remotely plus a POSIX SSH shell.
 - All tests and agentic smoke/verification processes MUST run hidden/headless, without showing or activating windows or taking focus. If hidden automation stalls, fix the harness or report the blocker; NEVER fall back to visible windows.
 
 ## UI exception

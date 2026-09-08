@@ -214,6 +214,9 @@ impl NativeContext {
             swapchain_extent: vk::Extent2D::default(),
             frame_slots: Vec::new(),
             frame_cursor: 0,
+            next_frame_value: 1,
+            last_frame_value: 0,
+            completed_frame_value: 0,
             image_available: None,
             depth_target: None,
         };
@@ -768,6 +771,7 @@ impl NativeContext {
         for slot in &mut self.frame_slots {
             slot.in_flight = false;
         }
+        self.completed_frame_value = self.last_frame_value;
         let resources = self
             .deferred
             .drain(..)
@@ -830,6 +834,21 @@ impl NativeContext {
         Ok(())
     }
 
+    /// Returns the most recently submitted graphics-frame token.
+    pub fn last_frame_completion(&self) -> Option<ez_gfx_hal::CompletionToken> {
+        ez_gfx_hal::CompletionToken::new(ez_gfx_hal::QueueKind::Graphics, self.last_frame_value)
+            .ok()
+    }
+
+    /// Polls frame fences and returns the completed graphics-frame prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns an allocation error when a fence status cannot be queried.
+    pub fn completed_frame_value(&mut self) -> Result<u64, AllocationError> {
+        self.poll_frame_completion()?;
+        Ok(self.completed_frame_value)
+    }
     ///
     /// # Errors
     ///
@@ -857,6 +876,12 @@ impl NativeContext {
         let bit = 1_u8
             .checked_shl(u32::try_from(slot_index).map_err(|_| AllocationError::NativeFailure)?)
             .ok_or(AllocationError::NativeFailure)?;
+        let submission_value = self
+            .frame_slots
+            .get(slot_index)
+            .ok_or(AllocationError::NativeFailure)?
+            .submission_value;
+        self.completed_frame_value = self.completed_frame_value.max(submission_value);
         let mut ready = Vec::new();
         let mut index = 0;
         while index < self.deferred.len() {
@@ -1110,88 +1135,5 @@ impl NativeContext {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn family(flags: vk::QueueFlags, count: u32) -> vk::QueueFamilyProperties {
-        vk::QueueFamilyProperties {
-            queue_flags: flags,
-            queue_count: count,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn transfer_family_prefers_non_graphics_hardware_queue() {
-        let families = [
-            family(vk::QueueFlags::GRAPHICS | vk::QueueFlags::TRANSFER, 2),
-            family(vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER, 1),
-        ];
-
-        assert_eq!(select_transfer_family(&families, 0), 1);
-    }
-
-    #[test]
-    fn transfer_family_falls_back_when_specialized_queue_is_unavailable() {
-        let families = [
-            family(vk::QueueFlags::GRAPHICS | vk::QueueFlags::TRANSFER, 1),
-            family(vk::QueueFlags::TRANSFER, 0),
-        ];
-
-        assert_eq!(select_transfer_family(&families, 0), 0);
-    }
-}
-
-#[cfg(test)]
-mod adapter_tests {
-    use super::*;
-    use std::collections::BTreeSet;
-
-    #[test]
-    fn enumeration_reports_unique_named_adapters() {
-        // No surface is created, shown, or activated by this test.
-        let adapters = NativeContext::enumerate_adapters().expect("Vulkan enumerates adapters");
-        assert!(!adapters.is_empty());
-        let mut identities = BTreeSet::new();
-        for adapter in &adapters {
-            assert_ne!(adapter.stable_id(), [0; 16]);
-            assert!(!adapter.name().is_empty());
-            assert!(!adapter.driver().is_empty());
-            assert!(identities.insert(adapter.stable_id()));
-        }
-    }
-
-    #[test]
-    fn explicit_selection_rejects_unknown_identity() {
-        // No surface is created, shown, or activated by this test.
-        // Win32 instances need a Win32 loader; every other host probes headless.
-        let platform = if cfg!(windows) {
-            SurfacePlatform::Win32
-        } else {
-            SurfacePlatform::Headless
-        };
-        let mut context = NativeContext::create(false, false, platform).expect("Vulkan instance");
-        assert_eq!(
-            context.init_device_for_adapter(None, [0xA5; 16], false),
-            Err(HalError::InvalidArgument)
-        );
-    }
-
-    #[test]
-    fn explicit_selection_admits_enumerated_adapter() {
-        // No surface is created, shown, or activated by this test.
-        // Win32 instances need a Win32 loader; every other host probes headless.
-        let platform = if cfg!(windows) {
-            SurfacePlatform::Win32
-        } else {
-            SurfacePlatform::Headless
-        };
-        let adapters = NativeContext::enumerate_adapters().expect("Vulkan enumerates adapters");
-        let wanted = adapters.first().expect("at least one adapter").stable_id();
-        let mut context = NativeContext::create(false, false, platform).expect("Vulkan instance");
-        let admitted = context
-            .init_device_for_adapter(None, wanted, true)
-            .expect("enumerated adapter initializes");
-        assert_eq!(admitted.stable_id(), wanted);
-    }
-}
+#[path = "device_tests.rs"]
+mod tests;

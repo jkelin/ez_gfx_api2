@@ -109,7 +109,7 @@ impl FrameRecorder {
     ///
     /// # Errors
     ///
-    /// Returns `FrameError::AlreadyRecording` unless the recorder is idle, or an indirect-buffer error if resetting the draw count fails.
+    /// Returns `FrameError::AlreadyRecording` unless the recorder is idle.
     pub fn begin(&mut self) -> Result<(), FrameError> {
         if self.state != FrameState::Idle {
             return Err(FrameError::AlreadyRecording);
@@ -117,14 +117,16 @@ impl FrameRecorder {
         self.state = FrameState::Recording;
         self.graph = FrameGraph::new();
         self.nodes.clear();
-        self.indirect.set_draw_count(0).map_err(map_indirect)
+        self.indirect.reset();
+        Ok(())
     }
 
     /// Writes an indexed draw command and extends the active draw range.
     ///
     /// # Errors
     ///
-    /// Returns `FrameError::NotRecording` when no recording is active, or an indirect-buffer error if the index or resulting draw count is invalid.
+    /// Returns `FrameError::NotRecording` when no recording is active, or an
+    /// indirect-buffer error if the index is invalid.
     pub fn write_indirect(
         &mut self,
         index: u32,
@@ -133,15 +135,8 @@ impl FrameRecorder {
         if self.state != FrameState::Recording {
             return Err(FrameError::NotRecording);
         }
-        self.indirect.write(index, command).map_err(map_indirect)?;
         self.indirect
-            .set_draw_count(
-                self.indirect.draw_count().max(
-                    index
-                        .checked_add(1)
-                        .ok_or(FrameError::IndirectOutOfBounds)?,
-                ),
-            )
+            .write_batch(index, core::slice::from_ref(&command))
             .map_err(map_indirect)
     }
 

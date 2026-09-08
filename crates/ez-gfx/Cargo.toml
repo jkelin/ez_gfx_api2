@@ -8,6 +8,7 @@ license.workspace = true
 [features]
 default = []
 basis = ["ez-gfx-runtime/basis"]
+ffi = []
 ktx2 = ["ez-gfx-runtime/ktx2"]
 
 [dependencies]
@@ -16,10 +17,12 @@ ez-gfx-hal.workspace = true
 ez-gfx-runtime.workspace = true
 ez-gfx-artifact.workspace = true
 blake3.workspace = true
+bytemuck.workspace = true
 ez-gfx-assets = { path = "../ez-gfx-assets" }
 crossbeam-channel.workspace = true
 ez-gfx-backend-vulkan = { path = "../ez-gfx-backend-vulkan" }
 
+thiserror.workspace = true
 [target.'cfg(windows)'.dependencies]
 ez-gfx-backend-dx12 = { path = "../ez-gfx-backend-dx12" }
 

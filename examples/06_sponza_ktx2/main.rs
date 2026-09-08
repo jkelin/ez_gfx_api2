@@ -1,7 +1,6 @@
 //! Textured Sponza using safe ez-gfx context, resource, and frame APIs.
 mod renderer {
     use crate::shared::{input::*, math::*, mesh::*, *};
-    use anyhow::Context as _;
     use ez_gfx::*;
     use glam::{DVec2, Mat4, Vec3};
 
@@ -26,7 +25,6 @@ mod renderer {
     }
     pub(super) struct ModelScene {
         shader: ShaderHandle,
-        indirect: IndirectBufferHandle,
         camera: OrbitCamera,
         clip_y: ClipY,
         target: Vec3,
@@ -34,14 +32,23 @@ mod renderer {
         far: f32,
         push: ScenePush,
         primitive_count: u32,
-        bindings: [PublicBinding; 6],
+        records: Vec<PrimitiveTextured>,
+        _positions_heap: VertexHeapHandle,
+        _normals_heap: VertexHeapHandle,
+        _uvs_heap: VertexHeapHandle,
+        _primitive_ids_heap: VertexHeapHandle,
+        _positions: VertexAllocationHandle,
+        _normals: VertexAllocationHandle,
+        _uvs: VertexAllocationHandle,
+        _primitive_ids: VertexAllocationHandle,
+        _indices: IndexAllocationHandle,
     }
 
     impl ModelScene {
         pub(super) fn create(context: ContextHandle, clip_y: ClipY) -> anyhow::Result<Self> {
             let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
-                .context("examples package has no workspace parent")?;
+                .ok_or_else(|| anyhow::anyhow!("examples package has no workspace parent"))?;
             let shader_bytes = ez_gfx_compiler::compile_shader(
                 &workspace_root.join("examples/06_sponza_ktx2/06_sponza_ktx2.slang"),
                 &[
@@ -50,17 +57,12 @@ mod renderer {
                     ez_gfx_compiler::Target::Metal,
                 ],
                 !cfg!(target_vendor = "apple"),
-            )
-            .context("compile Sponza shader")?;
+            )?;
             let mesh = load_textured_glb(include_bytes!("../shared/assets/sponza.glb"))?;
-            let primitive_count =
-                u32::try_from(mesh.primitives.len()).context("primitive count exceeds ABI")?;
+            let primitive_count = u32::try_from(mesh.primitives.len())?;
             let primitive_ids = primitive_ids(&mesh.primitives, mesh.positions.len())?;
             let primitive_bytes = u64::from(primitive_count)
-                .checked_mul(
-                    u64::try_from(std::mem::size_of::<PrimitiveTextured>())
-                        .context("primitive record size exceeds ABI")?,
-                )
+                .checked_mul(u64::try_from(std::mem::size_of::<PrimitiveTextured>())?)
                 .ok_or_else(|| anyhow::anyhow!("primitive records size overflow"))?;
             if primitive_bytes > 16 * 1024 * 1024 {
                 anyhow::bail!("primitive records exceed ABI boundary");
@@ -70,45 +72,19 @@ mod renderer {
             let normals_bytes = byte_len(&mesh.normals)?;
             let uvs_bytes = byte_len(&mesh.uvs)?;
             let primitive_ids_bytes = byte_len(&primitive_ids)?;
-            status(
-                create_index_heap(context, index_bytes),
-                "create Sponza index heap",
-            )?;
-            let first_index = upload_indices(
-                context,
-                mesh.indices.len() as u32,
-                slice_bytes(&mesh.indices),
-            )
-            .map_err(|error| anyhow::anyhow!("{error:?}"))
-            .context("upload Sponza indices")?;
-            let positions = acquire_structured(context, positions_bytes)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-                .context("acquire positions")?;
-            status(
-                write_structured(context, positions, slice_bytes(&mesh.positions)),
-                "upload positions",
-            )?;
-            let normals = acquire_structured(context, normals_bytes)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-                .context("acquire normals")?;
-            status(
-                write_structured(context, normals, slice_bytes(&mesh.normals)),
-                "upload normals",
-            )?;
-            let uvs = acquire_structured(context, uvs_bytes)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-                .context("acquire uvs")?;
-            status(
-                write_structured(context, uvs, slice_bytes(&mesh.uvs)),
-                "upload uvs",
-            )?;
-            let primitive_ids_buffer = acquire_structured(context, primitive_ids_bytes)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-                .context("acquire primitive IDs")?;
-            status(
-                write_structured(context, primitive_ids_buffer, slice_bytes(&primitive_ids)),
-                "upload primitive IDs",
-            )?;
+            create_index_heap(context, index_bytes)?;
+            let index_allocation = upload_indices(context, &mesh.indices)?;
+            let (first_index, _) = index_allocation_range(context, index_allocation)?;
+            let positions_heap = create_vertex_heap(context, "positions", positions_bytes, 16)?;
+            let positions = upload_vertices(context, positions_heap, &mesh.positions)?;
+            let normals_heap = create_vertex_heap(context, "normals", normals_bytes, 16)?;
+            let normals = upload_vertices(context, normals_heap, &mesh.normals)?;
+            let uvs_heap = create_vertex_heap(context, "uvs", uvs_bytes, 16)?;
+            let uvs = upload_vertices(context, uvs_heap, &mesh.uvs)?;
+            let primitive_ids_heap =
+                create_vertex_heap(context, "primitive_ids", primitive_ids_bytes, 4)?;
+            let primitive_ids_buffer =
+                upload_vertices(context, primitive_ids_heap, &primitive_ids)?;
             let repeat_sampler = TextureSamplerDesc {
                 min_filter: SamplerFilter::Linear,
                 mag_filter: SamplerFilter::Linear,
@@ -133,13 +109,9 @@ mod renderer {
                 &[255, 255, 255, 255],
                 false,
                 &fallback_config,
-            )
-            .map_err(|error| anyhow::anyhow!("{error:?}"))
-            .context("load Sponza fallback")?;
-            status(wait_idle(context), "wait for Sponza fallback")?;
-            let fallback_binding = texture_binding(context, fallback)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-                .context("resolve fallback binding")?;
+            )?;
+            wait_idle(context)?;
+            let fallback_binding = texture_binding(context, fallback)?;
             let mut textures = vec![fallback];
             let mut image_bindings = Vec::with_capacity(mesh.images.len());
             for image in &mesh.images {
@@ -160,13 +132,11 @@ mod renderer {
                     match load_texture(context, TextureSource::Ktx2, &image.bytes, true, &config) {
                         Ok(value) => value,
                         Err(error) => {
-                            return Err(anyhow::anyhow!("{error:?}").context("load Sponza KTX2"));
+                            return Err(anyhow::anyhow!("{error:?}"));
                         }
                     };
-                status(wait_idle(context), "wait for Sponza texture")?;
-                let binding = texture_binding(context, texture)
-                    .map_err(|error| anyhow::anyhow!("{error:?}"))
-                    .context("resolve Sponza texture binding")?;
+                wait_idle(context)?;
+                let binding = texture_binding(context, texture)?;
                 image_bindings.push(binding);
                 textures.push(texture);
             }
@@ -187,26 +157,9 @@ mod renderer {
                     transform: row_major(primitive.transform),
                 })
                 .collect::<Vec<_>>();
-            let primitives = acquire_structured(context, primitive_bytes)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-                .context("acquire primitives")?;
-            status(
-                write_structured(context, primitives, slice_bytes(&records)),
-                "upload primitives",
-            )?;
-            let indirect = acquire_indirect(context, primitive_count)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-                .context("acquire Sponza indirect commands")?;
-            status(
-                set_indirect_count(context, indirect, primitive_count),
-                "set Sponza draw count",
-            )?;
-            let shader = load_shader(context, &shader_bytes)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-                .context("load Sponza artifact")?;
+            let shader = load_shader(context, &shader_bytes)?;
             Ok(Self {
                 shader,
-                indirect,
                 camera: OrbitCamera::new(90.0_f32.to_radians(), 8.0_f32.to_radians(), 0.45),
                 clip_y,
                 target: Vec3::new(0.0, -0.32, 0.0),
@@ -218,32 +171,16 @@ mod renderer {
                     padding: [0; 3],
                 },
                 primitive_count,
-                bindings: [
-                    PublicBinding {
-                        name: "positions".to_owned(),
-                        resource: ResourceIdentity::Structured(positions),
-                    },
-                    PublicBinding {
-                        name: "normals".to_owned(),
-                        resource: ResourceIdentity::Structured(normals),
-                    },
-                    PublicBinding {
-                        name: "primitives".to_owned(),
-                        resource: ResourceIdentity::Structured(primitives),
-                    },
-                    PublicBinding {
-                        name: "draw_commands".to_owned(),
-                        resource: ResourceIdentity::Indirect(indirect),
-                    },
-                    PublicBinding {
-                        name: "uvs".to_owned(),
-                        resource: ResourceIdentity::Structured(uvs),
-                    },
-                    PublicBinding {
-                        name: "primitive_ids".to_owned(),
-                        resource: ResourceIdentity::Structured(primitive_ids_buffer),
-                    },
-                ],
+                records,
+                _positions_heap: positions_heap,
+                _normals_heap: normals_heap,
+                _uvs_heap: uvs_heap,
+                _primitive_ids_heap: primitive_ids_heap,
+                _positions: positions,
+                _normals: normals,
+                _uvs: uvs,
+                _primitive_ids: primitive_ids_buffer,
+                _indices: index_allocation,
             })
         }
     }
@@ -269,28 +206,36 @@ mod renderer {
             Ok(())
         }
         pub(super) fn record(&mut self, context: ContextHandle) -> anyhow::Result<()> {
-            let bindings = &self.bindings;
-            status(
-                render_add_compute(
-                    context,
-                    self.shader,
-                    [self.primitive_count, 1, 1],
-                    bindings,
-                    bytes_of(&self.push),
-                ),
-                "record Sponza compute pipeline",
+            let primitives = acquire_structured::<PrimitiveTextured>(context, self.records.len())?;
+            write_structured(context, primitives, 0, &self.records)?;
+            let indirect = acquire_indirect(context, self.primitive_count)?;
+            publish_compute_indirect_count(context, indirect, self.primitive_count)?;
+            let bindings = [
+                PublicBinding {
+                    name: "primitives".to_owned(),
+                    resource: ResourceIdentity::Structured(primitives),
+                },
+                PublicBinding {
+                    name: "draw_commands".to_owned(),
+                    resource: ResourceIdentity::Indirect(indirect),
+                },
+            ];
+            render_add_compute(
+                context,
+                self.shader,
+                [self.primitive_count, 1, 1],
+                &bindings,
+                bytes_of(&self.push),
             )?;
-            status(
-                render_add_graphics(
-                    context,
-                    self.shader,
-                    self.indirect,
-                    bindings,
-                    DynamicPipelineState::from_abi(2, 0, 0, 0).unwrap(),
-                    bytes_of(&self.push),
-                ),
-                "record Sponza graphics pipeline",
-            )
+            render_add_graphics(
+                context,
+                self.shader,
+                indirect,
+                &bindings,
+                DynamicPipelineState::from_abi(2, 0, 0, 0).unwrap(),
+                bytes_of(&self.push),
+            )?;
+            Ok(())
         }
     }
     fn primitive_ids(
@@ -303,12 +248,9 @@ mod renderer {
 
         let mut ids = vec![u32::MAX; vertex_count];
         for (index, primitive) in primitives.iter().enumerate() {
-            let start =
-                usize::try_from(primitive.vertex_offset).context("vertex offset exceeds ABI")?;
+            let start = usize::try_from(primitive.vertex_offset)?;
             let end = match primitives.get(index + 1) {
-                Some(next) => {
-                    usize::try_from(next.vertex_offset).context("vertex offset exceeds ABI")?
-                }
+                Some(next) => usize::try_from(next.vertex_offset)?,
                 None => vertex_count,
             };
             // The loader appends one contiguous vertex range per primitive; gaps or empty ranges
@@ -316,19 +258,12 @@ mod renderer {
             if (index == 0 && start != 0) || start >= end || end > vertex_count {
                 anyhow::bail!("primitive vertex ranges are not contiguous");
             }
-            ids[start..end].fill(u32::try_from(index).context("primitive index exceeds ABI")?);
+            ids[start..end].fill(u32::try_from(index)?);
         }
         if ids.iter().any(|id| *id == u32::MAX) {
             anyhow::bail!("primitive vertex ranges do not cover the mesh");
         }
         Ok(ids)
-    }
-
-    fn status(result: EzGfxResult, operation: &str) -> anyhow::Result<()> {
-        match result {
-            EzGfxResult::Ok => Ok(()),
-            error => Err(anyhow::anyhow!("{error:?}").context(operation.to_owned())),
-        }
     }
 
     #[cfg(test)]
@@ -374,7 +309,6 @@ mod renderer {
 #[path = "../shared/mod.rs"]
 mod shared;
 
-use anyhow::Context as _;
 use ez_gfx::*;
 use renderer::ModelScene as ExampleScene;
 use shared::*;
@@ -399,7 +333,7 @@ impl Example {
         }
     }
 
-    fn context(&self) -> ContextHandle {
+    fn context_handle(&self) -> ContextHandle {
         self.context.expect("example context is initialized")
     }
 
@@ -414,7 +348,7 @@ impl LifecycleCallbacks for Example {
     fn initialize(&mut self, native: NativeSurface, width: u32, height: u32) -> anyhow::Result<()> {
         let config = backend_config(native.platform)?;
         let backend = config.backend;
-        let backend_name = config.name;
+
         let platform = config.platform;
         let context = create_context(ContextOptions {
             enable_debug: env_flag("EZ_GFX_EXAMPLE_DEBUG")?,
@@ -423,9 +357,7 @@ impl LifecycleCallbacks for Example {
             backend,
             texture_decode_workers: 0,
             adapter_selection: None,
-        })
-        .map_err(|error| anyhow::anyhow!("{error:?}"))
-        .with_context(|| format!("create {backend_name} context"))?;
+        })?;
         self.context = Some(context);
         let surface = create_surface(
             context,
@@ -437,30 +369,20 @@ impl LifecycleCallbacks for Example {
                 height,
                 cache_presented_snapshots: false,
             },
-        )
-        .map_err(|error| anyhow::anyhow!("{error:?}"))
-        .with_context(|| format!("create {backend_name} surface"))?;
+        )?;
         self.surface = Some(surface);
-        status(
-            init_device(self.context(), self.surface()),
-            &format!("initialize {backend_name} surface device"),
-        )?;
-        status(
-            resize_surface(self.context(), self.surface(), width, height),
-            &format!("initialize {backend_name} swapchain"),
-        )?;
+        init_device(self.context_handle(), self.surface())?;
+        resize_surface(self.context_handle(), self.surface(), width, height)?;
         self.resources = Some(ExampleScene::create(
-            self.context(),
+            self.context_handle(),
             shared::clip_y(backend),
         )?);
         Ok(())
     }
 
     fn resize(&mut self, width: u32, height: u32) -> anyhow::Result<()> {
-        status(
-            resize_surface(self.context(), self.surface(), width, height),
-            "resize presented surface",
-        )
+        resize_surface(self.context_handle(), self.surface(), width, height)?;
+        Ok(())
     }
 
     fn input(&mut self, input: SceneInput) {
@@ -476,43 +398,34 @@ impl LifecycleCallbacks for Example {
         frame_index: u32,
     ) -> anyhow::Result<()> {
         self.benchmark.begin_frame(frame_index);
-        let context = self.context();
+        let context = self.context_handle();
         let surface = self.surface();
         if terminal {
-            status(
-                set_snapshot_cache(context, surface, true),
-                "enable terminal snapshot cache",
-            )?;
+            set_snapshot_cache(context, surface, true)?;
         }
         let resources = self
             .resources
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("example resources are unavailable"))?;
         resources.update(frame)?;
-        status(begin_render(context, surface), "begin presented frame")?;
+        begin_render(context, surface)?;
         resources.record(context)?;
-        status(finish_render(context), "submit and present example")?;
+        finish_render(context)?;
         self.benchmark.end_frame(frame_index.saturating_add(1));
         Ok(())
     }
 
     fn capture(&mut self, width: u32, height: u32, frames: u32) -> anyhow::Result<ProgramReport> {
-        let rgba8 = frame_readback(self.context())
-            .map_err(|error| anyhow::anyhow!("{error:?}"))
-            .context("read presented snapshot")?;
+        let rgba8 = frame_readback(self.context_handle())?;
         let counts = drain_bounded(
             4096,
             || {
-                poll_runtime_event(self.context())
+                poll_runtime_event(self.context_handle())
                     .map(|(record, dropped)| (record.is_some(), dropped))
-                    .map_err(|error| anyhow::anyhow!("{error:?}"))
-                    .context("poll runtime event")
             },
             || {
-                poll_diagnostic(self.context())
+                poll_diagnostic(self.context_handle())
                     .map(|(record, dropped)| (record.is_some(), dropped))
-                    .map_err(|error| anyhow::anyhow!("{error:?}"))
-                    .context("poll diagnostic")
             },
         )?;
         Ok(ProgramReport {
@@ -549,13 +462,6 @@ fn run_example_with_benchmark(
         },
         Example::new(benchmark),
     )
-}
-
-fn status(result: EzGfxResult, operation: &str) -> anyhow::Result<()> {
-    match result {
-        EzGfxResult::Ok => Ok(()),
-        error => Err(anyhow::anyhow!("{error:?}").context(operation.to_owned())),
-    }
 }
 
 fn main() {

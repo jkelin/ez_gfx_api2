@@ -13,6 +13,8 @@ use serde::Deserialize;
 pub enum BindingKind {
     /// A structured buffer resource.
     Structured,
+    /// A named vertex heap bound automatically by reflection.
+    VertexHeap,
     /// A buffer used for indirect GPU commands.
     Indirect,
     /// A render-target resource.
@@ -304,6 +306,7 @@ impl ReflectedBindings {
         let expected = self
             .requirements
             .iter()
+            .filter(|requirement| requirement.kind != BindingKind::VertexHeap)
             .map(|requirement| (requirement.name.as_str(), requirement.kind))
             .collect::<BTreeMap<_, _>>();
         let mut actual = BTreeMap::new();
@@ -514,6 +517,7 @@ const fn one() -> u32 {
 fn parse_kind(value: &str) -> Option<BindingKind> {
     match value {
         "structured" => Some(BindingKind::Structured),
+        "vertex_heap" => Some(BindingKind::VertexHeap),
         "indirect" => Some(BindingKind::Indirect),
         "render_target" => Some(BindingKind::RenderTarget),
         _ => None,

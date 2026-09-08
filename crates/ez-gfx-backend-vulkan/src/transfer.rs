@@ -104,7 +104,6 @@ pub(super) fn start_worker(
     let mut slot_values = [0_u64; COMMAND_SLOTS];
     let mut slot = 0_usize;
     TransferWorker::new_ordered_with_shutdown(
-        64,
         DEFAULT_STAGING_POLICY,
         job_bytes,
         job_group,
@@ -632,7 +631,6 @@ mod tests {
     fn native_texture_stages_coalesce_without_skipping_fine_mips() {
         let (sent, received) = std::sync::mpsc::channel();
         let mut worker = TransferWorker::new_ordered_with_shutdown(
-            8,
             ez_gfx_hal::StagingPolicy::new(1, 8, 8, 8).unwrap(),
             job_bytes,
             job_group,

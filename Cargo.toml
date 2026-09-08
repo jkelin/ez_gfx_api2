@@ -51,8 +51,10 @@ ez-gfx-artifact = { path = "crates/ez-gfx-artifact" }
 ez-gfx-compiler = { path = "crates/ez-gfx-compiler" }
 blake3 = { version = "1.8.2", default-features = false, features = ["std", "pure"] }
 glam = { version = "0.30.9", features = ["bytemuck"] }
+bytemuck = "1.23"
 rkyv = { version = "=0.8.18", features = ["bytecheck", "little_endian", "pointer_width_32"] }
 anyhow = "1.0.104"
+thiserror = "2.0.18"
 clap = { version = "4.6.6", features = ["derive"] }
 tempfile = "3.27.0"
 ash = { version = "0.38.0", default-features = false, features = ["loaded", "std"] }

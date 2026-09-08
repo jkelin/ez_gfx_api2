@@ -1,7 +1,7 @@
 use super::{
     AdapterCapabilities, AdapterClass, AdapterInfo, AllocationError, AllocationSizes, Allocator,
-    AllocatorCreateDesc, BACKEND, CompressionSupport, CreateDXGIFactory1, CreateEventW,
-    D3D_FEATURE_LEVEL_12_1, D3D_SHADER_MODEL_6_5, D3D12_COMMAND_LIST_TYPE_COPY,
+    AllocatorCreateDesc, BACKEND, CompletionToken, CompressionSupport, CreateDXGIFactory1,
+    CreateEventW, D3D_FEATURE_LEVEL_12_1, D3D_SHADER_MODEL_6_5, D3D12_COMMAND_LIST_TYPE_COPY,
     D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC, D3D12_DESCRIPTOR_HEAP_DESC,
     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
     D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, D3D12_FEATURE_D3D12_OPTIONS,
@@ -240,6 +240,24 @@ impl NativeContext {
     /// Never returns an error; the `Result` keeps the shared dispatch uniform.
     pub fn poll_frame_completion(&mut self) -> Result<(), HalError> {
         Ok(())
+    }
+    /// Returns the most recently submitted graphics-frame token.
+    pub fn last_frame_completion(&self) -> Option<CompletionToken> {
+        CompletionToken::new(QueueKind::Graphics, self.next_fence.saturating_sub(1)).ok()
+    }
+
+    /// Returns the completed graphics fence value.
+    ///
+    /// # Errors
+    ///
+    /// DX12 reports device removal by returning the reserved failure fence value.
+    pub fn completed_frame_value(&mut self) -> Result<u64, AllocationError> {
+        // SAFETY: the context retains the graphics fence through this query.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        if completed == u64::MAX {
+            return Err(AllocationError::DeviceLost);
+        }
+        Ok(completed)
     }
 
     /// Enumeration exhaustion reports `DXGI_ERROR_UNSUPPORTED`; software adapters are ignored unless explicitly allowed.

@@ -168,12 +168,11 @@ mod tests {
     }
 
     #[test]
-    fn transfer_worker_reports_backpressure_without_waiting() {
+    fn transfer_worker_admits_without_a_fixed_channel_limit() {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let mut first = true;
         let mut worker = TransferWorker::new(
-            1,
             StagingPolicy::new(1, 8, 1, 1).unwrap(),
             |_| 1,
             move |_| {
@@ -189,8 +188,9 @@ mod tests {
 
         worker.submit(1).unwrap();
         started_rx.recv().unwrap();
-        worker.submit(2).unwrap();
-        assert_eq!(worker.submit(3), Err(TransferWorkerError::Full));
+        for job in 2..=1_000 {
+            worker.submit(job).unwrap();
+        }
         release_tx.send(()).unwrap();
         worker.shutdown();
     }
@@ -200,7 +200,6 @@ mod tests {
         let (batch_tx, batch_rx) = std::sync::mpsc::channel();
         let policy = StagingPolicy::new(1, 8, 8, 8).unwrap();
         let mut worker = TransferWorker::new(
-            4,
             policy,
             |_| 1,
             move |jobs| {
@@ -223,7 +222,6 @@ mod tests {
         let shutdown_tx = batch_tx.clone();
         let policy = StagingPolicy::new(1, 8, 8, 8).unwrap();
         let mut worker = TransferWorker::new_grouped_with_shutdown(
-            4,
             policy,
             |_| 1,
             |job: &u64| job % 2,
@@ -252,7 +250,6 @@ mod tests {
     fn atomic_texture_bundle_batches_equal_stages_without_reordering() {
         let (sent, received) = channel();
         let mut worker = TransferWorker::new_grouped_with_shutdown(
-            8,
             StagingPolicy::new(1, 8, 8, 8).unwrap(),
             |_| 1,
             |job: &(u64, u64)| job.1,
@@ -279,7 +276,6 @@ mod tests {
         let (release, gate) = channel();
         let worker = Arc::new(
             TransferWorker::new_ordered_with_shutdown(
-                4,
                 StagingPolicy::new(1, 8, 1, 1).unwrap(),
                 |_| 1,
                 |value: &u64| *value,
@@ -314,7 +310,6 @@ mod tests {
     fn ordered_admission_rejects_invalid_bundles_without_advancing_watermark() {
         let (sent, received) = channel();
         let mut worker = TransferWorker::new_ordered_with_shutdown(
-            4,
             StagingPolicy::new(1, 8, 8, 8).unwrap(),
             |_| 1,
             |_| 1,
@@ -330,10 +325,7 @@ mod tests {
             worker.submit_batch(Vec::new()),
             Err(TransferWorkerError::Failed)
         );
-        assert_eq!(
-            worker.submit_batch(vec![1, 2, 3, 4, 5]),
-            Err(TransferWorkerError::Full)
-        );
+        // Admission has no artificial bundle-size limit.
         assert_eq!(
             worker.submit_batch(vec![3, 2]),
             Err(TransferWorkerError::Failed)
@@ -352,7 +344,6 @@ mod tests {
         for panic in [false, true] {
             let (drained, cleanup) = channel();
             let worker = TransferWorker::new_ordered_with_shutdown(
-                1,
                 StagingPolicy::new(1, 8, 1, 1).unwrap(),
                 |_| 1,
                 |_| 1,
@@ -377,7 +368,6 @@ mod tests {
     #[test]
     fn device_loss_poison_reports_device_lost_not_generic_failure() {
         let worker = TransferWorker::new_ordered_with_shutdown(
-            4,
             StagingPolicy::new(1, 8, 1, 1).unwrap(),
             |_| 1,
             |_| 1,
@@ -398,12 +388,11 @@ mod tests {
     }
 
     #[test]
-    fn bundles_consume_job_credits_not_one_channel_slot() {
+    fn bundles_have_no_artificial_job_credit_limit() {
         let (started, reached) = channel();
         let (release, gate) = channel();
         let (sent, received) = channel();
         let mut worker = TransferWorker::new_ordered_with_shutdown(
-            4,
             StagingPolicy::new(1, 8, 1, 1).unwrap(),
             |_| 1,
             |_| 1,
@@ -423,24 +412,19 @@ mod tests {
         worker.submit(1).unwrap();
         reached.recv_timeout(Duration::from_secs(2)).unwrap();
         worker.submit_batch(vec![2, 3, 4]).unwrap();
-        assert_eq!(
-            worker.submit_batch(vec![5, 6]),
-            Err(TransferWorkerError::Full)
-        );
-        worker.submit(5).unwrap();
-        assert_eq!(worker.submit(6), Err(TransferWorkerError::Full));
+        worker.submit_batch(vec![5, 6]).unwrap();
+        worker.submit(7).unwrap();
         drop(release);
         worker.shutdown();
         assert_eq!(
             received.into_iter().flatten().collect::<Vec<_>>(),
-            [1, 2, 3, 4, 5]
+            [1, 2, 3, 4, 5, 6, 7]
         );
     }
 
     #[test]
     fn trailing_unordered_job_preserves_ordered_batch_completion() {
         let mut worker = TransferWorker::new_ordered_with_shutdown(
-            4,
             StagingPolicy::new(1, 8, 8, 8).unwrap(),
             |_| 1,
             |_| 1,
@@ -468,7 +452,6 @@ mod tests {
             let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let resource = DropProbe(dropped.clone());
             let mut worker = TransferWorker::new_ordered_with_shutdown(
-                1,
                 StagingPolicy::new(1, 8, 1, 1).unwrap(),
                 |_| 1,
                 |_| 1,

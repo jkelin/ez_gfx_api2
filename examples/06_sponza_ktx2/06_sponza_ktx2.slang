@@ -55,16 +55,16 @@ void computemain(uint3 id : SV_DispatchThreadID) {
     draw_commands[id.x] = command;
 }
 
-[StructuredBuffer("positions")]
+[VertexHeap("positions")]
 StructuredBuffer<float4> positions;
 
-[StructuredBuffer("normals")]
+[VertexHeap("normals")]
 StructuredBuffer<float4> normals;
 
-[StructuredBuffer("uvs")]
+[VertexHeap("uvs")]
 StructuredBuffer<float4> uvs;
 
-[StructuredBuffer("primitive_ids")]
+[VertexHeap("primitive_ids")]
 StructuredBuffer<uint> primitive_ids;
 
 [BindlessTextureHeap(EZ_GFX_MAX_TEXTURES)]

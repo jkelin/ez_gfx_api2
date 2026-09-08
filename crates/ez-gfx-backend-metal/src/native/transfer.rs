@@ -132,7 +132,6 @@ pub(super) fn start_worker() -> Result<ez_gfx_hal::TransferWorker<MetalTransferJ
     let submitted = Arc::new(SubmittedCommands::default());
     let shutdown = submitted.clone();
     ez_gfx_hal::TransferWorker::new_ordered_with_shutdown(
-        64,
         ez_gfx_hal::DEFAULT_STAGING_POLICY,
         job_bytes,
         |_| 0,
@@ -236,72 +235,64 @@ pub(super) fn start_texture_worker(
     let mut last_value = 0;
     let submitted = Arc::new(SubmittedCommands::default());
     let shutdown = submitted.clone();
-    ez_gfx_hal::TransferWorker::new_ordered_with_shutdown(
-        64,
-        ez_gfx_hal::DEFAULT_STAGING_POLICY,
-        |job: &TextureTransferJob| job.bytes,
-        |job| job.stage,
-        |job| job.value,
-        move |mut jobs| {
-            // Admission order is immutable: a later signal may cover only copied or cancelled jobs.
-            for job in &jobs {
-                if job.value <= last_value {
-                    return Err(ez_gfx_hal::TransferWorkerError::Failed);
-                }
-                last_value = job.value;
-            }
-            // Snapshot cancellation once. Cancellation after this point retires submitted work.
-            jobs.retain(|job| {
-                if job.cancellation.cancelled.load(Ordering::Acquire) {
-                    job.submission.skipped.store(true, Ordering::Release);
-                    false
-                } else {
-                    true
-                }
-            });
-            // An all-cancelled batch still needs a real FIFO marker for accepted event waits.
-            let command = queue.commandBuffer().ok_or(ez_gfx_hal::TransferWorkerError::Failed)?;
-            // Wait outside the encoder for every accepted overwrite's graphics release.
-            for job in &jobs {
-                if job.graphics_wait {
-                    command.encodeWaitForEvent_value(&graphics_event, job.value);
-                }
-            }
-            if !jobs.is_empty() {
-            let blit = command.blitCommandEncoder().ok_or(ez_gfx_hal::TransferWorkerError::Failed)?;
-            for job in &jobs {
-                let copy = &job.copy;
-                // SAFETY: producer validation bounds the source strides and destination extent.
-                // The job retains both resources; the default command buffer retains encoded resources.
-                unsafe {
-                    blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
-                        &copy.source, copy.source_offset, copy.row_bytes, copy.image_bytes,
-                        copy.size, &copy.destination, 0, copy.level, copy.origin,
-                    );
-                }
-            }
-            blit.endEncoding();
-            }
-            command.encodeSignalEvent_value(&completion_event, last_value);
-            // Fail promptly without blocking when an earlier batch errored: retained
-            // buffers are pruned below, so observe their status before pruning.
-            if submitted.has_error() {
+    ez_gfx_hal::TransferWorker::new_ordered_with_shutdown(ez_gfx_hal::DEFAULT_STAGING_POLICY, |job: &TextureTransferJob| job.bytes, |job| job.stage, |job| job.value, move |mut jobs| {
+        // Admission order is immutable: a later signal may cover only copied or cancelled jobs.
+        for job in &jobs {
+            if job.value <= last_value {
                 return Err(ez_gfx_hal::TransferWorkerError::Failed);
             }
-            // Publish every observer before commit: a poisoned observer cannot orphan live work.
-            for job in &jobs {
-                *job.submission.command.lock().map_err(|_| ez_gfx_hal::TransferWorkerError::Failed)? =
-                    Some(TransferCommand::new(command.clone()));
+            last_value = job.value;
+        }
+        // Snapshot cancellation once. Cancellation after this point retires submitted work.
+        jobs.retain(|job| {
+            if job.cancellation.cancelled.load(Ordering::Acquire) {
+                job.submission.skipped.store(true, Ordering::Release);
+                false
+            } else {
+                true
             }
-            submitted.retain_before_commit(&command);
-            // Ordering and failure observation are GPU-side from here: the completion
-            // event orders graphics waits and `completed()` polls buffer status lazily.
-            // Shutdown and wait-idle drains still join actual GPU work terminally.
-            command.commit();
-            Ok(())
-        },
-        move || shutdown.drain(),
-    ).map_err(|_| AllocationError::NativeFailure)
+        });
+        // An all-cancelled batch still needs a real FIFO marker for accepted event waits.
+        let command = queue.commandBuffer().ok_or(ez_gfx_hal::TransferWorkerError::Failed)?;
+        // Wait outside the encoder for every accepted overwrite's graphics release.
+        for job in &jobs {
+            if job.graphics_wait {
+                command.encodeWaitForEvent_value(&graphics_event, job.value);
+            }
+        }
+        if !jobs.is_empty() {
+        let blit = command.blitCommandEncoder().ok_or(ez_gfx_hal::TransferWorkerError::Failed)?;
+        for job in &jobs {
+            let copy = &job.copy;
+            // SAFETY: producer validation bounds the source strides and destination extent.
+            // The job retains both resources; the default command buffer retains encoded resources.
+            unsafe {
+                blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                    &copy.source, copy.source_offset, copy.row_bytes, copy.image_bytes,
+                    copy.size, &copy.destination, 0, copy.level, copy.origin,
+                );
+            }
+        }
+        blit.endEncoding();
+        }
+        command.encodeSignalEvent_value(&completion_event, last_value);
+        // Fail promptly without blocking when an earlier batch errored: retained
+        // buffers are pruned below, so observe their status before pruning.
+        if submitted.has_error() {
+            return Err(ez_gfx_hal::TransferWorkerError::Failed);
+        }
+        // Publish every observer before commit: a poisoned observer cannot orphan live work.
+        for job in &jobs {
+            *job.submission.command.lock().map_err(|_| ez_gfx_hal::TransferWorkerError::Failed)? =
+                Some(TransferCommand::new(command.clone()));
+        }
+        submitted.retain_before_commit(&command);
+        // Ordering and failure observation are GPU-side from here: the completion
+        // event orders graphics waits and `completed()` polls buffer status lazily.
+        // Shutdown and wait-idle drains still join actual GPU work terminally.
+        command.commit();
+        Ok(())
+    }, move || shutdown.drain()).map_err(|_| AllocationError::NativeFailure)
 }
 
 #[cfg(test)]

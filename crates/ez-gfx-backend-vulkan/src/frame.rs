@@ -1007,6 +1007,8 @@ impl NativeContext {
             self.ensure_depth_target(self.swapchain_extent)?;
         }
         let prepared = self.prepare_frame_slot(uses_surface)?;
+        let frame_value = self.next_frame_value;
+        self.next_frame_value = frame_value.checked_add(1).ok_or(HalError::NativeFailure)?;
 
         let (readbacks, public_sets) = self.allocate_frame_bindings(
             actions,
@@ -1046,10 +1048,13 @@ impl NativeContext {
         );
 
         if submitted {
-            self.frame_slots
+            let slot = self
+                .frame_slots
                 .get_mut(prepared.slot_index)
-                .ok_or(HalError::NativeFailure)?
-                .in_flight = true;
+                .ok_or(HalError::NativeFailure)?;
+            slot.in_flight = true;
+            slot.submission_value = frame_value;
+            self.last_frame_value = frame_value;
         }
         if submitted && (recorded.is_err() || !readbacks.is_empty()) {
             // SAFETY: when `submitted` is true, `prepared.fence` was passed to `prepared.device.queue_submit`, and the one-element fence slice lasts through `wait_for_fences`.

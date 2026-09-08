@@ -4,8 +4,8 @@ use ez_gfx::{
 };
 
 use super::{
-    EzGfxContext, EzGfxRenderTarget, EzGfxRenderTargetDesc, EzGfxResult, catch_status, catch_void,
-    read_bounded_string,
+    EzGfxContext, EzGfxRenderTarget, EzGfxRenderTargetDesc, EzGfxResult, IntoFfiResult,
+    catch_status, catch_void, read_bounded_string,
 };
 
 // Zero/stale/wrong-kind packed handles fail before any context access.
@@ -136,7 +136,7 @@ pub unsafe extern "C" fn ez_gfx_render_target_create(
                 unsafe { out_target.write(target.into_raw()) };
                 EzGfxResult::Ok
             }
-            Err(status) => status,
+            Err(status) => status.into(),
         }
     })
 }
@@ -180,7 +180,7 @@ pub unsafe extern "C" fn ez_gfx_render_target_get_format(
                 unsafe { out_format.write(format as u8) };
                 EzGfxResult::Ok
             }
-            Err(status) => status,
+            Err(status) => status.into(),
         }
     })
 }
@@ -218,7 +218,7 @@ pub unsafe extern "C" fn ez_gfx_render_target_get_extent(
                 }
                 EzGfxResult::Ok
             }
-            Err(status) => status,
+            Err(status) => status.into(),
         }
     })
 }
@@ -265,7 +265,7 @@ pub unsafe extern "C" fn ez_gfx_render_target_get_clear(
                 }
                 EzGfxResult::Ok
             }
-            Err(status) => status,
+            Err(status) => status.into(),
         }
     })
 }
@@ -296,7 +296,7 @@ pub extern "C" fn ez_gfx_render_target_probe_format(
             Ok(context) => context,
             Err(error) => return error,
         };
-        ez_gfx::probe_render_target_format(context, format, samples)
+        ez_gfx::probe_render_target_format(context, format, samples).into_ffi_result()
     })
 }
 
@@ -315,6 +315,6 @@ pub extern "C" fn ez_gfx_begin_render_target(
             Ok(context) => context,
             Err(error) => return error,
         };
-        ez_gfx::begin_render_target(context, target)
+        ez_gfx::begin_render_target(context, target).into_ffi_result()
     })
 }

@@ -4,7 +4,7 @@ use core::mem::{align_of, size_of};
 use ez_gfx_core::handle::{
     ContextHandle, GenerationalArena, HandleError, HandleParts, IndirectBufferHandle, LocalHandle,
     PackedHandle, RenderTargetHandle, ShaderHandle, StructuredBufferHandle, SurfaceHandle,
-    TextureHandle,
+    TextureHandle, VertexHeapHandle,
 };
 
 #[test]
@@ -82,6 +82,11 @@ fn typed_handles_preserve_wire_layout_and_raw_values() {
             StructuredBufferHandle::from_raw(resource_raw)
                 .unwrap()
                 .into_raw(),
+        ),
+        (
+            size_of::<VertexHeapHandle>(),
+            align_of::<VertexHeapHandle>(),
+            VertexHeapHandle::from_raw(resource_raw).unwrap().into_raw(),
         ),
         (
             size_of::<TextureHandle>(),

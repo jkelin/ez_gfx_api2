@@ -2,7 +2,7 @@
 
 Showcases indexed geometry, an orbit camera, push-constant MVP data, PNG texture upload, and bindless texture selection.
 
-`main.rs` is the complete renderer. It uploads cube positions and indices, creates an indirect draw with `acquire_indirect`, `write_indirect`, and `set_indirect_count`, and loads `cube.png` with `load_texture`. `texture_binding` supplies the bindless texture ID carried in the push constants; `render_add_graphics` records the draw with `DynamicPipelineState`.
+`main.rs` retains typed geometry handles and the texture, then acquires a fresh indirect handle after each frame begins. Batched `write_indirect` publishes the draw; `texture_binding`, push constants, and `DynamicPipelineState` complete graphics recording.
 
 Run:
 

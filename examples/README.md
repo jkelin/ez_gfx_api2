@@ -9,9 +9,9 @@ The six numbered directories are standalone development programs that own their 
 - [05 Helmet](05_helmet/README.md)
 - [06 Sponza KTX2](06_sponza_ktx2/README.md)
 
-The Rust examples' Cargo dependency explicitly enables `ez-gfx` features `ktx2` and `basis`; the Sponza KTX2 example therefore retains universal decoding. Library/FFI default builds no longer include those decoders. For a separate client, enable both features for universal KTX2, `ktx2` alone for native blocks, or `basis` alone for standalone Basis; see [texture support](../docs/textures.md#features-and-backend-admission).
+The Rust examples enable `ktx2` and `basis`; the Sponza example therefore retains universal decoding. Library/FFI default builds omit those decoders. Enable both for universal KTX2, `ktx2` for native blocks, or `basis` for standalone Basis; see [texture admission](../docs/textures.md#admission-and-memory).
 
-The Win32 [`C textured cube`](c/textured_cube/README.md) is a separate ABI v23 flow. CMake compiles its Slang source with SPIR-V, DXIL, and Metal targets in development mode, links `ez-gfx-ffi`, and copies the generated artifact beside the executable. CI builds it on Windows and executes Vulkan with SwiftShader; the hosted DX12 row is compile-only.
+The Win32 [`C textured cube`](c/textured_cube/README.md) is a separate ABI 30 flow using typed heap/allocation handles, per-frame transient buffers, and stable result printing.
 
 | Binary | Complete renderer | Owned inputs |
 | --- | --- | --- |
@@ -24,7 +24,7 @@ The Win32 [`C textured cube`](c/textured_cube/README.md) is a separate ABI v23 f
 
 The original Sponza GLB is the only shared Rust asset: examples 03 and 06 consume `shared/assets/sponza.glb`. Shared support is split into [`shared/data.rs`](shared/data.rs) (neutral Pod byte views), [`shared/host.rs`](shared/host.rs) (native window handles and Metal layer), [`shared/input.rs`](shared/input.rs) (winit input translation), [`shared/lifecycle.rs`](shared/lifecycle.rs) (event-loop and callback orchestration), [`shared/observability.rs`](shared/observability.rs) (bounded runtime/diagnostic draining), [`shared/math.rs`](shared/math.rs) (`glam`-backed projection/camera adapters), and [`shared/mesh.rs`](shared/mesh.rs) (`gltf` decoding, `glam` transforms, normalization, and neutral primitive records). `shared/mod.rs` re-exports these helpers and owns environment parsing, benchmark timing, snapshot readback, and external PNG comparison.
 
-`shared/` owns neutral data, host/backend selection, input, lifecycle, observability, math, and mesh adapters. Each example's `main.rs` remains its complete renderer: it directly loads shaders/textures, acquires and writes buffers, and records compute/graphics work. Once a context exists, `destroy_context` performs the complete safe ez-gfx teardown; examples do not manually release child resources. No shared rendering-wrapper layer obscures that flow.
+`shared/` owns neutral support. Each `main.rs` remains its complete renderer: persistent geometry uses typed heap/allocation handles, while structured and indirect handles are freshly acquired after each frame begins and become stale after successful submission. Context destruction remains the terminal cascading cleanup path.
 
 Benchmark mode is available on every binary. Stable JSON identities are `01_triangle`, `02_textured_cube`, `03_compute_structured`, `04_imgui`, `05_helmet`, and `06_sponza_ktx2`; benchmark frame limits always override the ordinary max-frame setting with warmup + measured + one terminal capture frame.
 

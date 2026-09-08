@@ -8,7 +8,7 @@ use ez_gfx::{
 use super::{
     EZ_GFX_MAX_BOUNDARY_BYTES, EzGfxContext, EzGfxDecodedTexture, EzGfxResult, EzGfxTexture,
     EzGfxTextureDecoderCallback, EzGfxTextureDecoderReleaseCallback, EzGfxTextureDesc,
-    catch_status, catch_void, validate_optional_bounded_string,
+    IntoFfiResult, catch_status, catch_void, validate_optional_bounded_string,
 };
 
 // Zero/stale/wrong-kind packed handles fail before any context access.
@@ -284,24 +284,8 @@ pub unsafe extern "C" fn ez_gfx_texture_load(
                 unsafe { out_texture.write(texture.into_raw()) };
                 EzGfxResult::Ok
             }
-            Err(status) => status,
+            Err(status) => status.into(),
         }
-    })
-}
-
-#[unsafe(no_mangle)]
-/// Polls asynchronous decode and transfer readiness for one texture.
-pub extern "C" fn ez_gfx_texture_poll(texture: EzGfxTexture, context: EzGfxContext) -> EzGfxResult {
-    catch_status(|| {
-        let texture = match texture_handle(texture) {
-            Ok(texture) => texture,
-            Err(error) => return error,
-        };
-        let context = match context_handle(context) {
-            Ok(context) => context,
-            Err(error) => return error,
-        };
-        ez_gfx::poll_texture_load(context, texture)
     })
 }
 
@@ -320,7 +304,7 @@ pub extern "C" fn ez_gfx_texture_cancel(
             Ok(context) => context,
             Err(error) => return error,
         };
-        ez_gfx::cancel_texture_load(context, texture)
+        ez_gfx::cancel_texture_load(context, texture).into_ffi_result()
     })
 }
 
@@ -353,7 +337,7 @@ pub unsafe extern "C" fn ez_gfx_texture_get_binding(
                 unsafe { out_binding.write(binding) };
                 EzGfxResult::Ok
             }
-            Err(status) => status,
+            Err(status) => status.into(),
         }
     })
 }
@@ -391,7 +375,7 @@ pub unsafe extern "C" fn ez_gfx_texture_get_residency(
                 }
                 EzGfxResult::Ok
             }
-            Err(status) => status,
+            Err(status) => status.into(),
         }
     })
 }
@@ -412,7 +396,7 @@ pub extern "C" fn ez_gfx_texture_set_residency(
             Ok(value) => value,
             Err(error) => return error,
         };
-        ez_gfx::set_texture_residency(context, texture, resident_mips)
+        ez_gfx::set_texture_residency(context, texture, resident_mips).into_ffi_result()
     })
 }
 #[unsafe(no_mangle)]
@@ -459,6 +443,7 @@ pub unsafe extern "C" fn ez_gfx_update_texture_region(
                 bytes,
             },
         )
+        .into_ffi_result()
     })
 }
 
@@ -493,7 +478,7 @@ pub unsafe extern "C" fn ez_gfx_texture_get_upload_telemetry(
                 }
                 EzGfxResult::Ok
             }
-            Err(error) => error,
+            Err(error) => error.into(),
         }
     })
 }

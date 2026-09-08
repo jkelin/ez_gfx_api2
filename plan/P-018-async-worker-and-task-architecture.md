@@ -42,7 +42,7 @@ Decompose background tasks into two decoupled stages:
 #### Tradeoffs and failure modes
 
 - **Tradeoffs:** Adds `rayon` and `crossbeam-channel` dependencies (~150KB compiled binary footprint).
-- **Failure Modes:** Unbounded task queue memory growth if assets are queued faster than GPU transfer bandwidth can ingest them; requires a high-water-mark backpressure limit.
+- **Failure Modes:** Unbounded task ownership can retain memory if producers permanently outrun decode and transfer consumption; allocation, counter, thread, and OS failures remain explicit.
 
 #### Sources
 
@@ -110,7 +110,7 @@ Perform all image decompression and staging writes synchronously on the calling 
 ## Performance comparison
 
 | Candidate | Relevant performance dimensions | Constraint fit | Evidence quality | Risks |
-| Rayon compute pool + dedicated transfer channel | Work-stealing load balancing, single-point GPU queue submission | High | Rayon/Crossbeam documentation & source inspection | Memory queue backpressure tuning |
+| Rayon compute pool + dedicated transfer channel | Work-stealing load balancing, single-point GPU queue submission | High | Rayon/Crossbeam documentation & source inspection | Unbounded retained memory under sustained producer overload |
 | Dedicated OS worker threads with custom channel queues | Zero external threadpool deps, but potential worker load imbalance | Moderate | Direct source code inspection | Coarse load balancing on heterogeneous assets |
 | Full asynchronous runtime (Tokio) | Unified async I/O, but higher runtime complexity | Low | Tokio architecture documentation | Violates non-goals, complex C ABI interop |
 | Incumbent synchronous inline decoding | Calling thread blocks on asset decode | Low | Direct source code inspection | Violates async streaming requirements |
@@ -146,7 +146,7 @@ Rayon work-stealing optimizes multi-core CPU scheduling and message-passing elim
 ### Risks and mitigations
 
 - **Risk:** Memory bloat if thousands of asset decoding tasks are queued faster than GPU transfers can consume them.
-- **Mitigation:** Implement bounded channel capacity with backpressure to limit in-flight decoded staging buffers.
+- **Mitigation:** Keep admission lossless and unbounded as required; applications control scheduling rate and drain completion events every frame. Allocation, counter, thread, and OS failures remain explicit rather than masquerading as routine `QueueFull`.
 
 ### Validation actions
 

@@ -1,5 +1,4 @@
 use super::{FrameInput, HostSurface, NativeSurface, SceneInput, dispatch_window_input, env_flag};
-use anyhow::Context as _;
 use std::time::Instant;
 use winit::{
     application::ApplicationHandler,
@@ -40,10 +39,10 @@ pub fn run<C: LifecycleCallbacks>(
         unsafe { std::env::set_var("VK_LOADER_LAYERS_DISABLE", "~implicit~") };
     }
     let visible = !env_flag("EZ_GFX_EXAMPLE_HIDDEN")?;
-    let event_loop = EventLoop::new().context("create event loop")?;
+    let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(config, callbacks, visible);
-    let run_result = event_loop.run_app(&mut app).context("run event loop");
+    let run_result = event_loop.run_app(&mut app).map_err(anyhow::Error::from);
     finish_app(app, run_result)
 }
 
@@ -127,12 +126,9 @@ impl<C: LifecycleCallbacks> ApplicationHandler for App<C> {
             .with_inner_size(PhysicalSize::new(self.config.width, self.config.height))
             .with_visible(self.visible)
             .with_active(self.visible);
-        let window = match event_loop
-            .create_window(attributes)
-            .context("create example window")
-        {
+        let window = match event_loop.create_window(attributes) {
             Ok(window) => window,
-            Err(error) => return self.fail(event_loop, error),
+            Err(error) => return self.fail(event_loop, error.into()),
         };
         let host = match HostSurface::attach(&window, self.config.width, self.config.height) {
             Ok(host) => host,

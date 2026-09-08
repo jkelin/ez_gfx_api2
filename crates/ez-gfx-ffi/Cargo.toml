@@ -14,7 +14,7 @@ ktx2 = ["ez-gfx/ktx2"]
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-ez-gfx.workspace = true
+ez-gfx = { workspace = true, features = ["ffi"] }
 ez-gfx-core.workspace = true
 
 [dev-dependencies]

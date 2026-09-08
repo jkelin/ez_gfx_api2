@@ -247,7 +247,6 @@ fn capture_uploads(
     let (sent, received) = mpsc::channel();
     context.texture_worker = Some(
         ez_gfx_hal::TransferWorker::new_ordered_with_shutdown(
-            64,
             ez_gfx_hal::DEFAULT_STAGING_POLICY,
             |job: &transfer::TextureTransferJob| job.bytes,
             |job| job.stage,

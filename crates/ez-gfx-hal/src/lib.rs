@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 use core::fmt;
-use ez_gfx_core::capability::AdapterInfo;
+use ez_gfx_core::capability::{AdapterInfo, MAX_BINDLESS_SAMPLED_TEXTURES};
 
 const ALLOCATION_BLOCK_ALIGNMENT: u64 = 4 * 1024 * 1024;
 
@@ -308,7 +308,7 @@ impl ShaderTextureHeapLayout {
         sampler_argument_offset: u32,
     ) -> Result<Self, HalError> {
         if capacity == 0
-            || capacity > 1024
+            || capacity > MAX_BINDLESS_SAMPLED_TEXTURES
             || argument_stride == 0
             || texture_argument_offset >= argument_stride
             || sampler_argument_offset >= argument_stride

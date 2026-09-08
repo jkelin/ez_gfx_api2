@@ -20,9 +20,9 @@ use ez_gfx_core::{
     Backend,
     capability::AdapterInfo,
     handle::{
-        ContextHandle, GenerationalArena, HandleParts, IndirectBufferHandle, LocalHandle,
-        PackedHandle, RenderTargetHandle, ShaderHandle, StructuredBufferHandle, SurfaceHandle,
-        TextureHandle,
+        ContextHandle, GenerationalArena, HandleParts, IndexAllocationHandle, IndirectBufferHandle,
+        LocalHandle, PackedHandle, RenderTargetHandle, ShaderHandle, StructuredBufferHandle,
+        SurfaceHandle, TextureHandle, VertexAllocationHandle, VertexHeapHandle,
     },
 };
 use ez_gfx_hal::{
@@ -51,9 +51,10 @@ use ez_gfx_runtime::{
         TextureRegistry, TextureSource, TextureUploadTelemetry, TextureUploadTelemetrySnapshot,
         generate_mips,
     },
+    upload::{UploadEvent, UploadEventQueue, UploadResource, UploadStatus},
 };
 
-use crate::EzGfxResult;
+use crate::{Error, Result};
 
 enum NativeContext {
     Vulkan(Box<VulkanContext>),
@@ -166,6 +167,7 @@ struct GeometryAllocation {
     allocation: NativeAllocation,
     ready: Option<CompletionToken>,
     size: u64,
+    heap_id: Option<u32>,
 }
 
 struct PendingTexture {
@@ -177,7 +179,7 @@ struct PendingTexture {
 
 struct DecodedTextureJob {
     handle: TextureHandle,
-    decoded: Result<DecodedTexture, TextureError>,
+    decoded: std::result::Result<DecodedTexture, TextureError>,
 }
 
 struct AsyncTextureState {
@@ -189,7 +191,7 @@ struct AsyncTextureState {
 }
 
 impl AsyncTextureState {
-    fn new_with_workers(workers: u32) -> Result<Self, EzGfxResult> {
+    fn new_with_workers(workers: u32) -> Result<Self> {
         // Zero preserves the historical default topology; an explicit count is
         // honored verbatim so embedders can pin decode concurrency. Counts above
         // the pool admission cap fail here, before Rayon spawns one OS thread
@@ -201,20 +203,15 @@ impl AsyncTextureState {
                 .saturating_sub(1)
                 .max(1)
         } else {
-            let threads = usize::try_from(workers).map_err(|_| EzGfxResult::InvalidArgument)?;
+            let threads = usize::try_from(workers).map_err(|_| Error::InvalidArgument)?;
             if threads > ez_gfx_assets::MAX_CPU_POOL_THREADS {
-                return Err(EzGfxResult::InvalidArgument);
+                return Err(Error::InvalidArgument);
             }
             threads
         };
-        let (ready_tx, ready_rx) = crossbeam_channel::bounded(64);
+        let (ready_tx, ready_rx) = crossbeam_channel::unbounded();
         Ok(Self {
-            pool: ez_gfx_assets::CpuPool::new(
-                threads,
-                64,
-                ez_gfx_runtime::texture::MAX_TEXTURE_BYTES,
-            )
-            .map_err(|_| EzGfxResult::NativeFailure)?,
+            pool: ez_gfx_assets::CpuPool::new(threads).map_err(|_| Error::NativeFailure)?,
             ready_tx,
             ready_rx,
             #[cfg(test)]
@@ -241,8 +238,23 @@ enum FrameNativeResource {
     Surface(SurfaceHandle),
     Depth,
     Index,
+    VertexHeap(u32),
     RenderTarget(RenderTargetHandle),
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransientUse {
+    Available,
+    Interned(u64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TransientBuffer {
+    element_size: u32,
+    element_count: u32,
+    byte_capacity: u64,
+    usage: TransientUse,
+}
+
 struct ContextState {
     identity: ContextIdentity,
     options: ContextOptions,
@@ -253,6 +265,9 @@ struct ContextState {
     shaders: HashMap<ShaderHandle, ShaderRecord>,
     indirects: HashMap<IndirectBufferHandle, IndexedIndirectBuffer>,
     textures: HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>,
+    transient_buffers: HashMap<PackedHandle, TransientBuffer>,
+    structured_pool: HashMap<u32, ez_gfx_hal::ReusableStagingPool<NativeAllocation>>,
+    indirect_pool: ez_gfx_hal::ReusableStagingPool<NativeAllocation>,
     render_targets: HashMap<RenderTargetHandle, render_target::RenderTargetRecord>,
     texture_formats: HashMap<TextureHandle, TextureFormat>,
     texture_published_mips: HashMap<TextureHandle, u32>,
@@ -267,13 +282,19 @@ struct ContextState {
     texture_handoffs: HashMap<TextureHandle, Instant>,
     texture_telemetry: Arc<TextureUploadTelemetry>,
     async_textures: AsyncTextureState,
-    texture_failures: HashMap<TextureHandle, EzGfxResult>,
+    texture_failures: HashMap<TextureHandle, Error>,
     geometry: GeometryManager,
     vertex_heaps: HashMap<String, GeometryAllocation>,
+    vertex_heap_handles: HashMap<VertexHeapHandle, String>,
     index_heap: Option<GeometryAllocation>,
+    next_vertex_heap_id: u32,
+    geometry_uploads: HashMap<PackedHandle, CompletionToken>,
+    upload_events: UploadEventQueue,
     staging: ez_gfx_hal::ReusableStagingPool<NativeAllocation>,
     frame: FrameRecorder,
     frame_resources: HashMap<PackedHandle, ResourceId>,
+    frame_vertex_heaps: HashMap<u32, ResourceId>,
+    frame_serial: u64,
     frame_native_resources: HashMap<ResourceId, FrameNativeResource>,
     frame_index: Option<ResourceId>,
     frame_surface: Option<ResourceId>,
@@ -302,19 +323,19 @@ struct ThreadContexts {
 }
 
 impl ThreadContexts {
-    fn cleanup_for_thread_exit(&mut self) -> EzGfxResult {
+    fn cleanup_for_thread_exit(&mut self) -> Result<()> {
         // Handles invalidate synchronously before platform-specific abandonment handling.
         let result = match CONTEXT_HANDLES.lock() {
             Ok(mut handles) => {
-                let mut result = EzGfxResult::Ok;
+                let mut result = Ok(());
                 for local in self.states.keys() {
                     if handles.remove(*local).is_err() {
-                        result = EzGfxResult::NativeFailure;
+                        result = Err(Error::NativeFailure);
                     }
                 }
                 result
             }
-            Err(_) => EzGfxResult::NativeFailure,
+            Err(_) => Err(Error::NativeFailure),
         };
 
         #[cfg(windows)]
@@ -332,7 +353,7 @@ impl ThreadContexts {
             let mut result = result;
             for (_, state) in self.states.drain() {
                 let cleanup = context::cleanup_context_state(state, None);
-                if result == EzGfxResult::Ok {
+                if result.is_ok() {
                     result = cleanup;
                 }
             }
@@ -356,17 +377,19 @@ thread_local! {
 mod buffers;
 mod context;
 mod frame;
+mod geometry;
 mod native;
 #[cfg(windows)]
 use native::dx12_bindings;
 #[cfg(target_vendor = "apple")]
 use native::metal_bindings;
 use native::{
-    allocate_native, completed_texture_transfer_native, completed_transfer_native, copy_native,
-    destroy_native_texture, free_native_allocation, map_allocation, map_frame, map_geometry,
-    map_hal, map_lifecycle, map_native_loss, map_texture, native_layouts,
-    native_texture_compression, pipeline_layout_key, poll_native_frame_completion, result_status,
-    retire_native_allocation, vulkan_bindings, wait_native_idle, write_native,
+    allocate_native, completed_native_frame_value, completed_texture_transfer_native,
+    completed_transfer_native, copy_native, destroy_native_texture, free_native_allocation,
+    last_native_frame_completion, map_allocation, map_frame, map_geometry, map_hal, map_lifecycle,
+    map_native_loss, map_texture, native_layouts, native_texture_compression, pipeline_layout_key,
+    poll_native_frame_completion, result_status, retire_native_allocation, vulkan_bindings,
+    wait_native_idle, write_native,
 };
 mod render_target;
 mod shader;
@@ -375,6 +398,7 @@ mod texture;
 pub use buffers::*;
 pub use context::*;
 pub use frame::*;
+pub use geometry::*;
 pub use render_target::*;
 pub use shader::*;
 pub use texture::*;
@@ -382,8 +406,8 @@ pub use texture::*;
 fn with_surface_mut<T>(
     context: ContextHandle,
     surface: SurfaceHandle,
-    operation: impl FnOnce(&mut SurfaceRecord) -> Result<T, EzGfxResult>,
-) -> Result<T, EzGfxResult> {
+    operation: impl FnOnce(&mut SurfaceRecord) -> Result<T>,
+) -> Result<T> {
     with_context_mut(context, |context| {
         context
             .identity
@@ -398,25 +422,25 @@ fn with_surface_mut<T>(
             context
                 .surfaces
                 .get_mut(&surface)
-                .ok_or(EzGfxResult::InvalidContext)?,
+                .ok_or(Error::InvalidContext)?,
         )
     })
 }
 fn with_context_mut<T>(
     context: ContextHandle,
-    operation: impl FnOnce(&mut ContextState) -> Result<T, EzGfxResult>,
-) -> Result<T, EzGfxResult> {
+    operation: impl FnOnce(&mut ContextState) -> Result<T>,
+) -> Result<T> {
     let (local, _) = context_local(context)?;
     CONTEXTS.with(|contexts| {
         let mut contexts = contexts
             .try_borrow_mut()
-            .map_err(|_| EzGfxResult::NativeFailure)?;
+            .map_err(|_| Error::NativeFailure)?;
         let context = contexts
             .states
             .get_mut(&local)
-            .ok_or(EzGfxResult::InvalidContext)?;
+            .ok_or(Error::InvalidContext)?;
         let result = operation(context);
-        if matches!(&result, Err(EzGfxResult::DeviceLost)) {
+        if matches!(&result, Err(Error::DeviceLost)) {
             // Terminal-loss sweep: the first DeviceLost synchronously cancels queued
             // decodes so later polls return DeviceLost fast instead of NotReady.
             texture::note_device_lost(context);
@@ -424,12 +448,12 @@ fn with_context_mut<T>(
         result
     })
 }
-fn context_local(handle: ContextHandle) -> Result<(LocalHandle, PackedHandle), EzGfxResult> {
+fn context_local(handle: ContextHandle) -> Result<(LocalHandle, PackedHandle)> {
     let packed = handle.packed();
 
-    match packed.parts().map_err(|_| EzGfxResult::InvalidContext)? {
+    match packed.parts().map_err(|_| Error::InvalidContext)? {
         HandleParts::Context(local) => Ok((local, packed)),
-        HandleParts::Child { .. } => Err(EzGfxResult::InvalidContext),
+        HandleParts::Child { .. } => Err(Error::InvalidContext),
     }
 }
 

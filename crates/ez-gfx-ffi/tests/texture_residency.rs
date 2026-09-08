@@ -15,8 +15,8 @@ use ez_gfx_runtime::texture::{TextureDecoder, TextureSource};
 
 use ez_gfx_ffi::{
     EzGfxResult, EzGfxTextureDesc, EzGfxTextureRegionDesc, EzGfxTextureUploadTelemetry,
-    ez_gfx_texture_cancel, ez_gfx_texture_get_binding, ez_gfx_texture_get_residency,
-    ez_gfx_texture_get_upload_telemetry, ez_gfx_texture_load, ez_gfx_texture_poll,
+    EzGfxUploadEvent, ez_gfx_poll_upload_event, ez_gfx_texture_cancel, ez_gfx_texture_get_binding,
+    ez_gfx_texture_get_residency, ez_gfx_texture_get_upload_telemetry, ez_gfx_texture_load,
     ez_gfx_texture_set_residency, ez_gfx_texture_unload, ez_gfx_update_texture_region,
 };
 #[cfg(all(feature = "ktx2", feature = "basis"))]
@@ -24,6 +24,21 @@ use ez_gfx_ffi::{
     ez_gfx_frame_begin, ez_gfx_frame_readback, ez_gfx_frame_submit,
     ez_gfx_graph_enqueue_texture_readback,
 };
+fn poll_texture_ready(context: u64, texture: u64) -> EzGfxResult {
+    // SAFETY: all-zero is the documented initialization for this plain C record.
+    let mut event = unsafe { core::mem::zeroed::<EzGfxUploadEvent>() };
+    let mut present = 0;
+    let progress =
+        // SAFETY: event and presence outputs remain writable for this call.
+        unsafe { ez_gfx_poll_upload_event(&raw mut event, &raw mut present, context) };
+    if progress != EzGfxResult::Ok {
+        return progress;
+    }
+    let mut binding = 0;
+    // SAFETY: binding remains writable and both handles are supplied by this test.
+    unsafe { ez_gfx_texture_get_binding(texture, &raw mut binding, context) }
+}
+
 fn cancel_after_native_admission(context: u64, bytes: &[u8], desc: &EzGfxTextureDesc) {
     let mut texture = 0;
     assert_eq!(
@@ -55,7 +70,7 @@ fn cancel_after_native_admission(context: u64, bytes: &[u8], desc: &EzGfxTexture
     }
     assert_eq!(ez_gfx_texture_cancel(texture, context), EzGfxResult::Ok);
     assert_eq!(
-        ez_gfx_texture_poll(texture, context),
+        poll_texture_ready(context, texture),
         EzGfxResult::InvalidContext
     );
 }
@@ -113,7 +128,7 @@ fn exercises_async_texture_batches(backend: u8) {
         loop {
             let mut ready = true;
             for &texture in &textures {
-                match ez_gfx_texture_poll(texture, context) {
+                match poll_texture_ready(context, texture) {
                     EzGfxResult::Ok => {}
                     EzGfxResult::NotReady => ready = false,
                     error => panic!("wave {wave} texture failed: {error:?}"),
@@ -146,7 +161,7 @@ fn exercises_async_texture_batches(backend: u8) {
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            match ez_gfx_texture_poll(textures[0], context) {
+            match poll_texture_ready(context, textures[0]) {
                 EzGfxResult::Ok => break,
                 EzGfxResult::NotReady => {
                     assert!(
@@ -162,7 +177,7 @@ fn exercises_async_texture_batches(backend: u8) {
         for texture in textures {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let (mut resident, mut total) = loop {
-                match ez_gfx_texture_poll(texture, context) {
+                match poll_texture_ready(context, texture) {
                     EzGfxResult::Ok | EzGfxResult::NotReady => {}
                     error => panic!("updated texture failed: {error:?}"),
                 }
@@ -268,7 +283,7 @@ fn exercises_async_texture_batches(backend: u8) {
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            match ez_gfx_texture_poll(compressed, context) {
+            match poll_texture_ready(context, compressed) {
                 EzGfxResult::Ok => break,
                 EzGfxResult::NotReady => {
                     assert!(

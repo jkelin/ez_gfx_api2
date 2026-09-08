@@ -21,6 +21,7 @@ use std::{
 use common::TestContext;
 use ez_gfx::*;
 use ez_gfx_compiler::{Target, compile_shader};
+use ez_gfx_ffi::EzGfxResult;
 
 #[cfg(not(target_vendor = "apple"))]
 #[test]
@@ -115,7 +116,7 @@ fn assert_validation_clean(child_marker: &str) {
     for bytes in [&output, &errors] {
         let text = String::from_utf8_lossy(bytes);
         assert!(
-            !text.contains("VUID-") && !text.contains("Validation Error"),
+            !text.contains("VUID-") && !text.contains("Validation EzGfxResult"),
             "Vulkan validation reported an error; see native output above"
         );
     }
@@ -175,9 +176,10 @@ fn exercise_backend(backend: u8) {
             }
         }
     }
-    assert_eq!(wait_idle(context), EzGfxResult::Ok);
-    release_indirect(context, quad.indirect);
-    release_structured(context, quad.positions);
+    assert_eq!(wait_idle(context), Ok(()));
+    assert_eq!(remove_vertices(context, quad.positions), Ok(()));
+    assert_eq!(remove_indices(context, quad.indices), Ok(()));
+    destroy_vertex_heap(context, quad.positions_heap);
     destroy_shader(context, quad.shader);
     destroy_index_heap(context);
     drop(native);
@@ -239,7 +241,7 @@ fn exercise_case(
                 ) =>
         {
             // Explicit ASTC admission consults native compression support; never fall back.
-            assert_eq!(status, EzGfxResult::Unsupported);
+            assert_eq!(status, Error::Unsupported);
             return true;
         }
         Err(status) => panic!("{format:?} admission failed: {status:?}"),
@@ -258,11 +260,8 @@ fn exercise_case(
         )
     {
         // DX12 rejects odd BC bases, but must support the same extent at a valid mip.
-        assert_eq!(status, EzGfxResult::Unsupported, "{format:?} odd base");
-        assert_eq!(
-            poll_texture_load(context, texture),
-            EzGfxResult::Unsupported
-        );
+        assert_eq!(status, Err(Error::Unsupported), "{format:?} odd base");
+        assert_eq!(texture_binding(context, texture), Err(Error::Unsupported));
         unload_texture(context, texture);
         assert_abi_odd_base_unsupported(context, &decoder, format, &pixels.initial);
         drop(decoder);
@@ -274,34 +273,34 @@ fn exercise_case(
             format,
             TextureFormat::Astc4x4Unorm | TextureFormat::Astc4x4Srgb
         )
-        && status == EzGfxResult::Unsupported
+        && status == Err(Error::Unsupported)
     {
         // Custom decoders reveal their format asynchronously; rejection can follow admission.
         unload_texture(context, texture);
         assert_stale(context, texture, &pixels.green);
         return true;
     }
-    assert_eq!(status, EzGfxResult::Ok, "{format:?} upload failed");
+    assert_eq!(status, Ok(()), "{format:?} upload failed");
     if format.is_compressed() {
         // Direct captures have no RGBA texel grid for compressed blocks; sampling
         // stays available through shaders, but enqueueing must fail identically
         // on every backend.
         assert_eq!(
             frame_enqueue_readback(context, texture),
-            EzGfxResult::InvalidArgument,
+            Err(Error::InvalidArgument),
             "{format:?} compressed readback"
         );
     }
     let draw_status = quad.draw_status(texture, true);
     #[cfg(not(any(windows, target_vendor = "apple")))]
-    if draw_status == EzGfxResult::Unsupported {
+    if draw_status == Err(Error::Unsupported) {
         // A logical headless surface deliberately exposes missing WSI at the first
         // presentation-dependent frame. No other error is an accepted capability result.
         eprintln!("Vulkan headless presentation is unsupported by the selected ICD");
         unload_texture(context, texture);
         return false;
     }
-    assert_eq!(draw_status, EzGfxResult::Ok);
+    assert_eq!(draw_status, Ok(()));
     let before = frame_readback(context).unwrap();
     assert_halves(&before, format, 0, width);
     if format == TextureFormat::Rgba8Unorm {
@@ -362,7 +361,7 @@ fn exercise_updates(
                 bytes: &pixels.green,
             }
         ),
-        EzGfxResult::Ok
+        Ok(())
     );
     await_texture(context, texture);
     quad.draw(texture, true);
@@ -394,10 +393,10 @@ fn exercise_updates(
                 bytes: &pixels.red,
             }
         ),
-        EzGfxResult::Ok
+        Ok(())
     );
     quad.record(binding, true);
-    assert_eq!(finish_render(context), EzGfxResult::Ok);
+    assert_eq!(finish_render(context), Ok(()));
     assert_eq!(frame_readback(context).unwrap(), before);
 
     // A dependency captured while recording becomes stale if an update is queued before
@@ -416,9 +415,9 @@ fn exercise_updates(
                 bytes: &pixels.green,
             }
         ),
-        EzGfxResult::Ok
+        Ok(())
     );
-    assert_eq!(finish_render(context), EzGfxResult::Ok);
+    assert_eq!(finish_render(context), Ok(()));
     assert_eq!(frame_readback(context).unwrap(), after);
 
     // The final block may contain fewer than four columns/rows, but its payload stays whole.
@@ -437,10 +436,10 @@ fn exercise_updates(
                     bytes: &pixels.red,
                 }
             ),
-            EzGfxResult::Ok
+            Ok(())
         );
         quad.record(binding, true);
-        assert_eq!(finish_render(context), EzGfxResult::Ok);
+        assert_eq!(finish_render(context), Ok(()));
         let edge = frame_readback(context).unwrap();
         for (index, pixel) in edge.chunks_exact(4).enumerate() {
             let expected = if index % 64 < split as usize {
@@ -474,7 +473,7 @@ fn exercise_retirement(
             load_texture(context, decoder.source(), &pixels.updated, false, config).unwrap();
         // Unload has already run against submitted work. Draining afterward lets the next
         // upload publish descriptors without depending on frame-slot reclamation timing.
-        assert_eq!(wait_idle(context), EzGfxResult::Ok);
+        assert_eq!(wait_idle(context), Ok(()));
         await_texture(context, replacement);
         reused |= !retired_bindings.insert(texture_binding(context, replacement).unwrap());
         quad.draw(replacement, false);
@@ -494,7 +493,7 @@ fn exercise_retirement(
         // Residency succeeds once native admission exists; do not await full upload first.
         match texture_residency(context, admitted) {
             Ok(_) => break,
-            Err(EzGfxResult::NotReady) => {
+            Err(Error::NotReady) => {
                 assert!(Instant::now() < deadline, "native admission timed out");
                 std::thread::yield_now();
             }
@@ -506,7 +505,7 @@ fn exercise_retirement(
 
     let final_texture =
         load_texture(context, decoder.source(), &pixels.updated, false, config).unwrap();
-    assert_eq!(wait_idle(context), EzGfxResult::Ok);
+    assert_eq!(wait_idle(context), Ok(()));
     await_texture(context, final_texture);
     quad.draw(final_texture, true);
     assert_eq!(
@@ -515,7 +514,7 @@ fn exercise_retirement(
         "retirement changed final pixels"
     );
     unload_texture(context, final_texture);
-    assert_eq!(wait_idle(context), EzGfxResult::Ok);
+    assert_eq!(wait_idle(context), Ok(()));
 }
 
 fn assert_abi_odd_base_unsupported(
@@ -525,7 +524,8 @@ fn assert_abi_odd_base_unsupported(
     bytes: &[u8],
 ) {
     use ez_gfx_ffi::{
-        EzGfxTextureDesc, ez_gfx_texture_load, ez_gfx_texture_poll, ez_gfx_texture_unload,
+        EzGfxTextureDesc, EzGfxUploadEvent, ez_gfx_poll_upload_event, ez_gfx_texture_get_binding,
+        ez_gfx_texture_load, ez_gfx_texture_unload,
     };
 
     // Call the exported C ABI, including descriptor validation and asynchronous status mapping.
@@ -570,7 +570,20 @@ fn assert_abi_odd_base_unsupported(
     );
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let status = ez_gfx_texture_poll(texture, context.into_raw());
+        // SAFETY: all-zero is the documented initialization for this plain C record.
+        let mut event = unsafe { core::mem::zeroed::<EzGfxUploadEvent>() };
+        let mut present = 0;
+        assert_eq!(
+            // SAFETY: event and presence outputs remain writable for this call.
+            unsafe {
+                ez_gfx_poll_upload_event(&raw mut event, &raw mut present, context.into_raw())
+            },
+            EzGfxResult::Ok
+        );
+        let mut binding = 0;
+        // SAFETY: binding remains writable and both handles are live.
+        let status =
+            unsafe { ez_gfx_texture_get_binding(texture, &raw mut binding, context.into_raw()) };
         if status != EzGfxResult::NotReady {
             assert_eq!(status, EzGfxResult::Unsupported, "{format:?} ABI odd base");
             break;
@@ -581,10 +594,6 @@ fn assert_abi_odd_base_unsupported(
         );
         std::thread::yield_now();
     }
-    assert_eq!(
-        ez_gfx_texture_poll(texture, context.into_raw()),
-        EzGfxResult::Unsupported
-    );
     ez_gfx_texture_unload(texture, context.into_raw());
 }
 
@@ -606,7 +615,7 @@ fn exercise_odd_mip(
     bytes.extend(adjacent_blocks(format, 0, 7, 3));
     let texture = load_texture(context, decoder.source(), &bytes, false, &config).unwrap();
     await_texture(context, texture);
-    assert_eq!(set_texture_residency(context, texture, 1), EzGfxResult::Ok);
+    assert_eq!(set_texture_residency(context, texture, 1), Ok(()));
     assert_eq!(texture_residency(context, texture), Ok((1, 3)));
     quad.draw(texture, true);
     let before = frame_readback(context).unwrap();
@@ -628,10 +637,10 @@ fn exercise_odd_mip(
                 bytes: &green,
             }
         ),
-        EzGfxResult::Ok
+        Ok(())
     );
     quad.record(binding, true);
-    assert_eq!(finish_render(context), EzGfxResult::Ok);
+    assert_eq!(finish_render(context), Ok(()));
     let after = frame_readback(context).unwrap();
     assert_halves(&after, format, 1, 7);
 
@@ -651,9 +660,9 @@ fn exercise_odd_mip(
                 bytes: &red,
             }
         ),
-        EzGfxResult::Ok
+        Ok(())
     );
-    assert_eq!(finish_render(context), EzGfxResult::Ok);
+    assert_eq!(finish_render(context), Ok(()));
     let edge = frame_readback(context).unwrap();
     for (index, pixel) in edge.chunks_exact(4).enumerate() {
         let left = (index % 64 * 2 + 1) * 7 < 512;
@@ -683,14 +692,14 @@ fn exercise_odd_mip(
         assert_eq!(texture_residency(context, texture), Ok((1, 3)));
     }
     exercise_promoted_mips(context, quad, texture, format, &after);
-    assert_eq!(wait_idle(context), EzGfxResult::Ok);
-    assert_eq!(set_texture_residency(context, texture, 1), EzGfxResult::Ok);
+    assert_eq!(wait_idle(context), Ok(()));
+    assert_eq!(set_texture_residency(context, texture, 1), Ok(()));
     assert_eq!(texture_residency(context, texture), Ok((1, 3)));
     // Compressed captures fail terminally even while demoted: the terminal
     // rejection takes precedence over the transient residency state.
     assert_eq!(
         frame_enqueue_readback(context, texture),
-        EzGfxResult::InvalidArgument
+        Err(Error::InvalidArgument)
     );
     quad.draw(texture, true);
     assert_eq!(
@@ -704,7 +713,7 @@ fn exercise_odd_mip(
     quad.draw(texture, false);
     unload_texture(context, texture);
     assert_stale(context, texture, &green);
-    assert_eq!(wait_idle(context), EzGfxResult::Ok);
+    assert_eq!(wait_idle(context), Ok(()));
 }
 
 fn exercise_destroy_fence_retry(
@@ -727,11 +736,11 @@ fn exercise_destroy_fence_retry(
     }
     assert_ne!(
         set_texture_residency(context, texture, 3),
-        EzGfxResult::NativeFailure,
+        Err(Error::NativeFailure),
         "{format:?} destroy-driven fence must stay retryable"
     );
-    assert_eq!(wait_idle(context), EzGfxResult::Ok);
-    assert_eq!(set_texture_residency(context, texture, 3), EzGfxResult::Ok);
+    assert_eq!(wait_idle(context), Ok(()));
+    assert_eq!(set_texture_residency(context, texture, 3), Ok(()));
 }
 fn exercise_promoted_mips(
     context: ContextHandle,
@@ -743,11 +752,8 @@ fn exercise_promoted_mips(
     // Promotion must expose uploaded finer mips, not keep sampling the edited coarse mip.
     // Both finer levels are uniformly green; demotion must preserve both clipped-edge updates.
     for resident in [2, 3] {
-        assert_eq!(wait_idle(context), EzGfxResult::Ok);
-        assert_eq!(
-            set_texture_residency(context, texture, resident),
-            EzGfxResult::Ok
-        );
+        assert_eq!(wait_idle(context), Ok(()));
+        assert_eq!(set_texture_residency(context, texture, resident), Ok(()));
         assert_eq!(texture_residency(context, texture), Ok((resident, 3)));
         quad.draw(texture, true);
         for pixel in frame_readback(context).unwrap().chunks_exact(4) {
@@ -757,20 +763,24 @@ fn exercise_promoted_mips(
 }
 
 fn await_texture(context: ContextHandle, texture: TextureHandle) {
-    assert_eq!(await_texture_status(context, texture), EzGfxResult::Ok);
+    assert_eq!(await_texture_status(context, texture), Ok(()));
 }
 
-fn await_texture_status(context: ContextHandle, texture: TextureHandle) -> EzGfxResult {
-    // Polling drives worker admission and completion; a bounded deadline also catches deadlocks.
+fn await_texture_status(context: ContextHandle, texture: TextureHandle) -> ez_gfx::Result<()> {
+    // The lossless context queue is the authoritative progress path.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        match poll_texture_load(context, texture) {
-            EzGfxResult::Ok => return EzGfxResult::Ok,
-            EzGfxResult::NotReady => {
+        match poll_upload_event(context) {
+            Ok(_) => {}
+            Err(status) => return Err(status),
+        }
+        match texture_binding(context, texture) {
+            Ok(_) => return Ok(()),
+            Err(Error::NotReady) => {
                 assert!(Instant::now() < deadline, "sample-ready handoff timed out");
                 std::thread::yield_now();
             }
-            status => return status,
+            Err(status) => return Err(status),
         }
     }
 }
@@ -779,11 +789,11 @@ fn assert_stale(context: ContextHandle, texture: TextureHandle, bytes: &[u8]) {
     // Stale generations must fail even when their descriptor slot is recycled later.
     assert_eq!(
         texture_binding(context, texture),
-        Err(EzGfxResult::InvalidContext)
+        Err(Error::Lifecycle(LifecycleError::StaleHandle))
     );
     assert_eq!(
-        poll_texture_load(context, texture),
-        EzGfxResult::InvalidContext
+        texture_binding(context, texture).unwrap_err(),
+        Error::Lifecycle(LifecycleError::StaleHandle)
     );
     assert_eq!(
         update_texture_region(
@@ -798,7 +808,7 @@ fn assert_stale(context: ContextHandle, texture: TextureHandle, bytes: &[u8]) {
                 bytes,
             }
         ),
-        EzGfxResult::InvalidContext
+        Err(Error::Lifecycle(LifecycleError::StaleHandle))
     );
 }
 
@@ -1039,8 +1049,10 @@ struct Quad {
     context: ContextHandle,
     surface: SurfaceHandle,
     shader: ShaderHandle,
-    positions: StructuredBufferHandle,
-    indirect: IndirectBufferHandle,
+    positions_heap: VertexHeapHandle,
+    positions: VertexAllocationHandle,
+    indices: IndexAllocationHandle,
+    first_index: u32,
 }
 
 impl Quad {
@@ -1052,65 +1064,37 @@ impl Quad {
             [1.0, 1.0, 0.5, 1.0],
             [-1.0, 1.0, 0.5, 1.0],
         ];
-        let positions_bytes: Vec<u8> = vertices
-            .into_iter()
-            .flatten()
-            .flat_map(f32::to_ne_bytes)
-            .collect();
-        let index_bytes: Vec<u8> = [0_u32, 1, 2, 2, 3, 0]
-            .into_iter()
-            .flat_map(u32::to_ne_bytes)
-            .collect();
-        assert_eq!(create_index_heap(context, 24), EzGfxResult::Ok);
-        let first_index = upload_indices(context, 6, &index_bytes).unwrap();
-        let positions = acquire_structured(context, 64).unwrap();
-        assert_eq!(
-            write_structured(context, positions, &positions_bytes),
-            EzGfxResult::Ok
-        );
-        let indirect = acquire_indirect(context, 1).unwrap();
-        assert_eq!(
-            write_indirect(
-                context,
-                indirect,
-                0,
-                DrawIndexedCommand {
-                    index_count: 6,
-                    instance_count: 1,
-                    first_index,
-                    vertex_offset: 0,
-                    first_instance: 0,
-                }
-            ),
-            EzGfxResult::Ok
-        );
-        assert_eq!(set_indirect_count(context, indirect, 1), EzGfxResult::Ok);
+        let indices = [0_u32, 1, 2, 2, 3, 0];
+        assert_eq!(create_index_heap(context, 24), Ok(()));
+        let index_allocation = upload_indices(context, &indices).unwrap();
+        let (first_index, _) = index_allocation_range(context, index_allocation).unwrap();
+        let positions_heap = create_vertex_heap(context, "positions", 64, 16).unwrap();
+        let positions = upload_vertices(context, positions_heap, &vertices).unwrap();
         Self {
             context,
             surface,
             shader: load_shader(context, artifact).unwrap(),
+            positions_heap,
             positions,
-            indirect,
+            indices: index_allocation,
+            first_index,
         }
     }
 
-    fn draw_status(&self, texture: TextureHandle, capture: bool) -> EzGfxResult {
+    fn draw_status(&self, texture: TextureHandle, capture: bool) -> ez_gfx::Result<()> {
         self.record(texture_binding(self.context, texture).unwrap(), capture);
         finish_render(self.context)
     }
 
     fn draw(&self, texture: TextureHandle, capture: bool) {
-        assert_eq!(self.draw_status(texture, capture), EzGfxResult::Ok);
+        assert_eq!(self.draw_status(texture, capture), Ok(()));
     }
     fn readback_direct(&self, texture: TextureHandle) -> Vec<u8> {
         // A surfaceless capture exercises the native texture-copy path rather
         // than surface sampling.
-        assert_eq!(begin_render(self.context, self.surface), EzGfxResult::Ok);
-        assert_eq!(
-            frame_enqueue_readback(self.context, texture),
-            EzGfxResult::Ok
-        );
-        assert_eq!(finish_render(self.context), EzGfxResult::Ok);
+        assert_eq!(begin_render(self.context, self.surface), Ok(()));
+        assert_eq!(frame_enqueue_readback(self.context, texture), Ok(()));
+        assert_eq!(finish_render(self.context), Ok(()));
         frame_readback(self.context).unwrap()
     }
 
@@ -1123,23 +1107,34 @@ impl Quad {
         push[64..68].copy_from_slice(&texture_id.to_ne_bytes());
         assert_eq!(
             set_snapshot_cache(self.context, self.surface, capture),
-            EzGfxResult::Ok
+            Ok(())
         );
-        assert_eq!(begin_render(self.context, self.surface), EzGfxResult::Ok);
+        assert_eq!(begin_render(self.context, self.surface), Ok(()));
+        let indirect = acquire_indirect(self.context, 1).unwrap();
+        write_indirect(
+            self.context,
+            indirect,
+            0,
+            &[DrawIndexedCommand {
+                index_count: 6,
+                instance_count: 1,
+                first_index: self.first_index,
+                vertex_offset: 0,
+                first_instance: 0,
+            }],
+        )
+        .unwrap();
         assert_eq!(
             render_add_graphics(
                 self.context,
                 self.shader,
-                self.indirect,
-                &[PublicBinding {
-                    name: "positions".to_owned(),
-                    resource: ResourceIdentity::Structured(self.positions)
-                }],
+                indirect,
+                &[],
                 // Disable culling: Vulkan and DX12 may use opposite framebuffer Y conventions.
                 DynamicPipelineState::from_abi(0, 0, 0, 0).unwrap(),
                 &push,
             ),
-            EzGfxResult::Ok
+            Ok(())
         );
     }
 }

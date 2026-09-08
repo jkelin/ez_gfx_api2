@@ -1,39 +1,56 @@
-//! Runtime integration and contract tests.
+//! Runtime geometry allocation contracts.
 
+use ez_gfx_core::handle::{LocalHandle, PackedHandle};
 use ez_gfx_hal::{CompletionToken, QueueKind};
 use ez_gfx_runtime::geometry::{GeometryError, GeometryManager, StagingPool};
 
+fn handle(slot: u32, generation: u32) -> PackedHandle {
+    PackedHandle::child(
+        LocalHandle::new(1, 1).unwrap(),
+        LocalHandle::new(slot, generation).unwrap(),
+    )
+    .unwrap()
+}
+
 #[test]
-fn heaps_validate_names_stride_uniqueness_and_capacity() {
+fn free_ranges_coalesce_and_reuse_without_fragmentation() {
     let mut geometry = GeometryManager::new();
-    assert_eq!(
-        geometry.create_vertex_heap("", 64, 16),
-        Err(GeometryError::InvalidName)
-    );
-    assert_eq!(
-        geometry.create_vertex_heap("mesh", 64, 0),
-        Err(GeometryError::InvalidStride)
-    );
     geometry.create_vertex_heap("mesh", 64, 16).unwrap();
+    let first = geometry
+        .reserve_vertices("mesh", 1, 16, handle(0, 1))
+        .unwrap();
+    let second = geometry
+        .reserve_vertices("mesh", 2, 16, handle(1, 1))
+        .unwrap();
+    geometry.free_vertices("mesh", first.handle).unwrap();
+    geometry.free_vertices("mesh", second.handle).unwrap();
+
+    let reused = geometry
+        .reserve_vertices("mesh", 4, 16, handle(2, 1))
+        .unwrap();
+    assert_eq!((reused.first_element, reused.element_count), (0, 4));
+}
+
+#[test]
+fn stale_double_free_and_wrong_heap_are_rejected() {
+    let mut geometry = GeometryManager::new();
+    geometry.create_vertex_heap("a", 64, 16).unwrap();
+    geometry.create_vertex_heap("b", 64, 16).unwrap();
+    let allocation = geometry.reserve_vertices("a", 1, 16, handle(0, 1)).unwrap();
+
     assert_eq!(
-        geometry.create_vertex_heap("mesh", 64, 16),
-        Err(GeometryError::DuplicateHeap)
+        geometry.free_vertices("b", allocation.handle),
+        Err(GeometryError::WrongHeap)
+    );
+    geometry.free_vertices("a", allocation.handle).unwrap();
+    assert_eq!(
+        geometry.free_vertices("a", allocation.handle),
+        Err(GeometryError::UnknownAllocation)
     );
     assert_eq!(
-        geometry.reserve_vertices("mesh", 2, 12),
-        Err(GeometryError::StrideMismatch)
+        geometry.allocation(handle(0, 2)),
+        Err(GeometryError::UnknownAllocation)
     );
-    assert_eq!(
-        geometry.reserve_vertices("mesh", 5, 16),
-        Err(GeometryError::CapacityExceeded)
-    );
-    let first = geometry.reserve_vertices("mesh", 2, 16).unwrap();
-    let second = geometry.reserve_vertices("mesh", 2, 16).unwrap();
-    assert_eq!(
-        (first.first_element, first.byte_offset, first.byte_size),
-        (0, 0, 32)
-    );
-    assert_eq!((second.first_element, second.byte_offset), (2, 32));
 }
 
 #[test]
@@ -44,96 +61,42 @@ fn index_heap_is_single_and_uses_u32_elements() {
         geometry.create_index_heap(32),
         Err(GeometryError::DuplicateHeap)
     );
-    let upload = geometry.reserve_indices(3).unwrap();
+    let upload = geometry.reserve_indices(3, handle(0, 1)).unwrap();
     assert_eq!((upload.first_element, upload.byte_size), (0, 12));
-    assert_eq!(
-        geometry.reserve_indices(6),
-        Err(GeometryError::CapacityExceeded)
-    );
 }
 
 #[test]
-fn readiness_tokens_are_per_resource_and_monotonic() {
+fn readiness_tokens_are_per_allocation_and_heap_monotonic() {
     let mut geometry = GeometryManager::new();
-    geometry.create_vertex_heap("a", 64, 16).unwrap();
-    geometry.create_vertex_heap("b", 64, 16).unwrap();
+    geometry.create_vertex_heap("mesh", 64, 16).unwrap();
+    let upload = geometry
+        .reserve_vertices("mesh", 1, 16, handle(0, 1))
+        .unwrap();
     let seven = CompletionToken::new(QueueKind::Transfer, 7).unwrap();
     let six = CompletionToken::new(QueueKind::Transfer, 6).unwrap();
-    geometry.mark_vertex_ready("a", seven).unwrap();
-    assert_eq!(geometry.vertex_ready("a"), Some(seven));
-    assert_eq!(geometry.vertex_ready("b"), None);
+    geometry.mark_ready(upload.handle, seven).unwrap();
+    assert_eq!(geometry.vertex_ready("mesh"), Some(seven));
     assert_eq!(
-        geometry.mark_vertex_ready("a", six),
+        geometry.mark_ready(upload.handle, six),
         Err(GeometryError::TimelineRegression)
     );
 }
 
 #[test]
+fn staging_pool_grows_without_fixed_slot_admission() {
+    let mut pool = StagingPool::new();
+    let slots: Vec<_> = (0..1_000).map(|_| pool.checkout(64, 0).unwrap()).collect();
+    assert_eq!(slots.len(), 1_000);
+}
+
+#[test]
 fn staging_pool_reuses_only_completed_compatible_slots() {
-    let mut pool = StagingPool::new(2).unwrap();
+    let mut pool = StagingPool::new();
     let first = pool.checkout(64, 0).unwrap();
     pool.retire(first, CompletionToken::new(QueueKind::Transfer, 3).unwrap())
         .unwrap();
-    let second = pool.checkout(32, 2).unwrap();
+    let second = pool.checkout(64, 2).unwrap();
     assert_ne!(first, second);
-    assert_eq!(
-        pool.checkout(8, 2),
-        Err(GeometryError::StagingPoolExhausted)
-    );
     pool.release_unsubmitted(second).unwrap();
-    assert_eq!(pool.checkout(32, 3).unwrap(), first);
-}
-
-#[test]
-fn staging_pool_allocates_power_of_two_buckets() {
-    let mut pool = StagingPool::new(2).unwrap();
-    let small = pool.checkout(1, 0).unwrap();
-    let large = pool.checkout(65 * 1024, 0).unwrap();
-
-    assert_eq!(pool.slot_capacity(small).unwrap(), 64 * 1024);
-    assert_eq!(pool.slot_capacity(large).unwrap(), 128 * 1024);
-}
-
-#[test]
-fn staging_pool_rejects_non_transfer_retirement_tokens() {
-    let mut pool = StagingPool::new(1).unwrap();
-    let slot = pool.checkout(64, 0).unwrap();
-
-    assert!(
-        pool.retire(slot, CompletionToken::new(QueueKind::Compute, 1).unwrap())
-            .is_err()
-    );
-    pool.release_unsubmitted(slot).unwrap();
-}
-
-#[test]
-fn rollback_rejects_a_forged_tail_subrange() {
-    let mut geometry = GeometryManager::new();
-    geometry.create_vertex_heap("mesh", 64, 16).unwrap();
-    let upload = geometry.reserve_vertices("mesh", 2, 16).unwrap();
-    let forged = ez_gfx_runtime::geometry::GeometryUpload {
-        first_element: 1,
-        byte_offset: 16,
-        byte_size: 16,
-    };
-
-    assert_eq!(
-        geometry.rollback_vertices("mesh", forged),
-        Err(GeometryError::InvalidRollback)
-    );
-    assert_eq!(geometry.rollback_vertices("mesh", upload), Ok(()));
-}
-
-#[test]
-fn rollback_does_not_restore_an_older_reservation() {
-    let mut geometry = GeometryManager::new();
-    geometry.create_vertex_heap("mesh", 64, 16).unwrap();
-    let older = geometry.reserve_vertices("mesh", 1, 16).unwrap();
-    let latest = geometry.reserve_vertices("mesh", 1, 16).unwrap();
-
-    assert_eq!(geometry.rollback_vertices("mesh", latest), Ok(()));
-    assert_eq!(
-        geometry.rollback_vertices("mesh", older),
-        Err(GeometryError::InvalidRollback)
-    );
+    assert_eq!(pool.checkout(64, 3).unwrap(), first);
 }

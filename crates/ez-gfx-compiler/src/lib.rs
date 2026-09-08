@@ -10,7 +10,9 @@ use ez_gfx_artifact::{
     AppleArchitecture, ApplePlatform, Artifact, CompatibilityVersion, MetalCompatibility,
     Provenance, Stage, Target as ArtifactTarget, TargetCompatibility, TargetVariant,
 };
-use ez_gfx_core::{Backend, SemanticError, SemanticGraph, TargetLayout};
+use ez_gfx_core::{
+    Backend, SemanticError, SemanticGraph, TargetLayout, capability::MAX_BINDLESS_SAMPLED_TEXTURES,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -467,6 +469,7 @@ fn collect_parameters<'a>(
             for attribute in variable.user_attributes() {
                 match attribute.name() {
                     "StructuredBuffer" => api_attribute = Some(("structured", attribute)),
+                    "VertexHeap" => api_attribute = Some(("vertex_heap", attribute)),
                     "IndirectBuffer" => api_attribute = Some(("indirect", attribute)),
                     "ColorTarget" | "DepthTarget" => {
                         api_attribute = Some(("render_target", attribute));
@@ -678,7 +681,7 @@ fn select_texture_heap<T>(
     }
     if selected
         .as_ref()
-        .is_some_and(|(_, capacity)| *capacity == 0 || *capacity > 1024)
+        .is_some_and(|(_, capacity)| *capacity == 0 || *capacity > MAX_BINDLESS_SAMPLED_TEXTURES)
     {
         return Err(CompilerError::Native(format!(
             "invalid bindless texture heap capacity: {entry}"

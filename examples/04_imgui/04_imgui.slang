@@ -26,11 +26,12 @@ struct ImGuiCommand {
 [push_constant]
 ConstantBuffer<Push> push;
 
-[StructuredBuffer("imgui_vertices")]
+[VertexHeap("imgui_vertices")]
 StructuredBuffer<ImGuiVertex> vertices;
 
-[StructuredBuffer("imgui_indices")]
+[VertexHeap("imgui_indices")]
 StructuredBuffer<uint> indices;
+
 
 [StructuredBuffer("imgui_commands")]
 StructuredBuffer<ImGuiCommand> commands;

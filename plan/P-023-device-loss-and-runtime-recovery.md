@@ -18,7 +18,7 @@ The Rust runtime owns devices, queues, allocations, graphs, workers, transfers, 
 
 ## Dependencies
 
-- P-002, P-003, P-004, P-007, P-012, P-013, P-017, P-018, and P-020.
+- P-002, P-003, P-004, P-007, P-012, P-017, P-018, and P-020.
 
 ## Unresolved questions
 

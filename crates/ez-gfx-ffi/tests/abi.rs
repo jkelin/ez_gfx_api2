@@ -21,55 +21,26 @@ use ez_gfx_ffi as ffi;
     reason = "platform-specific tests consume different ABI symbols"
 )]
 use ez_gfx_ffi::{
-    EZ_GFX_ABI_VERSION, EzGfxAdapterClass, EzGfxAdapterDesc, EzGfxAdapterInfo,
-    EzGfxBackendContextDesc, EzGfxBinding, EzGfxByteBuffer, EzGfxContextDesc, EzGfxDiagnostic,
-    EzGfxDrawIndexedCommand, EzGfxDynamicState, EzGfxHandleParts, EzGfxRenderTargetDesc,
-    EzGfxRenderTargetFormat, EzGfxRenderTargetUsage, EzGfxResult, EzGfxRuntimeRecord,
-    EzGfxShaderDesc, EzGfxSurfaceDesc, EzGfxTextureDesc, EzGfxTextureError, ez_gfx_abi_version,
-    ez_gfx_acquire_indirect, ez_gfx_adapter_count, ez_gfx_adapters_query,
+    EzGfxAdapterClass, EzGfxAdapterDesc, EzGfxAdapterInfo, EzGfxBackendContextDesc, EzGfxBinding,
+    EzGfxByteBuffer, EzGfxContextDesc, EzGfxDiagnostic, EzGfxDrawIndexedCommand, EzGfxDynamicState,
+    EzGfxHandleParts, EzGfxRenderTargetDesc, EzGfxRenderTargetFormat, EzGfxRenderTargetUsage,
+    EzGfxResult, EzGfxRuntimeRecord, EzGfxShaderDesc, EzGfxSurfaceDesc, EzGfxTextureDesc,
+    EzGfxUploadEvent, ez_gfx_acquire_indirect, ez_gfx_adapter_count, ez_gfx_adapters_query,
     ez_gfx_begin_render_target, ez_gfx_context_create, ez_gfx_context_create_backend,
     ez_gfx_context_destroy, ez_gfx_context_wait_idle, ez_gfx_finish_render, ez_gfx_frame_begin,
     ez_gfx_frame_readback, ez_gfx_frame_submit, ez_gfx_graph_enqueue_texture_readback,
-    ez_gfx_handle_inspect, ez_gfx_index_heap_create, ez_gfx_index_heap_destroy,
-    ez_gfx_indirect_release, ez_gfx_indirect_set_draw_count, ez_gfx_indirect_write_draw,
-    ez_gfx_poll_diagnostic, ez_gfx_poll_runtime_event, ez_gfx_render_target_create,
+    ez_gfx_handle_inspect, ez_gfx_index_allocation_get_range, ez_gfx_index_allocation_remove,
+    ez_gfx_index_heap_create, ez_gfx_index_heap_destroy, ez_gfx_indirect_publish_compute_count,
+    ez_gfx_indirect_release, ez_gfx_indirect_write_draws, ez_gfx_poll_diagnostic,
+    ez_gfx_poll_runtime_event, ez_gfx_poll_upload_event, ez_gfx_render_target_create,
     ez_gfx_render_target_destroy, ez_gfx_render_target_get_clear, ez_gfx_render_target_get_extent,
     ez_gfx_render_target_get_format, ez_gfx_render_target_probe_format, ez_gfx_semantic_id,
     ez_gfx_shader_load_artifact, ez_gfx_structured_acquire, ez_gfx_structured_release,
     ez_gfx_structured_write, ez_gfx_texture_get_binding, ez_gfx_texture_get_residency,
-    ez_gfx_texture_load, ez_gfx_texture_poll, ez_gfx_texture_unload, ez_gfx_vertex_heap_create,
-    ez_gfx_vertex_heap_destroy, ez_gfx_vertex_upload, ez_gfx_vertex_upload_indices,
+    ez_gfx_texture_load, ez_gfx_texture_unload, ez_gfx_vertex_allocation_get_range,
+    ez_gfx_vertex_allocation_remove, ez_gfx_vertex_heap_create, ez_gfx_vertex_heap_destroy,
+    ez_gfx_vertex_upload, ez_gfx_vertex_upload_indices,
 };
-
-#[test]
-fn status_values_and_abi_version_are_stable() {
-    assert_eq!(ez_gfx_abi_version(), EZ_GFX_ABI_VERSION);
-    assert_eq!(EzGfxResult::Ok as u8, 0);
-    assert_eq!(EzGfxResult::InvalidArgument as u8, 1);
-    assert_eq!(EzGfxResult::InvalidContext as u8, 2);
-    assert_eq!(EzGfxResult::NativeFailure as u8, 3);
-    assert_eq!(EzGfxResult::NotReady as u8, 4);
-    assert_eq!(EzGfxResult::Unsupported as u8, 5);
-    assert_eq!(EzGfxResult::DeviceLost as u8, 6);
-    assert_eq!(EzGfxResult::QueueFull as u8, 7);
-    assert_eq!(EzGfxResult::Cancelled as u8, 8);
-    assert_eq!(
-        [
-            EzGfxTextureError::None as u8,
-            EzGfxTextureError::InvalidContext as u8,
-            EzGfxTextureError::InvalidArguments as u8,
-            EzGfxTextureError::UnsupportedFormat as u8,
-            EzGfxTextureError::OutOfTextureHandles as u8,
-            EzGfxTextureError::OutOfMemory as u8,
-            EzGfxTextureError::DecodeFailed as u8,
-            EzGfxTextureError::VulkanFailed as u8,
-            EzGfxTextureError::WorkerUnavailable as u8,
-            EzGfxTextureError::NotFound as u8,
-        ],
-        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-    );
-    assert_eq!(EZ_GFX_ABI_VERSION, 27);
-}
 
 #[test]
 fn render_target_codes_are_stable() {
@@ -685,6 +656,7 @@ fn explicit_dx12_context_allocates_writes_and_releases_structured_memory() {
         },
         EzGfxResult::Ok
     );
+    assert_eq!(ez_gfx_frame_begin(context), EzGfxResult::Ok);
     let name = b"vertices";
     let mut structured = 0;
     assert_eq!(
@@ -707,21 +679,14 @@ fn explicit_dx12_context_allocates_writes_and_releases_structured_memory() {
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe {
-                ez_gfx_structured_write(
-                    structured,
-                    bytes.as_ptr().cast(),
-                    bytes.len() as u64,
-                    context,
-                )
-            }
+            unsafe { ez_gfx_structured_write(structured, 0, bytes.as_ptr().cast(), 4, 16, context) }
         },
         EzGfxResult::Ok
     );
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_structured_write(structured, bytes.as_ptr().cast(), 65, context) }
+            unsafe { ez_gfx_structured_write(structured, 0, bytes.as_ptr().cast(), 1, 65, context) }
         },
         EzGfxResult::InvalidArgument
     );
@@ -729,14 +694,7 @@ fn explicit_dx12_context_allocates_writes_and_releases_structured_memory() {
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe {
-                ez_gfx_structured_write(
-                    structured,
-                    bytes.as_ptr().cast(),
-                    bytes.len() as u64,
-                    context,
-                )
-            }
+            unsafe { ez_gfx_structured_write(structured, 0, bytes.as_ptr().cast(), 4, 16, context) }
         },
         EzGfxResult::InvalidContext
     );

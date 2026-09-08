@@ -1,7 +1,6 @@
 //! `ImGui` using safe ez-gfx context, resource, and frame APIs.
 mod renderer {
     use crate::shared::{input::*, *};
-    use anyhow::Context as _;
     use ez_gfx::*;
     use imgui::{Condition, DrawCmd, Key, MouseButton, TextureId};
 
@@ -35,21 +34,16 @@ mod renderer {
         imgui: imgui::Context,
         shader: ShaderHandle,
         identity_start: u32,
-        indirect: IndirectBufferHandle,
-        indirect_capacity: u32,
-        vertices: Option<StructuredBufferHandle>,
-        draw_indices: Option<StructuredBufferHandle>,
-        commands: Option<StructuredBufferHandle>,
-        vertex_capacity: usize,
-        index_capacity: usize,
-        command_capacity: usize,
+        vertices_heap: VertexHeapHandle,
+        indices_heap: VertexHeapHandle,
+        vertices: Option<VertexAllocationHandle>,
+        indices: Option<VertexAllocationHandle>,
+        _identity_indices: IndexAllocationHandle,
         cpu_vertices: Vec<ImGuiVertex>,
         cpu_indices: Vec<u32>,
         cpu_commands: Vec<ImGuiCommand>,
         uploaded_vertices: Vec<ImGuiVertex>,
         uploaded_indices: Vec<u32>,
-        uploaded_commands: Vec<ImGuiCommand>,
-        uploaded_draw_counts: Vec<u32>,
         draw_counts: Vec<u32>,
         push: Push,
     }
@@ -58,7 +52,7 @@ mod renderer {
         pub(super) fn create(context: ContextHandle, backend: Backend) -> anyhow::Result<Self> {
             let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
-                .context("examples package has no workspace parent")?;
+                .ok_or_else(|| anyhow::anyhow!("examples package has no workspace parent"))?;
             let shader_bytes = ez_gfx_compiler::compile_shader(
                 &workspace_root.join("examples/04_imgui/04_imgui.slang"),
                 &[
@@ -67,12 +61,15 @@ mod renderer {
                     ez_gfx_compiler::Target::Metal,
                 ],
                 !cfg!(target_vendor = "apple"),
-            )
-            .context("compile ImGui shader")?;
+            )?;
             let mut imgui = imgui::Context::create();
             imgui.set_ini_filename(None);
             let identity = (0..IDENTITY_INDEX_COUNT as u32).collect::<Vec<_>>();
-            let identity_bytes = byte_len(&identity)?;
+            let index_bytes = byte_len(&identity)? as u64;
+            let vertex_bytes = IDENTITY_INDEX_COUNT
+                .checked_mul(std::mem::size_of::<ImGuiVertex>())
+                .ok_or_else(|| anyhow::anyhow!("ImGui vertex heap size overflow"))?
+                as u64;
             let atlas = imgui.fonts().build_rgba32_texture();
             let config = TextureConfig {
                 width: atlas.width,
@@ -97,48 +94,36 @@ mod renderer {
                 atlas.data,
                 false,
                 &config,
-            )
-            .map_err(|error| anyhow::anyhow!("{error:?}"))
-            .context("load ImGui font atlas")?;
-            status(wait_idle(context), "wait for ImGui font atlas")?;
-            let texture_id = texture_binding(context, texture)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-                .context("resolve ImGui font binding")?;
-            imgui.fonts().tex_id = TextureId::new(texture_id as usize);
-            status(
-                create_index_heap(context, identity_bytes),
-                "create ImGui index heap",
             )?;
-            let identity_start =
-                upload_indices(context, identity.len() as u32, slice_bytes(&identity))
-                    .map_err(|error| anyhow::anyhow!("{error:?}"))
-                    .context("upload ImGui identity indices")?;
-            let indirect = acquire_indirect(context, 256)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-                .context("acquire ImGui indirect draws")?;
-            let shader = load_shader(context, &shader_bytes)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-                .context("load ImGui artifact")?;
+            wait_idle(context)?;
+            let texture_id = texture_binding(context, texture)?;
+            imgui.fonts().tex_id = TextureId::new(texture_id as usize);
+            create_index_heap(context, index_bytes)?;
+            let identity_indices = upload_indices(context, &identity)?;
+            let identity_start = index_allocation_range(context, identity_indices)?.0;
+            let vertices_heap = create_vertex_heap(
+                context,
+                "imgui_vertices",
+                vertex_bytes,
+                std::mem::size_of::<ImGuiVertex>() as u64,
+            )?;
+            let indices_heap = create_vertex_heap(context, "imgui_indices", index_bytes, 4)?;
+            let shader = load_shader(context, &shader_bytes)?;
             Ok(Self {
                 imgui,
                 shader,
                 identity_start,
-                indirect,
-                indirect_capacity: 256,
+                vertices_heap,
+                indices_heap,
                 vertices: None,
-                draw_indices: None,
-                commands: None,
-                vertex_capacity: 0,
-                index_capacity: 0,
-                command_capacity: 0,
+                indices: None,
+                _identity_indices: identity_indices,
                 cpu_vertices: Vec::new(),
                 cpu_indices: Vec::new(),
                 cpu_commands: Vec::new(),
                 draw_counts: Vec::new(),
                 uploaded_vertices: Vec::new(),
                 uploaded_indices: Vec::new(),
-                uploaded_commands: Vec::new(),
-                uploaded_draw_counts: Vec::new(),
                 push: Push {
                     display_size: [640.0, 480.0],
                     vertical_sign: if backend == Backend::Vulkan {
@@ -194,32 +179,19 @@ mod renderer {
             Ok(())
         }
 
-        fn upload_dynamic<T: bytemuck::Pod>(
+        fn upload_heap<T: bytemuck::Pod>(
             context: ContextHandle,
-            name: &str,
+            heap: VertexHeapHandle,
             values: &[T],
-            buffer: &mut Option<StructuredBufferHandle>,
-            capacity: &mut usize,
-        ) -> anyhow::Result<Option<StructuredBufferHandle>> {
-            if values.len() > *capacity {
-                let replacement = acquire_structured(context, byte_len(values)?)
-                    .map_err(|error| anyhow::anyhow!("{error:?}"))
-                    .with_context(|| format!("acquire {name}"))?;
-                status(
-                    write_structured(context, replacement, slice_bytes(values)),
-                    &format!("upload {name}"),
-                )?;
-                let _previous = buffer.replace(replacement);
-                *capacity = values.len();
-                Ok(Some(replacement))
-            } else {
-                let handle = buffer.ok_or_else(|| anyhow::anyhow!("{name} buffer unavailable"))?;
-                status(
-                    write_structured(context, handle, slice_bytes(values)),
-                    &format!("rewrite {name}"),
-                )?;
-                Ok(None)
+            allocation: &mut Option<VertexAllocationHandle>,
+        ) -> anyhow::Result<()> {
+            // A dedicated ImGui heap has one live range; removal restores its full zero-based range.
+            if let Some(previous) = allocation.take() {
+                remove_vertices(context, previous)?;
             }
+            let uploaded = ez_gfx::upload_vertices(context, heap, values)?;
+            *allocation = Some(uploaded);
+            Ok(())
         }
     }
 
@@ -259,110 +231,79 @@ mod renderer {
         }
         pub(super) fn record(&mut self, context: ContextHandle) -> anyhow::Result<()> {
             if self.cpu_vertices != self.uploaded_vertices {
-                Self::upload_dynamic(
+                Self::upload_heap(
                     context,
-                    "imgui_vertices",
+                    self.vertices_heap,
                     &self.cpu_vertices,
                     &mut self.vertices,
-                    &mut self.vertex_capacity,
                 )?;
+                let first = vertex_allocation_range(
+                    context,
+                    self.vertices
+                        .ok_or_else(|| anyhow::anyhow!("ImGui vertex allocation unavailable"))?,
+                )?
+                .0;
+                anyhow::ensure!(
+                    first == 0,
+                    "dedicated ImGui vertex heap did not restart at zero"
+                );
                 std::mem::swap(&mut self.cpu_vertices, &mut self.uploaded_vertices);
             }
             if self.cpu_indices != self.uploaded_indices {
-                Self::upload_dynamic(
+                Self::upload_heap(
                     context,
-                    "imgui_indices",
+                    self.indices_heap,
                     &self.cpu_indices,
-                    &mut self.draw_indices,
-                    &mut self.index_capacity,
+                    &mut self.indices,
                 )?;
+                let first = vertex_allocation_range(
+                    context,
+                    self.indices.ok_or_else(|| {
+                        anyhow::anyhow!("ImGui index-data allocation unavailable")
+                    })?,
+                )?
+                .0;
+                anyhow::ensure!(
+                    first == 0,
+                    "dedicated ImGui index-data heap did not restart at zero"
+                );
                 std::mem::swap(&mut self.cpu_indices, &mut self.uploaded_indices);
             }
-            if self.cpu_commands != self.uploaded_commands {
-                Self::upload_dynamic(
-                    context,
-                    "imgui_commands",
-                    &self.cpu_commands,
-                    &mut self.commands,
-                    &mut self.command_capacity,
-                )?;
-                std::mem::swap(&mut self.cpu_commands, &mut self.uploaded_commands);
-            }
-            if self.uploaded_commands.len() > self.indirect_capacity as usize {
-                let replacement = acquire_indirect(context, self.uploaded_commands.len() as u32)
-                    .map_err(|error| anyhow::anyhow!("{error:?}"))
-                    .context("grow ImGui indirect draws")?;
-                let _previous = std::mem::replace(&mut self.indirect, replacement);
-                self.indirect_capacity = self.uploaded_commands.len() as u32;
-                self.uploaded_draw_counts.clear();
-            }
-            if self.draw_counts != self.uploaded_draw_counts {
-                for (index, count) in self.draw_counts.iter().copied().enumerate() {
-                    status(
-                        write_indirect(
-                            context,
-                            self.indirect,
-                            index as u32,
-                            DrawIndexedCommand {
-                                index_count: count,
-                                instance_count: 1,
-                                first_index: self.identity_start,
-                                vertex_offset: 0,
-                                first_instance: index as u32,
-                            },
-                        ),
-                        &format!("write ImGui draw {index}"),
-                    )?;
-                }
-                status(
-                    set_indirect_count(context, self.indirect, self.uploaded_commands.len() as u32),
-                    "set ImGui draw count",
-                )?;
-                self.uploaded_draw_counts.clone_from(&self.draw_counts);
-            }
-            let bindings = [
-                PublicBinding {
-                    name: "imgui_vertices".to_owned(),
-                    resource: ResourceIdentity::Structured(
-                        self.vertices
-                            .ok_or_else(|| anyhow::anyhow!("ImGui vertex buffer unavailable"))?,
-                    ),
-                },
-                PublicBinding {
-                    name: "imgui_indices".to_owned(),
-                    resource: ResourceIdentity::Structured(
-                        self.draw_indices
-                            .ok_or_else(|| anyhow::anyhow!("ImGui index buffer unavailable"))?,
-                    ),
-                },
-                PublicBinding {
-                    name: "imgui_commands".to_owned(),
-                    resource: ResourceIdentity::Structured(
-                        self.commands
-                            .ok_or_else(|| anyhow::anyhow!("ImGui command buffer unavailable"))?,
-                    ),
-                },
-            ];
-            status(
-                render_add_graphics(
-                    context,
-                    self.shader,
-                    self.indirect,
-                    &bindings,
-                    DynamicPipelineState::from_abi(0, 0, 0, 1).unwrap(),
-                    bytes_of(&self.push),
-                ),
-                "record ImGui graphics pipeline",
-            )
+
+            let commands = acquire_structured::<ImGuiCommand>(context, self.cpu_commands.len())?;
+            write_structured(context, commands, 0, &self.cpu_commands)?;
+            let indirect = acquire_indirect(context, self.draw_counts.len() as u32)?;
+            let draws = self
+                .draw_counts
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, count)| DrawIndexedCommand {
+                    index_count: count,
+                    instance_count: 1,
+                    first_index: self.identity_start,
+                    vertex_offset: 0,
+                    first_instance: index as u32,
+                })
+                .collect::<Vec<_>>();
+            write_indirect(context, indirect, 0, &draws)?;
+
+            let bindings = [PublicBinding {
+                name: "imgui_commands".to_owned(),
+                resource: ResourceIdentity::Structured(commands),
+            }];
+            render_add_graphics(
+                context,
+                self.shader,
+                indirect,
+                &bindings,
+                DynamicPipelineState::from_abi(0, 0, 0, 1).unwrap(),
+                bytes_of(&self.push),
+            )?;
+            Ok(())
         }
     }
 
-    fn status(result: EzGfxResult, operation: &str) -> anyhow::Result<()> {
-        match result {
-            EzGfxResult::Ok => Ok(()),
-            error => Err(anyhow::anyhow!("{error:?}").context(operation.to_owned())),
-        }
-    }
     fn imgui_key(key: SceneKey) -> Option<Key> {
         Some(match key {
             SceneKey::Tab => Key::Tab,
@@ -388,7 +329,6 @@ mod renderer {
 #[path = "../shared/mod.rs"]
 mod shared;
 
-use anyhow::Context as _;
 use ez_gfx::*;
 use renderer::ImGuiScene as ExampleScene;
 use shared::*;
@@ -413,7 +353,7 @@ impl Example {
         }
     }
 
-    fn context(&self) -> ContextHandle {
+    fn context_handle(&self) -> ContextHandle {
         self.context.expect("example context is initialized")
     }
 
@@ -428,7 +368,7 @@ impl LifecycleCallbacks for Example {
     fn initialize(&mut self, native: NativeSurface, width: u32, height: u32) -> anyhow::Result<()> {
         let config = backend_config(native.platform)?;
         let backend = config.backend;
-        let backend_name = config.name;
+
         let platform = config.platform;
         let context = create_context(ContextOptions {
             enable_debug: env_flag("EZ_GFX_EXAMPLE_DEBUG")?,
@@ -437,9 +377,7 @@ impl LifecycleCallbacks for Example {
             backend,
             texture_decode_workers: 0,
             adapter_selection: None,
-        })
-        .map_err(|error| anyhow::anyhow!("{error:?}"))
-        .with_context(|| format!("create {backend_name} context"))?;
+        })?;
         self.context = Some(context);
         let surface = create_surface(
             context,
@@ -451,27 +389,17 @@ impl LifecycleCallbacks for Example {
                 height,
                 cache_presented_snapshots: false,
             },
-        )
-        .map_err(|error| anyhow::anyhow!("{error:?}"))
-        .with_context(|| format!("create {backend_name} surface"))?;
+        )?;
         self.surface = Some(surface);
-        status(
-            init_device(self.context(), self.surface()),
-            &format!("initialize {backend_name} surface device"),
-        )?;
-        status(
-            resize_surface(self.context(), self.surface(), width, height),
-            &format!("initialize {backend_name} swapchain"),
-        )?;
-        self.resources = Some(ExampleScene::create(self.context(), backend)?);
+        init_device(self.context_handle(), self.surface())?;
+        resize_surface(self.context_handle(), self.surface(), width, height)?;
+        self.resources = Some(ExampleScene::create(self.context_handle(), backend)?);
         Ok(())
     }
 
     fn resize(&mut self, width: u32, height: u32) -> anyhow::Result<()> {
-        status(
-            resize_surface(self.context(), self.surface(), width, height),
-            "resize presented surface",
-        )
+        resize_surface(self.context_handle(), self.surface(), width, height)?;
+        Ok(())
     }
 
     fn input(&mut self, input: SceneInput) {
@@ -487,43 +415,34 @@ impl LifecycleCallbacks for Example {
         frame_index: u32,
     ) -> anyhow::Result<()> {
         self.benchmark.begin_frame(frame_index);
-        let context = self.context();
+        let context = self.context_handle();
         let surface = self.surface();
         if terminal {
-            status(
-                set_snapshot_cache(context, surface, true),
-                "enable terminal snapshot cache",
-            )?;
+            set_snapshot_cache(context, surface, true)?;
         }
         let resources = self
             .resources
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("example resources are unavailable"))?;
         resources.update(frame)?;
-        status(begin_render(context, surface), "begin presented frame")?;
+        begin_render(context, surface)?;
         resources.record(context)?;
-        status(finish_render(context), "submit and present example")?;
+        finish_render(context)?;
         self.benchmark.end_frame(frame_index.saturating_add(1));
         Ok(())
     }
 
     fn capture(&mut self, width: u32, height: u32, frames: u32) -> anyhow::Result<ProgramReport> {
-        let rgba8 = frame_readback(self.context())
-            .map_err(|error| anyhow::anyhow!("{error:?}"))
-            .context("read presented snapshot")?;
+        let rgba8 = frame_readback(self.context_handle())?;
         let counts = drain_bounded(
             4096,
             || {
-                poll_runtime_event(self.context())
+                poll_runtime_event(self.context_handle())
                     .map(|(record, dropped)| (record.is_some(), dropped))
-                    .map_err(|error| anyhow::anyhow!("{error:?}"))
-                    .context("poll runtime event")
             },
             || {
-                poll_diagnostic(self.context())
+                poll_diagnostic(self.context_handle())
                     .map(|(record, dropped)| (record.is_some(), dropped))
-                    .map_err(|error| anyhow::anyhow!("{error:?}"))
-                    .context("poll diagnostic")
             },
         )?;
         Ok(ProgramReport {
@@ -560,13 +479,6 @@ fn run_example_with_benchmark(
         },
         Example::new(benchmark),
     )
-}
-
-fn status(result: EzGfxResult, operation: &str) -> anyhow::Result<()> {
-    match result {
-        EzGfxResult::Ok => Ok(()),
-        error => Err(anyhow::anyhow!("{error:?}").context(operation.to_owned())),
-    }
 }
 
 fn main() {

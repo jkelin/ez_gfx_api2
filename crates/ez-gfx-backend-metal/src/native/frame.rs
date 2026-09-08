@@ -811,14 +811,19 @@ impl NativeContext {
         capture_presented: bool,
         mut surface: Option<&mut NativeSurface>,
     ) -> Result<Option<Vec<u8>>, HalError> {
+        let frame_value = self.next_frame_value;
+        self.next_frame_value = frame_value.checked_add(1).ok_or(HalError::NativeFailure)?;
         self.drain_complete = false;
         command.commit();
+        self.last_frame_value = frame_value;
         if readbacks.is_empty() {
             self.frame_slots[slot_index].command = Some(ThreadBound::new(command));
+            self.frame_slots[slot_index].submission_value = frame_value;
             self.frame_tracker.mark_submitted(slot_index);
             return Ok(None);
         }
         command.waitUntilCompleted();
+        self.completed_frame_value = self.completed_frame_value.max(frame_value);
         if command.status() != MTLCommandBufferStatus::Completed || command.error().is_some() {
             for (allocation, _, _, _, _) in readbacks {
                 let _ = self.free(allocation);

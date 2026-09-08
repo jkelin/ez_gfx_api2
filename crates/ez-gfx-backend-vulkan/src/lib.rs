@@ -353,6 +353,7 @@ struct FrameSlot {
     fence: vk::Fence,
     descriptor_pool: vk::DescriptorPool,
     in_flight: bool,
+    submission_value: u64,
 }
 
 struct DeviceProbe {
@@ -495,6 +496,9 @@ pub struct NativeContext {
     swapchain_extent: vk::Extent2D,
     frame_slots: Vec<FrameSlot>,
     frame_cursor: usize,
+    next_frame_value: u64,
+    last_frame_value: u64,
+    completed_frame_value: u64,
     image_available: Option<vk::Semaphore>,
     depth_target: Option<DepthTarget>,
 }

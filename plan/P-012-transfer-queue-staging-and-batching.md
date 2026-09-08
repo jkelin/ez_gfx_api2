@@ -2,7 +2,7 @@
 
 ## Problem
 
-Decide how to implement reusable, bucketed staging buffer pools for both vertex and texture data, batch transfer-queue submissions to eliminate per-upload command buffer overhead, and replace global timeline signal serialization with fine-grained queue-side dependencies.
+Decide how to implement reusable, bucketed staging buffer pools for both vertex and texture data, batch transfer-queue submissions to eliminate per-upload command buffer overhead, and replace global timeline signal serialization with decoupled per-stream, transfer-domain queue timelines.
 
 ## Prompt context
 
@@ -18,7 +18,7 @@ Source evidence: `TODO.md` ("Add a reusable vertex staging buffer pool...", "Bat
 ## Dependencies
 
 - Incoming dependency: `P-012` depends on `P-003` (HAL queues), `P-004` (Allocator), and `P-011` (Vertex manager).
-- Outgoing dependency: `P-013` and `P-015` depend on `P-012` for staging memory and transfer batch execution.
+- Outgoing dependency: `P-015` depends on `P-012` for staging memory and transfer batch execution; P-013 consumes its submitted aggregate prefixes.
 
 ## Unresolved questions
 
@@ -137,13 +137,13 @@ Reusing staging blocks by GPU timeline status eliminates allocation churn and am
 
 ### Implementation and evidence status
 
-Power-of-two staging reuse, independent geometry/texture completion streams, atomic bounded mip-bundle admission, and native cross-texture batches are implemented on Vulkan, DX12, and Metal. Adjacent equal stream stages coalesce without FIFO reordering; repeated writes to one image remain separate. Per-mip completion values remain truthful.
+Power-of-two staging reuse, independent geometry/texture completion streams, and native cross-texture batches are implemented on Vulkan, Direct3D 12, and Metal. CPU jobs, decoded-result channels, geometry staging growth, and transfer request channels have no fixed count or aggregate-byte admission limit; real allocation, OS, handle, and request-size limits remain.
 
-The scheduling implementation deliberately departs from the original no-per-submission-blocking goal: targeted `flush_through` waits only through referenced accepted work, but its native callback may wait for GPU copy/command completion before safely queuing graphics handoff. Later fine-copy waits stay off the graphics queue so ready coarse frames can finish. Failure still drains actual native submissions; an undrainable live context retains GPU-owned state instead of aborting or freeing it early.
+Batch byte/copy/deadline values are flush thresholds, not backpressure. Adjacent equal stream stages coalesce without FIFO reordering; repeated writes remain separate. Per-mip completion remains truthful. Prior queue-full measurements describe the superseded bounded implementation and are not current evidence.
 
-RTX 3080 native tests prove shared copy submissions, blocked-fine/coarse-frame overlap, queue-full admission, and failure-safe retirement. The 64-image upload benchmark observed 64→2 Vulkan and 64→5 DX12 native batches; exact timings, staging retention, method, and limitations are in [texture measurements](../docs/textures.md#measured-workloads). These are scoped debug-profile observations, not general throughput claims.
+Metal has nonblocking submission coverage. Vulkan and Direct3D 12 retain targeted host waits; removing them needs a dedicated transition/acquire queue and remains tracked work. Fresh remote evidence for this cutover is required before claiming native completion.
 
-Apple M2 Pro native execution now proves shared texture command buffers, cancelled-only completion signaling, GPU-gated fine-copy/coarse-frame overlap, submitted retirement, rejected updates, and drain-safe partial buffer failure. Ordered buffer admission and targeted producer completion fix a real pending-copy frame rejection. Metal may block the caller through a referenced buffer command; no later transfers are drained. See [native evidence](../docs/textures.md#verification-and-remaining-evidence). Apple performance was not benchmarked.
+The 2026-09-07 local workspace, lint, ABI, C-build, event, and Vulkan/DX12 pixel evidence passed. Fresh remote native evidence is absent: the exact Linux/macOS mise tasks failed during SSH-agent signing, and the Windows task lacks its required host/path variables.
 
 The selected nonblocking-submission goal is implemented on Metal; Vulkan and Direct3D 12 retain targeted host waits as explicit exceptions (see below), recorded in root `TODO.md`.
 

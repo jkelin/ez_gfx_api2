@@ -1,9 +1,11 @@
+use crate::Result;
+
 use super::{
-    Backend, ContextState, ExecutableNode, ExecutionAction, EzGfxResult, FrameExecutionPlan,
-    FrameNativeResource, HashMap, MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext,
-    NativePipeline, NativeShader, NativeSurface, NativeTexture, PipelineKey, RenderTargetHandle,
-    RenderTargetRecord, ResourceId, SURFACE_DEFAULT_CLEAR, ShaderRecord, TextureHandle, TextureId,
-    map_hal, metal_bindings, native_layouts, pipeline_layout_key,
+    Backend, ContextState, Error, ExecutableNode, ExecutionAction, FrameExecutionPlan,
+    FrameNativeResource, GeometryAllocation, HashMap, MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation,
+    NativeContext, NativePipeline, NativeShader, NativeSurface, NativeTexture, PipelineKey,
+    RenderTargetHandle, RenderTargetRecord, ResourceId, SURFACE_DEFAULT_CLEAR, ShaderRecord,
+    TextureHandle, TextureId, map_hal, metal_bindings, native_layouts, pipeline_layout_key,
 };
 use ez_gfx_backend_metal::native::{
     NativeAllocation as MetalAllocation, NativeBufferBinding as MetalBufferBinding,
@@ -37,7 +39,7 @@ struct PreparedMetalPipelines {
 
 fn metal_texture_heap(
     layout: Option<&TextureHeapLayout>,
-) -> Result<Option<ShaderTextureHeapLayout>, EzGfxResult> {
+) -> Result<Option<ShaderTextureHeapLayout>> {
     layout
         .map(|layout| {
             ShaderTextureHeapLayout::new(
@@ -59,25 +61,22 @@ fn prepare_compute_pipeline(
     native: &MetalContext,
     shader: ShaderHandle,
     layout: &ReflectedBindings,
-) -> Result<PreparedComputePipeline, EzGfxResult> {
-    let record = shaders.get(&shader).ok_or(EzGfxResult::InvalidContext)?;
-    let compute = record
-        .compute
-        .as_ref()
-        .ok_or(EzGfxResult::InvalidArgument)?;
+) -> Result<PreparedComputePipeline> {
+    let record = shaders.get(&shader).ok_or(Error::InvalidContext)?;
+    let compute = record.compute.as_ref().ok_or(Error::InvalidArgument)?;
     let NativeShader::Metal(native_shader) = &record.native else {
-        return Err(EzGfxResult::NativeFailure);
+        return Err(Error::NativeFailure);
     };
     let layouts = native_layouts(layout).map_err(map_hal)?;
     let compute_layout = record
         .runtime
         .pipeline_layout(ez_gfx_artifact::Stage::Compute)
-        .map_err(|_| EzGfxResult::InvalidArgument)?;
+        .map_err(|_| Error::InvalidArgument)?;
     let texture_heap = metal_texture_heap(compute_layout.texture_heap())?;
     let workgroup_size = record
         .runtime
         .compute_workgroup_size()
-        .map_err(|_| EzGfxResult::InvalidArgument)?;
+        .map_err(|_| Error::InvalidArgument)?;
     let key = PipelineKey::Compute {
         backend: Backend::Metal,
         shader,
@@ -107,26 +106,23 @@ fn prepare_graphics_pipeline(
     layout: &ReflectedBindings,
     pipeline_layout: &PipelineLayout,
     state: DynamicPipelineState,
-) -> Result<PreparedGraphicsPipeline, EzGfxResult> {
-    let record = shaders.get(&shader).ok_or(EzGfxResult::InvalidContext)?;
-    let graphics = record
-        .graphics
-        .as_ref()
-        .ok_or(EzGfxResult::InvalidArgument)?;
+) -> Result<PreparedGraphicsPipeline> {
+    let record = shaders.get(&shader).ok_or(Error::InvalidContext)?;
+    let graphics = record.graphics.as_ref().ok_or(Error::InvalidArgument)?;
     let NativeShader::Metal(native_shader) = &record.native else {
-        return Err(EzGfxResult::NativeFailure);
+        return Err(Error::NativeFailure);
     };
     let layouts = native_layouts(layout).map_err(map_hal)?;
     let texture_heap = metal_texture_heap(pipeline_layout.texture_heap())?;
     let vertex_layout = record
         .runtime
         .pipeline_layout(ez_gfx_artifact::Stage::Vertex)
-        .map_err(|_| EzGfxResult::InvalidArgument)?;
+        .map_err(|_| Error::InvalidArgument)?;
     let vertex_texture_heap = metal_texture_heap(vertex_layout.texture_heap())?;
     let fragment_layout = record
         .runtime
         .pipeline_layout(ez_gfx_artifact::Stage::Fragment)
-        .map_err(|_| EzGfxResult::InvalidArgument)?;
+        .map_err(|_| Error::InvalidArgument)?;
     let fragment_texture_heap = metal_texture_heap(fragment_layout.texture_heap())?;
     let depth_required = pipeline_layout.depth_required();
     let key = PipelineKey::Graphics {
@@ -170,7 +166,7 @@ fn cache_metal_pipeline(
     native: &mut MetalContext,
     key: PipelineKey,
     pipeline: Option<NativePipeline>,
-) -> Result<(), EzGfxResult> {
+) -> Result<()> {
     let Some(pipeline) = pipeline else {
         return Ok(());
     };
@@ -182,7 +178,7 @@ fn cache_metal_pipeline(
             .collect::<Vec<_>>();
         for pipeline in stale {
             let NativePipeline::Metal(pipeline) = pipeline else {
-                return Err(EzGfxResult::NativeFailure);
+                return Err(Error::NativeFailure);
             };
             native.destroy_pipeline(pipeline);
         }
@@ -196,7 +192,7 @@ fn prepare_metal_pipelines(
     pipelines: &mut HashMap<PipelineKey, NativePipeline>,
     native: &mut MetalContext,
     payloads: &[ExecutableNode],
-) -> Result<PreparedMetalPipelines, EzGfxResult> {
+) -> Result<PreparedMetalPipelines> {
     let mut prepared = PreparedMetalPipelines {
         keys: vec![None; payloads.len()],
         texture_heaps: vec![None; payloads.len()],
@@ -241,6 +237,7 @@ fn prepare_metal_pipelines(
 struct MetalActionInputs<'a> {
     payloads: &'a [ExecutableNode],
     allocations: &'a HashMap<PackedHandle, (u64, NativeAllocation)>,
+    vertex_heaps: &'a HashMap<String, GeometryAllocation>,
     textures: &'a MetalTextureRecords,
     render_targets: &'a HashMap<RenderTargetHandle, RenderTargetRecord>,
     pipelines: &'a HashMap<PipelineKey, NativePipeline>,
@@ -254,11 +251,8 @@ struct MetalActionInputs<'a> {
 }
 
 impl<'a> MetalActionInputs<'a> {
-    fn node(&self, index: usize) -> Result<MetalFrameAction<'a>, EzGfxResult> {
-        let payload = self
-            .payloads
-            .get(index)
-            .ok_or(EzGfxResult::InvalidArgument)?;
+    fn node(&self, index: usize) -> Result<MetalFrameAction<'a>> {
+        let payload = self.payloads.get(index).ok_or(Error::InvalidArgument)?;
         match payload {
             ExecutableNode::Graphics {
                 indirect,
@@ -270,18 +264,18 @@ impl<'a> MetalActionInputs<'a> {
             } => {
                 let key = self.prepared.keys[index]
                     .as_ref()
-                    .ok_or(EzGfxResult::InvalidArgument)?;
+                    .ok_or(Error::InvalidArgument)?;
                 let NativePipeline::Metal(pipeline) =
-                    self.pipelines.get(key).ok_or(EzGfxResult::NativeFailure)?
+                    self.pipelines.get(key).ok_or(Error::NativeFailure)?
                 else {
-                    return Err(EzGfxResult::NativeFailure);
+                    return Err(Error::NativeFailure);
                 };
                 let (indirect_size, NativeAllocation::Metal(indirect)) = self
                     .allocations
                     .get(&indirect.packed())
-                    .ok_or(EzGfxResult::InvalidContext)?
+                    .ok_or(Error::InvalidContext)?
                 else {
-                    return Err(EzGfxResult::NativeFailure);
+                    return Err(Error::NativeFailure);
                 };
                 Ok(MetalFrameAction::Graphics(
                     ez_gfx_backend_metal::native::NativeGraphicsDraw {
@@ -289,7 +283,7 @@ impl<'a> MetalActionInputs<'a> {
                         depth_required: pipeline_layout.depth_required(),
                         texture_heap: self.prepared.texture_heaps[index],
                         state: *state,
-                        index: self.index.ok_or(EzGfxResult::NotReady)?,
+                        index: self.index.ok_or(Error::NotReady)?,
                         index_size: self.index_size,
                         indirect,
                         indirect_size: *indirect_size,
@@ -307,18 +301,18 @@ impl<'a> MetalActionInputs<'a> {
             } => {
                 let key = self.prepared.keys[index]
                     .as_ref()
-                    .ok_or(EzGfxResult::InvalidArgument)?;
+                    .ok_or(Error::InvalidArgument)?;
                 let NativePipeline::Metal(pipeline) =
-                    self.pipelines.get(key).ok_or(EzGfxResult::NativeFailure)?
+                    self.pipelines.get(key).ok_or(Error::NativeFailure)?
                 else {
-                    return Err(EzGfxResult::NativeFailure);
+                    return Err(Error::NativeFailure);
                 };
                 Ok(MetalFrameAction::Compute(
                     ez_gfx_backend_metal::native::NativeComputeDispatch {
                         pipeline,
                         groups: *groups,
                         threads_per_group: self.prepared.workgroup_sizes[index]
-                            .ok_or(EzGfxResult::InvalidArgument)?,
+                            .ok_or(Error::InvalidArgument)?,
                         push_constants,
                         bindings: &self.binding_sets[index],
                         texture_heap: self.prepared.texture_heaps[index],
@@ -327,12 +321,10 @@ impl<'a> MetalActionInputs<'a> {
                 ))
             }
             ExecutableNode::TextureReadback { texture } => {
-                let (_, NativeTexture::Metal(texture), width, height, _) = self
-                    .textures
-                    .get(texture)
-                    .ok_or(EzGfxResult::InvalidContext)?
+                let (_, NativeTexture::Metal(texture), width, height, _) =
+                    self.textures.get(texture).ok_or(Error::InvalidContext)?
                 else {
-                    return Err(EzGfxResult::NativeFailure);
+                    return Err(Error::NativeFailure);
                 };
                 Ok(MetalFrameAction::TextureReadback {
                     texture,
@@ -342,7 +334,7 @@ impl<'a> MetalActionInputs<'a> {
             }
             ExecutableNode::Present { surface } => {
                 if Some(*surface) != self.surface {
-                    return Err(EzGfxResult::InvalidArgument);
+                    return Err(Error::InvalidArgument);
                 }
                 Ok(MetalFrameAction::Present)
             }
@@ -353,7 +345,7 @@ impl<'a> MetalActionInputs<'a> {
 fn build_metal_actions<'a>(
     plan: &'a FrameExecutionPlan,
     inputs: &'a MetalActionInputs<'a>,
-) -> Result<Vec<MetalFrameAction<'a>>, EzGfxResult> {
+) -> Result<Vec<MetalFrameAction<'a>>> {
     let mut actions = Vec::with_capacity(plan.actions.len());
     for action in &plan.actions {
         match action {
@@ -366,26 +358,24 @@ fn build_metal_actions<'a>(
                 let resource = inputs
                     .frame_resources
                     .get(&ResourceId::from_index(barrier.resource))
-                    .ok_or(EzGfxResult::InvalidArgument)?;
+                    .ok_or(Error::InvalidArgument)?;
                 let resource = match *resource {
                     FrameNativeResource::Buffer(handle) => {
                         let NativeAllocation::Metal(allocation) = &inputs
                             .allocations
                             .get(&handle)
-                            .ok_or(EzGfxResult::InvalidContext)?
+                            .ok_or(Error::InvalidContext)?
                             .1
                         else {
-                            return Err(EzGfxResult::NativeFailure);
+                            return Err(Error::NativeFailure);
                         };
                         MetalFrameResource::Buffer(allocation)
                     }
                     FrameNativeResource::Texture(handle) => {
-                        let (_, NativeTexture::Metal(texture), _, _, _) = inputs
-                            .textures
-                            .get(&handle)
-                            .ok_or(EzGfxResult::InvalidContext)?
+                        let (_, NativeTexture::Metal(texture), _, _, _) =
+                            inputs.textures.get(&handle).ok_or(Error::InvalidContext)?
                         else {
-                            return Err(EzGfxResult::NativeFailure);
+                            return Err(Error::NativeFailure);
                         };
                         MetalFrameResource::Texture(texture)
                     }
@@ -395,14 +385,25 @@ fn build_metal_actions<'a>(
                         let record = inputs
                             .render_targets
                             .get(&handle)
-                            .ok_or(EzGfxResult::InvalidContext)?;
+                            .ok_or(Error::InvalidContext)?;
                         let NativeTexture::Metal(texture) = &record.native else {
-                            return Err(EzGfxResult::NativeFailure);
+                            return Err(Error::NativeFailure);
                         };
                         MetalFrameResource::RenderTarget(texture)
                     }
                     FrameNativeResource::Index => {
-                        MetalFrameResource::Buffer(inputs.index.ok_or(EzGfxResult::NotReady)?)
+                        MetalFrameResource::Buffer(inputs.index.ok_or(Error::NotReady)?)
+                    }
+                    FrameNativeResource::VertexHeap(heap_id) => {
+                        let heap = inputs
+                            .vertex_heaps
+                            .values()
+                            .find(|heap| heap.heap_id == Some(heap_id))
+                            .ok_or(Error::InvalidContext)?;
+                        let NativeAllocation::Metal(allocation) = &heap.allocation else {
+                            return Err(Error::NativeFailure);
+                        };
+                        MetalFrameResource::Buffer(allocation)
                     }
                 };
                 actions.push(MetalFrameAction::Barrier {
@@ -419,7 +420,7 @@ fn build_metal_actions<'a>(
                     let resource = inputs
                         .frame_resources
                         .get(&ResourceId::from_index(*index))
-                        .ok_or(EzGfxResult::InvalidArgument)?;
+                        .ok_or(Error::InvalidArgument)?;
                     colors.push(match *resource {
                         FrameNativeResource::Surface(_) => MetalPassAttachment {
                             resource: MetalFrameResource::Surface,
@@ -429,9 +430,9 @@ fn build_metal_actions<'a>(
                             let record = inputs
                                 .render_targets
                                 .get(&handle)
-                                .ok_or(EzGfxResult::InvalidContext)?;
+                                .ok_or(Error::InvalidContext)?;
                             let NativeTexture::Metal(texture) = &record.native else {
-                                return Err(EzGfxResult::NativeFailure);
+                                return Err(Error::NativeFailure);
                             };
                             MetalPassAttachment {
                                 resource: MetalFrameResource::RenderTarget(texture),
@@ -440,7 +441,7 @@ fn build_metal_actions<'a>(
                                 ),
                             }
                         }
-                        _ => return Err(EzGfxResult::InvalidArgument),
+                        _ => return Err(Error::InvalidArgument),
                     });
                 }
                 actions.push(MetalFrameAction::BeginPass { pass, colors });
@@ -457,7 +458,7 @@ pub(super) fn execute_metal_frame_plan(
     context: &mut ContextState,
     plan: &FrameExecutionPlan,
     payloads: &[ExecutableNode],
-) -> Result<(), EzGfxResult> {
+) -> Result<()> {
     let surface_handle = payloads.iter().find_map(|payload| match payload {
         ExecutableNode::Present { surface } => Some(*surface),
         ExecutableNode::Graphics { .. }
@@ -469,7 +470,7 @@ pub(super) fn execute_metal_frame_plan(
             context
                 .surfaces
                 .remove(&handle)
-                .ok_or(EzGfxResult::InvalidContext)
+                .ok_or(Error::InvalidContext)
         })
         .transpose()?;
     // Target-only frames size draws and validations from the target extents.
@@ -495,7 +496,13 @@ pub(super) fn execute_metal_frame_plan(
             }
             | ExecutableNode::Compute {
                 layout, bindings, ..
-            } => metal_bindings(layout, bindings, &context.allocations).map_err(map_hal)?,
+            } => metal_bindings(
+                layout,
+                bindings,
+                &context.allocations,
+                &context.vertex_heaps,
+            )
+            .map_err(map_hal)?,
             ExecutableNode::TextureReadback { .. } | ExecutableNode::Present { .. } => Vec::new(),
         };
         binding_sets.push(bindings);
@@ -511,24 +518,25 @@ pub(super) fn execute_metal_frame_plan(
         })
         .map(|(_, (_, texture, _, _, _))| match texture {
             NativeTexture::Metal(texture) => Ok(texture),
-            NativeTexture::Vulkan(_) => Err(EzGfxResult::NativeFailure),
+            NativeTexture::Vulkan(_) => Err(Error::NativeFailure),
         })
-        .collect::<Result<_, _>>()?;
+        .collect::<std::result::Result<_, _>>()?;
     let (index, index_size) = match context.index_heap.as_ref() {
         Some(heap) => match &heap.allocation {
             NativeAllocation::Metal(index) => (Some(index), heap.size),
-            NativeAllocation::Vulkan(_) => return Err(EzGfxResult::NativeFailure),
+            NativeAllocation::Vulkan(_) => return Err(Error::NativeFailure),
         },
         None => (None, 0),
     };
     let NativeContext::Metal(native) = &mut context.native else {
-        return Err(EzGfxResult::NativeFailure);
+        return Err(Error::NativeFailure);
     };
     let prepared =
         prepare_metal_pipelines(&context.shaders, &mut context.pipelines, native, payloads)?;
     let inputs = MetalActionInputs {
         payloads,
         allocations: &context.allocations,
+        vertex_heaps: &context.vertex_heaps,
         textures: &context.textures,
         render_targets: &context.render_targets,
         pipelines: &context.pipelines,
@@ -546,7 +554,7 @@ pub(super) fn execute_metal_frame_plan(
             .execute_frame(Some((surface, extent)), &actions, capture)
             .map_err(map_hal),
         None => native.execute_frame(None, &actions, false).map_err(map_hal),
-        Some(NativeSurface::Vulkan(_)) => Err(EzGfxResult::NativeFailure),
+        Some(NativeSurface::Vulkan(_)) => Err(Error::NativeFailure),
     };
     if let Ok(Some(readback)) = &result {
         context.last_readback.clone_from(readback);

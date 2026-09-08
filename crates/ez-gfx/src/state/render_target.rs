@@ -6,8 +6,10 @@
 //! attachments happen here; the stored declaration (including its clear value
 //! and sample count) feeds the render-pass slice. Render targets lease heap
 
+use crate::Result;
+
 use super::{
-    ContextHandle, ContextState, EzGfxResult, NativeTexture, RenderTargetHandle, ResourceKind,
+    ContextHandle, ContextState, Error, NativeTexture, RenderTargetHandle, ResourceKind,
     destroy_native_texture, map_allocation, map_lifecycle, map_texture, native_texture_compression,
     result_status, with_context_mut,
 };
@@ -45,23 +47,23 @@ pub(super) struct RenderTargetRecord {
 /// storage that resolves into the sampled image at end of pass. Depth,
 /// storage, and sampled-only declarations are deferred.
 /// # Errors
-/// Returns [`EzGfxResult::InvalidArgument`] for empty extents or a malformed
-/// declaration, [`EzGfxResult::Unsupported`] for non-color usage or an
-/// unresolvable format, [`EzGfxResult::NativeFailure`] for oversized targets,
+/// Returns [`Error::InvalidArgument`] for empty extents or a malformed
+/// declaration, [`Error::Unsupported`] for non-color usage or an
+/// unresolvable format, [`Error::NativeFailure`] for oversized targets,
 /// an exhausted binding range, or native allocation failure.
 pub fn create_render_target(
     context: ContextHandle,
     declaration: &TargetDeclaration,
     width: u32,
     height: u32,
-) -> Result<RenderTargetHandle, EzGfxResult> {
+) -> Result<RenderTargetHandle> {
     if declaration.usage() != TargetUsage::Color {
         // Depth, storage, and sampled-only targets need pass-attachment and
         // descriptor-table work owned by later slices.
-        return Err(EzGfxResult::Unsupported);
+        return Err(Error::Unsupported);
     }
     if width == 0 || height == 0 {
-        return Err(EzGfxResult::InvalidArgument);
+        return Err(Error::InvalidArgument);
     }
     with_context_mut(context, |context| {
         context
@@ -72,15 +74,15 @@ pub fn create_render_target(
         let capabilities = match &context.native {
             super::NativeContext::Vulkan(native) => native
                 .probe_target_formats()
-                .map_err(|_| EzGfxResult::NativeFailure)?,
+                .map_err(|_| Error::NativeFailure)?,
             #[cfg(windows)]
             super::NativeContext::Dx12(native) => native
                 .probe_target_formats()
-                .map_err(|_| EzGfxResult::NativeFailure)?,
+                .map_err(|_| Error::NativeFailure)?,
             #[cfg(target_vendor = "apple")]
             super::NativeContext::Metal(native) => native
                 .probe_target_formats()
-                .map_err(|_| EzGfxResult::NativeFailure)?,
+                .map_err(|_| Error::NativeFailure)?,
         };
         let format = capabilities
             .resolve_with_compression(declaration, compression)
@@ -90,15 +92,15 @@ pub fn create_render_target(
         let bytes_per_texel: u64 = match format {
             Format::Rgba8Unorm | Format::Bgra8Srgb => 4,
             Format::Rgba16Float => 8,
-            _ => return Err(EzGfxResult::Unsupported),
+            _ => return Err(Error::Unsupported),
         };
         let bytes = u64::from(width)
             .checked_mul(u64::from(height))
             .and_then(|pixels| pixels.checked_mul(bytes_per_texel))
             .and_then(|single| single.checked_mul(u64::from(declaration.samples())))
-            .ok_or(EzGfxResult::NativeFailure)?;
+            .ok_or(Error::NativeFailure)?;
         if bytes > ez_gfx_runtime::texture::MAX_TEXTURE_BYTES as u64 {
-            return Err(EzGfxResult::NativeFailure);
+            return Err(Error::NativeFailure);
         }
         let id = context
             .texture_registry
@@ -145,7 +147,7 @@ pub fn create_render_target(
         let Ok(typed) = RenderTargetHandle::from_packed(handle) else {
             release_heap_slot(context, id);
             let _ = destroy_native_texture(&mut context.native, native);
-            return Err(EzGfxResult::NativeFailure);
+            return Err(Error::NativeFailure);
         };
         context.render_targets.insert(
             typed,
@@ -190,11 +192,8 @@ pub fn destroy_render_target(context: ContextHandle, target: RenderTargetHandle)
 ///
 /// # Errors
 ///
-/// Returns [`EzGfxResult::InvalidArgument`] for an unknown or destroyed handle.
-pub fn render_target_format(
-    context: ContextHandle,
-    target: RenderTargetHandle,
-) -> Result<Format, EzGfxResult> {
+/// Returns [`Error::InvalidArgument`] for an unknown or destroyed handle.
+pub fn render_target_format(context: ContextHandle, target: RenderTargetHandle) -> Result<Format> {
     with_context_mut(context, |context| {
         context
             .identity
@@ -204,7 +203,7 @@ pub fn render_target_format(
             .render_targets
             .get(&target)
             .map(|record| record.format)
-            .ok_or(EzGfxResult::InvalidArgument)
+            .ok_or(Error::InvalidArgument)
     })
 }
 
@@ -212,11 +211,11 @@ pub fn render_target_format(
 ///
 /// # Errors
 ///
-/// Returns [`EzGfxResult::InvalidArgument`] for an unknown or destroyed handle.
+/// Returns [`Error::InvalidArgument`] for an unknown or destroyed handle.
 pub fn render_target_extent(
     context: ContextHandle,
     target: RenderTargetHandle,
-) -> Result<(u32, u32), EzGfxResult> {
+) -> Result<(u32, u32)> {
     with_context_mut(context, |context| {
         context
             .identity
@@ -226,7 +225,7 @@ pub fn render_target_extent(
             .render_targets
             .get(&target)
             .map(|record| (record.width, record.height))
-            .ok_or(EzGfxResult::InvalidArgument)
+            .ok_or(Error::InvalidArgument)
     })
 }
 
@@ -237,11 +236,11 @@ pub fn render_target_extent(
 ///
 /// # Errors
 ///
-/// Returns [`EzGfxResult::InvalidArgument`] for an unknown or destroyed handle.
+/// Returns [`Error::InvalidArgument`] for an unknown or destroyed handle.
 pub fn render_target_clear(
     context: ContextHandle,
     target: RenderTargetHandle,
-) -> Result<ez_gfx_runtime::target::ClearValue, EzGfxResult> {
+) -> Result<ez_gfx_runtime::target::ClearValue> {
     with_context_mut(context, |context| {
         context
             .identity
@@ -251,7 +250,7 @@ pub fn render_target_clear(
             .render_targets
             .get(&target)
             .map(|record| record.declaration.clear())
-            .ok_or(EzGfxResult::InvalidArgument)
+            .ok_or(Error::InvalidArgument)
     })
 }
 /// Probes whether one format admits a sampled color target at the given sample count.
@@ -263,36 +262,36 @@ pub fn render_target_clear(
 ///
 /// # Errors
 ///
-/// Returns [`EzGfxResult::InvalidArgument`] for a sample count outside
-/// `1 | 2 | 4 | 8`, [`EzGfxResult::Unsupported`] when no candidate satisfies
-/// the declaration, and [`EzGfxResult::NativeFailure`] when the device cannot
+/// Returns [`Error::InvalidArgument`] for a sample count outside
+/// `1 | 2 | 4 | 8`, [`Error::Unsupported`] when no candidate satisfies
+/// the declaration, and [`Error::NativeFailure`] when the device cannot
 /// be probed.
 pub fn probe_render_target_format(
     context: ContextHandle,
     format: Format,
     samples: u8,
-) -> EzGfxResult {
+) -> Result<()> {
     result_status(with_context_mut(context, |context| {
         context
             .identity
             .check_thread_and_health()
             .map_err(map_lifecycle)?;
         if !matches!(samples, 1 | 2 | 4 | 8) {
-            return Err(EzGfxResult::InvalidArgument);
+            return Err(Error::InvalidArgument);
         }
         let compression = native_texture_compression(&context.native);
         let capabilities = match &context.native {
             super::NativeContext::Vulkan(native) => native
                 .probe_target_formats()
-                .map_err(|_| EzGfxResult::NativeFailure)?,
+                .map_err(|_| Error::NativeFailure)?,
             #[cfg(windows)]
             super::NativeContext::Dx12(native) => native
                 .probe_target_formats()
-                .map_err(|_| EzGfxResult::NativeFailure)?,
+                .map_err(|_| Error::NativeFailure)?,
             #[cfg(target_vendor = "apple")]
             super::NativeContext::Metal(native) => native
                 .probe_target_formats()
-                .map_err(|_| EzGfxResult::NativeFailure)?,
+                .map_err(|_| Error::NativeFailure)?,
         };
         let declaration = TargetDeclaration::new(
             "probe",
@@ -331,16 +330,16 @@ fn release_heap_slot(context: &mut ContextState, id: TextureId) {
     let _ = context.texture_registry.cancel_upload(id);
 }
 
-fn map_target_error(error: TargetError) -> EzGfxResult {
+fn map_target_error(error: TargetError) -> Error {
     match error {
-        TargetError::UnsupportedFormat => EzGfxResult::Unsupported,
-        TargetError::DuplicateSupport => EzGfxResult::NativeFailure,
+        TargetError::UnsupportedFormat => Error::Unsupported,
+        TargetError::DuplicateSupport => Error::NativeFailure,
         TargetError::InvalidName
         | TargetError::InvalidScale
         | TargetError::InvalidSamples
         | TargetError::NoCandidates
         | TargetError::DuplicateCandidate
         | TargetError::InvalidClear
-        | TargetError::ClearTypeMismatch => EzGfxResult::InvalidArgument,
+        | TargetError::ClearTypeMismatch => Error::InvalidArgument,
     }
 }

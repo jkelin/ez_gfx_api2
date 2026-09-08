@@ -1,23 +1,41 @@
-/// Result of a safe ez-gfx operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum EzGfxResult {
-    /// Operation completed successfully.
-    Ok = 0,
+use ez_gfx_core::capability::CapabilityError;
+use ez_gfx_runtime::LifecycleError;
+
+/// Error returned by the safe Rust facade.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
     /// An argument violates the operation contract.
-    InvalidArgument = 1,
+    #[error("invalid argument")]
+    InvalidArgument,
     /// A context or resource handle is invalid or stale.
-    InvalidContext = 2,
+    #[error("invalid or stale context/resource handle")]
+    InvalidContext,
     /// The native graphics backend failed.
-    NativeFailure = 3,
+    #[error("native graphics backend failure")]
+    NativeFailure,
     /// Completion or output is not yet available.
-    NotReady = 4,
+    #[error("operation is not ready")]
+    NotReady,
     /// The requested capability is unavailable.
-    Unsupported = 5,
+    #[error("unsupported operation or capability")]
+    Unsupported,
     /// The graphics device was lost.
-    DeviceLost = 6,
-    /// A bounded asynchronous queue has no available capacity.
-    QueueFull = 7,
+    #[error("graphics device lost")]
+    DeviceLost,
+    /// Asynchronous scheduling or staging capacity is unavailable.
+    #[error("asynchronous scheduling capacity unavailable")]
+    QueueFull,
     /// An asynchronous operation was cancelled before completion.
-    Cancelled = 8,
+    #[error("asynchronous operation cancelled")]
+    Cancelled,
+    /// Preserves a lifecycle or handle-validation cause.
+    #[error(transparent)]
+    Lifecycle(#[from] LifecycleError),
+    /// Preserves an adapter capability cause.
+    #[error(transparent)]
+    Capability(#[from] CapabilityError),
 }
+
+/// Result returned by the safe Rust facade.
+pub type Result<T> = std::result::Result<T, Error>;

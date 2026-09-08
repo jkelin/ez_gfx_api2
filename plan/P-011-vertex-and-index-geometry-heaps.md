@@ -18,7 +18,7 @@ Source evidence: `TODO.md` ("Add a direct staging-write upload API for generated
 ## Dependencies
 
 - Incoming dependency: `P-011` depends on `P-004` (Allocator) for GPU buffer allocations.
-- Outgoing dependency: `P-012` and `P-013` depend on `P-011` for staging buffers and upload dependency tracking.
+- Outgoing dependency: `P-012` depends on `P-011` for geometry staging and transfer batches.
 
 ## Unresolved questions
 
@@ -31,7 +31,7 @@ Source evidence: `TODO.md` ("Add a direct staging-write upload API for generated
 
 #### Approach and integration
 
-Maintain each named vertex heap as a GPU-resident storage buffer with an internal generation-indexed slot map and an ordered range free-list. For procedural mesh generation, expose `acquire_staging_vertex_lease(heap, element_count)` which reserves a mapped slice in a host-visible ring buffer and returns a lease guard. Dropping or submitting the lease commits the GPU transfer command without any intermediate CPU-to-CPU buffer copy. Handle frees validate the generation token against the slot table, guaranteeing deterministic detection of double-frees or stale handle releases.
+Maintain each named vertex heap as a GPU-resident storage buffer with an internal generation-indexed slot map and an ordered range free-list. For procedural mesh generation, expose `acquire_staging_vertex_lease(heap, element_count)` which reserves a mapped slice in a host-visible ring buffer and returns a lease guard. The lease is committed or cancelled explicitly, exactly once; dropping an uncommitted lease cancels it and must never submit partially initialized data, so the GPU transfer command covers only committed bytes without any intermediate CPU-to-CPU buffer copy. Handle frees validate the generation token against the slot table, guaranteeing deterministic detection of double-frees or stale handle releases.
 
 #### Performance evidence
 
@@ -107,31 +107,20 @@ Implement a binary buddy suballocator (power-of-two blocks) for GPU heap space, 
 
 ### Selection rationale
 
-`S-P-011-generation-freelist-mapped-ring` directly satisfies all explicit constraints and both inherited TODO items:
-1. It provides a zero-copy direct staging write lease API (`acquire_staging_vertex_lease`) for procedural mesh generation, avoiding redundant CPU-to-CPU intermediate buffer copies.
-2. It pairs the free-list range allocator with a generation-tagged slot map, guaranteeing O(1) double-free and stale handle detection to eliminate the memory corruption risks documented in the original project.
-3. Unlike buddy allocation, it eliminates internal power-of-two fragmentation on arbitrary mesh vertex counts.
+The generation-checked range allocator portion is implemented. Named vertex heaps and the global index heap return typed owner-validated allocation handles, coalesce removed ranges, reject stale/double/wrong-heap frees, and bind automatically from `[VertexHeap(\"name\")]` reflection on Vulkan, Direct3D 12, and Metal. The index heap remains a native index binding.
 
-### Rejected alternatives
+Removal currently waits for native idle before returning a range to the free list. This is safe but more conservative than token-retired reuse.
+Frame readiness is tracked per heap maximum: that conservative gate remains library safety, while applications decide per-allocation visibility from lossless `DeviceReady` upload events. The forthcoming shared `FrameBeginConfig` keeps this aggregate geometry wait by default and lets event-driven applications set `wait_for_geometry_uploads = false`; its independent `TextureMipWait::None`, `TextureMipWait::Coarsest`, and `TextureMipWait::ThroughLevel(level)` variants govern texture waits. No per-allocation graph-wait optimization is tracked.
 
-- **`S-P-011-offset-freelist-copy-staging`**: Rejected because raw offset tracking fails to detect double-frees or stale range frees during asynchronous failure recovery, and requires redundant CPU-side buffer allocations for procedural geometry generation.
-- **`S-P-011-buddy-allocator-persistent-staging`**: Rejected due to internal fragmentation waste on non-power-of-two vertex counts, which causes premature GPU memory exhaustion on complex geometry assets.
+The mapped staging lease is not implemented. Slice uploads copy caller bytes directly into runtime-owned mapped staging and emit `SourceStaged`; plans and docs must not claim zero-copy procedural generation.
 
-### Evidence summary
+### Remaining work
 
-Eliminates redundant CPU memory copy steps for dynamic mesh uploads and guarantees deterministic O(1) slot validation against slot map generation counters (`[INFERENCE]` from indexed array characteristics and memory copy elimination).
+- expose a lifetime-safe direct mapped staging lease for Rust and C;
+- retire removed ranges against fine-grained graphics completion rather than full context idle;
 
-### Key assumptions
+### Validation
 
-- Named vertex heaps are bound via bindless storage buffer descriptors or vertex buffer bindings in shader reflection.
-- Callers commit staging write leases within the frame they are acquired or return them on cancelation.
+Allocator tests cover coalescing, stale/double/wrong-heap frees, generation identity, and unbounded staging-slot growth. Examples exercise typed heap handles, reflected semantic lookup, queried indirect offsets, and per-frame transient buffers.
 
-### Risks and mitigations
-
-- **Risk:** Staging ring-buffer space exhaustion if procedural leases are held across multiple frames.
-- **Mitigation:** Enforce frame-scoped lifetime bounds on lease guards and implement automatic lease retirement on frame boundary submission.
-
-### Validation actions
-
-1. Unit test free-list coalescing, double-free detection, and handle generation rollover.
-2. Integration test procedural geometry generation using `acquire_staging_vertex_lease` in Example 1 (Triangle) and Example 2 (Textured Cube).
+Evidence on 2026-09-08: workspace nextest 555/555 plus doc tests, strict workspace all-target/all-feature Clippy, formatting, source-line limits, ABI 30 export/layout parity, C11/C++17 header checks, the MSVC C build, hidden examples 32/32, focused ABI 29/29, error 2/2, and Vulkan/DX12 PSO 2/2 passed. The 60-second per-case backend matrices passed on local Windows (HAL/Vulkan/DX12/safe facade 94/94), Linux Vulkan (73/73), and macOS Metal (51/51).

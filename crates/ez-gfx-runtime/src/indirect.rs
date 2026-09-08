@@ -39,31 +39,58 @@ impl IndexedIndirectBuffer {
         })
     }
 
-    /// Replaces the command in the specified allocated slot.
+    /// Replaces a contiguous command range and publishes its prefix.
+    ///
+    /// The active count advances to `max(previous_count, start_index + commands.len())`.
+    /// An empty batch is a no-op.
     ///
     /// # Errors
     ///
-    /// Returns `IndirectError::OutOfBounds` if `index` is outside the allocated command slots.
-    pub fn write(&mut self, index: u32, command: DrawIndexedCommand) -> Result<(), IndirectError> {
+    /// Returns [`IndirectError::OutOfBounds`] when the checked element range
+    /// exceeds the allocated command capacity.
+    pub fn write_batch(
+        &mut self,
+        start_index: u32,
+        commands: &[DrawIndexedCommand],
+    ) -> Result<(), IndirectError> {
+        if commands.is_empty() {
+            return Ok(());
+        }
+        let count = u32::try_from(commands.len()).map_err(|_| IndirectError::OutOfBounds)?;
+        let end = start_index
+            .checked_add(count)
+            .ok_or(IndirectError::OutOfBounds)?;
+        let start = usize::try_from(start_index).map_err(|_| IndirectError::OutOfBounds)?;
+        let end_index = usize::try_from(end).map_err(|_| IndirectError::OutOfBounds)?;
         let destination = self
             .commands
-            .get_mut(index as usize)
+            .get_mut(start..end_index)
             .ok_or(IndirectError::OutOfBounds)?;
-        *destination = command;
+
+        destination.copy_from_slice(commands);
+        self.draw_count = self.draw_count.max(end);
         Ok(())
     }
 
-    /// Publishes the leading `count` command slots for drawing.
+    /// Publishes the active count written by a GPU producer.
+    ///
+    /// CPU writes publish their range through [`Self::write_batch`]. This
+    /// explicit path exists only because GPU command generation cannot update
+    /// the CPU-side publication metadata.
     ///
     /// # Errors
     ///
-    /// Returns `IndirectError::OutOfBounds` if `count` exceeds the allocated command capacity.
-    pub fn set_draw_count(&mut self, count: u32) -> Result<(), IndirectError> {
+    /// Returns [`IndirectError::OutOfBounds`] if `count` exceeds capacity.
+    pub fn publish_generated_count(&mut self, count: u32) -> Result<(), IndirectError> {
         if count as usize > self.commands.len() {
             return Err(IndirectError::OutOfBounds);
         }
         self.draw_count = count;
         Ok(())
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.draw_count = 0;
     }
 
     /// Returns the number of commands currently published for drawing.

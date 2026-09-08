@@ -85,7 +85,7 @@ fn cpu_pool_emits_completion_and_error_once() {
         thread,
         time::{Duration, Instant},
     };
-    let p = ez_gfx_assets::CpuPool::new(2, 2, 1024).unwrap();
+    let p = ez_gfx_assets::CpuPool::new(2).unwrap();
     let q = Arc::new(EventQueue::new(2).unwrap());
     let e = AssetEvent {
         correlation_id: 4,
@@ -117,7 +117,7 @@ fn accepted_shutdown_emits_cancelled() {
         thread,
         time::{Duration, Instant},
     };
-    let p = ez_gfx_assets::CpuPool::new(1, 1, 64).unwrap();
+    let p = ez_gfx_assets::CpuPool::new(1).unwrap();
     let q = Arc::new(EventQueue::new(1).unwrap());
     let e = AssetEvent {
         correlation_id: 1,
@@ -153,7 +153,7 @@ fn panic_releases_job_and_byte_capacity() {
         thread,
         time::{Duration, Instant},
     };
-    let p = ez_gfx_assets::CpuPool::new(1, 1, 8).unwrap();
+    let p = ez_gfx_assets::CpuPool::new(1).unwrap();
     let q = Arc::new(EventQueue::new(2).unwrap());
     let e = AssetEvent {
         correlation_id: 2,
@@ -189,7 +189,7 @@ fn panic_releases_job_and_byte_capacity() {
 
 #[test]
 fn unpolled_completion_reservation_rejects_without_blocking() {
-    let p = ez_gfx_assets::CpuPool::new(1, 2, 8).unwrap();
+    let p = ez_gfx_assets::CpuPool::new(1).unwrap();
     let q = std::sync::Arc::new(EventQueue::new(1).unwrap());
     let event = AssetEvent {
         correlation_id: 7,

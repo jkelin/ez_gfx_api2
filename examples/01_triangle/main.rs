@@ -1,21 +1,22 @@
 //! Triangle using safe ez-gfx context, resource, and frame APIs.
 mod renderer {
-    use anyhow::Context as _;
     use ez_gfx::*;
 
     use crate::shared::{input::*, *};
 
     pub(super) struct Triangle {
         shader: ShaderHandle,
-        indirect: IndirectBufferHandle,
-        bindings: [PublicBinding; 1],
+        first_index: u32,
+        _positions_heap: VertexHeapHandle,
+        _positions: VertexAllocationHandle,
+        _indices: IndexAllocationHandle,
     }
 
     impl Triangle {
         pub(super) fn create(context: ContextHandle) -> anyhow::Result<Self> {
             let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
-                .context("examples package has no workspace parent")?;
+                .ok_or_else(|| anyhow::anyhow!("examples package has no workspace parent"))?;
             let shader_bytes = ez_gfx_compiler::compile_shader(
                 &workspace_root.join("examples/01_triangle/01_triangle.slang"),
                 &[
@@ -24,8 +25,7 @@ mod renderer {
                     ez_gfx_compiler::Target::Metal,
                 ],
                 !cfg!(target_vendor = "apple"),
-            )
-            .context("compile triangle shader")?;
+            )?;
             let vertical = if cfg!(target_vendor = "apple") {
                 -1.0
             } else {
@@ -40,52 +40,20 @@ mod renderer {
 
             let index_bytes = byte_len(&indices)?;
             let positions_bytes = byte_len(&positions)?;
-            status(create_index_heap(context, index_bytes), "create index heap")?;
-            let first_index = upload_indices(context, indices.len() as u32, slice_bytes(&indices))
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-                .context("upload indices")?;
-            let positions_handle = acquire_structured(context, positions_bytes)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-                .context("acquire positions")?;
-            status(
-                write_structured(context, positions_handle, slice_bytes(&positions)),
-                "upload positions",
-            )?;
+            create_index_heap(context, index_bytes)?;
+            let indices_handle = upload_indices(context, &indices)?;
+            let (first_index, _) = index_allocation_range(context, indices_handle)?;
+            let positions_heap = create_vertex_heap(context, "positions", positions_bytes, 16)?;
+            let positions_handle = upload_vertices(context, positions_heap, &positions)?;
 
-            let indirect = acquire_indirect(context, 1)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-                .context("acquire triangle indirect buffer")?;
-            status(
-                write_indirect(
-                    context,
-                    indirect,
-                    0,
-                    DrawIndexedCommand {
-                        index_count: 3,
-                        instance_count: 1,
-                        first_index,
-                        vertex_offset: 0,
-                        first_instance: 0,
-                    },
-                ),
-                "write triangle draw",
-            )?;
-            status(
-                set_indirect_count(context, indirect, 1),
-                "set triangle draw count",
-            )?;
-
-            let shader = load_shader(context, &shader_bytes)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-                .context("load triangle artifact")?;
+            let shader = load_shader(context, &shader_bytes)?;
 
             Ok(Self {
                 shader,
-                indirect,
-                bindings: [PublicBinding {
-                    name: "positions".to_owned(),
-                    resource: ResourceIdentity::Structured(positions_handle),
-                }],
+                first_index,
+                _positions_heap: positions_heap,
+                _positions: positions_handle,
+                _indices: indices_handle,
             })
         }
     }
@@ -96,19 +64,22 @@ mod renderer {
         pub(super) fn update(&mut self, _frame: FrameInput) {}
 
         pub(super) fn record(&mut self, context: ContextHandle) -> anyhow::Result<()> {
-            let bindings = &self.bindings;
+            let indirect = acquire_indirect(context, 1)?;
+            write_indirect(
+                context,
+                indirect,
+                0,
+                &[DrawIndexedCommand {
+                    index_count: 3,
+                    instance_count: 1,
+                    first_index: self.first_index,
+                    vertex_offset: 0,
+                    first_instance: 0,
+                }],
+            )?;
             let state = DynamicPipelineState::from_abi(0, 0, 0, 0).unwrap();
-            status(
-                render_add_graphics(context, self.shader, self.indirect, bindings, state, &[]),
-                "record triangle graphics pipeline",
-            )
-        }
-    }
-
-    fn status(result: EzGfxResult, operation: &str) -> anyhow::Result<()> {
-        match result {
-            EzGfxResult::Ok => Ok(()),
-            error => Err(anyhow::anyhow!("{error:?}").context(operation.to_owned())),
+            render_add_graphics(context, self.shader, indirect, &[], state, &[])?;
+            Ok(())
         }
     }
 }
@@ -116,7 +87,6 @@ mod renderer {
 #[path = "../shared/mod.rs"]
 mod shared;
 
-use anyhow::Context as _;
 use ez_gfx::*;
 use renderer::Triangle as ExampleScene;
 use shared::*;
@@ -141,7 +111,7 @@ impl Example {
         }
     }
 
-    fn context(&self) -> ContextHandle {
+    fn context_handle(&self) -> ContextHandle {
         self.context.expect("example context is initialized")
     }
 
@@ -156,7 +126,7 @@ impl LifecycleCallbacks for Example {
     fn initialize(&mut self, native: NativeSurface, width: u32, height: u32) -> anyhow::Result<()> {
         let config = backend_config(native.platform)?;
         let backend = config.backend;
-        let backend_name = config.name;
+
         let platform = config.platform;
         let context = create_context(ContextOptions {
             enable_debug: env_flag("EZ_GFX_EXAMPLE_DEBUG")?,
@@ -165,9 +135,7 @@ impl LifecycleCallbacks for Example {
             backend,
             texture_decode_workers: 0,
             adapter_selection: None,
-        })
-        .map_err(|error| anyhow::anyhow!("{error:?}"))
-        .with_context(|| format!("create {backend_name} context"))?;
+        })?;
         self.context = Some(context);
         let surface = create_surface(
             context,
@@ -179,27 +147,17 @@ impl LifecycleCallbacks for Example {
                 height,
                 cache_presented_snapshots: false,
             },
-        )
-        .map_err(|error| anyhow::anyhow!("{error:?}"))
-        .with_context(|| format!("create {backend_name} surface"))?;
+        )?;
         self.surface = Some(surface);
-        status(
-            init_device(self.context(), self.surface()),
-            &format!("initialize {backend_name} surface device"),
-        )?;
-        status(
-            resize_surface(self.context(), self.surface(), width, height),
-            &format!("initialize {backend_name} swapchain"),
-        )?;
-        self.resources = Some(ExampleScene::create(self.context())?);
+        init_device(self.context_handle(), self.surface())?;
+        resize_surface(self.context_handle(), self.surface(), width, height)?;
+        self.resources = Some(ExampleScene::create(self.context_handle())?);
         Ok(())
     }
 
     fn resize(&mut self, width: u32, height: u32) -> anyhow::Result<()> {
-        status(
-            resize_surface(self.context(), self.surface(), width, height),
-            "resize presented surface",
-        )
+        resize_surface(self.context_handle(), self.surface(), width, height)?;
+        Ok(())
     }
 
     fn input(&mut self, input: SceneInput) {
@@ -215,43 +173,34 @@ impl LifecycleCallbacks for Example {
         frame_index: u32,
     ) -> anyhow::Result<()> {
         self.benchmark.begin_frame(frame_index);
-        let context = self.context();
+        let context = self.context_handle();
         let surface = self.surface();
         if terminal {
-            status(
-                set_snapshot_cache(context, surface, true),
-                "enable terminal snapshot cache",
-            )?;
+            set_snapshot_cache(context, surface, true)?;
         }
         let resources = self
             .resources
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("example resources are unavailable"))?;
         resources.update(frame);
-        status(begin_render(context, surface), "begin presented frame")?;
+        begin_render(context, surface)?;
         resources.record(context)?;
-        status(finish_render(context), "submit and present example")?;
+        finish_render(context)?;
         self.benchmark.end_frame(frame_index.saturating_add(1));
         Ok(())
     }
 
     fn capture(&mut self, width: u32, height: u32, frames: u32) -> anyhow::Result<ProgramReport> {
-        let rgba8 = frame_readback(self.context())
-            .map_err(|error| anyhow::anyhow!("{error:?}"))
-            .context("read presented snapshot")?;
+        let rgba8 = frame_readback(self.context_handle())?;
         let counts = drain_bounded(
             4096,
             || {
-                poll_runtime_event(self.context())
+                poll_runtime_event(self.context_handle())
                     .map(|(record, dropped)| (record.is_some(), dropped))
-                    .map_err(|error| anyhow::anyhow!("{error:?}"))
-                    .context("poll runtime event")
             },
             || {
-                poll_diagnostic(self.context())
+                poll_diagnostic(self.context_handle())
                     .map(|(record, dropped)| (record.is_some(), dropped))
-                    .map_err(|error| anyhow::anyhow!("{error:?}"))
-                    .context("poll diagnostic")
             },
         )?;
         Ok(ProgramReport {
@@ -296,11 +245,4 @@ fn main() {
         std::process::exit(2);
     });
     run_program("01_triangle", backend, run_example_with_benchmark);
-}
-
-fn status(result: EzGfxResult, operation: &str) -> anyhow::Result<()> {
-    match result {
-        EzGfxResult::Ok => Ok(()),
-        error => Err(anyhow::anyhow!("{error:?}").context(operation.to_owned())),
-    }
 }

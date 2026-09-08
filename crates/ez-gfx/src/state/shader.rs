@@ -1,6 +1,8 @@
+use crate::Result;
+
 use super::{
-    ContextHandle, EzGfxResult, NativeContext, NativePipeline, NativeShader, ResourceKind,
-    ShaderHandle, ShaderRecord, map_hal, map_lifecycle, with_context_mut,
+    ContextHandle, Error, NativeContext, NativePipeline, NativeShader, ResourceKind, ShaderHandle,
+    ShaderRecord, map_hal, map_lifecycle, with_context_mut,
 };
 
 /// Loads every stage from a shader artifact for the context backend.
@@ -8,7 +10,7 @@ use super::{
 /// # Errors
 ///
 /// Returns an error for invalid handles, malformed artifacts, missing backend products, or native shader failure.
-pub fn load_shader(context: ContextHandle, artifact: &[u8]) -> Result<ShaderHandle, EzGfxResult> {
+pub fn load_shader(context: ContextHandle, artifact: &[u8]) -> Result<ShaderHandle> {
     with_context_mut(context, |context| {
         context
             .identity
@@ -20,7 +22,7 @@ pub fn load_shader(context: ContextHandle, artifact: &[u8]) -> Result<ShaderHand
             context.options.backend,
             ez_gfx_core::capability::SemanticProfile::V1,
         )
-        .map_err(|_| EzGfxResult::InvalidArgument)?;
+        .map_err(|_| Error::InvalidArgument)?;
         let graphics = shader.graphics_pair().ok().map(|(vertex, fragment)| {
             (
                 vertex.0,
@@ -41,9 +43,9 @@ pub fn load_shader(context: ContextHandle, artifact: &[u8]) -> Result<ShaderHand
                     .merge(&shader.pipeline_layout(ez_gfx_artifact::Stage::Fragment)?)
             })
             .transpose()
-            .map_err(|_| EzGfxResult::InvalidArgument)?;
+            .map_err(|_| Error::InvalidArgument)?;
         if graphics.is_none() && compute.is_none() {
-            return Err(EzGfxResult::InvalidArgument);
+            return Err(Error::InvalidArgument);
         }
         let products = shader
             .products()
@@ -69,7 +71,7 @@ pub fn load_shader(context: ContextHandle, artifact: &[u8]) -> Result<ShaderHand
                 return Err(map_lifecycle(error));
             }
         };
-        let typed = ShaderHandle::from_packed(handle).map_err(|_| EzGfxResult::NativeFailure)?;
+        let typed = ShaderHandle::from_packed(handle).map_err(|_| Error::NativeFailure)?;
         context.shaders.insert(
             typed,
             ShaderRecord {
@@ -104,7 +106,7 @@ pub fn destroy_shader(context: ContextHandle, shader: ShaderHandle) {
         let native = context
             .shaders
             .remove(&shader)
-            .ok_or(EzGfxResult::InvalidContext)?;
+            .ok_or(Error::InvalidContext)?;
         destroy_native_shader(&mut context.native, native.native);
         Ok(())
     });

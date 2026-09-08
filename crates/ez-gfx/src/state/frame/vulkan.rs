@@ -1,14 +1,17 @@
+use crate::Result;
+
 use super::{
-    Backend, ContextState, ExecutableNode, ExecutionAction, ExecutionBarrier, ExecutionPass,
-    EzGfxResult, FrameExecutionPlan, FrameNativeResource, HashMap, MAX_PIPELINE_CACHE_ENTRIES,
-    NativeAllocation, NativeContext, NativePipeline, NativeShader, NativeSurface, NativeTexture,
-    NativeTextureMap, PackedHandle, PipelineKey, RenderTargetHandle, RenderTargetRecord,
-    ResourceId, SURFACE_DEFAULT_CLEAR, ShaderHandle, ShaderRecord, map_hal, native_layouts,
-    pipeline_layout_key, vulkan_bindings,
+    Backend, ContextState, Error, ExecutableNode, ExecutionAction, ExecutionBarrier, ExecutionPass,
+    FrameExecutionPlan, FrameNativeResource, GeometryAllocation, HashMap,
+    MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext, NativePipeline, NativeShader,
+    NativeSurface, NativeTexture, NativeTextureMap, PackedHandle, PipelineKey, RenderTargetHandle,
+    RenderTargetRecord, ResourceId, SURFACE_DEFAULT_CLEAR, ShaderHandle, ShaderRecord, map_hal,
+    native_layouts, pipeline_layout_key, vulkan_bindings,
 };
 
 struct VulkanActionState<'a> {
     allocations: &'a HashMap<PackedHandle, (u64, NativeAllocation)>,
+    vertex_heaps: &'a HashMap<String, GeometryAllocation>,
     textures: &'a NativeTextureMap,
     render_targets: &'a HashMap<RenderTargetHandle, RenderTargetRecord>,
     resources: &'a HashMap<ResourceId, FrameNativeResource>,
@@ -21,19 +24,19 @@ struct VulkanActionState<'a> {
 trait VulkanRef {
     type Native;
 
-    fn vulkan(&self) -> Result<&Self::Native, EzGfxResult>;
+    fn vulkan(&self) -> Result<&Self::Native>;
 }
 
 trait VulkanMut {
     type Native;
 
-    fn vulkan_mut(&mut self) -> Result<&mut Self::Native, EzGfxResult>;
+    fn vulkan_mut(&mut self) -> Result<&mut Self::Native>;
 }
 
 trait IntoVulkan {
     type Native;
 
-    fn into_vulkan(self) -> Result<Self::Native, EzGfxResult>;
+    fn into_vulkan(self) -> Result<Self::Native>;
 }
 
 macro_rules! impl_vulkan_ref {
@@ -41,11 +44,11 @@ macro_rules! impl_vulkan_ref {
         impl VulkanRef for $wrapper {
             type Native = $native;
 
-            fn vulkan(&self) -> Result<&Self::Native, EzGfxResult> {
+            fn vulkan(&self) -> Result<&Self::Native> {
                 match self {
                     $variant(native) => Ok(native),
                     #[cfg(any(windows, target_vendor = "apple"))]
-                    _ => Err(EzGfxResult::NativeFailure),
+                    _ => Err(Error::NativeFailure),
                 }
             }
         }
@@ -76,11 +79,11 @@ impl_vulkan_ref!(
 impl VulkanMut for NativeContext {
     type Native = ez_gfx_backend_vulkan::NativeContext;
 
-    fn vulkan_mut(&mut self) -> Result<&mut Self::Native, EzGfxResult> {
+    fn vulkan_mut(&mut self) -> Result<&mut Self::Native> {
         match self {
             Self::Vulkan(native) => Ok(native),
             #[cfg(any(windows, target_vendor = "apple"))]
-            _ => Err(EzGfxResult::NativeFailure),
+            _ => Err(Error::NativeFailure),
         }
     }
 }
@@ -88,11 +91,11 @@ impl VulkanMut for NativeContext {
 impl VulkanMut for NativeSurface {
     type Native = ez_gfx_backend_vulkan::NativeSurface;
 
-    fn vulkan_mut(&mut self) -> Result<&mut Self::Native, EzGfxResult> {
+    fn vulkan_mut(&mut self) -> Result<&mut Self::Native> {
         match self {
             Self::Vulkan(native) => Ok(native),
             #[cfg(any(windows, target_vendor = "apple"))]
-            _ => Err(EzGfxResult::NativeFailure),
+            _ => Err(Error::NativeFailure),
         }
     }
 }
@@ -100,11 +103,11 @@ impl VulkanMut for NativeSurface {
 impl IntoVulkan for NativePipeline {
     type Native = ez_gfx_backend_vulkan::NativePipeline;
 
-    fn into_vulkan(self) -> Result<Self::Native, EzGfxResult> {
+    fn into_vulkan(self) -> Result<Self::Native> {
         match self {
             Self::Vulkan(native) => Ok(native),
             #[cfg(any(windows, target_vendor = "apple"))]
-            _ => Err(EzGfxResult::NativeFailure),
+            _ => Err(Error::NativeFailure),
         }
     }
 }
@@ -116,7 +119,7 @@ fn prepare_vulkan_surface(
     graphics_format: &mut Option<u32>,
     surface: Option<&ez_gfx_backend_vulkan::NativeSurface>,
     extent: (u32, u32),
-) -> Result<(), EzGfxResult> {
+) -> Result<()> {
     if let Some(surface) = surface {
         native
             .prepare_surface(surface, extent.0, extent.1)
@@ -143,16 +146,13 @@ fn prepare_vulkan_pipelines(
     shaders: &HashMap<ShaderHandle, ShaderRecord>,
     pipelines: &mut HashMap<PipelineKey, NativePipeline>,
     payloads: &[ExecutableNode],
-) -> Result<Vec<Option<PipelineKey>>, EzGfxResult> {
+) -> Result<Vec<Option<PipelineKey>>> {
     let mut pipeline_keys: Vec<Option<PipelineKey>> = (0..payloads.len()).map(|_| None).collect();
     for (node_index, payload) in payloads.iter().enumerate() {
         let (key, pipeline) = match payload {
             ExecutableNode::Compute { shader, layout, .. } => {
-                let record = shaders.get(shader).ok_or(EzGfxResult::InvalidContext)?;
-                let compute = record
-                    .compute
-                    .as_ref()
-                    .ok_or(EzGfxResult::InvalidArgument)?;
+                let record = shaders.get(shader).ok_or(Error::InvalidContext)?;
+                let compute = record.compute.as_ref().ok_or(Error::InvalidArgument)?;
                 let native_shader = record.native.vulkan()?;
                 let layouts = native_layouts(layout).map_err(map_hal)?;
                 let key = PipelineKey::Compute {
@@ -181,11 +181,8 @@ fn prepare_vulkan_pipelines(
                 state,
                 ..
             } => {
-                let record = shaders.get(shader).ok_or(EzGfxResult::InvalidContext)?;
-                let graphics = record
-                    .graphics
-                    .as_ref()
-                    .ok_or(EzGfxResult::InvalidArgument)?;
+                let record = shaders.get(shader).ok_or(Error::InvalidContext)?;
+                let graphics = record.graphics.as_ref().ok_or(Error::InvalidArgument)?;
                 let native_shader = record.native.vulkan()?;
                 let layouts = native_layouts(layout).map_err(map_hal)?;
                 let depth_required = pipeline_layout.depth_required();
@@ -250,26 +247,23 @@ fn prepare_vulkan_pipelines(
 fn vulkan_barrier_resource<'a>(
     state: &'a VulkanActionState<'a>,
     barrier: &ExecutionBarrier,
-) -> Result<ez_gfx_backend_vulkan::NativeFrameResource<'a>, EzGfxResult> {
+) -> Result<ez_gfx_backend_vulkan::NativeFrameResource<'a>> {
     let resource = state
         .resources
         .get(&ResourceId::from_index(barrier.resource))
-        .ok_or(EzGfxResult::InvalidArgument)?;
+        .ok_or(Error::InvalidArgument)?;
     Ok(match *resource {
         FrameNativeResource::Buffer(handle) => {
             let allocation = state
                 .allocations
                 .get(&handle)
-                .ok_or(EzGfxResult::InvalidContext)?
+                .ok_or(Error::InvalidContext)?
                 .1
                 .vulkan()?;
             ez_gfx_backend_vulkan::NativeFrameResource::Buffer(allocation)
         }
         FrameNativeResource::Texture(handle) => {
-            let (_, texture, _, _, _) = state
-                .textures
-                .get(&handle)
-                .ok_or(EzGfxResult::InvalidContext)?;
+            let (_, texture, _, _, _) = state.textures.get(&handle).ok_or(Error::InvalidContext)?;
             ez_gfx_backend_vulkan::NativeFrameResource::Texture(texture.vulkan()?)
         }
         FrameNativeResource::Surface(_) => ez_gfx_backend_vulkan::NativeFrameResource::Surface,
@@ -277,13 +271,21 @@ fn vulkan_barrier_resource<'a>(
             let record = state
                 .render_targets
                 .get(&handle)
-                .ok_or(EzGfxResult::InvalidContext)?;
+                .ok_or(Error::InvalidContext)?;
             ez_gfx_backend_vulkan::NativeFrameResource::RenderTarget(record.native.vulkan()?)
         }
         FrameNativeResource::Depth => ez_gfx_backend_vulkan::NativeFrameResource::Depth,
-        FrameNativeResource::Index => ez_gfx_backend_vulkan::NativeFrameResource::Buffer(
-            state.index.ok_or(EzGfxResult::NotReady)?,
-        ),
+        FrameNativeResource::Index => {
+            ez_gfx_backend_vulkan::NativeFrameResource::Buffer(state.index.ok_or(Error::NotReady)?)
+        }
+        FrameNativeResource::VertexHeap(heap_id) => {
+            let allocation = state
+                .vertex_heaps
+                .values()
+                .find(|heap| heap.heap_id == Some(heap_id))
+                .ok_or(Error::InvalidContext)?;
+            ez_gfx_backend_vulkan::NativeFrameResource::Buffer(allocation.allocation.vulkan()?)
+        }
     })
 }
 
@@ -293,13 +295,13 @@ fn vulkan_barrier_resource<'a>(
 fn vulkan_pass_colors<'a>(
     state: &'a VulkanActionState<'a>,
     pass: &ExecutionPass,
-) -> Result<Vec<ez_gfx_backend_vulkan::PassAttachment<'a>>, EzGfxResult> {
+) -> Result<Vec<ez_gfx_backend_vulkan::PassAttachment<'a>>> {
     let mut colors = Vec::with_capacity(pass.colors.len());
     for index in &pass.colors {
         let resource = state
             .resources
             .get(&ResourceId::from_index(*index))
-            .ok_or(EzGfxResult::InvalidArgument)?;
+            .ok_or(Error::InvalidArgument)?;
         colors.push(match *resource {
             FrameNativeResource::Surface(_) => ez_gfx_backend_vulkan::PassAttachment {
                 resource: ez_gfx_backend_vulkan::NativeFrameResource::Surface,
@@ -309,7 +311,7 @@ fn vulkan_pass_colors<'a>(
                 let record = state
                     .render_targets
                     .get(&handle)
-                    .ok_or(EzGfxResult::InvalidContext)?;
+                    .ok_or(Error::InvalidContext)?;
                 ez_gfx_backend_vulkan::PassAttachment {
                     resource: ez_gfx_backend_vulkan::NativeFrameResource::RenderTarget(
                         record.native.vulkan()?,
@@ -317,7 +319,7 @@ fn vulkan_pass_colors<'a>(
                     clear: super::super::render_target::render_target_clear_color(record),
                 }
             }
-            _ => return Err(EzGfxResult::InvalidArgument),
+            _ => return Err(Error::InvalidArgument),
         });
     }
     Ok(colors)
@@ -330,7 +332,7 @@ fn vulkan_actions<'a>(
     payloads: &'a [ExecutableNode],
     binding_sets: &'a [Vec<ez_gfx_backend_vulkan::NativeBufferBinding<'a>>],
     pipeline_keys: &[Option<PipelineKey>],
-) -> Result<Vec<ez_gfx_backend_vulkan::NativeFrameAction<'a>>, EzGfxResult> {
+) -> Result<Vec<ez_gfx_backend_vulkan::NativeFrameAction<'a>>> {
     let mut actions = Vec::with_capacity(plan.actions.len());
     for action in &plan.actions {
         match action {
@@ -352,9 +354,7 @@ fn vulkan_actions<'a>(
             }
             ExecutionAction::ExecuteNode(node) => {
                 let index_node = *node as usize;
-                let payload = payloads
-                    .get(index_node)
-                    .ok_or(EzGfxResult::InvalidArgument)?;
+                let payload = payloads.get(index_node).ok_or(Error::InvalidArgument)?;
                 match payload {
                     ExecutableNode::Compute {
                         groups,
@@ -363,11 +363,11 @@ fn vulkan_actions<'a>(
                     } => {
                         let key = pipeline_keys[index_node]
                             .as_ref()
-                            .ok_or(EzGfxResult::InvalidArgument)?;
+                            .ok_or(Error::InvalidArgument)?;
                         let pipeline = state
                             .pipelines
                             .get(key)
-                            .ok_or(EzGfxResult::NativeFailure)?
+                            .ok_or(Error::NativeFailure)?
                             .vulkan()?;
                         actions.push(ez_gfx_backend_vulkan::NativeFrameAction::Compute(
                             ez_gfx_backend_vulkan::NativeComputeDispatch {
@@ -387,23 +387,23 @@ fn vulkan_actions<'a>(
                         let indirect = state
                             .allocations
                             .get(&indirect.packed())
-                            .ok_or(EzGfxResult::InvalidContext)?
+                            .ok_or(Error::InvalidContext)?
                             .1
                             .vulkan()?;
                         let key = pipeline_keys[index_node]
                             .as_ref()
-                            .ok_or(EzGfxResult::InvalidArgument)?;
+                            .ok_or(Error::InvalidArgument)?;
                         let pipeline = state
                             .pipelines
                             .get(key)
-                            .ok_or(EzGfxResult::NativeFailure)?
+                            .ok_or(Error::NativeFailure)?
                             .vulkan()?;
                         actions.push(ez_gfx_backend_vulkan::NativeFrameAction::Graphics(
                             ez_gfx_backend_vulkan::NativeDrawIndexed {
                                 width: state.extent.0,
                                 height: state.extent.1,
                                 pipeline,
-                                index_buffer: state.index.ok_or(EzGfxResult::NotReady)?,
+                                index_buffer: state.index.ok_or(Error::NotReady)?,
                                 indirect_buffer: indirect,
                                 draw_count: *draw_count,
                                 push_constants,
@@ -412,10 +412,8 @@ fn vulkan_actions<'a>(
                         ));
                     }
                     ExecutableNode::TextureReadback { texture } => {
-                        let (_, texture, width, height, _) = state
-                            .textures
-                            .get(texture)
-                            .ok_or(EzGfxResult::InvalidContext)?;
+                        let (_, texture, width, height, _) =
+                            state.textures.get(texture).ok_or(Error::InvalidContext)?;
                         let texture = texture.vulkan()?;
                         actions.push(ez_gfx_backend_vulkan::NativeFrameAction::TextureReadback {
                             texture,
@@ -440,7 +438,7 @@ pub(super) fn execute_vulkan_frame_plan(
     context: &mut ContextState,
     plan: &FrameExecutionPlan,
     payloads: &[ExecutableNode],
-) -> Result<(), EzGfxResult> {
+) -> Result<()> {
     let surface_handle = payloads.iter().find_map(|payload| match payload {
         ExecutableNode::Present { surface } => Some(*surface),
         _ => None,
@@ -450,7 +448,7 @@ pub(super) fn execute_vulkan_frame_plan(
             context
                 .surfaces
                 .remove(&handle)
-                .ok_or(EzGfxResult::InvalidContext)
+                .ok_or(Error::InvalidContext)
         })
         .transpose()?;
     // Target-only frames size draws and validations from the target extents.
@@ -480,7 +478,7 @@ pub(super) fn execute_vulkan_frame_plan(
         if let (Some(handle), Some(surface)) = (surface_handle, surface) {
             context.surfaces.insert(handle, surface);
         }
-        return Err(EzGfxResult::NativeFailure);
+        return Err(Error::NativeFailure);
     }
     if surface.as_ref().is_some_and(
         |surface| matches!(&surface.native, NativeSurface::Vulkan(native) if native.is_headless()),
@@ -488,7 +486,7 @@ pub(super) fn execute_vulkan_frame_plan(
         if let (Some(handle), Some(surface)) = (surface_handle, surface) {
             context.surfaces.insert(handle, surface);
         }
-        return Err(EzGfxResult::Unsupported);
+        return Err(Error::Unsupported);
     }
     let mut native_surface = surface
         .as_mut()
@@ -513,14 +511,21 @@ pub(super) fn execute_vulkan_frame_plan(
             }
             | ExecutableNode::Graphics {
                 layout, bindings, ..
-            } => vulkan_bindings(layout, bindings, &context.allocations).map_err(map_hal),
+            } => vulkan_bindings(
+                layout,
+                bindings,
+                &context.allocations,
+                &context.vertex_heaps,
+            )
+            .map_err(map_hal),
             ExecutableNode::TextureReadback { .. } | ExecutableNode::Present { .. } => {
                 Ok(Vec::new())
             }
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     let state = VulkanActionState {
         allocations: &context.allocations,
+        vertex_heaps: &context.vertex_heaps,
         textures: &context.textures,
         render_targets: &context.render_targets,
         pipelines: &context.pipelines,
@@ -553,7 +558,7 @@ pub(super) fn execute_vulkan_frame_plan(
                     if let (Some(handle), Some(surface)) = (surface_handle, surface) {
                         context.surfaces.insert(handle, surface);
                     }
-                    return Err(EzGfxResult::NativeFailure);
+                    return Err(Error::NativeFailure);
                 };
                 context.last_readback.clone_from(readback);
             }

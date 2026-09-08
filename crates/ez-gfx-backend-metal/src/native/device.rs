@@ -1,11 +1,12 @@
 use super::{
     AdapterCapabilities, AdapterClass, AdapterInfo, AllocationError, AllocationSizes, Allocator,
-    AllocatorCreateDesc, BACKEND, CompressionSupport, DEFAULT_ALLOCATION_BLOCK_POLICY,
-    DeferredNativeResource, DeferredResource, FRAMES_IN_FLIGHT, FrameSlot, FrameSlotTracker,
-    HalError, MTLArgumentBuffersTier, MTLCommandBuffer, MTLCommandBufferStatus, MTLCopyAllDevices,
-    MTLCreateSystemDefaultDevice, MTLDevice, MemoryAllocator, NativeContext, NativeSurface,
-    ProtocolObject, QueueKind, Retained, SemanticProfile, TEXTURE_DESCRIPTOR_CAPACITY,
-    complete_deferred_slot, map_allocation_hal, map_allocator, map_allocator_hal,
+    AllocatorCreateDesc, BACKEND, CompletionToken, CompressionSupport,
+    DEFAULT_ALLOCATION_BLOCK_POLICY, DeferredNativeResource, DeferredResource, FRAMES_IN_FLIGHT,
+    FrameSlot, FrameSlotTracker, HalError, MTLArgumentBuffersTier, MTLCommandBuffer,
+    MTLCommandBufferStatus, MTLCopyAllDevices, MTLCreateSystemDefaultDevice, MTLDevice,
+    MemoryAllocator, NativeContext, NativeSurface, ProtocolObject, QueueKind, Retained,
+    SemanticProfile, TEXTURE_DESCRIPTOR_CAPACITY, complete_deferred_slot, map_allocation_hal,
+    map_allocator, map_allocator_hal,
 };
 
 /// Architecture-guaranteed render-target roles per format.
@@ -213,9 +214,13 @@ impl NativeContext {
                 .map(|_| FrameSlot {
                     command: None,
                     argument_buffers: Vec::new(),
+                    submission_value: 0,
                 })
                 .collect(),
             frame_tracker: FrameSlotTracker::default(),
+            next_frame_value: 1,
+            last_frame_value: 0,
+            completed_frame_value: 0,
             deferred: Vec::new(),
             adapter,
             drain_complete: true,
@@ -370,6 +375,7 @@ impl NativeContext {
             self.frame_slots[slot].command = None;
             self.frame_tracker.mark_completed(slot);
         }
+        self.completed_frame_value = self.last_frame_value;
         let deferred = self
             .deferred
             .drain(..)
@@ -395,6 +401,9 @@ impl NativeContext {
             false
         };
         self.frame_tracker.mark_completed(slot);
+        self.completed_frame_value = self
+            .completed_frame_value
+            .max(self.frame_slots[slot].submission_value);
 
         let mut index = 0;
         while index < self.deferred.len() {
@@ -435,6 +444,16 @@ impl NativeContext {
                 let _ = self.complete_frame_slot(slot);
             }
         }
+    }
+    /// Returns the most recently submitted graphics-frame token.
+    pub fn last_frame_completion(&self) -> Option<CompletionToken> {
+        CompletionToken::new(QueueKind::Graphics, self.last_frame_value).ok()
+    }
+
+    /// Polls command buffers and returns the completed graphics-frame prefix.
+    pub fn completed_frame_value(&mut self) -> Result<u64, AllocationError> {
+        self.poll_frame_completion();
+        Ok(self.completed_frame_value)
     }
 
     pub(super) fn defer_resource(

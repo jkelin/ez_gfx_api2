@@ -1,8 +1,8 @@
 # Compute Structured
 
-Showcases a GLB scene rendered from structured buffers, with a compute pass generating indexed-indirect draw commands for the graphics pass.
+Showcases a GLB scene rendered from reflected named vertex heaps, with structured primitive records and compute-generated indexed-indirect commands.
 
-`main.rs` is the complete renderer. It loads the shared `../shared/assets/sponza.glb`, uploads positions, normals, primitive records, and indices, and allocates the indirect buffer. Each frame, `render_add_compute` dispatches one workgroup per primitive to write draw commands; `render_add_graphics` then consumes that indirect buffer with the same structured bindings and MVP push constants. The artifact is loaded with `load_shader`.
+`main.rs` retains typed position/normal heap and allocation handles. Each frame acquires fresh structured primitive and indirect buffers, writes the primitive records, explicitly publishes the CPU-known compute output count, then shares both handles from compute to graphics in that frame.
 
 Run:
 

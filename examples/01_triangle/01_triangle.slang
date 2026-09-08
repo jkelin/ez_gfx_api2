@@ -1,6 +1,6 @@
 import "../../ez_gfx_api";
 
-[StructuredBuffer("positions")]
+[VertexHeap("positions")]
 StructuredBuffer<float4> positions;
 
 struct VertexOutput {

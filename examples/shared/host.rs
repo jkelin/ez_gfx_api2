@@ -1,5 +1,4 @@
 #[cfg(any(windows, target_vendor = "apple"))]
-use anyhow::Context as _;
 use ez_gfx::{Backend, SurfacePlatform};
 #[cfg(any(windows, target_vendor = "apple"))]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -98,10 +97,7 @@ impl HostSurface {
         #[cfg(not(any(windows, target_vendor = "apple")))]
         let _ = window;
         #[cfg(any(windows, target_vendor = "apple"))]
-        let raw = window
-            .window_handle()
-            .context("get native window handle")?
-            .as_raw();
+        let raw = window.window_handle()?.as_raw();
         #[cfg(windows)]
         if let RawWindowHandle::Win32(handle) = raw {
             let display = handle

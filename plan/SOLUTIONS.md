@@ -338,7 +338,7 @@ Probe time, clear cost, and frame impact are unknown. D16 has fewer raw bytes pe
 
 ### Problem and required outcome
 
-Manage named bindless vertex heaps and a global index heap with validated stride/capacity, deterministic stale/double-free detection, and a direct mapped staging-write path for generated geometry. Depends on P-004; supplies upload ranges and readiness to P-012/P-013.
+Manage named bindless vertex heaps and a global index heap with validated stride/capacity, deterministic stale/double-free detection, and a direct mapped staging-write path for generated geometry. Depends on P-004 and supplies geometry staging to P-012.
 
 ### Decision
 
@@ -369,7 +369,7 @@ Indexed handle validation is constant-time by data-structure design, and direct 
 
 ### Problem and required outcome
 
-Recycle host-visible staging memory, batch vertex/index/texture copies, and remove shared timeline serialization without synchronously waiting per upload. Depends on P-003/P-004/P-011; supplies staging and batches to P-013/P-015.
+Recycle host-visible staging memory, batch vertex/index/texture copies, and remove shared timeline serialization without synchronously waiting per upload. Depends on P-003/P-004/P-011; supplies staging and submitted transfer prefixes to P-013/P-015.
 
 ### Decision
 
@@ -396,36 +396,25 @@ Pooling removes repeated allocation/destruction by construction; batching reduce
 - Risks include high-water memory retention, starvation behind batch thresholds, oversize churn, non-coherent flush errors, and completion-domain mixups.
 - Stress repeated mixed-size uploads; verify no reuse before completion; compare allocations, submits, staging bytes/capacity, queue latency, readiness latency, and CPU recording time across threshold policies; test idle trimming.
 
-## P-013: Upload synchronization — Per-resource GPU timeline dependencies
+## P-013: Frame-level upload readiness policy
 
 ### Problem and required outcome
 
-Remove global host waits at frame start, wait only for resources referenced by active work, and move managed-target clear dependencies to GPU queues. Depends on P-003/P-008/P-012; feeds non-blocking texture/draw behavior in P-015/P-016.
+Configure upload visibility once per frame without coupling asset readiness to graph nodes, resource discovery, or draw batching. Depends on P-003/P-012/P-015 and feeds P-016.
 
 ### Decision
 
-Attach a submitted completion token and queue identity to each uploaded allocation/subresource. During graph compilation, collect tokens for referenced resources, validate that each token is reachable from a submitted batch, coalesce waits per queue/domain, and encode queue-side dependencies plus ownership/state transitions. Frame-start target clears use the same graph dependency model. CPU code never waits merely because unrelated uploads exist.
+One immutable `FrameBeginConfig` serves surface, render-target, and headless begin paths. Geometry upload waits default on and cover vertex plus index heaps; `wait_for_geometry_uploads = false` transfers visible-use scheduling to `DeviceReady` consumers. `TextureMipWait` defaults to `Coarsest`; `None` disables frame submission texture-upload waits only, while `ThroughLevel(level)` requires readiness through the selected minimum mip, where mip 0 is finest and higher numeric levels are coarser and uploaded first. Under `None`, applications gate first texture visibility through `DeviceReady` or a fallback and finer residency through `set_texture_residency`/`texture_residency`.
 
-### Performance and tradeoffs
+Submission applies enabled reachable readiness once as at most one aggregate prefix per active transfer domain for the whole frame. It never attaches asset-upload waits to particular textures, allocations, draws, graph resources, or graph nodes. `TextureMipWait::None` does not stop polling, completion-gated descriptor publication, recycling, progressive uploads, events, or loss handling. Generic graph hazards/barriers and frame-local synchronization remain intact.
 
-The design removes unconditional host waits; actual CPU savings and transfer/graphics overlap depend on workload and hardware and are unmeasured. Per-resource tokens consume metadata and graph processing. Coalescing to a maximum value is valid only within one ordered timeline domain; independent domains require separate waits.
+### Superseded design
 
-### Rejected alternatives
-
-- Placeholder-only readiness: useful texture policy but invalid for missing geometry and not a general synchronization solution.
-- Global timeline drain: hard failure because unrelated work blocks frame start.
-
-### Evidence
-
-- [Vulkan timeline semaphore rules](https://docs.vulkan.org/spec/latest/chapters/synchronization.html#synchronization-semaphores-timeline) define queue-side signal/wait semantics.
-- [Vulkan timeline sample](https://docs.vulkan.org/samples/latest/samples/extensions/timeline_semaphore/) demonstrates cross-queue ordering.
-- Original `src/render.odin`, `src/ctx.odin`, and `TODO.md` identify global host waits.
+Per-resource and per-draw GPU timeline dependency collection is retired. Named heap imports, indirect commands, graph reordering, and transfer batching make exact asset-to-node wait placement disproportionately complex. The current heap-maximum and first-texture-ready waits are safe historical implementation facts to replace with the frame-level policy.
 
 ### Assumptions, risks, and validation
 
-- Assumption—every readiness token is published only after its signaling submission is guaranteed.
-- An unreachable token can deadlock the GPU; omitted ownership/state transitions can corrupt output.
-- Model-check submitted/unsubmitted/cancelled batches; run mixed vertex/texture/clear dependencies; assert unrelated uploads do not enter waits; measure host `begin_render`, graph compile, queue idle, and overlap with named hardware and captures.
+Only submitted, reachable transfer prefixes selected by the frame policy may enter its snapshot. Applications selecting either manual mode must honor `DeviceReady`; texture users must retain a fallback until first publication and use the residency APIs for finer levels. Delayed texture descriptor publication remains part of readiness even under `None`. Validate defaults, all texture-policy tags and mip ranges, manual geometry and texture scheduling, mixed chains, during-recording uploads, continued polling/recycling/progressive upload, failure/loss, all begin paths, Rust/C ABI parity, and all three backends. Prove at most one aggregate prefix per enabled active transfer domain and no asset-specific graph wait actions.
 
 ## P-014: Basis Universal and compressed textures — Feature-gated official transcoder wrapper
 
@@ -710,7 +699,7 @@ One floor avoids hot-path/profile branching and multiplies neither cache nor con
 
 ### Problem and required outcome
 
-Device loss/removal must transition queues, resources, pending jobs, callbacks, handles, caches, and FFI callers without deadlock, stale reuse, unwinding, or stranded work. Depends on P-002/P-003/P-004/P-007/P-012/P-013/P-017/P-018 and gates P-020.
+Device loss/removal must transition queues, resources, pending jobs, callbacks, handles, caches, and FFI callers without deadlock, stale reuse, unwinding, or stranded work. Depends on P-002/P-003/P-004/P-007/P-012/P-017/P-018 and gates P-020.
 
 ### Decision
 

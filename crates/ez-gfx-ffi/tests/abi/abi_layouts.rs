@@ -247,6 +247,23 @@ fn layouts_are_stable() {
         [0, 8, 16, 17, 18, 19]
     );
     assert_eq!(
+        (
+            size_of::<EzGfxUploadEvent>(),
+            align_of::<EzGfxUploadEvent>()
+        ),
+        (16, 8)
+    );
+    assert_eq!(
+        [
+            offset_of!(EzGfxUploadEvent, resource),
+            offset_of!(EzGfxUploadEvent, resource_kind),
+            offset_of!(EzGfxUploadEvent, status),
+            offset_of!(EzGfxUploadEvent, error),
+            offset_of!(EzGfxUploadEvent, _padding)
+        ],
+        [0, 8, 9, 10, 11]
+    );
+    assert_eq!(
         (size_of::<EzGfxDiagnostic>(), align_of::<EzGfxDiagnostic>()),
         (32, 8)
     );
@@ -284,6 +301,7 @@ fn all_public_export_signatures_are_stable() {
     type Handle = u64;
 
     let _: extern "C" fn() -> u32 = ffi::ez_gfx_abi_version;
+    let _: unsafe extern "C" fn(u8, *mut u8, usize, *mut usize) -> Status = ffi::ez_gfx_print_error;
     let _: unsafe extern "C" fn(*const EzGfxContextDesc, *mut Handle) -> Status =
         ffi::ez_gfx_context_create;
     let _: unsafe extern "C" fn(*const EzGfxBackendContextDesc, *mut Handle) -> Status =
@@ -312,7 +330,6 @@ fn all_public_export_signatures_are_stable() {
         *mut Handle,
         Handle,
     ) -> Status = ffi::ez_gfx_texture_load;
-    let _: extern "C" fn(Handle, Handle) -> Status = ffi::ez_gfx_texture_poll;
     let _: extern "C" fn(Handle, Handle) -> Status = ffi::ez_gfx_texture_cancel;
     let _: unsafe extern "C" fn(Handle, *mut u32, Handle) -> Status =
         ffi::ez_gfx_texture_get_binding;
@@ -340,9 +357,15 @@ fn all_public_export_signatures_are_stable() {
     let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_frame_begin;
     let _: unsafe extern "C" fn(u32, *const u8, usize, *mut Handle, Handle) -> Status =
         ffi::ez_gfx_acquire_indirect;
-    let _: unsafe extern "C" fn(Handle, u32, *const EzGfxDrawIndexedCommand, Handle) -> Status =
-        ffi::ez_gfx_indirect_write_draw;
-    let _: extern "C" fn(Handle, u32, Handle) -> Status = ffi::ez_gfx_indirect_set_draw_count;
+    let _: unsafe extern "C" fn(
+        Handle,
+        u32,
+        *const EzGfxDrawIndexedCommand,
+        u32,
+        Handle,
+    ) -> Status = ffi::ez_gfx_indirect_write_draws;
+    let _: extern "C" fn(Handle, u32, Handle) -> Status =
+        ffi::ez_gfx_indirect_publish_compute_count;
     let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_indirect_release;
     let _: unsafe extern "C" fn(
         Handle,
@@ -369,31 +392,32 @@ fn all_public_export_signatures_are_stable() {
     let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_frame_submit;
     let _: unsafe extern "C" fn(*mut EzGfxRuntimeRecord, *mut u8, *mut u64, Handle) -> Status =
         ffi::ez_gfx_poll_runtime_event;
+    let _: unsafe extern "C" fn(*mut EzGfxUploadEvent, *mut u8, Handle) -> Status =
+        ffi::ez_gfx_poll_upload_event;
     let _: unsafe extern "C" fn(*mut EzGfxDiagnostic, *mut u8, *mut u64, Handle) -> Status =
         ffi::ez_gfx_poll_diagnostic;
     let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_finish_render;
     let _: unsafe extern "C" fn(*mut u8, usize, *mut usize, Handle) -> Status =
         ffi::ez_gfx_frame_readback;
-    let _: unsafe extern "C" fn(*const u8, usize, u64, u64, Handle) -> Status =
+    let _: unsafe extern "C" fn(*const u8, usize, u64, u64, *mut Handle, Handle) -> Status =
         ffi::ez_gfx_vertex_heap_create;
-    let _: unsafe extern "C" fn(*const u8, usize, Handle) = ffi::ez_gfx_vertex_heap_destroy;
+    let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_vertex_heap_destroy;
     let _: unsafe extern "C" fn(u64, *const u8, usize, Handle) -> Status =
         ffi::ez_gfx_index_heap_create;
     let _: extern "C" fn(Handle) = ffi::ez_gfx_index_heap_destroy;
-    let _: unsafe extern "C" fn(*const c_void, u32, *mut u32, Handle) -> Status =
+    let _: unsafe extern "C" fn(*const c_void, u32, *mut u64, Handle) -> Status =
         ffi::ez_gfx_vertex_upload_indices;
-    let _: unsafe extern "C" fn(
-        *const u8,
-        usize,
-        *const c_void,
-        u32,
-        u64,
-        *mut u32,
-        Handle,
-    ) -> Status = ffi::ez_gfx_vertex_upload;
+    let _: unsafe extern "C" fn(Handle, *const c_void, u32, u64, *mut u64, Handle) -> Status =
+        ffi::ez_gfx_vertex_upload;
+    let _: unsafe extern "C" fn(Handle, *mut u32, *mut u32, Handle) -> Status =
+        ffi::ez_gfx_vertex_allocation_get_range;
+    let _: unsafe extern "C" fn(Handle, *mut u32, *mut u32, Handle) -> Status =
+        ffi::ez_gfx_index_allocation_get_range;
+    let _: extern "C" fn(Handle, Handle) -> Status = ffi::ez_gfx_vertex_allocation_remove;
+    let _: extern "C" fn(Handle, Handle) -> Status = ffi::ez_gfx_index_allocation_remove;
     let _: unsafe extern "C" fn(u32, u32, *const u8, usize, *mut Handle, Handle) -> Status =
         ffi::ez_gfx_structured_acquire;
-    let _: unsafe extern "C" fn(Handle, *const c_void, u64, Handle) -> Status =
+    let _: unsafe extern "C" fn(Handle, u32, *const c_void, u32, u32, Handle) -> Status =
         ffi::ez_gfx_structured_write;
     let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_structured_release;
     let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_surface_destroy;

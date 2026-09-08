@@ -11,28 +11,52 @@ fn view(x: i32) -> DynamicView {
 }
 
 #[test]
-fn command_buffer_validates_capacity_and_standard_layout() {
+fn command_buffer_writes_batches_and_publishes_only_written_prefix() {
     assert_eq!(core::mem::size_of::<DrawIndexedCommand>(), 20);
-    let mut buffer = IndexedIndirectBuffer::new(2).unwrap();
-    buffer
-        .write(
-            0,
-            DrawIndexedCommand {
-                index_count: 3,
-                instance_count: 1,
-                first_index: 0,
-                vertex_offset: -1,
-                first_instance: 0,
-            },
-        )
-        .unwrap();
+    let mut buffer = IndexedIndirectBuffer::new(3).unwrap();
+    let first = DrawIndexedCommand {
+        index_count: 3,
+        instance_count: 1,
+        first_index: 0,
+        vertex_offset: -1,
+        first_instance: 0,
+    };
+    let last = DrawIndexedCommand {
+        first_index: 3,
+        ..first
+    };
+    buffer.write_batch(u32::MAX, &[]).unwrap();
+    assert_eq!(buffer.draw_count(), 0);
+
+    buffer.write_batch(1, &[first, last]).unwrap();
+
+    assert_eq!(buffer.draw_count(), 3);
     assert_eq!(
-        buffer.write(2, DrawIndexedCommand::default()),
+        buffer.commands(),
+        &[DrawIndexedCommand::default(), first, last]
+    );
+    assert_eq!(
+        buffer.write_batch(3, &[DrawIndexedCommand::default()]),
         Err(IndirectError::OutOfBounds)
     );
-    buffer.set_draw_count(1).unwrap();
-    assert_eq!(buffer.draw_count(), 1);
-    assert_eq!(buffer.set_draw_count(3), Err(IndirectError::OutOfBounds));
+    assert_eq!(
+        buffer.write_batch(u32::MAX, &[DrawIndexedCommand::default(); 2]),
+        Err(IndirectError::OutOfBounds)
+    );
+    assert_eq!(buffer.draw_count(), 3);
+}
+
+#[test]
+fn generated_count_publication_validates_capacity() {
+    let mut buffer = IndexedIndirectBuffer::new(2).unwrap();
+
+    buffer.publish_generated_count(2).unwrap();
+
+    assert_eq!(buffer.draw_count(), 2);
+    assert_eq!(
+        buffer.publish_generated_count(3),
+        Err(IndirectError::OutOfBounds)
+    );
 }
 
 #[test]

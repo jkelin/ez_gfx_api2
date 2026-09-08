@@ -28,6 +28,8 @@ pub mod shader;
 pub mod target;
 /// Texture creation, views, and sampling APIs.
 pub mod texture;
+/// Reliable typed upload progress events.
+pub mod upload;
 
 pub use api::{
     AdapterSelection, ContextOptions, PublicApiError, SurfaceOptions, SurfacePlatform, SurfaceState,

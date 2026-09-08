@@ -1,34 +1,34 @@
 use super::{
-    AllocationRequest, BufferTransfer, CompletionToken, ContextIdentity, EzGfxResult,
+    AllocationRequest, BufferTransfer, CompletionToken, ContextIdentity, Error, GeometryAllocation,
     GeometryError, HalError, HashMap, LifecycleError, MemoryAllocator, NativeAllocation,
     NativeContext, NativeTexture, PackedHandle,
 };
 
-pub(super) fn map_frame(error: &ez_gfx_runtime::frame::FrameError) -> EzGfxResult {
+pub(super) fn map_frame(error: &ez_gfx_runtime::frame::FrameError) -> Error {
     match error {
         ez_gfx_runtime::frame::FrameError::NotRecording
         | ez_gfx_runtime::frame::FrameError::MissingGraph
-        | ez_gfx_runtime::frame::FrameError::NotSubmitted => EzGfxResult::NotReady,
-        _ => EzGfxResult::InvalidArgument,
+        | ez_gfx_runtime::frame::FrameError::NotSubmitted => Error::NotReady,
+        _ => Error::InvalidArgument,
     }
 }
 
-pub(super) fn map_texture(error: ez_gfx_runtime::texture::TextureError) -> EzGfxResult {
+pub(super) fn map_texture(error: ez_gfx_runtime::texture::TextureError) -> Error {
     use ez_gfx_runtime::texture::TextureError;
     match error {
-        TextureError::Unsupported => EzGfxResult::Unsupported,
-        TextureError::NotReady => EzGfxResult::NotReady,
+        TextureError::Unsupported => Error::Unsupported,
+        TextureError::NotReady => Error::NotReady,
         TextureError::TooLarge
         | TextureError::CapacityExceeded
-        | TextureError::GenerationExhausted => EzGfxResult::NativeFailure,
-        _ => EzGfxResult::InvalidArgument,
+        | TextureError::GenerationExhausted => Error::NativeFailure,
+        _ => Error::InvalidArgument,
     }
 }
 
 pub(super) fn destroy_native_texture(
     context: &mut NativeContext,
     texture: NativeTexture,
-) -> Result<(), ez_gfx_hal::AllocationError> {
+) -> std::result::Result<(), ez_gfx_hal::AllocationError> {
     match (context, texture) {
         (NativeContext::Vulkan(context), NativeTexture::Vulkan(texture)) => {
             context.destroy_texture(texture)
@@ -66,7 +66,7 @@ pub(super) fn native_texture_compression(
 
 pub(super) fn native_layouts(
     layout: &ez_gfx_runtime::binding::ReflectedBindings,
-) -> Result<Vec<ez_gfx_hal::ShaderBufferLayout>, HalError> {
+) -> std::result::Result<Vec<ez_gfx_hal::ShaderBufferLayout>, HalError> {
     layout
         .requirements()
         .iter()
@@ -101,16 +101,35 @@ pub(super) fn vulkan_bindings<'a>(
     layout: &ez_gfx_runtime::binding::ReflectedBindings,
     bindings: &[ez_gfx_runtime::binding::PublicBinding],
     allocations: &'a HashMap<PackedHandle, (u64, NativeAllocation)>,
-) -> Result<Vec<ez_gfx_backend_vulkan::NativeBufferBinding<'a>>, HalError> {
+    vertex_heaps: &'a HashMap<String, GeometryAllocation>,
+) -> std::result::Result<Vec<ez_gfx_backend_vulkan::NativeBufferBinding<'a>>, HalError> {
     let mut native = Vec::new();
     for requirement in layout.requirements() {
+        if requirement.descriptor_count != 1 {
+            return Err(HalError::Unsupported);
+        }
+        if requirement.kind == ez_gfx_runtime::binding::BindingKind::VertexHeap {
+            let heap = vertex_heaps
+                .get(&requirement.name)
+                .ok_or(HalError::InvalidArgument)?;
+            #[cfg(not(any(windows, target_vendor = "apple")))]
+            let NativeAllocation::Vulkan(allocation) = &heap.allocation;
+            #[cfg(any(windows, target_vendor = "apple"))]
+            let NativeAllocation::Vulkan(allocation) = &heap.allocation else {
+                return Err(HalError::InvalidArgument);
+            };
+            native.push(ez_gfx_backend_vulkan::NativeBufferBinding {
+                allocation,
+                offset: 0,
+                range: heap.size,
+                writable: requirement.writable,
+            });
+            continue;
+        }
         let public = bindings
             .iter()
             .find(|binding| binding.name == requirement.name)
             .ok_or(HalError::InvalidArgument)?;
-        if requirement.descriptor_count != 1 {
-            return Err(HalError::Unsupported);
-        }
         let handle = match public.resource {
             ez_gfx_runtime::binding::ResourceIdentity::Structured(handle) => handle.packed(),
             ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle) => handle.packed(),
@@ -140,16 +159,31 @@ pub(super) fn metal_bindings<'a>(
     layout: &ez_gfx_runtime::binding::ReflectedBindings,
     bindings: &[ez_gfx_runtime::binding::PublicBinding],
     allocations: &'a HashMap<PackedHandle, (u64, NativeAllocation)>,
-) -> Result<Vec<ez_gfx_backend_metal::native::NativeBufferBinding<'a>>, HalError> {
+    vertex_heaps: &'a HashMap<String, GeometryAllocation>,
+) -> std::result::Result<Vec<ez_gfx_backend_metal::native::NativeBufferBinding<'a>>, HalError> {
     let mut native = Vec::new();
     for requirement in layout.requirements() {
+        if requirement.descriptor_count != 1 {
+            return Err(HalError::Unsupported);
+        }
+        if requirement.kind == ez_gfx_runtime::binding::BindingKind::VertexHeap {
+            let heap = vertex_heaps
+                .get(&requirement.name)
+                .ok_or(HalError::InvalidArgument)?;
+            let NativeAllocation::Metal(allocation) = &heap.allocation else {
+                return Err(HalError::InvalidArgument);
+            };
+            native.push(ez_gfx_backend_metal::native::NativeBufferBinding {
+                allocation,
+                offset: 0,
+                index: requirement.binding as usize,
+            });
+            continue;
+        }
         let public = bindings
             .iter()
             .find(|binding| binding.name == requirement.name)
             .ok_or(HalError::InvalidArgument)?;
-        if requirement.descriptor_count != 1 {
-            return Err(HalError::Unsupported);
-        }
         let handle = match public.resource {
             ez_gfx_runtime::binding::ResourceIdentity::Structured(handle) => handle.packed(),
             ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle) => handle.packed(),
@@ -175,16 +209,31 @@ pub(super) fn dx12_bindings<'a>(
     layout: &ez_gfx_runtime::binding::ReflectedBindings,
     bindings: &[ez_gfx_runtime::binding::PublicBinding],
     allocations: &'a HashMap<PackedHandle, (u64, NativeAllocation)>,
-) -> Result<Vec<ez_gfx_backend_dx12::native::NativeBufferBinding<'a>>, HalError> {
+    vertex_heaps: &'a HashMap<String, GeometryAllocation>,
+) -> std::result::Result<Vec<ez_gfx_backend_dx12::native::NativeBufferBinding<'a>>, HalError> {
     let mut native = Vec::new();
     for requirement in layout.requirements() {
+        if requirement.descriptor_count != 1 {
+            return Err(HalError::Unsupported);
+        }
+        if requirement.kind == ez_gfx_runtime::binding::BindingKind::VertexHeap {
+            let heap = vertex_heaps
+                .get(&requirement.name)
+                .ok_or(HalError::InvalidArgument)?;
+            let NativeAllocation::Dx12(allocation) = &heap.allocation else {
+                return Err(HalError::InvalidArgument);
+            };
+            native.push(ez_gfx_backend_dx12::native::NativeBufferBinding {
+                allocation,
+                offset: 0,
+                writable: requirement.writable,
+            });
+            continue;
+        }
         let public = bindings
             .iter()
             .find(|binding| binding.name == requirement.name)
             .ok_or(HalError::InvalidArgument)?;
-        if requirement.descriptor_count != 1 {
-            return Err(HalError::Unsupported);
-        }
         let handle = match public.resource {
             ez_gfx_runtime::binding::ResourceIdentity::Structured(handle) => handle.packed(),
             ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle) => handle.packed(),
@@ -205,7 +254,7 @@ pub(super) fn dx12_bindings<'a>(
     Ok(native)
 }
 
-pub(super) fn wait_native_idle(context: &mut NativeContext) -> Result<(), HalError> {
+pub(super) fn wait_native_idle(context: &mut NativeContext) -> std::result::Result<(), HalError> {
     match context {
         NativeContext::Vulkan(context) => context.wait_idle(),
         #[cfg(windows)]
@@ -219,7 +268,7 @@ pub(super) fn wait_native_idle(context: &mut NativeContext) -> Result<(), HalErr
 /// finished GPU work. Vulkan/Metal track submission in software slot state that
 /// otherwise clears only on wrap-around or `wait_idle`; DX12 already consults
 /// the live graphics fence on every gate check.
-pub(super) fn poll_native_frame_completion(context: &mut NativeContext) -> Result<(), EzGfxResult> {
+pub(super) fn poll_native_frame_completion(context: &mut NativeContext) -> crate::Result<()> {
     match context {
         NativeContext::Vulkan(context) => {
             context.poll_frame_completion().map_err(map_allocation)?;
@@ -231,11 +280,33 @@ pub(super) fn poll_native_frame_completion(context: &mut NativeContext) -> Resul
     }
     Ok(())
 }
+pub(super) fn completed_native_frame_value(context: &mut NativeContext) -> crate::Result<u64> {
+    match context {
+        NativeContext::Vulkan(context) => context.completed_frame_value().map_err(map_allocation),
+        #[cfg(windows)]
+        NativeContext::Dx12(context) => context.completed_frame_value().map_err(map_allocation),
+        #[cfg(target_vendor = "apple")]
+        NativeContext::Metal(context) => context.completed_frame_value().map_err(map_allocation),
+    }
+}
+
+pub(super) fn last_native_frame_completion(
+    context: &NativeContext,
+) -> crate::Result<CompletionToken> {
+    match context {
+        NativeContext::Vulkan(context) => context.last_frame_completion(),
+        #[cfg(windows)]
+        NativeContext::Dx12(context) => context.last_frame_completion(),
+        #[cfg(target_vendor = "apple")]
+        NativeContext::Metal(context) => context.last_frame_completion(),
+    }
+    .ok_or(Error::NativeFailure)
+}
 
 pub(super) fn allocate_native(
     context: &mut NativeContext,
     request: AllocationRequest,
-) -> Result<NativeAllocation, ez_gfx_hal::AllocationError> {
+) -> std::result::Result<NativeAllocation, ez_gfx_hal::AllocationError> {
     match context {
         NativeContext::Vulkan(context) => context.allocate(request).map(NativeAllocation::Vulkan),
         #[cfg(windows)]
@@ -249,7 +320,7 @@ pub(super) fn write_native(
     context: &mut NativeContext,
     allocation: &mut NativeAllocation,
     bytes: &[u8],
-) -> Result<(), ez_gfx_hal::AllocationError> {
+) -> std::result::Result<(), ez_gfx_hal::AllocationError> {
     match (context, allocation) {
         (NativeContext::Vulkan(context), NativeAllocation::Vulkan(allocation)) => {
             let target = context.mapped_slice_mut(allocation)?;
@@ -289,7 +360,7 @@ pub(super) fn copy_native(
     source_offset: u64,
     destination_offset: u64,
     size: u64,
-) -> Result<CompletionToken, ez_gfx_hal::AllocationError> {
+) -> std::result::Result<CompletionToken, ez_gfx_hal::AllocationError> {
     match (context, source, destination) {
         (
             NativeContext::Vulkan(context),
@@ -315,7 +386,7 @@ pub(super) fn copy_native(
 
 pub(super) fn completed_transfer_native(
     context: &mut NativeContext,
-) -> Result<u64, ez_gfx_hal::AllocationError> {
+) -> std::result::Result<u64, ez_gfx_hal::AllocationError> {
     let completed = match context {
         NativeContext::Vulkan(context) => context.completed_transfer_value()?,
         #[cfg(windows)]
@@ -341,7 +412,7 @@ pub(super) fn completed_transfer_native(
 
 pub(super) fn completed_texture_transfer_native(
     context: &mut NativeContext,
-) -> Result<u64, ez_gfx_hal::AllocationError> {
+) -> std::result::Result<u64, ez_gfx_hal::AllocationError> {
     let completed = match context {
         NativeContext::Vulkan(context) => context.completed_texture_transfer_value()?,
         #[cfg(windows)]
@@ -368,7 +439,7 @@ pub(super) fn completed_texture_transfer_native(
 pub(super) fn free_native_allocation(
     context: &mut NativeContext,
     allocation: NativeAllocation,
-) -> Result<(), ez_gfx_hal::AllocationError> {
+) -> std::result::Result<(), ez_gfx_hal::AllocationError> {
     match (context, allocation) {
         (NativeContext::Vulkan(context), NativeAllocation::Vulkan(allocation)) => {
             context.free(allocation)
@@ -390,7 +461,7 @@ pub(super) fn retire_native_allocation(
     context: &mut NativeContext,
     allocation: NativeAllocation,
     completion: CompletionToken,
-) -> Result<(), ez_gfx_hal::AllocationError> {
+) -> std::result::Result<(), ez_gfx_hal::AllocationError> {
     match (context, allocation) {
         (NativeContext::Vulkan(context), NativeAllocation::Vulkan(allocation)) => {
             context.retire(allocation, completion)
@@ -407,51 +478,48 @@ pub(super) fn retire_native_allocation(
         _ => Err(ez_gfx_hal::AllocationError::NativeFailure),
     }
 }
-pub(super) fn map_allocation(error: ez_gfx_hal::AllocationError) -> EzGfxResult {
+pub(super) fn map_allocation(error: ez_gfx_hal::AllocationError) -> Error {
     match error {
         ez_gfx_hal::AllocationError::ZeroSize
         | ez_gfx_hal::AllocationError::InvalidAlignment
         | ez_gfx_hal::AllocationError::NotHostVisible
-        | ez_gfx_hal::AllocationError::InvalidAliasClass => EzGfxResult::InvalidArgument,
-        ez_gfx_hal::AllocationError::DeviceLost => EzGfxResult::DeviceLost,
-        ez_gfx_hal::AllocationError::Unsupported => EzGfxResult::Unsupported,
+        | ez_gfx_hal::AllocationError::InvalidAliasClass => Error::InvalidArgument,
+        ez_gfx_hal::AllocationError::DeviceLost => Error::DeviceLost,
+        ez_gfx_hal::AllocationError::Unsupported => Error::Unsupported,
         ez_gfx_hal::AllocationError::OutOfMemory | ez_gfx_hal::AllocationError::NativeFailure => {
-            EzGfxResult::NativeFailure
+            Error::NativeFailure
         }
     }
 }
 
-pub(super) fn map_geometry(error: GeometryError) -> EzGfxResult {
+pub(super) fn map_geometry(error: GeometryError) -> Error {
     match error {
-        GeometryError::StagingPoolExhausted => EzGfxResult::NotReady,
-        _ => EzGfxResult::InvalidArgument,
+        GeometryError::StagingPoolExhausted => Error::NotReady,
+        _ => Error::InvalidArgument,
     }
 }
 
-pub(super) fn map_lifecycle(error: LifecycleError) -> EzGfxResult {
+pub(super) fn map_lifecycle(error: LifecycleError) -> Error {
     match error {
-        LifecycleError::DeviceLost | LifecycleError::AlreadyLost => EzGfxResult::DeviceLost,
-        _ => EzGfxResult::InvalidContext,
+        LifecycleError::DeviceLost | LifecycleError::AlreadyLost => Error::DeviceLost,
+        error => Error::Lifecycle(error),
     }
 }
-pub(super) fn map_native_loss(identity: &ContextIdentity, error: HalError) -> EzGfxResult {
+pub(super) fn map_native_loss(identity: &ContextIdentity, error: HalError) -> Error {
     if error == HalError::DeviceLost {
         let _ = identity.mark_lost();
     }
     map_hal(error)
 }
-pub(super) fn result_status(result: Result<(), EzGfxResult>) -> EzGfxResult {
-    match result {
-        Ok(()) => EzGfxResult::Ok,
-        Err(status) => status,
-    }
+pub(super) fn result_status(result: crate::Result<()>) -> crate::Result<()> {
+    result
 }
-pub(super) fn map_hal(error: HalError) -> EzGfxResult {
+pub(super) fn map_hal(error: HalError) -> Error {
     match error {
-        HalError::InvalidArgument => EzGfxResult::InvalidArgument,
-        HalError::Unsupported => EzGfxResult::Unsupported,
-        HalError::NotReady => EzGfxResult::NotReady,
-        HalError::DeviceLost => EzGfxResult::DeviceLost,
-        HalError::OutOfMemory | HalError::NativeFailure => EzGfxResult::NativeFailure,
+        HalError::InvalidArgument => Error::InvalidArgument,
+        HalError::Unsupported => Error::Unsupported,
+        HalError::NotReady => Error::NotReady,
+        HalError::DeviceLost => Error::DeviceLost,
+        HalError::OutOfMemory | HalError::NativeFailure => Error::NativeFailure,
     }
 }

@@ -1,32 +1,52 @@
+use crate::Result;
+
 #[cfg(windows)]
 use super::dx12_bindings;
 #[cfg(target_vendor = "apple")]
 use super::metal_bindings;
 use super::{
     Access, Backend, BufferRange, ContextHandle, ContextState, DiagnosticLevel,
-    DynamicPipelineState, ExecutableNode, ExecutionAction, ExecutionBarrier, ExecutionError,
-    ExecutionPass, EzGfxResult, Format, FrameExecutionBackend, FrameExecutionPlan,
-    FrameNativeResource, HashMap, ImageRange, IndirectBufferHandle, LoadOp,
+    DynamicPipelineState, Error, ExecutableNode, ExecutionAction, ExecutionBarrier, ExecutionError,
+    ExecutionPass, Format, FrameExecutionBackend, FrameExecutionPlan, FrameNativeResource,
+    GeometryAllocation, HashMap, ImageRange, IndirectBufferHandle, LoadOp,
     MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext, NativePipeline, NativeShader,
     NativeSurface, NativeTexture, NodeDesc, PackedHandle, PassInfo, PipelineKey, QueueKind,
     RenderTargetHandle, RenderTargetRecord, ResourceAccess, ResourceDesc, ResourceId, ResourceKind,
     ResourceLifetime, ResourceState, RuntimePhase, SURFACE_DEFAULT_CLEAR, ShaderHandle,
     ShaderRecord, ShaderStage, StoreOp, TextureFormat, TextureHandle, TextureId,
-    execute_compiled_graph, map_frame, map_hal, map_lifecycle, native_layouts, pipeline_layout_key,
-    result_status, runtime_record, vulkan_bindings, with_context_mut,
+    execute_compiled_graph, last_native_frame_completion, map_frame, map_hal, map_lifecycle,
+    native_layouts, pipeline_layout_key, result_status, runtime_record, vulkan_bindings,
+    wait_native_idle, with_context_mut,
 };
+
+#[cfg(test)]
+mod transient_tests;
 type NativeTextureMap = HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>;
 
 /// Begins frame recording.
-pub fn frame_begin(context: ContextHandle) -> EzGfxResult {
+///
+/// # Errors
+///
+/// Returns an error when validation, handle ownership, readiness, or a backend operation fails.
+pub fn frame_begin(context: ContextHandle) -> Result<()> {
     result_status(with_context_mut(context, |context| {
         context
             .identity
             .check_thread_and_health()
             .map_err(map_lifecycle)?;
+        let frame_serial = context
+            .frame_serial
+            .checked_add(1)
+            .ok_or(Error::NativeFailure)?;
         context.frame.begin().map_err(|error| map_frame(&error))?;
+        if let Err(error) = super::buffers::reclaim_available_transients(context) {
+            context.frame.abort();
+            return Err(error);
+        }
+        context.frame_serial = frame_serial;
         context.frame_resources.clear();
         context.frame_native_resources.clear();
+        context.frame_vertex_heaps.clear();
         context.frame_index = None;
         context.frame_surface = None;
         context.frame_render_target = None;
@@ -38,10 +58,7 @@ pub fn frame_begin(context: ContextHandle) -> EzGfxResult {
     }))
 }
 
-fn intern_buffer_resource(
-    context: &mut ContextState,
-    handle: PackedHandle,
-) -> Result<ResourceId, EzGfxResult> {
+fn intern_buffer_resource(context: &mut ContextState, handle: PackedHandle) -> Result<ResourceId> {
     if let Some(resource) = context.frame_resources.get(&handle) {
         return Ok(*resource);
     }
@@ -49,9 +66,9 @@ fn intern_buffer_resource(
         .allocations
         .get(&handle)
         .map(|(size, _)| *size)
-        .ok_or(EzGfxResult::InvalidContext)?;
+        .ok_or(Error::InvalidContext)?;
     let desc = ResourceDesc::buffer(size, 4, ResourceLifetime::External)
-        .map_err(|_| EzGfxResult::InvalidArgument)?;
+        .map_err(|_| Error::InvalidArgument)?;
     let resource = context
         .frame
         .add_resource(desc)
@@ -61,7 +78,7 @@ fn intern_buffer_resource(
         ShaderStage::None,
         ResourceAccess::TransferWrite,
     )
-    .map_err(|_| EzGfxResult::InvalidArgument)?;
+    .map_err(|_| Error::InvalidArgument)?;
     context
         .frame
         .set_resource_initial_state(resource, initial)
@@ -79,16 +96,16 @@ fn intern_buffer_resource(
     Ok(resource)
 }
 
-fn intern_surface_resource(context: &mut ContextState) -> Result<ResourceId, EzGfxResult> {
+fn intern_surface_resource(context: &mut ContextState) -> Result<ResourceId> {
     if let Some(resource) = context.frame_surface {
         return Ok(resource);
     }
-    let surface = context.active_surface.ok_or(EzGfxResult::NotReady)?;
+    let surface = context.active_surface.ok_or(Error::NotReady)?;
     let (width, height) = context
         .surfaces
         .get(&surface)
         .and_then(|surface| surface.state.extent())
-        .ok_or(EzGfxResult::NotReady)?;
+        .ok_or(Error::NotReady)?;
     let desc = ResourceDesc::image(
         width,
         height,
@@ -98,7 +115,7 @@ fn intern_surface_resource(context: &mut ContextState) -> Result<ResourceId, EzG
         1,
         ResourceLifetime::External,
     )
-    .map_err(|_| EzGfxResult::InvalidArgument)?;
+    .map_err(|_| Error::InvalidArgument)?;
     let resource = context
         .frame
         .add_resource(desc)
@@ -108,7 +125,7 @@ fn intern_surface_resource(context: &mut ContextState) -> Result<ResourceId, EzG
         ShaderStage::None,
         ResourceAccess::Present,
     )
-    .map_err(|_| EzGfxResult::InvalidArgument)?;
+    .map_err(|_| Error::InvalidArgument)?;
     context
         .frame
         .set_resource_initial_state(resource, present)
@@ -120,16 +137,16 @@ fn intern_surface_resource(context: &mut ContextState) -> Result<ResourceId, EzG
     Ok(resource)
 }
 
-fn intern_depth_resource(context: &mut ContextState) -> Result<ResourceId, EzGfxResult> {
+fn intern_depth_resource(context: &mut ContextState) -> Result<ResourceId> {
     if let Some(resource) = context.frame_depth {
         return Ok(resource);
     }
-    let surface = context.active_surface.ok_or(EzGfxResult::NotReady)?;
+    let surface = context.active_surface.ok_or(Error::NotReady)?;
     let (width, height) = context
         .surfaces
         .get(&surface)
         .and_then(|surface| surface.state.extent())
-        .ok_or(EzGfxResult::NotReady)?;
+        .ok_or(Error::NotReady)?;
     let desc = ResourceDesc::image(
         width,
         height,
@@ -139,7 +156,7 @@ fn intern_depth_resource(context: &mut ContextState) -> Result<ResourceId, EzGfx
         1,
         ResourceLifetime::Transient,
     )
-    .map_err(|_| EzGfxResult::InvalidArgument)?;
+    .map_err(|_| Error::InvalidArgument)?;
     let resource = context
         .frame
         .add_resource(desc)
@@ -151,14 +168,14 @@ fn intern_depth_resource(context: &mut ContextState) -> Result<ResourceId, EzGfx
     Ok(resource)
 }
 
-fn intern_index_resource(context: &mut ContextState) -> Result<ResourceId, EzGfxResult> {
+fn intern_index_resource(context: &mut ContextState) -> Result<ResourceId> {
     if let Some(resource) = context.frame_index {
         return Ok(resource);
     }
-    let heap = context.index_heap.as_ref().ok_or(EzGfxResult::NotReady)?;
+    let heap = context.index_heap.as_ref().ok_or(Error::NotReady)?;
     let size = heap.size;
     let desc = ResourceDesc::buffer(size, 4, ResourceLifetime::External)
-        .map_err(|_| EzGfxResult::InvalidArgument)?;
+        .map_err(|_| Error::InvalidArgument)?;
     let resource = context
         .frame
         .add_resource(desc)
@@ -168,7 +185,7 @@ fn intern_index_resource(context: &mut ContextState) -> Result<ResourceId, EzGfx
         ShaderStage::None,
         ResourceAccess::TransferWrite,
     )
-    .map_err(|_| EzGfxResult::InvalidArgument)?;
+    .map_err(|_| Error::InvalidArgument)?;
     context
         .frame
         .set_resource_initial_state(resource, initial)
@@ -186,6 +203,46 @@ fn intern_index_resource(context: &mut ContextState) -> Result<ResourceId, EzGfx
     Ok(resource)
 }
 
+fn intern_vertex_heap_resource(
+    context: &mut ContextState,
+    name: &str,
+) -> Result<(ResourceId, u64)> {
+    let heap = context.vertex_heaps.get(name).ok_or(Error::NotReady)?;
+    let heap_id = heap.heap_id.ok_or(Error::NativeFailure)?;
+    if let Some(resource) = context.frame_vertex_heaps.get(&heap_id) {
+        return Ok((*resource, heap.size));
+    }
+    let size = heap.size;
+    let ready = heap.ready;
+    let desc = ResourceDesc::buffer(size, 16, ResourceLifetime::External)
+        .map_err(|_| Error::InvalidArgument)?;
+    let resource = context
+        .frame
+        .add_resource(desc)
+        .map_err(|error| map_frame(&error))?;
+    let initial = ResourceState::new(
+        QueueKind::Transfer,
+        ShaderStage::None,
+        ResourceAccess::TransferWrite,
+    )
+    .map_err(|_| Error::InvalidArgument)?;
+    context
+        .frame
+        .set_resource_initial_state(resource, initial)
+        .map_err(|error| map_frame(&error))?;
+    if let Some(ready) = ready {
+        context
+            .frame
+            .set_resource_ready(resource, ready)
+            .map_err(|error| map_frame(&error))?;
+    }
+    context.frame_vertex_heaps.insert(heap_id, resource);
+    context
+        .frame_native_resources
+        .insert(resource, FrameNativeResource::VertexHeap(heap_id));
+    Ok((resource, size))
+}
+
 fn add_binding_accesses(
     context: &mut ContextState,
     mut node: NodeDesc,
@@ -194,17 +251,36 @@ fn add_binding_accesses(
     queue: QueueKind,
     stage: ShaderStage,
     combined_indirect: Option<IndirectBufferHandle>,
-) -> Result<NodeDesc, EzGfxResult> {
+) -> Result<NodeDesc> {
     for requirement in layout.requirements() {
+        if requirement.kind == ez_gfx_runtime::binding::BindingKind::VertexHeap {
+            let (resource, size) = intern_vertex_heap_resource(context, &requirement.name)?;
+            let access_state = ResourceState::new(
+                queue,
+                stage,
+                if requirement.writable {
+                    ResourceAccess::StorageReadWrite
+                } else {
+                    ResourceAccess::StorageRead
+                },
+            )
+            .map_err(|_| Error::InvalidArgument)?;
+            node = node.access(Access::buffer(
+                resource,
+                BufferRange::new(0, size).map_err(|_| Error::InvalidArgument)?,
+                access_state,
+            ));
+            continue;
+        }
         let binding = bindings
             .iter()
             .find(|binding| binding.name == requirement.name)
-            .ok_or(EzGfxResult::InvalidArgument)?;
+            .ok_or(Error::InvalidArgument)?;
         let handle = match binding.resource {
             ez_gfx_runtime::binding::ResourceIdentity::Structured(handle) => handle.packed(),
             ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle) => handle.packed(),
             ez_gfx_runtime::binding::ResourceIdentity::RenderTarget(_) => {
-                return Err(EzGfxResult::Unsupported);
+                return Err(Error::Unsupported);
             }
         };
         if combined_indirect.is_some_and(|indirect| indirect.packed() == handle) {
@@ -214,7 +290,7 @@ fn add_binding_accesses(
             .allocations
             .get(&handle)
             .map(|(size, _)| *size)
-            .ok_or(EzGfxResult::InvalidContext)?;
+            .ok_or(Error::InvalidContext)?;
         let resource = intern_buffer_resource(context, handle)?;
         let writable = requirement.writable;
         let access_state = ResourceState::new(
@@ -226,10 +302,10 @@ fn add_binding_accesses(
                 ResourceAccess::StorageRead
             },
         )
-        .map_err(|_| EzGfxResult::InvalidArgument)?;
+        .map_err(|_| Error::InvalidArgument)?;
         node = node.access(Access::buffer(
             resource,
-            BufferRange::new(0, size).map_err(|_| EzGfxResult::InvalidArgument)?,
+            BufferRange::new(0, size).map_err(|_| Error::InvalidArgument)?,
             access_state,
         ));
     }
@@ -239,14 +315,14 @@ fn add_binding_accesses(
 fn intern_texture_resource(
     context: &mut ContextState,
     texture: TextureHandle,
-) -> Result<ResourceId, EzGfxResult> {
+) -> Result<ResourceId> {
     if let Some(resource) = context.frame_resources.get(&texture.packed()) {
         return Ok(*resource);
     }
     let (_, _, width, height, _) = context
         .textures
         .get(&texture)
-        .ok_or(EzGfxResult::InvalidContext)?;
+        .ok_or(Error::InvalidContext)?;
     let desc = ResourceDesc::image(
         *width,
         *height,
@@ -256,7 +332,7 @@ fn intern_texture_resource(
         1,
         ResourceLifetime::External,
     )
-    .map_err(|_| EzGfxResult::InvalidArgument)?;
+    .map_err(|_| Error::InvalidArgument)?;
     let resource = context
         .frame
         .add_resource(desc)
@@ -266,7 +342,7 @@ fn intern_texture_resource(
         ShaderStage::Fragment,
         ResourceAccess::SampledRead,
     )
-    .map_err(|_| EzGfxResult::InvalidArgument)?;
+    .map_err(|_| Error::InvalidArgument)?;
     context
         .frame
         .set_resource_initial_state(resource, sampled)
@@ -287,10 +363,14 @@ fn intern_texture_resource(
 ///
 /// Readback captures the full stored image as RGBA8. Block-compressed storage has
 /// no RGBA texel grid, so compressed textures are rejected with
-/// [`EzGfxResult::InvalidArgument`]; sample them through a shader instead.
-/// A logically demoted texture reports [`EzGfxResult::NotReady`] until its full
+/// [`Error::InvalidArgument`]; sample them through a shader instead.
+/// A logically demoted texture reports [`Error::NotReady`] until its full
 /// chain is resident again, so the captured extent always matches the request.
-pub fn frame_enqueue_readback(context: ContextHandle, texture: TextureHandle) -> EzGfxResult {
+///
+/// # Errors
+///
+/// Returns an error when validation, handle ownership, readiness, or a backend operation fails.
+pub fn frame_enqueue_readback(context: ContextHandle, texture: TextureHandle) -> Result<()> {
     result_status(with_context_mut(context, |context| {
         let handle = texture.packed();
         context
@@ -301,7 +381,7 @@ pub fn frame_enqueue_readback(context: ContextHandle, texture: TextureHandle) ->
         // smaller extent than the request. Both are boundary rejections, applied
         // identically before any backend records the copy.
         if context.pending_textures.contains_key(&texture) {
-            return Err(EzGfxResult::NotReady);
+            return Err(Error::NotReady);
         }
         let format = context
             .texture_formats
@@ -309,12 +389,12 @@ pub fn frame_enqueue_readback(context: ContextHandle, texture: TextureHandle) ->
             .copied()
             .unwrap_or(TextureFormat::Rgba8Unorm);
         if format.is_compressed() {
-            return Err(EzGfxResult::InvalidArgument);
+            return Err(Error::InvalidArgument);
         }
         let (_, _, _, _, total) = context
             .textures
             .get(&texture)
-            .ok_or(EzGfxResult::InvalidContext)?;
+            .ok_or(Error::InvalidContext)?;
         let total = *total;
         let resident = context
             .texture_published_mips
@@ -322,16 +402,16 @@ pub fn frame_enqueue_readback(context: ContextHandle, texture: TextureHandle) ->
             .copied()
             .unwrap_or(0);
         if resident != total {
-            return Err(EzGfxResult::NotReady);
+            return Err(Error::NotReady);
         }
         let resource = intern_texture_resource(context, texture)?;
-        let range = ImageRange::all(1, 1).map_err(|_| EzGfxResult::InvalidArgument)?;
+        let range = ImageRange::all(1, 1).map_err(|_| Error::InvalidArgument)?;
         let state = ResourceState::new(
             QueueKind::Transfer,
             ShaderStage::None,
             ResourceAccess::TransferRead,
         )
-        .map_err(|_| EzGfxResult::InvalidArgument)?;
+        .map_err(|_| Error::InvalidArgument)?;
         context
             .frame
             .record_node(
@@ -351,7 +431,7 @@ pub fn frame_enqueue_readback(context: ContextHandle, texture: TextureHandle) ->
 fn intern_render_target_resource(
     context: &mut ContextState,
     target: RenderTargetHandle,
-) -> Result<ResourceId, EzGfxResult> {
+) -> Result<ResourceId> {
     context
         .identity
         .resolve(target.packed(), ResourceKind::RenderTarget)
@@ -362,7 +442,7 @@ fn intern_render_target_resource(
     let record = context
         .render_targets
         .get(&target)
-        .ok_or(EzGfxResult::InvalidContext)?;
+        .ok_or(Error::InvalidContext)?;
     let desc = ResourceDesc::image(
         record.width,
         record.height,
@@ -372,7 +452,7 @@ fn intern_render_target_resource(
         record.declaration.samples(),
         ResourceLifetime::External,
     )
-    .map_err(|_| EzGfxResult::InvalidArgument)?;
+    .map_err(|_| Error::InvalidArgument)?;
     let resource = context
         .frame
         .add_resource(desc)
@@ -391,22 +471,22 @@ fn graphics_node(
     bindings: &[ez_gfx_runtime::binding::PublicBinding],
     indirect: IndirectBufferHandle,
     pipeline_layout: ez_gfx_runtime::binding::PipelineLayout,
-) -> Result<NodeDesc, EzGfxResult> {
+) -> Result<NodeDesc> {
     // A bound render target replaces the surface color attachment; depth
     // pipelines stay surface-only. Draws into multisampled targets stay
     // unsupported until pipelines carry sample counts; clears resolve without
     // any draw.
     let (color, depth, width, height, samples) = if let Some(target) = context.frame_render_target {
         if pipeline_layout.depth_required() {
-            return Err(EzGfxResult::Unsupported);
+            return Err(Error::Unsupported);
         }
         let resource = intern_render_target_resource(context, target)?;
         let record = context
             .render_targets
             .get(&target)
-            .ok_or(EzGfxResult::InvalidContext)?;
+            .ok_or(Error::InvalidContext)?;
         if record.declaration.samples() != 1 {
-            return Err(EzGfxResult::Unsupported);
+            return Err(Error::Unsupported);
         }
         (
             resource,
@@ -426,7 +506,7 @@ fn graphics_node(
             .active_surface
             .and_then(|surface| context.surfaces.get(&surface))
             .and_then(|surface| surface.state.extent())
-            .ok_or(EzGfxResult::NotReady)?;
+            .ok_or(Error::NotReady)?;
         (surface, depth, width, height, 1)
     };
     let load = if context.frame_has_graphics {
@@ -442,17 +522,17 @@ fn graphics_node(
         load,
         StoreOp::Store,
     )
-    .map_err(|_| EzGfxResult::InvalidArgument)?;
+    .map_err(|_| Error::InvalidArgument)?;
     let color_state = ResourceState::new(
         QueueKind::Graphics,
         ShaderStage::Fragment,
         ResourceAccess::ColorAttachmentWrite,
     )
-    .map_err(|_| EzGfxResult::InvalidArgument)?;
+    .map_err(|_| Error::InvalidArgument)?;
     let mut node = NodeDesc::new("graphics", QueueKind::Graphics)
         .access(Access::image(
             color,
-            ImageRange::all(1, 1).map_err(|_| EzGfxResult::InvalidArgument)?,
+            ImageRange::all(1, 1).map_err(|_| Error::InvalidArgument)?,
             color_state,
         ))
         .pass(pass);
@@ -462,28 +542,24 @@ fn graphics_node(
             ShaderStage::Fragment,
             ResourceAccess::DepthStencilWrite,
         )
-        .map_err(|_| EzGfxResult::InvalidArgument)?;
+        .map_err(|_| Error::InvalidArgument)?;
         node = node.access(Access::image(
             depth,
-            ImageRange::all(1, 1).map_err(|_| EzGfxResult::InvalidArgument)?,
+            ImageRange::all(1, 1).map_err(|_| Error::InvalidArgument)?,
             depth_state,
         ));
     }
     let index_resource = intern_index_resource(context)?;
-    let index_size = context
-        .index_heap
-        .as_ref()
-        .ok_or(EzGfxResult::NotReady)?
-        .size;
+    let index_size = context.index_heap.as_ref().ok_or(Error::NotReady)?.size;
     let index_state = ResourceState::new(
         QueueKind::Graphics,
         ShaderStage::AllGraphics,
         ResourceAccess::IndexRead,
     )
-    .map_err(|_| EzGfxResult::InvalidArgument)?;
+    .map_err(|_| Error::InvalidArgument)?;
     node = node.access(Access::buffer(
         index_resource,
-        BufferRange::new(0, index_size).map_err(|_| EzGfxResult::InvalidArgument)?,
+        BufferRange::new(0, index_size).map_err(|_| Error::InvalidArgument)?,
         index_state,
     ));
     let indirect_binding = layout.requirements().iter().find_map(|requirement| {
@@ -500,7 +576,7 @@ fn graphics_node(
         .allocations
         .get(&indirect.packed())
         .map(|(size, _)| *size)
-        .ok_or(EzGfxResult::InvalidContext)?;
+        .ok_or(Error::InvalidContext)?;
     let indirect_resource = intern_buffer_resource(context, indirect.packed())?;
     let indirect_state = ResourceState::new(
         QueueKind::Graphics,
@@ -511,10 +587,10 @@ fn graphics_node(
             None => ResourceAccess::IndirectRead,
         },
     )
-    .map_err(|_| EzGfxResult::InvalidArgument)?;
+    .map_err(|_| Error::InvalidArgument)?;
     node = node.access(Access::buffer(
         indirect_resource,
-        BufferRange::new(0, indirect_size).map_err(|_| EzGfxResult::InvalidArgument)?,
+        BufferRange::new(0, indirect_size).map_err(|_| Error::InvalidArgument)?,
         indirect_state,
     ));
     node = add_binding_accesses(
@@ -534,7 +610,7 @@ fn add_texture_accesses(
     mut node: NodeDesc,
     queue: QueueKind,
     stage: ShaderStage,
-) -> Result<NodeDesc, EzGfxResult> {
+) -> Result<NodeDesc> {
     // Unpublished textures cannot be sampled yet; unrelated uploads must not stall the heap.
     let texture_handles: Vec<_> = context
         .texture_published_mips
@@ -544,10 +620,10 @@ fn add_texture_accesses(
     for texture in texture_handles {
         let resource = intern_texture_resource(context, texture)?;
         let sampled = ResourceState::new(queue, stage, ResourceAccess::SampledRead)
-            .map_err(|_| EzGfxResult::InvalidArgument)?;
+            .map_err(|_| Error::InvalidArgument)?;
         node = node.access(Access::image(
             resource,
-            ImageRange::all(1, 1).map_err(|_| EzGfxResult::InvalidArgument)?,
+            ImageRange::all(1, 1).map_err(|_| Error::InvalidArgument)?,
             sampled,
         ));
     }
@@ -555,6 +631,10 @@ fn add_texture_accesses(
 }
 
 /// Records an indexed graphics operation.
+///
+/// # Errors
+///
+/// Returns an error when validation, handle ownership, readiness, or a backend operation fails.
 pub fn render_add_graphics(
     context: ContextHandle,
     shader: ShaderHandle,
@@ -562,7 +642,7 @@ pub fn render_add_graphics(
     bindings: &[ez_gfx_runtime::binding::PublicBinding],
     state: DynamicPipelineState,
     push_constants: &[u8],
-) -> EzGfxResult {
+) -> Result<()> {
     result_status(with_context_mut(context, |context| {
         let shader_handle = shader.packed();
         context
@@ -575,10 +655,7 @@ pub fn render_add_graphics(
             .resolve(indirect_handle, ResourceKind::Indirect)
             .map_err(map_lifecycle)?;
         validate_binding_handles(context, bindings)?;
-        let record = context
-            .shaders
-            .get(&shader)
-            .ok_or(EzGfxResult::InvalidContext)?;
+        let record = context.shaders.get(&shader).ok_or(Error::InvalidContext)?;
         let layout = record
             .runtime
             .bindings(ez_gfx_artifact::Stage::Vertex)
@@ -588,23 +665,23 @@ pub fn render_add_graphics(
                     .bindings(ez_gfx_artifact::Stage::Fragment)
                     .and_then(|fragment| vertex.merge(&fragment))
             })
-            .map_err(|_| EzGfxResult::InvalidArgument)?;
+            .map_err(|_| Error::InvalidArgument)?;
         layout
             .validate(bindings)
-            .map_err(|_| EzGfxResult::InvalidArgument)?;
+            .map_err(|_| Error::InvalidArgument)?;
         let draw_count = context
             .indirects
             .get(&indirect)
-            .ok_or(EzGfxResult::InvalidContext)?
+            .ok_or(Error::InvalidContext)?
             .draw_count();
         if draw_count == 0 || push_constants.len() > 128 || !push_constants.len().is_multiple_of(4)
         {
-            return Err(EzGfxResult::InvalidArgument);
+            return Err(Error::InvalidArgument);
         }
         let pipeline_layout = *record
             .graphics_layout
             .as_ref()
-            .ok_or(EzGfxResult::InvalidArgument)?;
+            .ok_or(Error::InvalidArgument)?;
         let node = graphics_node(context, &layout, bindings, indirect, pipeline_layout)?;
         context
             .frame
@@ -622,18 +699,24 @@ pub fn render_add_graphics(
                 },
             )
             .map_err(|error| map_frame(&error))?;
+        mark_transient_bindings_interned(context, bindings)?;
+        mark_transient_interned(context, indirect_handle)?;
         context.frame_has_graphics = true;
         Ok(())
     }))
 }
 /// Records a compute dispatch.
+///
+/// # Errors
+///
+/// Returns an error when validation, handle ownership, readiness, or a backend operation fails.
 pub fn render_add_compute(
     context: ContextHandle,
     shader: ShaderHandle,
     groups: [u32; 3],
     bindings: &[ez_gfx_runtime::binding::PublicBinding],
     push_constants: &[u8],
-) -> EzGfxResult {
+) -> Result<()> {
     result_status(with_context_mut(context, |context| {
         let handle = shader.packed();
         context
@@ -641,23 +724,20 @@ pub fn render_add_compute(
             .resolve(handle, ResourceKind::Shader)
             .map_err(map_lifecycle)?;
         validate_binding_handles(context, bindings)?;
-        let record = context
-            .shaders
-            .get(&shader)
-            .ok_or(EzGfxResult::InvalidContext)?;
+        let record = context.shaders.get(&shader).ok_or(Error::InvalidContext)?;
         if groups.contains(&0)
             || push_constants.len() > 128
             || !push_constants.len().is_multiple_of(4)
         {
-            return Err(EzGfxResult::InvalidArgument);
+            return Err(Error::InvalidArgument);
         }
         let layout = record
             .runtime
             .bindings(ez_gfx_artifact::Stage::Compute)
-            .map_err(|_| EzGfxResult::InvalidArgument)?;
+            .map_err(|_| Error::InvalidArgument)?;
         layout
             .validate(bindings)
-            .map_err(|_| EzGfxResult::InvalidArgument)?;
+            .map_err(|_| Error::InvalidArgument)?;
         let node = add_binding_accesses(
             context,
             NodeDesc::new("compute", QueueKind::Compute),
@@ -681,6 +761,7 @@ pub fn render_add_compute(
                 },
             )
             .map_err(|error| map_frame(&error))?;
+        mark_transient_bindings_interned(context, bindings)?;
         Ok(())
     }))
 }
@@ -688,7 +769,7 @@ pub fn render_add_compute(
 fn validate_binding_handles(
     context: &ContextState,
     bindings: &[ez_gfx_runtime::binding::PublicBinding],
-) -> Result<(), EzGfxResult> {
+) -> Result<()> {
     for binding in bindings {
         let (packed, kind) = match binding.resource {
             ez_gfx_runtime::binding::ResourceIdentity::Structured(handle) => {
@@ -698,20 +779,69 @@ fn validate_binding_handles(
                 (handle.packed(), ResourceKind::Indirect)
             }
             ez_gfx_runtime::binding::ResourceIdentity::RenderTarget(handle) => {
-                (handle.packed(), ResourceKind::RenderTarget)
+                context
+                    .identity
+                    .resolve(handle.packed(), ResourceKind::RenderTarget)
+                    .map_err(map_lifecycle)?;
+                continue;
             }
         };
         context
             .identity
             .resolve(packed, kind)
             .map_err(map_lifecycle)?;
+        let usage = context
+            .transient_buffers
+            .get(&packed)
+            .ok_or(Error::InvalidContext)?
+            .usage;
+        match usage {
+            super::TransientUse::Available => {}
+            super::TransientUse::Interned(frame) if frame == context.frame_serial => {}
+            super::TransientUse::Interned(_) => return Err(Error::NotReady),
+        }
     }
     Ok(())
 }
 
+fn mark_transient_bindings_interned(
+    context: &mut ContextState,
+    bindings: &[ez_gfx_runtime::binding::PublicBinding],
+) -> Result<()> {
+    for binding in bindings {
+        let handle = match binding.resource {
+            ez_gfx_runtime::binding::ResourceIdentity::Structured(handle) => handle.packed(),
+            ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle) => handle.packed(),
+            ez_gfx_runtime::binding::ResourceIdentity::RenderTarget(_) => continue,
+        };
+        mark_transient_interned(context, handle)?;
+    }
+    Ok(())
+}
+
+fn mark_transient_interned(context: &mut ContextState, handle: PackedHandle) -> Result<()> {
+    let buffer = context
+        .transient_buffers
+        .get_mut(&handle)
+        .ok_or(Error::InvalidContext)?;
+    match buffer.usage {
+        super::TransientUse::Available => {
+            buffer.usage = super::TransientUse::Interned(context.frame_serial);
+            Ok(())
+        }
+        super::TransientUse::Interned(frame) if frame == context.frame_serial => Ok(()),
+        super::TransientUse::Interned(_) => Err(Error::NotReady),
+    }
+}
+
 /// Submits the recorded frame.
-pub fn frame_submit(context: ContextHandle) -> EzGfxResult {
+///
+/// # Errors
+///
+/// Returns an error when validation, handle ownership, readiness, or a backend operation fails.
+pub fn frame_submit(context: ContextHandle) -> Result<()> {
     result_status(with_context_mut(context, |context| {
+        let mut native_started = false;
         let result = (|| {
             // Updates admitted after draw recording still precede submission. Refresh their
             // dependencies so a cached resource entry cannot retain an older ready value.
@@ -726,20 +856,20 @@ pub fn frame_submit(context: ContextHandle) -> EzGfxResult {
             // Target-only frames present nothing; the image stays sampled.
             let presenting = context.frame_has_graphics && context.frame_render_target.is_none();
             if presenting {
-                let surface = context.active_surface.ok_or(EzGfxResult::NotReady)?;
-                let resource = context.frame_surface.ok_or(EzGfxResult::NotReady)?;
+                let surface = context.active_surface.ok_or(Error::NotReady)?;
+                let resource = context.frame_surface.ok_or(Error::NotReady)?;
                 let present = ResourceState::new(
                     QueueKind::Graphics,
                     ShaderStage::None,
                     ResourceAccess::Present,
                 )
-                .map_err(|_| EzGfxResult::InvalidArgument)?;
+                .map_err(|_| Error::InvalidArgument)?;
                 context
                     .frame
                     .record_node(
                         NodeDesc::new("present", QueueKind::Graphics).access(Access::image(
                             resource,
-                            ImageRange::all(1, 1).map_err(|_| EzGfxResult::InvalidArgument)?,
+                            ImageRange::all(1, 1).map_err(|_| Error::InvalidArgument)?,
                             present,
                         )),
                         ExecutableNode::Present { surface },
@@ -747,21 +877,30 @@ pub fn frame_submit(context: ContextHandle) -> EzGfxResult {
                     .map_err(|error| map_frame(&error))?;
             }
             let submission = context.frame.submit().map_err(|error| map_frame(&error))?;
+            native_started = true;
             let mut adapter = NativeFrameAdapter { context };
             execute_compiled_graph(&submission.graph, &submission.nodes, &mut adapter)
                 .map_err(|error| map_execution(&error))?;
+            let completion = last_native_frame_completion(&adapter.context.native)?;
             adapter
                 .context
                 .frame
                 .finish()
                 .map_err(|error| map_frame(&error))?;
-            let record = runtime_record(adapter.context, 0, RuntimePhase::Submit, EzGfxResult::Ok);
+            recycle_consumed_transients(adapter.context, completion)?;
+            super::buffers::reclaim_available_transients(adapter.context)?;
+            let record = runtime_record(adapter.context, 0, RuntimePhase::Submit, Ok(()));
             adapter.context.observability.push_event(record);
             Ok(())
         })();
         if let Err(status) = result {
             context.frame.abort();
-            let record = runtime_record(context, 0, RuntimePhase::Submit, status);
+            if !native_started || wait_native_idle(&mut context.native).is_ok() {
+                rollback_transient_internment(context);
+            } else {
+                invalidate_unsafe_transients(context);
+            }
+            let record = runtime_record(context, 0, RuntimePhase::Submit, Err(status));
             context
                 .observability
                 .push_diagnostic(DiagnosticLevel::Error, record);
@@ -770,26 +909,106 @@ pub fn frame_submit(context: ContextHandle) -> EzGfxResult {
     }))
 }
 
+fn rollback_transient_internment(context: &mut ContextState) {
+    for buffer in context.transient_buffers.values_mut() {
+        if buffer.usage == super::TransientUse::Interned(context.frame_serial) {
+            buffer.usage = super::TransientUse::Available;
+        }
+    }
+}
+
+fn invalidate_unsafe_transients(context: &mut ContextState) {
+    let handles = context
+        .transient_buffers
+        .iter()
+        .filter_map(|(handle, buffer)| {
+            (buffer.usage == super::TransientUse::Interned(context.frame_serial)).then_some(*handle)
+        })
+        .collect::<Vec<_>>();
+    for handle in handles {
+        if let Ok(kind) = context.identity.resource_kind(handle) {
+            let _ = context.identity.remove(handle, kind);
+            if kind == ResourceKind::Indirect
+                && let Ok(typed) = IndirectBufferHandle::from_packed(handle)
+            {
+                context.indirects.remove(&typed);
+            }
+        }
+        context.transient_buffers.remove(&handle);
+        // Native ownership is uncertain after a failed idle drain. Keep the
+        // allocation quarantined in `allocations` for terminal context cleanup.
+    }
+}
+
+fn recycle_consumed_transients(
+    context: &mut ContextState,
+    completion: ez_gfx_hal::CompletionToken,
+) -> Result<()> {
+    let handles = context
+        .transient_buffers
+        .iter()
+        .filter_map(|(handle, buffer)| {
+            (buffer.usage == super::TransientUse::Interned(context.frame_serial)).then_some(*handle)
+        })
+        .collect::<Vec<_>>();
+    for handle in handles {
+        let kind = context
+            .identity
+            .resource_kind(handle)
+            .map_err(map_lifecycle)?;
+        context
+            .identity
+            .remove(handle, kind)
+            .map_err(map_lifecycle)?;
+        let metadata = context
+            .transient_buffers
+            .remove(&handle)
+            .ok_or(Error::InvalidContext)?;
+        context.allocation_ready.remove(&handle);
+        let (_, allocation) = context
+            .allocations
+            .remove(&handle)
+            .ok_or(Error::InvalidContext)?;
+        match kind {
+            ResourceKind::Structured => context
+                .structured_pool
+                .entry(metadata.element_size)
+                .or_insert_with(|| ez_gfx_hal::ReusableStagingPool::new(256))
+                .put(metadata.byte_capacity, allocation, Some(completion)),
+            ResourceKind::Indirect => {
+                let typed =
+                    IndirectBufferHandle::from_packed(handle).map_err(|_| Error::NativeFailure)?;
+                context.indirects.remove(&typed);
+                context
+                    .indirect_pool
+                    .put(metadata.byte_capacity, allocation, Some(completion));
+            }
+            _ => return Err(Error::InvalidContext),
+        }
+    }
+    Ok(())
+}
+
 /// Returns the completed frame readback.
 ///
 /// # Errors
 ///
 /// Returns an error when the context is invalid or no completed readback is available.
-pub fn frame_readback(context: ContextHandle) -> Result<Vec<u8>, EzGfxResult> {
+pub fn frame_readback(context: ContextHandle) -> Result<Vec<u8>> {
     with_context_mut(context, |context| {
         if context.last_readback.is_empty() {
-            return Err(EzGfxResult::NotReady);
+            return Err(Error::NotReady);
         }
         Ok(context.last_readback.clone())
     })
 }
 
-fn map_execution(error: &ExecutionError<EzGfxResult>) -> EzGfxResult {
+fn map_execution(error: &ExecutionError<Error>) -> Error {
     match error {
         ExecutionError::Backend(error) => *error,
         ExecutionError::MissingPayload { .. }
         | ExecutionError::UnexpectedPayloads
-        | ExecutionError::InvalidCompiledRange => EzGfxResult::InvalidArgument,
+        | ExecutionError::InvalidCompiledRange => Error::InvalidArgument,
     }
 }
 
@@ -798,13 +1017,13 @@ struct NativeFrameAdapter<'a> {
 }
 
 impl FrameExecutionBackend<ExecutableNode> for NativeFrameAdapter<'_> {
-    type Error = EzGfxResult;
+    type Error = Error;
 
     fn execute(
         &mut self,
         plan: &FrameExecutionPlan,
         payloads: &[ExecutableNode],
-    ) -> Result<(), Self::Error> {
+    ) -> std::result::Result<(), Self::Error> {
         if matches!(self.context.native, NativeContext::Vulkan(_)) {
             return execute_vulkan_frame_plan(self.context, plan, payloads);
         }
@@ -816,7 +1035,7 @@ impl FrameExecutionBackend<ExecutableNode> for NativeFrameAdapter<'_> {
         if matches!(self.context.native, NativeContext::Metal(_)) {
             return execute_metal_frame_plan(self.context, plan, payloads);
         }
-        Err(EzGfxResult::NativeFailure)
+        Err(Error::NativeFailure)
     }
 }
 

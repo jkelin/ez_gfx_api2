@@ -1,6 +1,5 @@
 //! Runtime in-memory shader compilation contract tests.
 
-use anyhow::Context as _;
 use ez_gfx_artifact::{Artifact, Stage, Target};
 use ez_gfx_compiler::compile_shader;
 use ez_gfx_core::{Backend, capability::SemanticProfile};
@@ -25,7 +24,7 @@ fn artifacts() -> anyhow::Result<&'static [ArtifactCase]> {
 fn compile_artifacts() -> anyhow::Result<Vec<ArtifactCase>> {
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .context("examples package has no workspace parent")?;
+        .ok_or_else(|| anyhow::anyhow!("examples package has no workspace parent"))?;
     let shaders: [(&str, &str, bool); 6] = [
         ("triangle", "examples/01_triangle/01_triangle.slang", false),
         (
@@ -58,8 +57,7 @@ fn compile_artifacts() -> anyhow::Result<Vec<ArtifactCase>> {
                     ez_gfx_compiler::Target::Metal,
                 ],
                 !cfg!(target_vendor = "apple"),
-            )
-            .with_context(|| format!("compile {name}"))?;
+            )?;
             Ok(ArtifactCase {
                 name,
                 bytes,
@@ -75,8 +73,7 @@ fn runtime_compiled_artifacts_select_every_stage_without_entry_requests() -> any
         let (name, bytes, has_compute) = (case.name, case.bytes.as_slice(), case.has_compute);
         for backend in [Backend::Vulkan, Backend::Dx12] {
             let shader = RuntimeShader::load(bytes, backend, SemanticProfile::V1)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-                .with_context(|| format!("{name} {backend:?}"))?;
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
             assert!(shader.graphics_pair().is_ok(), "{name} {backend:?}");
             assert_eq!(
                 shader.compute_product().is_ok(),
@@ -92,7 +89,7 @@ fn runtime_compiled_artifacts_select_every_stage_without_entry_requests() -> any
 fn runtime_compiled_metal_product_matches_the_host() -> anyhow::Result<()> {
     for case in artifacts()? {
         let (name, bytes) = (case.name, case.bytes.as_slice());
-        let artifact = Artifact::decode(bytes).with_context(|| format!("decode {name}"))?;
+        let artifact = Artifact::decode(bytes)?;
         #[cfg(target_vendor = "apple")]
         {
             assert!(
@@ -133,16 +130,15 @@ fn runtime_compiled_metal_product_matches_the_host() -> anyhow::Result<()> {
 fn runtime_compiler_reflection_has_unique_physical_bindings_per_stage() -> anyhow::Result<()> {
     for case in artifacts()? {
         let (name, bytes) = (case.name, case.bytes.as_slice());
-        let artifact = Artifact::decode(bytes).with_context(|| format!("decode {name}"))?;
-        let metadata: serde_json::Value = serde_json::from_slice(&artifact.metadata)
-            .with_context(|| format!("decode {name} reflection metadata"))?;
+        let artifact = Artifact::decode(bytes)?;
+        let metadata: serde_json::Value = serde_json::from_slice(&artifact.metadata)?;
         let reflections = metadata["reflections"]
             .as_array()
-            .context("reflection metadata has no reflections array")?;
+            .ok_or_else(|| anyhow::anyhow!("{name}: reflections must be an array"))?;
         for reflection in reflections {
             let parameters = reflection["reflection"]["parameters"]
                 .as_array()
-                .with_context(|| format!("{name} reflection has no parameters array"))?;
+                .ok_or_else(|| anyhow::anyhow!("{name}: parameters must be an array"))?;
             let mut bindings = std::collections::BTreeSet::new();
             for parameter in parameters {
                 if parameter["api_kind"].is_null() {
@@ -171,13 +167,13 @@ fn sponza_fragment_marks_bindless_texture_and_sampler_selection_nonuniform() -> 
     let case = artifacts()?
         .iter()
         .find(|case| case.name == "sponza")
-        .context("missing Sponza artifact")?;
-    let artifact = Artifact::decode(&case.bytes).context("decode Sponza artifact")?;
+        .ok_or_else(|| anyhow::anyhow!("missing Sponza artifact"))?;
+    let artifact = Artifact::decode(&case.bytes)?;
     let variant = artifact
         .variants
         .iter()
         .find(|variant| variant.target == Target::Spirv && variant.stage == Stage::Fragment)
-        .context("missing Sponza SPIR-V fragment product")?;
+        .ok_or_else(|| anyhow::anyhow!("missing Sponza fragment SPIR-V"))?;
     let bytes = variant.bytes.as_slice();
     assert!(bytes.len().is_multiple_of(4), "SPIR-V must contain words");
 
@@ -212,13 +208,12 @@ fn sponza_vertex_reflection_preserves_portable_primitive_identity() -> anyhow::R
     let case = artifacts()?
         .iter()
         .find(|case| case.name == "sponza")
-        .context("missing Sponza artifact")?;
-    let artifact = Artifact::decode(&case.bytes).context("decode Sponza artifact")?;
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&artifact.metadata).context("decode Sponza reflection metadata")?;
+        .ok_or_else(|| anyhow::anyhow!("missing Sponza artifact"))?;
+    let artifact = Artifact::decode(&case.bytes)?;
+    let metadata: serde_json::Value = serde_json::from_slice(&artifact.metadata)?;
     let reflections = metadata["reflections"]
         .as_array()
-        .context("Sponza reflection metadata has no reflections array")?;
+        .ok_or_else(|| anyhow::anyhow!("Sponza reflections must be an array"))?;
 
     let metal_target = if cfg!(target_vendor = "apple") {
         "Metallib"
@@ -229,10 +224,10 @@ fn sponza_vertex_reflection_preserves_portable_primitive_identity() -> anyhow::R
         let vertex = reflections
             .iter()
             .find(|reflection| reflection["target"] == target && reflection["stage"] == "Vertex")
-            .with_context(|| format!("missing Sponza {target} vertex reflection"))?;
+            .ok_or_else(|| anyhow::anyhow!("missing Sponza {target} vertex reflection"))?;
         let parameters = vertex["reflection"]["parameters"]
             .as_array()
-            .context("Sponza vertex reflection has no parameters array")?;
+            .ok_or_else(|| anyhow::anyhow!("Sponza {target} parameters must be an array"))?;
         assert_eq!(
             parameters
                 .iter()

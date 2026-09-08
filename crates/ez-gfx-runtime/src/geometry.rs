@@ -1,36 +1,63 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
+use ez_gfx_core::handle::PackedHandle;
 use ez_gfx_hal::{CompletionToken, DEFAULT_STAGING_POLICY, QueueKind, staging_bucket_size};
 
 const MAX_HEAP_NAME_BYTES: usize = 255;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Describes a contiguous reservation within a geometry heap.
+/// Describes a live contiguous allocation within a geometry heap.
 pub struct GeometryUpload {
-    /// Zero-based element position where the reservation begins.
+    /// Generation- and owner-bearing public allocation identity.
+    pub handle: PackedHandle,
+    /// Zero-based element position where the allocation begins.
     pub first_element: u32,
-    /// Byte position where the reservation begins.
+    /// Number of elements in the allocation.
+    pub element_count: u32,
+    /// Byte position where the allocation begins.
     pub byte_offset: u64,
     /// Number of bytes reserved for the upload.
     pub byte_size: u64,
 }
 
 #[derive(Clone, Debug)]
+struct LiveRange {
+    heap: HeapIdentity,
+    upload: GeometryUpload,
+    ready: Option<CompletionToken>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum HeapIdentity {
+    Vertex(String),
+    Index,
+}
+
+#[derive(Clone, Debug)]
 struct Heap {
     capacity: u64,
     stride: u64,
-    used: u64,
+    free: BTreeMap<u64, u64>,
     ready: Option<CompletionToken>,
-    latest_reservation: Option<GeometryUpload>,
+}
+
+impl Heap {
+    fn new(capacity: u64, stride: u64) -> Self {
+        Self {
+            capacity,
+            stride,
+            free: BTreeMap::from([(0, capacity)]),
+            ready: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
-/// Tracks vertex and index heap allocation and upload readiness.
+/// Tracks named vertex and global index heap ranges and upload readiness.
 pub struct GeometryManager {
-    /// Named vertex heaps with independent capacities and strides.
     vertex: BTreeMap<String, Heap>,
-    /// Optional heap containing packed 32-bit indices.
     index: Option<Heap>,
+    live: HashMap<PackedHandle, LiveRange>,
 }
 
 impl GeometryManager {
@@ -39,11 +66,11 @@ impl GeometryManager {
         Self::default()
     }
 
-    /// Names are bounded ASCII identifiers; zero capacity/stride and duplicate names are rejected.
+    /// Creates one validated named vertex heap.
     ///
     /// # Errors
     ///
-    /// Returns `InvalidName` for an invalid heap name, `InvalidCapacity` for zero capacity, `InvalidStride` for a zero or oversized stride, or `DuplicateHeap` when the name already exists.
+    /// Rejects invalid names, capacities, strides, and duplicate names.
     pub fn create_vertex_heap(
         &mut self,
         name: &str,
@@ -60,24 +87,16 @@ impl GeometryManager {
         if self.vertex.contains_key(name) {
             return Err(GeometryError::DuplicateHeap);
         }
-        self.vertex.insert(
-            name.to_owned(),
-            Heap {
-                capacity,
-                stride,
-                used: 0,
-                ready: None,
-                latest_reservation: None,
-            },
-        );
+        self.vertex
+            .insert(name.to_owned(), Heap::new(capacity, stride));
         Ok(())
     }
 
-    /// Only one u32 index heap exists; capacity must hold at least one complete index.
+    /// Creates the single packed-u32 index heap.
     ///
     /// # Errors
     ///
-    /// Returns `InvalidCapacity` when capacity is less than four bytes or `DuplicateHeap` when an index heap already exists.
+    /// Rejects capacities smaller than one index and duplicate heaps.
     pub fn create_index_heap(&mut self, capacity: u64) -> Result<(), GeometryError> {
         if capacity < 4 {
             return Err(GeometryError::InvalidCapacity);
@@ -85,143 +104,226 @@ impl GeometryManager {
         if self.index.is_some() {
             return Err(GeometryError::DuplicateHeap);
         }
-        self.index = Some(Heap {
-            capacity,
-            stride: 4,
-            used: 0,
-            ready: None,
-            latest_reservation: None,
-        });
+        self.index = Some(Heap::new(capacity, 4));
         Ok(())
     }
 
-    /// Reserves contiguous space for vertices in the named heap.
+    /// Allocates a contiguous vertex range and associates its public identity.
     ///
     /// # Errors
     ///
-    /// Returns an error if the heap is unknown, the count is zero, the element size differs from the heap stride, or the reservation exceeds supported capacity or arithmetic.
+    /// Rejects unknown heaps, duplicate handles, zero counts, stride mismatch, and exhaustion.
     pub fn reserve_vertices(
         &mut self,
         name: &str,
         count: u32,
         element_size: u64,
+        handle: PackedHandle,
     ) -> Result<GeometryUpload, GeometryError> {
+        if self.live.contains_key(&handle) {
+            return Err(GeometryError::DuplicateAllocation);
+        }
         let heap = self
             .vertex
             .get_mut(name)
             .ok_or(GeometryError::UnknownHeap)?;
-        if count == 0 {
-            return Err(GeometryError::InvalidCount);
-        }
         if element_size != heap.stride {
             return Err(GeometryError::StrideMismatch);
         }
-        reserve(heap, count)
+        let upload = reserve(heap, count, handle)?;
+        self.live.insert(
+            handle,
+            LiveRange {
+                heap: HeapIdentity::Vertex(name.to_owned()),
+                upload,
+                ready: None,
+            },
+        );
+        Ok(upload)
     }
 
-    /// Reserves contiguous space for 32-bit indices.
+    /// Allocates a contiguous index range and associates its public identity.
     ///
     /// # Errors
     ///
-    /// Returns an error if the index heap is unknown, the count is zero, or the reservation exceeds supported capacity or arithmetic.
-    pub fn reserve_indices(&mut self, count: u32) -> Result<GeometryUpload, GeometryError> {
-        if count == 0 {
-            return Err(GeometryError::InvalidCount);
+    /// Rejects a missing heap, duplicate handle, zero count, or exhaustion.
+    pub fn reserve_indices(
+        &mut self,
+        count: u32,
+        handle: PackedHandle,
+    ) -> Result<GeometryUpload, GeometryError> {
+        if self.live.contains_key(&handle) {
+            return Err(GeometryError::DuplicateAllocation);
         }
-        reserve(
-            self.index.as_mut().ok_or(GeometryError::UnknownHeap)?,
-            count,
-        )
+        let heap = self.index.as_mut().ok_or(GeometryError::UnknownHeap)?;
+        let upload = reserve(heap, count, handle)?;
+        self.live.insert(
+            handle,
+            LiveRange {
+                heap: HeapIdentity::Index,
+                upload,
+                ready: None,
+            },
+        );
+        Ok(upload)
     }
 
-    /// Only the immediately latest reservation is rollbackable. A newer reservation permanently
-    /// supersedes the previous candidate, even when the newer reservation is rolled back.
+    /// Returns one live allocation's range.
     ///
     /// # Errors
     ///
-    /// Returns `UnknownHeap` if the vertex heap does not exist or `InvalidRollback` if the upload is not the current rollback candidate.
-    pub fn rollback_vertices(
+    /// Returns `UnknownAllocation` for stale, freed, or foreign identities.
+    pub fn allocation(&self, handle: PackedHandle) -> Result<GeometryUpload, GeometryError> {
+        self.live
+            .get(&handle)
+            .map(|range| range.upload)
+            .ok_or(GeometryError::UnknownAllocation)
+    }
+
+    /// Records the upload token for one allocation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale identities and timeline regression.
+    pub fn mark_ready(
         &mut self,
-        name: &str,
-        upload: GeometryUpload,
-    ) -> Result<(), GeometryError> {
-        rollback(
-            self.vertex
-                .get_mut(name)
-                .ok_or(GeometryError::UnknownHeap)?,
-            upload,
-        )
-    }
-
-    /// Reclaims the immediately latest index reservation.
-    ///
-    /// A successful rollback clears the candidate rather than restoring an older reservation.
-    ///
-    /// # Errors
-    ///
-    /// Returns `UnknownHeap` if the index heap does not exist or `InvalidRollback` if the upload is not the current rollback candidate.
-    pub fn rollback_indices(&mut self, upload: GeometryUpload) -> Result<(), GeometryError> {
-        rollback(
-            self.index.as_mut().ok_or(GeometryError::UnknownHeap)?,
-            upload,
-        )
-    }
-
-    /// Records the completion token that makes a vertex heap usable.
-    ///
-    /// # Errors
-    ///
-    /// Returns `UnknownHeap` if the vertex heap does not exist or `TimelineRegression` if the token does not advance the same queue timeline.
-    pub fn mark_vertex_ready(
-        &mut self,
-        name: &str,
+        handle: PackedHandle,
         token: CompletionToken,
     ) -> Result<(), GeometryError> {
-        mark_ready(
-            self.vertex
-                .get_mut(name)
-                .ok_or(GeometryError::UnknownHeap)?,
-            token,
-        )
+        let range = self
+            .live
+            .get_mut(&handle)
+            .ok_or(GeometryError::UnknownAllocation)?;
+        if range
+            .ready
+            .is_some_and(|current| current.queue == token.queue && current.value >= token.value)
+        {
+            return Err(GeometryError::TimelineRegression);
+        }
+        range.ready = Some(token);
+        let heap = match &range.heap {
+            HeapIdentity::Vertex(name) => self.vertex.get_mut(name),
+            HeapIdentity::Index => self.index.as_mut(),
+        }
+        .ok_or(GeometryError::UnknownHeap)?;
+        if heap.ready.is_none_or(|current| current.value < token.value) {
+            heap.ready = Some(token);
+        }
+        Ok(())
     }
 
-    /// Records the completion token that makes the index heap usable.
+    /// Releases a live vertex allocation after the caller establishes GPU safety.
     ///
     /// # Errors
     ///
-    /// Returns `UnknownHeap` if the index heap does not exist or `TimelineRegression` if the token does not advance the same queue timeline.
-    pub fn mark_index_ready(&mut self, token: CompletionToken) -> Result<(), GeometryError> {
-        mark_ready(
-            self.index.as_mut().ok_or(GeometryError::UnknownHeap)?,
-            token,
-        )
+    /// Rejects stale identities and handles belonging to another heap.
+    pub fn free_vertices(
+        &mut self,
+        name: &str,
+        handle: PackedHandle,
+    ) -> Result<GeometryUpload, GeometryError> {
+        let range = self
+            .live
+            .get(&handle)
+            .cloned()
+            .ok_or(GeometryError::UnknownAllocation)?;
+        if range.heap != HeapIdentity::Vertex(name.to_owned()) {
+            return Err(GeometryError::WrongHeap);
+        }
+        self.live.remove(&handle);
+        let heap = self
+            .vertex
+            .get_mut(name)
+            .ok_or(GeometryError::UnknownHeap)?;
+        release_range(heap, range.upload)?;
+        Ok(range.upload)
     }
 
-    /// Returns the completion token recorded for the named vertex heap.
+    /// Releases a live vertex allocation using its recorded heap ownership.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale identities and non-vertex allocation handles.
+    pub fn free_vertex(&mut self, handle: PackedHandle) -> Result<GeometryUpload, GeometryError> {
+        let range = self
+            .live
+            .get(&handle)
+            .cloned()
+            .ok_or(GeometryError::UnknownAllocation)?;
+        let HeapIdentity::Vertex(name) = &range.heap else {
+            return Err(GeometryError::WrongHeap);
+        };
+        self.live.remove(&handle);
+        let heap = self
+            .vertex
+            .get_mut(name)
+            .ok_or(GeometryError::UnknownHeap)?;
+        release_range(heap, range.upload)?;
+        Ok(range.upload)
+    }
+
+    /// Releases a live index allocation after the caller establishes GPU safety.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale identities and vertex allocation handles.
+    pub fn free_indices(&mut self, handle: PackedHandle) -> Result<GeometryUpload, GeometryError> {
+        let range = self
+            .live
+            .get(&handle)
+            .cloned()
+            .ok_or(GeometryError::UnknownAllocation)?;
+        if range.heap != HeapIdentity::Index {
+            return Err(GeometryError::WrongHeap);
+        }
+        self.live.remove(&handle);
+        let heap = self.index.as_mut().ok_or(GeometryError::UnknownHeap)?;
+        release_range(heap, range.upload)?;
+        Ok(range.upload)
+    }
+
+    /// Returns the latest token for a named heap.
     pub fn vertex_ready(&self, name: &str) -> Option<CompletionToken> {
         self.vertex.get(name).and_then(|heap| heap.ready)
     }
-    /// Returns the completion token recorded for the index heap.
+
+    /// Returns the latest token for the index heap.
     pub fn index_ready(&self) -> Option<CompletionToken> {
         self.index.as_ref().and_then(|heap| heap.ready)
     }
-    /// Removes the named vertex heap and its allocation state.
+
+    /// Removes an empty vertex heap.
     ///
     /// # Errors
     ///
-    /// Returns `UnknownHeap` if the named vertex heap does not exist.
+    /// Rejects unknown or nonempty heaps.
     pub fn remove_vertex_heap(&mut self, name: &str) -> Result<(), GeometryError> {
+        if self
+            .live
+            .values()
+            .any(|range| range.heap == HeapIdentity::Vertex(name.to_owned()))
+        {
+            return Err(GeometryError::HeapNotEmpty);
+        }
         self.vertex
             .remove(name)
             .map(|_| ())
             .ok_or(GeometryError::UnknownHeap)
     }
-    /// Removes the index heap and its allocation state.
+
+    /// Removes an empty index heap.
     ///
     /// # Errors
     ///
-    /// Returns `UnknownHeap` if no index heap exists.
+    /// Rejects a missing or nonempty heap.
     pub fn remove_index_heap(&mut self) -> Result<(), GeometryError> {
+        if self
+            .live
+            .values()
+            .any(|range| range.heap == HeapIdentity::Index)
+        {
+            return Err(GeometryError::HeapNotEmpty);
+        }
         self.index
             .take()
             .map(|_| ())
@@ -229,62 +331,63 @@ impl GeometryManager {
     }
 }
 
-/// Appends a contiguous reservation to a heap.
-///
-/// # Errors
-///
-/// Returns `CapacityExceeded` if size arithmetic overflows, the reservation exceeds heap capacity, or its first element cannot fit in `u32`.
-fn reserve(heap: &mut Heap, count: u32) -> Result<GeometryUpload, GeometryError> {
+fn reserve(
+    heap: &mut Heap,
+    count: u32,
+    handle: PackedHandle,
+) -> Result<GeometryUpload, GeometryError> {
+    if count == 0 {
+        return Err(GeometryError::InvalidCount);
+    }
     let byte_size = u64::from(count)
         .checked_mul(heap.stride)
         .ok_or(GeometryError::CapacityExceeded)?;
-    let end = heap
-        .used
-        .checked_add(byte_size)
+    let (&offset, &available) = heap
+        .free
+        .iter()
+        .find(|(_, available)| **available >= byte_size)
         .ok_or(GeometryError::CapacityExceeded)?;
-    if end > heap.capacity {
-        return Err(GeometryError::CapacityExceeded);
+    heap.free.remove(&offset);
+    if available > byte_size {
+        heap.free.insert(offset + byte_size, available - byte_size);
     }
     let first_element =
-        u32::try_from(heap.used / heap.stride).map_err(|_| GeometryError::CapacityExceeded)?;
-    let upload = GeometryUpload {
+        u32::try_from(offset / heap.stride).map_err(|_| GeometryError::CapacityExceeded)?;
+    Ok(GeometryUpload {
+        handle,
         first_element,
-        byte_offset: heap.used,
+        element_count: count,
+        byte_offset: offset,
         byte_size,
-    };
-    heap.latest_reservation = Some(upload);
-    heap.used = end;
-    Ok(upload)
+    })
 }
 
-/// Reclaims only the immediately latest reservation.
-///
-/// # Errors
-///
-/// Returns `InvalidRollback` unless the upload exactly matches the current rollback candidate.
-fn rollback(heap: &mut Heap, upload: GeometryUpload) -> Result<(), GeometryError> {
-    // Public fields are forgeable, and rollback must not revive an older superseded candidate.
-    if heap.latest_reservation != Some(upload) {
-        return Err(GeometryError::InvalidRollback);
-    }
-    heap.latest_reservation.take();
-    heap.used = upload.byte_offset;
-    Ok(())
-}
-
-/// Updates a heap's readiness token without regressing the same queue timeline.
-///
-/// # Errors
-///
-/// Returns `TimelineRegression` if the token's value does not exceed the current value for the same queue.
-fn mark_ready(heap: &mut Heap, token: CompletionToken) -> Result<(), GeometryError> {
-    if heap
-        .ready
-        .is_some_and(|current| current.queue == token.queue && current.value >= token.value)
+fn release_range(heap: &mut Heap, upload: GeometryUpload) -> Result<(), GeometryError> {
+    let mut start = upload.byte_offset;
+    let mut size = upload.byte_size;
+    if let Some((&previous, &previous_size)) = heap.free.range(..start).next_back()
+        && previous.checked_add(previous_size) == Some(start)
     {
-        return Err(GeometryError::TimelineRegression);
+        heap.free.remove(&previous);
+        start = previous;
+        size = size
+            .checked_add(previous_size)
+            .ok_or(GeometryError::CapacityExceeded)?;
     }
-    heap.ready = Some(token);
+    if let Some((&next, &next_size)) = heap.free.range(start..).next()
+        && start.checked_add(size) == Some(next)
+    {
+        heap.free.remove(&next);
+        size = size
+            .checked_add(next_size)
+            .ok_or(GeometryError::CapacityExceeded)?;
+    }
+    let end = start
+        .checked_add(size)
+        .ok_or(GeometryError::CapacityExceeded)?;
+    if end > heap.capacity || heap.free.insert(start, size).is_some() {
+        return Err(GeometryError::InvalidFree);
+    }
     Ok(())
 }
 
@@ -316,40 +419,30 @@ struct StagingEntry {
     retirement: Option<CompletionToken>,
 }
 
-#[derive(Clone, Debug)]
-/// Reuses and allocates staging buffers up to a fixed slot limit.
+#[derive(Clone, Debug, Default)]
+/// Reuses staging buffers without an artificial slot limit.
 pub struct StagingPool {
-    /// Maximum number of staging slots that may exist.
-    capacity: u32,
-    /// Allocated staging slots and their reuse state.
     entries: Vec<StagingEntry>,
 }
 
 impl StagingPool {
-    /// Creates an empty staging pool with the given slot limit.
-    ///
-    /// # Errors
-    ///
-    /// Returns `InvalidCapacity` if the slot limit is zero.
-    pub fn new(capacity: u32) -> Result<Self, GeometryError> {
-        if capacity == 0 {
-            return Err(GeometryError::InvalidCapacity);
-        }
-        Ok(Self {
-            capacity,
+    /// Creates an empty staging pool.
+    pub fn new() -> Self {
+        Self {
             entries: Vec::new(),
-        })
+        }
     }
 
     /// A retired slot is reusable only after its transfer value completes and only if it fits.
     ///
     /// # Errors
     ///
-    /// Returns `InvalidCount` if size is zero or `StagingPoolExhausted` if no reusable slot is available at the slot limit.
+    /// Returns `InvalidCount` if size is zero or `StagingPoolExhausted` only if
+    /// the slot index cannot be represented.
     ///
     /// # Panics
     ///
-    /// The staging pool capacity bounds every slot index conversion.
+    /// Existing slot indices were validated when inserted.
     pub fn checkout(
         &mut self,
         size: u64,
@@ -369,9 +462,6 @@ impl StagingPool {
             return Ok(StagingSlot(
                 u32::try_from(index).expect("validated index fits u32"),
             ));
-        }
-        if self.entries.len() >= self.capacity as usize {
-            return Err(GeometryError::StagingPoolExhausted);
         }
         self.entries.push(StagingEntry {
             capacity: bucket,
@@ -454,20 +544,28 @@ pub enum GeometryError {
     InvalidCount,
     /// A heap already exists for the requested name or index storage.
     DuplicateHeap,
+    /// A public allocation handle is already live.
+    DuplicateAllocation,
     /// The requested vertex or index heap does not exist.
     UnknownHeap,
+    /// The requested allocation is stale or unknown.
+    UnknownAllocation,
+    /// The allocation belongs to another heap kind or name.
+    WrongHeap,
+    /// A heap still owns live ranges.
+    HeapNotEmpty,
     /// The requested vertex element size differs from the heap stride.
     StrideMismatch,
     /// A reservation exceeds heap capacity or supported offset arithmetic.
     CapacityExceeded,
+    /// A free range overlaps or exceeds the heap.
+    InvalidFree,
     /// A readiness token does not advance its queue timeline.
     TimelineRegression,
-    /// No reusable staging slot exists and the slot limit has been reached.
+    /// The staging slot index cannot be represented.
     StagingPoolExhausted,
     /// The staging slot index is unknown or the slot is not checked out.
     InvalidStagingSlot,
     /// A staging retirement token did not belong to the transfer queue.
     WrongQueue,
-    /// The reservation is not the heap's most recent allocation.
-    InvalidRollback,
 }

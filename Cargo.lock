@@ -684,6 +684,7 @@ name = "ez-gfx"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "bytemuck",
  "crossbeam-channel",
  "ez-gfx-artifact",
  "ez-gfx-assets",
@@ -693,6 +694,7 @@ dependencies = [
  "ez-gfx-core",
  "ez-gfx-hal",
  "ez-gfx-runtime",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

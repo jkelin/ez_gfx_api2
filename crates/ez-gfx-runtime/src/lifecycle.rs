@@ -24,6 +24,12 @@ pub enum ResourceKind {
     Texture = 5,
     /// Render-target resource.
     RenderTarget = 6,
+    /// Named vertex heap.
+    VertexHeap = 7,
+    /// Allocation within a named vertex heap.
+    VertexAllocation = 8,
+    /// Allocation within the global index heap.
+    IndexAllocation = 9,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,6 +154,23 @@ impl ContextIdentity {
                 Err(LifecycleError::Handle(error))
             }
         }
+    }
+
+    /// Returns the validated kind of a live child handle.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unhealthy contexts and invalid, foreign, or stale handles.
+    pub fn resource_kind(&self, handle: PackedHandle) -> Result<ResourceKind, LifecycleError> {
+        self.check_thread_and_health()?;
+        let (owner, child) = child_parts(handle)?;
+        if owner != self.owner {
+            return Err(LifecycleError::WrongOwner);
+        }
+        self.resources
+            .get(child)
+            .copied()
+            .map_err(|_| LifecycleError::StaleHandle)
     }
 
     /// Owner, packed form, generation, and kind are all checked before typed resource lookup.

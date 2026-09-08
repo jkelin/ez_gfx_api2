@@ -7,8 +7,8 @@ pub use api::*;
 pub use ez_gfx_artifact::Stage;
 pub use ez_gfx_core::capability::{AdapterClass, AdapterInfo, CapabilityError};
 pub use ez_gfx_core::handle::{
-    ContextHandle, IndirectBufferHandle, RenderTargetHandle, ShaderHandle, StructuredBufferHandle,
-    SurfaceHandle, TextureHandle,
+    ContextHandle, IndexAllocationHandle, IndirectBufferHandle, RenderTargetHandle, ShaderHandle,
+    StructuredBufferHandle, SurfaceHandle, TextureHandle, VertexAllocationHandle, VertexHeapHandle,
 };
 pub use ez_gfx_core::{Backend, SemanticId};
 pub use ez_gfx_hal::{
@@ -23,27 +23,28 @@ pub use ez_gfx_runtime::texture::{
     TextureSource, TextureUploadTelemetrySnapshot, register_texture_decoder,
     unregister_texture_decoder,
 };
+pub use ez_gfx_runtime::upload::{UploadEvent, UploadResource, UploadStatus};
 pub use ez_gfx_runtime::{
-    AdapterReport, AdapterSelection, ContextOptions, SurfaceOptions, SurfacePlatform,
-    admission_report,
+    AdapterReport, AdapterSelection, ContextOptions, LifecycleError, SurfaceOptions,
+    SurfacePlatform, admission_report,
 };
 pub use state::*;
 
 /// Submits the recorded frame and presents its active surface; a failed submission is never followed by presentation.
-pub fn finish_render(context: ContextHandle) -> EzGfxResult {
+///
+/// # Errors
+///
+/// Returns an error when validation, handle ownership, readiness, or a backend operation fails.
+pub fn finish_render(context: ContextHandle) -> Result<()> {
     submit_then_present(|| frame_submit(context), || present(context))
 }
 
 // Submission failures propagate unchanged and must short-circuit presentation.
 fn submit_then_present(
-    submit: impl FnOnce() -> EzGfxResult,
-    present: impl FnOnce() -> EzGfxResult,
-) -> EzGfxResult {
-    let submitted = submit();
-    if submitted != EzGfxResult::Ok {
-        return submitted;
-    }
-
+    submit: impl FnOnce() -> Result<()>,
+    present: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    submit()?;
     present()
 }
 
@@ -55,14 +56,14 @@ mod tests {
     fn failed_submission_prevents_presentation() {
         let mut presented = false;
         let status = submit_then_present(
-            || EzGfxResult::NativeFailure,
+            || Err(Error::NativeFailure),
             || {
                 presented = true;
-                EzGfxResult::Ok
+                Ok(())
             },
         );
 
-        assert_eq!(status, EzGfxResult::NativeFailure);
+        assert_eq!(status, Err(Error::NativeFailure));
         assert!(!presented);
     }
 }

@@ -12,12 +12,64 @@ pub type EzGfxShader = EzGfxHandle;
 pub type EzGfxIndirectBuffer = EzGfxHandle;
 /// Opaque identifier for a shader-accessible structured buffer.
 pub type EzGfxStructuredBuffer = EzGfxHandle;
+/// Opaque identifier for a named vertex heap.
+pub type EzGfxVertexHeap = EzGfxHandle;
+/// Opaque identifier for an allocation within a named vertex heap.
+pub type EzGfxVertexAllocation = EzGfxHandle;
+/// Opaque identifier for an allocation within the global index heap.
+pub type EzGfxIndexAllocation = EzGfxHandle;
 /// Opaque identifier for a sampled texture resource.
 pub type EzGfxTexture = EzGfxHandle;
 /// Opaque identifier for a render-target resource.
 pub type EzGfxRenderTarget = EzGfxHandle;
 
-pub use ez_gfx::EzGfxResult;
+/// Stable C ABI result code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum EzGfxResult {
+    /// Operation completed successfully.
+    Ok = 0,
+    /// An argument violates the operation contract.
+    InvalidArgument = 1,
+    /// A context or resource handle is invalid or stale.
+    InvalidContext = 2,
+    /// The native graphics backend failed.
+    NativeFailure = 3,
+    /// Completion or output is not yet available.
+    NotReady = 4,
+    /// The requested capability is unavailable.
+    Unsupported = 5,
+    /// The graphics device was lost.
+    DeviceLost = 6,
+    /// Asynchronous scheduling or staging capacity is unavailable.
+    QueueFull = 7,
+    /// An asynchronous operation was cancelled before completion.
+    Cancelled = 8,
+}
+
+impl From<ez_gfx::Error> for EzGfxResult {
+    #[allow(
+        clippy::match_same_arms,
+        reason = "current variants stay explicit while the non-exhaustive facade retains a safe fallback"
+    )]
+    fn from(error: ez_gfx::Error) -> Self {
+        match error {
+            ez_gfx::Error::InvalidArgument => Self::InvalidArgument,
+            ez_gfx::Error::InvalidContext => Self::InvalidContext,
+            ez_gfx::Error::Lifecycle(
+                ez_gfx::LifecycleError::DeviceLost | ez_gfx::LifecycleError::AlreadyLost,
+            ) => Self::DeviceLost,
+            ez_gfx::Error::Lifecycle(_) => Self::InvalidContext,
+            ez_gfx::Error::NativeFailure => Self::NativeFailure,
+            ez_gfx::Error::NotReady => Self::NotReady,
+            ez_gfx::Error::Unsupported | ez_gfx::Error::Capability(_) => Self::Unsupported,
+            ez_gfx::Error::DeviceLost => Self::DeviceLost,
+            ez_gfx::Error::QueueFull => Self::QueueFull,
+            ez_gfx::Error::Cancelled => Self::Cancelled,
+            _ => Self::NativeFailure,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -428,6 +480,26 @@ pub struct EzGfxRuntimeRecord {
     clippy::pub_underscore_fields,
     reason = "Named public padding preserves ABI layout and zero-initialization for callers."
 )]
+/// One lossless typed upload transition.
+pub struct EzGfxUploadEvent {
+    /// Opaque texture, vertex-allocation, or index-allocation handle.
+    pub resource: EzGfxHandle,
+    /// Resource kind: 1 texture, 2 vertex allocation, 3 index allocation.
+    pub resource_kind: u8,
+    /// Status: 1 source staged, 2 device ready, 3 failed, 4 cancelled.
+    pub status: u8,
+    /// `RuntimeStatus` code for failed events, zero otherwise.
+    pub error: u8,
+    /// Reserves bytes that keep the C ABI layout stable.
+    pub _padding: [u8; 5],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+#[allow(
+    clippy::pub_underscore_fields,
+    reason = "Named public padding preserves ABI layout and zero-initialization for callers."
+)]
 /// Couples a runtime record with its diagnostic severity.
 pub struct EzGfxDiagnostic {
     /// Contains the correlated runtime record being diagnosed.
@@ -450,5 +522,40 @@ mod tests {
             sampler_address_from_abi(2),
             Err(EzGfxResult::InvalidArgument)
         );
+    }
+}
+
+#[cfg(test)]
+mod result_tests {
+    use super::*;
+    use ez_gfx::{CapabilityError, Error};
+    use ez_gfx_runtime::LifecycleError;
+
+    #[test]
+    fn every_safe_error_maps_to_a_stable_abi_status() {
+        for (error, expected) in [
+            (Error::InvalidArgument, EzGfxResult::InvalidArgument),
+            (Error::InvalidContext, EzGfxResult::InvalidContext),
+            (Error::NativeFailure, EzGfxResult::NativeFailure),
+            (Error::NotReady, EzGfxResult::NotReady),
+            (Error::Unsupported, EzGfxResult::Unsupported),
+            (Error::DeviceLost, EzGfxResult::DeviceLost),
+            (Error::QueueFull, EzGfxResult::QueueFull),
+            (Error::Cancelled, EzGfxResult::Cancelled),
+            (
+                Error::Lifecycle(LifecycleError::WrongThread),
+                EzGfxResult::InvalidContext,
+            ),
+            (
+                Error::Lifecycle(LifecycleError::AlreadyLost),
+                EzGfxResult::DeviceLost,
+            ),
+            (
+                Error::Capability(CapabilityError::MissingCompression),
+                EzGfxResult::Unsupported,
+            ),
+        ] {
+            assert_eq!(EzGfxResult::from(error), expected);
+        }
     }
 }

@@ -12,9 +12,9 @@ use ez_gfx_ffi::{
     EzGfxSurfaceDesc, EzGfxTextureDesc, ez_gfx_acquire_indirect, ez_gfx_begin_render,
     ez_gfx_context_create_backend, ez_gfx_context_destroy, ez_gfx_context_init_device,
     ez_gfx_context_wait_idle, ez_gfx_finish_render, ez_gfx_frame_begin, ez_gfx_frame_readback,
-    ez_gfx_frame_submit, ez_gfx_graph_enqueue_texture_readback, ez_gfx_index_heap_create,
-    ez_gfx_index_heap_destroy, ez_gfx_indirect_release, ez_gfx_indirect_set_draw_count,
-    ez_gfx_indirect_write_draw, ez_gfx_render_add_compute_pipeline,
+    ez_gfx_frame_submit, ez_gfx_graph_enqueue_texture_readback, ez_gfx_index_allocation_get_range,
+    ez_gfx_index_heap_create, ez_gfx_index_heap_destroy, ez_gfx_indirect_release,
+    ez_gfx_indirect_write_draws, ez_gfx_render_add_compute_pipeline,
     ez_gfx_render_add_vertex_pipeline, ez_gfx_shader_destroy, ez_gfx_shader_load_artifact,
     ez_gfx_surface_create, ez_gfx_surface_destroy, ez_gfx_texture_load, ez_gfx_texture_unload,
     ez_gfx_vertex_upload_indices,
@@ -207,7 +207,6 @@ fn submit_render_nodes(context: u64, surface: u64, shader: u64, indirect: u64) {
         primitive_type: 0,
         blend_mode: 1,
     };
-    assert_eq!(ez_gfx_begin_render(surface, context), EzGfxResult::Ok);
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
@@ -366,7 +365,7 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
         EzGfxResult::Ok
     );
     let indices = [0_u32, 1, 2];
-    let mut first_index = 0;
+    let mut index_allocation = 0;
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
@@ -374,13 +373,31 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
                 ez_gfx_vertex_upload_indices(
                     indices.as_ptr().cast(),
                     u32::try_from(indices.len()).unwrap(),
-                    &raw mut first_index,
+                    &raw mut index_allocation,
                     context,
                 )
             }
         },
         EzGfxResult::Ok
     );
+    let mut first_index = 0;
+    let mut index_count = 0;
+    assert_eq!(
+        {
+            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            unsafe {
+                ez_gfx_index_allocation_get_range(
+                    index_allocation,
+                    &raw mut first_index,
+                    &raw mut index_count,
+                    context,
+                )
+            }
+        },
+        EzGfxResult::Ok
+    );
+    assert_eq!(index_count, 3);
+    assert_eq!(ez_gfx_begin_render(surface, context), EzGfxResult::Ok);
     let mut indirect = 0;
     assert_eq!(
         {
@@ -401,12 +418,8 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_indirect_write_draw(indirect, 0, &raw const command, context) }
+            unsafe { ez_gfx_indirect_write_draws(indirect, 0, &raw const command, 1, context) }
         },
-        EzGfxResult::Ok
-    );
-    assert_eq!(
-        ez_gfx_indirect_set_draw_count(indirect, 1, context),
         EzGfxResult::Ok
     );
 

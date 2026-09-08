@@ -373,13 +373,10 @@ impl EventQueue {
 
 struct JobPermit {
     jobs: Arc<AtomicUsize>,
-    bytes: Arc<AtomicUsize>,
-    reserved_bytes: usize,
 }
 impl Drop for JobPermit {
     fn drop(&mut self) {
         self.jobs.fetch_sub(1, Ordering::AcqRel);
-        self.bytes.fetch_sub(self.reserved_bytes, Ordering::AcqRel);
     }
 }
 
@@ -392,25 +389,21 @@ impl Drop for JobPermit {
 /// overhead; any larger request is configuration garbage.
 pub const MAX_CPU_POOL_THREADS: usize = 256;
 
-/// Bounded CPU worker pool for asset processing.
+/// CPU worker pool for asset processing with unbounded job admission.
 pub struct CpuPool {
     pool: ThreadPool,
     cancelled: Arc<AtomicBool>,
-    max_jobs: usize,
-    max_bytes: usize,
     jobs: Arc<AtomicUsize>,
-    bytes: Arc<AtomicUsize>,
 }
 impl CpuPool {
-    /// Creates a worker pool with job and byte budgets.
+    /// Creates a worker pool with unbounded job admission.
     ///
     /// # Errors
     ///
-    /// Returns [`AssetError::InvalidPool`] when any budget is zero, the thread
-    /// count exceeds [`MAX_CPU_POOL_THREADS`], or the worker pool cannot be
-    /// created.
-    pub fn new(threads: usize, max_jobs: usize, max_bytes: usize) -> Result<Self, AssetError> {
-        if threads == 0 || max_jobs == 0 || max_bytes == 0 {
+    /// Returns [`AssetError::InvalidPool`] when `threads` is zero, exceeds
+    /// [`MAX_CPU_POOL_THREADS`], or the worker pool cannot be created.
+    pub fn new(threads: usize) -> Result<Self, AssetError> {
+        if threads == 0 {
             return Err(AssetError::InvalidPool);
         }
         if threads > MAX_CPU_POOL_THREADS {
@@ -423,75 +416,37 @@ impl CpuPool {
         Ok(Self {
             pool,
             cancelled: Arc::new(AtomicBool::new(false)),
-            max_jobs,
-            max_bytes,
             jobs: Arc::new(AtomicUsize::new(0)),
-            bytes: Arc::new(AtomicUsize::new(0)),
         })
     }
     /// Returns the worker thread count backing this pool.
     pub fn thread_count(&self) -> usize {
         self.pool.current_num_threads()
     }
-    fn permit(&self, bytes: usize) -> Result<JobPermit, AssetError> {
-        if bytes > self.max_bytes {
-            return Err(AssetError::QueueFull);
-        }
-        loop {
-            let jobs = self.jobs.load(Ordering::Acquire);
-            let used = self.bytes.load(Ordering::Acquire);
-            if jobs >= self.max_jobs || used > self.max_bytes - bytes {
-                return Err(AssetError::QueueFull);
-            }
-            if self
-                .jobs
-                .compare_exchange(jobs, jobs + 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                if self
-                    .bytes
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                        (v <= self.max_bytes - bytes).then_some(v + bytes)
-                    })
-                    .is_ok()
-                {
-                    return Ok(JobPermit {
-                        jobs: self.jobs.clone(),
-                        bytes: self.bytes.clone(),
-                        reserved_bytes: bytes,
-                    });
-                }
-                self.jobs.fetch_sub(1, Ordering::AcqRel);
-            }
-        }
+    fn permit(&self) -> Result<JobPermit, AssetError> {
+        self.jobs
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |jobs| {
+                jobs.checked_add(1)
+            })
+            .map_err(|_| AssetError::QueueFull)?;
+        Ok(JobPermit {
+            jobs: self.jobs.clone(),
+        })
     }
-    /// Schedules a CPU job after reserving its resource budget.
+    /// Schedules a CPU job without an artificial count or byte limit.
     ///
     /// # Errors
     ///
-    /// Returns [`AssetError::Cancelled`] when shut down or
-    /// [`AssetError::QueueFull`] when job capacity is exhausted.
+    /// Returns [`AssetError::Cancelled`] after shutdown or
+    /// [`AssetError::QueueFull`] only if the in-flight counter overflows.
     pub fn submit<F>(&self, job: F) -> Result<(), AssetError>
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        self.submit_sized(0, job)
-    }
-
-    /// Schedules a CPU job after reserving job-count and input-byte budgets.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AssetError::Cancelled`] when shut down or
-    /// [`AssetError::QueueFull`] when either budget is exhausted.
-    pub fn submit_sized<F>(&self, bytes: usize, job: F) -> Result<(), AssetError>
     where
         F: FnOnce() + Send + 'static,
     {
         if self.cancelled.load(Ordering::Acquire) {
             return Err(AssetError::Cancelled);
         }
-        let permit = self.permit(bytes)?;
+        let permit = self.permit()?;
         let cancelled = self.cancelled.clone();
         self.pool.spawn(move || {
             let _permit = permit;
@@ -510,7 +465,7 @@ impl CpuPool {
     ///
     /// # Errors
     ///
-    /// Returns queue or worker-budget errors before scheduling the job.
+    /// Returns cancellation, event-queue, or counter-overflow errors before scheduling.
     pub fn submit_event<F>(
         &self,
         queue: Arc<EventQueue>,
@@ -521,11 +476,11 @@ impl CpuPool {
         F: FnOnce() -> Result<usize, AssetError> + Send + 'static,
     {
         queue.reserve()?;
-        let permit = match self.permit(event.bytes) {
-            Ok(p) => p,
-            Err(e) => {
+        let permit = match self.permit() {
+            Ok(permit) => permit,
+            Err(error) => {
                 queue.reserved.fetch_sub(1, Ordering::AcqRel);
-                return Err(e);
+                return Err(error);
             }
         };
         let cancelled = self.cancelled.clone();
@@ -777,11 +732,11 @@ mod tests {
 
     #[test]
     fn cpu_job_admission_returns_before_the_admitted_work_finishes() {
-        let pool = CpuPool::new(1, 2, 8).unwrap();
+        let pool = CpuPool::new(1).unwrap();
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
 
-        pool.submit_sized(4, move || {
+        pool.submit(move || {
             started_tx.send(()).unwrap();
             release_rx.recv().unwrap();
         })
@@ -795,22 +750,22 @@ mod tests {
     fn cpu_pool_rejects_absurd_thread_counts_without_spawning() {
         // The admission cap precedes ThreadPoolBuilder, so neither rejected call creates threads.
         assert_eq!(
-            CpuPool::new(usize::MAX, 1, 8).map(|_| ()),
+            CpuPool::new(usize::MAX).map(|_| ()),
             Err(AssetError::InvalidPool)
         );
         assert_eq!(
-            CpuPool::new(MAX_CPU_POOL_THREADS + 1, 1, 8).map(|_| ()),
+            CpuPool::new(MAX_CPU_POOL_THREADS + 1).map(|_| ()),
             Err(AssetError::InvalidPool)
         );
         assert_eq!(
-            CpuPool::new(MAX_CPU_POOL_THREADS, 1, 8).map(|pool| pool.thread_count()),
+            CpuPool::new(MAX_CPU_POOL_THREADS).map(|pool| pool.thread_count()),
             Ok(MAX_CPU_POOL_THREADS)
         );
     }
 
     #[test]
-    fn cpu_pool_rejects_work_while_the_job_budget_is_exhausted() {
-        let pool = CpuPool::new(1, 1, 8).unwrap();
+    fn cpu_pool_admits_more_jobs_than_worker_threads() {
+        let pool = CpuPool::new(1).unwrap();
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         pool.submit(move || {
@@ -820,27 +775,10 @@ mod tests {
         .unwrap();
         started_rx.recv().unwrap();
 
-        assert_eq!(pool.submit(|| {}), Err(AssetError::QueueFull));
-        release_tx.send(()).unwrap();
-    }
-
-    #[test]
-    fn cpu_pool_releases_byte_budget_only_after_work_finishes() {
-        let pool = CpuPool::new(1, 2, 4).unwrap();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        pool.submit_sized(4, move || {
-            started_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-        })
-        .unwrap();
-        started_rx.recv().unwrap();
-
-        assert_eq!(pool.submit_sized(1, || {}), Err(AssetError::QueueFull));
-        release_tx.send(()).unwrap();
-        while pool.in_flight_jobs() != 0 {
-            std::thread::yield_now();
+        for _ in 0..1_000 {
+            pool.submit(|| {}).unwrap();
         }
-        assert!(pool.submit_sized(1, || {}).is_ok());
+        assert_eq!(pool.in_flight_jobs(), 1_001);
+        release_tx.send(()).unwrap();
     }
 }

@@ -273,6 +273,7 @@ pub enum NativePipeline {
 struct FrameSlot {
     command: Option<ThreadBound<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
     argument_buffers: Vec<ThreadBound<Retained<ProtocolObject<dyn MTLBuffer>>>>,
+    submission_value: u64,
 }
 
 enum DeferredResource {
@@ -353,6 +354,9 @@ pub struct NativeContext {
     retired: Vec<RetiredAllocation>,
     frame_slots: Vec<FrameSlot>,
     frame_tracker: FrameSlotTracker,
+    next_frame_value: u64,
+    last_frame_value: u64,
+    completed_frame_value: u64,
     deferred: Vec<DeferredNativeResource>,
     adapter: AdapterInfo,
     drain_complete: bool,

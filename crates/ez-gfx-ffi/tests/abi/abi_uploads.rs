@@ -6,35 +6,45 @@ use super::*;
 fn geometry_uploads_use_real_device_buffers_and_transfer_fence(backend: u8) {
     let native = common::TestContext::create(backend);
     let context = native.context;
-    let heap = b"position";
+    let heap_name = b"position";
+    let mut heap = 0;
     assert_eq!(
         {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_vertex_heap_create(heap.as_ptr(), heap.len(), 8192, 16, context) }
+            // SAFETY: the heap name and output are valid for this call.
+            unsafe {
+                ez_gfx_vertex_heap_create(
+                    heap_name.as_ptr(),
+                    heap_name.len(),
+                    8192,
+                    16,
+                    &raw mut heap,
+                    context,
+                )
+            }
         },
         EzGfxResult::Ok
     );
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_index_heap_create(256, heap.as_ptr(), heap.len(), context) }
+            unsafe { ez_gfx_index_heap_create(256, heap_name.as_ptr(), heap_name.len(), context) }
         },
         EzGfxResult::Ok
     );
     let vertices = [1_u8; 64];
+    let mut vertex_allocations = Vec::new();
     for upload in 0..96 {
-        let mut first = u32::MAX;
+        let mut allocation = 0_u64;
         assert_eq!(
             {
                 // SAFETY: the vertex slice is readable for four 16-byte elements for this call.
                 unsafe {
                     ez_gfx_vertex_upload(
-                        heap.as_ptr(),
-                        heap.len(),
+                        heap,
                         vertices.as_ptr().cast(),
                         4,
                         16,
-                        &raw mut first,
+                        &raw mut allocation,
                         context,
                     )
                 }
@@ -42,26 +52,69 @@ fn geometry_uploads_use_real_device_buffers_and_transfer_fence(backend: u8) {
             EzGfxResult::Ok,
             "upload {upload}"
         );
-        assert_eq!(first, upload * 4);
+        let mut first = u32::MAX;
+        let mut count = 0;
+        assert_eq!(
+            // SAFETY: both outputs are writable and the allocation/context handles are live.
+            unsafe {
+                ez_gfx_vertex_allocation_get_range(
+                    allocation,
+                    &raw mut first,
+                    &raw mut count,
+                    context,
+                )
+            },
+            EzGfxResult::Ok
+        );
+        assert_eq!((first, count), (upload * 4, 4));
+        vertex_allocations.push(allocation);
         if upload % 8 == 7 {
             assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
         }
     }
-    let mut first = u32::MAX;
+    let mut index_allocation = 0_u64;
     let indices = [0_u32, 1, 2];
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_vertex_upload_indices(indices.as_ptr().cast(), 3, &raw mut first, context)
+                ez_gfx_vertex_upload_indices(
+                    indices.as_ptr().cast(),
+                    3,
+                    &raw mut index_allocation,
+                    context,
+                )
             }
         },
         EzGfxResult::Ok
     );
-    assert_eq!(first, 0);
+    let mut first = u32::MAX;
+    let mut count = 0;
+    assert_eq!(
+        // SAFETY: both outputs are writable and the allocation/context handles are live.
+        unsafe {
+            ez_gfx_index_allocation_get_range(
+                index_allocation,
+                &raw mut first,
+                &raw mut count,
+                context,
+            )
+        },
+        EzGfxResult::Ok
+    );
+    assert_eq!((first, count), (0, 3));
     assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
-    // SAFETY: `heap` is readable for exactly `heap.len()` UTF-8 bytes for this call.
-    unsafe { ez_gfx_vertex_heap_destroy(heap.as_ptr(), heap.len(), context) };
+    for allocation in vertex_allocations {
+        assert_eq!(
+            ez_gfx_vertex_allocation_remove(allocation, context),
+            EzGfxResult::Ok
+        );
+    }
+    assert_eq!(
+        ez_gfx_index_allocation_remove(index_allocation, context),
+        EzGfxResult::Ok
+    );
+    ez_gfx_vertex_heap_destroy(heap, context);
     ez_gfx_index_heap_destroy(context);
     drop(native);
 }
@@ -133,7 +186,19 @@ fn dx12_texture_upload_becomes_resident_and_unload_invalidates_handle() {
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let completion = loop {
-        let status = ez_gfx_texture_poll(texture, context);
+        // SAFETY: all-zero is the documented initialization for this plain C record.
+        let mut event = unsafe { core::mem::zeroed::<EzGfxUploadEvent>() };
+        let mut present = 0;
+        let progress =
+            // SAFETY: event and presence outputs remain writable for this call.
+            unsafe { ez_gfx_poll_upload_event(&raw mut event, &raw mut present, context) };
+        if progress != EzGfxResult::Ok {
+            break progress;
+        }
+        let mut binding = u32::MAX;
+        let status =
+            // SAFETY: binding remains writable and both handles are live.
+            unsafe { ez_gfx_texture_get_binding(texture, &raw mut binding, context) };
         if status != EzGfxResult::NotReady || std::time::Instant::now() >= deadline {
             break status;
         }
@@ -235,12 +300,8 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_indirect_write_draw(indirect, 0, &raw const command, context) }
+            unsafe { ez_gfx_indirect_write_draws(indirect, 0, &raw const command, 1, context) }
         },
-        EzGfxResult::Ok
-    );
-    assert_eq!(
-        ez_gfx_indirect_set_draw_count(indirect, 1, context),
         EzGfxResult::Ok
     );
     assert_eq!(

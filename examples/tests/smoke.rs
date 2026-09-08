@@ -1,7 +1,7 @@
 //! Smoke tests for the migrated examples.
 #[path = "../shared/mod.rs"]
 mod shared;
-use anyhow::Context as _;
+
 use std::{
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
@@ -70,15 +70,13 @@ fn snapshot(binary: &str, file: &str, backend: &str) -> anyhow::Result<(String, 
     }
     #[cfg(target_vendor = "apple")]
     command.env("MTL_DEBUG_LAYER", "1");
-    let output = command
-        .output()
-        .with_context(|| format!("launch {binary}"))?;
+    let output = command.output()?;
     assert!(
         output.status.success(),
         "{binary}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let report = String::from_utf8(output.stdout).context("report must be UTF-8")?;
+    let report = String::from_utf8(output.stdout)?;
     let fields = report.split_whitespace().collect::<Vec<_>>();
     assert_eq!(fields.len(), 8, "{binary}: {report:?}");
     assert_eq!(
@@ -91,9 +89,7 @@ fn snapshot(binary: &str, file: &str, backend: &str) -> anyhow::Result<(String, 
         "{binary} emitted no runtime events"
     );
     assert_eq!(fields[7], "0", "{binary} dropped observations");
-    let image = image::open(&path)
-        .with_context(|| format!("open {backend} snapshot"))?
-        .into_rgba8();
+    let image = image::open(&path)?.into_rgba8();
     assert_eq!(
         image.dimensions(),
         (640, 480),

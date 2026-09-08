@@ -166,7 +166,6 @@ pub(super) fn start_worker(
     let mut slot = 0_usize;
     let mut copy_value = 0_u64;
     ez_gfx_hal::TransferWorker::new_ordered_with_shutdown(
-        64,
         ez_gfx_hal::DEFAULT_STAGING_POLICY,
         job_bytes,
         job_group,

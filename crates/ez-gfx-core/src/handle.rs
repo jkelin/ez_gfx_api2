@@ -275,6 +275,24 @@ define_typed_handle!(
     "A validated structured-buffer handle."
 );
 define_typed_handle!(
+    VertexHeapHandle,
+    HandleParts::Child { .. },
+    ExpectedResource,
+    "A validated named vertex-heap handle."
+);
+define_typed_handle!(
+    VertexAllocationHandle,
+    HandleParts::Child { .. },
+    ExpectedResource,
+    "A validated allocation within a named vertex heap."
+);
+define_typed_handle!(
+    IndexAllocationHandle,
+    HandleParts::Child { .. },
+    ExpectedResource,
+    "A validated allocation within the global index heap."
+);
+define_typed_handle!(
     TextureHandle,
     HandleParts::Child { .. },
     ExpectedResource,

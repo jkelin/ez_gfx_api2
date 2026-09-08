@@ -3,6 +3,9 @@
 struct StructuredBufferAttribute { string name; }
 
 [__AttributeUsage(_AttributeTargets.Var)]
+struct VertexHeapAttribute { string name; }
+
+[__AttributeUsage(_AttributeTargets.Var)]
 struct IndirectBufferAttribute { string name; }
 
 [__AttributeUsage(_AttributeTargets.Var)]

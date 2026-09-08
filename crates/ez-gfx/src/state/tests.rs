@@ -2,7 +2,7 @@ use super::*;
 use std::collections::HashSet;
 
 #[cfg(not(target_vendor = "apple"))]
-fn vulkan_options() -> Result<ContextOptions, ez_gfx_runtime::PublicApiError> {
+fn vulkan_options() -> std::result::Result<ContextOptions, ez_gfx_runtime::PublicApiError> {
     // Win32 contexts need a Win32 host; every other non-Apple host runs headless.
     ContextOptions::new_for_backend(0, 0, if cfg!(windows) { 0 } else { 3 }, Backend::Vulkan)
 }
@@ -110,19 +110,35 @@ fn texture_admission_is_nonblocking_and_pending_cancellation_invalidates_the_han
         &texture_config(),
     )
     .unwrap();
-    assert_eq!(poll_texture_load(context, texture), EzGfxResult::NotReady);
-
-    gate.wait();
-    assert_eq!(cancel_texture_load(context, texture), EzGfxResult::Ok);
     assert_eq!(
-        poll_texture_load(context, texture),
-        EzGfxResult::InvalidContext
+        poll_upload_event(context),
+        Ok(Some(crate::UploadEvent {
+            resource: crate::UploadResource::Texture(texture),
+            status: crate::UploadStatus::SourceStaged,
+        }))
+    );
+    assert_eq!(texture_binding(context, texture), Err(Error::NotReady));
+
+    assert_eq!(cancel_texture_load(context, texture), Ok(()));
+    assert_eq!(
+        poll_upload_event(context),
+        Ok(Some(crate::UploadEvent {
+            resource: crate::UploadResource::Texture(texture),
+            status: crate::UploadStatus::Cancelled,
+        }))
+    );
+    assert_eq!(poll_upload_event(context), Ok(None));
+    assert_eq!(
+        texture_binding(context, texture),
+        Err(Error::Lifecycle(LifecycleError::StaleHandle))
     );
     assert_eq!(
         cancel_texture_load(context, texture),
-        EzGfxResult::InvalidArgument
+        Err(Error::InvalidArgument)
     );
-    assert_eq!(destroy_context(context), EzGfxResult::Ok);
+
+    gate.wait();
+    assert_eq!(destroy_context(context), Ok(()));
 }
 
 #[test]
@@ -143,11 +159,11 @@ fn texture_region_validation_and_update_backpressure_are_stable() {
     let invalid = TextureRegion { width: 3, ..valid };
     assert_eq!(
         validate_texture_update(TextureFormat::Rgba8Unorm, 4, 4, 3, invalid),
-        Err(EzGfxResult::InvalidArgument)
+        Err(Error::InvalidArgument)
     );
     assert_eq!(
         map_texture_update_error(ez_gfx_hal::AllocationError::OutOfMemory),
-        EzGfxResult::QueueFull
+        Error::QueueFull
     );
 }
 
@@ -160,11 +176,11 @@ fn first_coarse_publication_records_handoff_telemetry_once() {
             .identity
             .insert(ResourceKind::Texture)
             .map_err(map_lifecycle)?;
-        let texture = TextureHandle::from_packed(packed).map_err(|_| EzGfxResult::NativeFailure)?;
+        let texture = TextureHandle::from_packed(packed).map_err(|_| Error::NativeFailure)?;
         state.texture_ready.insert(
             texture,
             CompletionToken::new(QueueKind::TextureTransfer, 3)
-                .map_err(|_| EzGfxResult::NativeFailure)?,
+                .map_err(|_| Error::NativeFailure)?,
         );
         state.texture_handoffs.insert(
             texture,
@@ -206,7 +222,7 @@ fn first_coarse_publication_records_handoff_telemetry_once() {
         Ok(())
     })
     .unwrap();
-    assert_eq!(destroy_context(context), EzGfxResult::Ok);
+    assert_eq!(destroy_context(context), Ok(()));
 }
 
 #[cfg(windows)]
@@ -218,9 +234,9 @@ fn dx12_context() -> ContextHandle {
 fn destroy_context_before_device_initialization_is_successful_and_terminal() {
     let context = create_context(vulkan_options().unwrap()).unwrap();
 
-    assert_eq!(destroy_context(context), EzGfxResult::Ok);
-    assert_eq!(wait_idle(context), EzGfxResult::InvalidContext);
-    assert_eq!(destroy_context(context), EzGfxResult::InvalidContext);
+    assert_eq!(destroy_context(context), Ok(()));
+    assert_eq!(wait_idle(context), Err(Error::InvalidContext));
+    assert_eq!(destroy_context(context), Err(Error::InvalidContext));
 }
 
 #[test]
@@ -242,7 +258,7 @@ fn decode_worker_topology_rejects_absurd_counts_before_spawning() {
     // The admission cap precedes pool construction, so no threads are spawned.
     assert_eq!(
         AsyncTextureState::new_with_workers(u32::MAX).map(|_| ()),
-        Err(EzGfxResult::InvalidArgument)
+        Err(Error::InvalidArgument)
     );
 }
 
@@ -257,32 +273,30 @@ fn context_decode_worker_count_reaches_pool_construction() {
     })
     .unwrap();
     assert_eq!(explicit_workers, 2);
-    assert_eq!(destroy_context(explicit_context), EzGfxResult::Ok);
+    assert_eq!(destroy_context(explicit_context), Ok(()));
 }
 
 #[cfg(windows)]
 #[test]
 fn destroy_context_reclaims_populated_state_and_invalidates_handles() {
     let context = dx12_context();
-    let structured = acquire_structured(context, 64).unwrap();
+    frame_begin(context).unwrap();
+    let structured = acquire_structured::<u8>(context, 64).unwrap();
     let indirect = acquire_indirect(context, 2).unwrap();
-    assert_eq!(
-        create_vertex_heap(context, "vertices", 256, 16),
-        EzGfxResult::Ok
-    );
-    assert_eq!(create_index_heap(context, 256), EzGfxResult::Ok);
+    assert!(create_vertex_heap(context, "vertices", 256, 16).is_ok());
+    assert_eq!(create_index_heap(context, 256), Ok(()));
 
-    assert_eq!(destroy_context(context), EzGfxResult::Ok);
-    assert_eq!(wait_idle(context), EzGfxResult::InvalidContext);
+    assert_eq!(destroy_context(context), Ok(()));
+    assert_eq!(wait_idle(context), Err(Error::InvalidContext));
     assert_eq!(
-        write_structured(context, structured, &[1; 16]),
-        EzGfxResult::InvalidContext
+        write_structured(context, structured, 0, &[1; 16]),
+        Err(Error::InvalidContext)
     );
     assert_eq!(
-        set_indirect_count(context, indirect, 1),
-        EzGfxResult::InvalidContext
+        publish_compute_indirect_count(context, indirect, 1),
+        Err(Error::InvalidContext)
     );
-    assert_eq!(destroy_context(context), EzGfxResult::InvalidContext);
+    assert_eq!(destroy_context(context), Err(Error::InvalidContext));
 }
 
 #[cfg(windows)]
@@ -294,10 +308,10 @@ fn destroy_context_rejects_wrong_thread_without_consuming_context() {
         std::thread::spawn(move || destroy_context(context))
             .join()
             .unwrap(),
-        EzGfxResult::InvalidContext
+        Err(Error::InvalidContext)
     );
-    assert_eq!(wait_idle(context), EzGfxResult::Ok);
-    assert_eq!(destroy_context(context), EzGfxResult::Ok);
+    assert_eq!(wait_idle(context), Ok(()));
+    assert_eq!(destroy_context(context), Ok(()));
 }
 
 #[cfg(windows)]
@@ -313,7 +327,7 @@ fn thread_exit_context() -> ContextHandle {
         SurfaceOptions::new(0, 0, SurfacePlatform::Headless, 1, 1, 0).unwrap(),
     )
     .unwrap();
-    assert_eq!(init_device(context, surface), EzGfxResult::Ok);
+    assert_eq!(init_device(context, surface), Ok(()));
     context
 }
 
@@ -323,22 +337,23 @@ fn recursive_context_access_returns_native_failure_without_panicking() {
     let context = thread_exit_context();
 
     let nested = with_context_mut(context, |_| {
-        with_context_mut(context, |_| Ok::<_, EzGfxResult>(()))
+        with_context_mut(context, |_| Ok::<_, Error>(()))
     });
 
-    assert_eq!(nested, Err(EzGfxResult::NativeFailure));
-    assert_eq!(destroy_context(context), EzGfxResult::Ok);
+    assert_eq!(nested, Err(Error::NativeFailure));
+    assert_eq!(destroy_context(context), Ok(()));
 }
 
 #[cfg(not(target_vendor = "apple"))]
 #[test]
 fn thread_exit_invalidates_populated_context_handle() {
     let context = thread_exit_context();
-    let _structured = acquire_structured(context, 64).unwrap();
+    frame_begin(context).unwrap();
+    let _structured = acquire_structured::<u8>(context, 64).unwrap();
     let cleanup = CONTEXTS.with(|contexts| contexts.borrow_mut().cleanup_for_thread_exit());
 
-    assert_eq!(cleanup, EzGfxResult::Ok);
-    assert_eq!(wait_idle(context), EzGfxResult::InvalidContext);
+    assert_eq!(cleanup, Ok(()));
+    assert_eq!(wait_idle(context), Err(Error::InvalidContext));
 }
 #[cfg(not(target_vendor = "apple"))]
 #[test]
@@ -346,25 +361,26 @@ fn creator_thread_exit_returns_and_invalidates_context_handle() {
     let stale = std::thread::spawn(thread_exit_context).join().unwrap();
     // Join completes thread-local abandonment before stale lookup and possible slot reuse.
 
-    assert_eq!(wait_idle(stale), EzGfxResult::InvalidContext);
+    assert_eq!(wait_idle(stale), Err(Error::InvalidContext));
     let current = thread_exit_context();
     assert_ne!(current, stale);
-    assert_eq!(destroy_context(current), EzGfxResult::Ok);
+    assert_eq!(destroy_context(current), Ok(()));
 }
 
 #[cfg(windows)]
 #[test]
 fn destroyed_resource_handles_are_rejected_by_other_owners() {
     let first = dx12_context();
-    let stale = acquire_structured(first, 64).unwrap();
+    frame_begin(first).unwrap();
+    let stale = acquire_structured::<u8>(first, 64).unwrap();
     let second = dx12_context();
 
-    assert_eq!(destroy_context(first), EzGfxResult::Ok);
+    assert_eq!(destroy_context(first), Ok(()));
     assert_eq!(
-        write_structured(second, stale, &[1; 16]),
-        EzGfxResult::InvalidContext
+        write_structured(second, stale, 0, &[1; 16]),
+        Err(Error::Lifecycle(LifecycleError::WrongOwner))
     );
-    assert_eq!(destroy_context(second), EzGfxResult::Ok);
+    assert_eq!(destroy_context(second), Ok(()));
 }
 
 #[cfg(windows)]
@@ -376,9 +392,9 @@ fn lost_context_can_still_be_destroyed_terminally() {
     })
     .unwrap();
 
-    assert_eq!(wait_idle(context), EzGfxResult::DeviceLost);
-    assert_eq!(destroy_context(context), EzGfxResult::Ok);
-    assert_eq!(wait_idle(context), EzGfxResult::InvalidContext);
+    assert_eq!(wait_idle(context), Err(Error::DeviceLost));
+    assert_eq!(destroy_context(context), Ok(()));
+    assert_eq!(wait_idle(context), Err(Error::InvalidContext));
 }
 
 #[cfg(not(target_vendor = "apple"))]
@@ -403,16 +419,28 @@ fn device_loss_sweeps_pending_decodes_to_fast_device_lost() {
         &texture_config(),
     )
     .unwrap();
-    assert_eq!(poll_texture_load(context, texture), EzGfxResult::NotReady);
+    assert_eq!(texture_binding(context, texture), Err(Error::NotReady));
 
-    // First observed loss marks the context; the poll itself must sweep the
-    // still-gated decode so no later poll can report NotReady.
+    // Loss preserves the already-queued ownership transition, then emits one terminal event.
     with_context_mut(context, |owned| {
         owned.identity.mark_lost().map_err(map_lifecycle)
     })
     .unwrap();
-    assert_eq!(poll_texture_load(context, texture), EzGfxResult::DeviceLost);
-    assert_eq!(poll_texture_load(context, texture), EzGfxResult::DeviceLost);
+    assert_eq!(
+        poll_upload_event(context),
+        Ok(Some(crate::UploadEvent {
+            resource: crate::UploadResource::Texture(texture),
+            status: crate::UploadStatus::SourceStaged,
+        }))
+    );
+    assert_eq!(
+        poll_upload_event(context),
+        Ok(Some(crate::UploadEvent {
+            resource: crate::UploadResource::Texture(texture),
+            status: crate::UploadStatus::Failed(RuntimeStatus::DeviceLost),
+        }))
+    );
+    assert_eq!(poll_upload_event(context), Err(Error::DeviceLost));
     with_context_mut(context, |state| {
         assert!(state.pending_textures.is_empty());
         Ok(())
@@ -421,8 +449,8 @@ fn device_loss_sweeps_pending_decodes_to_fast_device_lost() {
 
     // Releasing the gate must not revive the swept request.
     gate.wait();
-    assert_eq!(poll_texture_load(context, texture), EzGfxResult::DeviceLost);
-    assert_eq!(destroy_context(context), EzGfxResult::Ok);
+    assert_eq!(poll_upload_event(context), Err(Error::DeviceLost));
+    assert_eq!(destroy_context(context), Ok(()));
 }
 
 #[test]
@@ -462,7 +490,7 @@ fn render_target_lifecycle_rejects_misuse_before_native_work() {
     // Empty extents fail before leasing allocator state; no device is needed.
     assert_eq!(
         create_render_target(context, &declaration, 0, 64),
-        Err(EzGfxResult::InvalidArgument)
+        Err(Error::InvalidArgument)
     );
     // Depth usage is deferred to the pass-attachment slice.
     let depth = TargetDeclaration::new(
@@ -480,7 +508,7 @@ fn render_target_lifecycle_rejects_misuse_before_native_work() {
     .unwrap();
     assert_eq!(
         create_render_target(context, &depth, 64, 64),
-        Err(EzGfxResult::Unsupported)
+        Err(Error::Unsupported)
     );
     // Unknown handles never reach native code. Live-target creation, format,
     // extent, clear, and destroy need an initialized device, which requires a
@@ -496,15 +524,15 @@ fn render_target_lifecycle_rejects_misuse_before_native_work() {
     .unwrap();
     assert_eq!(
         render_target_format(context, phantom),
-        Err(EzGfxResult::InvalidArgument)
+        Err(Error::InvalidArgument)
     );
     assert_eq!(
         render_target_extent(context, phantom),
-        Err(EzGfxResult::InvalidArgument)
+        Err(Error::InvalidArgument)
     );
     assert_eq!(
         render_target_clear(context, phantom),
-        Err(EzGfxResult::InvalidArgument)
+        Err(Error::InvalidArgument)
     );
     destroy_render_target(context, phantom);
 }
@@ -516,14 +544,14 @@ fn probe_render_target_format_rejects_misuse_before_native_work() {
     // Sample counts outside the closed set fail before probing any device.
     assert_eq!(
         probe_render_target_format(context, Format::Rgba8Unorm, 3),
-        EzGfxResult::InvalidArgument
+        Err(Error::InvalidArgument)
     );
     // Probing without an initialized device cannot query adapter capabilities.
     // Live-device resolution is proven by the native allocation tests on
     // Vulkan, DX12, and Metal instead of here.
     assert_eq!(
         probe_render_target_format(context, Format::Rgba8Unorm, 1),
-        EzGfxResult::NativeFailure
+        Err(Error::NativeFailure)
     );
 }
 
@@ -542,7 +570,7 @@ fn begin_render_target_rejects_foreign_handles() {
     .unwrap();
     assert_eq!(
         begin_render_target(context, phantom),
-        EzGfxResult::InvalidContext
+        Err(Error::Lifecycle(LifecycleError::WrongOwner))
     );
     // A live texture handle is the wrong kind, never an alias.
     let texture = load_texture(
@@ -559,7 +587,7 @@ fn begin_render_target_rejects_foreign_handles() {
     let mistaken = RenderTargetHandle::from_packed(texture.packed()).unwrap();
     assert_eq!(
         begin_render_target(context, mistaken),
-        EzGfxResult::InvalidContext
+        Err(Error::Lifecycle(LifecycleError::WrongResourceKind))
     );
 }
 
@@ -584,7 +612,7 @@ fn frame_begin_clears_stale_render_target_override() {
         Ok(())
     })
     .unwrap();
-    assert_eq!(frame_begin(context), EzGfxResult::Ok);
+    assert_eq!(frame_begin(context), Ok(()));
     with_context_mut(context, |context| {
         assert_eq!(context.frame_render_target, None);
         Ok(())
@@ -703,7 +731,7 @@ fn rejected_render_target_admissions_leave_no_allocator_residue() {
     .unwrap();
     assert_eq!(
         create_render_target(context, &color, 0, 64),
-        Err(EzGfxResult::InvalidArgument)
+        Err(Error::InvalidArgument)
     );
     let depth = TargetDeclaration::new(
         "rt-residue-depth",
@@ -720,7 +748,7 @@ fn rejected_render_target_admissions_leave_no_allocator_residue() {
     .unwrap();
     assert_eq!(
         create_render_target(context, &depth, 64, 64),
-        Err(EzGfxResult::Unsupported)
+        Err(Error::Unsupported)
     );
     // A later texture admission takes slot zero, proving the rejections leased
     // nothing from the shared heap.
@@ -752,7 +780,7 @@ fn rejected_render_target_admissions_leave_no_allocator_residue() {
 fn explicit_selection_rejects_unknown_identity_before_native_calls() {
     // No surface is created, shown, or activated by this test.
     let options = vulkan_options().unwrap().with_adapter([0xA5; 16], false);
-    assert_eq!(create_context(options), Err(EzGfxResult::InvalidArgument));
+    assert_eq!(create_context(options), Err(Error::InvalidArgument));
 }
 
 #[cfg(not(target_vendor = "apple"))]
@@ -768,7 +796,7 @@ fn explicit_selection_creates_context_for_enumerated_adapter() {
         .stable_id();
     let options = vulkan_options().unwrap().with_adapter(wanted, true);
     let context = create_context(options).expect("enumerated adapter creates a context");
-    assert_eq!(destroy_context(context), EzGfxResult::Ok);
+    assert_eq!(destroy_context(context), Ok(()));
 }
 
 #[test]

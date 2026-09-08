@@ -39,7 +39,6 @@ pub use lifecycle::{LifecycleCallbacks, LifecycleConfig, run};
 )]
 pub use observability::{ObservationCounts, drain_bounded};
 
-use anyhow::Context as _;
 use std::{ffi::OsString, path::Path, process::Command, time::Instant};
 /// Captured terminal frame and neutral observability totals.
 #[derive(Debug)]
@@ -172,7 +171,7 @@ pub fn env_flag(name: &str) -> anyhow::Result<bool> {
     match std::env::var(name) {
         Ok(value) => parse_env_flag(name, Some(&value)),
         Err(std::env::VarError::NotPresent) => parse_env_flag(name, None),
-        Err(error) => Err(error).with_context(|| name.to_owned()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -188,16 +187,14 @@ fn parse_env_flag(name: &str, value: Option<&str>) -> anyhow::Result<bool> {
 pub fn max_frames_from_env() -> anyhow::Result<Option<u32>> {
     match std::env::var("EZ_GFX_EXAMPLE_MAX_FRAMES") {
         Ok(value) => {
-            let frames = value
-                .parse::<u32>()
-                .context("EZ_GFX_EXAMPLE_MAX_FRAMES must be a positive integer")?;
+            let frames = value.parse::<u32>()?;
             if frames == 0 {
                 anyhow::bail!("EZ_GFX_EXAMPLE_MAX_FRAMES must be positive");
             }
             Ok(Some(frames))
         }
         Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(error) => Err(error).context("EZ_GFX_EXAMPLE_MAX_FRAMES"),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -343,9 +340,7 @@ fn positive_env(name: &str, default: u32) -> anyhow::Result<u32> {
     if value.is_empty() {
         return Ok(default);
     }
-    let parsed = value
-        .parse::<u32>()
-        .with_context(|| format!("{name} must be a positive integer"))?;
+    let parsed = value.parse::<u32>()?;
     (parsed > 0)
         .then_some(parsed)
         .ok_or_else(|| anyhow::anyhow!("{name} must be positive"))

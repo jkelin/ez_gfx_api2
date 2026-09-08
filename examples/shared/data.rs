@@ -1,9 +1,8 @@
-use anyhow::Context as _;
 use bytemuck::Pod;
 use std::mem::size_of_val;
 
 pub fn byte_len<T>(values: &[T]) -> anyhow::Result<u64> {
-    u64::try_from(size_of_val(values)).context("value byte size exceeds u64")
+    Ok(u64::try_from(size_of_val(values))?)
 }
 
 pub fn slice_bytes<T: Pod>(values: &[T]) -> &[u8] {
