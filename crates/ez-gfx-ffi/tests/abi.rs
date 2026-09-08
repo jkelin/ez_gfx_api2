@@ -515,8 +515,27 @@ fn callback_registration_replaces_clears_and_validates_context() {
 #[cfg(not(target_vendor = "apple"))]
 #[test]
 fn callback_registration_is_creator_thread_only() {
-    let native = common::TestContext::create(1);
-    let context = native.context;
+    // Surface platform 3 is headless, and callback registration needs no
+    // device: admit only the context so device-less runners skip explicitly.
+    let desc = EzGfxBackendContextDesc {
+        enable_debug: 0,
+        enable_validation: 0,
+        surface_platform: 3,
+        backend: 1,
+        texture_decode_workers: 0,
+        adapter_count: 0,
+        adapter: core::ptr::null(),
+    };
+    let mut context = 0;
+    match
+        // SAFETY: descriptor and output storage are live and correctly aligned through the FFI call.
+        unsafe { ez_gfx_context_create_backend(&raw const desc, &raw mut context) }
+    {
+        // Optional hosted runners may expose no usable native device.
+        EzGfxResult::Unsupported => return,
+        EzGfxResult::Ok => {}
+        status => panic!("callback test context creation failed: {status:?}"),
+    }
     let foreign = std::thread::spawn(move || {
         // SAFETY: clearing a callback retains no user-data pointer.
         unsafe { ez_gfx_callback_register(context, None, core::ptr::null_mut()) }
@@ -530,6 +549,7 @@ fn callback_registration_is_creator_thread_only() {
         unsafe { ez_gfx_callback_register(context, None, core::ptr::null_mut()) },
         EzGfxResult::Ok
     );
+    ez_gfx_context_destroy(context);
 }
 
 #[test]
