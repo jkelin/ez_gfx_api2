@@ -6,7 +6,7 @@ use crate::state::{
     write_structured,
 };
 
-fn test_context() -> ContextHandle {
+fn test_context() -> Option<ContextHandle> {
     #[cfg(windows)]
     let backend = Backend::Dx12;
     #[cfg(target_vendor = "apple")]
@@ -21,27 +21,44 @@ fn test_context() -> ContextHandle {
     #[cfg(not(any(windows, target_vendor = "apple")))]
     // Linux Vulkan tests require the headless surface platform even without presentation.
     let platform = 3;
-    let context =
-        create_context(ContextOptions::new_for_backend(0, 0, platform, backend).unwrap()).unwrap();
+    let options = ContextOptions::new_for_backend(0, 0, platform, backend).unwrap();
+    let context = match create_context(options) {
+        Ok(context) => context,
+        // Optional hosted runners may expose no usable native device.
+        Err(Error::Unsupported) => return None,
+        Err(error) => panic!("transient test context creation failed: {error}"),
+    };
+
     #[cfg(not(any(windows, target_vendor = "apple")))]
     {
         // Vulkan initializes its device from a surface; a headless surface keeps this test hidden.
-        let surface = crate::state::create_surface(
-            context,
-            crate::state::SurfaceOptions::new(
-                0,
-                0,
-                crate::state::SurfacePlatform::Headless,
-                1,
-                1,
-                0,
-            )
-            .unwrap(),
+        let options = crate::state::SurfaceOptions::new(
+            0,
+            0,
+            crate::state::SurfacePlatform::Headless,
+            1,
+            1,
+            0,
         )
         .unwrap();
-        crate::state::init_device(context, surface).unwrap();
+        let surface = match crate::state::create_surface(context, options) {
+            Ok(surface) => surface,
+            Err(Error::Unsupported) => {
+                destroy_context(context).unwrap();
+                return None;
+            }
+            Err(error) => panic!("transient test surface creation failed: {error}"),
+        };
+        match crate::state::init_device(context, surface) {
+            Ok(()) => {}
+            Err(Error::Unsupported) => {
+                destroy_context(context).unwrap();
+                return None;
+            }
+            Err(error) => panic!("transient test device initialization failed: {error}"),
+        }
     }
-    context
+    Some(context)
 }
 
 fn draw() -> DrawIndexedCommand {
@@ -56,7 +73,9 @@ fn draw() -> DrawIndexedCommand {
 
 #[test]
 fn successful_submission_retires_handles_and_same_frame_reuse_stays_interned() {
-    let context = test_context();
+    let Some(context) = test_context() else {
+        return;
+    };
     frame_begin(context).unwrap();
     let structured = acquire_structured::<u32>(context, 4).unwrap();
     let indirect = acquire_indirect(context, 1).unwrap();
@@ -137,7 +156,9 @@ fn successful_submission_retires_handles_and_same_frame_reuse_stays_interned() {
 
 #[test]
 fn submission_failure_restores_safe_handles_and_quarantines_unsafe_handles() {
-    let context = test_context();
+    let Some(context) = test_context() else {
+        return;
+    };
     frame_begin(context).unwrap();
     let safe = acquire_structured::<u32>(context, 1).unwrap();
     with_context_mut(context, |state| {
