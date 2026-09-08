@@ -1,6 +1,6 @@
 # C textured cube
 
-Minimal ABI 30 example: positions and normals use typed heap handles, indices use a typed global allocation, and buffer/counted-buffer handles are freshly acquired each frame. Compute writes the indirect command after explicit CPU-known count publication; graphics consumes it in the same frame. A creator-thread callback receives runtime diagnostics and copies borrowed snapshot bytes.
+Minimal ABI 32 example: positions and normals use auto-growing typed heap handles, indices use the lazy context-owned singleton heap, and structured/counted buffers retain context-owned CPU storage until explicit release. The sample allocates and populates both buffers before its frame loop; each frame imports them for compute-to-graphics use. A creator-thread callback receives runtime diagnostics and copies borrowed snapshot bytes.
 
 ## Build
 
@@ -40,8 +40,8 @@ CMake invokes `ez-gfx-compile` directly on `textured_cube.slang` with SPIR-V, DX
 Run one bounded frame and require a nonempty raw 640×480 RGBA snapshot:
 
 ```powershell
-target/c-examples/textured_cube-build/Debug/textured_cube.exe --backend vulkan --artifact target/c-examples/textured_cube-build/Debug/textured_cube.ezgfxshader --max-frames 1 --snapshot target/c-examples/vulkan.rgba
-target/c-examples/textured_cube-build/Debug/textured_cube.exe --backend dx12 --artifact target/c-examples/textured_cube-build/Debug/textured_cube.ezgfxshader --max-frames 1 --snapshot target/c-examples/dx12.rgba
+target/c-examples/textured_cube-build/Debug/textured_cube.exe --backend vulkan --artifact target/c-examples/textured_cube-build/Debug/textured_cube.ezgfxshader --max-frames 1 --snapshot target/c-examples/vulkan.rgba --hidden
+target/c-examples/textured_cube-build/Debug/textured_cube.exe --backend dx12 --artifact target/c-examples/textured_cube-build/Debug/textured_cube.ezgfxshader --max-frames 1 --snapshot target/c-examples/dx12.rgba --hidden
 ```
 
 The host is intentionally Win32-only. The C ABI accepts a borrowed `CAMetalLayer`, but creating and retaining one requires Objective-C; a plain portable C Metal host would fake ownership. CI compiles the ABI header as C11 and C++17 on every OS and builds/links this sample on Windows. The Vulkan row runs with its configured software ICD. GitHub-hosted Windows does not guarantee a D3D12 feature-level 12.1 adapter, so that row is explicitly compile-only; run the DX12 command above on a hardware-capable host.

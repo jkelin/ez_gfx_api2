@@ -2,10 +2,19 @@
 
 use super::*;
 
+#[derive(Debug, Eq, PartialEq)]
+struct ObservedReadback {
+    request_id: u64,
+    texture: u64,
+    width: u32,
+    height: u32,
+    bytes: Vec<u8>,
+}
+
 #[derive(Default)]
 struct Collected {
     uploads: Vec<(u64, u8)>,
-    readback: Option<(u64, u32, u32, Vec<u8>)>,
+    readbacks: Vec<ObservedReadback>,
 }
 
 /// Records callback-delivered events into test-owned storage.
@@ -33,12 +42,13 @@ unsafe extern "C" fn collect_event(event: *const EzGfxEvent, user_data: *mut cor
                 }
                 .to_vec()
             };
-            out.readback = Some((
-                event.readback_texture,
-                event.readback_width,
-                event.readback_height,
+            out.readbacks.push(ObservedReadback {
+                request_id: event.readback_request_id,
+                texture: event.readback_texture,
+                width: event.readback_width,
+                height: event.readback_height,
                 bytes,
-            ));
+            });
         }
         _ => {}
     }
@@ -86,19 +96,11 @@ fn geometry_uploads_use_real_device_buffers_and_transfer_fence(backend: u8) {
                 ez_gfx_vertex_heap_create(
                     heap_name.as_ptr(),
                     heap_name.len(),
-                    8192,
                     16,
                     &raw mut heap,
                     context,
                 )
             }
-        },
-        EzGfxResult::Ok
-    );
-    assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_index_heap_create(256, heap_name.as_ptr(), heap_name.len(), context) }
         },
         EzGfxResult::Ok
     );
@@ -186,7 +188,6 @@ fn geometry_uploads_use_real_device_buffers_and_transfer_fence(backend: u8) {
         EzGfxResult::Ok
     );
     ez_gfx_vertex_heap_destroy(heap, context);
-    ez_gfx_index_heap_destroy(context);
     drop(native);
 }
 
@@ -364,11 +365,13 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
                 ez_gfx_counted_buffer_acquire(
+                    u32::try_from(core::mem::size_of::<EzGfxDrawIndexedCommand>())
+                        .expect("draw command size fits u32"),
                     1,
                     debug_name.as_ptr(),
                     debug_name.len(),
                     &raw mut indirect,
-                    frame,
+                    context,
                 )
             }
         },
@@ -377,17 +380,35 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_counted_buffer_write_draws(indirect, 0, &raw const command, 1, frame) }
+            unsafe {
+                ez_gfx_counted_buffer_write_draws(indirect, 0, &raw const command, 1, context)
+            }
         },
         EzGfxResult::Ok
     );
+    let mut first_request = 0;
+    let mut second_request = 0;
     assert_eq!(
-        ez_gfx_graph_enqueue_texture_readback(texture, frame),
+        // SAFETY: each output points to writable aligned test-owned storage.
+        unsafe { ez_gfx_graph_enqueue_texture_readback(texture, frame, &raw mut first_request) },
         EzGfxResult::Ok
     );
+    assert_eq!(
+        // SAFETY: repeated same-source requests remain separately correlated.
+        unsafe { ez_gfx_graph_enqueue_texture_readback(texture, frame, &raw mut second_request) },
+        EzGfxResult::Ok
+    );
+    assert_ne!(first_request, second_request);
     assert_eq!(ez_gfx_frame_end(frame), EzGfxResult::Ok);
-    let (_, _, _, actual) = collected.readback.take().expect("readback event delivered");
-    assert_eq!(actual, pixels);
+    assert_eq!(collected.readbacks.len(), 2);
+    assert_eq!(collected.readbacks[0].request_id, first_request);
+    assert_eq!(collected.readbacks[1].request_id, second_request);
+    assert!(collected.readbacks.iter().all(|readback| {
+        readback.texture == texture
+            && readback.width == texture_desc.width
+            && readback.height == texture_desc.height
+            && readback.bytes == pixels
+    }));
     assert_eq!(
         // SAFETY: clearing a live registration needs no user data.
         unsafe { ez_gfx_callback_register(context, None, core::ptr::null_mut()) },

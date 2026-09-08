@@ -820,6 +820,7 @@ dependencies = [
 name = "ez-gfx-ffi"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "ez-gfx",
  "ez-gfx-artifact",
  "ez-gfx-compiler",
@@ -845,6 +846,7 @@ version = "0.1.0"
 dependencies = [
  "basisu_c_sys",
  "blake3",
+ "bytemuck",
  "ez-gfx-artifact",
  "ez-gfx-basis",
  "ez-gfx-core",

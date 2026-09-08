@@ -17,8 +17,12 @@ struct Push {
     padding: [u32; 3],
 }
 
-fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
-    run(config, move |context, _surface, backend| {
+fn main() -> anyhow::Result<()> {
+    let (program, config) = ExampleProgram::new("02_textured_cube", WIDTH, HEIGHT, "ez_gfx_api2");
+    let mut example = Example::new(config)?;
+    {
+        let backend = example.backend();
+        let context = example.context();
         let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .ok_or_else(|| anyhow::anyhow!("examples package has no workspace parent"))?;
@@ -96,9 +100,23 @@ fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
             texture_id,
             padding: [0; 3],
         };
+        let indirect = context.acquire_counted_buffer::<DrawIndexedCommand>(1)?;
+        indirect.write(
+            0,
+            &[DrawIndexedCommand {
+                index_count,
+                instance_count: 1,
+                first_index,
+                vertex_offset: 0,
+                first_instance: 0,
+            }],
+        )?;
 
-        Ok(move |window_frame: WindowFrame| {
-            let mut frame = window_frame.frame;
+        indirect.publish_count(1)?;
+        while let Some(window_frame) = example.wait_for_next_frame()? {
+            let mut frame = example.surface().begin_frame()?;
+            let swapchain_target =
+                frame.configure_swapchain(window_frame.size, Format::Bgra8Srgb)?;
             let input = window_frame.input;
             let events = &window_frame.events;
             for &event in events {
@@ -118,18 +136,6 @@ fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
                     clip_y,
                 )? * camera.view(Vec3::ZERO)?,
             );
-            let indirect = frame.acquire_counted_buffer(1)?;
-            indirect.write(
-                &mut frame,
-                0,
-                &[DrawIndexedCommand {
-                    index_count,
-                    instance_count: 1,
-                    first_index,
-                    vertex_offset: 0,
-                    first_instance: 0,
-                }],
-            )?;
             frame.retain_vertex_allocation(&positions_handle)?;
             frame.retain_index_allocation(&index_allocation)?;
             frame.retain_texture(&texture)?;
@@ -140,17 +146,10 @@ fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
                 DynamicPipelineState::from_abi(2, 0, 0, 0).unwrap(),
                 bytes_of(&push),
             )?;
-            Ok::<_, anyhow::Error>(frame)
-        })
-    })
-}
-
-fn main() {
-    run_program(
-        "02_textured_cube",
-        WIDTH,
-        HEIGHT,
-        "ez_gfx_api2",
-        run_example,
-    );
+            example.handle_frame(frame, swapchain_target)?;
+        }
+    }
+    let report = example.close()?;
+    program.finish(report);
+    Ok(())
 }

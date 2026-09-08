@@ -93,8 +93,12 @@ mod tests {
     }
 }
 
-fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
-    run(config, move |context, _surface, backend| {
+fn main() -> anyhow::Result<()> {
+    let (program, config) = ExampleProgram::new("06_sponza_ktx2", WIDTH, HEIGHT, "ez_gfx_api2");
+    let mut example = Example::new(config)?;
+    {
+        let backend = example.backend();
+        let context = example.context();
         let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .ok_or_else(|| anyhow::anyhow!("examples package has no workspace parent"))?;
@@ -206,9 +210,16 @@ fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
             primitive_count,
             padding: [0; 3],
         };
+        let primitives = context.acquire_buffer::<PrimitiveTextured>(records.len())?;
+        primitives.write(0, &records)?;
+        let indirect =
+            context.acquire_counted_buffer::<DrawIndexedCommand>(primitive_count as usize)?;
+        indirect.publish_count(primitive_count)?;
 
-        Ok(move |window_frame: WindowFrame| {
-            let mut frame = window_frame.frame;
+        while let Some(window_frame) = example.wait_for_next_frame()? {
+            let mut frame = example.surface().begin_frame()?;
+            let swapchain_target =
+                frame.configure_swapchain(window_frame.size, Format::Bgra8Srgb)?;
             let input = window_frame.input;
             let events = &window_frame.events;
             for &event in events {
@@ -228,10 +239,6 @@ fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
                     clip_y,
                 )? * camera.view(target)?,
             );
-            let primitives = frame.acquire_buffer::<PrimitiveTextured>(records.len())?;
-            primitives.write(&mut frame, 0, &records)?;
-            let indirect = frame.acquire_counted_buffer(primitive_count)?;
-            indirect.publish_count(&mut frame, primitive_count)?;
             let bindings = [
                 Binding::buffer("primitives", &primitives),
                 Binding::counted_buffer("draw_commands", &indirect),
@@ -252,11 +259,10 @@ fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
                 DynamicPipelineState::from_abi(2, 0, 0, 0).unwrap(),
                 bytes_of(&push),
             )?;
-            Ok::<_, anyhow::Error>(frame)
-        })
-    })
-}
-
-fn main() {
-    run_program("06_sponza_ktx2", WIDTH, HEIGHT, "ez_gfx_api2", run_example);
+            example.handle_frame(frame, swapchain_target)?;
+        }
+    }
+    let report = example.close()?;
+    program.finish(report);
+    Ok(())
 }

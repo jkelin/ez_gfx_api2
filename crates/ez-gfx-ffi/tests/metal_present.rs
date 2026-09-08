@@ -14,10 +14,10 @@ use ez_gfx_ffi::{
     ez_gfx_context_init_device, ez_gfx_context_wait_idle, ez_gfx_counted_buffer_acquire,
     ez_gfx_counted_buffer_write_draws, ez_gfx_frame_begin, ez_gfx_frame_end,
     ez_gfx_graph_enqueue_texture_readback, ez_gfx_index_allocation_get_range,
-    ez_gfx_index_heap_create, ez_gfx_index_heap_destroy, ez_gfx_render_add_compute_pipeline,
-    ez_gfx_render_add_vertex_pipeline, ez_gfx_render_target_create, ez_gfx_render_target_destroy,
-    ez_gfx_render_target_frame_begin, ez_gfx_shader_destroy, ez_gfx_shader_load_artifact,
-    ez_gfx_surface_create, ez_gfx_surface_destroy, ez_gfx_texture_load, ez_gfx_texture_unload,
+    ez_gfx_render_add_compute_pipeline, ez_gfx_render_add_vertex_pipeline,
+    ez_gfx_render_target_create, ez_gfx_render_target_destroy, ez_gfx_render_target_frame_begin,
+    ez_gfx_shader_destroy, ez_gfx_shader_load_artifact, ez_gfx_surface_create,
+    ez_gfx_surface_destroy, ez_gfx_texture_load, ez_gfx_texture_unload,
     ez_gfx_vertex_upload_indices,
 };
 use objc2::rc::Retained;
@@ -167,10 +167,13 @@ fn metal_texture_readback_submits_without_a_surface() {
         EzGfxResult::Ok
     );
     let (frame, target) = begin_offscreen_frame(context);
+    let mut request_id = 0;
     assert_eq!(
-        ez_gfx_graph_enqueue_texture_readback(texture, frame),
+        // SAFETY: request output is writable aligned test-owned storage.
+        unsafe { ez_gfx_graph_enqueue_texture_readback(texture, frame, &raw mut request_id) },
         EzGfxResult::Ok
     );
+    assert_ne!(request_id, 0);
     assert_eq!(ez_gfx_frame_end(frame), EzGfxResult::Ok);
     ez_gfx_render_target_destroy(target, context);
 
@@ -411,22 +414,8 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
         },
         EzGfxResult::Ok
     );
-
     let label = b"metal-present";
-    assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe {
-                ez_gfx_index_heap_create(
-                    3 * size_of::<u32>() as u64,
-                    label.as_ptr(),
-                    label.len(),
-                    context,
-                )
-            }
-        },
-        EzGfxResult::Ok
-    );
+
     let indices = [0_u32, 1, 2];
     let mut index_allocation = 0;
     assert_eq!(
@@ -472,11 +461,12 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
                 ez_gfx_counted_buffer_acquire(
+                    size_of::<EzGfxDrawIndexedCommand>() as u32,
                     1,
                     label.as_ptr(),
                     label.len(),
                     &raw mut indirect,
-                    frame,
+                    context,
                 )
             }
         },
@@ -492,7 +482,9 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_counted_buffer_write_draws(indirect, 0, &raw const command, 1, frame) }
+            unsafe {
+                ez_gfx_counted_buffer_write_draws(indirect, 0, &raw const command, 1, context)
+            }
         },
         EzGfxResult::Ok
     );
@@ -516,7 +508,6 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
         EzGfxResult::Ok
     );
 
-    ez_gfx_index_heap_destroy(context);
     ez_gfx_shader_destroy(shader, context);
     ez_gfx_surface_destroy(surface, context);
     ez_gfx_context_destroy(context);

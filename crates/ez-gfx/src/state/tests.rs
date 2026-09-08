@@ -281,7 +281,7 @@ fn context_decode_worker_count_reaches_pool_construction() {
 fn destroy_context_reclaims_populated_state_and_invalidates_handles() {
     let context = dx12_context();
     frame_begin(context).unwrap();
-    let structured = acquire_structured::<u8>(context, 64).unwrap();
+    let structured = acquire_structured_sized(context, 1, 64).unwrap();
     let indirect = acquire_indirect(context, 2).unwrap();
     assert!(create_vertex_heap(context, "vertices", 16).is_ok());
     assert_eq!(create_index_heap(context, 256), Ok(()));
@@ -289,7 +289,7 @@ fn destroy_context_reclaims_populated_state_and_invalidates_handles() {
     assert_eq!(destroy_context(context), Ok(()));
     assert_eq!(wait_idle(context), Err(Error::InvalidContext));
     assert_eq!(
-        write_structured(context, structured, 0, &[1; 16]),
+        write_structured_bytes(context, structured, 1, &[1; 16]),
         Err(Error::InvalidContext)
     );
     assert_eq!(
@@ -349,7 +349,7 @@ fn recursive_context_access_returns_native_failure_without_panicking() {
 fn thread_exit_invalidates_populated_context_handle() {
     let context = thread_exit_context();
     frame_begin(context).unwrap();
-    let _structured = acquire_structured::<u8>(context, 64).unwrap();
+    let _structured = acquire_structured_sized(context, 1, 64).unwrap();
     let cleanup = CONTEXTS.with(|contexts| contexts.borrow_mut().cleanup_for_thread_exit());
 
     assert_eq!(cleanup, Ok(()));
@@ -372,12 +372,12 @@ fn creator_thread_exit_returns_and_invalidates_context_handle() {
 fn destroyed_resource_handles_are_rejected_by_other_owners() {
     let first = dx12_context();
     frame_begin(first).unwrap();
-    let stale = acquire_structured::<u8>(first, 64).unwrap();
+    let stale = acquire_structured_sized(first, 1, 64).unwrap();
     let second = dx12_context();
 
     assert_eq!(destroy_context(first), Ok(()));
     assert_eq!(
-        write_structured(second, stale, 0, &[1; 16]),
+        write_structured_bytes(second, stale, 1, &[1; 16]),
         Err(Error::Lifecycle(LifecycleError::WrongOwner))
     );
     assert_eq!(destroy_context(second), Ok(()));

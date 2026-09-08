@@ -575,13 +575,29 @@ pub(super) fn execute_metal_frame_plan(
         None => native.execute_frame(None, &actions, false).map_err(map_hal),
         Some(NativeSurface::Vulkan(_)) => Err(Error::NativeFailure),
     };
-    if let Ok(Some(readback)) = &result {
-        context.last_readback.clone_from(readback);
+    let output_count_valid = result.as_ref().is_err_or(|outputs| {
+        let texture_readbacks = payloads
+            .iter()
+            .filter(|payload| {
+                matches!(
+                    payload,
+                    ExecutableNode::TextureReadback { .. }
+                        | ExecutableNode::RenderTargetReadback { .. }
+                )
+            })
+            .count();
+        outputs.len() == texture_readbacks + usize::from(capture)
+    });
+    if let Ok(outputs) = &result {
+        context.last_readbacks.clone_from(outputs);
     }
     if let (Some(handle), Some(surface)) = (surface_handle, surface) {
         context.surfaces.insert(handle, surface);
     }
     result?;
+    if !output_count_valid {
+        return Err(Error::NativeFailure);
+    }
     context.frame_presented = payloads
         .iter()
         .any(|payload| matches!(payload, ExecutableNode::Present { .. }));

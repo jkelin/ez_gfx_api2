@@ -82,9 +82,9 @@ C calls copy borrowed source bytes during the call, preserving asynchronous life
 
 ## Frame ownership
 
-Texture bindings are recorded only through `&mut Frame`. Surface recording uses `Surface::begin_frame()` and `Frame::configure_swapchain`; named targets use `Context::begin_frame()` and `Frame::configure_render_target`. `Frame::finish(self)` preserves exact errors, while dropping an unfinished frame aborts. `Buffer<T>` and `CountedBuffer<T>` values used alongside textures are invalidated on every terminal path. `RenderTarget::prepare_readback()` creates an opaque request, and completed bytes exist only during the registered callback.
+Texture bindings are recorded only through `&mut Frame`. Surface recording uses `Surface::begin_frame()` and `Frame::configure_swapchain`; named targets use `Context::begin_frame()` and `Frame::configure_render_target`. `Frame::finish(self)` preserves exact errors, while dropping an unfinished frame aborts. Context-owned `Buffer<T>` and `CountedBuffer<T>` values persist across frames; binding imports an immutable snapshot for the live transaction, so writes resume after it terminates. `RenderTarget::prepare_readback(&mut frame)` creates and attaches an opaque owner-and-generation request, and completed metadata and bytes exist only during the registered callback.
 
-## C ABI 30
+## C ABI 32
 
 Install `ez_gfx_callback_register(context, callback, user_data)`. The callback receives `EzGfxEventKind_Upload`, runtime, diagnostic, dropped-count, and readback events on the context creator thread at graphics safe points. Compare upload resource handles, resolve bindings after `EzGfxUploadStatus_DeviceReady`, and copy readback bytes before the callback returns. Passing a null callback clears the registration. Convert result codes with `ez_gfx_print_error`.
 
@@ -96,4 +96,4 @@ Frame recording imports only resources referenced by active work. Texture descri
 
 ## Verification and remaining evidence
 
-Pure queue and allocator transitions are covered by runtime tests. ABI layout/export tests cover callback event records, typed heap/allocation handles, transient buffer signatures, and ABI 30 parity. Native backend behavior requires the Linux Vulkan, Windows DX12, and macOS Metal remote matrices.
+Pure queue and allocator transitions are covered by runtime tests. ABI layout/export tests cover callback event records, typed heap/allocation handles, context-owned buffer signatures, and ABI 32 parity. Native backend behavior requires the Linux Vulkan, Windows DX12, and macOS Metal remote matrices.

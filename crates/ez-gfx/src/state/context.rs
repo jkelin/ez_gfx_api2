@@ -99,7 +99,7 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         frame_depth: None,
         frame_has_graphics: false,
         frame_render_target: None,
-        last_readback: Vec::new(),
+        last_readbacks: Vec::new(),
         active_surface: None,
         frame_presented: false,
         observability,
@@ -606,7 +606,7 @@ pub(super) fn cleanup_context_state(
     owned.frame_surface = None;
     owned.frame_depth = None;
     owned.frame_has_graphics = false;
-    owned.last_readback.clear();
+    owned.last_readbacks.clear();
     owned.active_surface = None;
     owned.frame_presented = false;
 

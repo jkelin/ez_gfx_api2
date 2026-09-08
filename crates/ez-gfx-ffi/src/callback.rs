@@ -10,7 +10,10 @@ use std::{
     cell::Cell,
     collections::HashMap,
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::{LazyLock, Mutex},
+    sync::{
+        LazyLock, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use core::ffi::c_void;
@@ -41,20 +44,21 @@ struct Slot {
     dispatching: bool,
 }
 
-/// Auxiliary per-frame C tracking: present surfaces/targets and the last
-/// enqueued readback texture. The raw frame owns lifecycle; this map only
-/// annotates live frames and is swept on frame consumption and teardown.
+/// Auxiliary per-frame C tracking for presentation and ordered readback requests.
+/// The raw frame owns lifecycle; this map only annotates live frames and is
+/// swept on frame consumption and teardown.
 pub(crate) struct FrameAux {
     pub(crate) owner: u64,
     pub(crate) surface: u64,
     pub(crate) target: u64,
-    pub(crate) readback_texture: Option<u64>,
+    pub(crate) readback_sources: Vec<ReadbackSource>,
 }
 
 static CALLBACKS: LazyLock<Mutex<HashMap<u64, Slot>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static FRAME_AUX: LazyLock<Mutex<HashMap<u64, FrameAux>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_READBACK_REQUEST: AtomicU64 = AtomicU64::new(1);
 
 fn blank_event(kind: EzGfxEventKind) -> EzGfxEvent {
     EzGfxEvent {
@@ -78,6 +82,7 @@ fn blank_event(kind: EzGfxEventKind) -> EzGfxEvent {
         level: 0,
         _pad_level: [0; 7],
         dropped: 0,
+        readback_request_id: 0,
         readback_texture: 0,
         readback_width: 0,
         readback_height: 0,
@@ -171,18 +176,53 @@ pub(crate) fn note_frame(frame: u64, owner: u64, surface: u64, target: u64) {
                 owner,
                 surface,
                 target,
-                readback_texture: None,
+                readback_sources: Vec::new(),
             },
         );
     }
 }
 
-/// Records the last texture readback enqueued into a live frame.
-pub(crate) fn note_readback_source(frame: u64, texture: u64) {
-    if let Ok(mut aux) = FRAME_AUX.lock() {
-        if let Some(entry) = aux.get_mut(&frame) {
-            entry.readback_texture = Some(texture);
-        }
+#[derive(Clone, Copy)]
+pub(crate) struct ReadbackSource {
+    pub(crate) request_id: u64,
+    pub(crate) texture: u64,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+/// Reserves and records one stable correlator in graph insertion order.
+pub(crate) fn note_readback_source(
+    frame: u64,
+    texture: u64,
+    width: u32,
+    height: u32,
+) -> Result<u64, EzGfxResult> {
+    let request_id = NEXT_READBACK_REQUEST
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .map_err(|_| EzGfxResult::QueueFull)?;
+    let mut aux = FRAME_AUX.lock().map_err(|_| EzGfxResult::NativeFailure)?;
+    let entry = aux.get_mut(&frame).ok_or(EzGfxResult::InvalidContext)?;
+    entry.readback_sources.push(ReadbackSource {
+        request_id,
+        texture,
+        width,
+        height,
+    });
+    Ok(request_id)
+}
+
+/// Removes a request whose graph insertion failed after correlator reservation.
+pub(crate) fn cancel_readback(frame: u64, request_id: u64) {
+    if let Ok(mut aux) = FRAME_AUX.lock()
+        && let Some(entry) = aux.get_mut(&frame)
+        && entry
+            .readback_sources
+            .last()
+            .is_some_and(|source| source.request_id == request_id)
+    {
+        entry.readback_sources.pop();
     }
 }
 
@@ -192,6 +232,8 @@ pub(crate) fn take_frame(frame: u64) -> Option<FrameAux> {
 }
 
 pub(crate) struct ReadbackDelivery {
+    pub(crate) kind: EzGfxEventKind,
+    pub(crate) request_id: u64,
     pub(crate) texture: u64,
     pub(crate) width: u32,
     pub(crate) height: u32,
@@ -256,7 +298,7 @@ fn fail(key: u64) {
     }
 }
 
-/// Delivers one readback completion; bytes are borrowed for the callback only.
+/// Delivers one readback or persistent snapshot; bytes are borrowed for the callback only.
 pub(crate) fn dispatch_readback(
     context: ContextHandle,
     delivery: &ReadbackDelivery,
@@ -268,7 +310,8 @@ pub(crate) fn dispatch_readback(
         Err(status) => return status,
     };
     let _guard = ResetGuard(key);
-    let mut event = blank_event(EzGfxEventKind::Readback);
+    let mut event = blank_event(delivery.kind);
+    event.readback_request_id = delivery.request_id;
     event.readback_texture = delivery.texture;
     event.readback_width = delivery.width;
     event.readback_height = delivery.height;

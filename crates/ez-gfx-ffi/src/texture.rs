@@ -151,7 +151,7 @@ pub unsafe extern "C" fn ez_gfx_texture_decoder_register(
                 mips,
             })
         });
-        match ez_gfx::register_texture_decoder(source_format, decoder) {
+        match ez_gfx::Context::register_texture_decoder(source_format, decoder) {
             Ok(()) => EzGfxResult::Ok,
             Err(_) => EzGfxResult::InvalidArgument,
         }
@@ -161,10 +161,12 @@ pub unsafe extern "C" fn ez_gfx_texture_decoder_register(
 #[unsafe(no_mangle)]
 /// Unregisters one custom source decoder. Accepted requests retain their callback.
 pub extern "C" fn ez_gfx_texture_decoder_unregister(source_format: u8) -> EzGfxResult {
-    catch_status(|| match ez_gfx::unregister_texture_decoder(source_format) {
-        Ok(()) => EzGfxResult::Ok,
-        Err(_) => EzGfxResult::InvalidArgument,
-    })
+    catch_status(
+        || match ez_gfx::Context::unregister_texture_decoder(source_format) {
+            Ok(()) => EzGfxResult::Ok,
+            Err(_) => EzGfxResult::InvalidArgument,
+        },
+    )
 }
 
 #[unsafe(no_mangle)]

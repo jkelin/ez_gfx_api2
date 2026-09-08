@@ -1,6 +1,6 @@
 # Geometry
 
-Geometry uses owning named vertex heaps and one singleton context-owned device-local `u32` index heap. Their allocation wrappers retain both the shared `Rc<ContextInner>` and the parent resource lease. Structured and indirect buffers are separate frame transients.
+Geometry uses owning auto-growing named vertex heaps and one lazy context-owned device-local `u32` index heap. Their allocation wrappers retain both the shared `Rc<ContextInner>` and the parent resource lease. Structured and counted buffers are separate persistent context-owned resources.
 
 ## Public path
 
@@ -10,7 +10,7 @@ Geometry uses owning named vertex heaps and one singleton context-owned device-l
 4. Register one `Context` callback for upload, runtime, diagnostic, and readback events.
 5. Drop heaps and allocations independently. Allocation leases keep their parent heap and context alive until cleanup is safe.
 
-The safe interface exposes an owning `VertexHeap`, owning vertex/index allocations, and a context-owned singleton index heap rather than public destroy, remove, release, or free functions. Dropping an allocation retires its range; dropping a vertex heap retires it after every child lease and GPU use. C mirrors the lifecycle with opaque generational `EzGfxVertexHeap`, `EzGfxVertexAllocation`, and `EzGfxIndexAllocation` handles; index-heap creation/destruction remains explicit against `EzGfxContext`.
+The C ABI keeps vertex heaps explicit because C has no RAII. Index storage remains a lazy context-owned singleton with upload, range-query, and allocation-release operations only.
 
 ```mermaid
 sequenceDiagram
@@ -67,11 +67,11 @@ Geometry staging grows subject to allocator and OS failure, not a fixed slot cou
 
 The typed slice upload interface derives and checks count, stride, multiplication, and byte length before one caller-slice to mapped-staging copy, followed by the GPU copy. Raw pointer/count conversion and the 16 MiB caller boundary remain in `ez-gfx-ffi`. The interface does not provide a direct mapped lease.
 
-## Transient frame buffers
+## Persistent frame buffers
 
-Applications call `Frame::acquire_buffer<T>(element_count)` and `Frame::acquire_counted_buffer(element_count)` through `&mut Frame`. `Buffer::write(&mut Frame, start_index, values)` and `CountedBuffer::write(&mut Frame, start_index, commands)` validate frame ownership and checked ranges.
+Applications allocate `Buffer<T>` and `CountedBuffer<T>` from `Context`, then populate them before beginning a frame. Recording imports their CPU-backed contents lazily when a binding or indirect draw first references them. The frame retains each imported buffer; mutation returns `NotReady` until the transaction finishes or aborts, after which the same owner can be updated and reused.
 
-Compute-generated indirect bytes cannot update CPU publication metadata, so callers publish the known indirect count before compute and graphics share the buffer in one frame. Transient wrappers may outlive the borrow that created them, but become invalid immediately when their frame finishes or aborts. Native reuse remains completion-gated or, after indeterminate failure, quarantined.
+Compute-generated indirect bytes cannot update CPU publication metadata, so callers publish the known indirect count before compute and graphics share the buffer in one frame. Native per-frame storage remains completion-gated or, after indeterminate failure, quarantined, without invalidating the context-owned wrapper.
 
 ## Frame ownership
 
@@ -79,4 +79,4 @@ Compute-generated indirect bytes cannot update CPU publication metadata, so call
 
 ## Examples
 
-The shared `Example` host owns `Context`, `Surface`, resize/input/automation, logical swapchain configuration, callbacks, and frame completion. Each setup closure returns concise per-frame recording logic; `Example::handle_frame` consumes the frame.
+The shared `Example` host owns `Context`, `Surface`, resize/input/automation, callbacks, and consuming completion. Each procedural loop receives `WindowFrame`, calls `surface.begin_frame()`, explicitly configures the swapchain from `window_frame.size`, records, then passes both `Frame` and `RenderTarget` to `Example::handle_frame`.

@@ -15,6 +15,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 ez-gfx = { workspace = true, features = ["ffi"] }
+bytemuck.workspace = true
 ez-gfx-core.workspace = true
 
 [dev-dependencies]

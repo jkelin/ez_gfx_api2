@@ -373,8 +373,12 @@ fn exercises_async_texture_batches(backend: u8) {
             unsafe { ez_gfx_frame_begin(context, native.surface, &raw mut frame) },
             EzGfxResult::Ok
         );
+        let mut request_id = 0;
         assert_eq!(
-            ez_gfx_graph_enqueue_texture_readback(compressed, frame),
+            // SAFETY: request output is writable aligned test-owned storage.
+            unsafe {
+                ez_gfx_graph_enqueue_texture_readback(compressed, frame, &raw mut request_id)
+            },
             EzGfxResult::InvalidArgument
         );
         assert_eq!(ez_gfx_ffi::ez_gfx_frame_abort(frame), EzGfxResult::Ok);

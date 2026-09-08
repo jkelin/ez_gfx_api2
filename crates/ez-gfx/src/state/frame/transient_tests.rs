@@ -1,9 +1,9 @@
 use super::*;
 use crate::state::{
     Backend, ContextOptions, DrawIndexedCommand, Error, LifecycleError, acquire_indirect,
-    acquire_structured, create_context, destroy_context, frame_begin, frame_submit,
+    acquire_structured_sized, create_context, destroy_context, frame_begin, frame_submit,
     publish_compute_indirect_count, release_indirect, release_structured, write_indirect,
-    write_structured,
+    write_structured_bytes,
 };
 
 fn test_context() -> Option<ContextHandle> {
@@ -77,9 +77,15 @@ fn successful_submission_retires_handles_and_same_frame_reuse_stays_interned() {
         return;
     };
     frame_begin(context).unwrap();
-    let structured = acquire_structured::<u32>(context, 4).unwrap();
+    let structured = acquire_structured_sized(context, 4, 4).unwrap();
     let indirect = acquire_indirect(context, 1).unwrap();
-    write_structured(context, structured, 0, &[1, 2, 3, 4]).unwrap();
+    write_structured_bytes(
+        context,
+        structured,
+        4,
+        bytemuck::cast_slice(&[1_u32, 2, 3, 4]),
+    )
+    .unwrap();
     write_indirect(context, indirect, 0, &[draw()]).unwrap();
 
     with_context_mut(context, |state| {
@@ -92,7 +98,7 @@ fn successful_submission_retires_handles_and_same_frame_reuse_stays_interned() {
     .unwrap();
 
     assert_eq!(
-        write_structured(context, structured, 0, &[9]),
+        write_structured_bytes(context, structured, 4, bytemuck::cast_slice(&[9_u32])),
         Err(Error::NotReady)
     );
     assert_eq!(
@@ -125,7 +131,7 @@ fn successful_submission_retires_handles_and_same_frame_reuse_stays_interned() {
     })
     .unwrap();
     assert_eq!(
-        write_structured(context, structured, 0, &[9]),
+        write_structured_bytes(context, structured, 4, bytemuck::cast_slice(&[9_u32])),
         Err(Error::Lifecycle(LifecycleError::StaleHandle))
     );
     assert_eq!(
@@ -134,7 +140,7 @@ fn successful_submission_retires_handles_and_same_frame_reuse_stays_interned() {
     );
 
     frame_begin(context).unwrap();
-    let fresh_structured = acquire_structured::<u32>(context, 4).unwrap();
+    let fresh_structured = acquire_structured_sized(context, 4, 4).unwrap();
     let fresh_indirect = acquire_indirect(context, 1).unwrap();
     assert_ne!(fresh_structured, structured);
     assert_ne!(fresh_indirect, indirect);
@@ -160,7 +166,7 @@ fn submission_failure_restores_safe_handles_and_quarantines_unsafe_handles() {
         return;
     };
     frame_begin(context).unwrap();
-    let safe = acquire_structured::<u32>(context, 1).unwrap();
+    let safe = acquire_structured_sized(context, 4, 1).unwrap();
     with_context_mut(context, |state| {
         mark_transient_interned(state, safe.packed())?;
         state.frame.abort();
@@ -171,7 +177,7 @@ fn submission_failure_restores_safe_handles_and_quarantines_unsafe_handles() {
     assert_eq!(frame_submit(context), Err(Error::NotReady));
     release_structured(context, safe);
     assert_eq!(
-        write_structured(context, safe, 0, &[1]),
+        write_structured_bytes(context, safe, 4, bytemuck::cast_slice(&[1_u32])),
         Err(Error::Lifecycle(LifecycleError::StaleHandle))
     );
 

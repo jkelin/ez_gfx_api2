@@ -280,7 +280,11 @@ fn layouts_are_stable() {
     assert_eq!(EzGfxEventKind::Diagnostic as u8, 3);
     assert_eq!(EzGfxEventKind::ObservationsDropped as u8, 4);
     assert_eq!(EzGfxEventKind::Readback as u8, 5);
-    assert_eq!((size_of::<EzGfxEvent>(), align_of::<EzGfxEvent>()), (96, 8));
+    assert_eq!(EzGfxEventKind::Snapshot as u8, 6);
+    assert_eq!(
+        (size_of::<EzGfxEvent>(), align_of::<EzGfxEvent>()),
+        (104, 8)
+    );
     assert_eq!(
         [
             offset_of!(EzGfxEvent, kind),
@@ -288,13 +292,14 @@ fn layouts_are_stable() {
             offset_of!(EzGfxEvent, record),
             offset_of!(EzGfxEvent, level),
             offset_of!(EzGfxEvent, dropped),
+            offset_of!(EzGfxEvent, readback_request_id),
             offset_of!(EzGfxEvent, readback_texture),
             offset_of!(EzGfxEvent, readback_width),
             offset_of!(EzGfxEvent, readback_height),
             offset_of!(EzGfxEvent, readback_byte_count),
             offset_of!(EzGfxEvent, readback_bytes)
         ],
-        [0, 8, 24, 48, 56, 64, 72, 76, 80, 88]
+        [0, 8, 24, 48, 56, 64, 72, 80, 84, 88, 96]
     );
     assert_eq!(
         (
@@ -376,7 +381,7 @@ fn all_public_export_signatures_are_stable() {
     let _: unsafe extern "C" fn(Handle, Handle, *mut Handle) -> Status =
         ffi::ez_gfx_render_target_frame_begin;
     let _: unsafe extern "C" fn(Handle, Handle, *mut Handle) -> Status = ffi::ez_gfx_frame_begin;
-    let _: unsafe extern "C" fn(u32, *const u8, usize, *mut Handle, Handle) -> Status =
+    let _: unsafe extern "C" fn(u32, u32, *const u8, usize, *mut Handle, Handle) -> Status =
         ffi::ez_gfx_counted_buffer_acquire;
     let _: unsafe extern "C" fn(
         Handle,
@@ -408,17 +413,15 @@ fn all_public_export_signatures_are_stable() {
         u32,
         Handle,
     ) -> Status = ffi::ez_gfx_render_add_compute_pipeline;
-    let _: extern "C" fn(Handle, Handle) -> Status = ffi::ez_gfx_graph_enqueue_texture_readback;
+    let _: unsafe extern "C" fn(Handle, Handle, *mut u64) -> Status =
+        ffi::ez_gfx_graph_enqueue_texture_readback;
     let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_frame_end;
     let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_frame_abort;
     let _: unsafe extern "C" fn(Handle, EzGfxEventCallback, *mut c_void) -> Status =
         ffi::ez_gfx_callback_register;
-    let _: unsafe extern "C" fn(*const u8, usize, u64, u64, *mut Handle, Handle) -> Status =
+    let _: unsafe extern "C" fn(*const u8, usize, u64, *mut Handle, Handle) -> Status =
         ffi::ez_gfx_vertex_heap_create;
     let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_vertex_heap_destroy;
-    let _: unsafe extern "C" fn(u64, *const u8, usize, Handle) -> Status =
-        ffi::ez_gfx_index_heap_create;
-    let _: extern "C" fn(Handle) = ffi::ez_gfx_index_heap_destroy;
     let _: unsafe extern "C" fn(*const c_void, u32, *mut u64, Handle) -> Status =
         ffi::ez_gfx_vertex_upload_indices;
     let _: unsafe extern "C" fn(Handle, *const c_void, u32, u64, *mut u64, Handle) -> Status =
@@ -462,7 +465,7 @@ fn counted_strings_reject_invalid_ranges_before_reading_or_delegating() {
     assert_eq!(
         // SAFETY: `valid` is readable for exactly its nonzero byte length and intentionally has no terminator.
         unsafe {
-            ez_gfx_counted_buffer_acquire(1, valid.as_ptr(), valid.len(), &raw mut indirect, 0)
+            ez_gfx_counted_buffer_acquire(20, 1, valid.as_ptr(), valid.len(), &raw mut indirect, 0)
         },
         EzGfxResult::InvalidContext
     );
@@ -479,7 +482,7 @@ fn counted_strings_reject_invalid_ranges_before_reading_or_delegating() {
     ] {
         assert_eq!(
             // SAFETY: Valid pointers name the declared test-owned ranges; oversized and null ranges are rejected before dereference.
-            unsafe { ez_gfx_counted_buffer_acquire(1, pointer, length, &raw mut indirect, 0) },
+            unsafe { ez_gfx_counted_buffer_acquire(20, 1, pointer, length, &raw mut indirect, 0) },
             EzGfxResult::InvalidArgument
         );
     }

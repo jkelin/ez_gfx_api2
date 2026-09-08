@@ -8,26 +8,18 @@ use super::{
     result_status, retire_native_allocation, stage_upload, with_context_mut,
 };
 
-/// Acquires one per-frame structured buffer whose stride is inferred from `T`.
-///
-/// # Errors
-///
-/// Returns an error outside frame recording, for an empty or zero-sized type,
-/// checked size overflow, an invalid context, or native allocation failure.
-pub fn acquire_structured<T: bytemuck::Pod>(
-    context: ContextHandle,
-    element_count: usize,
-) -> Result<StructuredBufferHandle> {
-    let element_size =
-        u32::try_from(core::mem::size_of::<T>()).map_err(|_| Error::InvalidArgument)?;
-    let element_count = u32::try_from(element_count).map_err(|_| Error::InvalidArgument)?;
-    acquire_structured_raw_impl(context, element_size, element_count)
-}
-
 /// Acquires a runtime-typed structured buffer for the C ABI.
 #[cfg(feature = "ffi")]
 #[doc(hidden)]
 pub fn acquire_structured_raw(
+    context: ContextHandle,
+    element_size: u32,
+    element_count: u32,
+) -> Result<StructuredBufferHandle> {
+    acquire_structured_raw_impl(context, element_size, element_count)
+}
+
+pub(crate) fn acquire_structured_sized(
     context: ContextHandle,
     element_size: u32,
     element_count: u32,
@@ -212,31 +204,6 @@ pub fn publish_compute_indirect_count(
     }))
 }
 
-/// Writes a typed element range into a structured buffer.
-///
-/// # Errors
-///
-/// Returns an error for a stale, consumed, foreign, type-mismatched, or
-/// out-of-range handle, checked arithmetic failure, or failed upload.
-pub fn write_structured<T: bytemuck::Pod>(
-    context: ContextHandle,
-    structured: StructuredBufferHandle,
-    start_index: usize,
-    values: &[T],
-) -> Result<()> {
-    let element_size =
-        u32::try_from(core::mem::size_of::<T>()).map_err(|_| Error::InvalidArgument)?;
-    let start_index = u32::try_from(start_index).map_err(|_| Error::InvalidArgument)?;
-    write_structured_raw_impl(
-        context,
-        structured,
-        start_index,
-        element_size,
-        bytemuck::cast_slice(values),
-        values.len(),
-    )
-}
-
 /// Writes runtime-typed structured elements for the C ABI.
 #[cfg(feature = "ffi")]
 #[doc(hidden)]
@@ -257,6 +224,19 @@ pub fn write_structured_raw(
         bytes,
         value_count,
     )
+}
+
+pub(crate) fn write_structured_bytes(
+    context: ContextHandle,
+    structured: StructuredBufferHandle,
+    element_size: u32,
+    bytes: &[u8],
+) -> Result<()> {
+    let value_count = bytes
+        .len()
+        .checked_div(element_size as usize)
+        .ok_or(Error::InvalidArgument)?;
+    write_structured_raw_impl(context, structured, 0, element_size, bytes, value_count)
 }
 
 fn write_structured_raw_impl(

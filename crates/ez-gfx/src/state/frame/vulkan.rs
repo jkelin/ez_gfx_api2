@@ -572,17 +572,21 @@ pub(super) fn execute_vulkan_frame_plan(
                     )
                 })
                 .count();
-            if texture_readbacks != 0 {
-                let Some(readback) = outputs.get(texture_readbacks - 1) else {
-                    if let (Some(handle), Some(surface)) = (surface_handle, surface) {
-                        context.surfaces.insert(handle, surface);
-                    }
-                    return Err(Error::NativeFailure);
-                };
-                context.last_readback.clone_from(readback);
+            let expected = texture_readbacks + usize::from(capture);
+            if outputs.len() != expected {
+                if let (Some(handle), Some(surface)) = (surface_handle, surface) {
+                    context.surfaces.insert(handle, surface);
+                }
+                return Err(Error::NativeFailure);
             }
+            context.last_readbacks = outputs;
             if capture && let Some(native_surface) = native_surface.as_deref() {
-                context.last_readback = native_surface.presented_rgba8().to_vec();
+                native_surface.presented_rgba8().clone_into(
+                    context
+                        .last_readbacks
+                        .last_mut()
+                        .expect("capture output exists"),
+                );
             }
             context.frame_presented = payloads
                 .iter()

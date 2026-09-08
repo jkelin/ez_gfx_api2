@@ -4,19 +4,19 @@
 
 ## Lifecycle
 
-`create_context` returns the creator-thread-affine owner. `create_surface(&context, options)` atomically creates the native surface, initializes the device, and applies the initial extent; failure rolls back the unpublished surface. Persistent resources retain context and parent leases. Their `Drop` implementations delegate release to the internal raw seam, so safe Rust exposes no destroy, release, remove, or free functions.
+`Context::new` returns the creator-thread-affine owner. `Context::create_surface` atomically creates the native surface, initializes the device, and applies the initial extent; failure rolls back the unpublished surface. Persistent resources retain context and parent leases. Their `Drop` implementations delegate release to the internal raw seam, so safe Rust exposes no destroy, release, remove, or free functions.
 
-`Surface::begin_frame()` returns one target-less recording transaction. `Frame::configure_swapchain(size, format)` attaches the surface and yields its logical render target. `Context::begin_frame()` plus `Frame::configure_render_target(name, size, format)` selects a cached named target; extent or format changes recreate its native image. Recording and frame-local acquisition require `&mut Frame`. `Frame::finish(self)` consumes the transaction and preserves exact errors. Dropping an unfinished frame aborts because `Drop` cannot return errors.
+`Surface::begin_frame()` returns one target-less recording transaction. `Frame::configure_swapchain(size, format)` attaches the surface and yields its logical render target. `Context::begin_frame()` plus `Frame::configure_render_target(name, size, format)` selects a cached named target; extent or format changes recreate its native image. Recording requires `&mut Frame`. `Frame::finish(self)` consumes the transaction and preserves exact errors. Dropping an unfinished frame aborts because `Drop` cannot return errors.
 
-Frame-local `Buffer<T>` and `CountedBuffer<T>` values share transaction state. Successful completion or abort invalidates them. Native storage is recycled only after GPU completion; indeterminate native failures quarantine it until terminal context cleanup. A `VertexAllocation` retains its `VertexHeap`, and a recording frame retains referenced persistent allocations through completion.
+`Buffer<T>` and `CountedBuffer<T>` are context-owned persistent CPU-backed resources. They are acquired and populated before `begin_frame`, imported lazily when bound, retained through the transaction, and reusable after completion. Mutation while a frame has imported a buffer returns `NotReady`. Native per-frame storage is recycled only after GPU completion; indeterminate native failures quarantine it until terminal context cleanup. A `VertexAllocation` retains its `VertexHeap`, and a recording frame retains referenced persistent allocations through completion.
 
 ## API and ownership
 
 Import public items from the crate root. `Context`, `Surface`, `Shader`, `Texture`, `RenderTarget`, `VertexHeap<T>`, `VertexAllocation<T>`, `IndexAllocation`, `Buffer<T>`, `CountedBuffer<T>`, and `Frame` are non-`Copy`, non-`Send`, and non-`Sync`. Raw handles and explicit lifecycle functions are doc-hidden for `ez-gfx-ffi`.
 
-The context-owned index heap is lazy behind `Context::upload_indices`. `Context::create_vertex_heap<T>(name)` derives stride; `VertexHeap::upload` derives checked count and byte size from `T: Pod`. `Frame::acquire_buffer<T: Pod>` and `Frame::acquire_counted_buffer` allocate transients. Writes validate element ranges; counted buffers publish their visible draw count explicitly.
+The context-owned index heap is lazy behind `Context::upload_indices`. `Context::create_vertex_heap<T>(name)` derives stride and auto-grows storage; `VertexHeap::upload` derives checked count and byte size from `T: Pod`. `Context::acquire_buffer<T: Pod>` and `Context::acquire_counted_buffer<T: Pod>` allocate persistent typed storage. Writes validate element ranges; counted buffers publish their visible count explicitly.
 
-`Context::load_shader` accepts validated artifact bytes. `Context::load_texture` copies caller bytes before returning and schedules CPU work. `Context::register_callback` is the sole safe event channel for upload, runtime, diagnostic, dropped-record, and callback-scoped readback events. `RenderTarget::prepare_readback` returns an opaque request consumed by `Frame::enqueue_readback`.
+`Context::load_shader` accepts validated artifact bytes. `Context::load_texture` copies caller bytes before returning and schedules CPU work. `Context::register_callback` is the sole safe event channel for upload, runtime, diagnostic, dropped-record, and callback-scoped readback events. `RenderTarget::prepare_readback(&mut frame)` creates and attaches an opaque owner-and-generation request; the callback receives its identity, dimensions, and scoped bytes.
 
 ## Shader artifacts
 
@@ -32,4 +32,4 @@ The context-owned index heap is lazy behind `Context::upload_indices`. `Context:
 | [04 Dear ImGui](https://github.com/jkelin/ez_gfx_api2/blob/main/examples/04_imgui/README.md) | Dynamic UI buffers and per-command clipping |
 | [05 Helmet](https://github.com/jkelin/ez_gfx_api2/blob/main/examples/05_helmet/README.md) | GLB geometry and depth-tested rendering |
 | [06 Sponza KTX2](https://github.com/jkelin/ez_gfx_api2/blob/main/examples/06_sponza_ktx2/README.md) | KTX2 materials and compute-to-graphics flow |
-| [C textured cube](../../examples/c/textured_cube/README.md) | ABI 30 typed-heap, transient compute-to-graphics indexed-indirect cube |
+| [C textured cube](../../examples/c/textured_cube/README.md) | ABI 32 typed-heap, context-owned compute-to-graphics indexed-indirect cube |

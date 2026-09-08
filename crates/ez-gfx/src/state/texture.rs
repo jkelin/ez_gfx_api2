@@ -699,6 +699,37 @@ pub fn texture_binding(context: ContextHandle, texture: TextureHandle) -> Result
     })
 }
 
+#[cfg(feature = "ffi")]
+/// Returns the stored texture extent.
+///
+/// # Errors
+///
+/// Returns an error when the context or texture is invalid, failed, or not ready.
+pub fn texture_extent(context: ContextHandle, texture: TextureHandle) -> Result<(u32, u32)> {
+    with_context_mut(context, |context| {
+        context
+            .identity
+            .check_thread_and_health()
+            .map_err(map_lifecycle)?;
+        pump_async_textures(context)?;
+        if let Some(error) = context.texture_failures.get(&texture).copied() {
+            return Err(error);
+        }
+        if context.pending_textures.contains_key(&texture) {
+            return Err(Error::NotReady);
+        }
+        context
+            .identity
+            .resolve(texture.packed(), ResourceKind::Texture)
+            .map_err(map_lifecycle)?;
+        let (_, _, width, height, _) = context
+            .textures
+            .get(&texture)
+            .ok_or(Error::InvalidContext)?;
+        Ok((*width, *height))
+    })
+}
+
 /// Returns resident and total mip counts.
 ///
 /// # Errors

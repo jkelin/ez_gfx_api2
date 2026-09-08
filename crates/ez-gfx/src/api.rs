@@ -67,6 +67,13 @@ pub enum Error {
 /// Result returned by the safe Rust facade.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Opaque owner-and-generation identity of one submitted readback request.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ReadbackId {
+    owner: u64,
+    generation: u64,
+}
+
 /// Creator-thread event delivered by [`Context::register_callback`].
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
@@ -84,8 +91,19 @@ pub enum Event<'a> {
     },
     /// Bounded observability storage discarded records.
     ObservationsDropped(u64),
-    /// Completed host-visible readback bytes, valid only for this callback.
-    Readback(&'a [u8]),
+    /// Completed requested readback; bytes are valid only for this callback.
+    Readback {
+        /// Request identity.
+        request: ReadbackId,
+        /// Pixel width.
+        width: u32,
+        /// Pixel height.
+        height: u32,
+        /// Tightly packed RGBA8 pixels.
+        bytes: &'a [u8],
+    },
+    /// Completed implicit terminal-frame snapshot.
+    Snapshot(&'a [u8]),
 }
 
 type EventCallback = dyn for<'a> FnMut(Event<'a>);
@@ -102,6 +120,7 @@ struct ContextInner {
     dispatching: Cell<bool>,
     render_targets: RefCell<HashMap<String, CachedRenderTarget>>,
     closed: Cell<bool>,
+    next_readback: Cell<u64>,
 }
 
 struct DispatchGuard<'a>(&'a Cell<bool>);
@@ -129,20 +148,46 @@ pub struct Context {
     inner: Rc<ContextInner>,
 }
 
-/// Creates a creator-thread graphics context.
-///
-/// # Errors
-/// Returns [`Error`] when native context creation or validation fails.
-pub fn create_context(options: ez_gfx_runtime::ContextOptions) -> Result<Context> {
-    state::create_context(options).map(|handle| Context {
-        inner: Rc::new(ContextInner {
-            handle,
-            callback: RefCell::new(None),
-            render_targets: RefCell::new(HashMap::new()),
-            dispatching: Cell::new(false),
-            closed: Cell::new(false),
-        }),
-    })
+impl Context {
+    /// Creates a creator-thread graphics context.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when native context creation or validation fails.
+    pub fn new(options: ez_gfx_runtime::ContextOptions) -> Result<Self> {
+        state::create_context(options).map(|handle| Self {
+            inner: Rc::new(ContextInner {
+                handle,
+                callback: RefCell::new(None),
+                render_targets: RefCell::new(HashMap::new()),
+                dispatching: Cell::new(false),
+                next_readback: Cell::new(1),
+                closed: Cell::new(false),
+            }),
+        })
+    }
+
+    /// Registers one process-wide custom texture decoder.
+    ///
+    /// # Errors
+    /// Returns [`TextureError`] when `source_format` is reserved or already registered.
+    pub fn register_texture_decoder(
+        source_format: u8,
+        decoder: ez_gfx_runtime::texture::TextureDecodeCallback,
+    ) -> std::result::Result<(), ez_gfx_runtime::texture::TextureError> {
+        ez_gfx_runtime::texture::register_texture_decoder(source_format, decoder)
+    }
+
+    /// Removes one process-wide custom texture decoder.
+    ///
+    /// Already-admitted texture loads retain their decoder.
+    ///
+    /// # Errors
+    /// Returns [`TextureError`] when `source_format` is reserved or not registered.
+    pub fn unregister_texture_decoder(
+        source_format: u8,
+    ) -> std::result::Result<(), ez_gfx_runtime::texture::TextureError> {
+        ez_gfx_runtime::texture::unregister_texture_decoder(source_format)
+    }
 }
 
 impl Context {
@@ -209,7 +254,26 @@ impl Context {
         }
     }
 
-    fn dispatch_readback(&self, bytes: &[u8]) -> Result<()> {
+    fn dispatch_readback(
+        &self,
+        request: ReadbackId,
+        width: u32,
+        height: u32,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.dispatch_callback(Event::Readback {
+            request,
+            width,
+            height,
+            bytes,
+        })
+    }
+
+    fn dispatch_snapshot(&self, bytes: &[u8]) -> Result<()> {
+        self.dispatch_callback(Event::Snapshot(bytes))
+    }
+
+    fn dispatch_callback(&self, event: Event<'_>) -> Result<()> {
         if self.inner.callback.borrow().is_none() {
             return Ok(());
         }
@@ -219,7 +283,7 @@ impl Context {
         let dispatch_guard = DispatchGuard(&self.inner.dispatching);
         let mut slot = self.inner.callback.borrow_mut();
         let result = if let Some(callback) = slot.as_mut() {
-            catch_unwind(AssertUnwindSafe(|| callback(Event::Readback(bytes))))
+            catch_unwind(AssertUnwindSafe(|| callback(event)))
         } else {
             Ok(())
         };
@@ -387,30 +451,30 @@ impl Surface {
     }
 }
 
-/// Creates, initializes, and sizes a surface atomically.
-///
-/// # Errors
-/// Returns [`Error`] when creation, device initialization, or initial sizing fails.
-pub fn create_surface(
-    context: &Context,
-    options: ez_gfx_runtime::SurfaceOptions,
-) -> Result<Surface> {
-    context.check_entry()?;
-    let handle = state::create_surface(context.raw(), options)?;
-    let initialized = state::init_device(context.raw(), handle)
-        .and_then(|()| state::resize_surface(context.raw(), handle, options.width, options.height));
-    if let Err(error) = initialized {
-        // A partially initialized surface is never published into the owning interface.
-        state::destroy_surface(context.raw(), handle);
-        return Err(error);
+impl Context {
+    /// Creates, initializes, and sizes a surface atomically.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when creation, device initialization, or initial sizing fails.
+    pub fn create_surface(&self, options: ez_gfx_runtime::SurfaceOptions) -> Result<Surface> {
+        self.check_entry()?;
+        let handle = state::create_surface(self.raw(), options)?;
+        let initialized = state::init_device(self.raw(), handle).and_then(|()| {
+            state::resize_surface(self.raw(), handle, options.width, options.height)
+        });
+        if let Err(error) = initialized {
+            // A partially initialized surface is never published into the owning interface.
+            state::destroy_surface(self.raw(), handle);
+            return Err(error);
+        }
+        self.complete(Ok(Surface {
+            inner: Rc::new(SurfaceInner {
+                context: Rc::clone(&self.inner),
+                handle,
+                target: RefCell::new(None),
+            }),
+        }))
     }
-    context.complete(Ok(Surface {
-        inner: Rc::new(SurfaceInner {
-            context: Rc::clone(&context.inner),
-            handle,
-            target: RefCell::new(None),
-        }),
-    }))
 }
 
 struct ShaderInner {
@@ -596,7 +660,7 @@ impl RenderTargetInner {
 /// Owning logical render target.
 pub struct RenderTarget {
     inner: Rc<RenderTargetInner>,
-    _surface_lease: Option<Rc<SurfaceInner>>,
+    surface_lease: Option<Rc<SurfaceInner>>,
 }
 
 impl RenderTarget {
@@ -662,18 +726,41 @@ impl RenderTarget {
         }
     }
 
-    /// Creates an opaque request for callback-scoped readback after this target is rendered.
-    #[must_use]
-    pub fn prepare_readback(&self) -> RenderTargetReadback {
-        RenderTargetReadback {
-            target: Rc::clone(&self.inner),
-        }
+    /// Creates and schedules a unique readback request on `frame`.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when the target is stale, foreign, already released, or not renderable.
+    pub fn prepare_readback(&self, frame: &mut Frame) -> Result<Readback> {
+        frame.prepare_target_readback(self)
     }
 }
 
-/// Opaque request to capture a managed render target through the context callback.
-pub struct RenderTargetReadback {
-    target: Rc<RenderTargetInner>,
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ReadbackState {
+    Queued,
+    Complete,
+    Aborted,
+}
+
+struct ReadbackInner {
+    _context: Rc<ContextInner>,
+    _target: Rc<RenderTargetInner>,
+    id: ReadbackId,
+    width: u32,
+    height: u32,
+    state: Cell<ReadbackState>,
+}
+
+/// Owning identity and target lease for one submitted readback.
+pub struct Readback {
+    inner: Rc<ReadbackInner>,
+}
+
+impl Readback {
+    /// Returns the opaque request identity delivered with its callback.
+    pub fn id(&self) -> ReadbackId {
+        self.inner.id
+    }
 }
 
 impl Context {

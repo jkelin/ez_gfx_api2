@@ -1,4 +1,4 @@
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 /// Parameters for one indexed indirect draw.
 pub struct DrawIndexedCommand {

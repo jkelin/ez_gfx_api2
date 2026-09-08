@@ -101,8 +101,12 @@ fn imgui_key(key: SceneKey) -> Option<Key> {
     })
 }
 
-fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
-    run(config, move |context, _surface, backend| {
+fn main() -> anyhow::Result<()> {
+    let (program, config) = ExampleProgram::new("04_imgui", WIDTH, HEIGHT, "ez_gfx_api2");
+    let mut example = Example::new(config)?;
+    {
+        let backend = example.backend();
+        let context = example.context();
         let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .ok_or_else(|| anyhow::anyhow!("examples package has no workspace parent"))?;
@@ -168,8 +172,7 @@ fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
             padding: 0.0,
         };
 
-        Ok(move |window_frame: WindowFrame| {
-            let mut frame = window_frame.frame;
+        while let Some(window_frame) = example.wait_for_next_frame()? {
             let input = window_frame.input;
             let events = &window_frame.events;
             for &event in events {
@@ -230,9 +233,13 @@ fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
                 );
                 std::mem::swap(&mut cpu_indices, &mut uploaded_indices);
             }
-            let commands = frame.acquire_buffer::<ImGuiCommand>(cpu_commands.len())?;
-            commands.write(&mut frame, 0, &cpu_commands)?;
-            let indirect = frame.acquire_counted_buffer(draw_counts.len() as u32)?;
+            let commands = example
+                .context()
+                .acquire_buffer::<ImGuiCommand>(cpu_commands.len())?;
+            commands.write(0, &cpu_commands)?;
+            let indirect = example
+                .context()
+                .acquire_counted_buffer::<DrawIndexedCommand>(draw_counts.len())?;
             let draws = draw_counts
                 .iter()
                 .copied()
@@ -245,7 +252,11 @@ fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
                     first_instance: index as u32,
                 })
                 .collect::<Vec<_>>();
-            indirect.write(&mut frame, 0, &draws)?;
+            indirect.write(0, &draws)?;
+            indirect.publish_count(u32::try_from(draws.len())?)?;
+            let mut frame = example.surface().begin_frame()?;
+            let swapchain_target =
+                frame.configure_swapchain(window_frame.size, Format::Bgra8Srgb)?;
             frame.retain_texture(&texture)?;
             frame.retain_index_allocation(&identity_indices)?;
             frame.retain_vertex_allocation(vertices.as_ref().expect("uploaded ImGui vertices"))?;
@@ -258,11 +269,10 @@ fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
                 DynamicPipelineState::from_abi(0, 0, 0, 1).unwrap(),
                 bytes_of(&push),
             )?;
-            Ok::<_, anyhow::Error>(frame)
-        })
-    })
-}
-
-fn main() {
-    run_program("04_imgui", WIDTH, HEIGHT, "ez_gfx_api2", run_example);
+            example.handle_frame(frame, swapchain_target)?;
+        }
+    }
+    let report = example.close()?;
+    program.finish(report);
+    Ok(())
 }

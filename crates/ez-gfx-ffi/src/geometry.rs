@@ -1,12 +1,11 @@
 use ez_gfx::raw::{
-    self, ContextHandle, IndexAllocationHandle, StructuredBufferHandle, VertexAllocationHandle,
-    VertexHeapHandle,
+    self, ContextHandle, IndexAllocationHandle, VertexAllocationHandle, VertexHeapHandle,
 };
 
 use super::{
-    EZ_GFX_MAX_BOUNDARY_BYTES, EzGfxBuffer, EzGfxContext, EzGfxFrame, EzGfxIndexAllocation,
-    EzGfxResult, EzGfxVertexAllocation, EzGfxVertexHeap, IntoFfiResult, catch_status, catch_void,
-    frame, read_bounded_string, validate_bounded_string,
+    EZ_GFX_MAX_BOUNDARY_BYTES, EzGfxBuffer, EzGfxContext, EzGfxIndexAllocation, EzGfxResult,
+    EzGfxVertexAllocation, EzGfxVertexHeap, IntoFfiResult, buffer, catch_status, catch_void,
+    read_bounded_string, validate_bounded_string,
 };
 
 #[unsafe(no_mangle)]
@@ -18,7 +17,6 @@ use super::{
 pub unsafe extern "C" fn ez_gfx_vertex_heap_create(
     name: *const u8,
     name_length: usize,
-    capacity: u64,
     stride: u64,
     out_heap: *mut EzGfxVertexHeap,
     context: EzGfxContext,
@@ -32,7 +30,7 @@ pub unsafe extern "C" fn ez_gfx_vertex_heap_create(
             return EzGfxResult::InvalidArgument;
         }
         let context = try_handle!(ContextHandle, context);
-        match raw::create_vertex_heap_with_capacity(context, &name, capacity, stride) {
+        match raw::create_vertex_heap(context, &name, stride) {
             Ok(handle) => {
                 // SAFETY: the validated caller-owned output remains writable for this call.
                 unsafe { out_heap.write(handle.into_raw()) };
@@ -52,37 +50,6 @@ pub extern "C" fn ez_gfx_vertex_heap_destroy(heap: EzGfxVertexHeap, context: EzG
             VertexHeapHandle::from_raw(heap),
         ) {
             raw::destroy_vertex_heap(context, heap);
-        }
-    });
-}
-
-#[unsafe(no_mangle)]
-/// Creates the context's index heap with the requested capacity.
-///
-/// # Safety
-///
-/// `debug_name` must be non-null and readable for exactly `debug_name_length` bytes; the range must be non-empty UTF-8 without embedded NUL bytes.
-pub unsafe extern "C" fn ez_gfx_index_heap_create(
-    capacity: u64,
-    debug_name: *const u8,
-    debug_name_length: usize,
-    context: EzGfxContext,
-) -> EzGfxResult {
-    catch_status(|| {
-        if validate_bounded_string(debug_name, debug_name_length).is_err() {
-            return EzGfxResult::InvalidArgument;
-        }
-        let context = try_handle!(ContextHandle, context);
-        raw::create_index_heap(context, capacity).into_ffi_result()
-    })
-}
-
-#[unsafe(no_mangle)]
-/// Destroys the context's index heap.
-pub extern "C" fn ez_gfx_index_heap_destroy(context: EzGfxContext) {
-    catch_void(|| {
-        if let Ok(context) = ContextHandle::from_raw(context) {
-            raw::destroy_index_heap(context);
         }
     });
 }
@@ -256,7 +223,7 @@ pub extern "C" fn ez_gfx_index_allocation_remove(
 }
 
 #[unsafe(no_mangle)]
-/// Acquires a transient buffer sized for the requested elements.
+/// Acquires a context-owned buffer sized for the requested elements.
 ///
 /// # Safety
 ///
@@ -268,7 +235,7 @@ pub unsafe extern "C" fn ez_gfx_buffer_acquire(
     debug_name: *const u8,
     debug_name_length: usize,
     out_buffer: *mut EzGfxBuffer,
-    frame: EzGfxFrame,
+    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         let byte_size = u64::from(element_size) * u64::from(element_count);
@@ -283,14 +250,19 @@ pub unsafe extern "C" fn ez_gfx_buffer_acquire(
         {
             return EzGfxResult::InvalidArgument;
         }
-        let context = try_frame!(frame);
-        match raw::acquire_structured_raw(context, element_size, element_count) {
+        let context = try_handle!(ContextHandle, context);
+        match buffer::insert(
+            context,
+            buffer::Kind::Structured,
+            element_size,
+            element_count,
+        ) {
             Ok(handle) => {
                 // SAFETY: the validated caller-owned output remains writable for this call.
-                unsafe { out_buffer.write(handle.into_raw()) };
+                unsafe { out_buffer.write(handle) };
                 EzGfxResult::Ok
             }
-            Err(status) => status.into(),
+            Err(status) => status,
         }
     })
 }
@@ -303,12 +275,12 @@ pub unsafe extern "C" fn ez_gfx_buffer_acquire(
 /// `data` must cover `element_count * element_size` readable bytes, or may be
 /// null when `element_count` is zero.
 pub unsafe extern "C" fn ez_gfx_buffer_write(
-    buffer: EzGfxBuffer,
+    buffer_handle: EzGfxBuffer,
     start_index: u32,
     data: *const std::ffi::c_void,
     element_count: u32,
     element_size: u32,
-    frame: EzGfxFrame,
+    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         let byte_size = match u64::from(element_count)
@@ -327,26 +299,25 @@ pub unsafe extern "C" fn ez_gfx_buffer_write(
             // SAFETY: the checked non-null caller range remains readable for this call.
             unsafe { core::slice::from_raw_parts(data.cast::<u8>(), byte_size) }
         };
-        raw::write_structured_raw(
-            try_frame!(frame),
-            try_handle!(StructuredBufferHandle, buffer),
+        let context = try_handle!(ContextHandle, context);
+        buffer::write(
+            buffer_handle,
+            context,
+            buffer::Kind::Structured,
             start_index,
-            element_count,
             element_size,
             bytes,
         )
-        .into_ffi_result()
+        .map_or_else(|status| status, |()| EzGfxResult::Ok)
     })
 }
 
 #[unsafe(no_mangle)]
-/// Releases a buffer upload.
-pub extern "C" fn ez_gfx_buffer_release(buffer: EzGfxBuffer, frame: EzGfxFrame) {
+/// Releases a context-owned buffer handle; zero and stale values are ignored.
+pub extern "C" fn ez_gfx_buffer_release(buffer_handle: EzGfxBuffer, context: EzGfxContext) {
     catch_void(|| {
-        if let (Ok(entry), Ok(buffer)) =
-            (frame::get(frame), StructuredBufferHandle::from_raw(buffer))
-        {
-            raw::release_structured(entry.owner, buffer);
+        if let Ok(context) = ContextHandle::from_raw(context) {
+            let _ = buffer::remove(buffer_handle, context, buffer::Kind::Structured);
         }
     });
 }

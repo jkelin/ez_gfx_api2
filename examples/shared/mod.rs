@@ -22,7 +22,7 @@ pub use error::{Error, Result};
     unused_imports,
     reason = "Standalone examples use different shared interfaces."
 )]
-pub use example::{Example, ExampleConfig, WindowFrame, run};
+pub use example::{Example, ExampleConfig, WindowFrame};
 #[allow(
     unused_imports,
     reason = "Standalone examples use different shared interfaces."
@@ -165,54 +165,69 @@ struct ProgramOptions {
     validation: bool,
 }
 
-/// Parses one process configuration, runs one example, and emits stable reports.
-pub fn run_program<E>(
-    identity: &str,
-    width: u32,
-    height: u32,
-    title: &'static str,
-    run: impl FnOnce(ExampleConfig) -> std::result::Result<Option<ProgramReport>, E>,
-) where
-    E: std::fmt::Display,
-{
-    let options = program_options().unwrap_or_else(|error| exit_config(error));
-    let backend_name = host::backend_name_for(options.backend);
-    let report = run(ExampleConfig {
-        width,
-        height,
-        title,
-        frame_limit: options.frame_limit,
-        benchmark: options.benchmark,
-        backend: options.backend,
-        visible: options.visible,
-        debug: options.debug,
-        validation: options.validation,
-    })
-    .unwrap_or_else(|error| {
-        eprintln!("example failed: {error}");
-        std::process::exit(1)
-    });
-    let Some(report) = report else { return };
-    let frame = report.frame;
-    publish_snapshot(
-        options.snapshot,
-        options.update_snapshots,
-        frame.width,
-        frame.height,
-        frame.frames,
-        &frame.rgba8,
-        frame.runtime_events,
-        frame.diagnostics,
-        frame.dropped_observations,
-        options.report,
-    );
-    if let Some(benchmark) = report.benchmark {
-        let frame_time_ns = benchmark.elapsed_ns as f64 / f64::from(benchmark.measured_frames);
-        let fps = 1_000_000_000.0 / frame_time_ns;
-        println!(
-            "{{\"benchmark\":\"{identity}\",\"backend\":\"{backend_name}\",\"warmup_frames\":{},\"measured_frames\":{},\"elapsed_ns\":{},\"frame_time_ns\":{frame_time_ns:.3},\"fps\":{fps:.3}}}",
-            benchmark.warmup_frames, benchmark.measured_frames, benchmark.elapsed_ns,
+/// Parsed process configuration and report publisher for one linear example.
+pub struct ExampleProgram {
+    identity: &'static str,
+    backend_name: &'static str,
+    options: ProgramOptions,
+}
+
+impl ExampleProgram {
+    /// Parses process configuration and returns the host configuration.
+    pub fn new(
+        identity: &'static str,
+        width: u32,
+        height: u32,
+        title: &'static str,
+    ) -> (Self, ExampleConfig) {
+        let options = program_options().unwrap_or_else(|error| exit_config(error));
+        let config = ExampleConfig {
+            width,
+            height,
+            title,
+            frame_limit: options.frame_limit,
+            benchmark: options.benchmark,
+            backend: options.backend,
+            visible: options.visible,
+            debug: options.debug,
+            validation: options.validation,
+        };
+        let program = Self {
+            identity,
+            backend_name: host::backend_name_for(options.backend),
+            options,
+        };
+        (program, config)
+    }
+
+    /// Emits configured snapshot and benchmark reports after graphics teardown.
+    pub fn finish(self, report: Option<ProgramReport>) {
+        let Some(report) = report else { return };
+        let frame = report.frame;
+        publish_snapshot(
+            self.options.snapshot,
+            self.options.update_snapshots,
+            frame.width,
+            frame.height,
+            frame.frames,
+            &frame.rgba8,
+            frame.runtime_events,
+            frame.diagnostics,
+            frame.dropped_observations,
+            self.options.report,
         );
+        if let Some(benchmark) = report.benchmark {
+            let frame_time_ns = benchmark.elapsed_ns as f64 / f64::from(benchmark.measured_frames);
+            let fps = 1_000_000_000.0 / frame_time_ns;
+            println!(
+                "{{\"benchmark\":\"{}\",\"backend\":\"{}\",\"warmup_frames\":{},\"measured_frames\":{},\"elapsed_ns\":{},\"frame_time_ns\":{frame_time_ns:.3},\"fps\":{fps:.3}}}",
+                self.identity,
+                self.backend_name,
+                benchmark.warmup_frames,
+                benchmark.measured_frames,
+                benchmark.elapsed_ns,
+            );
+        }
     }
 }
 

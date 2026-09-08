@@ -2,7 +2,7 @@
 
 Showcases the smallest safe `ez-gfx` graphics path: named vertex-heap data, an index heap, one indexed-indirect draw, and a compiled shader artifact.
 
-`main.rs` reads top-to-bottom: setup creates typed geometry and shader owners, then returns a per-frame closure. The shared host supplies a configured `Frame`; the closure acquires a `CountedBuffer`, writes one draw, records graphics, and passes the frame to `Example::handle_frame`.
+`main.rs` reads top-to-bottom: it creates typed geometry, a persistent counted buffer, and a shader, then enters a linear frame loop. Each iteration explicitly begins and configures the swapchain, records graphics, and passes the frame and target to `Example::handle_frame`.
 
 Run:
 

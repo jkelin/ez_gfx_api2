@@ -2,10 +2,7 @@ use super::{
     BenchmarkConfig, BenchmarkRunner, Error, FrameInput, HostSurface, NativeSurface,
     PresentedFrame, ProgramReport, Result, SceneInput, backend_config, dispatch_window_input,
 };
-use ez_gfx::{
-    Backend, Context, ContextOptions, Event, Frame, Surface, SurfaceOptions, create_context,
-    create_surface,
-};
+use ez_gfx::{Backend, Context, ContextOptions, Event, Frame, Surface, SurfaceOptions};
 use std::{
     cell::RefCell,
     rc::Rc,
@@ -34,10 +31,9 @@ pub struct ExampleConfig {
     pub(crate) validation: bool,
 }
 
-/// One frame acquired while pumping the native event loop.
+/// Host input and timing for one pending frame.
 pub struct WindowFrame {
-    pub frame: Frame,
-    pub target: ez_gfx::RenderTarget,
+    pub size: [u32; 2],
     pub input: FrameInput,
     pub events: Vec<SceneInput>,
 }
@@ -140,24 +136,17 @@ pub struct Example {
     state: HostState,
     context: Option<Context>,
     surface: Option<Surface>,
+    backend: Backend,
     observations: Rc<RefCell<Observations>>,
     benchmark: BenchmarkRunner,
     frames: u32,
     last_frame: Instant,
     report: Option<ProgramReport>,
-    acquire: bool,
-    acquired: Option<(Frame, ez_gfx::RenderTarget)>,
 }
 
 impl Example {
-    /// Creates the native host and the atomic context/surface pair, then runs setup procedurally.
-    pub fn new<T, E>(
-        config: ExampleConfig,
-        setup: impl FnOnce(&Context, &Surface, Backend) -> std::result::Result<T, E>,
-    ) -> Result<(Self, T)>
-    where
-        E: std::fmt::Display,
-    {
+    /// Creates the native host and atomic context/surface pair.
+    pub fn new(config: ExampleConfig) -> Result<Self> {
         if config.frame_limit == Some(0) {
             return Err(Error::message("frame limit must be positive"));
         }
@@ -174,13 +163,12 @@ impl Example {
             state: HostState::new(config),
             context: None,
             surface: None,
+            backend: config.backend,
             observations: Rc::clone(&observations),
             benchmark: BenchmarkRunner::new(config.benchmark),
             frames: 0,
             last_frame: Instant::now(),
             report: None,
-            acquire: false,
-            acquired: None,
         };
         while example.state.window.is_none() && !example.state.closed {
             example.pump_once()?;
@@ -191,7 +179,7 @@ impl Example {
 
         let native = example.state.descriptor()?;
         let backend = backend_config(native.platform, config.backend);
-        let context = create_context(ContextOptions {
+        let context = Context::new(ContextOptions {
             enable_debug: config.debug,
             enable_validation: config.validation,
             surface_platform: backend.platform,
@@ -199,17 +187,14 @@ impl Example {
             texture_decode_workers: 0,
             adapter_selection: None,
         })?;
-        let surface = create_surface(
-            &context,
-            SurfaceOptions {
-                window: native.window,
-                display: native.display,
-                platform: backend.platform,
-                width: example.state.width,
-                height: example.state.height,
-                cache_presented_snapshots: false,
-            },
-        )?;
+        let surface = context.create_surface(SurfaceOptions {
+            window: native.window,
+            display: native.display,
+            platform: backend.platform,
+            width: example.state.width,
+            height: example.state.height,
+            cache_presented_snapshots: false,
+        })?;
         let callback_observations = Rc::clone(&observations);
         context.register_callback(move |event| {
             let mut observations = callback_observations.borrow_mut();
@@ -224,15 +209,15 @@ impl Example {
                 Event::ObservationsDropped(count) => {
                     observations.dropped = observations.dropped.saturating_add(count);
                 }
-                Event::Readback(bytes) => observations.rgba8.clear_from_slice(bytes),
+                Event::Readback { bytes, .. } | Event::Snapshot(bytes) => {
+                    observations.rgba8.clear_from_slice(bytes);
+                }
                 _ => {}
             }
         })?;
         example.context = Some(context);
         example.surface = Some(surface);
-        let setup_value = setup(example.context(), example.surface(), backend.backend)
-            .map_err(Error::callback)?;
-        Ok((example, setup_value))
+        Ok(example)
     }
 
     fn pump_once(&mut self) -> Result<()> {
@@ -248,33 +233,7 @@ impl Example {
         Ok(())
     }
 
-    fn acquire_frame(&mut self) {
-        if !self.acquire || self.acquired.is_some() || self.state.closed {
-            return;
-        }
-        let result: Result<_> = (|| {
-            let surface = self
-                .surface
-                .as_ref()
-                .ok_or_else(|| Error::message("surface is unavailable"))?;
-            if let Some((width, height)) = self.state.pending_resize.take() {
-                surface.resize(width, height)?;
-            }
-            let mut frame = surface.begin_frame()?;
-            let size = [self.state.width, self.state.height];
-            let target = frame.configure_swapchain(size, ez_gfx::Format::Bgra8Srgb)?;
-            Ok((frame, target))
-        })();
-        match result {
-            Ok(frame) => {
-                self.acquired = Some(frame);
-                self.acquire = false;
-            }
-            Err(error) => self.state.fail(error),
-        }
-    }
-
-    /// Pumps until one native frame is acquired, or returns `None` after exit/automation completion.
+    /// Pumps until host input is ready, or returns `None` after completion.
     pub fn wait_for_next_frame(&mut self) -> Result<Option<WindowFrame>> {
         if self.state.closed
             || self
@@ -285,31 +244,25 @@ impl Example {
         {
             return Ok(None);
         }
-        let terminal = self
-            .state
-            .config
-            .frame_limit
-            .is_some_and(|limit| self.frames.saturating_add(1) >= limit);
-        if terminal {
-            self.surface().set_snapshot_cache(true)?;
-        }
         if self.state.config.visible
             && let Some(window) = &self.state.window
         {
             window.request_redraw();
         }
 
-        self.acquire = true;
-        self.acquired = None;
-        while self.acquired.is_none() && !self.state.closed {
+        self.state.redraw_ready = false;
+        while !self.state.redraw_ready && !self.state.closed {
             self.pump_once()?;
         }
         if let Some(error) = self.state.error.take() {
             return Err(error);
         }
-        let Some((frame, target)) = self.acquired.take() else {
+        if self.state.closed {
             return Ok(None);
-        };
+        }
+        if let Some((width, height)) = self.state.pending_resize.take() {
+            self.surface().resize(width, height)?;
+        }
 
         self.benchmark.begin_frame(self.frames);
         let input = FrameInput {
@@ -319,15 +272,32 @@ impl Example {
         };
         self.last_frame = Instant::now();
         Ok(Some(WindowFrame {
-            frame,
-            target,
+            size: [self.state.width, self.state.height],
             input,
             events: std::mem::take(&mut self.state.pending_input),
         }))
     }
 
-    /// Consumes the sole pending frame and preserves exact submit/present errors.
-    pub fn handle_frame(&mut self, frame: Frame) -> Result<()> {
+    /// Consumes the pending frame and configures terminal swapchain readback.
+    pub fn handle_frame(
+        &mut self,
+        mut frame: Frame,
+        swapchain_target: ez_gfx::RenderTarget,
+    ) -> Result<()> {
+        if swapchain_target.extent()? != (self.state.width, self.state.height) {
+            return Err(Error::message(
+                "swapchain target extent does not match host size",
+            ));
+        }
+        let terminal = self
+            .state
+            .config
+            .frame_limit
+            .is_some_and(|limit| self.frames.saturating_add(1) >= limit);
+        let _readback = terminal
+            .then(|| swapchain_target.prepare_readback(&mut frame))
+            .transpose()?;
+        drop(swapchain_target);
         frame.finish()?;
         self.frames = self.frames.saturating_add(1);
         self.benchmark.end_frame(self.frames);
@@ -358,6 +328,10 @@ impl Example {
         self.context.as_ref().expect("context exists until close")
     }
 
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+
     pub fn surface(&self) -> &Surface {
         self.surface.as_ref().expect("surface exists until close")
     }
@@ -379,33 +353,13 @@ impl ApplicationHandler for Example {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         // Hidden automation cannot depend on compositor redraw delivery.
         if !self.state.config.visible {
-            self.acquire_frame();
+            self.state.redraw_ready = true;
         }
     }
 
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        let redraw = matches!(event, WindowEvent::RedrawRequested);
         self.state.window_event(id, event);
-        if redraw {
-            self.acquire_frame();
-        }
     }
-}
-
-/// Runs one procedural setup closure and one caller-owned frame loop.
-pub fn run<S, H, E>(config: ExampleConfig, setup: S) -> Result<Option<ProgramReport>>
-where
-    S: FnOnce(&Context, &Surface, Backend) -> std::result::Result<H, E>,
-    H: FnMut(WindowFrame) -> std::result::Result<Frame, E>,
-    E: std::fmt::Display,
-{
-    let (mut example, mut handle_frame) = Example::new(config, setup)?;
-    while let Some(window_frame) = example.wait_for_next_frame()? {
-        let frame = handle_frame(window_frame).map_err(Error::callback)?;
-        example.handle_frame(frame)?;
-    }
-    drop(handle_frame);
-    example.close()
 }
 
 trait ClearFromSlice {

@@ -8,6 +8,8 @@ pub type EzGfxContext = EzGfxHandle;
 pub type EzGfxSurface = EzGfxHandle;
 /// Opaque identifier for one live frame recording interval.
 pub type EzGfxFrame = EzGfxHandle;
+/// Stable process-unique identity for one enqueued readback request.
+pub type EzGfxReadbackRequest = u64;
 /// Opaque identifier for a compiled shader resource.
 pub type EzGfxShader = EzGfxHandle;
 /// Opaque identifier for a frame-local counted buffer holding indexed draw commands.
@@ -526,8 +528,10 @@ pub enum EzGfxEventKind {
     Diagnostic = 3,
     /// Bounded observability storage discarded records; `dropped` is valid.
     ObservationsDropped = 4,
-    /// Completed readback bytes; the `readback_*` fields are valid.
+    /// Completed explicitly requested readback bytes; the `readback_*` fields are valid.
     Readback = 5,
+    /// Unrequested persistent presentation snapshot; the `readback_*` fields are valid.
+    Snapshot = 6,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -555,13 +559,15 @@ pub struct EzGfxEvent {
     pub _pad_level: [u8; 7],
     /// Discarded-record count; valid when `kind` is `ObservationsDropped`.
     pub dropped: u64,
+    /// Stable request correlator, or zero for an unrequested snapshot.
+    pub readback_request_id: EzGfxReadbackRequest,
     /// Readback source texture, or zero for a surface-presented snapshot.
     pub readback_texture: EzGfxTexture,
-    /// Readback image width in pixels; valid when `kind` is `Readback`.
+    /// Readback image width in pixels; valid for `Readback` or `Snapshot`.
     pub readback_width: u32,
-    /// Readback image height in pixels; valid when `kind` is `Readback`.
+    /// Readback image height in pixels; valid for `Readback` or `Snapshot`.
     pub readback_height: u32,
-    /// Readback byte count; valid when `kind` is `Readback`.
+    /// Readback byte count; valid for `Readback` or `Snapshot`.
     pub readback_byte_count: usize,
     /// Readback RGBA bytes borrowed for this callback invocation only.
     pub readback_bytes: *const u8,

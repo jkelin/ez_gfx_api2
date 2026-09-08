@@ -15,13 +15,12 @@ pub use ez_gfx_runtime::indirect::DrawIndexedCommand;
 pub use ez_gfx_runtime::target::{ClearValue, Format, TargetDeclaration, TargetError, TargetUsage};
 pub use ez_gfx_runtime::texture::{
     DecodedMip, DecodedTexture, TextureDecodeCallback, TextureDestination, TextureError,
-    TextureSource, TextureUploadTelemetrySnapshot, register_texture_decoder,
-    unregister_texture_decoder,
+    TextureSource, TextureUploadTelemetrySnapshot,
 };
 pub use ez_gfx_runtime::upload::{UploadEvent, UploadResource, UploadStatus};
 pub use ez_gfx_runtime::{
     AdapterReport, AdapterSelection, ContextOptions, LifecycleError, SurfaceOptions,
-    SurfacePlatform, admission_report,
+    SurfacePlatform,
 };
 pub use state::TextureConfig;
 

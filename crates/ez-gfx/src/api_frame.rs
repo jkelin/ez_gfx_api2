@@ -11,12 +11,17 @@ enum TransientHandle {
 
 struct TransientInner {
     context: Rc<ContextInner>,
+    buffer: Rc<BufferInner>,
     handle: TransientHandle,
     state: Cell<TransientState>,
 }
 
 impl Drop for TransientInner {
     fn drop(&mut self) {
+        // Exactly one increment accompanies each materialization, and the frame owns this lease.
+        self.buffer
+            .borrowed
+            .set(self.buffer.borrowed.get().saturating_sub(1));
         if self.state.get() != TransientState::Live {
             return;
         }
@@ -33,66 +38,149 @@ impl Drop for TransientInner {
     }
 }
 
-/// Frame-local typed buffer.
+struct BufferInner {
+    context: Rc<ContextInner>,
+    element_size: u32,
+    element_count: u32,
+    bytes: RefCell<Vec<u8>>,
+    published_count: Cell<u32>,
+    borrowed: Cell<u32>,
+}
+
+impl BufferInner {
+    fn write<T: bytemuck::Pod>(&self, start_index: usize, values: &[T]) -> Result<()> {
+        // Zero-sized types and range overflow are rejected below; imported snapshots are immutable.
+        if self.borrowed.get() != 0 {
+            return Err(Error::NotReady);
+        }
+        if core::mem::size_of::<T>() != self.element_size as usize {
+            return Err(Error::InvalidArgument);
+        }
+        let end = start_index
+            .checked_add(values.len())
+            .filter(|end| *end <= self.element_count as usize)
+            .ok_or(Error::InvalidArgument)?;
+        let start_byte = start_index
+            .checked_mul(self.element_size as usize)
+            .ok_or(Error::InvalidArgument)?;
+        let end_byte = end
+            .checked_mul(self.element_size as usize)
+            .ok_or(Error::InvalidArgument)?;
+        self.bytes.borrow_mut()[start_byte..end_byte].copy_from_slice(bytemuck::cast_slice(values));
+        Ok(())
+    }
+}
+
+/// Context-owned typed buffer uploaded when a frame first binds it.
 pub struct Buffer<T: bytemuck::Pod> {
-    inner: Rc<TransientInner>,
+    inner: Rc<BufferInner>,
     marker: PhantomData<T>,
 }
 
 impl<T: bytemuck::Pod> Buffer<T> {
-    /// Writes a typed element range while this buffer's frame is live.
+    /// Replaces a typed element range.
     ///
     /// # Errors
-    /// Returns [`Error`] when the frame or buffer is stale, foreign, or out of range.
-    pub fn write(&self, frame: &mut Frame, start_index: usize, values: &[T]) -> Result<()> {
-        frame.ensure_transient(&self.inner)?;
-        let TransientHandle::Structured(handle) = self.inner.handle else {
-            return frame.fail(Error::InvalidContext);
+    /// Returns [`Error`] when the context is dispatching a callback or the range is invalid.
+    pub fn write(&self, start_index: usize, values: &[T]) -> Result<()> {
+        let context = Context {
+            inner: Rc::clone(&self.inner.context),
         };
-        frame.record(|context| state::write_structured(context, handle, start_index, values))
+        context.check_entry()?;
+        self.inner.write(start_index, values)
     }
 }
 
-/// Frame-local typed buffer carrying a separately publishable visible count.
-pub struct CountedBuffer<T> {
-    inner: Rc<TransientInner>,
+/// Context-owned typed buffer carrying a separately publishable visible count.
+pub struct CountedBuffer<T: bytemuck::Pod> {
+    inner: Rc<BufferInner>,
     marker: PhantomData<T>,
 }
 
-impl CountedBuffer<ez_gfx_runtime::indirect::DrawIndexedCommand> {
-    /// Writes indexed draw commands.
+impl<T: bytemuck::Pod> CountedBuffer<T> {
+    /// Replaces a typed element range.
     ///
     /// # Errors
-    /// Returns [`Error`] when the frame or buffer is stale, foreign, or out of range.
-    pub fn write(
-        &self,
-        frame: &mut Frame,
-        start_index: u32,
-        commands: &[ez_gfx_runtime::indirect::DrawIndexedCommand],
-    ) -> Result<()> {
-        frame.ensure_transient(&self.inner)?;
-        let TransientHandle::Indirect(handle) = self.inner.handle else {
-            return frame.fail(Error::InvalidContext);
+    /// Returns [`Error`] when the context is dispatching a callback or the range is invalid.
+    pub fn write(&self, start_index: usize, values: &[T]) -> Result<()> {
+        let context = Context {
+            inner: Rc::clone(&self.inner.context),
         };
-        frame.record(|context| state::write_indirect(context, handle, start_index, commands))
+        context.check_entry()?;
+        self.inner.write(start_index, values)
     }
 
-    /// Publishes the visible command count.
+    /// Publishes the visible element count.
     ///
     /// # Errors
-    /// Returns [`Error`] when the frame or buffer is stale, foreign, or out of range.
-    pub fn publish_count(&self, frame: &mut Frame, count: u32) -> Result<()> {
-        frame.ensure_transient(&self.inner)?;
-        let TransientHandle::Indirect(handle) = self.inner.handle else {
-            return frame.fail(Error::InvalidContext);
+    /// Returns [`Error`] during callback dispatch or when the count exceeds capacity.
+    pub fn publish_count(&self, count: u32) -> Result<()> {
+        let context = Context {
+            inner: Rc::clone(&self.inner.context),
         };
-        frame.record(|context| state::publish_compute_indirect_count(context, handle, count))
+        context.check_entry()?;
+        // Publication changes metadata only, but must not diverge from an imported snapshot.
+        if self.inner.borrowed.get() != 0 {
+            return Err(Error::NotReady);
+        }
+        if count > self.inner.element_count {
+            return Err(Error::InvalidArgument);
+        }
+        self.inner.published_count.set(count);
+        Ok(())
+    }
+}
+
+impl Context {
+    fn allocate_buffer<T: bytemuck::Pod>(&self, element_count: usize) -> Result<Rc<BufferInner>> {
+        // Empty and zero-sized buffers cannot produce valid native bindings.
+        self.check_entry()?;
+        let element_size =
+            u32::try_from(core::mem::size_of::<T>()).map_err(|_| Error::InvalidArgument)?;
+        let element_count = u32::try_from(element_count).map_err(|_| Error::InvalidArgument)?;
+        let byte_count = (element_size as usize)
+            .checked_mul(element_count as usize)
+            .filter(|size| element_size != 0 && element_count != 0 && *size <= 16 * 1024 * 1024)
+            .ok_or(Error::InvalidArgument)?;
+        Ok(Rc::new(BufferInner {
+            context: Rc::clone(&self.inner),
+            element_size,
+            element_count,
+            bytes: RefCell::new(vec![0; byte_count]),
+            published_count: Cell::new(0),
+            borrowed: Cell::new(0),
+        }))
+    }
+
+    /// Acquires a reusable typed buffer by element count.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when the count, type size, or context is invalid.
+    pub fn acquire_buffer<T: bytemuck::Pod>(&self, element_count: usize) -> Result<Buffer<T>> {
+        Ok(Buffer {
+            inner: self.allocate_buffer::<T>(element_count)?,
+            marker: PhantomData,
+        })
+    }
+
+    /// Acquires a reusable typed counted buffer by element count.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when the count, type size, or context is invalid.
+    pub fn acquire_counted_buffer<T: bytemuck::Pod>(
+        &self,
+        element_count: usize,
+    ) -> Result<CountedBuffer<T>> {
+        Ok(CountedBuffer {
+            inner: self.allocate_buffer::<T>(element_count)?,
+            marker: PhantomData,
+        })
     }
 }
 
 enum BindingResource<'a> {
-    Structured(&'a Rc<TransientInner>),
-    Indirect(&'a Rc<TransientInner>),
+    Structured(&'a Rc<BufferInner>),
+    Indirect(&'a Rc<BufferInner>),
     RenderTarget(&'a Rc<RenderTargetInner>),
 }
 
@@ -112,7 +200,10 @@ impl<'a> Binding<'a> {
     }
 
     /// Binds a counted buffer.
-    pub fn counted_buffer<T>(name: impl Into<String>, buffer: &'a CountedBuffer<T>) -> Self {
+    pub fn counted_buffer<T: bytemuck::Pod>(
+        name: impl Into<String>,
+        buffer: &'a CountedBuffer<T>,
+    ) -> Self {
         Self {
             name: name.into(),
             resource: BindingResource::Indirect(&buffer.inner),
@@ -134,6 +225,12 @@ enum FrameTarget {
     Surface,
     RenderTarget,
 }
+enum PendingReadback {
+    RequestedGraph(Rc<ReadbackInner>),
+    AnonymousGraph,
+    RequestedPresentation(Rc<ReadbackInner>),
+}
+
 
 /// One explicit recording transaction.
 ///
@@ -147,7 +244,7 @@ pub struct Frame {
     transients: Vec<Rc<TransientInner>>,
     poison: Option<Error>,
     terminal: bool,
-    readback_queued: bool,
+    readbacks: Vec<PendingReadback>,
 }
 
 impl Frame {
@@ -159,14 +256,6 @@ impl Frame {
         }
     }
 
-    fn ensure_transient(&mut self, transient: &Rc<TransientInner>) -> Result<()> {
-        self.ensure_context(&transient.context)?;
-        if transient.state.get() == TransientState::Live {
-            Ok(())
-        } else {
-            self.fail(Error::InvalidContext)
-        }
-    }
 
     fn fail<T>(&mut self, error: Error) -> Result<T> {
         self.poison.get_or_insert(error);
@@ -210,58 +299,91 @@ impl Frame {
         }
     }
 
-    /// Acquires a typed transient buffer by element count.
-    ///
-    /// # Errors
-    /// Returns [`Error`] when the frame, count, type size, or allocation is invalid.
-    pub fn acquire_buffer<T: bytemuck::Pod>(
-        &mut self,
-        element_count: usize,
-    ) -> Result<Buffer<T>> {
-        if let Some(error) = self.poison {
-            return Err(error);
+    fn materialize_structured(&mut self, inner: &Rc<BufferInner>) -> Result<StructuredBufferHandle> {
+        self.ensure_context(&inner.context)?;
+        if let Some(handle) = self.transients.iter().find_map(|transient| {
+            Rc::ptr_eq(&transient.buffer, inner).then_some(&transient.handle)
+        }) {
+            return match handle {
+                TransientHandle::Structured(handle) => Ok(*handle),
+                TransientHandle::Indirect(_) => self.fail(Error::InvalidContext),
+            };
         }
-        let handle = match state::acquire_structured::<T>(self.context.handle, element_count) {
+        let handle = match state::acquire_structured_sized(
+            self.context.handle,
+            inner.element_size,
+            inner.element_count,
+        ) {
             Ok(handle) => handle,
             Err(error) => return self.fail(error),
         };
-        let inner = Rc::new(TransientInner {
+        if let Err(error) = state::write_structured_bytes(
+            self.context.handle,
+            handle,
+            inner.element_size,
+            &inner.bytes.borrow(),
+        ) {
+            state::release_structured(self.context.handle, handle);
+            return self.fail(error);
+        }
+        inner.borrowed.set(inner.borrowed.get().saturating_add(1));
+        let transient = Rc::new(TransientInner {
             context: Rc::clone(&self.context),
+            buffer: Rc::clone(inner),
             handle: TransientHandle::Structured(handle),
             state: Cell::new(TransientState::Live),
         });
-        self.transients.push(Rc::clone(&inner));
-        Ok(Buffer {
-            inner,
-            marker: PhantomData,
-        })
+        self.transients.push(transient);
+        self.retain(inner);
+        Ok(handle)
     }
 
-    /// Acquires an indexed-command counted buffer by element count.
-    ///
-    /// # Errors
-    /// Returns [`Error`] when the frame, count, or allocation is invalid.
-    pub fn acquire_counted_buffer(
-        &mut self,
-        element_count: u32,
-    ) -> Result<CountedBuffer<ez_gfx_runtime::indirect::DrawIndexedCommand>> {
-        if let Some(error) = self.poison {
-            return Err(error);
+    fn materialize_counted(&mut self, inner: &Rc<BufferInner>) -> Result<IndirectBufferHandle> {
+        self.ensure_context(&inner.context)?;
+        if inner.element_size as usize
+            != core::mem::size_of::<ez_gfx_runtime::indirect::DrawIndexedCommand>()
+        {
+            return self.fail(Error::InvalidArgument);
         }
-        let handle = match state::acquire_indirect(self.context.handle, element_count) {
+        if let Some(handle) = self.transients.iter().find_map(|transient| {
+            Rc::ptr_eq(&transient.buffer, inner).then_some(&transient.handle)
+        }) {
+            return match handle {
+                TransientHandle::Indirect(handle) => Ok(*handle),
+                TransientHandle::Structured(_) => self.fail(Error::InvalidContext),
+            };
+        }
+        let handle = match state::acquire_indirect(self.context.handle, inner.element_count) {
             Ok(handle) => handle,
             Err(error) => return self.fail(error),
         };
-        let inner = Rc::new(TransientInner {
+        let commands = inner
+            .bytes
+            .borrow()
+            .chunks_exact(inner.element_size as usize)
+            .map(bytemuck::pod_read_unaligned)
+            .collect::<Vec<ez_gfx_runtime::indirect::DrawIndexedCommand>>();
+        let staged = state::write_indirect(self.context.handle, handle, 0, &commands).and_then(|()| {
+            state::publish_compute_indirect_count(
+                self.context.handle,
+                handle,
+                inner.published_count.get(),
+            )
+        });
+        if let Err(error) = staged {
+            state::release_indirect(self.context.handle, handle);
+            return self.fail(error);
+        }
+        inner.borrowed.set(inner.borrowed.get().saturating_add(1));
+        let transient = Rc::new(TransientInner {
             context: Rc::clone(&self.context),
+            buffer: Rc::clone(inner),
             handle: TransientHandle::Indirect(handle),
             state: Cell::new(TransientState::Live),
         });
-        self.transients.push(Rc::clone(&inner));
-        Ok(CountedBuffer {
-            inner,
-            marker: PhantomData,
-        })
+        self.transients.push(transient);
+        self.retain(inner);
+        Ok(handle)
     }
 
     fn raw_bindings(&mut self, bindings: &[Binding<'_>]) -> Result<Vec<RawBinding>> {
@@ -269,20 +391,10 @@ impl Frame {
         for binding in bindings {
             let resource = match binding.resource {
                 BindingResource::Structured(inner) => {
-                    self.ensure_transient(inner)?;
-                    self.retain(inner);
-                    let TransientHandle::Structured(handle) = inner.handle else {
-                        return self.fail(Error::InvalidContext);
-                    };
-                    ResourceIdentity::Structured(handle)
+                    ResourceIdentity::Structured(self.materialize_structured(inner)?)
                 }
                 BindingResource::Indirect(inner) => {
-                    self.ensure_transient(inner)?;
-                    self.retain(inner);
-                    let TransientHandle::Indirect(handle) = inner.handle else {
-                        return self.fail(Error::InvalidContext);
-                    };
-                    ResourceIdentity::Indirect(handle)
+                    ResourceIdentity::Indirect(self.materialize_counted(inner)?)
                 }
                 BindingResource::RenderTarget(inner) => {
                     self.ensure_context(&inner.context)?;
@@ -315,13 +427,9 @@ impl Frame {
         push_constants: &[u8],
     ) -> Result<()> {
         self.ensure_context(&shader.inner.context)?;
-        self.ensure_transient(&indirect.inner)?;
+        let indirect_handle = self.materialize_counted(&indirect.inner)?;
         let raw_bindings = self.raw_bindings(bindings)?;
         self.retain(&shader.inner);
-        self.retain(&indirect.inner);
-        let TransientHandle::Indirect(indirect_handle) = indirect.inner.handle else {
-            return self.fail(Error::InvalidContext);
-        };
         self.record(|context| {
             state::render_add_graphics(
                 context,
@@ -361,8 +469,8 @@ impl Frame {
 
     /// Enqueues a texture readback and retains the texture until completion.
     ///
-    /// Completed bytes are delivered through [`Event::Readback`] and are valid
-    /// only for that callback invocation.
+    /// Texture bytes are delivered as [`Event::Snapshot`] because textures do
+    /// not expose a stable logical extent through the safe facade.
     ///
     /// # Errors
     /// Returns [`Error`] when the frame or texture is stale, foreign, or not ready.
@@ -372,28 +480,61 @@ impl Frame {
         let result =
             self.record(|context| state::frame_enqueue_readback(context, texture.inner.handle));
         if result.is_ok() {
-            self.readback_queued = true;
+            self.readbacks.push(PendingReadback::AnonymousGraph);
         }
         result
     }
 
-    /// Enqueues an opaque managed-target readback request.
-    ///
-    /// # Errors
-    /// Returns [`Error`] when the request is stale, foreign, or not renderable.
-    pub fn enqueue_readback(&mut self, request: &RenderTargetReadback) -> Result<()> {
-        self.ensure_context(&request.target.context)?;
-        let handle = match request.target.managed_handle() {
-            Ok(handle) => handle,
+    fn prepare_target_readback(&mut self, target: &RenderTarget) -> Result<Readback> {
+        self.ensure_context(&target.inner.context)?;
+        let (width, height) = match target.extent() {
+            Ok(extent) => extent,
             Err(error) => return self.fail(error),
         };
-        self.retain(&request.target);
-        let result =
-            self.record(|context| state::frame_enqueue_render_target_readback(context, handle));
-        if result.is_ok() {
-            self.readback_queued = true;
-        }
-        result
+        let generation = self.context.next_readback.get();
+        let Some(next) = generation.checked_add(1) else {
+            return self.fail(Error::InvalidArgument);
+        };
+        let presented = match &target.inner.backing {
+            RenderTargetBacking::Managed(_) => {
+                let handle = match target.inner.managed_handle() {
+                    Ok(handle) => handle,
+                    Err(error) => return self.fail(error),
+                };
+                self.record(|context| {
+                    state::frame_enqueue_render_target_readback(context, handle)
+                })?;
+                false
+            }
+            // Presented images have no stable raw target handle; surface capture is emitted last.
+            RenderTargetBacking::Surface { .. } => {
+                let Some(surface) = target.surface_lease.as_ref() else {
+                    return self.fail(Error::InvalidContext);
+                };
+                self.record(|context| {
+                    state::set_snapshot_cache(context, surface.handle, true)
+                })?;
+                true
+            }
+        };
+        self.context.next_readback.set(next);
+        let request = Rc::new(ReadbackInner {
+            _context: Rc::clone(&self.context),
+            _target: Rc::clone(&target.inner),
+            id: ReadbackId {
+                owner: self.context.handle.into_raw(),
+                generation,
+            },
+            width,
+            height,
+            state: Cell::new(ReadbackState::Queued),
+        });
+        self.readbacks.push(if presented {
+            PendingReadback::RequestedPresentation(Rc::clone(&request))
+        } else {
+            PendingReadback::RequestedGraph(Rc::clone(&request))
+        });
+        Ok(Readback { inner: request })
     }
 
     /// Explicitly retains a texture used through the bindless heap.
@@ -497,7 +638,7 @@ impl Frame {
         self.retain(&inner);
         Ok(RenderTarget {
             inner,
-            _surface_lease: None,
+            surface_lease: None,
         })
     }
 
@@ -578,7 +719,7 @@ impl Frame {
         });
         Ok(RenderTarget {
             inner,
-            _surface_lease: Some(surface),
+            surface_lease: Some(surface),
         })
     }
 
@@ -617,25 +758,101 @@ impl Frame {
                 }
             }
         };
-        let readback = if result.is_ok()
-            && (self.readback_queued || matches!(self.target, FrameTarget::Surface))
-        {
-            match state::frame_readback(self.context.handle) {
-                Ok(bytes) => Some(Ok(bytes)),
-                Err(Error::NotReady) if !self.readback_queued => None,
+        let outputs = if result.is_ok() {
+            match state::frame_readbacks(self.context.handle) {
+                Ok(outputs) => Some(Ok(outputs)),
+                Err(Error::NotReady) if self.readbacks.is_empty() => None,
+                Err(Error::NotReady) => Some(Err(Error::NativeFailure)),
                 Err(error) => Some(Err(error)),
             }
         } else {
             None
         };
+        if result.is_err() {
+            for readback in &self.readbacks {
+                match readback {
+                    PendingReadback::RequestedGraph(request)
+                    | PendingReadback::RequestedPresentation(request) => {
+                        request.state.set(ReadbackState::Aborted);
+                    }
+                    PendingReadback::AnonymousGraph => {}
+                }
+            }
+        }
+        let readbacks = std::mem::take(&mut self.readbacks);
         self.terminal = true;
         drop(self);
         let result = context.complete(result);
-        match (result, readback) {
-            (Err(error), _) | (Ok(()), Some(Err(error))) => Err(error),
-            (Ok(()), Some(Ok(bytes))) => context.dispatch_readback(&bytes),
-            (Ok(()), None) => Ok(()),
+        let mut outputs = match (result, outputs) {
+            (Err(error), _) | (Ok(()), Some(Err(error))) => return Err(error),
+            (Ok(()), Some(Ok(outputs))) => outputs,
+            (Ok(()), None) => return Ok(()),
+        };
+        let graph_count = readbacks
+            .iter()
+            .filter(|readback| {
+                matches!(
+                    readback,
+                    PendingReadback::RequestedGraph(_) | PendingReadback::AnonymousGraph
+                )
+            })
+            .count();
+        let has_presented = readbacks.iter().any(|readback| {
+            matches!(readback, PendingReadback::RequestedPresentation(_))
+        });
+        let minimum_outputs = graph_count + usize::from(has_presented);
+        if outputs.len() < minimum_outputs {
+            for request in readbacks.iter().filter_map(|readback| match readback {
+                PendingReadback::RequestedGraph(request)
+                | PendingReadback::RequestedPresentation(request) => Some(request),
+                PendingReadback::AnonymousGraph => None,
+            }) {
+                request.state.set(ReadbackState::Aborted);
+            }
+            return Err(Error::NativeFailure);
         }
+        let mut trailing = outputs.split_off(graph_count);
+        let presented_output = has_presented
+            .then(|| trailing.pop().ok_or(Error::NativeFailure))
+            .transpose()?;
+        let mut graph_outputs = outputs.into_iter();
+        for readback in &readbacks {
+            let dispatched = match readback {
+                PendingReadback::RequestedGraph(request) => {
+                    let bytes = graph_outputs.next().ok_or(Error::NativeFailure)?;
+                    request.state.set(ReadbackState::Complete);
+                    context.dispatch_readback(request.id, request.width, request.height, &bytes)
+                }
+                PendingReadback::AnonymousGraph => {
+                    let bytes = graph_outputs.next().ok_or(Error::NativeFailure)?;
+                    context.dispatch_snapshot(&bytes)
+                }
+                PendingReadback::RequestedPresentation(request) => {
+                    let bytes = presented_output.as_deref().ok_or(Error::NativeFailure)?;
+                    request.state.set(ReadbackState::Complete);
+                    context.dispatch_readback(request.id, request.width, request.height, bytes)
+                }
+            };
+            if let Err(error) = dispatched {
+                for request in readbacks.iter().filter_map(|pending| match pending {
+                    PendingReadback::RequestedGraph(request)
+                    | PendingReadback::RequestedPresentation(request)
+                        if request.state.get() == ReadbackState::Queued =>
+                    {
+                        Some(request)
+                    }
+                    _ => None,
+                }) {
+                    request.state.set(ReadbackState::Aborted);
+                }
+                return Err(error);
+            }
+        }
+        debug_assert!(graph_outputs.next().is_none());
+        for bytes in trailing {
+            context.dispatch_snapshot(&bytes)?;
+        }
+        Ok(())
     }
 }
 
@@ -645,6 +862,15 @@ impl Drop for Frame {
             // Rollback precedes release so Interned(frame_serial) becomes releasable.
             let _ = state::frame_abort(self.context.handle);
             self.release_aborted_transients();
+            for readback in &self.readbacks {
+                match readback {
+                    PendingReadback::RequestedGraph(request)
+                    | PendingReadback::RequestedPresentation(request) => {
+                        request.state.set(ReadbackState::Aborted);
+                    }
+                    PendingReadback::AnonymousGraph => {}
+                }
+            }
         }
     }
 }
@@ -670,7 +896,7 @@ impl Surface {
             transients: Vec::new(),
             poison: None,
             terminal: false,
-            readback_queued: false,
+            readbacks: Vec::new(),
         })
     }
 }
@@ -692,7 +918,7 @@ impl Context {
             transients: Vec::new(),
             poison: None,
             terminal: false,
-            readback_queued: false,
+            readbacks: Vec::new(),
         })
     }
 }

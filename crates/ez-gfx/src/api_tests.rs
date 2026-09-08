@@ -25,9 +25,8 @@ fn headless() -> Result<(Context, Surface)> {
     let options =
         ez_gfx_runtime::ContextOptions::new_for_backend(0, 0, 3, ez_gfx_core::Backend::Vulkan)
             .map_err(|_| Error::InvalidArgument)?;
-    let context = create_context(options)?;
-    let surface = create_surface(
-        &context,
+    let context = Context::new(options)?;
+    let surface = context.create_surface(
         ez_gfx_runtime::SurfaceOptions::new(
             0,
             0,
@@ -44,20 +43,16 @@ fn headless() -> Result<(Context, Surface)> {
 #[cfg(not(target_vendor = "apple"))]
 #[test]
 fn dropping_frame_aborts_and_allows_next_transaction() -> Result<()> {
-    let (_context, surface) = headless()?;
-    let mut frame = surface.begin_frame()?;
-    let structured = frame.acquire_buffer::<u32>(1)?;
-    structured.write(&mut frame, 0, &[1])?;
+    let (context, surface) = headless()?;
+    let structured = context.acquire_buffer::<u32>(1)?;
+    structured.write(0, &[1])?;
+    let frame = surface.begin_frame()?;
     assert_eq!(surface.begin_frame().err(), Some(Error::NotReady));
 
     drop(frame);
 
-    let mut next = surface.begin_frame()?;
-    assert_eq!(
-        structured.write(&mut next, 0, &[2]),
-        Err(Error::InvalidContext)
-    );
-    drop(next);
+    structured.write(0, &[2])?;
+    drop(surface.begin_frame()?);
     Ok(())
 }
 
@@ -97,7 +92,7 @@ fn poisoned_frame_finish_returns_exact_record_error_without_submit() -> Result<(
     let (_context, surface) = headless()?;
     let mut frame = surface.begin_frame()?;
     assert!(matches!(
-        frame.acquire_buffer::<u32>(0),
+        frame.configure_swapchain([0, 1], ez_gfx_runtime::target::Format::Bgra8Srgb),
         Err(Error::InvalidArgument)
     ));
 
@@ -179,13 +174,13 @@ fn named_render_target_reuses_then_recreates_cached_image() -> Result<()> {
 
 #[cfg(not(target_vendor = "apple"))]
 #[test]
-fn render_target_readback_is_delivered_only_through_callback() -> Result<()> {
+fn repeated_render_target_readbacks_keep_distinct_callback_identities() -> Result<()> {
     let (context, _surface) = headless()?;
-    let observed = Rc::new(Cell::new(0_usize));
+    let observed = Rc::new(RefCell::new(Vec::new()));
     let callback_observed = Rc::clone(&observed);
     context.register_callback(move |event| {
-        if let Event::Readback(bytes) = event {
-            callback_observed.set(bytes.len());
+        if let Event::Readback { request, bytes, .. } = event {
+            callback_observed.borrow_mut().push((request, bytes.len()));
         }
     })?;
     let mut frame = context.begin_frame()?;
@@ -194,27 +189,28 @@ fn render_target_readback_is_delivered_only_through_callback() -> Result<()> {
         [2, 2],
         ez_gfx_runtime::target::Format::Rgba8Unorm,
     )?;
-    frame.enqueue_readback(&target.prepare_readback())?;
+    let first = target.prepare_readback(&mut frame)?;
+    let second = target.prepare_readback(&mut frame)?;
+    assert_ne!(first.id(), second.id());
     frame.finish()?;
-    assert_eq!(observed.get(), 16);
+    assert_eq!(
+        observed.borrow().as_slice(),
+        &[(first.id(), 16), (second.id(), 16)]
+    );
     Ok(())
 }
 
 #[cfg(not(target_vendor = "apple"))]
 #[test]
-fn terminal_error_invalidates_frame_transient() -> Result<()> {
-    let (_context, surface) = headless()?;
-    let mut first = surface.begin_frame()?;
-    let structured = first.acquire_buffer::<u32>(1)?;
-    assert_eq!(structured.write(&mut first, 0, &[7]), Ok(()));
+fn persistent_buffer_survives_terminal_frame_error() -> Result<()> {
+    let (context, surface) = headless()?;
+    let structured = context.acquire_buffer::<u32>(1)?;
+    structured.write(0, &[7])?;
+    let first = surface.begin_frame()?;
     assert_eq!(first.finish(), Err(Error::NotReady));
 
-    let mut second = surface.begin_frame()?;
-    assert_eq!(
-        structured.write(&mut second, 0, &[9]),
-        Err(Error::InvalidContext)
-    );
-    assert_eq!(second.finish(), Err(Error::InvalidContext));
+    structured.write(0, &[9])?;
+    drop(surface.begin_frame()?);
     Ok(())
 }
 
@@ -224,7 +220,7 @@ fn failed_atomic_surface_creation_does_not_block_later_surface() -> Result<()> {
     let options =
         ez_gfx_runtime::ContextOptions::new_for_backend(0, 0, 3, ez_gfx_core::Backend::Vulkan)
             .map_err(|_| Error::InvalidArgument)?;
-    let context = create_context(options)?;
+    let context = Context::new(options)?;
     let invalid = ez_gfx_runtime::SurfaceOptions {
         window: 0,
         display: 0,
@@ -234,7 +230,7 @@ fn failed_atomic_surface_creation_does_not_block_later_surface() -> Result<()> {
         cache_presented_snapshots: false,
     };
     assert_eq!(
-        create_surface(&context, invalid).err(),
+        context.create_surface(invalid).err(),
         Some(Error::InvalidArgument)
     );
 
@@ -247,7 +243,7 @@ fn failed_atomic_surface_creation_does_not_block_later_surface() -> Result<()> {
         0,
     )
     .map_err(|_| Error::InvalidArgument)?;
-    let surface = create_surface(&context, valid)?;
+    let surface = context.create_surface(valid)?;
     assert_eq!(surface.extent(), Ok((1, 1)));
     Ok(())
 }
@@ -276,7 +272,7 @@ fn context_drop_after_state_tls_teardown_does_not_panic() {
                 ez_gfx_core::Backend::Vulkan,
             )
             .expect("valid options");
-            *slot.borrow_mut() = Some(create_context(options).expect("context"));
+            *slot.borrow_mut() = Some(Context::new(options).expect("context"));
         });
     })
     .join()

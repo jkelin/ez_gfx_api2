@@ -10,11 +10,11 @@ mod common;
 use common::TestContext;
 use ez_gfx_compiler::{CompilerError, Target, compile_shader};
 use ez_gfx_ffi::{
-    EzGfxBinding, EzGfxRenderTargetDesc, EzGfxResult, ez_gfx_buffer_acquire, ez_gfx_buffer_write,
-    ez_gfx_context_wait_idle, ez_gfx_counted_buffer_acquire, ez_gfx_counted_buffer_publish_count,
-    ez_gfx_frame_end, ez_gfx_render_add_compute_pipeline, ez_gfx_render_target_create,
-    ez_gfx_render_target_destroy, ez_gfx_render_target_frame_begin, ez_gfx_shader_destroy,
-    ez_gfx_shader_load_artifact,
+    EzGfxBinding, EzGfxRenderTargetDesc, EzGfxResult, ez_gfx_buffer_acquire, ez_gfx_buffer_release,
+    ez_gfx_buffer_write, ez_gfx_context_wait_idle, ez_gfx_counted_buffer_acquire,
+    ez_gfx_counted_buffer_publish_count, ez_gfx_counted_buffer_release, ez_gfx_frame_end,
+    ez_gfx_render_add_compute_pipeline, ez_gfx_render_target_create, ez_gfx_render_target_destroy,
+    ez_gfx_render_target_frame_begin, ez_gfx_shader_destroy, ez_gfx_shader_load_artifact,
 };
 
 const COMPUTE_SOURCE: &str = r#"[__AttributeUsage(_AttributeTargets.Var)]
@@ -130,7 +130,7 @@ fn run_compute_pipeline(backend: u8) {
                     binding_name.as_ptr(),
                     binding_name.len(),
                     &raw mut buffer,
-                    frame,
+                    context,
                 )
             }
         },
@@ -140,7 +140,7 @@ fn run_compute_pipeline(backend: u8) {
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_buffer_write(buffer, 0, value.as_ptr().cast(), 1, 4, frame) }
+            unsafe { ez_gfx_buffer_write(buffer, 0, value.as_ptr().cast(), 1, 4, context) }
         },
         EzGfxResult::Ok
     );
@@ -151,18 +151,20 @@ fn run_compute_pipeline(backend: u8) {
             // SAFETY: The name and output ranges remain valid for the call.
             unsafe {
                 ez_gfx_counted_buffer_acquire(
+                    u32::try_from(core::mem::size_of::<ez_gfx_ffi::EzGfxDrawIndexedCommand>())
+                        .expect("draw command size fits u32"),
                     1,
                     indirect_name.as_ptr(),
                     indirect_name.len(),
                     &raw mut indirect,
-                    frame,
+                    context,
                 )
             }
         },
         EzGfxResult::Ok
     );
     assert_eq!(
-        ez_gfx_counted_buffer_publish_count(indirect, 1, frame),
+        ez_gfx_counted_buffer_publish_count(indirect, 1, context),
         EzGfxResult::Ok
     );
     let bindings = [
@@ -204,12 +206,12 @@ fn run_compute_pipeline(backend: u8) {
     assert_eq!(
         {
             // SAFETY: The source range remains valid; rejection occurs before any copy.
-            unsafe { ez_gfx_buffer_write(buffer, 0, value.as_ptr().cast(), 1, 4, frame) }
+            unsafe { ez_gfx_buffer_write(buffer, 0, value.as_ptr().cast(), 1, 4, context) }
         },
         EzGfxResult::NotReady
     );
     assert_eq!(
-        ez_gfx_counted_buffer_publish_count(indirect, 1, frame),
+        ez_gfx_counted_buffer_publish_count(indirect, 1, context),
         EzGfxResult::NotReady
     );
     assert_eq!(ez_gfx_frame_end(frame), EzGfxResult::Ok);
@@ -217,15 +219,17 @@ fn run_compute_pipeline(backend: u8) {
     assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
     assert_eq!(
         {
-            // SAFETY: The source range remains valid; the stale handle is validated first.
-            unsafe { ez_gfx_buffer_write(buffer, 0, value.as_ptr().cast(), 1, 4, frame) }
+            // SAFETY: Context-owned CPU storage is writable again after frame completion.
+            unsafe { ez_gfx_buffer_write(buffer, 0, value.as_ptr().cast(), 1, 4, context) }
         },
-        EzGfxResult::InvalidContext
+        EzGfxResult::Ok
     );
     assert_eq!(
-        ez_gfx_counted_buffer_publish_count(indirect, 1, frame),
-        EzGfxResult::InvalidContext
+        ez_gfx_counted_buffer_publish_count(indirect, 1, context),
+        EzGfxResult::Ok
     );
+    ez_gfx_buffer_release(buffer, context);
+    ez_gfx_counted_buffer_release(indirect, context);
 
     ez_gfx_shader_destroy(shader, context);
     drop(native);

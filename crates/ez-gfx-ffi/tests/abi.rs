@@ -32,9 +32,8 @@ use ez_gfx_ffi::{
     ez_gfx_counted_buffer_publish_count, ez_gfx_counted_buffer_release,
     ez_gfx_counted_buffer_write_draws, ez_gfx_frame_abort, ez_gfx_frame_begin, ez_gfx_frame_end,
     ez_gfx_graph_enqueue_texture_readback, ez_gfx_handle_inspect,
-    ez_gfx_index_allocation_get_range, ez_gfx_index_allocation_remove, ez_gfx_index_heap_create,
-    ez_gfx_index_heap_destroy, ez_gfx_render_target_create, ez_gfx_render_target_destroy,
-    ez_gfx_render_target_frame_begin, ez_gfx_render_target_get_clear,
+    ez_gfx_index_allocation_get_range, ez_gfx_index_allocation_remove, ez_gfx_render_target_create,
+    ez_gfx_render_target_destroy, ez_gfx_render_target_frame_begin, ez_gfx_render_target_get_clear,
     ez_gfx_render_target_get_extent, ez_gfx_render_target_get_format,
     ez_gfx_render_target_probe_format, ez_gfx_semantic_id, ez_gfx_shader_load_artifact,
     ez_gfx_texture_get_binding, ez_gfx_texture_get_residency, ez_gfx_texture_load,
@@ -647,7 +646,7 @@ fn explicit_dx12_context_allocates_writes_and_releases_buffer_memory() {
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_buffer_acquire(16, 4, name.as_ptr(), name.len(), &raw mut buffer, frame)
+                ez_gfx_buffer_acquire(16, 4, name.as_ptr(), name.len(), &raw mut buffer, context)
             }
         },
         EzGfxResult::Ok
@@ -656,22 +655,22 @@ fn explicit_dx12_context_allocates_writes_and_releases_buffer_memory() {
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_buffer_write(buffer, 0, bytes.as_ptr().cast(), 4, 16, frame) }
+            unsafe { ez_gfx_buffer_write(buffer, 0, bytes.as_ptr().cast(), 4, 16, context) }
         },
         EzGfxResult::Ok
     );
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_buffer_write(buffer, 0, bytes.as_ptr().cast(), 1, 65, frame) }
+            unsafe { ez_gfx_buffer_write(buffer, 0, bytes.as_ptr().cast(), 1, 65, context) }
         },
         EzGfxResult::InvalidArgument
     );
-    ez_gfx_buffer_release(buffer, frame);
+    ez_gfx_buffer_release(buffer, context);
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_buffer_write(buffer, 0, bytes.as_ptr().cast(), 4, 16, frame) }
+            unsafe { ez_gfx_buffer_write(buffer, 0, bytes.as_ptr().cast(), 4, 16, context) }
         },
         EzGfxResult::InvalidContext
     );

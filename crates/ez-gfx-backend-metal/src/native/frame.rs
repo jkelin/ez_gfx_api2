@@ -810,7 +810,7 @@ impl NativeContext {
         slot_index: usize,
         capture_presented: bool,
         mut surface: Option<&mut NativeSurface>,
-    ) -> Result<Option<Vec<u8>>, HalError> {
+    ) -> Result<Vec<Vec<u8>>, HalError> {
         let frame_value = self.next_frame_value;
         self.next_frame_value = frame_value.checked_add(1).ok_or(HalError::NativeFailure)?;
         self.drain_complete = false;
@@ -820,7 +820,7 @@ impl NativeContext {
             self.frame_slots[slot_index].command = Some(ThreadBound::new(command));
             self.frame_slots[slot_index].submission_value = frame_value;
             self.frame_tracker.mark_submitted(slot_index);
-            return Ok(None);
+            return Ok(Vec::new());
         }
         command.waitUntilCompleted();
         self.completed_frame_value = self.completed_frame_value.max(frame_value);
@@ -830,7 +830,7 @@ impl NativeContext {
             }
             return Err(HalError::NativeFailure);
         }
-        let mut final_pixels = None;
+        let mut outputs = Vec::with_capacity(readbacks.len());
         let mut remaining = readbacks.into_iter();
         while let Some((mut allocation, tight_row, row_stride, size, height)) = remaining.next() {
             let copied = (|| {
@@ -878,9 +878,9 @@ impl NativeContext {
                     .presented_rgba8
                     .clone_from(&packed);
             }
-            final_pixels = Some(packed);
+            outputs.push(packed);
         }
-        Ok(final_pixels)
+        Ok(outputs)
     }
 
     fn prepare_drawable(
@@ -921,7 +921,7 @@ impl NativeContext {
         surface: Option<(&mut NativeSurface, (u32, u32))>,
         actions: &[NativeFrameAction<'_>],
         capture_presented: bool,
-    ) -> Result<Option<Vec<u8>>, HalError> {
+    ) -> Result<Vec<Vec<u8>>, HalError> {
         if actions.is_empty() {
             return Err(HalError::InvalidArgument);
         }

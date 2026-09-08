@@ -63,7 +63,7 @@ pub(super) fn start_recording(context: &mut ContextState) -> Result<()> {
     context.frame_render_target = None;
     context.frame_depth = None;
     context.frame_has_graphics = false;
-    context.last_readback.clear();
+    context.last_readbacks.clear();
     context.frame_presented = false;
     Ok(())
 }
@@ -1085,17 +1085,19 @@ fn recycle_consumed_transients(
     Ok(())
 }
 
-/// Returns the completed frame readback.
+/// Returns every completed frame readback in recording order.
 ///
 /// # Errors
 ///
 /// Returns an error when the context is invalid or no completed readback is available.
-pub fn frame_readback(context: ContextHandle) -> Result<Vec<u8>> {
+#[cfg_attr(feature = "ffi", doc(hidden))]
+#[cfg_attr(not(feature = "ffi"), allow(dead_code))]
+pub fn frame_readbacks(context: ContextHandle) -> Result<Vec<Vec<u8>>> {
     with_context_mut(context, |context| {
-        if context.last_readback.is_empty() {
+        if context.last_readbacks.is_empty() {
             return Err(Error::NotReady);
         }
-        Ok(context.last_readback.clone())
+        Ok(context.last_readbacks.clone())
     })
 }
 

@@ -1,6 +1,6 @@
 # Rust examples
 
-The six numbered directories are procedural renderers hosted by one shared `Example`. Each main calls `run_program`, whose clap parser resolves CLI/environment contracts before `run(config, setup)`. The host hides winit inversion, native context/surface setup, resize, queued input, pacing, callbacks, benchmark, capture, and reporting. It acquires and configures each swapchain `Frame` inside the event callback; setup returns concise recording logic, and `Example::handle_frame(Frame)` consumes completion.
+The six numbered directories are linear procedural renderers hosted by one shared `Example`. Each main constructs `Example`, creates persistent resources top-to-bottom, then loops over `wait_for_next_frame`. The host hides clap configuration, winit inversion, native context/surface setup, resize, queued input, pacing, callbacks, benchmark, capture, and reporting. User code explicitly begins and configures each swapchain frame, records it, then calls `Example::handle_frame(frame, swapchain_target)`.
 
 - [01 Triangle](01_triangle/README.md)
 - [02 Textured Cube](02_textured_cube/README.md)
@@ -11,7 +11,7 @@ The six numbered directories are procedural renderers hosted by one shared `Exam
 
 The Rust examples enable `ktx2` and `basis`; the Sponza example therefore retains universal decoding. Library/FFI default builds omit those decoders. Enable both for universal KTX2, `ktx2` for native blocks, or `basis` for standalone Basis; see [texture admission](../docs/textures.md#admission-and-memory).
 
-The Win32 [`C textured cube`](c/textured_cube/README.md) is a separate ABI 30 flow. C uses an opaque generational `EzGfxFrame` and must explicitly call `ez_gfx_frame_end` or `ez_gfx_frame_abort`; Rust examples never use those raw completion functions.
+The Win32 [`C textured cube`](c/textured_cube/README.md) is a separate ABI 32 flow. C uses an opaque generational `EzGfxFrame` and must explicitly call `ez_gfx_frame_end` or `ez_gfx_frame_abort`; Rust examples never use those raw completion functions.
 
 | Binary | Complete renderer | Owned inputs |
 | --- | --- | --- |
@@ -24,7 +24,7 @@ The Win32 [`C textured cube`](c/textured_cube/README.md) is a separate ABI 30 fl
 
 The original Sponza GLB is the only shared Rust asset: examples 03 and 06 consume `shared/assets/sponza.glb`. Shared support owns neutral data, native window attachment, input translation, observability, math, and mesh decoding. `shared/example.rs` is the single host for `ApplicationHandler`, native window, `Context`, `Surface`, resize, queued input, frame pacing, benchmark, capture, and reporting; `shared/error.rs` provides host errors.
 
-Persistent resources are owning wrappers whose leases retain their context until `Drop`. The context owns the lazy singleton index heap. `Buffer<T>` and `CountedBuffer<T>` are acquired from `&mut Frame` and become stale on every terminal path, including implicit abort by `Drop`; no renderer manually destroys or releases safe resources.
+Persistent resources are owning wrappers whose leases retain their context until `Drop`. The context owns the lazy singleton index heap. `Buffer<T>` and `CountedBuffer<T>` are acquired from `Context`, populated before frame recording, imported and retained when bound, and reusable after the frame terminates. Each loop explicitly begins and configures a swapchain frame before passing the frame and target to `Example::handle_frame`; no renderer manually destroys or releases safe resources.
 
 Benchmark mode is available on every binary. Stable JSON identities are `01_triangle`, `02_textured_cube`, `03_compute_structured`, `04_imgui`, `05_helmet`, and `06_sponza_ktx2`; benchmark frame limits always override the ordinary max-frame setting with warmup + measured + one terminal capture frame.
 

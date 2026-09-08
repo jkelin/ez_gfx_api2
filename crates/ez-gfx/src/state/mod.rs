@@ -330,7 +330,7 @@ struct ContextState {
     frame_presented: bool,
     active_surface: Option<SurfaceHandle>,
     frame_render_target: Option<RenderTargetHandle>,
-    last_readback: Vec<u8>,
+    last_readbacks: Vec<Vec<u8>>,
     observability: Observability,
 }
 
