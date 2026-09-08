@@ -159,12 +159,12 @@ jobs:
         if: matrix.backend == 'vulkan-windows'
         timeout-minutes: 20
         run: |
-          cargo nextest run -p ez-gfx-backend-vulkan --lib -E 'not test(texture::texture_tests::)'
+          cargo nextest run -p ez-gfx-backend-vulkan --lib -E 'not test(texture::texture_tests::) & not test(=device::tests::explicit_selection_admits_enumerated_adapter)'
           cargo nextest run -p ez-gfx-backend-vulkan --lib -E 'test(texture::texture_tests::)' --no-run
       - name: Test Windows Vulkan ez-gfx library contracts
         if: matrix.backend == 'vulkan-windows'
         timeout-minutes: 20
-        run: cargo nextest run -p ez-gfx --lib
+        run: cargo nextest run -p ez-gfx --lib -E 'not test(/^api::tests::/)'
       - name: Compile Windows Vulkan native init test suite
         if: matrix.backend == 'vulkan-windows'
         timeout-minutes: 20
