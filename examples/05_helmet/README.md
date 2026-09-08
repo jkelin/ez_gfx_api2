@@ -2,7 +2,7 @@
 
 Showcases loading a GLB model into named position and normal vertex heaps plus structured primitive buffers, then using compute-generated indirect commands for depth-tested graphics.
 
-`main.rs` is the complete renderer. It loads `helmet.glb`, uploads positions and normals with `create_vertex_heap`/`upload_vertices`, fills the global index heap with `create_index_heap`/`upload_indices` returning typed allocation handles, stages primitive records with `acquire_structured`/`write_structured`, and allocates the indirect buffer. `render_add_compute` builds one indexed draw command per primitive; `render_add_graphics` consumes those commands with structured bindings and MVP push constants. The universal artifact is loaded with `load_shader`.
+`main.rs` reads top-to-bottom through the shared host setup closure: it loads `helmet.glb`, creates owning position/normal heaps and vertex/index allocations, and loads the universal shader artifact. The returned per-frame closure calls `begin_frame`, acquires and writes frame-local structured and indirect buffers through `&mut Frame`, records compute-generated indexed commands followed by depth-tested graphics, and returns the owning `Frame` to `Example::handle_frame`. Persistent wrappers release through `Drop`.
 
 Run:
 

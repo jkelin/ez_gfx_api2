@@ -131,6 +131,11 @@ jobs:
           fi
           VK_DRIVER_FILES="$lavapipe_icd" vulkaninfo --summary
           echo "VK_DRIVER_FILES=$lavapipe_icd" >> "$GITHUB_ENV"
+      - name: Test Linux RAII ownership facade
+        if: matrix.backend == 'vulkan-linux'
+        timeout-minutes: 10
+        run: cargo nextest run -p ez-gfx --lib api::tests
+
       - name: Test Linux Vulkan contracts and native init; compile GPU suites
         if: matrix.backend == 'vulkan-linux'
         run: |
