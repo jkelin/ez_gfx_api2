@@ -113,6 +113,11 @@ pub(crate) fn register(
     callback: EzGfxEventCallback,
     user_data: *mut c_void,
 ) -> EzGfxResult {
+    // Registration is creator-thread state: validate before replacing or clearing
+    // a slot so a foreign caller cannot leave behind its callback pointer.
+    if let Err(error) = ez_gfx::raw::texture_decode_worker_count(context) {
+        return error.into();
+    }
     let key = context.into_raw();
     let Some(callback) = callback else {
         if let Ok(mut slots) = CALLBACKS.lock() {
@@ -350,6 +355,7 @@ pub(crate) fn dispatch(context: ContextHandle) -> EzGfxResult {
     // The guard holds `dispatching` across every event so a reentrant callback
     // cannot interleave a nested dispatch; it resets on every exit path below.
     let _guard = ResetGuard(key);
+    let mut events = Vec::new();
     for _ in 0..DISPATCH_BOUND {
         let upload = match ez_gfx::raw::poll_upload_event(context) {
             Ok(event) => event,
@@ -373,9 +379,7 @@ pub(crate) fn dispatch(context: ContextHandle) -> EzGfxResult {
             record.upload.resource_kind = resource_kind;
             record.upload.status = status;
             record.upload.error = error;
-            if deliver(key, callback, user_data, &record) != EzGfxResult::Ok {
-                return EzGfxResult::NativeFailure;
-            }
+            events.push(record);
         }
         if let Some(record) = runtime {
             pending = true;
@@ -385,9 +389,7 @@ pub(crate) fn dispatch(context: ContextHandle) -> EzGfxResult {
             event.record.backend = record.backend as u8;
             event.record.phase = record.phase as u8;
             event.record.status = record.status as u8;
-            if deliver(key, callback, user_data, &event) != EzGfxResult::Ok {
-                return EzGfxResult::NativeFailure;
-            }
+            events.push(event);
         }
         if let Some((level, record)) = diagnostic {
             pending = true;
@@ -398,20 +400,22 @@ pub(crate) fn dispatch(context: ContextHandle) -> EzGfxResult {
             event.record.status = record.status as u8;
             event.record.resource = record.resource;
             event.level = level as u8;
-            if deliver(key, callback, user_data, &event) != EzGfxResult::Ok {
-                return EzGfxResult::NativeFailure;
-            }
+            events.push(event);
         }
         if dropped != 0 {
             pending = true;
             let mut event = blank_event(EzGfxEventKind::ObservationsDropped);
             event.dropped = dropped;
-            if deliver(key, callback, user_data, &event) != EzGfxResult::Ok {
-                return EzGfxResult::NativeFailure;
-            }
+            events.push(event);
         }
         if !pending {
             break;
+        }
+    }
+    // Raw polling has released every context TLS borrow before user code runs.
+    for event in &events {
+        if deliver(key, callback, user_data, event) != EzGfxResult::Ok {
+            return EzGfxResult::NativeFailure;
         }
     }
     EzGfxResult::Ok

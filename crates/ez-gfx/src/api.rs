@@ -211,31 +211,36 @@ impl Context {
             return Err(Error::ReentrantCallback);
         }
         let dispatch_guard = DispatchGuard(&self.inner.dispatching);
+        let mut events: Vec<Event<'static>> = Vec::new();
 
-        let mut callback_panicked = false;
+        // Drain raw queues into owned records before invoking user code. Each poll
+        // releases the context TLS borrow before any callback can run.
         for _ in 0..4096 {
             let upload = state::poll_upload_event(self.raw())?.map(Event::Upload);
             let (runtime, runtime_dropped) = state::poll_runtime_event(self.raw())?;
             let (diagnostic, diagnostic_dropped) = state::poll_diagnostic(self.raw())?;
             let dropped = runtime_dropped.saturating_add(diagnostic_dropped);
-            let mut events = [
+            let pending = [
                 upload,
                 runtime.map(Event::Runtime),
                 diagnostic.map(|(level, record)| Event::Diagnostic { level, record }),
                 (dropped != 0).then_some(Event::ObservationsDropped(dropped)),
             ];
-            if events.iter().all(Option::is_none) {
+            if pending.iter().all(Option::is_none) {
                 break;
             }
-            for event in events.iter_mut().filter_map(Option::take) {
-                let mut slot = self.inner.callback.borrow_mut();
-                let Some(callback) = slot.as_mut() else {
-                    continue;
-                };
-                if catch_unwind(AssertUnwindSafe(|| callback(event))).is_err() {
-                    *slot = None;
-                    callback_panicked = true;
-                }
+            events.extend(pending.into_iter().flatten());
+        }
+
+        let mut callback_panicked = false;
+        for event in events {
+            let mut slot = self.inner.callback.borrow_mut();
+            let Some(callback) = slot.as_mut() else {
+                continue;
+            };
+            if catch_unwind(AssertUnwindSafe(|| callback(event))).is_err() {
+                *slot = None;
+                callback_panicked = true;
             }
         }
         drop(dispatch_guard);

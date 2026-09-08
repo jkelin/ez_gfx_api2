@@ -512,6 +512,26 @@ fn callback_registration_replaces_clears_and_validates_context() {
     );
 }
 
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn callback_registration_is_creator_thread_only() {
+    let native = common::TestContext::create(1);
+    let context = native.context;
+    let foreign = std::thread::spawn(move || {
+        // SAFETY: clearing a callback retains no user-data pointer.
+        unsafe { ez_gfx_callback_register(context, None, core::ptr::null_mut()) }
+    })
+    .join()
+    .expect("foreign registration thread returns");
+
+    assert_eq!(foreign, EzGfxResult::InvalidContext);
+    assert_eq!(
+        // SAFETY: clearing on the creator thread retains no user-data pointer.
+        unsafe { ez_gfx_callback_register(context, None, core::ptr::null_mut()) },
+        EzGfxResult::Ok
+    );
+}
+
 #[test]
 fn texture_residency_validates_both_output_pointers() {
     let mut value = 0;
