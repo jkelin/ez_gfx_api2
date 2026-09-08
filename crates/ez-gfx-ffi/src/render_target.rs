@@ -3,7 +3,7 @@ use ez_gfx::{ClearValue, Format, TargetDeclaration, TargetError, TargetUsage, ra
 
 use super::{
     EzGfxContext, EzGfxFrame, EzGfxRenderTarget, EzGfxRenderTargetDesc, EzGfxResult, IntoFfiResult,
-    catch_status, catch_void, frame, read_bounded_string,
+    callback, catch_status, catch_void, frame, read_bounded_string,
 };
 
 // Zero/stale/wrong-kind packed handles fail before any context access.
@@ -321,6 +321,13 @@ pub unsafe extern "C" fn ez_gfx_render_target_frame_begin(
             Ok(context) => context,
             Err(error) => return error,
         };
+        if let Err(status) = callback::check_entry(context) {
+            return status;
+        }
+        match callback::dispatch(context) {
+            EzGfxResult::Ok => {}
+            status => return status,
+        }
         if let Err(status) = raw::begin_render_target(context, target) {
             return status.into();
         }
@@ -338,6 +345,7 @@ pub unsafe extern "C" fn ez_gfx_render_target_frame_begin(
                 return status;
             }
         };
+        callback::note_frame(frame, context.into_raw(), 0, target.into_raw());
         // SAFETY: `out_frame` was validated and remains caller-owned through this write.
         unsafe { out_frame.write(frame) };
         EzGfxResult::Ok

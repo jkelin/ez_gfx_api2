@@ -283,7 +283,7 @@ fn destroy_context_reclaims_populated_state_and_invalidates_handles() {
     frame_begin(context).unwrap();
     let structured = acquire_structured::<u8>(context, 64).unwrap();
     let indirect = acquire_indirect(context, 2).unwrap();
-    assert!(create_vertex_heap(context, "vertices", 256, 16).is_ok());
+    assert!(create_vertex_heap(context, "vertices", 16).is_ok());
     assert_eq!(create_index_heap(context, 256), Ok(()));
 
     assert_eq!(destroy_context(context), Ok(()));

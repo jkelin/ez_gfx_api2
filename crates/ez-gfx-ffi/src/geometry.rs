@@ -4,9 +4,9 @@ use ez_gfx::raw::{
 };
 
 use super::{
-    EZ_GFX_MAX_BOUNDARY_BYTES, EzGfxContext, EzGfxFrame, EzGfxIndexAllocation, EzGfxResult,
-    EzGfxStructuredBuffer, EzGfxVertexAllocation, EzGfxVertexHeap, IntoFfiResult, catch_status,
-    catch_void, frame, read_bounded_string, validate_bounded_string,
+    EZ_GFX_MAX_BOUNDARY_BYTES, EzGfxBuffer, EzGfxContext, EzGfxFrame, EzGfxIndexAllocation,
+    EzGfxResult, EzGfxVertexAllocation, EzGfxVertexHeap, IntoFfiResult, catch_status, catch_void,
+    frame, read_bounded_string, validate_bounded_string,
 };
 
 #[unsafe(no_mangle)]
@@ -32,7 +32,7 @@ pub unsafe extern "C" fn ez_gfx_vertex_heap_create(
             return EzGfxResult::InvalidArgument;
         }
         let context = try_handle!(ContextHandle, context);
-        match raw::create_vertex_heap(context, &name, capacity, stride) {
+        match raw::create_vertex_heap_with_capacity(context, &name, capacity, stride) {
             Ok(handle) => {
                 // SAFETY: the validated caller-owned output remains writable for this call.
                 unsafe { out_heap.write(handle.into_raw()) };
@@ -256,18 +256,18 @@ pub extern "C" fn ez_gfx_index_allocation_remove(
 }
 
 #[unsafe(no_mangle)]
-/// Acquires a transient structured buffer sized for the requested elements.
+/// Acquires a transient buffer sized for the requested elements.
 ///
 /// # Safety
 ///
-/// `debug_name` must cover its non-empty UTF-8 range and `out_structured` one
+/// `debug_name` must cover its non-empty UTF-8 range and `out_buffer` one
 /// writable handle.
-pub unsafe extern "C" fn ez_gfx_structured_acquire(
+pub unsafe extern "C" fn ez_gfx_buffer_acquire(
     element_size: u32,
     element_count: u32,
     debug_name: *const u8,
     debug_name_length: usize,
-    out_structured: *mut EzGfxStructuredBuffer,
+    out_buffer: *mut EzGfxBuffer,
     frame: EzGfxFrame,
 ) -> EzGfxResult {
     catch_status(|| {
@@ -277,8 +277,8 @@ pub unsafe extern "C" fn ez_gfx_structured_acquire(
             || usize::try_from(byte_size)
                 .ok()
                 .is_none_or(|size| size > EZ_GFX_MAX_BOUNDARY_BYTES)
-            || out_structured.is_null()
-            || !out_structured.is_aligned()
+            || out_buffer.is_null()
+            || !out_buffer.is_aligned()
             || validate_bounded_string(debug_name, debug_name_length).is_err()
         {
             return EzGfxResult::InvalidArgument;
@@ -287,7 +287,7 @@ pub unsafe extern "C" fn ez_gfx_structured_acquire(
         match raw::acquire_structured_raw(context, element_size, element_count) {
             Ok(handle) => {
                 // SAFETY: the validated caller-owned output remains writable for this call.
-                unsafe { out_structured.write(handle.into_raw()) };
+                unsafe { out_buffer.write(handle.into_raw()) };
                 EzGfxResult::Ok
             }
             Err(status) => status.into(),
@@ -296,14 +296,14 @@ pub unsafe extern "C" fn ez_gfx_structured_acquire(
 }
 
 #[unsafe(no_mangle)]
-/// Copies a typed element range into a structured buffer.
+/// Copies a typed element range into a buffer.
 ///
 /// # Safety
 ///
 /// `data` must cover `element_count * element_size` readable bytes, or may be
 /// null when `element_count` is zero.
-pub unsafe extern "C" fn ez_gfx_structured_write(
-    structured: EzGfxStructuredBuffer,
+pub unsafe extern "C" fn ez_gfx_buffer_write(
+    buffer: EzGfxBuffer,
     start_index: u32,
     data: *const std::ffi::c_void,
     element_count: u32,
@@ -329,7 +329,7 @@ pub unsafe extern "C" fn ez_gfx_structured_write(
         };
         raw::write_structured_raw(
             try_frame!(frame),
-            try_handle!(StructuredBufferHandle, structured),
+            try_handle!(StructuredBufferHandle, buffer),
             start_index,
             element_count,
             element_size,
@@ -340,14 +340,13 @@ pub unsafe extern "C" fn ez_gfx_structured_write(
 }
 
 #[unsafe(no_mangle)]
-/// Releases a structured upload buffer.
-pub extern "C" fn ez_gfx_structured_release(structured: EzGfxStructuredBuffer, frame: EzGfxFrame) {
+/// Releases a buffer upload.
+pub extern "C" fn ez_gfx_buffer_release(buffer: EzGfxBuffer, frame: EzGfxFrame) {
     catch_void(|| {
-        if let (Ok(entry), Ok(structured)) = (
-            frame::get(frame),
-            StructuredBufferHandle::from_raw(structured),
-        ) {
-            raw::release_structured(entry.owner, structured);
+        if let (Ok(entry), Ok(buffer)) =
+            (frame::get(frame), StructuredBufferHandle::from_raw(buffer))
+        {
+            raw::release_structured(entry.owner, buffer);
         }
     });
 }

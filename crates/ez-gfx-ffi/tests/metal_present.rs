@@ -8,13 +8,13 @@ use ez_gfx_artifact::{
     Provenance, Stage, Target, TargetCompatibility, TargetVariant,
 };
 use ez_gfx_ffi::{
-    EzGfxBackendContextDesc, EzGfxDrawIndexedCommand, EzGfxDynamicState, EzGfxRenderTargetDesc,
-    EzGfxResult, EzGfxSurfaceDesc, EzGfxTextureDesc, ez_gfx_acquire_indirect,
-    ez_gfx_context_create_backend, ez_gfx_context_destroy, ez_gfx_context_init_device,
-    ez_gfx_context_wait_idle, ez_gfx_frame_begin, ez_gfx_frame_end, ez_gfx_frame_readback,
+    EzGfxBackendContextDesc, EzGfxDrawIndexedCommand, EzGfxDynamicState, EzGfxEvent,
+    EzGfxEventKind, EzGfxRenderTargetDesc, EzGfxResult, EzGfxSurfaceDesc, EzGfxTextureDesc,
+    ez_gfx_callback_register, ez_gfx_context_create_backend, ez_gfx_context_destroy,
+    ez_gfx_context_init_device, ez_gfx_context_wait_idle, ez_gfx_counted_buffer_acquire,
+    ez_gfx_counted_buffer_write_draws, ez_gfx_frame_begin, ez_gfx_frame_end,
     ez_gfx_graph_enqueue_texture_readback, ez_gfx_index_allocation_get_range,
-    ez_gfx_index_heap_create, ez_gfx_index_heap_destroy, ez_gfx_indirect_release,
-    ez_gfx_indirect_write_draws, ez_gfx_render_add_compute_pipeline,
+    ez_gfx_index_heap_create, ez_gfx_index_heap_destroy, ez_gfx_render_add_compute_pipeline,
     ez_gfx_render_add_vertex_pipeline, ez_gfx_render_target_create, ez_gfx_render_target_destroy,
     ez_gfx_render_target_frame_begin, ez_gfx_shader_destroy, ez_gfx_shader_load_artifact,
     ez_gfx_surface_create, ez_gfx_surface_destroy, ez_gfx_texture_load, ez_gfx_texture_unload,
@@ -27,6 +27,32 @@ use objc2_quartz_core::CAMetalLayer;
 
 const WIDTH: u32 = 64;
 const HEIGHT: u32 = 64;
+#[derive(Default)]
+struct Collected {
+    readback: Option<Vec<u8>>,
+}
+
+/// Copies callback-scoped readback bytes into test-owned storage.
+///
+/// # Safety
+///
+/// `user_data` must point to a live `Collected` while registered.
+unsafe extern "C" fn collect_event(event: *const EzGfxEvent, user_data: *mut core::ffi::c_void) {
+    // SAFETY: registration keeps both pointers valid for this callback invocation.
+    let (event, collected) = unsafe { (&*event, &mut *user_data.cast::<Collected>()) };
+    if event.kind == EzGfxEventKind::Readback {
+        let bytes = if event.readback_byte_count == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: nonempty readback bytes are callback-scoped and copied before returning.
+            unsafe {
+                core::slice::from_raw_parts(event.readback_bytes, event.readback_byte_count)
+                    .to_vec()
+            }
+        };
+        collected.readback = Some(bytes);
+    }
+}
 
 fn begin_offscreen_frame(context: u64) -> (u64, u64) {
     let name = b"metal-target";
@@ -132,6 +158,14 @@ fn metal_texture_readback_submits_without_a_surface() {
     );
     // Admission is asynchronous; readback requires the decoded native texture to be ready.
     assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
+    let mut collected = Collected::default();
+    assert_eq!(
+        // SAFETY: `collected` remains alive until registration is explicitly cleared.
+        unsafe {
+            ez_gfx_callback_register(context, Some(collect_event), (&raw mut collected).cast())
+        },
+        EzGfxResult::Ok
+    );
     let (frame, target) = begin_offscreen_frame(context);
     assert_eq!(
         ez_gfx_graph_enqueue_texture_readback(texture, frame),
@@ -140,27 +174,15 @@ fn metal_texture_readback_submits_without_a_surface() {
     assert_eq!(ez_gfx_frame_end(frame), EzGfxResult::Ok);
     ez_gfx_render_target_destroy(target, context);
 
-    let mut size = 0;
-    assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_frame_readback(core::ptr::null_mut(), 0, &raw mut size, context) }
-        },
-        EzGfxResult::Ok
-    );
-    let mut actual = vec![0; size];
-    assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe {
-                ez_gfx_frame_readback(actual.as_mut_ptr(), actual.len(), &raw mut size, context)
-            }
-        },
-        EzGfxResult::Ok
-    );
+    let actual = collected.readback.take().expect("readback event delivered");
     assert_eq!(actual, expected);
 
     ez_gfx_texture_unload(texture, context);
+    assert_eq!(
+        // SAFETY: clearing a live registration retains no user-data pointer.
+        unsafe { ez_gfx_callback_register(context, None, core::ptr::null_mut()) },
+        EzGfxResult::Ok
+    );
     ez_gfx_context_destroy(context);
 }
 
@@ -365,6 +387,14 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
         ez_gfx_context_init_device(surface, context),
         EzGfxResult::Ok
     );
+    let mut collected = Collected::default();
+    assert_eq!(
+        // SAFETY: `collected` remains alive until registration is explicitly cleared.
+        unsafe {
+            ez_gfx_callback_register(context, Some(collect_event), (&raw mut collected).cast())
+        },
+        EzGfxResult::Ok
+    );
 
     let mut shader = 0;
     assert_eq!(
@@ -441,7 +471,13 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_acquire_indirect(1, label.as_ptr(), label.len(), &raw mut indirect, frame)
+                ez_gfx_counted_buffer_acquire(
+                    1,
+                    label.as_ptr(),
+                    label.len(),
+                    &raw mut indirect,
+                    frame,
+                )
             }
         },
         EzGfxResult::Ok
@@ -456,37 +492,29 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_indirect_write_draws(indirect, 0, &raw const command, 1, frame) }
+            unsafe { ez_gfx_counted_buffer_write_draws(indirect, 0, &raw const command, 1, frame) }
         },
         EzGfxResult::Ok
     );
 
     submit_render_nodes(context, frame, shader, indirect);
 
-    let mut size = 0;
-    let status = {
-        // SAFETY: Non-null output pointers reference writable storage of the declared capacity and alignment for this call.
-        unsafe { ez_gfx_frame_readback(core::ptr::null_mut(), 0, &raw mut size, context) }
-    };
     let bytes = if cache_presented_snapshots {
-        assert_eq!(status, EzGfxResult::Ok);
-        assert_eq!(size, WIDTH as usize * HEIGHT as usize * 4);
-        let mut bytes = vec![0; size];
-        assert_eq!(
-            {
-                // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-                unsafe {
-                    ez_gfx_frame_readback(bytes.as_mut_ptr(), bytes.len(), &raw mut size, context)
-                }
-            },
-            EzGfxResult::Ok
-        );
+        let bytes = collected
+            .readback
+            .take()
+            .expect("presented readback event delivered");
+        assert_eq!(bytes.len(), WIDTH as usize * HEIGHT as usize * 4);
         bytes
     } else {
-        assert_eq!(status, EzGfxResult::NotReady);
-        assert_eq!(size, 0);
+        assert!(collected.readback.is_none());
         Vec::new()
     };
+    assert_eq!(
+        // SAFETY: clearing a live registration retains no user-data pointer.
+        unsafe { ez_gfx_callback_register(context, None, core::ptr::null_mut()) },
+        EzGfxResult::Ok
+    );
 
     ez_gfx_index_heap_destroy(context);
     ez_gfx_shader_destroy(shader, context);

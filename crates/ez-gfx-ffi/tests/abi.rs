@@ -23,20 +23,20 @@ use ez_gfx_ffi as ffi;
 use ez_gfx_ffi::{
     EzGfxAdapterClass, EzGfxAdapterDesc, EzGfxAdapterInfo, EzGfxBackendContextDesc, EzGfxBinding,
     EzGfxByteBuffer, EzGfxContextDesc, EzGfxDiagnostic, EzGfxDrawIndexedCommand, EzGfxDynamicState,
-    EzGfxHandleParts, EzGfxRenderTargetDesc, EzGfxRenderTargetFormat, EzGfxRenderTargetUsage,
-    EzGfxResult, EzGfxRuntimeRecord, EzGfxShaderDesc, EzGfxSurfaceDesc, EzGfxTextureDesc,
-    EzGfxUploadEvent, ez_gfx_acquire_indirect, ez_gfx_adapter_count, ez_gfx_adapters_query,
-    ez_gfx_context_create, ez_gfx_context_create_backend, ez_gfx_context_destroy,
-    ez_gfx_context_wait_idle, ez_gfx_frame_abort, ez_gfx_frame_begin, ez_gfx_frame_end,
-    ez_gfx_frame_readback, ez_gfx_graph_enqueue_texture_readback, ez_gfx_handle_inspect,
+    EzGfxEvent, EzGfxEventCallback, EzGfxEventKind, EzGfxHandleParts, EzGfxRenderTargetDesc,
+    EzGfxRenderTargetFormat, EzGfxRenderTargetUsage, EzGfxResult, EzGfxRuntimeRecord,
+    EzGfxShaderDesc, EzGfxSurfaceDesc, EzGfxTextureDesc, EzGfxUploadEvent, ez_gfx_adapter_count,
+    ez_gfx_adapters_query, ez_gfx_buffer_acquire, ez_gfx_buffer_release, ez_gfx_buffer_write,
+    ez_gfx_callback_register, ez_gfx_context_create, ez_gfx_context_create_backend,
+    ez_gfx_context_destroy, ez_gfx_context_wait_idle, ez_gfx_counted_buffer_acquire,
+    ez_gfx_counted_buffer_publish_count, ez_gfx_counted_buffer_release,
+    ez_gfx_counted_buffer_write_draws, ez_gfx_frame_abort, ez_gfx_frame_begin, ez_gfx_frame_end,
+    ez_gfx_graph_enqueue_texture_readback, ez_gfx_handle_inspect,
     ez_gfx_index_allocation_get_range, ez_gfx_index_allocation_remove, ez_gfx_index_heap_create,
-    ez_gfx_index_heap_destroy, ez_gfx_indirect_publish_compute_count, ez_gfx_indirect_release,
-    ez_gfx_indirect_write_draws, ez_gfx_poll_diagnostic, ez_gfx_poll_runtime_event,
-    ez_gfx_poll_upload_event, ez_gfx_render_target_create, ez_gfx_render_target_destroy,
+    ez_gfx_index_heap_destroy, ez_gfx_render_target_create, ez_gfx_render_target_destroy,
     ez_gfx_render_target_frame_begin, ez_gfx_render_target_get_clear,
     ez_gfx_render_target_get_extent, ez_gfx_render_target_get_format,
     ez_gfx_render_target_probe_format, ez_gfx_semantic_id, ez_gfx_shader_load_artifact,
-    ez_gfx_structured_acquire, ez_gfx_structured_release, ez_gfx_structured_write,
     ez_gfx_texture_get_binding, ez_gfx_texture_get_residency, ez_gfx_texture_load,
     ez_gfx_texture_unload, ez_gfx_vertex_allocation_get_range, ez_gfx_vertex_allocation_remove,
     ez_gfx_vertex_heap_create, ez_gfx_vertex_heap_destroy, ez_gfx_vertex_upload,
@@ -499,63 +499,17 @@ fn terminal_frame_calls_reject_null_and_stale_handles() {
 }
 
 #[test]
-fn observability_polls_validate_all_output_pointers() {
-    let mut record = EzGfxRuntimeRecord {
-        correlation_id: 0,
-        resource: 0,
-        backend: 0,
-        phase: 0,
-        status: 0,
-        _padding: [0; 5],
-    };
-    let mut diagnostic = EzGfxDiagnostic {
-        record,
-        level: 0,
-        _padding: [0; 7],
-    };
-    let mut present = 0;
-    let mut dropped = 0;
+fn callback_registration_replaces_clears_and_validates_context() {
+    unsafe extern "C" fn probe(_event: *const EzGfxEvent, _user_data: *mut c_void) {}
     assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe {
-                ez_gfx_poll_runtime_event(
-                    core::ptr::null_mut(),
-                    &raw mut present,
-                    &raw mut dropped,
-                    0,
-                )
-            }
-        },
-        EzGfxResult::InvalidArgument
+        // SAFETY: no live context exists, so validation fails before touching user data.
+        unsafe { ez_gfx_callback_register(0, None, core::ptr::null_mut()) },
+        EzGfxResult::InvalidContext
     );
     assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe {
-                ez_gfx_poll_runtime_event(
-                    &raw mut record,
-                    core::ptr::null_mut(),
-                    &raw mut dropped,
-                    0,
-                )
-            }
-        },
-        EzGfxResult::InvalidArgument
-    );
-    assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe {
-                ez_gfx_poll_diagnostic(
-                    &raw mut diagnostic,
-                    &raw mut present,
-                    core::ptr::null_mut(),
-                    0,
-                )
-            }
-        },
-        EzGfxResult::InvalidArgument
+        // SAFETY: no live context exists, so validation fails before touching user data.
+        unsafe { ez_gfx_callback_register(0, Some(probe), core::ptr::null_mut()) },
+        EzGfxResult::InvalidContext
     );
 }
 
@@ -678,7 +632,7 @@ fn frame_handles_are_thread_local_terminal_and_context_owned() {
 
 #[cfg(windows)]
 #[test]
-fn explicit_dx12_context_allocates_writes_and_releases_structured_memory() {
+fn explicit_dx12_context_allocates_writes_and_releases_buffer_memory() {
     let native = common::TestContext::create(2);
     let context = native.context;
     let mut frame = 0;
@@ -688,19 +642,12 @@ fn explicit_dx12_context_allocates_writes_and_releases_structured_memory() {
         EzGfxResult::Ok
     );
     let name = b"vertices";
-    let mut structured = 0;
+    let mut buffer = 0;
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_structured_acquire(
-                    16,
-                    4,
-                    name.as_ptr(),
-                    name.len(),
-                    &raw mut structured,
-                    frame,
-                )
+                ez_gfx_buffer_acquire(16, 4, name.as_ptr(), name.len(), &raw mut buffer, frame)
             }
         },
         EzGfxResult::Ok
@@ -709,22 +656,22 @@ fn explicit_dx12_context_allocates_writes_and_releases_structured_memory() {
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_structured_write(structured, 0, bytes.as_ptr().cast(), 4, 16, frame) }
+            unsafe { ez_gfx_buffer_write(buffer, 0, bytes.as_ptr().cast(), 4, 16, frame) }
         },
         EzGfxResult::Ok
     );
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_structured_write(structured, 0, bytes.as_ptr().cast(), 1, 65, frame) }
+            unsafe { ez_gfx_buffer_write(buffer, 0, bytes.as_ptr().cast(), 1, 65, frame) }
         },
         EzGfxResult::InvalidArgument
     );
-    ez_gfx_structured_release(structured, frame);
+    ez_gfx_buffer_release(buffer, frame);
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_structured_write(structured, 0, bytes.as_ptr().cast(), 4, 16, frame) }
+            unsafe { ez_gfx_buffer_write(buffer, 0, bytes.as_ptr().cast(), 4, 16, frame) }
         },
         EzGfxResult::InvalidContext
     );

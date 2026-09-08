@@ -58,6 +58,7 @@ pub(super) fn start_recording(context: &mut ContextState) -> Result<()> {
     context.frame_native_resources.clear();
     context.frame_vertex_heaps.clear();
     context.frame_index = None;
+    context.active_surface = None;
     context.frame_surface = None;
     context.frame_render_target = None;
     context.frame_depth = None;
@@ -491,6 +492,44 @@ fn intern_render_target_resource(
         .frame_native_resources
         .insert(resource, FrameNativeResource::RenderTarget(target));
     Ok(resource)
+}
+/// Enqueues full-image RGBA8 readback of a managed render target.
+///
+/// # Errors
+/// Returns an error when the target is invalid, compressed, or not part of a recording frame.
+pub fn frame_enqueue_render_target_readback(
+    context: ContextHandle,
+    target: RenderTargetHandle,
+) -> Result<()> {
+    result_status(with_context_mut(context, |context| {
+        let record = context
+            .render_targets
+            .get(&target)
+            .ok_or(Error::InvalidContext)?;
+        if matches!(
+            record.format,
+            Format::Bc7Unorm | Format::Astc4x4Unorm | Format::Depth32Float
+        ) {
+            return Err(Error::InvalidArgument);
+        }
+        let resource = intern_render_target_resource(context, target)?;
+        let range = ImageRange::all(1, 1).map_err(|_| Error::InvalidArgument)?;
+        let state = ResourceState::new(
+            QueueKind::Transfer,
+            ShaderStage::None,
+            ResourceAccess::TransferRead,
+        )
+        .map_err(|_| Error::InvalidArgument)?;
+        context
+            .frame
+            .record_node(
+                NodeDesc::new("render-target-readback", QueueKind::Transfer)
+                    .access(Access::image(resource, range, state)),
+                ExecutableNode::RenderTargetReadback { target },
+            )
+            .map_err(|error| map_frame(&error))?;
+        Ok(())
+    }))
 }
 
 // Missing surface/index resources and invalid ranges fail before the frame node is recorded.

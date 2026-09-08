@@ -3,7 +3,7 @@
 ## P0
 
 - Lower compiled transient alias assignments into Vulkan, DX12, and Metal resource placement, including alias barriers and overlap-safe retirement (P-004, P-008, P-009).
-- Finish managed render-target sampled/storage bindings, resize/history, graph attachment, and cross-backend evidence. The safe interface must remain ownership-based; C ABI 31 retains explicit opaque-handle release (P-008, P-009, P-010, P-015).
+- Finish managed render-target sampled/storage bindings, resize/history, graph attachment, and cross-backend evidence. The safe interface must remain ownership-based; C ABI 30 retains explicit opaque-handle release (P-008, P-009, P-010, P-015).
 
 ## P1
 
@@ -11,8 +11,8 @@
 - Add the selected caller-writable mapped staging lease for procedural vertex/index writes (P-011). The existing slice path copies into mapped staging. The lease must retain its context/resource ownership, commit or cancel exactly once, cancel safely on `Drop`, and fail after loss. Acceptance is procedural-upload pixel parity, commit/cancel/failure coverage, and no cross-frame lease stalls.
 - Retire dropped vertex/index allocation ranges against fine-grained graphics completion instead of full context idle (P-011). Quarantine each range against its last graphics completion token before free-list reuse; stale, foreign, and duplicate C releases remain rejected.
 - Expose validated per-draw/per-pipeline viewport and scissor state and batch consecutive equal-state MDI ranges; current backends set only full-render-area state (P-016).
-- Complete Metal execution evidence for deterministic adapter enumeration, selection, admitted limits/formats, and rejection diagnostics through safe Rust and ABI 31 (P-003, P-022).
-- Add Linux X11/Wayland Vulkan surfaces, DPI-aware recreation coverage, and native presentation tests. Safe surfaces remain owning wrappers with atomic construction rollback; ABI 31 validates borrowed native handles (P-017, P-022).
+- Complete Metal execution evidence for deterministic adapter enumeration, selection, admitted limits/formats, and rejection diagnostics through safe Rust and ABI 30 (P-003, P-022).
+- Add Linux X11/Wayland Vulkan surfaces, DPI-aware recreation coverage, and native presentation tests. Safe surfaces remain owning wrappers with atomic construction rollback; ABI 30 validates borrowed native handles (P-017, P-022).
 - Add bounded, validated host-owned pipeline-cache import/export envelopes with backend/device/driver/schema compatibility; current caches are process-local only (P-007, P-024).
 - Finish terminal device-loss behavior for staging leases and waits. Pending texture decode/transfer uploads emit terminal loss events and transfer workers retain sticky loss; loader-lock teardown remains abandon-only (P-023, P-026).
 - Add correlation IDs, sequence/domain, clocks, units, payloads, and cleanup outcomes to the lossless typed upload queue. The queue currently preserves every texture/vertex/index ownership, readiness, cancellation, and failure transition; bounded diagnostics remain separate (P-023, P-026, P-028).

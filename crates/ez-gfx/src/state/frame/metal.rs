@@ -226,7 +226,9 @@ fn prepare_metal_pipelines(
                 prepared.texture_heaps[node_index] = texture_heap;
                 (key, pipeline)
             }
-            ExecutableNode::TextureReadback { .. } | ExecutableNode::Present { .. } => continue,
+            ExecutableNode::TextureReadback { .. }
+            | ExecutableNode::RenderTargetReadback { .. }
+            | ExecutableNode::Present { .. } => continue,
         };
         cache_metal_pipeline(pipelines, native, key.clone(), pipeline)?;
         prepared.keys[node_index] = Some(key);
@@ -330,6 +332,20 @@ impl<'a> MetalActionInputs<'a> {
                     texture,
                     width: *width,
                     height: *height,
+                })
+            }
+            ExecutableNode::RenderTargetReadback { target } => {
+                let record = self
+                    .render_targets
+                    .get(target)
+                    .ok_or(Error::InvalidContext)?;
+                let NativeTexture::Metal(texture) = &record.native else {
+                    return Err(Error::NativeFailure);
+                };
+                Ok(MetalFrameAction::TextureReadback {
+                    texture,
+                    width: record.width,
+                    height: record.height,
                 })
             }
             ExecutableNode::Present { surface } => {
@@ -463,7 +479,8 @@ pub(super) fn execute_metal_frame_plan(
         ExecutableNode::Present { surface } => Some(*surface),
         ExecutableNode::Graphics { .. }
         | ExecutableNode::Compute { .. }
-        | ExecutableNode::TextureReadback { .. } => None,
+        | ExecutableNode::TextureReadback { .. }
+        | ExecutableNode::RenderTargetReadback { .. } => None,
     });
     let mut surface = surface_handle
         .map(|handle| {
@@ -503,7 +520,9 @@ pub(super) fn execute_metal_frame_plan(
                 &context.vertex_heaps,
             )
             .map_err(map_hal)?,
-            ExecutableNode::TextureReadback { .. } | ExecutableNode::Present { .. } => Vec::new(),
+            ExecutableNode::TextureReadback { .. }
+            | ExecutableNode::RenderTargetReadback { .. }
+            | ExecutableNode::Present { .. } => Vec::new(),
         };
         binding_sets.push(bindings);
     }

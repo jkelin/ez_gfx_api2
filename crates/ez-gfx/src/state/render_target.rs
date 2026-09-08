@@ -193,6 +193,7 @@ pub fn destroy_render_target(context: ContextHandle, target: RenderTargetHandle)
 /// # Errors
 ///
 /// Returns [`Error::InvalidArgument`] for an unknown or destroyed handle.
+#[allow(dead_code, reason = "the C raw seam queries physical target metadata")]
 pub fn render_target_format(context: ContextHandle, target: RenderTargetHandle) -> Result<Format> {
     with_context_mut(context, |context| {
         context
@@ -212,6 +213,7 @@ pub fn render_target_format(context: ContextHandle, target: RenderTargetHandle) 
 /// # Errors
 ///
 /// Returns [`Error::InvalidArgument`] for an unknown or destroyed handle.
+#[allow(dead_code, reason = "the C raw seam queries physical target metadata")]
 pub fn render_target_extent(
     context: ContextHandle,
     target: RenderTargetHandle,
@@ -237,6 +239,7 @@ pub fn render_target_extent(
 /// # Errors
 ///
 /// Returns [`Error::InvalidArgument`] for an unknown or destroyed handle.
+#[allow(dead_code, reason = "the C raw seam queries physical target metadata")]
 pub fn render_target_clear(
     context: ContextHandle,
     target: RenderTargetHandle,

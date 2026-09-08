@@ -292,6 +292,31 @@ impl GeometryManager {
         self.index.as_ref().and_then(|heap| heap.ready)
     }
 
+    /// Extends a named vertex heap without moving existing logical ranges.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unknown heaps, nonincreasing capacities, or capacities whose
+    /// element offsets cannot be represented by the public `u32` range.
+    pub fn grow_vertex_heap(&mut self, name: &str, new_capacity: u64) -> Result<(), GeometryError> {
+        let heap = self
+            .vertex
+            .get_mut(name)
+            .ok_or(GeometryError::UnknownHeap)?;
+        grow_heap(heap, new_capacity)
+    }
+
+    /// Extends the packed-u32 index heap without moving existing logical ranges.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a missing heap, nonincreasing capacities, or capacities whose
+    /// index offsets cannot be represented by the public `u32` range.
+    pub fn grow_index_heap(&mut self, new_capacity: u64) -> Result<(), GeometryError> {
+        let heap = self.index.as_mut().ok_or(GeometryError::UnknownHeap)?;
+        grow_heap(heap, new_capacity)
+    }
+
     /// Removes an empty vertex heap.
     ///
     /// # Errors
@@ -329,6 +354,28 @@ impl GeometryManager {
             .map(|_| ())
             .ok_or(GeometryError::UnknownHeap)
     }
+}
+
+fn grow_heap(heap: &mut Heap, new_capacity: u64) -> Result<(), GeometryError> {
+    if new_capacity <= heap.capacity || new_capacity / heap.stride > u64::from(u32::MAX) {
+        return Err(GeometryError::InvalidCapacity);
+    }
+
+    let old_capacity = heap.capacity;
+    let extension = new_capacity - old_capacity;
+    heap.capacity = new_capacity;
+    if let Some((&previous, &previous_size)) = heap.free.range(..old_capacity).next_back()
+        && previous.checked_add(previous_size) == Some(old_capacity)
+    {
+        heap.free.remove(&previous);
+        let size = previous_size
+            .checked_add(extension)
+            .ok_or(GeometryError::CapacityExceeded)?;
+        heap.free.insert(previous, size);
+    } else {
+        heap.free.insert(old_capacity, extension);
+    }
+    Ok(())
 }
 
 fn reserve(

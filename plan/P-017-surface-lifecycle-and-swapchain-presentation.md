@@ -33,7 +33,7 @@ Zero extent returns `NotReady` from `begin_frame`. Presentation mode remains a v
 
 Construct an owning `Surface` from borrowed host-native handles. The wrapper retains `Rc<ContextInner>` and its resource lease until `Drop`; the host keeps the actual window/display objects alive for that interval. Construction is atomic: native surface creation, device initialization, and initial resize either all succeed or destroy the unpublished raw surface and return the original error without retaining a safe wrapper.
 
-`begin_frame(&Context, &Surface)` returns `NotReady` without recording or acquisition for zero drawable extent. Recording uses `&mut Frame`; `Frame::finish(self)` submits and presents, while `Frame::drop` aborts. Resize/out-of-date handling stays behind the surface seam. Graph validation rejects shader reads from the presentation target; screenshots use transfer readback.
+`Surface::begin_frame()` creates a target-less owner; `Frame::configure_swapchain(size, format)` performs acquisition after resize handling inside the winit callback. Recording uses `&mut Frame`; `Frame::finish(self)` submits and presents, while `Frame::drop` aborts. Graph validation rejects shader reads from presentation targets; readback bytes are callback-scoped.
 
 #### Performance evidence
 

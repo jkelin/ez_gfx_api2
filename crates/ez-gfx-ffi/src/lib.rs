@@ -20,6 +20,7 @@ macro_rules! try_frame {
 mod adapter;
 mod api;
 mod bounded_string;
+mod callback;
 mod error;
 mod frame;
 mod geometry;
@@ -46,10 +47,10 @@ use ez_gfx::raw::{
 };
 use ez_gfx::{
     Backend, ContextOptions, DrawIndexedCommand, DynamicPipelineState, SurfaceOptions,
-    SurfacePlatform, UploadResource, UploadStatus, raw,
+    SurfacePlatform, raw,
 };
-/// Identifies C ABI revision 31 for compatibility checks.
-pub const EZ_GFX_ABI_VERSION: u32 = 31;
+/// Identifies C ABI revision 30 for compatibility checks.
+pub const EZ_GFX_ABI_VERSION: u32 = 30;
 /// Caps any caller-provided byte range at 16 MiB.
 pub const EZ_GFX_MAX_BOUNDARY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -147,9 +148,18 @@ pub unsafe extern "C" fn ez_gfx_context_create_backend(
 }
 
 #[unsafe(no_mangle)]
-/// Waits until all work submitted through the graphics context is idle.
+/// Waits until all work submitted through the graphics context is idle, then delivers pending events.
 pub extern "C" fn ez_gfx_context_wait_idle(context: EzGfxContext) -> EzGfxResult {
-    catch_status(|| raw::wait_idle(try_handle!(ContextHandle, context)).into_ffi_result())
+    catch_status(|| {
+        let context = try_handle!(ContextHandle, context);
+        if let Err(status) = callback::check_entry(context) {
+            return status;
+        }
+        match raw::wait_idle(context).into_ffi_result() {
+            EzGfxResult::Ok => callback::dispatch(context),
+            status => status,
+        }
+    })
 }
 #[unsafe(no_mangle)]
 /// Destroys the graphics context after aborting every live descendant frame.
@@ -162,142 +172,33 @@ pub extern "C" fn ez_gfx_context_destroy(context: EzGfxContext) {
             // A failing descendant abort cannot prevent invalidation or context teardown.
             let _ = catch_unwind(AssertUnwindSafe(|| raw::frame_abort(context)));
         }
+        callback::remove(context);
         let _ = raw::destroy_context(context);
     });
 }
-
 #[unsafe(no_mangle)]
-/// Polls the context for the next runtime record and reports dropped-record count.
+/// Replaces the context event callback and delivers pending events.
+///
+/// A null callback clears the registration. Delivery runs on the calling
+/// owner thread inside this and other dispatching entry points, never on a
+/// worker thread. Callbacks must not reenter dispatching operations and must
+/// not unwind; a reentrant call fails and a panic unregisters the callback.
 ///
 /// # Safety
 ///
-/// Every non-null output pointer must address one writable, aligned value for this call.
-pub unsafe extern "C" fn ez_gfx_poll_runtime_event(
-    out_record: *mut EzGfxRuntimeRecord,
-    out_present: *mut u8,
-    out_dropped: *mut u64,
+/// `user_data` must remain valid until the callback is replaced, cleared, or
+/// its context is destroyed.
+pub unsafe extern "C" fn ez_gfx_callback_register(
     context: EzGfxContext,
+    callback: EzGfxEventCallback,
+    user_data: *mut core::ffi::c_void,
 ) -> EzGfxResult {
     catch_status(|| {
-        if out_record.is_null() || out_present.is_null() || out_dropped.is_null() {
-            return EzGfxResult::InvalidArgument;
-        }
         let context = try_handle!(ContextHandle, context);
-        match raw::poll_runtime_event(context) {
-            Ok((record, dropped)) => {
-                // SAFETY: All three output pointers are non-null; the caller keeps aligned writable storage for one value of each pointed-to type alive through these writes.
-                unsafe {
-                    out_present.write(u8::from(record.is_some()));
-                    out_dropped.write(dropped);
-                    if let Some(record) = record {
-                        out_record.write(EzGfxRuntimeRecord {
-                            correlation_id: record.correlation_id,
-                            resource: record.resource,
-                            backend: record.backend as u8,
-                            phase: record.phase as u8,
-                            status: record.status as u8,
-                            _padding: [0; 5],
-                        });
-                    }
-                }
-                EzGfxResult::Ok
-            }
-            Err(status) => status.into(),
+        if let Err(status) = callback::check_entry(context) {
+            return status;
         }
-    })
-}
-
-#[unsafe(no_mangle)]
-/// Polls one lossless typed upload transition after progressing owner-thread work.
-///
-/// # Safety
-///
-/// Both pointers must address writable, aligned values for this call.
-pub unsafe extern "C" fn ez_gfx_poll_upload_event(
-    out_event: *mut EzGfxUploadEvent,
-    out_present: *mut u8,
-    context: EzGfxContext,
-) -> EzGfxResult {
-    catch_status(|| {
-        if out_event.is_null() || out_present.is_null() {
-            return EzGfxResult::InvalidArgument;
-        }
-        let context = try_handle!(ContextHandle, context);
-        match raw::poll_upload_event(context) {
-            Ok(event) => {
-                // SAFETY: pointers were validated and remain caller-owned through the call.
-                unsafe {
-                    out_present.write(u8::from(event.is_some()));
-                    if let Some(event) = event {
-                        let (resource, resource_kind) = match event.resource {
-                            UploadResource::Texture(handle) => (handle.into_raw(), 1),
-                            UploadResource::Vertex(handle) => (handle.into_raw(), 2),
-                            UploadResource::Index(handle) => (handle.into_raw(), 3),
-                        };
-                        let (status, error) = match event.status {
-                            UploadStatus::SourceStaged => (1, 0),
-                            UploadStatus::DeviceReady => (2, 0),
-                            UploadStatus::Failed(error) => (3, error as u8),
-                            UploadStatus::Cancelled => (4, 0),
-                        };
-                        out_event.write(EzGfxUploadEvent {
-                            resource,
-                            resource_kind,
-                            status,
-                            error,
-                            _padding: [0; 5],
-                        });
-                    }
-                }
-                EzGfxResult::Ok
-            }
-            Err(status) => status.into(),
-        }
-    })
-}
-
-#[unsafe(no_mangle)]
-/// Polls the context for the next diagnostic and reports its severity and dropped-record count.
-///
-/// # Safety
-///
-/// Every non-null output pointer must address one writable, aligned value for this call.
-pub unsafe extern "C" fn ez_gfx_poll_diagnostic(
-    out_diagnostic: *mut EzGfxDiagnostic,
-    out_present: *mut u8,
-    out_dropped: *mut u64,
-    context: EzGfxContext,
-) -> EzGfxResult {
-    catch_status(|| {
-        if out_diagnostic.is_null() || out_present.is_null() || out_dropped.is_null() {
-            return EzGfxResult::InvalidArgument;
-        }
-        let context = try_handle!(ContextHandle, context);
-        match raw::poll_diagnostic(context) {
-            Ok((diagnostic, dropped)) => {
-                // SAFETY: All three output pointers are non-null; the caller keeps aligned writable storage for one value of each pointed-to type alive through these writes.
-                unsafe {
-                    out_present.write(u8::from(diagnostic.is_some()));
-                    out_dropped.write(dropped);
-                    if let Some((level, record)) = diagnostic {
-                        out_diagnostic.write(EzGfxDiagnostic {
-                            record: EzGfxRuntimeRecord {
-                                correlation_id: record.correlation_id,
-                                resource: record.resource,
-                                backend: record.backend as u8,
-                                phase: record.phase as u8,
-                                status: record.status as u8,
-                                _padding: [0; 5],
-                            },
-                            level: level as u8,
-                            _padding: [0; 7],
-                        });
-                    }
-                }
-                EzGfxResult::Ok
-            }
-            Err(status) => status.into(),
-        }
+        callback::register(context, callback, user_data)
     })
 }
 
@@ -366,6 +267,13 @@ pub unsafe extern "C" fn ez_gfx_frame_begin(
         }
         let context = try_handle!(ContextHandle, context);
         let surface = try_handle!(SurfaceHandle, surface);
+        if let Err(status) = callback::check_entry(context) {
+            return status;
+        }
+        match callback::dispatch(context) {
+            EzGfxResult::Ok => {}
+            status => return status,
+        }
         if let Err(status) = raw::begin_render(context, surface) {
             return status.into();
         }
@@ -383,6 +291,7 @@ pub unsafe extern "C" fn ez_gfx_frame_begin(
                 return status;
             }
         };
+        callback::note_frame(frame, context.into_raw(), surface.into_raw(), 0);
         // SAFETY: `out_frame` was validated and remains caller-owned through this write.
         unsafe { out_frame.write(frame) };
         EzGfxResult::Ok
@@ -390,16 +299,16 @@ pub unsafe extern "C" fn ez_gfx_frame_begin(
 }
 
 #[unsafe(no_mangle)]
-/// Acquires an indirect draw buffer with the requested command capacity.
+/// Acquires a counted command buffer with the requested command capacity.
 ///
 /// # Safety
 ///
-/// `debug_name` must be non-null and readable for exactly `debug_name_length` bytes; the range must be non-empty UTF-8 without embedded NUL bytes. Non-null `out_indirect` must address one writable, aligned handle for this call.
-pub unsafe extern "C" fn ez_gfx_acquire_indirect(
+/// `debug_name` must be non-null and readable for exactly `debug_name_length` bytes; the range must be non-empty UTF-8 without embedded NUL bytes. Non-null `out_buffer` must address one writable, aligned handle for this call.
+pub unsafe extern "C" fn ez_gfx_counted_buffer_acquire(
     capacity: u32,
     debug_name: *const u8,
     debug_name_length: usize,
-    out_indirect: *mut EzGfxIndirectBuffer,
+    out_indirect: *mut EzGfxCountedBuffer,
     frame: EzGfxFrame,
 ) -> EzGfxResult {
     catch_status(|| {
@@ -412,7 +321,7 @@ pub unsafe extern "C" fn ez_gfx_acquire_indirect(
         let context = try_frame!(frame);
         match raw::acquire_indirect(context, capacity) {
             Ok(handle) => {
-                // SAFETY: `out_indirect` is non-null, and the caller keeps writable, properly aligned storage for one `EzGfxIndirectBuffer` alive through this write.
+                // SAFETY: `out_indirect` is non-null, and the caller keeps writable, properly aligned storage for one `EzGfxCountedBuffer` alive through this write.
                 unsafe { out_indirect.write(handle.into_raw()) };
                 EzGfxResult::Ok
             }
@@ -428,8 +337,8 @@ pub unsafe extern "C" fn ez_gfx_acquire_indirect(
 ///
 /// `commands` must cover `command_count` readable commands, or may be null when
 /// `command_count` is zero.
-pub unsafe extern "C" fn ez_gfx_indirect_write_draws(
-    indirect: EzGfxIndirectBuffer,
+pub unsafe extern "C" fn ez_gfx_counted_buffer_write_draws(
+    indirect: EzGfxCountedBuffer,
     start_index: u32,
     commands: *const EzGfxDrawIndexedCommand,
     command_count: u32,
@@ -476,8 +385,8 @@ pub unsafe extern "C" fn ez_gfx_indirect_write_draws(
 
 #[unsafe(no_mangle)]
 /// Publishes a CPU-known count for compute-generated indirect commands.
-pub extern "C" fn ez_gfx_indirect_publish_compute_count(
-    indirect: EzGfxIndirectBuffer,
+pub extern "C" fn ez_gfx_counted_buffer_publish_count(
+    indirect: EzGfxCountedBuffer,
     count: u32,
     frame: EzGfxFrame,
 ) -> EzGfxResult {
@@ -492,8 +401,8 @@ pub extern "C" fn ez_gfx_indirect_publish_compute_count(
 }
 
 #[unsafe(no_mangle)]
-/// Releases an indirect draw buffer.
-pub extern "C" fn ez_gfx_indirect_release(indirect: EzGfxIndirectBuffer, frame: EzGfxFrame) {
+/// Releases a counted command buffer.
+pub extern "C" fn ez_gfx_counted_buffer_release(indirect: EzGfxCountedBuffer, frame: EzGfxFrame) {
     catch_void(|| {
         if let (Ok(entry), Ok(indirect)) =
             (frame::get(frame), IndirectBufferHandle::from_raw(indirect))
@@ -511,7 +420,7 @@ pub extern "C" fn ez_gfx_indirect_release(indirect: EzGfxIndirectBuffer, frame: 
 /// Non-null `bindings` must be readable for `binding_count` aligned entries; every binding name must be a non-null, non-empty exact UTF-8 byte range without embedded NUL bytes. Non-null `dynamic_state` must address one readable aligned value, and non-null `push_constants` must be readable for `push_constant_size` bytes.
 pub unsafe extern "C" fn ez_gfx_render_add_vertex_pipeline(
     shader: EzGfxShader,
-    indirect: EzGfxIndirectBuffer,
+    indirect: EzGfxCountedBuffer,
     bindings: *const EzGfxBinding,
     binding_count: u32,
     dynamic_state: *const EzGfxDynamicState,
@@ -629,74 +538,130 @@ pub extern "C" fn ez_gfx_graph_enqueue_texture_readback(
     frame: EzGfxFrame,
 ) -> EzGfxResult {
     catch_status(|| {
-        raw::frame_enqueue_readback(try_frame!(frame), try_handle!(TextureHandle, texture))
-            .into_ffi_result()
+        let result =
+            raw::frame_enqueue_readback(try_frame!(frame), try_handle!(TextureHandle, texture))
+                .into_ffi_result();
+        if result == EzGfxResult::Ok {
+            callback::note_readback_source(frame, texture);
+        }
+        result
     })
 }
 
 #[unsafe(no_mangle)]
 /// Consumes and completes a frame; every result invalidates the handle.
+///
+/// Queued upload, runtime, and diagnostic events dispatch to the registered
+/// callback before any readback delivery. A successfully completed readback
+/// delivers one borrowed-bytes event through the same callback.
 pub extern "C" fn ez_gfx_frame_end(frame: EzGfxFrame) -> EzGfxResult {
-    catch_status(|| {
+    catch_frame_terminal(frame, || {
+        let owner = match frame::get(frame) {
+            Ok(entry) => entry.owner,
+            Err(status) => return status,
+        };
+        if let Err(status) = callback::check_entry(owner) {
+            let _ = frame::remove(frame, frame::FrameState::Aborted);
+            callback::take_frame(frame);
+            let _ = raw::frame_abort(owner);
+            return status;
+        }
         let entry = match frame::remove(frame, frame::FrameState::Ended) {
             Ok(entry) => entry,
             Err(status) => return status,
         };
-        match entry.kind {
+        let aux = callback::take_frame(frame);
+        let submit = match entry.kind {
             frame::FrameKind::Surface => raw::finish_render(entry.owner),
             frame::FrameKind::RenderTarget => raw::frame_submit(entry.owner),
+        };
+        let readback = match submit {
+            Err(_) => None,
+            Ok(()) => match raw::frame_readback(entry.owner) {
+                Ok(bytes) => {
+                    let texture = aux
+                        .as_ref()
+                        .and_then(|aux| aux.readback_texture)
+                        .unwrap_or(0);
+                    let explicit = aux.as_ref().is_some_and(|aux| {
+                        aux.readback_texture.is_some() || entry.kind == frame::FrameKind::Surface
+                    });
+                    if explicit {
+                        let (width, height) = readback_extent(&entry, aux.as_ref());
+                        Some(Ok(callback::ReadbackDelivery {
+                            texture,
+                            width,
+                            height,
+                            bytes,
+                        }))
+                    } else {
+                        None
+                    }
+                }
+                Err(ez_gfx::Error::NotReady) => None,
+                Err(error) => Some(Err(EzGfxResult::from(error))),
+            },
+        };
+        let combined = match submit.map_err(EzGfxResult::from) {
+            Err(status) => Err(status),
+            Ok(()) => match callback::dispatch(entry.owner) {
+                EzGfxResult::Ok => Ok(()),
+                status => Err(status),
+            },
+        };
+        match (combined, readback) {
+            (Err(status), _) | (Ok(()), Some(Err(status))) => status,
+            (Ok(()), Some(Ok(delivery))) => callback::dispatch_readback(entry.owner, &delivery),
+            (Ok(()), None) => EzGfxResult::Ok,
         }
-        .into_ffi_result()
     })
+}
+
+/// Resolves readback image metadata from tracked frame auxiliaries.
+fn readback_extent(entry: &frame::FrameEntry, aux: Option<&callback::FrameAux>) -> (u32, u32) {
+    let Some(aux) = aux else {
+        return (0, 0);
+    };
+    if aux.surface != 0 {
+        if let Ok(surface) = SurfaceHandle::from_raw(aux.surface) {
+            if let Ok(extent) = raw::surface_extent(entry.owner, surface) {
+                return extent;
+            }
+        }
+    }
+    if aux.target != 0 {
+        if let Ok(target) = RenderTargetHandle::from_raw(aux.target) {
+            if let Ok(extent) = raw::render_target_extent(entry.owner, target) {
+                return extent;
+            }
+        }
+    }
+    (0, 0)
 }
 
 #[unsafe(no_mangle)]
 /// Consumes a frame without submitting; every result invalidates the handle.
 pub extern "C" fn ez_gfx_frame_abort(frame: EzGfxFrame) -> EzGfxResult {
-    catch_status(|| {
+    catch_frame_terminal(frame, || {
+        let owner = match frame::get(frame) {
+            Ok(entry) => entry.owner,
+            Err(status) => return status,
+        };
+        if let Err(status) = callback::check_entry(owner) {
+            let _ = frame::remove(frame, frame::FrameState::Aborted);
+            callback::take_frame(frame);
+            let _ = raw::frame_abort(owner);
+            return status;
+        }
         let entry = match frame::remove(frame, frame::FrameState::Aborted) {
             Ok(entry) => entry,
             Err(status) => return status,
         };
-        raw::frame_abort(entry.owner).into_ffi_result()
-    })
-}
-
-#[unsafe(no_mangle)]
-/// Copies the completed frame readback into caller storage and reports the required byte count.
-///
-/// # Safety
-///
-/// A non-null `out_size` must address one writable, aligned `usize`. Non-null `data` must be writable for `capacity` bytes.
-pub unsafe extern "C" fn ez_gfx_frame_readback(
-    data: *mut u8,
-    capacity: usize,
-    out_size: *mut usize,
-    context: EzGfxContext,
-) -> EzGfxResult {
-    catch_status(|| {
-        if out_size.is_null()
-            || capacity > EZ_GFX_MAX_BOUNDARY_BYTES
-            || (capacity != 0 && data.is_null())
-        {
-            return EzGfxResult::InvalidArgument;
+        callback::take_frame(frame);
+        match raw::frame_abort(entry.owner).into_ffi_result() {
+            EzGfxResult::Ok => callback::dispatch(entry.owner),
+            status => status,
         }
-        let context = try_handle!(ContextHandle, context);
-        let bytes = match raw::frame_readback(context) {
-            Ok(bytes) => bytes,
-            Err(status) => return status.into(),
-        };
-        // SAFETY: `out_size` is non-null, and the caller keeps writable, properly aligned storage for one `usize` alive through this write.
-        unsafe { out_size.write(bytes.len()) };
-        if capacity == 0 {
-            return EzGfxResult::Ok;
-        }
-        if capacity < bytes.len() {
-            return EzGfxResult::InvalidArgument;
-        }
-        // SAFETY: `capacity >= bytes.len()` and `data` is non-null; runtime-owned `bytes` is live and disjoint from the caller's alignment-1 writable `data` range of `bytes.len()` bytes through the copy.
-        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len()) };
-        EzGfxResult::Ok
     })
 }
 #[unsafe(no_mangle)]
@@ -888,9 +853,29 @@ impl IntoFfiResult for ez_gfx::Result<()> {
 }
 
 fn catch_status<T: IntoFfiResult>(operation: impl FnOnce() -> T) -> EzGfxResult {
+    // Reentrant calls would alias the owner-thread runtime while it dispatches.
+    if callback::is_invoking() {
+        return EzGfxResult::InvalidArgument;
+    }
     catch_unwind(AssertUnwindSafe(operation))
         .map(IntoFfiResult::into_ffi_result)
         .unwrap_or(EzGfxResult::NativeFailure)
+}
+
+fn catch_frame_terminal<T: IntoFfiResult>(
+    frame_handle: EzGfxFrame,
+    operation: impl FnOnce() -> T,
+) -> EzGfxResult {
+    // A panic must still retire the opaque handle and unwind the raw transaction.
+    if let Ok(result) = catch_unwind(AssertUnwindSafe(operation)) {
+        result.into_ffi_result()
+    } else {
+        if let Ok(entry) = frame::remove(frame_handle, frame::FrameState::Aborted) {
+            callback::take_frame(frame_handle);
+            let _ = raw::frame_abort(entry.owner);
+        }
+        EzGfxResult::NativeFailure
+    }
 }
 
 /// Binding arrays are bounded; every item requires one UTF-8 name and exactly one non-null typed handle.
@@ -910,16 +895,16 @@ fn read_bindings(
     for binding in raw {
         let name = read_bounded_string(binding.name, binding.name_length)?;
         let resource = match (
-            binding.structured != 0,
-            binding.indirect != 0,
+            binding.buffer != 0,
+            binding.counted_buffer != 0,
             binding.render_target != 0,
         ) {
             (true, false, false) => ResourceIdentity::Structured(
-                StructuredBufferHandle::from_raw(binding.structured)
+                StructuredBufferHandle::from_raw(binding.buffer)
                     .map_err(|_| EzGfxResult::InvalidContext)?,
             ),
             (false, true, false) => ResourceIdentity::Indirect(
-                IndirectBufferHandle::from_raw(binding.indirect)
+                IndirectBufferHandle::from_raw(binding.counted_buffer)
                     .map_err(|_| EzGfxResult::InvalidContext)?,
             ),
             (false, false, true) => ResourceIdentity::RenderTarget(
@@ -934,5 +919,8 @@ fn read_bindings(
 }
 
 fn catch_void(operation: impl FnOnce()) {
+    if callback::is_invoking() {
+        return;
+    }
     let _ = catch_unwind(AssertUnwindSafe(operation));
 }

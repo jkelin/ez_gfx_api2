@@ -116,23 +116,16 @@ fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
         if primitive_bytes > 16 * 1024 * 1024 {
             anyhow::bail!("primitive records exceed ABI boundary");
         }
-        let index_bytes = byte_len(&mesh.indices)?;
-        let positions_bytes = byte_len(&mesh.positions)?;
-        let normals_bytes = byte_len(&mesh.normals)?;
-        let uvs_bytes = byte_len(&mesh.uvs)?;
-        let primitive_ids_bytes = byte_len(&primitive_ids)?;
-        create_index_heap(context, index_bytes)?;
-        let index_allocation = upload_indices(context, &mesh.indices)?;
+        let index_allocation = context.upload_indices(&mesh.indices)?;
         let (first_index, _) = index_allocation.range()?;
-        let positions_heap = create_vertex_heap(context, "positions", positions_bytes, 16)?;
-        let positions = upload_vertices(&positions_heap, &mesh.positions)?;
-        let normals_heap = create_vertex_heap(context, "normals", normals_bytes, 16)?;
-        let normals = upload_vertices(&normals_heap, &mesh.normals)?;
-        let uvs_heap = create_vertex_heap(context, "uvs", uvs_bytes, 16)?;
-        let uvs = upload_vertices(&uvs_heap, &mesh.uvs)?;
-        let primitive_ids_heap =
-            create_vertex_heap(context, "primitive_ids", primitive_ids_bytes, 4)?;
-        let primitive_ids_buffer = upload_vertices(&primitive_ids_heap, &primitive_ids)?;
+        let positions_heap = context.create_vertex_heap("positions")?;
+        let positions = positions_heap.upload(&mesh.positions)?;
+        let normals_heap = context.create_vertex_heap("normals")?;
+        let normals = normals_heap.upload(&mesh.normals)?;
+        let uvs_heap = context.create_vertex_heap("uvs")?;
+        let uvs = uvs_heap.upload(&mesh.uvs)?;
+        let primitive_ids_heap = context.create_vertex_heap("primitive_ids")?;
+        let primitive_ids_buffer = primitive_ids_heap.upload(&primitive_ids)?;
         let repeat_sampler = TextureSamplerDesc {
             min_filter: SamplerFilter::Linear,
             mag_filter: SamplerFilter::Linear,
@@ -148,8 +141,7 @@ fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
             destination: ez_gfx::TextureDestination::Rgba8Unorm,
             sampler: repeat_sampler,
         };
-        let fallback = load_texture(
-            context,
+        let fallback = context.load_texture(
             TextureSource::Rgba8 {
                 width: 1,
                 height: 1,
@@ -177,7 +169,7 @@ fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
                 },
             };
             let texture =
-                match load_texture(context, TextureSource::Ktx2, &image.bytes, true, &config) {
+                match context.load_texture(TextureSource::Ktx2, &image.bytes, true, &config) {
                     Ok(value) => value,
                     Err(error) => {
                         return Err(anyhow::anyhow!("{error:?}"));
@@ -205,7 +197,7 @@ fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
                 transform: row_major(primitive.transform),
             })
             .collect::<Vec<_>>();
-        let shader = load_shader(context, &shader_bytes)?;
+        let shader = context.load_shader(&shader_bytes)?;
         let mut camera = OrbitCamera::new(90.0_f32.to_radians(), 8.0_f32.to_radians(), 0.45);
         let clip_y = shared::clip_y(backend);
         let target = Vec3::new(0.0, -0.32, 0.0);
@@ -215,55 +207,53 @@ fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
             padding: [0; 3],
         };
 
-        Ok(
-            move |context: &Context,
-                  surface: &Surface,
-                  input: FrameInput,
-                  events: &[SceneInput]| {
-                let mut frame = begin_frame(context, surface)?;
-                for &event in events {
-                    match event {
-                        SceneInput::CursorMoved { x, y } => camera.cursor(DVec2::new(x, y)),
-                        SceneInput::PrimaryButton(value) => camera.set_dragging(value),
-                        SceneInput::ScrollLines(lines) => camera.zoom(lines),
-                        _ => {}
-                    }
+        Ok(move |window_frame: WindowFrame| {
+            let mut frame = window_frame.frame;
+            let input = window_frame.input;
+            let events = &window_frame.events;
+            for &event in events {
+                match event {
+                    SceneInput::CursorMoved { x, y } => camera.cursor(DVec2::new(x, y)),
+                    SceneInput::PrimaryButton(value) => camera.set_dragging(value),
+                    SceneInput::ScrollLines(lines) => camera.zoom(lines),
+                    _ => {}
                 }
-                push.mvp = row_major(
-                    perspective(
-                        60.0_f32.to_radians(),
-                        input.width as f32 / input.height as f32,
-                        0.02,
-                        100.0,
-                        clip_y,
-                    )? * camera.view(target)?,
-                );
-                let primitives = frame.acquire_structured::<PrimitiveTextured>(records.len())?;
-                primitives.write(&mut frame, 0, &records)?;
-                let indirect = frame.acquire_indirect(primitive_count)?;
-                indirect.publish_compute_count(&mut frame, primitive_count)?;
-                let bindings = [
-                    Binding::structured("primitives", &primitives),
-                    Binding::indirect("draw_commands", &indirect),
-                ];
-                for allocation in [&positions, &normals, &uvs, &primitive_ids_buffer] {
-                    frame.retain_vertex_allocation(allocation)?;
-                }
-                frame.retain_index_allocation(&index_allocation)?;
-                for texture in &textures {
-                    frame.retain_texture(texture)?;
-                }
-                frame.add_compute(&shader, [primitive_count, 1, 1], &bindings, bytes_of(&push))?;
-                frame.add_graphics(
-                    &shader,
-                    &indirect,
-                    &bindings,
-                    DynamicPipelineState::from_abi(2, 0, 0, 0).unwrap(),
-                    bytes_of(&push),
-                )?;
-                Ok::<_, anyhow::Error>(frame)
-            },
-        )
+            }
+            push.mvp = row_major(
+                perspective(
+                    60.0_f32.to_radians(),
+                    input.width as f32 / input.height as f32,
+                    0.02,
+                    100.0,
+                    clip_y,
+                )? * camera.view(target)?,
+            );
+            let primitives = frame.acquire_buffer::<PrimitiveTextured>(records.len())?;
+            primitives.write(&mut frame, 0, &records)?;
+            let indirect = frame.acquire_counted_buffer(primitive_count)?;
+            indirect.publish_count(&mut frame, primitive_count)?;
+            let bindings = [
+                Binding::buffer("primitives", &primitives),
+                Binding::counted_buffer("draw_commands", &indirect),
+            ];
+            frame.retain_vertex_allocation(&positions)?;
+            frame.retain_vertex_allocation(&normals)?;
+            frame.retain_vertex_allocation(&uvs)?;
+            frame.retain_vertex_allocation(&primitive_ids_buffer)?;
+            frame.retain_index_allocation(&index_allocation)?;
+            for texture in &textures {
+                frame.retain_texture(texture)?;
+            }
+            frame.add_compute(&shader, [primitive_count, 1, 1], &bindings, bytes_of(&push))?;
+            frame.add_graphics(
+                &shader,
+                &indirect,
+                &bindings,
+                DynamicPipelineState::from_abi(2, 0, 0, 0).unwrap(),
+                bytes_of(&push),
+            )?;
+            Ok::<_, anyhow::Error>(frame)
+        })
     })
 }
 

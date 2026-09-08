@@ -4,12 +4,11 @@ Geometry uses owning named vertex heaps and one singleton context-owned device-l
 
 ## Public path
 
-1. Create each vertex heap with a unique semantic name, byte capacity, and stride; retain its owning `VertexHeap`.
-2. Create the context's singleton index heap with a byte capacity divisible by four. A second live index heap is rejected.
-3. Call `upload_vertices(&VertexHeap, &[T])` or `upload_indices(&Context, &[u32])`; each returns an owning, generation-validated allocation.
-4. Query `VertexAllocation::range` or `IndexAllocation::range` for indirect draw offsets.
-5. Poll upload events until empty once per frame.
-6. Drop heaps and allocations independently. Allocation leases keep their parent heap and context alive until cleanup is safe.
+1. Create each typed vertex heap with a unique semantic name through `Context::create_vertex_heap<T>(name)`; retain its owning `VertexHeap<T>`.
+2. Call `VertexHeap::upload(&[T])` or `Context::upload_indices(&[u32])`; the index heap is created lazily, and each upload returns an owning generation-validated allocation.
+3. Query `VertexAllocation::range` or `IndexAllocation::range` for indirect draw offsets.
+4. Register one `Context` callback for upload, runtime, diagnostic, and readback events.
+5. Drop heaps and allocations independently. Allocation leases keep their parent heap and context alive until cleanup is safe.
 
 The safe interface exposes an owning `VertexHeap`, owning vertex/index allocations, and a context-owned singleton index heap rather than public destroy, remove, release, or free functions. Dropping an allocation retires its range; dropping a vertex heap retires it after every child lease and GPU use. C mirrors the lifecycle with opaque generational `EzGfxVertexHeap`, `EzGfxVertexAllocation`, and `EzGfxIndexAllocation` handles; index-heap creation/destruction remains explicit against `EzGfxContext`.
 
@@ -56,14 +55,9 @@ Each heap uses an ordered range free list. Allocation validates stride, capacity
 The index heap is a context singleton, not a freely creatable family of named heaps. Range retirement remains gated by native completion; parent resources remain leased until their children and recorded uses are gone.
 ## Upload events
 
-`upload_vertices(&VertexHeap, &[T])` and `upload_indices(&Context, &[u32])` enqueue lossless typed transitions:
+`VertexHeap::upload(&[T])` and `Context::upload_indices(&[u32])` enqueue lossless typed transitions: `SourceStaged`, `DeviceReady`, `Failed(status)`, or `Cancelled`.
 
-- `SourceStaged`: caller bytes were copied into runtime-owned mapped staging and may be released;
-- `DeviceReady`: the device-local allocation completed transfer;
-- `Failed(status)`: terminal upload failure;
-- `Cancelled`: terminal cancellation where supported.
-
-The queue is unbounded and never shares the bounded diagnostic queue. Poll until empty every frame to avoid retaining events indefinitely. The last context/resource owner drops remaining events after draining owned work.
+`Context::register_callback` is the sole safe event channel. The facade dispatches queued events at creator-thread operation seams; applications do not poll internal runtime queues.
 
 A heap-level maximum readiness token is used when a frame imports a named heap. It may wait for a later allocation in the same heap, but never permits early use.
 
@@ -71,18 +65,18 @@ A heap-level maximum readiness token is used when a frame imports a named heap. 
 
 Geometry staging grows subject to allocator and OS failure, not a fixed slot count. Reusable mapped buckets retire by completion token and are reused only after completion.
 
-The typed slice upload API derives and checks count, stride, multiplication, and byte length before one caller-slice to mapped-staging copy, followed by the GPU copy. Raw pointer/count conversion and the 16 MiB caller boundary remain in `ez-gfx-ffi`. The API does not provide a direct mapped lease. Procedural zero-copy staging leases remain planned work; current APIs and plans must not claim that feature is implemented.
+The typed slice upload interface derives and checks count, stride, multiplication, and byte length before one caller-slice to mapped-staging copy, followed by the GPU copy. Raw pointer/count conversion and the 16 MiB caller boundary remain in `ez-gfx-ffi`. The interface does not provide a direct mapped lease.
 
 ## Transient frame buffers
 
-Applications call `Frame::acquire_structured<T>(element_count)` and `Frame::acquire_indirect(capacity)` through `&mut Frame`. `StructuredBuffer::write(&mut Frame, start_index, values)` and `IndirectBuffer::write(&mut Frame, start_index, commands)` validate frame ownership and checked ranges; indirect writes advance the active count to the maximum written end.
+Applications call `Frame::acquire_buffer<T>(element_count)` and `Frame::acquire_counted_buffer(element_count)` through `&mut Frame`. `Buffer::write(&mut Frame, start_index, values)` and `CountedBuffer::write(&mut Frame, start_index, commands)` validate frame ownership and checked ranges.
 
 Compute-generated indirect bytes cannot update CPU publication metadata, so callers publish the known indirect count before compute and graphics share the buffer in one frame. Transient wrappers may outlive the borrow that created them, but become invalid immediately when their frame finishes or aborts. Native reuse remains completion-gated or, after indeterminate failure, quarantined.
 
 ## Frame ownership
 
-`begin_frame(&Context, &Surface)` returns an owning `Frame`; all recording methods take `&mut Frame`. `Frame::finish(self)` preserves exact submission or presentation errors. `Drop` aborts an unfinished frame, so the safe interface exposes no frame-end, frame-abort, or transient-release functions. ABI 31 keeps those operations explicit for C through opaque generational `EzGfxFrame` handles.
+`Surface::begin_frame()` creates an owning target-less `Frame`; `Frame::configure_swapchain(size, format)` attaches presentation. Named targets use `Context::begin_frame()` and `Frame::configure_render_target(name, size, format)`. `Frame::finish(self)` preserves exact errors. `Drop` aborts an unfinished frame, so safe Rust exposes no frame-end, frame-abort, or transient-release functions.
 
 ## Examples
 
-The shared `Example` host owns `Context`, `Surface`, resize/input/automation, and frame completion. Each renderer closure begins and records an owning `Frame`, acquires fresh transients through `&mut Frame`, and returns the frame to `Example::handle_frame` for consuming completion.
+The shared `Example` host owns `Context`, `Surface`, resize/input/automation, logical swapchain configuration, callbacks, and frame completion. Each setup closure returns concise per-frame recording logic; `Example::handle_frame` consumes the frame.

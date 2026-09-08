@@ -13,27 +13,62 @@ use ez_gfx_core::capability::CompressionSupport;
 #[cfg(all(feature = "ktx2", feature = "basis"))]
 use ez_gfx_runtime::texture::{TextureDecoder, TextureSource};
 
-use ez_gfx_ffi::{
-    EzGfxResult, EzGfxTextureDesc, EzGfxTextureRegionDesc, EzGfxTextureUploadTelemetry,
-    EzGfxUploadEvent, ez_gfx_poll_upload_event, ez_gfx_texture_cancel, ez_gfx_texture_get_binding,
-    ez_gfx_texture_get_residency, ez_gfx_texture_get_upload_telemetry, ez_gfx_texture_load,
-    ez_gfx_texture_set_residency, ez_gfx_texture_unload, ez_gfx_update_texture_region,
-};
 #[cfg(all(feature = "ktx2", feature = "basis"))]
 use ez_gfx_ffi::{
-    ez_gfx_frame_begin, ez_gfx_frame_end, ez_gfx_frame_readback,
+    EzGfxEvent, EzGfxEventKind, ez_gfx_callback_register, ez_gfx_frame_begin,
     ez_gfx_graph_enqueue_texture_readback,
 };
-fn poll_texture_ready(context: u64, texture: u64) -> EzGfxResult {
-    // SAFETY: all-zero is the documented initialization for this plain C record.
-    let mut event = unsafe { core::mem::zeroed::<EzGfxUploadEvent>() };
-    let mut present = 0;
-    let progress =
-        // SAFETY: event and presence outputs remain writable for this call.
-        unsafe { ez_gfx_poll_upload_event(&raw mut event, &raw mut present, context) };
-    if progress != EzGfxResult::Ok {
-        return progress;
+use ez_gfx_ffi::{
+    EzGfxResult, EzGfxTextureDesc, EzGfxTextureRegionDesc, EzGfxTextureUploadTelemetry,
+    ez_gfx_texture_cancel, ez_gfx_texture_get_binding, ez_gfx_texture_get_residency,
+    ez_gfx_texture_get_upload_telemetry, ez_gfx_texture_load, ez_gfx_texture_set_residency,
+    ez_gfx_texture_unload, ez_gfx_update_texture_region,
+};
+#[cfg(all(feature = "ktx2", feature = "basis"))]
+#[derive(Default)]
+struct Collected {
+    uploads: Vec<(u64, u8)>,
+    readback: Option<Vec<u8>>,
+}
+
+/// Records callback-delivered upload transitions and readback bytes.
+///
+/// # Safety
+///
+/// `user_data` must address a live `Collected` for the registration lifetime.
+#[cfg(all(feature = "ktx2", feature = "basis"))]
+unsafe extern "C" fn collect_event(event: *const EzGfxEvent, user_data: *mut core::ffi::c_void) {
+    // SAFETY: registration keeps this test-owned allocation alive through each delivery.
+    let out = unsafe { &mut *user_data.cast::<Collected>() };
+    // SAFETY: the event borrows its payload for this invocation only.
+    let event = unsafe { &*event };
+    match event.kind {
+        EzGfxEventKind::Upload => {
+            out.uploads
+                .push((event.upload.resource, event.upload.status));
+        }
+        EzGfxEventKind::Readback => {
+            let bytes = if event.readback_bytes.is_null() || event.readback_byte_count == 0 {
+                Vec::new()
+            } else {
+                // SAFETY: the borrowed byte range is live for this invocation.
+                unsafe {
+                    core::slice::from_raw_parts(event.readback_bytes, event.readback_byte_count)
+                }
+                .to_vec()
+            };
+            out.readback = Some(bytes);
+        }
+        _ => {}
     }
+}
+fn poll_texture_ready(context: u64, texture: u64) -> EzGfxResult {
+    // Owner-thread idle admits transfers; a registration observes their events.
+    // Binding readiness stays authoritative: this only advances progress.
+    assert_eq!(
+        ez_gfx_ffi::ez_gfx_context_wait_idle(context),
+        EzGfxResult::Ok
+    );
     let mut binding = 0;
     // SAFETY: binding remains writable and both handles are supplied by this test.
     unsafe { ez_gfx_texture_get_binding(texture, &raw mut binding, context) }
@@ -325,6 +360,14 @@ fn exercises_async_texture_batches(backend: u8) {
             EzGfxResult::Ok
         );
         let mut frame = 0;
+        let mut collected = Collected::default();
+        assert_eq!(
+            // SAFETY: `collected` outlives the registration below through explicit clearing.
+            unsafe {
+                ez_gfx_callback_register(context, Some(collect_event), (&raw mut collected).cast())
+            },
+            EzGfxResult::Ok
+        );
         assert_eq!(
             // SAFETY: frame output storage is live and aligned.
             unsafe { ez_gfx_frame_begin(context, native.surface, &raw mut frame) },
@@ -332,32 +375,15 @@ fn exercises_async_texture_batches(backend: u8) {
         );
         assert_eq!(
             ez_gfx_graph_enqueue_texture_readback(compressed, frame),
+            EzGfxResult::InvalidArgument
+        );
+        assert_eq!(ez_gfx_ffi::ez_gfx_frame_abort(frame), EzGfxResult::Ok);
+        assert!(collected.readback.is_none());
+        assert_eq!(
+            // SAFETY: clearing a live registration needs no user data.
+            unsafe { ez_gfx_callback_register(context, None, core::ptr::null_mut()) },
             EzGfxResult::Ok
         );
-        assert_eq!(
-            ez_gfx_frame_end(frame),
-            if cfg!(windows) {
-                EzGfxResult::Ok
-            } else {
-                EzGfxResult::Unsupported
-            }
-        );
-        let mut size = 0;
-        assert_eq!(
-            // SAFETY: The size output remains live and writable through the query.
-            unsafe { ez_gfx_frame_readback(core::ptr::null_mut(), 0, &raw mut size, context) },
-            EzGfxResult::Ok
-        );
-        let mut actual = vec![0; size];
-        assert_eq!(
-            // SAFETY: `actual` exposes exactly its writable initialized allocation.
-            unsafe {
-                ez_gfx_frame_readback(actual.as_mut_ptr(), actual.len(), &raw mut size, context)
-            },
-            EzGfxResult::Ok
-        );
-        assert_eq!(&actual[..base.bytes.len()], base.bytes);
-        assert!(actual[base.bytes.len()..].iter().all(|byte| *byte == 0));
         ez_gfx_texture_unload(compressed, context);
     }
     let mut telemetry = EzGfxTextureUploadTelemetry {

@@ -3,7 +3,9 @@ use crate::{
     graph::{CompiledGraph, FrameGraph, GraphError, NodeDesc, NodeId, ResourceDesc, ResourceId},
     indirect::{DrawIndexedCommand, IndexedIndirectBuffer, IndirectError},
 };
-use ez_gfx_core::handle::{IndirectBufferHandle, ShaderHandle, SurfaceHandle, TextureHandle};
+use ez_gfx_core::handle::{
+    IndirectBufferHandle, RenderTargetHandle, ShaderHandle, SurfaceHandle, TextureHandle,
+};
 use ez_gfx_hal::{CompletionToken, DynamicPipelineState, ResourceState};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +58,11 @@ pub enum ExecutableNode {
     TextureReadback {
         /// Texture handle.
         texture: TextureHandle,
+    },
+    /// A managed render-target readback node.
+    RenderTargetReadback {
+        /// Render-target handle.
+        target: RenderTargetHandle,
     },
     /// A presentation node.
     Present {

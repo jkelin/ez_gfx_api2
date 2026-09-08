@@ -4,9 +4,7 @@ Texture loading is asynchronous. Each safe `Texture` is an owning wrapper whose 
 
 ## Public path
 
-`load_texture` validates the request, copies caller source before returning, reserves a generational lease, and schedules CPU work. The context-wide lossless upload queue is authoritative in ABI 31.
-
-Poll until the queue is empty once per frame on the context creator thread. Polling also drains decoded work, admits native transfers, publishes completed texture views, and reports owner-thread failures.
+`Context::load_texture` validates the request, copies caller source before returning, reserves a generational lease, and schedules CPU work. Register one creator-thread callback with `Context::register_callback`; graphics safe points drain the lossless upload queue, advance decoded work and native transfers, publish completed views, and report failures.
 
 Events identify a typed texture, vertex allocation, or index allocation and report:
 
@@ -15,7 +13,7 @@ Events identify a typed texture, vertex allocation, or index allocation and repo
 - `Failed(status)`: terminal failure;
 - `Cancelled`: terminal cancellation.
 
-The upload queue is unbounded and lossless. It is separate from bounded runtime diagnostics. Applications must drain it regularly; otherwise queued records retain memory until polling or the last owning context/resource wrapper is dropped.
+The upload queue is unbounded and lossless. It is separate from bounded runtime diagnostics. Applications must retain a callback and regularly reach graphics safe points; otherwise queued records retain memory until the last owning context/resource wrapper is dropped.
 
 ```mermaid
 sequenceDiagram
@@ -84,11 +82,11 @@ C calls copy borrowed source bytes during the call, preserving asynchronous life
 
 ## Frame ownership
 
-Texture bindings are recorded only through `&mut Frame`. `begin_frame(&Context, &Surface)` returns the frame owner; `Frame::finish(self)` submits and presents while preserving exact errors, and dropping an unfinished frame aborts. Any structured or indirect buffers used alongside textures are transient and become invalid on finish or abort.
+Texture bindings are recorded only through `&mut Frame`. Surface recording uses `Surface::begin_frame()` and `Frame::configure_swapchain`; named targets use `Context::begin_frame()` and `Frame::configure_render_target`. `Frame::finish(self)` preserves exact errors, while dropping an unfinished frame aborts. `Buffer<T>` and `CountedBuffer<T>` values used alongside textures are invalidated on every terminal path. `RenderTarget::prepare_readback()` creates an opaque request, and completed bytes exist only during the registered callback.
 
-## C ABI 31
+## C ABI 30
 
-Use `ez_gfx_poll_upload_event(&event, &present, context)` until `present == 0` each frame. When `event.resource_kind == EzGfxUploadResourceKind_Texture`, compare `event.resource` with the retained texture handle. On `EzGfxUploadStatus_DeviceReady`, resolve the binding. On `Failed` or `Cancelled`, retire the request or continue with a fallback. Convert result codes with `ez_gfx_print_error` into caller-owned storage.
+Install `ez_gfx_callback_register(context, callback, user_data)`. The callback receives `EzGfxEventKind_Upload`, runtime, diagnostic, dropped-count, and readback events on the context creator thread at graphics safe points. Compare upload resource handles, resolve bindings after `EzGfxUploadStatus_DeviceReady`, and copy readback bytes before the callback returns. Passing a null callback clears the registration. Convert result codes with `ez_gfx_print_error`.
 
 `ez_gfx_texture_poll` remains absent. C retains explicit texture load, cancellation, binding, residency, region-update, telemetry, and unload functions because RAII is available only through the safe Rust interface.
 
@@ -98,4 +96,4 @@ Frame recording imports only resources referenced by active work. Texture descri
 
 ## Verification and remaining evidence
 
-Pure queue and allocator transitions are covered by runtime tests. ABI layout/export tests cover event records, typed heap/allocation handles, transient buffer signatures, and ABI 31 parity. Native backend behavior requires the Linux Vulkan, Windows DX12, and macOS Metal remote matrices.
+Pure queue and allocator transitions are covered by runtime tests. ABI layout/export tests cover callback event records, typed heap/allocation handles, transient buffer signatures, and ABI 30 parity. Native backend behavior requires the Linux Vulkan, Windows DX12, and macOS Metal remote matrices.

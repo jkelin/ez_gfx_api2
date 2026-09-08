@@ -2,11 +2,11 @@
 
 `ez-gfx-ffi` is the C ABI boundary for the `ez-gfx` runtime. C and other foreign-language clients must include [`include/ez_gfx_api.h`](../../include/ez_gfx_api.h); the declarations and numeric values in that header are canonical. Rust clients should depend on `ez-gfx`, not `ez-gfx-ffi`.
 
-The complete [C textured cube](../../examples/c/textured_cube/README.md) exercises ABI 31 typed heap/allocation handles, transient compute-to-graphics buffers, presentation, stable error printing, and snapshot readback on Win32.
+The complete [C textured cube](../../examples/c/textured_cube/README.md) exercises ABI 30 typed heap/allocation handles, transient compute-to-graphics buffers, presentation, creator-thread callbacks, stable error printing, and snapshot readback on Win32.
 
 ## Compatibility and ownership
 
-Before any other call, require `ez_gfx_abi_version() == EZ_GFX_ABI_VERSION` (ABI 31). Version 31 adds explicit generation-, kind-, owner-, state-, and frame-serial-validated `EzGfxFrame` handles and makes recording and transient operations frame-scoped. Version 30 added typed vertex heaps, batched indirect writes, and frame-transient structured/indirect buffers; version 29 made `EzGfxResult` C-ABI-only and added `ez_gfx_print_error`; version 28 added typed geometry allocations and upload events.
+Before any other call, require `ez_gfx_abi_version() == EZ_GFX_ABI_VERSION` (ABI 30). Version 30 introduces creator-thread event callbacks, `EzGfxBuffer` and `EzGfxCountedBuffer`, explicit generation-, kind-, owner-, state-, and frame-serial-validated `EzGfxFrame` handles, frame-scoped recording and transient operations, typed vertex heaps, and batched indirect writes.
 
 `ez_gfx_handle_inspect` decodes a packed handle into its context/child slot and generation fields; it does not validate that the handle is live in a context. `ez_gfx_semantic_id` accepts an exact 1-to-255-byte canonical semantic name and writes its fixed 16-byte identifier. Semantic names are ASCII dot-separated identifiers: every non-empty segment starts with an ASCII letter and continues with ASCII letters, digits, or underscores. Empty segments, non-ASCII bytes, embedded NUL, and terminators included in the supplied length are invalid.
 
@@ -23,7 +23,7 @@ The context and all context/resource operations, including teardown, are creator
 5. Consume the frame with `ez_gfx_frame_end`; it submits and presents surface frames. On early exit, consume it with `ez_gfx_frame_abort`. Terminal calls invalidate the frame even when submission, presentation, or abort reports an error.
 6. Remove live geometry allocations before destroying typed heaps. Destroying the context aborts any remaining descendant frame, then tears down on the creator thread.
 
-Texture loading copies caller bytes and schedules unbounded CPU work subject to real allocation failure. `ez_gfx_poll_upload_event` reports source ownership transfer, device readiness, cancellation, and terminal failure. Custom decoder callbacks may execute concurrently; successful output remains valid until ez-gfx copies it and calls the paired release callback.
+Texture loading copies caller bytes and schedules unbounded CPU work subject to real allocation failure. `ez_gfx_callback_register` delivers source ownership transfer, device readiness, cancellation, terminal failure, runtime diagnostics, dropped-count reports, and borrowed readback bytes at creator-thread graphics safe points. Custom decoder callbacks may execute concurrently; successful output remains valid until ez-gfx copies it and calls the paired release callback.
 
 ## Boundary rules
 
@@ -31,8 +31,8 @@ Every pointer must be non-null where its declaration or operation requires it, c
 
 Every `const char *` input has an adjacent `size_t` byte length. The pointer denotes exactly that many UTF-8 bytes, excluding and not requiring a terminator; embedded NUL is invalid. Required strings accept only a non-null pointer and a length in `1..=16 MiB`. Optional strings accept only null plus zero, or a non-null pointer and a length in that same nonzero range. This contract also applies independently to every string field nested in shader, texture, and binding structures. Binding arrays contain at most 16 entries and each entry names exactly one nonzero typed resource handle. Push-constant data is borrowed for the call, at most 128 bytes, and its size must be a multiple of four.
 
-Pointer-plus-count ranges must describe the complete range and stay within 16 MiB. Structured acquire validates nonzero stride/count; structured write validates start/count/stride and permits null data only for zero elements. Indirect batch write likewise permits null commands only for zero count and rejects checked end overflow. Vertex/index uploads and artifacts remain nonempty and capped.
+Pointer-plus-count ranges must describe the complete range and stay within 16 MiB. Buffer acquire validates nonzero stride/count; buffer write validates start/count/stride and permits null data only for zero elements. Counted-buffer batch write likewise permits null commands only for zero count and rejects checked end overflow. Vertex/index uploads and artifacts remain nonempty and capped.
 
 Void destruction exports contain panics but cannot report stale, foreign, wrong-kind, or wrong-thread handles. Status-returning exports validate their complete boundary, convert the safe facade `Error` explicitly, and map contained panics to `EzGfxResult_NativeFailure`. `ez_gfx_print_error` uses caller-owned storage: null+zero queries the required NUL-inclusive size, sufficient storage receives stable UTF-8 plus NUL, and insufficient storage is rejected without modifying the buffer.
 
-The upload-event queue is lossless and unbounded; drain it until empty once per frame. Runtime progress and diagnostic queues remain bounded and report dropped counts. `QueueFull` is retained for genuine counter/channel failure, not routine texture or transfer admission.
+The upload-event queue is lossless and unbounded; creator-thread graphics safe points deliver it through the registered callback. Runtime progress and diagnostic queues remain bounded and report dropped counts through that callback. `QueueFull` is retained for genuine counter/channel failure, not routine texture or transfer admission.

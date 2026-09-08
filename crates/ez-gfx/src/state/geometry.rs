@@ -3,26 +3,60 @@
 use crate::Result;
 
 use super::{
-    AllocationRequest, CompletionToken, ContextHandle, DEFAULT_STAGING_POLICY, Error,
-    GeometryAllocation, IndexAllocationHandle, MemoryClass, NativeAllocation, NativeContext,
-    ResourceKind, UploadEvent, UploadResource, UploadStatus, VertexAllocationHandle,
-    VertexHeapHandle, allocate_native, completed_transfer_native, copy_native,
-    free_native_allocation, map_allocation, map_geometry, map_hal, map_lifecycle, result_status,
-    staging_bucket_size, wait_native_idle, with_context_mut, write_native,
+    AllocationRequest, CompletionToken, ContextHandle, ContextState, DEFAULT_STAGING_POLICY, Error,
+    GeometryAllocation, GeometryError, IndexAllocationHandle, MemoryClass, NativeAllocation,
+    NativeContext, ResourceKind, RetiredGeometry, RetiredGeometryRange, RetiredRangeKind,
+    RetiredVertexHeap, UploadEvent, UploadResource, UploadStatus, VertexAllocationHandle,
+    VertexHeapHandle, allocate_native, completed_native_frame_value, completed_transfer_native,
+    copy_native, free_native_allocation, last_native_frame_completion, map_allocation,
+    map_geometry, map_lifecycle, result_status, staging_bucket_size, with_context_mut,
+    write_native,
 };
 
-/// Creates a named vertex heap and returns its typed identity.
+const INITIAL_GEOMETRY_HEAP_BYTES: u64 = 64 * 1024;
+
+/// Creates an auto-growing named vertex heap and returns its typed identity.
 ///
 /// # Errors
 ///
-/// Returns an error when validation, handle ownership, readiness, or a backend operation fails.
+/// Returns an error when validation, handle ownership, readiness, or native allocation fails.
 pub fn create_vertex_heap(
+    context: ContextHandle,
+    name: &str,
+    stride: u64,
+) -> Result<VertexHeapHandle> {
+    let capacity = initial_heap_capacity(stride)?;
+    create_vertex_heap_with_capacity(context, name, capacity, stride)
+}
+
+/// Creates a fixed-initial-capacity heap for the C raw seam.
+///
+/// # Errors
+/// Returns an error when validation, capacity, ownership, or allocation fails.
+#[allow(
+    dead_code,
+    reason = "the C raw seam preserves caller-selected initial capacity"
+)]
+pub fn create_vertex_heap_with_capacity(
+    context: ContextHandle,
+    name: &str,
+    capacity: u64,
+    stride: u64,
+) -> Result<VertexHeapHandle> {
+    if capacity == 0 || stride == 0 {
+        return Err(Error::InvalidArgument);
+    }
+    create_vertex_heap_impl(context, name, capacity, stride)
+}
+
+fn create_vertex_heap_impl(
     context: ContextHandle,
     name: &str,
     capacity: u64,
     stride: u64,
 ) -> Result<VertexHeapHandle> {
     with_context_mut(context, |context| {
+        reclaim_retired_geometry(context)?;
         let heap_id = context.next_vertex_heap_id;
         let next_heap_id = heap_id.checked_add(1).ok_or(Error::NativeFailure)?;
         context
@@ -62,9 +96,10 @@ pub fn create_vertex_heap(
     })
 }
 
-/// Destroys a vertex heap identified by its owner-validated handle.
+/// Retires a vertex heap identified by its owner-validated handle.
 pub fn destroy_vertex_heap(context: ContextHandle, handle: VertexHeapHandle) {
     let _ = with_context_mut(context, |context| {
+        reclaim_retired_geometry(context)?;
         context
             .identity
             .resolve(handle.packed(), ResourceKind::VertexHeap)
@@ -82,10 +117,11 @@ pub fn destroy_vertex_heap(context: ContextHandle, handle: VertexHeapHandle) {
         if context.frame_vertex_heaps.contains_key(&heap_id) {
             return Err(Error::NotReady);
         }
-        context
-            .geometry
-            .remove_vertex_heap(&name)
-            .map_err(map_geometry)?;
+        let logical_removed = match context.geometry.remove_vertex_heap(&name) {
+            Ok(()) => true,
+            Err(GeometryError::HeapNotEmpty) => false,
+            Err(error) => return Err(map_geometry(error)),
+        };
         context.vertex_heap_handles.remove(&handle);
         let heap = context
             .vertex_heaps
@@ -95,7 +131,15 @@ pub fn destroy_vertex_heap(context: ContextHandle, handle: VertexHeapHandle) {
             .identity
             .remove(handle.packed(), ResourceKind::VertexHeap)
             .map_err(map_lifecycle)?;
-        free_native_allocation(&mut context.native, heap.allocation).map_err(map_allocation)
+        if logical_removed {
+            free_native_allocation(&mut context.native, heap.allocation).map_err(map_allocation)
+        } else {
+            context.retired_vertex_heaps.push(RetiredVertexHeap {
+                name,
+                allocation: heap.allocation,
+            });
+            Ok(())
+        }
     });
 }
 
@@ -104,6 +148,10 @@ pub fn destroy_vertex_heap(context: ContextHandle, handle: VertexHeapHandle) {
 /// # Errors
 ///
 /// Returns an error when validation, handle ownership, readiness, or a backend operation fails.
+#[allow(
+    dead_code,
+    reason = "the C raw seam retains explicit index-heap creation while safe Rust creates it lazily"
+)]
 pub fn create_index_heap(context: ContextHandle, capacity: u64) -> Result<()> {
     result_status(with_context_mut(context, |context| {
         context
@@ -144,6 +192,178 @@ pub fn destroy_index_heap(context: ContextHandle) {
         let heap = context.index_heap.take().ok_or(Error::InvalidArgument)?;
         free_native_allocation(&mut context.native, heap.allocation).map_err(map_allocation)
     });
+}
+
+fn initial_heap_capacity(stride: u64) -> Result<u64> {
+    if stride == 0 || stride > u64::from(u32::MAX) {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(INITIAL_GEOMETRY_HEAP_BYTES.max(stride))
+}
+
+fn grown_capacity(current: u64, appended_bytes: u64) -> Result<u64> {
+    let required = current
+        .checked_add(appended_bytes)
+        .ok_or(Error::InvalidArgument)?;
+    Ok(current.saturating_mul(2).max(required))
+}
+
+fn ensure_index_heap(context: &mut ContextState, required_bytes: u64) -> Result<()> {
+    if context.index_heap.is_some() {
+        return Ok(());
+    }
+    let capacity = initial_heap_capacity(4)?.max(required_bytes);
+    context
+        .geometry
+        .create_index_heap(capacity)
+        .map_err(map_geometry)?;
+    let request = AllocationRequest::new(capacity, 16, MemoryClass::Device, false, None)
+        .map_err(map_allocation)?;
+    match allocate_native(&mut context.native, request) {
+        Ok(allocation) => {
+            context.index_heap = Some(GeometryAllocation {
+                allocation,
+                ready: None,
+                size: capacity,
+                heap_id: None,
+            });
+            Ok(())
+        }
+        Err(error) => {
+            let _ = context.geometry.remove_index_heap();
+            Err(map_allocation(error))
+        }
+    }
+}
+
+fn grow_vertex_storage(context: &mut ContextState, name: &str, appended_bytes: u64) -> Result<()> {
+    let heap = context
+        .vertex_heaps
+        .get(name)
+        .ok_or(Error::InvalidContext)?;
+    let heap_id = heap.heap_id.ok_or(Error::NativeFailure)?;
+    if context.frame_vertex_heaps.contains_key(&heap_id) {
+        return Err(Error::NotReady);
+    }
+    let capacity = grown_capacity(heap.size, appended_bytes)?;
+    grow_storage(context, Some(name), capacity)
+}
+
+fn grow_index_storage(context: &mut ContextState, appended_bytes: u64) -> Result<()> {
+    if context.frame_index.is_some() {
+        return Err(Error::NotReady);
+    }
+    let heap = context.index_heap.as_ref().ok_or(Error::InvalidContext)?;
+    let capacity = grown_capacity(heap.size, appended_bytes)?;
+    grow_storage(context, None, capacity)
+}
+
+fn grow_storage(
+    context: &mut ContextState,
+    vertex_name: Option<&str>,
+    capacity: u64,
+) -> Result<()> {
+    reclaim_retired_geometry(context)?;
+    let current = match vertex_name {
+        Some(name) => context.vertex_heaps.get(name),
+        None => context.index_heap.as_ref(),
+    }
+    .ok_or(Error::InvalidContext)?;
+    let request = AllocationRequest::new(capacity, 16, MemoryClass::Device, false, None)
+        .map_err(map_allocation)?;
+    let replacement = allocate_native(&mut context.native, request).map_err(map_allocation)?;
+    let transfer = match copy_native(
+        &mut context.native,
+        &current.allocation,
+        &replacement,
+        0,
+        0,
+        current.size,
+    ) {
+        Ok(token) => token,
+        Err(error) => {
+            let _ = free_native_allocation(&mut context.native, replacement);
+            return Err(map_allocation(error));
+        }
+    };
+    let graphics = last_native_frame_completion(&context.native).ok();
+    let old = if let Some(name) = vertex_name {
+        context
+            .geometry
+            .grow_vertex_heap(name, capacity)
+            .map_err(map_geometry)?;
+        context.vertex_heaps.get_mut(name)
+    } else {
+        context
+            .geometry
+            .grow_index_heap(capacity)
+            .map_err(map_geometry)?;
+        context.index_heap.as_mut()
+    }
+    .ok_or(Error::InvalidContext)?;
+    old.ready = Some(transfer);
+    old.size = capacity;
+    let allocation = core::mem::replace(&mut old.allocation, replacement);
+    context.retired_geometry.push(RetiredGeometry {
+        allocation,
+        transfer,
+        graphics,
+    });
+    Ok(())
+}
+
+fn reclaim_retired_geometry(context: &mut ContextState) -> Result<()> {
+    if !context.retired_geometry.is_empty() || !context.retired_geometry_ranges.is_empty() {
+        let transfer = completed_transfer_native(&mut context.native).map_err(map_allocation)?;
+        let graphics = completed_native_frame_value(&mut context.native)?;
+        let mut index = 0;
+        while index < context.retired_geometry.len() {
+            let retired = &context.retired_geometry[index];
+            let graphics_ready = retired
+                .graphics
+                .is_none_or(|completion| completion.value <= graphics);
+            if retired.transfer.value > transfer || !graphics_ready {
+                index += 1;
+                continue;
+            }
+            let retired = context.retired_geometry.swap_remove(index);
+            free_native_allocation(&mut context.native, retired.allocation)
+                .map_err(map_allocation)?;
+        }
+
+        let mut index = 0;
+        while index < context.retired_geometry_ranges.len() {
+            let retired = &context.retired_geometry_ranges[index];
+            let graphics_ready = retired
+                .graphics
+                .is_none_or(|completion| completion.value <= graphics);
+            if retired.transfer.value > transfer || !graphics_ready {
+                index += 1;
+                continue;
+            }
+            let retired = context.retired_geometry_ranges.swap_remove(index);
+            match retired.kind {
+                RetiredRangeKind::Vertex => context.geometry.free_vertex(retired.handle),
+                RetiredRangeKind::Index => context.geometry.free_indices(retired.handle),
+            }
+            .map_err(map_geometry)?;
+        }
+    }
+
+    let mut index = 0;
+    while index < context.retired_vertex_heaps.len() {
+        let name = &context.retired_vertex_heaps[index].name;
+        match context.geometry.remove_vertex_heap(name) {
+            Ok(()) => {
+                let retired = context.retired_vertex_heaps.swap_remove(index);
+                free_native_allocation(&mut context.native, retired.allocation)
+                    .map_err(map_allocation)?;
+            }
+            Err(GeometryError::HeapNotEmpty) => index += 1,
+            Err(error) => return Err(map_geometry(error)),
+        }
+    }
+    Ok(())
 }
 
 /// Uploads a typed POD slice to a vertex heap.
@@ -211,6 +431,12 @@ fn upload_vertices_raw_impl(
             .get(&heap)
             .cloned()
             .ok_or(Error::InvalidContext)?;
+        let byte_size = u64::from(count)
+            .checked_mul(element_size)
+            .ok_or(Error::InvalidArgument)?;
+        if bytes.len() as u64 != byte_size {
+            return Err(Error::InvalidArgument);
+        }
         let packed = context
             .identity
             .insert(ResourceKind::VertexAllocation)
@@ -222,6 +448,18 @@ fn upload_vertices_raw_impl(
             .reserve_vertices(&name, count, element_size, packed)
         {
             Ok(upload) => upload,
+            Err(GeometryError::CapacityExceeded) => {
+                if let Err(error) = grow_vertex_storage(context, &name, byte_size) {
+                    let _ = context
+                        .identity
+                        .remove(packed, ResourceKind::VertexAllocation);
+                    return Err(error);
+                }
+                context
+                    .geometry
+                    .reserve_vertices(&name, count, element_size, packed)
+                    .map_err(map_geometry)?
+            }
             Err(error) => {
                 let _ = context
                     .identity
@@ -229,13 +467,6 @@ fn upload_vertices_raw_impl(
                 return Err(map_geometry(error));
             }
         };
-        if bytes.len() as u64 != upload.byte_size {
-            let _ = context.geometry.free_vertices(&name, packed);
-            let _ = context
-                .identity
-                .remove(packed, ResourceKind::VertexAllocation);
-            return Err(Error::InvalidArgument);
-        }
         let heap = context
             .vertex_heaps
             .get_mut(&name)
@@ -254,6 +485,7 @@ fn upload_vertices_raw_impl(
                     .mark_ready(packed, token)
                     .map_err(map_geometry)?;
                 context.geometry_uploads.insert(packed, token);
+                context.geometry_last_transfer.insert(packed, token);
                 context.upload_events.push(UploadEvent {
                     resource: UploadResource::Vertex(handle),
                     status: UploadStatus::SourceStaged,
@@ -308,6 +540,13 @@ fn upload_indices_raw_impl(
     bytes: &[u8],
 ) -> Result<IndexAllocationHandle> {
     with_context_mut(context, |context| {
+        let byte_size = u64::from(count)
+            .checked_mul(4)
+            .ok_or(Error::InvalidArgument)?;
+        if bytes.len() as u64 != byte_size {
+            return Err(Error::InvalidArgument);
+        }
+        ensure_index_heap(context, byte_size)?;
         let packed = context
             .identity
             .insert(ResourceKind::IndexAllocation)
@@ -316,6 +555,18 @@ fn upload_indices_raw_impl(
             IndexAllocationHandle::from_packed(packed).map_err(|_| Error::NativeFailure)?;
         let upload = match context.geometry.reserve_indices(count, packed) {
             Ok(upload) => upload,
+            Err(GeometryError::CapacityExceeded) => {
+                if let Err(error) = grow_index_storage(context, byte_size) {
+                    let _ = context
+                        .identity
+                        .remove(packed, ResourceKind::IndexAllocation);
+                    return Err(error);
+                }
+                context
+                    .geometry
+                    .reserve_indices(count, packed)
+                    .map_err(map_geometry)?
+            }
             Err(error) => {
                 let _ = context
                     .identity
@@ -323,13 +574,6 @@ fn upload_indices_raw_impl(
                 return Err(map_geometry(error));
             }
         };
-        if bytes.len() as u64 != upload.byte_size {
-            let _ = context.geometry.free_indices(packed);
-            let _ = context
-                .identity
-                .remove(packed, ResourceKind::IndexAllocation);
-            return Err(Error::InvalidArgument);
-        }
         let heap = context.index_heap.as_mut().ok_or(Error::InvalidArgument)?;
         match stage_upload(
             &mut context.native,
@@ -345,6 +589,7 @@ fn upload_indices_raw_impl(
                     .mark_ready(packed, token)
                     .map_err(map_geometry)?;
                 context.geometry_uploads.insert(packed, token);
+                context.geometry_last_transfer.insert(packed, token);
                 context.upload_events.push(UploadEvent {
                     resource: UploadResource::Index(handle),
                     status: UploadStatus::SourceStaged,
@@ -406,49 +651,65 @@ pub fn index_allocation_range(
     })
 }
 
-/// Removes a vertex range after waiting for transfer and graphics safety.
+/// Retires a vertex range without blocking resource `Drop`.
 ///
 /// # Errors
+/// Returns an error for a stale identity or unavailable completion state.
 pub fn remove_vertices(context: ContextHandle, handle: VertexAllocationHandle) -> Result<()> {
     result_status(with_context_mut(context, |context| {
+        reclaim_retired_geometry(context)?;
         context
             .identity
             .resolve(handle.packed(), ResourceKind::VertexAllocation)
             .map_err(map_lifecycle)?;
-        wait_native_idle(&mut context.native).map_err(map_hal)?;
-        context
-            .geometry
-            .free_vertex(handle.packed())
-            .map_err(map_geometry)?;
-        context.geometry_uploads.remove(&handle.packed());
+        // Completed uploads leave the pending-event map but retain this fence until allocation drop.
+        let transfer = context
+            .geometry_last_transfer
+            .remove(&handle.packed())
+            .ok_or(Error::InvalidContext)?;
+        let graphics = last_native_frame_completion(&context.native).ok();
         context
             .identity
             .remove(handle.packed(), ResourceKind::VertexAllocation)
-            .map_err(map_lifecycle)
+            .map_err(map_lifecycle)?;
+        context.retired_geometry_ranges.push(RetiredGeometryRange {
+            handle: handle.packed(),
+            kind: RetiredRangeKind::Vertex,
+            transfer,
+            graphics,
+        });
+        reclaim_retired_geometry(context)
     }))
 }
 
-/// Removes an index range after waiting for transfer and graphics safety.
+/// Retires an index range without blocking resource `Drop`.
 ///
 /// # Errors
-///
-/// Returns an error when validation, handle ownership, readiness, or a backend operation fails.
+/// Returns an error for a stale identity or unavailable completion state.
 pub fn remove_indices(context: ContextHandle, handle: IndexAllocationHandle) -> Result<()> {
     result_status(with_context_mut(context, |context| {
+        reclaim_retired_geometry(context)?;
         context
             .identity
             .resolve(handle.packed(), ResourceKind::IndexAllocation)
             .map_err(map_lifecycle)?;
-        wait_native_idle(&mut context.native).map_err(map_hal)?;
-        context
-            .geometry
-            .free_indices(handle.packed())
-            .map_err(map_geometry)?;
-        context.geometry_uploads.remove(&handle.packed());
+        // Completed uploads leave the pending-event map but retain this fence until allocation drop.
+        let transfer = context
+            .geometry_last_transfer
+            .remove(&handle.packed())
+            .ok_or(Error::InvalidContext)?;
+        let graphics = last_native_frame_completion(&context.native).ok();
         context
             .identity
             .remove(handle.packed(), ResourceKind::IndexAllocation)
-            .map_err(map_lifecycle)
+            .map_err(map_lifecycle)?;
+        context.retired_geometry_ranges.push(RetiredGeometryRange {
+            handle: handle.packed(),
+            kind: RetiredRangeKind::Index,
+            transfer,
+            graphics,
+        });
+        reclaim_retired_geometry(context)
     }))
 }
 

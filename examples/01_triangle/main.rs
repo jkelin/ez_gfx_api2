@@ -34,43 +34,37 @@ fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
         ];
         let indices = [0_u32, 1, 2];
 
-        create_index_heap(context, byte_len(&indices)?)?;
-        let indices = upload_indices(context, &indices)?;
+        let indices = context.upload_indices(&indices)?;
         let first_index = indices.range()?.0;
-        let positions_heap = create_vertex_heap(context, "positions", byte_len(&positions)?, 16)?;
-        let positions = upload_vertices(&positions_heap, &positions)?;
-        let shader = load_shader(context, &shader_bytes)?;
+        let positions_heap = context.create_vertex_heap("positions")?;
+        let positions = positions_heap.upload(&positions)?;
+        let shader = context.load_shader(&shader_bytes)?;
 
-        Ok(
-            move |context: &Context,
-                  surface: &Surface,
-                  _input: FrameInput,
-                  _events: &[SceneInput]| {
-                let mut frame = begin_frame(context, surface)?;
-                let indirect = frame.acquire_indirect(1)?;
-                indirect.write(
-                    &mut frame,
-                    0,
-                    &[DrawIndexedCommand {
-                        index_count: 3,
-                        instance_count: 1,
-                        first_index,
-                        vertex_offset: 0,
-                        first_instance: 0,
-                    }],
-                )?;
-                frame.retain_vertex_allocation(&positions)?;
-                frame.retain_index_allocation(&indices)?;
-                frame.add_graphics(
-                    &shader,
-                    &indirect,
-                    &[],
-                    DynamicPipelineState::from_abi(0, 0, 0, 0).unwrap(),
-                    &[],
-                )?;
-                Ok::<_, anyhow::Error>(frame)
-            },
-        )
+        Ok(move |window_frame: WindowFrame| {
+            let mut frame = window_frame.frame;
+            let indirect = frame.acquire_counted_buffer(1)?;
+            indirect.write(
+                &mut frame,
+                0,
+                &[DrawIndexedCommand {
+                    index_count: 3,
+                    instance_count: 1,
+                    first_index,
+                    vertex_offset: 0,
+                    first_instance: 0,
+                }],
+            )?;
+            frame.retain_vertex_allocation(&positions)?;
+            frame.retain_index_allocation(&indices)?;
+            frame.add_graphics(
+                &shader,
+                &indirect,
+                &[],
+                DynamicPipelineState::from_abi(0, 0, 0, 0).unwrap(),
+                &[],
+            )?;
+            Ok::<_, anyhow::Error>(frame)
+        })
     })
 }
 

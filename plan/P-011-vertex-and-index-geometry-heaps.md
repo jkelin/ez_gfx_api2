@@ -10,7 +10,7 @@ Define safe ownership for named vertex heaps, their allocations, the singleton c
 - A vertex allocation retains its parent heap; every owning wrapper retains `Rc<ContextInner>`.
 - The index heap is a singleton owned by `Context`; `IndexAllocation` retains the context.
 - Structured and indirect buffers are valid only with their owning `Frame` and are invalidated by finish or abort.
-- ABI 31 retains explicit opaque-handle lifecycle functions and rejects stale, foreign, wrong-kind, and duplicate handles.
+- ABI 30 retains explicit opaque-handle lifecycle functions and rejects stale, foreign, wrong-kind, and duplicate handles.
 
 ## Retired exploration
 
@@ -20,7 +20,7 @@ The selected ordered range free list and generation-indexed identity remain. Fin
 
 ## Selected solution
 
-Named vertex heaps and one singleton context-owned index heap use ordered range free lists and generation-checked allocation identities. Safe heap and allocation wrappers retain `Rc<ContextInner>` plus their parent resource leases. Dropping an allocation retires its range; dropping a heap retires it after child leases and recorded uses. The safe interface exposes no remove, destroy, release, or free operations. ABI 31 retains explicit opaque-handle release and rejects stale, foreign, wrong-kind, and duplicate handles.
+Named vertex heaps and one singleton context-owned index heap use ordered range free lists and generation-checked allocation identities. Safe heap and allocation wrappers retain `Rc<ContextInner>` plus their parent resource leases. Dropping an allocation retires its range; dropping a heap retires it after child leases and recorded uses. The safe interface exposes no remove, destroy, release, or free operations. ABI 30 retains explicit opaque-handle release and rejects stale, foreign, wrong-kind, and duplicate handles.
 
 Frame readiness conservatively covers imported named vertex heaps and the singleton index heap. Applications schedule visible use from lossless `DeviceReady` events. Structured and indirect buffers belong to an owning `Frame`; `Frame::finish` and implicit `Drop` abort both invalidate them, while native storage remains completion-gated or quarantined.
 

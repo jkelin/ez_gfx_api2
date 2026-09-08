@@ -2,7 +2,7 @@
 
 Showcases Dear ImGui integration: font-atlas upload, CPU draw-data flattening, named geometry heaps, bindless texture sampling, clip rectangles, and per-command indirect draws.
 
-`main.rs` loads the font atlas and resolves its texture binding after readiness. The native global index heap contains the original identity sequence; named heaps contain vertex records and shader-index records. This preserves the original `SV_VertexID` plus shader-index lookup semantics while removing public structured geometry allocations. Dedicated heap ranges are validated as zero-based after safe replacement.
+`main.rs` procedurally loads the font atlas, resolves its texture binding, and creates typed heaps. Each host-configured frame flattens ImGui draw data into owning heap allocations and a `CountedBuffer`, records graphics, and passes the frame to `Example::handle_frame`.
 
 Run:
 

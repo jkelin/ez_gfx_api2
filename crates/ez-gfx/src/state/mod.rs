@@ -170,6 +170,29 @@ struct GeometryAllocation {
     heap_id: Option<u32>,
 }
 
+struct RetiredGeometry {
+    allocation: NativeAllocation,
+    transfer: CompletionToken,
+    graphics: Option<CompletionToken>,
+}
+
+enum RetiredRangeKind {
+    Vertex,
+    Index,
+}
+
+struct RetiredGeometryRange {
+    handle: PackedHandle,
+    kind: RetiredRangeKind,
+    transfer: CompletionToken,
+    graphics: Option<CompletionToken>,
+}
+
+struct RetiredVertexHeap {
+    name: String,
+    allocation: NativeAllocation,
+}
+
 struct PendingTexture {
     id: TextureId,
     cancelled: Arc<AtomicBool>,
@@ -287,8 +310,12 @@ struct ContextState {
     vertex_heaps: HashMap<String, GeometryAllocation>,
     vertex_heap_handles: HashMap<VertexHeapHandle, String>,
     index_heap: Option<GeometryAllocation>,
+    retired_geometry: Vec<RetiredGeometry>,
+    retired_geometry_ranges: Vec<RetiredGeometryRange>,
+    retired_vertex_heaps: Vec<RetiredVertexHeap>,
     next_vertex_heap_id: u32,
     geometry_uploads: HashMap<PackedHandle, CompletionToken>,
+    geometry_last_transfer: HashMap<PackedHandle, CompletionToken>,
     upload_events: UploadEventQueue,
     staging: ez_gfx_hal::ReusableStagingPool<NativeAllocation>,
     frame: FrameRecorder,
@@ -426,27 +453,47 @@ fn with_surface_mut<T>(
         )
     })
 }
+
+pub(crate) fn abandon_context(context: ContextHandle) {
+    let Ok((local, _)) = context_local(context) else {
+        return;
+    };
+    if let Ok(mut handles) = CONTEXT_HANDLES.lock() {
+        let _ = handles.remove(local);
+    }
+    let _ = CONTEXTS.try_with(|contexts| {
+        let Ok(mut contexts) = contexts.try_borrow_mut() else {
+            return;
+        };
+        if let Some(state) = contexts.states.remove(&local) {
+            // Drop is nonblocking and may run during Windows loader/TLS teardown.
+            // Explicit `Context::close` is the only native destruction path.
+            std::mem::forget(state);
+        }
+    });
+}
+
 fn with_context_mut<T>(
     context: ContextHandle,
     operation: impl FnOnce(&mut ContextState) -> Result<T>,
 ) -> Result<T> {
     let (local, _) = context_local(context)?;
-    CONTEXTS.with(|contexts| {
-        let mut contexts = contexts
-            .try_borrow_mut()
-            .map_err(|_| Error::NativeFailure)?;
-        let context = contexts
-            .states
-            .get_mut(&local)
-            .ok_or(Error::InvalidContext)?;
-        let result = operation(context);
-        if matches!(&result, Err(Error::DeviceLost)) {
-            // Terminal-loss sweep: the first DeviceLost synchronously cancels queued
-            // decodes so later polls return DeviceLost fast instead of NotReady.
-            texture::note_device_lost(context);
-        }
-        result
-    })
+    CONTEXTS
+        .try_with(|contexts| {
+            let mut contexts = contexts
+                .try_borrow_mut()
+                .map_err(|_| Error::NativeFailure)?;
+            let context = contexts
+                .states
+                .get_mut(&local)
+                .ok_or(Error::InvalidContext)?;
+            let result = operation(context);
+            if matches!(&result, Err(Error::DeviceLost)) {
+                texture::note_device_lost(context);
+            }
+            result
+        })
+        .map_err(|_| Error::InvalidContext)?
 }
 fn context_local(handle: ContextHandle) -> Result<(LocalHandle, PackedHandle)> {
     let packed = handle.packed();

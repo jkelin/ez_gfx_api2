@@ -22,7 +22,7 @@ pub use error::{Error, Result};
     unused_imports,
     reason = "Standalone examples use different shared interfaces."
 )]
-pub use example::{Example, ExampleConfig, run};
+pub use example::{Example, ExampleConfig, WindowFrame, run};
 #[allow(
     unused_imports,
     reason = "Standalone examples use different shared interfaces."

@@ -2,7 +2,7 @@
 
 Showcases compressed KTX2 material textures, bindless per-primitive texture IDs, structured GLB data, and a compute-to-graphics indirect rendering flow.
 
-`main.rs` reads top-to-bottom through the shared host setup closure: it loads `sponza.glb`, validates embedded KTX2 images, and creates owning texture, geometry, and shader wrappers. The returned per-frame closure calls `begin_frame`, acquires structured and indirect buffers through `&mut Frame`, records compute-generated commands and textured graphics, then returns the owning `Frame` to `Example::handle_frame`. Missing materials use the retained fallback texture; every persistent wrapper releases through `Drop`.
+`main.rs` reads top-to-bottom: setup loads Sponza, validates KTX2 images, and creates owning texture, geometry, and shader wrappers. The per-frame closure receives a configured frame, records compute-generated commands and textured graphics with `Buffer` and `CountedBuffer` transients, then passes ownership to `Example::handle_frame`.
 
 Run:
 

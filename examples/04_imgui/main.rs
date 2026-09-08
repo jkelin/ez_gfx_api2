@@ -118,11 +118,6 @@ fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
         let mut imgui = imgui::Context::create();
         imgui.set_ini_filename(None);
         let identity = (0..IDENTITY_INDEX_COUNT as u32).collect::<Vec<_>>();
-        let index_bytes = byte_len(&identity)? as u64;
-        let vertex_bytes = IDENTITY_INDEX_COUNT
-            .checked_mul(std::mem::size_of::<ImGuiVertex>())
-            .ok_or_else(|| anyhow::anyhow!("ImGui vertex heap size overflow"))?
-            as u64;
         let atlas = imgui.fonts().build_rgba32_texture();
         let config = TextureConfig {
             width: atlas.width,
@@ -138,8 +133,7 @@ fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
                 address_w: SamplerAddressMode::Clamp,
             },
         };
-        let texture = load_texture(
-            context,
+        let texture = context.load_texture(
             TextureSource::Rgba8 {
                 width: atlas.width,
                 height: atlas.height,
@@ -151,17 +145,11 @@ fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
         context.wait_idle()?;
         let texture_id = texture.binding()?;
         imgui.fonts().tex_id = TextureId::new(texture_id as usize);
-        create_index_heap(context, index_bytes)?;
-        let identity_indices = upload_indices(context, &identity)?;
+        let identity_indices = context.upload_indices(&identity)?;
         let identity_start = identity_indices.range()?.0;
-        let vertices_heap = create_vertex_heap(
-            context,
-            "imgui_vertices",
-            vertex_bytes,
-            std::mem::size_of::<ImGuiVertex>() as u64,
-        )?;
-        let indices_heap = create_vertex_heap(context, "imgui_indices", index_bytes, 4)?;
-        let shader = load_shader(context, &shader_bytes)?;
+        let vertices_heap = context.create_vertex_heap("imgui_vertices")?;
+        let indices_heap = context.create_vertex_heap("imgui_indices")?;
+        let shader = context.load_shader(&shader_bytes)?;
         let mut vertices = None;
         let mut indices = None;
         let mut cpu_vertices = Vec::new();
@@ -180,104 +168,98 @@ fn run_example(config: ExampleConfig) -> shared::Result<Option<ProgramReport>> {
             padding: 0.0,
         };
 
-        Ok(
-            move |context: &Context,
-                  surface: &Surface,
-                  input: FrameInput,
-                  events: &[SceneInput]| {
-                let mut frame = begin_frame(context, surface)?;
-                for &event in events {
-                    let io = imgui.io_mut();
-                    match event {
-                        SceneInput::CursorMoved { x, y } => {
-                            io.add_mouse_pos_event([x as f32, y as f32])
-                        }
-                        SceneInput::PrimaryButton(value) => {
-                            io.add_mouse_button_event(MouseButton::Left, value)
-                        }
-                        SceneInput::ScrollLines(lines) => io.add_mouse_wheel_event([0.0, lines]),
-                        SceneInput::Character(value) => io.add_input_character(value),
-                        SceneInput::Key { key, pressed } => {
-                            if let Some(key) = imgui_key(key) {
-                                io.add_key_event(key, pressed);
-                            }
+        Ok(move |window_frame: WindowFrame| {
+            let mut frame = window_frame.frame;
+            let input = window_frame.input;
+            let events = &window_frame.events;
+            for &event in events {
+                let io = imgui.io_mut();
+                match event {
+                    SceneInput::CursorMoved { x, y } => {
+                        io.add_mouse_pos_event([x as f32, y as f32])
+                    }
+                    SceneInput::PrimaryButton(value) => {
+                        io.add_mouse_button_event(MouseButton::Left, value)
+                    }
+                    SceneInput::ScrollLines(lines) => io.add_mouse_wheel_event([0.0, lines]),
+                    SceneInput::Character(value) => io.add_input_character(value),
+                    SceneInput::Key { key, pressed } => {
+                        if let Some(key) = imgui_key(key) {
+                            io.add_key_event(key, pressed);
                         }
                     }
                 }
-                let display_size = [input.width as f32, input.height as f32];
-                {
-                    let io = imgui.io_mut();
-                    io.display_size = display_size;
-                    io.delta_time = input.delta_seconds.max(1.0 / 1000.0);
-                }
-                let ui = imgui.frame();
-                ui.window("Dear ImGui Demo")
-                    .position([20.0, 20.0], Condition::Always)
-                    .size([550.0, 440.0], Condition::Always)
-                    .build(|| {});
-                let mut open = true;
-                ui.show_demo_window(&mut open);
-                push.display_size = display_size;
-                rebuild_draw_data(
-                    &mut imgui,
-                    &mut cpu_vertices,
-                    &mut cpu_indices,
-                    &mut cpu_commands,
-                    &mut draw_counts,
-                )?;
+            }
+            let display_size = [input.width as f32, input.height as f32];
+            {
+                let io = imgui.io_mut();
+                io.display_size = display_size;
+                io.delta_time = input.delta_seconds.max(1.0 / 1000.0);
+            }
+            let ui = imgui.frame();
+            ui.window("Dear ImGui Demo")
+                .position([20.0, 20.0], Condition::Always)
+                .size([550.0, 440.0], Condition::Always)
+                .build(|| {});
+            let mut open = true;
+            ui.show_demo_window(&mut open);
+            push.display_size = display_size;
+            rebuild_draw_data(
+                &mut imgui,
+                &mut cpu_vertices,
+                &mut cpu_indices,
+                &mut cpu_commands,
+                &mut draw_counts,
+            )?;
 
-                if cpu_vertices != uploaded_vertices {
-                    drop(vertices.take());
-                    vertices = Some(upload_vertices(&vertices_heap, &cpu_vertices)?);
-                    anyhow::ensure!(
-                        vertices.as_ref().expect("just assigned").range()?.0 == 0,
-                        "dedicated ImGui vertex heap did not restart at zero"
-                    );
-                    std::mem::swap(&mut cpu_vertices, &mut uploaded_vertices);
-                }
-                if cpu_indices != uploaded_indices {
-                    drop(indices.take());
-                    indices = Some(upload_vertices(&indices_heap, &cpu_indices)?);
-                    anyhow::ensure!(
-                        indices.as_ref().expect("just assigned").range()?.0 == 0,
-                        "dedicated ImGui index-data heap did not restart at zero"
-                    );
-                    std::mem::swap(&mut cpu_indices, &mut uploaded_indices);
-                }
-                let commands = frame.acquire_structured::<ImGuiCommand>(cpu_commands.len())?;
-                commands.write(&mut frame, 0, &cpu_commands)?;
-                let indirect = frame.acquire_indirect(draw_counts.len() as u32)?;
-                let draws = draw_counts
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .map(|(index, count)| DrawIndexedCommand {
-                        index_count: count,
-                        instance_count: 1,
-                        first_index: identity_start,
-                        vertex_offset: 0,
-                        first_instance: index as u32,
-                    })
-                    .collect::<Vec<_>>();
-                indirect.write(&mut frame, 0, &draws)?;
-                frame.retain_texture(&texture)?;
-                frame.retain_index_allocation(&identity_indices)?;
-                frame.retain_vertex_allocation(
-                    vertices.as_ref().expect("uploaded ImGui vertices"),
-                )?;
-                frame
-                    .retain_vertex_allocation(indices.as_ref().expect("uploaded ImGui indices"))?;
-                let bindings = [Binding::structured("imgui_commands", &commands)];
-                frame.add_graphics(
-                    &shader,
-                    &indirect,
-                    &bindings,
-                    DynamicPipelineState::from_abi(0, 0, 0, 1).unwrap(),
-                    bytes_of(&push),
-                )?;
-                Ok::<_, anyhow::Error>(frame)
-            },
-        )
+            if cpu_vertices != uploaded_vertices {
+                drop(vertices.take());
+                vertices = Some(vertices_heap.upload(&cpu_vertices)?);
+                anyhow::ensure!(
+                    vertices.as_ref().expect("just assigned").range()?.0 == 0,
+                    "dedicated ImGui vertex heap did not restart at zero"
+                );
+                std::mem::swap(&mut cpu_vertices, &mut uploaded_vertices);
+            }
+            if cpu_indices != uploaded_indices {
+                drop(indices.take());
+                indices = Some(indices_heap.upload(&cpu_indices)?);
+                anyhow::ensure!(
+                    indices.as_ref().expect("just assigned").range()?.0 == 0,
+                    "dedicated ImGui index-data heap did not restart at zero"
+                );
+                std::mem::swap(&mut cpu_indices, &mut uploaded_indices);
+            }
+            let commands = frame.acquire_buffer::<ImGuiCommand>(cpu_commands.len())?;
+            commands.write(&mut frame, 0, &cpu_commands)?;
+            let indirect = frame.acquire_counted_buffer(draw_counts.len() as u32)?;
+            let draws = draw_counts
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, count)| DrawIndexedCommand {
+                    index_count: count,
+                    instance_count: 1,
+                    first_index: identity_start,
+                    vertex_offset: 0,
+                    first_instance: index as u32,
+                })
+                .collect::<Vec<_>>();
+            indirect.write(&mut frame, 0, &draws)?;
+            frame.retain_texture(&texture)?;
+            frame.retain_index_allocation(&identity_indices)?;
+            frame.retain_vertex_allocation(vertices.as_ref().expect("uploaded ImGui vertices"))?;
+            frame.retain_vertex_allocation(indices.as_ref().expect("uploaded ImGui indices"))?;
+            let bindings = [Binding::buffer("imgui_commands", &commands)];
+            frame.add_graphics(
+                &shader,
+                &indirect,
+                &bindings,
+                DynamicPipelineState::from_abi(0, 0, 0, 1).unwrap(),
+                bytes_of(&push),
+            )?;
+            Ok::<_, anyhow::Error>(frame)
+        })
     })
 }
 

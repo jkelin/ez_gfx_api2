@@ -2,6 +2,47 @@
 
 use super::*;
 
+#[derive(Default)]
+struct Collected {
+    uploads: Vec<(u64, u8)>,
+    readback: Option<(u64, u32, u32, Vec<u8>)>,
+}
+
+/// Records callback-delivered events into test-owned storage.
+///
+/// # Safety
+///
+/// `user_data` must address a live `Collected` for the registration lifetime.
+unsafe extern "C" fn collect_event(event: *const EzGfxEvent, user_data: *mut core::ffi::c_void) {
+    // SAFETY: registration keeps this test-owned allocation alive through each delivery.
+    let out = unsafe { &mut *user_data.cast::<Collected>() };
+    // SAFETY: the event borrows its payload for this invocation only.
+    let event = unsafe { &*event };
+    match event.kind {
+        EzGfxEventKind::Upload => {
+            out.uploads
+                .push((event.upload.resource, event.upload.status));
+        }
+        EzGfxEventKind::Readback => {
+            let bytes = if event.readback_bytes.is_null() || event.readback_byte_count == 0 {
+                Vec::new()
+            } else {
+                // SAFETY: the borrowed byte range is live for this invocation.
+                unsafe {
+                    core::slice::from_raw_parts(event.readback_bytes, event.readback_byte_count)
+                }
+                .to_vec()
+            };
+            out.readback = Some((
+                event.readback_texture,
+                event.readback_width,
+                event.readback_height,
+                bytes,
+            ));
+        }
+        _ => {}
+    }
+}
 fn begin_offscreen_frame(context: u64) -> (u64, u64) {
     let name = b"readback-target";
     let format = 1_u8;
@@ -214,17 +255,16 @@ fn dx12_texture_upload_becomes_resident_and_unload_invalidates_handle() {
         },
         EzGfxResult::Ok
     );
+    let mut collected = Collected::default();
+    assert_eq!(
+        // SAFETY: `collected` outlives the registration below through explicit clearing.
+        unsafe {
+            ez_gfx_callback_register(context, Some(collect_event), (&raw mut collected).cast())
+        },
+        EzGfxResult::Ok
+    );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let completion = loop {
-        // SAFETY: all-zero is the documented initialization for this plain C record.
-        let mut event = unsafe { core::mem::zeroed::<EzGfxUploadEvent>() };
-        let mut present = 0;
-        let progress =
-            // SAFETY: event and presence outputs remain writable for this call.
-            unsafe { ez_gfx_poll_upload_event(&raw mut event, &raw mut present, context) };
-        if progress != EzGfxResult::Ok {
-            break progress;
-        }
         let mut binding = u32::MAX;
         let status =
             // SAFETY: binding remains writable and both handles are live.
@@ -232,9 +272,17 @@ fn dx12_texture_upload_becomes_resident_and_unload_invalidates_handle() {
         if status != EzGfxResult::NotReady || std::time::Instant::now() >= deadline {
             break status;
         }
+        // Owner-thread idle admits transfers and dispatches their events.
+        assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
         std::thread::yield_now();
     };
     assert_eq!(completion, EzGfxResult::Ok);
+    assert!(
+        collected
+            .uploads
+            .iter()
+            .any(|&(resource, status)| resource == texture && status == 2)
+    );
     let mut binding = u32::MAX;
     assert_eq!(
         {
@@ -286,6 +334,14 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
     let mut texture = 0;
     let mut indirect = 0;
     let debug_name = b"frame";
+    let mut collected = Collected::default();
+    assert_eq!(
+        // SAFETY: `collected` outlives the registration below through explicit clearing.
+        unsafe {
+            ez_gfx_callback_register(context, Some(collect_event), (&raw mut collected).cast())
+        },
+        EzGfxResult::Ok
+    );
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
@@ -302,21 +358,12 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
         EzGfxResult::Ok
     );
     assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
-    let mut binding = u32::MAX;
-    assert_eq!(
-        {
-            // SAFETY: `binding` is writable u32 storage and both handles remain live.
-            unsafe { ez_gfx_texture_get_binding(texture, &raw mut binding, context) }
-        },
-        EzGfxResult::Ok
-    );
-    assert_eq!(binding, 0);
     let (frame, target) = begin_offscreen_frame(context);
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_acquire_indirect(
+                ez_gfx_counted_buffer_acquire(
                     1,
                     debug_name.as_ptr(),
                     debug_name.len(),
@@ -330,7 +377,7 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_indirect_write_draws(indirect, 0, &raw const command, 1, frame) }
+            unsafe { ez_gfx_counted_buffer_write_draws(indirect, 0, &raw const command, 1, frame) }
         },
         EzGfxResult::Ok
     );
@@ -339,25 +386,13 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
         EzGfxResult::Ok
     );
     assert_eq!(ez_gfx_frame_end(frame), EzGfxResult::Ok);
-    let mut size = 0;
-    assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_frame_readback(core::ptr::null_mut(), 0, &raw mut size, context) }
-        },
-        EzGfxResult::Ok
-    );
-    let mut actual = vec![0; size];
-    assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe {
-                ez_gfx_frame_readback(actual.as_mut_ptr(), actual.len(), &raw mut size, context)
-            }
-        },
-        EzGfxResult::Ok
-    );
+    let (_, _, _, actual) = collected.readback.take().expect("readback event delivered");
     assert_eq!(actual, pixels);
+    assert_eq!(
+        // SAFETY: clearing a live registration needs no user data.
+        unsafe { ez_gfx_callback_register(context, None, core::ptr::null_mut()) },
+        EzGfxResult::Ok
+    );
     ez_gfx_render_target_destroy(target, context);
     ez_gfx_texture_unload(texture, context);
     drop(native);

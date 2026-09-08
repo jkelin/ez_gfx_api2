@@ -10,10 +10,10 @@ pub type EzGfxSurface = EzGfxHandle;
 pub type EzGfxFrame = EzGfxHandle;
 /// Opaque identifier for a compiled shader resource.
 pub type EzGfxShader = EzGfxHandle;
-/// Opaque identifier for a buffer containing indirect draw commands.
-pub type EzGfxIndirectBuffer = EzGfxHandle;
-/// Opaque identifier for a shader-accessible structured buffer.
-pub type EzGfxStructuredBuffer = EzGfxHandle;
+/// Opaque identifier for a frame-local counted buffer holding indexed draw commands.
+pub type EzGfxCountedBuffer = EzGfxHandle;
+/// Opaque identifier for a frame-local shader-accessible buffer.
+pub type EzGfxBuffer = EzGfxHandle;
 /// Opaque identifier for a named vertex heap.
 pub type EzGfxVertexHeap = EzGfxHandle;
 /// Opaque identifier for an allocation within a named vertex heap.
@@ -68,6 +68,8 @@ impl From<ez_gfx::Error> for EzGfxResult {
             ez_gfx::Error::DeviceLost => Self::DeviceLost,
             ez_gfx::Error::QueueFull => Self::QueueFull,
             ez_gfx::Error::Cancelled => Self::Cancelled,
+            ez_gfx::Error::ReentrantCallback => Self::InvalidArgument,
+            ez_gfx::Error::CallbackPanicked => Self::NativeFailure,
             _ => Self::NativeFailure,
         }
     }
@@ -387,10 +389,10 @@ pub struct EzGfxBinding {
     pub name: *const u8,
     /// Specifies the nonzero byte length available through `name`.
     pub name_length: usize,
-    /// Identifies the structured buffer assigned to the binding.
-    pub structured: EzGfxStructuredBuffer,
-    /// Identifies the indirect-command buffer assigned to the binding.
-    pub indirect: EzGfxIndirectBuffer,
+    /// Identifies the buffer assigned to the binding.
+    pub buffer: EzGfxBuffer,
+    /// Identifies the counted command buffer assigned to the binding.
+    pub counted_buffer: EzGfxCountedBuffer,
     /// Identifies the render target assigned to the binding.
     pub render_target: EzGfxRenderTarget,
 }
@@ -511,6 +513,68 @@ pub struct EzGfxDiagnostic {
     /// Reserves bytes that keep the C ABI layout stable.
     pub _padding: [u8; 7],
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+/// Discriminates the payload carried by [`EzGfxEvent`].
+pub enum EzGfxEventKind {
+    /// A typed upload state transition; `upload` is valid.
+    Upload = 1,
+    /// A runtime observation; `record` is valid.
+    Runtime = 2,
+    /// A diagnostic observation; `record` and `level` are valid.
+    Diagnostic = 3,
+    /// Bounded observability storage discarded records; `dropped` is valid.
+    ObservationsDropped = 4,
+    /// Completed readback bytes; the `readback_*` fields are valid.
+    Readback = 5,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+#[allow(
+    clippy::pub_underscore_fields,
+    reason = "Named public padding preserves ABI layout and zero-initialization for callers."
+)]
+/// One tagged graphics event delivered to the registered context callback.
+///
+/// Only the payload selected by `kind` is valid. Readback bytes are borrowed
+/// for the callback invocation and must not be retained afterwards.
+pub struct EzGfxEvent {
+    /// Selects the valid payload by its C ABI numeric code.
+    pub kind: EzGfxEventKind,
+    /// Reserves bytes that keep the C ABI layout stable.
+    pub _pad_kind: [u8; 7],
+    /// Upload transition; valid when `kind` is `Upload`.
+    pub upload: EzGfxUploadEvent,
+    /// Runtime or diagnostic record; valid when `kind` is `Runtime` or `Diagnostic`.
+    pub record: EzGfxRuntimeRecord,
+    /// Diagnostic severity; valid when `kind` is `Diagnostic`.
+    pub level: u8,
+    /// Reserves bytes that keep the C ABI layout stable.
+    pub _pad_level: [u8; 7],
+    /// Discarded-record count; valid when `kind` is `ObservationsDropped`.
+    pub dropped: u64,
+    /// Readback source texture, or zero for a surface-presented snapshot.
+    pub readback_texture: EzGfxTexture,
+    /// Readback image width in pixels; valid when `kind` is `Readback`.
+    pub readback_width: u32,
+    /// Readback image height in pixels; valid when `kind` is `Readback`.
+    pub readback_height: u32,
+    /// Readback byte count; valid when `kind` is `Readback`.
+    pub readback_byte_count: usize,
+    /// Readback RGBA bytes borrowed for this callback invocation only.
+    pub readback_bytes: *const u8,
+}
+
+/// Context event callback invoked on the owner thread at graphics safe points.
+///
+/// `event` borrows its payload, including readback bytes, for the invocation
+/// only. `user_data` is the registration value. Callbacks must not reenter
+/// graphics operations or unwind; a reentrant dispatch attempt fails and a
+/// panic unregisters the callback.
+pub type EzGfxEventCallback =
+    Option<unsafe extern "C" fn(event: *const EzGfxEvent, user_data: *mut c_void)>;
 #[cfg(test)]
 mod tests {
     use crate::{EzGfxResult, texture::sampler_address_from_abi};

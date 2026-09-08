@@ -2,7 +2,7 @@
 
 Showcases the smallest safe `ez-gfx` graphics path: named vertex-heap data, an index heap, one indexed-indirect draw, and a compiled shader artifact.
 
-`main.rs` retains the typed `positions` heap handle and geometry allocation, then acquires a fresh indirect handle after each frame begins. One batched `write_indirect` call writes and publishes the draw before graphics records it.
+`main.rs` reads top-to-bottom: setup creates typed geometry and shader owners, then returns a per-frame closure. The shared host supplies a configured `Frame`; the closure acquires a `CountedBuffer`, writes one draw, records graphics, and passes the frame to `Example::handle_frame`.
 
 Run:
 

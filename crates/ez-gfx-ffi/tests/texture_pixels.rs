@@ -530,8 +530,7 @@ fn assert_abi_odd_base_unsupported(
     bytes: &[u8],
 ) {
     use ez_gfx_ffi::{
-        EzGfxTextureDesc, EzGfxUploadEvent, ez_gfx_poll_upload_event, ez_gfx_texture_get_binding,
-        ez_gfx_texture_load, ez_gfx_texture_unload,
+        EzGfxTextureDesc, ez_gfx_texture_get_binding, ez_gfx_texture_load, ez_gfx_texture_unload,
     };
 
     // Call the exported C ABI, including descriptor validation and asynchronous status mapping.
@@ -576,16 +575,6 @@ fn assert_abi_odd_base_unsupported(
     );
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        // SAFETY: all-zero is the documented initialization for this plain C record.
-        let mut event = unsafe { core::mem::zeroed::<EzGfxUploadEvent>() };
-        let mut present = 0;
-        assert_eq!(
-            // SAFETY: event and presence outputs remain writable for this call.
-            unsafe {
-                ez_gfx_poll_upload_event(&raw mut event, &raw mut present, context.into_raw())
-            },
-            EzGfxResult::Ok
-        );
         let mut binding = 0;
         // SAFETY: binding remains writable and both handles are live.
         let status =
@@ -1074,7 +1063,8 @@ impl Quad {
         assert_eq!(create_index_heap(context, 24), Ok(()));
         let index_allocation = upload_indices(context, &indices).unwrap();
         let (first_index, _) = index_allocation_range(context, index_allocation).unwrap();
-        let positions_heap = create_vertex_heap(context, "positions", 64, 16).unwrap();
+        let positions_heap =
+            create_vertex_heap_with_capacity(context, "positions", 64, 16).unwrap();
         let positions = upload_vertices(context, positions_heap, &vertices).unwrap();
         Self {
             context,

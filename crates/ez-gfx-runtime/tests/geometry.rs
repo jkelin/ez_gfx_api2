@@ -83,6 +83,53 @@ fn readiness_tokens_are_per_allocation_and_heap_monotonic() {
 }
 
 #[test]
+fn growing_heaps_preserves_live_offsets_and_extends_free_space() {
+    let mut geometry = GeometryManager::new();
+    geometry.create_vertex_heap("mesh", 32, 16).unwrap();
+    geometry.create_index_heap(8).unwrap();
+    let vertices = geometry
+        .reserve_vertices("mesh", 2, 16, handle(0, 1))
+        .unwrap();
+    let indices = geometry.reserve_indices(2, handle(1, 1)).unwrap();
+
+    geometry.grow_vertex_heap("mesh", 64).unwrap();
+    geometry.grow_index_heap(32).unwrap();
+
+    assert_eq!(geometry.allocation(vertices.handle).unwrap(), vertices);
+    assert_eq!(geometry.allocation(indices.handle).unwrap(), indices);
+    assert_eq!(
+        geometry
+            .reserve_vertices("mesh", 2, 16, handle(2, 1))
+            .unwrap()
+            .first_element,
+        2
+    );
+    assert_eq!(
+        geometry
+            .reserve_indices(6, handle(3, 1))
+            .unwrap()
+            .first_element,
+        2
+    );
+}
+
+#[test]
+fn heap_growth_rejects_nonincreasing_capacity() {
+    let mut geometry = GeometryManager::new();
+    geometry.create_vertex_heap("mesh", 32, 16).unwrap();
+    geometry.create_index_heap(16).unwrap();
+
+    assert_eq!(
+        geometry.grow_vertex_heap("mesh", 32),
+        Err(GeometryError::InvalidCapacity)
+    );
+    assert_eq!(
+        geometry.grow_index_heap(8),
+        Err(GeometryError::InvalidCapacity)
+    );
+}
+
+#[test]
 fn staging_pool_grows_without_fixed_slot_admission() {
     let mut pool = StagingPool::new();
     let slots: Vec<_> = (0..1_000).map(|_| pool.checkout(64, 0).unwrap()).collect();

@@ -222,7 +222,9 @@ fn prepare_vulkan_pipelines(
                 };
                 (key, pipeline)
             }
-            ExecutableNode::TextureReadback { .. } | ExecutableNode::Present { .. } => continue,
+            ExecutableNode::TextureReadback { .. }
+            | ExecutableNode::RenderTargetReadback { .. }
+            | ExecutableNode::Present { .. } => continue,
         };
         if let Some(pipeline) = pipeline {
             if pipelines.len() == MAX_PIPELINE_CACHE_ENTRIES {
@@ -421,6 +423,17 @@ fn vulkan_actions<'a>(
                             height: *height,
                         });
                     }
+                    ExecutableNode::RenderTargetReadback { target } => {
+                        let record = state
+                            .render_targets
+                            .get(target)
+                            .ok_or(Error::InvalidContext)?;
+                        actions.push(ez_gfx_backend_vulkan::NativeFrameAction::TextureReadback {
+                            texture: record.native.vulkan()?,
+                            width: record.width,
+                            height: record.height,
+                        });
+                    }
                     ExecutableNode::Present { .. } => {
                         actions.push(ez_gfx_backend_vulkan::NativeFrameAction::Present);
                     }
@@ -518,9 +531,9 @@ pub(super) fn execute_vulkan_frame_plan(
                 &context.vertex_heaps,
             )
             .map_err(map_hal),
-            ExecutableNode::TextureReadback { .. } | ExecutableNode::Present { .. } => {
-                Ok(Vec::new())
-            }
+            ExecutableNode::TextureReadback { .. }
+            | ExecutableNode::RenderTargetReadback { .. }
+            | ExecutableNode::Present { .. } => Ok(Vec::new()),
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let state = VulkanActionState {
@@ -551,7 +564,13 @@ pub(super) fn execute_vulkan_frame_plan(
         Ok(outputs) => {
             let texture_readbacks = payloads
                 .iter()
-                .filter(|payload| matches!(payload, ExecutableNode::TextureReadback { .. }))
+                .filter(|payload| {
+                    matches!(
+                        payload,
+                        ExecutableNode::TextureReadback { .. }
+                            | ExecutableNode::RenderTargetReadback { .. }
+                    )
+                })
                 .count();
             if texture_readbacks != 0 {
                 let Some(readback) = outputs.get(texture_readbacks - 1) else {

@@ -2,7 +2,7 @@
 
 Showcases a GLB scene rendered from reflected named vertex heaps, with structured primitive records and compute-generated indexed-indirect commands.
 
-`main.rs` retains typed position/normal heap and allocation handles. Each frame acquires fresh structured primitive and indirect buffers, writes the primitive records, explicitly publishes the CPU-known compute output count, then shares both handles from compute to graphics in that frame.
+`main.rs` retains typed position/normal heaps and allocations. For each host-configured frame it acquires fresh `Buffer<BasicPrimitive>` and `CountedBuffer<DrawIndexedCommand>` values, writes primitive records, publishes the CPU-known output count, and shares both from compute to graphics.
 
 Run:
 

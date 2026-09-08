@@ -81,8 +81,12 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         vertex_heaps: HashMap::new(),
         vertex_heap_handles: HashMap::new(),
         next_vertex_heap_id: 0,
+        retired_geometry_ranges: Vec::new(),
+        retired_vertex_heaps: Vec::new(),
         index_heap: None,
+        retired_geometry: Vec::new(),
         geometry_uploads: HashMap::new(),
+        geometry_last_transfer: HashMap::new(),
         upload_events: ez_gfx_runtime::upload::UploadEventQueue::new(),
         staging: ez_gfx_hal::ReusableStagingPool::new(256),
         frame_vertex_heaps: HashMap::new(),
@@ -333,7 +337,9 @@ pub(super) fn runtime_status(result: Result<()>) -> RuntimeStatus {
         Err(Error::NotReady | Error::QueueFull) => RuntimeStatus::NotReady,
         Err(Error::Cancelled) => RuntimeStatus::Cancelled,
         Err(Error::Unsupported | Error::Capability(_)) => RuntimeStatus::Unsupported,
-        Err(Error::NativeFailure) => RuntimeStatus::NativeFailure,
+        Err(Error::NativeFailure | Error::ReentrantCallback | Error::CallbackPanicked) => {
+            RuntimeStatus::NativeFailure
+        }
         Err(Error::DeviceLost) => RuntimeStatus::DeviceLost,
     }
 }
@@ -641,6 +647,13 @@ fn destroy_buffer_state(owned: &mut ContextState, failure: &mut Option<Error>) {
     if let Some(heap) = owned.index_heap.take() {
         free(heap.allocation);
     }
+    for retired in owned.retired_geometry.drain(..) {
+        free(retired.allocation);
+    }
+    owned.retired_geometry_ranges.clear();
+    for retired in owned.retired_vertex_heaps.drain(..) {
+        free(retired.allocation);
+    }
     for allocation in owned.staging.drain() {
         free(allocation);
     }
@@ -850,67 +863,120 @@ pub fn destroy_surface(context: ContextHandle, surface: SurfaceHandle) {
 /// # Errors
 ///
 /// Returns an error when validation, handle ownership, readiness, or a backend operation fails.
+#[allow(
+    dead_code,
+    reason = "the C raw seam begins an already-configured surface frame"
+)]
 pub fn begin_render(context: ContextHandle, surface: SurfaceHandle) -> Result<()> {
     result_status(with_context_mut(context, |context| {
-        context
-            .identity
-            .check_thread_and_health()
-            .map_err(map_lifecycle)?;
-        let handle = surface.packed();
-        context
-            .identity
-            .resolve(handle, ResourceKind::Surface)
-            .map_err(map_lifecycle)?;
-        let record = context
-            .surfaces
-            .get(&surface)
-            .ok_or(Error::InvalidContext)?;
-        if record.state.extent().is_none() {
-            return Err(Error::NotReady);
-        }
         super::frame::start_recording(context)?;
-        context.active_surface = Some(surface);
-        context.frame_render_target = None;
+        if let Err(error) = configure_surface_recording(context, surface) {
+            context.frame.abort();
+            return Err(error);
+        }
         Ok(())
     }))
 }
 
-/// Begins rendering to a managed color render target instead of a surface.
-///
-/// The target's stored declaration clear applies to clearing passes; depth,
-/// storage, and multisampled draws stay unsupported. The frame presents
-/// nothing; sample the target through a later pass or read it back natively.
+/// Selects the presentation surface for the active recording transaction.
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidArgument`] for an unknown handle,
-/// [`Error::InvalidContext`] for a destroyed target, and
-/// [`Error::Unsupported`] for a non-color declaration.
+/// Returns an error when no frame is recording or the surface is invalid or not ready.
+pub(crate) fn configure_surface(context: ContextHandle, surface: SurfaceHandle) -> Result<()> {
+    result_status(with_context_mut(context, |context| {
+        configure_surface_recording(context, surface)
+    }))
+}
+
+fn configure_surface_recording(context: &mut ContextState, surface: SurfaceHandle) -> Result<()> {
+    context
+        .identity
+        .check_thread_and_health()
+        .map_err(map_lifecycle)?;
+    if context.frame.state() != ez_gfx_runtime::frame::FrameState::Recording
+        || context.active_surface.is_some()
+        || context.frame_render_target.is_some()
+    {
+        return Err(Error::NotReady);
+    }
+    context
+        .identity
+        .resolve(surface.packed(), ResourceKind::Surface)
+        .map_err(map_lifecycle)?;
+    let record = context
+        .surfaces
+        .get(&surface)
+        .ok_or(Error::InvalidContext)?;
+    if record.state.extent().is_none() {
+        return Err(Error::NotReady);
+    }
+    context.active_surface = Some(surface);
+    Ok(())
+}
+/// Begins rendering to a managed color target.
+///
+/// # Errors
+/// Returns an error when the target is invalid, unsupported, or another frame is active.
+#[allow(
+    dead_code,
+    reason = "the C raw seam begins a preconfigured managed-target frame"
+)]
 pub fn begin_render_target(context: ContextHandle, target: RenderTargetHandle) -> Result<()> {
     result_status(with_context_mut(context, |context| {
-        context
-            .identity
-            .check_thread_and_health()
-            .map_err(map_lifecycle)?;
-        context
-            .identity
-            .resolve(target.packed(), ResourceKind::RenderTarget)
-            .map_err(map_lifecycle)?;
-        let record = context
-            .render_targets
-            .get(&target)
-            .ok_or(Error::InvalidContext)?;
-        if record.declaration.usage() != ez_gfx_runtime::target::TargetUsage::Color {
-            return Err(Error::Unsupported);
-        }
-        if record.width == 0 || record.height == 0 {
-            return Err(Error::InvalidArgument);
-        }
         super::frame::start_recording(context)?;
-        context.active_surface = None;
-        context.frame_render_target = Some(target);
+        if let Err(error) = configure_render_target_recording(context, target) {
+            context.frame.abort();
+            return Err(error);
+        }
         Ok(())
     }))
+}
+
+/// Selects a managed target for the active recording transaction.
+///
+/// # Errors
+/// Returns an error when no frame is recording or the target is invalid.
+pub(crate) fn configure_render_target(
+    context: ContextHandle,
+    target: RenderTargetHandle,
+) -> Result<()> {
+    result_status(with_context_mut(context, |context| {
+        configure_render_target_recording(context, target)
+    }))
+}
+
+fn configure_render_target_recording(
+    context: &mut ContextState,
+    target: RenderTargetHandle,
+) -> Result<()> {
+    context
+        .identity
+        .check_thread_and_health()
+        .map_err(map_lifecycle)?;
+    if context.frame.state() != ez_gfx_runtime::frame::FrameState::Recording
+        || context.active_surface.is_some()
+        || context.frame_render_target.is_some()
+    {
+        return Err(Error::NotReady);
+    }
+    context
+        .identity
+        .resolve(target.packed(), ResourceKind::RenderTarget)
+        .map_err(map_lifecycle)?;
+    let record = context
+        .render_targets
+        .get(&target)
+        .ok_or(Error::InvalidContext)?;
+    if record.declaration.usage() != ez_gfx_runtime::target::TargetUsage::Color {
+        return Err(Error::Unsupported);
+    }
+    if record.width == 0 || record.height == 0 {
+        return Err(Error::InvalidArgument);
+    }
+    context.active_surface = None;
+    context.frame_render_target = Some(target);
+    Ok(())
 }
 
 /// Presents the recorded frame.

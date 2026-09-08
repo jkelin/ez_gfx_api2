@@ -4,8 +4,8 @@ use core::mem::{align_of, offset_of, size_of};
 
 #[cfg(windows)]
 use ez_gfx_ffi::{
-    EzGfxBackendContextDesc, EzGfxTextureDesc, EzGfxUploadEvent, ez_gfx_context_create_backend,
-    ez_gfx_context_destroy, ez_gfx_poll_upload_event, ez_gfx_texture_get_binding,
+    EzGfxBackendContextDesc, EzGfxTextureDesc, ez_gfx_context_create_backend,
+    ez_gfx_context_destroy, ez_gfx_context_wait_idle, ez_gfx_texture_get_binding,
     ez_gfx_texture_load, ez_gfx_texture_unload,
 };
 use ez_gfx_ffi::{
@@ -214,26 +214,12 @@ fn context_decode_workers_flow_from_c_descriptor_to_creation() {
             EzGfxResult::Ok,
             "workers={workers}"
         );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            // SAFETY: all-zero is the documented initialization for this plain C record.
-            let mut event = unsafe { core::mem::zeroed::<EzGfxUploadEvent>() };
-            let mut present = 0;
-            assert_eq!(
-                // SAFETY: event and presence outputs remain writable for this call.
-                unsafe { ez_gfx_poll_upload_event(&raw mut event, &raw mut present, context) },
-                EzGfxResult::Ok
-            );
-            let mut binding = 0;
-            let status =
-                // SAFETY: binding remains writable and both handles are live.
-                unsafe { ez_gfx_texture_get_binding(texture, &raw mut binding, context) };
-            assert_ne!(status, EzGfxResult::InvalidArgument, "workers={workers}");
-            if status != EzGfxResult::NotReady || std::time::Instant::now() >= deadline {
-                assert_eq!(status, EzGfxResult::Ok, "workers={workers}");
-                break;
-            }
-        }
+        assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
+        let mut binding = 0;
+        let status =
+            // SAFETY: binding remains writable and both handles are live.
+            unsafe { ez_gfx_texture_get_binding(texture, &raw mut binding, context) };
+        assert_eq!(status, EzGfxResult::Ok, "workers={workers}");
         ez_gfx_texture_unload(texture, context);
         ez_gfx_context_destroy(context);
     }

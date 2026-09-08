@@ -1,6 +1,6 @@
 # C textured cube
 
-Minimal ABI 31 example: positions and normals use typed heap handles, indices use a typed global allocation, and structured/indirect handles are freshly acquired each frame. Compute writes the indirect command after explicit CPU-known count publication; graphics consumes it in the same frame.
+Minimal ABI 30 example: positions and normals use typed heap handles, indices use a typed global allocation, and buffer/counted-buffer handles are freshly acquired each frame. Compute writes the indirect command after explicit CPU-known count publication; graphics consumes it in the same frame. A creator-thread callback receives runtime diagnostics and copies borrowed snapshot bytes.
 
 ## Build
 

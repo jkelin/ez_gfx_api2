@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define EZ_GFX_ABI_VERSION 31u
+#define EZ_GFX_ABI_VERSION 30u
 
 #if defined(__clang__)
 #  if __has_attribute(access)
@@ -41,13 +41,13 @@ typedef uint64_t EzGfxFrame;
  */
 typedef uint64_t EzGfxShader;
 /**
- * EzGfxIndirectBuffer: Opaque packed u64 indirect-buffer handle; child bits index the context identity arena and resolve only as Indirect.
+ * EzGfxCountedBuffer: Opaque packed u64 counted-buffer handle; child bits index the context identity arena and resolve only as Indirect.
  */
-typedef uint64_t EzGfxIndirectBuffer;
+typedef uint64_t EzGfxCountedBuffer;
 /**
- * EzGfxStructuredBuffer: Opaque packed u64 structured-buffer handle; child bits index the context identity arena and resolve only as Structured.
+ * EzGfxBuffer: Opaque packed u64 buffer handle; child bits index the context identity arena and resolve only as Structured.
  */
-typedef uint64_t EzGfxStructuredBuffer;
+typedef uint64_t EzGfxBuffer;
 /** Opaque named vertex heap; owner and generation are validated. */
 typedef uint64_t EzGfxVertexHeap;
 /** Opaque allocation within a named vertex heap; owner and generation are validated. */
@@ -616,8 +616,8 @@ typedef void (*EzGfxTextureDecoderReleaseCallback)(
  * EzGfxBinding:
  * @name (not nullable): Exactly @name_length UTF-8 shader-binding-name bytes.
  * @name_length: Non-zero byte length of @name.
- * @structured: Optional structured buffer handle.
- * @indirect: Optional indirect-command buffer handle.
+ * @buffer: Optional buffer handle.
+ * @counted_buffer: Optional counted-command buffer handle.
  * @render_target: Optional render-target handle.
  *
  * Shader resource binding. Names are not NUL-terminated and embedded NUL bytes
@@ -626,8 +626,8 @@ typedef void (*EzGfxTextureDecoderReleaseCallback)(
 typedef struct EzGfxBinding {
     const char * name;
     size_t name_length;
-    EzGfxStructuredBuffer structured;
-    EzGfxIndirectBuffer indirect;
+    EzGfxBuffer buffer;
+    EzGfxCountedBuffer counted_buffer;
     EzGfxRenderTarget render_target;
 } EzGfxBinding;
 
@@ -690,6 +690,46 @@ typedef struct EzGfxDiagnostic {
     EzGfxDiagnosticLevel level;
     uint8_t _padding[7];
 } EzGfxDiagnostic;
+/**
+ * EzGfxEventKind: selects the valid payload of EzGfxEvent.
+ */
+typedef uint8_t EzGfxEventKind;
+enum {
+    EzGfxEventKind_Upload = 1,
+    EzGfxEventKind_Runtime = 2,
+    EzGfxEventKind_Diagnostic = 3,
+    EzGfxEventKind_ObservationsDropped = 4,
+    EzGfxEventKind_Readback = 5,
+};
+
+/**
+ * EzGfxEvent: one tagged graphics event for the registered context callback.
+ * Only the payload selected by kind is valid. Readback bytes are borrowed for
+ * the callback invocation and must not be retained afterwards.
+ */
+typedef struct EzGfxEvent {
+    EzGfxEventKind kind;
+    uint8_t _pad_kind[7];
+    EzGfxUploadEvent upload;
+    EzGfxRuntimeRecord record;
+    uint8_t level;
+    uint8_t _pad_level[7];
+    uint64_t dropped;
+    EzGfxTexture readback_texture;
+    uint32_t readback_width;
+    uint32_t readback_height;
+    size_t readback_byte_count;
+    const uint8_t *readback_bytes;
+} EzGfxEvent;
+
+/**
+ * EzGfxEventCallback: context event callback invoked on the owner thread at
+ * graphics safe points. `event` borrows its payload for the invocation only.
+ * `user_data` is the registration value. Callbacks must not reenter graphics
+ * operations or unwind; a reentrant dispatch attempt fails and a panic
+ * unregisters the callback.
+ */
+typedef void (*EzGfxEventCallback)(const EzGfxEvent *event, void *user_data);
 
 /**
  * EzGfxByteBuffer:
@@ -853,7 +893,6 @@ EzGfxResult ez_gfx_surface_resize_pending(EzGfxSurface surface, int32_t * out_pe
 
 /** Updates the snapshot-cache preference; enabled must be zero or one. */
 EzGfxResult ez_gfx_surface_set_snapshot_cache(EzGfxSurface surface, int32_t enabled, EzGfxContext context);
-
 /** Loads a validated precompiled shader artifact; runtime packages contain no compiler. */
 EzGfxResult ez_gfx_shader_load_artifact(const uint8_t *data, size_t data_size, EzGfxShader *out_shader, EzGfxContext context) EZ_GFX_ACCESS(read_only, 1, 2) EZ_GFX_ACCESS(write_only, 3);
 /** Destroys a shader and its backend-native modules/libraries. */
@@ -894,16 +933,17 @@ EzGfxResult ez_gfx_render_target_probe_format(uint8_t format, uint8_t samples, E
 EzGfxResult ez_gfx_render_target_frame_begin(EzGfxContext context, EzGfxRenderTarget target, EzGfxFrame *out_frame) EZ_GFX_ACCESS(write_only, 3);
 /** Begins one presented-surface frame and returns its explicit owner handle. */
 EzGfxResult ez_gfx_frame_begin(EzGfxContext context, EzGfxSurface surface, EzGfxFrame *out_frame) EZ_GFX_ACCESS(write_only, 3);
-/** Acquires a transient indexed-indirect command buffer for a live frame. */
-EzGfxResult ez_gfx_acquire_indirect(uint32_t capacity, const char *debug_name, size_t debug_name_length, EzGfxIndirectBuffer *out_indirect, EzGfxFrame frame) EZ_GFX_ACCESS(read_only, 2, 3) EZ_GFX_ACCESS(write_only, 4);
+
+/** Acquires a transient counted command buffer for a live frame. */
+EzGfxResult ez_gfx_counted_buffer_acquire(uint32_t capacity, const char *debug_name, size_t debug_name_length, EzGfxCountedBuffer *out_buffer, EzGfxFrame frame) EZ_GFX_ACCESS(read_only, 2, 3) EZ_GFX_ACCESS(write_only, 4);
 /** Writes a contiguous command range and publishes its written prefix. */
-EzGfxResult ez_gfx_indirect_write_draws(EzGfxIndirectBuffer indirect, uint32_t start_index, const EzGfxDrawIndexedCommand *commands, uint32_t command_count, EzGfxFrame frame) EZ_GFX_ACCESS(read_only, 3, 4);
+EzGfxResult ez_gfx_counted_buffer_write_draws(EzGfxCountedBuffer buffer, uint32_t start_index, const EzGfxDrawIndexedCommand *commands, uint32_t command_count, EzGfxFrame frame) EZ_GFX_ACCESS(read_only, 3, 4);
 /** Publishes a CPU-known count for commands generated by a compute node. */
-EzGfxResult ez_gfx_indirect_publish_compute_count(EzGfxIndirectBuffer indirect, uint32_t count, EzGfxFrame frame);
-/** Invalidates an unsubmitted transient indirect handle; zero is ignored. */
-void ez_gfx_indirect_release(EzGfxIndirectBuffer indirect, EzGfxFrame frame);
+EzGfxResult ez_gfx_counted_buffer_publish_count(EzGfxCountedBuffer buffer, uint32_t count, EzGfxFrame frame);
+/** Invalidates an unsubmitted transient counted handle; zero is ignored. */
+void ez_gfx_counted_buffer_release(EzGfxCountedBuffer buffer, EzGfxFrame frame);
 /** Records a validated graphics pipeline and indexed-indirect draw. */
-EzGfxResult ez_gfx_render_add_vertex_pipeline(EzGfxShader shader, EzGfxIndirectBuffer indirect, const EzGfxBinding *bindings, uint32_t binding_count, const EzGfxDynamicState *dynamic_state, const void *push_constants, uint32_t push_constant_size, EzGfxFrame frame) EZ_GFX_ACCESS(read_only, 3, 4) EZ_GFX_ACCESS(read_only, 6, 7);
+EzGfxResult ez_gfx_render_add_vertex_pipeline(EzGfxShader shader, EzGfxCountedBuffer buffer, const EzGfxBinding *bindings, uint32_t binding_count, const EzGfxDynamicState *dynamic_state, const void *push_constants, uint32_t push_constant_size, EzGfxFrame frame) EZ_GFX_ACCESS(read_only, 3, 4) EZ_GFX_ACCESS(read_only, 6, 7);
 /** Records a validated compute pipeline dispatch. */
 EzGfxResult ez_gfx_render_add_compute_pipeline(EzGfxShader shader, uint32_t dispatch_x, uint32_t dispatch_y, uint32_t dispatch_z, const EzGfxBinding *bindings, uint32_t binding_count, const void *push_constants, uint32_t push_constant_size, EzGfxFrame frame) EZ_GFX_ACCESS(read_only, 5, 6) EZ_GFX_ACCESS(read_only, 7, 8);
 /** Compiles and enqueues a texture-readback graph node for a live frame. */
@@ -912,14 +952,8 @@ EzGfxResult ez_gfx_graph_enqueue_texture_readback(EzGfxTexture texture, EzGfxFra
 EzGfxResult ez_gfx_frame_end(EzGfxFrame frame);
 /** Consumes a live frame without submitting it. */
 EzGfxResult ez_gfx_frame_abort(EzGfxFrame frame);
-/** Polls one bounded runtime event. out_present is zero when no event is queued; out_dropped reports overflow since the prior poll. */
-EzGfxResult ez_gfx_poll_runtime_event(EzGfxRuntimeRecord *out_record, uint8_t *out_present, uint64_t *out_dropped, EzGfxContext context) EZ_GFX_ACCESS(write_only, 1) EZ_GFX_ACCESS(write_only, 2) EZ_GFX_ACCESS(write_only, 3);
-/** Polls one lossless upload transition and progresses owner-thread texture work. */
-EzGfxResult ez_gfx_poll_upload_event(EzGfxUploadEvent *out_event, uint8_t *out_present, EzGfxContext context) EZ_GFX_ACCESS(write_only, 1) EZ_GFX_ACCESS(write_only, 2);
-/** Polls one bounded local diagnostic. out_present is zero when none is queued; out_dropped reports overflow since the prior poll. */
-EzGfxResult ez_gfx_poll_diagnostic(EzGfxDiagnostic *out_diagnostic, uint8_t *out_present, uint64_t *out_dropped, EzGfxContext context) EZ_GFX_ACCESS(write_only, 1) EZ_GFX_ACCESS(write_only, 2) EZ_GFX_ACCESS(write_only, 3);
-/** Copies a completed readback into caller storage; capacity zero queries required size. */
-EzGfxResult ez_gfx_frame_readback(uint8_t *data, size_t capacity, size_t *out_size, EzGfxContext context) EZ_GFX_ACCESS(write_only, 1, 2) EZ_GFX_ACCESS(write_only, 3);
+/** Replaces the context event callback and delivers pending events. Null clears. */
+EzGfxResult ez_gfx_callback_register(EzGfxContext context, EzGfxEventCallback callback, void *user_data);
 /** Creates a named device-local vertex heap and returns its owner-validated handle. */
 EzGfxResult ez_gfx_vertex_heap_create(const char *name, size_t name_length, uint64_t capacity, uint64_t stride, EzGfxVertexHeap *out_heap, EzGfxContext context) EZ_GFX_ACCESS(read_only, 1, 2) EZ_GFX_ACCESS(write_only, 5);
 
@@ -946,14 +980,14 @@ EzGfxResult ez_gfx_vertex_allocation_remove(EzGfxVertexAllocation allocation, Ez
 /** Removes one index allocation after establishing GPU safety. */
 EzGfxResult ez_gfx_index_allocation_remove(EzGfxIndexAllocation allocation, EzGfxContext context);
 
-/** Acquires a transient structured buffer for a live frame. */
-EzGfxResult ez_gfx_structured_acquire(uint32_t element_size, uint32_t element_count, const char *debug_name, size_t debug_name_length, EzGfxStructuredBuffer *out_structured, EzGfxFrame frame) EZ_GFX_ACCESS(read_only, 3, 4) EZ_GFX_ACCESS(write_only, 5);
+/** Acquires a transient buffer for a live frame. */
+EzGfxResult ez_gfx_buffer_acquire(uint32_t element_size, uint32_t element_count, const char *debug_name, size_t debug_name_length, EzGfxBuffer *out_buffer, EzGfxFrame frame) EZ_GFX_ACCESS(read_only, 3, 4) EZ_GFX_ACCESS(write_only, 5);
 
-/** Copies a validated element range into a transient structured buffer. */
-EzGfxResult ez_gfx_structured_write(EzGfxStructuredBuffer structured, uint32_t start_index, const void *data, uint32_t element_count, uint32_t element_size, EzGfxFrame frame) EZ_GFX_ACCESS(read_only, 3, 4);
+/** Copies a validated element range into a transient buffer. */
+EzGfxResult ez_gfx_buffer_write(EzGfxBuffer buffer, uint32_t start_index, const void *data, uint32_t element_count, uint32_t element_size, EzGfxFrame frame) EZ_GFX_ACCESS(read_only, 3, 4);
 
-/** Invalidates an unsubmitted transient structured handle; zero is ignored. */
-void ez_gfx_structured_release(EzGfxStructuredBuffer structured, EzGfxFrame frame);
+/** Invalidates an unsubmitted transient buffer handle; zero is ignored. */
+void ez_gfx_buffer_release(EzGfxBuffer buffer, EzGfxFrame frame);
 
 /**
  * ez_gfx_surface_destroy:

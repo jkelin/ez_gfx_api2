@@ -178,8 +178,8 @@ fn layouts_are_stable() {
         [
             offset_of!(EzGfxBinding, name),
             offset_of!(EzGfxBinding, name_length),
-            offset_of!(EzGfxBinding, structured),
-            offset_of!(EzGfxBinding, indirect),
+            offset_of!(EzGfxBinding, buffer),
+            offset_of!(EzGfxBinding, counted_buffer),
             offset_of!(EzGfxBinding, render_target)
         ],
         [0, 8, 16, 24, 32]
@@ -275,6 +275,27 @@ fn layouts_are_stable() {
         ],
         [0, 24, 25]
     );
+    assert_eq!(EzGfxEventKind::Upload as u8, 1);
+    assert_eq!(EzGfxEventKind::Runtime as u8, 2);
+    assert_eq!(EzGfxEventKind::Diagnostic as u8, 3);
+    assert_eq!(EzGfxEventKind::ObservationsDropped as u8, 4);
+    assert_eq!(EzGfxEventKind::Readback as u8, 5);
+    assert_eq!((size_of::<EzGfxEvent>(), align_of::<EzGfxEvent>()), (96, 8));
+    assert_eq!(
+        [
+            offset_of!(EzGfxEvent, kind),
+            offset_of!(EzGfxEvent, upload),
+            offset_of!(EzGfxEvent, record),
+            offset_of!(EzGfxEvent, level),
+            offset_of!(EzGfxEvent, dropped),
+            offset_of!(EzGfxEvent, readback_texture),
+            offset_of!(EzGfxEvent, readback_width),
+            offset_of!(EzGfxEvent, readback_height),
+            offset_of!(EzGfxEvent, readback_byte_count),
+            offset_of!(EzGfxEvent, readback_bytes)
+        ],
+        [0, 8, 24, 48, 56, 64, 72, 76, 80, 88]
+    );
     assert_eq!(
         (
             size_of::<EzGfxHandleParts>(),
@@ -356,17 +377,16 @@ fn all_public_export_signatures_are_stable() {
         ffi::ez_gfx_render_target_frame_begin;
     let _: unsafe extern "C" fn(Handle, Handle, *mut Handle) -> Status = ffi::ez_gfx_frame_begin;
     let _: unsafe extern "C" fn(u32, *const u8, usize, *mut Handle, Handle) -> Status =
-        ffi::ez_gfx_acquire_indirect;
+        ffi::ez_gfx_counted_buffer_acquire;
     let _: unsafe extern "C" fn(
         Handle,
         u32,
         *const EzGfxDrawIndexedCommand,
         u32,
         Handle,
-    ) -> Status = ffi::ez_gfx_indirect_write_draws;
-    let _: extern "C" fn(Handle, u32, Handle) -> Status =
-        ffi::ez_gfx_indirect_publish_compute_count;
-    let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_indirect_release;
+    ) -> Status = ffi::ez_gfx_counted_buffer_write_draws;
+    let _: extern "C" fn(Handle, u32, Handle) -> Status = ffi::ez_gfx_counted_buffer_publish_count;
+    let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_counted_buffer_release;
     let _: unsafe extern "C" fn(
         Handle,
         Handle,
@@ -391,14 +411,8 @@ fn all_public_export_signatures_are_stable() {
     let _: extern "C" fn(Handle, Handle) -> Status = ffi::ez_gfx_graph_enqueue_texture_readback;
     let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_frame_end;
     let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_frame_abort;
-    let _: unsafe extern "C" fn(*mut EzGfxRuntimeRecord, *mut u8, *mut u64, Handle) -> Status =
-        ffi::ez_gfx_poll_runtime_event;
-    let _: unsafe extern "C" fn(*mut EzGfxUploadEvent, *mut u8, Handle) -> Status =
-        ffi::ez_gfx_poll_upload_event;
-    let _: unsafe extern "C" fn(*mut EzGfxDiagnostic, *mut u8, *mut u64, Handle) -> Status =
-        ffi::ez_gfx_poll_diagnostic;
-    let _: unsafe extern "C" fn(*mut u8, usize, *mut usize, Handle) -> Status =
-        ffi::ez_gfx_frame_readback;
+    let _: unsafe extern "C" fn(Handle, EzGfxEventCallback, *mut c_void) -> Status =
+        ffi::ez_gfx_callback_register;
     let _: unsafe extern "C" fn(*const u8, usize, u64, u64, *mut Handle, Handle) -> Status =
         ffi::ez_gfx_vertex_heap_create;
     let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_vertex_heap_destroy;
@@ -416,10 +430,10 @@ fn all_public_export_signatures_are_stable() {
     let _: extern "C" fn(Handle, Handle) -> Status = ffi::ez_gfx_vertex_allocation_remove;
     let _: extern "C" fn(Handle, Handle) -> Status = ffi::ez_gfx_index_allocation_remove;
     let _: unsafe extern "C" fn(u32, u32, *const u8, usize, *mut Handle, Handle) -> Status =
-        ffi::ez_gfx_structured_acquire;
+        ffi::ez_gfx_buffer_acquire;
     let _: unsafe extern "C" fn(Handle, u32, *const c_void, u32, u32, Handle) -> Status =
-        ffi::ez_gfx_structured_write;
-    let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_structured_release;
+        ffi::ez_gfx_buffer_write;
+    let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_buffer_release;
     let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_surface_destroy;
     let _: unsafe extern "C" fn(u64, *mut EzGfxHandleParts) -> Status = ffi::ez_gfx_handle_inspect;
     let _: unsafe extern "C" fn(*const u8, usize, *mut u8) -> Status = ffi::ez_gfx_semantic_id;
@@ -447,7 +461,9 @@ fn counted_strings_reject_invalid_ranges_before_reading_or_delegating() {
 
     assert_eq!(
         // SAFETY: `valid` is readable for exactly its nonzero byte length and intentionally has no terminator.
-        unsafe { ez_gfx_acquire_indirect(1, valid.as_ptr(), valid.len(), &raw mut indirect, 0) },
+        unsafe {
+            ez_gfx_counted_buffer_acquire(1, valid.as_ptr(), valid.len(), &raw mut indirect, 0)
+        },
         EzGfxResult::InvalidContext
     );
 
@@ -463,7 +479,7 @@ fn counted_strings_reject_invalid_ranges_before_reading_or_delegating() {
     ] {
         assert_eq!(
             // SAFETY: Valid pointers name the declared test-owned ranges; oversized and null ranges are rejected before dereference.
-            unsafe { ez_gfx_acquire_indirect(1, pointer, length, &raw mut indirect, 0) },
+            unsafe { ez_gfx_counted_buffer_acquire(1, pointer, length, &raw mut indirect, 0) },
             EzGfxResult::InvalidArgument
         );
     }
@@ -542,8 +558,8 @@ fn optional_and_nested_counted_strings_enforce_the_same_contract() {
     let binding = EzGfxBinding {
         name: binding_name.as_ptr(),
         name_length: binding_name.len(),
-        structured: child_handle,
-        indirect: 0,
+        buffer: child_handle,
+        counted_buffer: 0,
         render_target: 0,
     };
     assert_eq!(

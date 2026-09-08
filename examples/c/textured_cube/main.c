@@ -9,14 +9,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if EZ_GFX_ABI_VERSION != 31u
-#error "textured_cube requires ez-gfx ABI v31"
+#if EZ_GFX_ABI_VERSION != 30u
+#error "textured_cube requires ez-gfx ABI v30"
 #endif
 
 #define WIDTH 640u
 #define HEIGHT 480u
 #define MAX_ARTIFACT_BYTES (16u * 1024u * 1024u)
-#define MAX_OBSERVATIONS 4096u
 
 typedef struct Vec4 { float x, y, z, w; } Vec4;
 typedef struct Primitive {
@@ -32,6 +31,12 @@ typedef struct Options {
     const char *snapshot_path;
     uint32_t max_frames;
 } Options;
+typedef struct Observations {
+    uint8_t *snapshot;
+    size_t snapshot_capacity;
+    size_t snapshot_size;
+    int failed;
+} Observations;
 
 _Static_assert(sizeof(Vec4) == 16, "Vec4 must match Slang float4");
 _Static_assert(sizeof(Primitive) == 16, "Primitive must match the shader record");
@@ -182,55 +187,46 @@ static int write_snapshot(const char *path, const uint8_t *bytes, size_t size) {
     return 1;
 }
 
-/* Polling is bounded; dropped, failed, and error-level observations fail the run. */
-static int poll_observability(EzGfxContext context) {
-    uint32_t count;
-    uint64_t dropped;
-    uint8_t present;
-    EzGfxRuntimeRecord record;
-    EzGfxDiagnostic diagnostic;
+/* Callback payloads are borrowed; readback bytes are copied before returning. */
+static void observe(const EzGfxEvent *event, void *user_data) {
+    Observations *observations = (Observations *)user_data;
+    if (event == NULL || observations == NULL) return;
 
-    for (count = 0; count < MAX_OBSERVATIONS; ++count) {
-        dropped = 0;
-        present = 0;
-        if (!checked(ez_gfx_poll_runtime_event(&record, &present, &dropped, context),
-                "poll runtime event")) return 0;
-        if (dropped != 0) {
-            fprintf(stderr, "runtime event queue dropped %llu records\n", (unsigned long long)dropped);
-            return 0;
-        }
-        if (!present) break;
+    switch (event->kind) {
+    case EzGfxEventKind_Upload:
+        if (event->upload.status == EzGfxUploadStatus_Failed) observations->failed = 1;
+        break;
+    case EzGfxEventKind_Runtime:
         printf("runtime event %llu backend=%u phase=%u status=%u\n",
-            (unsigned long long)record.correlation_id, (unsigned)record.backend,
-            (unsigned)record.phase, (unsigned)record.status);
-        if (record.status != EzGfxResult_Ok) return 0;
-    }
-    if (count == MAX_OBSERVATIONS) {
-        fprintf(stderr, "runtime event drain exceeded its bound\n");
-        return 0;
-    }
-
-    for (count = 0; count < MAX_OBSERVATIONS; ++count) {
-        dropped = 0;
-        present = 0;
-        if (!checked(ez_gfx_poll_diagnostic(&diagnostic, &present, &dropped, context),
-                "poll diagnostic")) return 0;
-        if (dropped != 0) {
-            fprintf(stderr, "diagnostic queue dropped %llu records\n", (unsigned long long)dropped);
-            return 0;
-        }
-        if (!present) break;
+            (unsigned long long)event->record.correlation_id, (unsigned)event->record.backend,
+            (unsigned)event->record.phase, (unsigned)event->record.status);
+        if (event->record.status != EzGfxResult_Ok) observations->failed = 1;
+        break;
+    case EzGfxEventKind_Diagnostic:
         fprintf(stderr, "diagnostic level=%u phase=%u status=%u\n",
-            (unsigned)diagnostic.level, (unsigned)diagnostic.record.phase,
-            (unsigned)diagnostic.record.status);
-        if (diagnostic.level == EzGfxDiagnosticLevel_Error ||
-            diagnostic.record.status != EzGfxResult_Ok) return 0;
+            (unsigned)event->level, (unsigned)event->record.phase,
+            (unsigned)event->record.status);
+        if (event->level == EzGfxDiagnosticLevel_Error ||
+            event->record.status != EzGfxResult_Ok) observations->failed = 1;
+        break;
+    case EzGfxEventKind_ObservationsDropped:
+        fprintf(stderr, "event queue dropped %llu records\n",
+            (unsigned long long)event->dropped);
+        observations->failed = 1;
+        break;
+    case EzGfxEventKind_Readback:
+        if (event->readback_byte_count != observations->snapshot_capacity ||
+            event->readback_bytes == NULL || observations->snapshot == NULL) {
+            observations->failed = 1;
+            break;
+        }
+        memcpy(observations->snapshot, event->readback_bytes, event->readback_byte_count);
+        observations->snapshot_size = event->readback_byte_count;
+        break;
+    default:
+        observations->failed = 1;
+        break;
     }
-    if (count == MAX_OBSERVATIONS) {
-        fprintf(stderr, "diagnostic drain exceeded its bound\n");
-        return 0;
-    }
-    return 1;
 }
 
 /* Closing during a bounded run stops future frame submission. */
@@ -294,11 +290,11 @@ int main(int argc, char **argv) {
     EzGfxContext context = 0;
     EzGfxSurface surface = 0;
     EzGfxShader shader = 0;
-    EzGfxStructuredBuffer primitives = 0;
+    EzGfxBuffer primitives = 0;
     EzGfxVertexHeap positions_heap = 0, normals_heap = 0;
     EzGfxVertexAllocation positions = 0, normals = 0;
     EzGfxIndexAllocation indices = 0;
-    EzGfxIndirectBuffer indirect = 0;
+    EzGfxCountedBuffer indirect = 0;
     EzGfxFrame active_frame = 0;
     uint32_t first_index = 0, index_count = 0, frame_index;
     int success = 0;
@@ -308,6 +304,7 @@ int main(int argc, char **argv) {
     EzGfxBinding bindings[2];
     EzGfxDynamicState dynamic_state;
     EzGfxResult frame_result;
+    Observations observations = {0};
 
     if (ez_gfx_abi_version() != EZ_GFX_ABI_VERSION) {
         fprintf(stderr, "ez-gfx ABI mismatch: header=%u library=%u\n",
@@ -319,11 +316,22 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
     if (!read_file(options.artifact_path, &artifact, &artifact_size)) goto cleanup;
+    if (options.snapshot_path != NULL) {
+        snapshot_size = (size_t)WIDTH * (size_t)HEIGHT * 4u;
+        snapshot = (uint8_t *)malloc(snapshot_size);
+        if (snapshot == NULL) {
+            fprintf(stderr, "allocate snapshot failed\n");
+            goto cleanup;
+        }
+        observations.snapshot = snapshot;
+        observations.snapshot_capacity = snapshot_size;
+    }
     window = create_window(instance);
     if (window == NULL) goto cleanup;
 
     context_desc = (EzGfxBackendContextDesc){0, 0, EzGfxSurfacePlatform_Win32, options.backend, 0};
     if (!checked(ez_gfx_context_create_backend(&context_desc, &context), "create context")) goto cleanup;
+    if (!checked(ez_gfx_callback_register(context, observe, &observations), "register callback")) goto cleanup;
     surface_desc = (EzGfxSurfaceDesc){window, instance, EzGfxSurfacePlatform_Win32,
         WIDTH, HEIGHT, options.snapshot_path != NULL};
     if (!checked(ez_gfx_surface_create(&surface_desc, &surface, context), "create surface")) goto cleanup;
@@ -351,16 +359,16 @@ int main(int argc, char **argv) {
         }
         if (!g_running) break;
         if (!checked(ez_gfx_frame_begin(context, surface, &active_frame), "begin frame")) goto cleanup;
-        if (!checked(ez_gfx_structured_acquire(sizeof(Primitive), 1, "primitives", sizeof("primitives") - 1, &primitives, active_frame), "acquire primitives")) {
+        if (!checked(ez_gfx_buffer_acquire(sizeof(Primitive), 1, "primitives", sizeof("primitives") - 1, &primitives, active_frame), "acquire primitives")) {
             (void)ez_gfx_frame_abort(active_frame); goto cleanup;
         }
-        if (!checked(ez_gfx_structured_write(primitives, 0, &primitive, 1, sizeof(Primitive), active_frame), "write primitives")) {
+        if (!checked(ez_gfx_buffer_write(primitives, 0, &primitive, 1, sizeof(Primitive), active_frame), "write primitives")) {
             (void)ez_gfx_frame_abort(active_frame); goto cleanup;
         }
-        if (!checked(ez_gfx_acquire_indirect(1, "draw commands", sizeof("draw commands") - 1, &indirect, active_frame), "acquire indirect")) {
+        if (!checked(ez_gfx_counted_buffer_acquire(1, "draw commands", sizeof("draw commands") - 1, &indirect, active_frame), "acquire indirect")) {
             (void)ez_gfx_frame_abort(active_frame); goto cleanup;
         }
-        if (!checked(ez_gfx_indirect_publish_compute_count(indirect, 1, active_frame), "publish compute indirect count")) {
+        if (!checked(ez_gfx_counted_buffer_publish_count(indirect, 1, active_frame), "publish compute indirect count")) {
             (void)ez_gfx_frame_abort(active_frame); goto cleanup;
         }
         bindings[0] = (EzGfxBinding){"primitives", sizeof("primitives") - 1, primitives, 0, 0};
@@ -375,13 +383,10 @@ int main(int argc, char **argv) {
         }
         frame_result = ez_gfx_frame_end(active_frame);
         active_frame = 0;
-        if (!checked(frame_result, "submit and present")) {
-            (void)poll_observability(context);
-            goto cleanup;
-        }
+        if (!checked(frame_result, "submit and present")) goto cleanup;
+        if (observations.failed) goto cleanup;
         primitives = 0;
         indirect = 0;
-        if (!poll_observability(context)) goto cleanup;
     }
     if (frame_index == 0) {
         fprintf(stderr, "no frame was presented\n");
@@ -389,13 +394,10 @@ int main(int argc, char **argv) {
     }
 
     if (options.snapshot_path != NULL) {
-        if (!checked(ez_gfx_frame_readback(NULL, 0, &snapshot_size, context), "query snapshot size")) goto cleanup;
-        snapshot = (uint8_t *)malloc(snapshot_size);
-        if (snapshot == NULL) {
-            fprintf(stderr, "allocate snapshot failed\n");
+        if (observations.snapshot_size != snapshot_size) {
+            fprintf(stderr, "snapshot callback was not delivered\n");
             goto cleanup;
         }
-        if (!checked(ez_gfx_frame_readback(snapshot, snapshot_size, &snapshot_size, context), "read snapshot")) goto cleanup;
         if (!write_snapshot(options.snapshot_path, snapshot, snapshot_size)) goto cleanup;
     }
     printf("rendered %u frame(s) with %s\n", frame_index, options.backend_name);
@@ -403,7 +405,10 @@ int main(int argc, char **argv) {
 
 cleanup:
     if (active_frame != 0) (void)ez_gfx_frame_abort(active_frame);
-    if (context != 0) ez_gfx_context_destroy(context);
+    if (context != 0) {
+        (void)ez_gfx_callback_register(context, NULL, NULL);
+        ez_gfx_context_destroy(context);
+    }
     if (window != NULL && IsWindow(window)) DestroyWindow(window);
     if (window != NULL) UnregisterClassA(class_name, instance);
     free(snapshot);

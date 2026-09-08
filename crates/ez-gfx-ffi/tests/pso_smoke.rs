@@ -10,11 +10,11 @@ mod common;
 use common::TestContext;
 use ez_gfx_compiler::{CompilerError, Target, compile_shader};
 use ez_gfx_ffi::{
-    EzGfxBinding, EzGfxRenderTargetDesc, EzGfxResult, ez_gfx_acquire_indirect,
-    ez_gfx_context_wait_idle, ez_gfx_frame_end, ez_gfx_indirect_publish_compute_count,
-    ez_gfx_render_add_compute_pipeline, ez_gfx_render_target_create, ez_gfx_render_target_destroy,
-    ez_gfx_render_target_frame_begin, ez_gfx_shader_destroy, ez_gfx_shader_load_artifact,
-    ez_gfx_structured_acquire, ez_gfx_structured_write,
+    EzGfxBinding, EzGfxRenderTargetDesc, EzGfxResult, ez_gfx_buffer_acquire, ez_gfx_buffer_write,
+    ez_gfx_context_wait_idle, ez_gfx_counted_buffer_acquire, ez_gfx_counted_buffer_publish_count,
+    ez_gfx_frame_end, ez_gfx_render_add_compute_pipeline, ez_gfx_render_target_create,
+    ez_gfx_render_target_destroy, ez_gfx_render_target_frame_begin, ez_gfx_shader_destroy,
+    ez_gfx_shader_load_artifact,
 };
 
 const COMPUTE_SOURCE: &str = r#"[__AttributeUsage(_AttributeTargets.Var)]
@@ -119,17 +119,17 @@ fn run_compute_pipeline(backend: u8) {
     let (frame, target) = begin_offscreen_frame(context);
 
     let binding_name = b"values";
-    let mut structured = 0;
+    let mut buffer = 0;
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_structured_acquire(
+                ez_gfx_buffer_acquire(
                     4,
                     1,
                     binding_name.as_ptr(),
                     binding_name.len(),
-                    &raw mut structured,
+                    &raw mut buffer,
                     frame,
                 )
             }
@@ -140,7 +140,7 @@ fn run_compute_pipeline(backend: u8) {
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_structured_write(structured, 0, value.as_ptr().cast(), 1, 4, frame) }
+            unsafe { ez_gfx_buffer_write(buffer, 0, value.as_ptr().cast(), 1, 4, frame) }
         },
         EzGfxResult::Ok
     );
@@ -150,7 +150,7 @@ fn run_compute_pipeline(backend: u8) {
         {
             // SAFETY: The name and output ranges remain valid for the call.
             unsafe {
-                ez_gfx_acquire_indirect(
+                ez_gfx_counted_buffer_acquire(
                     1,
                     indirect_name.as_ptr(),
                     indirect_name.len(),
@@ -162,22 +162,22 @@ fn run_compute_pipeline(backend: u8) {
         EzGfxResult::Ok
     );
     assert_eq!(
-        ez_gfx_indirect_publish_compute_count(indirect, 1, frame),
+        ez_gfx_counted_buffer_publish_count(indirect, 1, frame),
         EzGfxResult::Ok
     );
     let bindings = [
         EzGfxBinding {
             name: binding_name.as_ptr(),
             name_length: binding_name.len(),
-            structured,
-            indirect: 0,
+            buffer,
+            counted_buffer: 0,
             render_target: 0,
         },
         EzGfxBinding {
             name: indirect_name.as_ptr(),
             name_length: indirect_name.len(),
-            structured: 0,
-            indirect,
+            buffer: 0,
+            counted_buffer: indirect,
             render_target: 0,
         },
     ];
@@ -204,12 +204,12 @@ fn run_compute_pipeline(backend: u8) {
     assert_eq!(
         {
             // SAFETY: The source range remains valid; rejection occurs before any copy.
-            unsafe { ez_gfx_structured_write(structured, 0, value.as_ptr().cast(), 1, 4, frame) }
+            unsafe { ez_gfx_buffer_write(buffer, 0, value.as_ptr().cast(), 1, 4, frame) }
         },
         EzGfxResult::NotReady
     );
     assert_eq!(
-        ez_gfx_indirect_publish_compute_count(indirect, 1, frame),
+        ez_gfx_counted_buffer_publish_count(indirect, 1, frame),
         EzGfxResult::NotReady
     );
     assert_eq!(ez_gfx_frame_end(frame), EzGfxResult::Ok);
@@ -218,12 +218,12 @@ fn run_compute_pipeline(backend: u8) {
     assert_eq!(
         {
             // SAFETY: The source range remains valid; the stale handle is validated first.
-            unsafe { ez_gfx_structured_write(structured, 0, value.as_ptr().cast(), 1, 4, frame) }
+            unsafe { ez_gfx_buffer_write(buffer, 0, value.as_ptr().cast(), 1, 4, frame) }
         },
         EzGfxResult::InvalidContext
     );
     assert_eq!(
-        ez_gfx_indirect_publish_compute_count(indirect, 1, frame),
+        ez_gfx_counted_buffer_publish_count(indirect, 1, frame),
         EzGfxResult::InvalidContext
     );
 

@@ -6,7 +6,8 @@ use super::{
 
 pub(super) fn map_frame(error: &ez_gfx_runtime::frame::FrameError) -> Error {
     match error {
-        ez_gfx_runtime::frame::FrameError::NotRecording
+        ez_gfx_runtime::frame::FrameError::AlreadyRecording
+        | ez_gfx_runtime::frame::FrameError::NotRecording
         | ez_gfx_runtime::frame::FrameError::MissingGraph
         | ez_gfx_runtime::frame::FrameError::NotSubmitted => Error::NotReady,
         _ => Error::InvalidArgument,
