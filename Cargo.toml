@@ -61,6 +61,7 @@ tempfile = "3.27.0"
 static_assertions = "1.1.0"
 ash = { version = "0.38.0", default-features = false, features = ["loaded", "std"] }
 windows = { version = "0.62.2", default-features = false }
+libloading = "0.8.9"
 objc2 = { version = "0.6.2", default-features = false, features = ["std"] }
 objc2-metal = { version = "0.3.2", default-features = false, features = ["MTLDevice"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSString"] }

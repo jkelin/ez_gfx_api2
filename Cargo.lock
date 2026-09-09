@@ -759,6 +759,7 @@ dependencies = [
  "ez-gfx-hal",
  "ez-gfx-runtime",
  "gpu-allocator",
+ "libloading",
  "parking_lot",
 ]
 

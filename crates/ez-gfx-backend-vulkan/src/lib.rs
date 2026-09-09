@@ -108,6 +108,8 @@ fn sampler_create_info(desc: TextureSamplerDesc, mip_count: u32) -> vk::SamplerC
 pub enum SurfacePlatform {
     /// A Win32 window and application instance.
     Win32,
+    /// A GLFW window; GLFW supplies the platform-specific Vulkan extensions and surface.
+    Glfw,
     /// A logical surfaceless target; no WSI extension or native surface is required.
     Headless,
 }
