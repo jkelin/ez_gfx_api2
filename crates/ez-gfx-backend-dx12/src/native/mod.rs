@@ -54,10 +54,9 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT,
     D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
     D3D12_RESOURCE_STATES, D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_RESOURCE_UAV_BARRIER,
-    D3D12_ROOT_CONSTANTS, D3D12_ROOT_DESCRIPTOR, D3D12_ROOT_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER,
-    D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-    D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER_TYPE_SRV,
-    D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_ROOT_SIGNATURE_DESC,
+    D3D12_ROOT_DESCRIPTOR, D3D12_ROOT_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER,
+    D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+    D3D12_ROOT_PARAMETER_TYPE_SRV, D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_ROOT_SIGNATURE_DESC,
     D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, D3D12_ROOT_SIGNATURE_FLAG_NONE,
     D3D12_SAMPLER_DESC, D3D12_SHADER_BYTECODE, D3D12_SHADER_RESOURCE_VIEW_DESC,
     D3D12_SHADER_RESOURCE_VIEW_DESC_0, D3D12_SHADER_VISIBILITY_ALL, D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -99,6 +98,7 @@ use windows::{
             },
         },
         System::Threading::{CreateEventW, INFINITE, WaitForSingleObject},
+        UI::WindowsAndMessaging::GetClientRect,
     },
     core::Interface,
 };
@@ -138,8 +138,6 @@ pub struct NativeDrawIndexed<'a> {
     pub indirect_size: u64,
     /// Number of indirect commands to execute.
     pub draw_count: u32,
-    /// Root-constant payload.
-    pub push_constants: &'a [u8],
     /// Reflected root buffer bindings.
     pub bindings: &'a [NativeBufferBinding<'a>],
 }
@@ -150,8 +148,6 @@ pub struct NativeComputeDispatch<'a> {
     pub pipeline: &'a NativePipeline,
     /// Workgroup count for each dimension.
     pub groups: [u32; 3],
-    /// Root-constant payload.
-    pub push_constants: &'a [u8],
     /// Reflected root buffer bindings.
     pub bindings: &'a [NativeBufferBinding<'a>],
 }
@@ -354,6 +350,27 @@ impl NativeSurface {
     /// Returns the borrowed HWND value.
     pub const fn window(&self) -> usize {
         self.window
+    }
+
+    /// Reads the current drawable size from the borrowed HWND.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HalError::NativeFailure`] when Win32 rejects the query.
+    pub fn window_extent(&self) -> Result<Option<(u32, u32)>, HalError> {
+        let mut rect = RECT::default();
+        // SAFETY: `self.window` remains borrowed and valid for this surface's lifetime.
+        unsafe { GetClientRect(HWND(self.window as *mut _), &raw mut rect) }
+            .map_err(|_| HalError::NativeFailure)?;
+        let width = rect.right.saturating_sub(rect.left);
+        let height = rect.bottom.saturating_sub(rect.top);
+        if width == 0 || height == 0 {
+            return Ok(None);
+        }
+        Ok(Some((
+            u32::try_from(width).map_err(|_| HalError::NativeFailure)?,
+            u32::try_from(height).map_err(|_| HalError::NativeFailure)?,
+        )))
     }
 
     /// Returns the most recently captured RGBA8 frame, or an empty slice before capture.

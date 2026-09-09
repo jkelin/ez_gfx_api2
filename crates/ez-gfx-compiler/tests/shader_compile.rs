@@ -153,3 +153,55 @@ fn duplicate_declared_stage_is_rejected_when_slang_is_available() {
 
     assert!(matches!(error, CompilerError::DuplicateStage(_)));
 }
+
+#[test]
+fn shared_buffer_semantics_compile_for_every_target_when_slang_is_available() {
+    if shader_slang::GlobalSession::new().is_none() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("ez_gfx_api.slang"),
+        include_str!("../../../ez_gfx_api.slang"),
+    )
+    .unwrap();
+    let source = root.path().join("shader.slang");
+    fs::write(
+        &source,
+        r#"
+            import ez_gfx_api;
+            struct Draw { uint indexCount; uint instanceCount; uint firstIndex; int vertexOffset; uint firstInstance; };
+            [Buffer("value")] StructuredBuffer<uint> value;
+            [CounterBuffer("draws")] CounterBuffer<Draw> draws;
+            [shader("compute")] [numthreads(1,1,1)]
+            void main(uint3 id : SV_DispatchThreadID) {
+                draws.set_count(0);
+                uint index = draws.add_count(value[0]);
+                draws.set(index, Draw(3, 1, 0, 0, 0));
+            }
+        "#,
+    )
+    .unwrap();
+
+    let bytes = compile_shader(&source, ALL_TARGETS, true).unwrap();
+    let artifact = Artifact::decode(&bytes).unwrap();
+    let metadata: serde_json::Value = serde_json::from_slice(&artifact.metadata).unwrap();
+
+    let reflections = metadata["reflections"].as_array().unwrap();
+    assert_eq!(reflections.len(), ALL_TARGETS.len());
+    for target in ["Spirv", "Dxil", "Msl"] {
+        let matching: Vec<_> = reflections
+            .iter()
+            .filter(|reflection| reflection["target"] == target)
+            .collect();
+        assert_eq!(matching.len(), 1);
+        let parameters = matching[0]["reflection"]["parameters"].as_array().unwrap();
+        let counters: Vec<_> = parameters
+            .iter()
+            .filter(|parameter| parameter["api_kind"] == "counter_buffer")
+            .collect();
+        assert_eq!(counters.len(), 1);
+        assert_eq!(counters[0]["descriptor_count"], 2);
+        assert_eq!(counters[0]["resource_access"], "ReadWrite");
+    }
+}

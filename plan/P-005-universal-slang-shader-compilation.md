@@ -13,7 +13,7 @@ Source evidence: Original Odin code (`src/shader.odin`) loaded Slang source at r
 
 - A single universal Slang shader source file must compile correctly to SPIR-V, DXIL, and MSL/AIR.
 - Uniform bindless resource access models and entry point conventions across all 3 targets.
-- Extraction of shader reflection metadata (render target attributes, push constants, resource bindings) during compilation.
+- Extraction of shader reflection metadata (render target attributes, resource bindings) during compilation.
 - Explicit non-goals: introducing a custom DSL or supporting legacy HLSL/GLSL files.
 
 ## Dependencies

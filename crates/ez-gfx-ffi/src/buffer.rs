@@ -20,7 +20,7 @@ const FIELD_MASK_U32: u32 = (1 << 24) - 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Kind {
-    Structured = 1,
+    Buffer = 1,
     Counter = 2,
 }
 
@@ -62,7 +62,7 @@ fn decode(handle: u64) -> Result<(u32, u32, Kind), EzGfxResult> {
         return Err(EzGfxResult::InvalidContext);
     }
     let kind = match (handle >> KIND_SHIFT) & 0xFF {
-        1 => Kind::Structured,
+        1 => Kind::Buffer,
         2 => Kind::Counter,
         _ => return Err(EzGfxResult::InvalidContext),
     };
@@ -240,14 +240,11 @@ pub(crate) fn materialize(
     }
     let frame_entry = crate::frame::get(frame)?;
     let resource = with_entry(handle, frame_entry.owner, kind, |entry| match kind {
-        Kind::Structured => {
-            let raw_handle = raw::acquire_structured_raw(
-                frame_entry.owner,
-                entry.element_size,
-                entry.element_count,
-            )
-            .map_err(EzGfxResult::from)?;
-            if let Err(error) = raw::write_structured_raw(
+        Kind::Buffer => {
+            let raw_handle =
+                raw::acquire_buffer_raw(frame_entry.owner, entry.element_size, entry.element_count)
+                    .map_err(EzGfxResult::from)?;
+            if let Err(error) = raw::write_buffer_raw(
                 frame_entry.owner,
                 raw_handle,
                 0,
@@ -255,30 +252,27 @@ pub(crate) fn materialize(
                 entry.element_size,
                 &entry.bytes,
             ) {
-                raw::release_structured(frame_entry.owner, raw_handle);
+                raw::release_buffer(frame_entry.owner, raw_handle);
                 return Err(error.into());
             }
-            Ok(ResourceIdentity::Structured(raw_handle))
+            Ok(ResourceIdentity::Buffer(raw_handle))
         }
         Kind::Counter => {
             if entry.element_size as usize != core::mem::size_of::<DrawIndexedCommand>() {
                 return Err(EzGfxResult::InvalidArgument);
             }
-            let raw_handle = raw::acquire_indirect(frame_entry.owner, entry.element_count)
+            let raw_handle = raw::acquire_counter(frame_entry.owner, entry.element_count)
                 .map_err(EzGfxResult::from)?;
-            let result = raw::write_indirect_bytes(frame_entry.owner, raw_handle, &entry.bytes)
-                .and_then(|()| {
-                    raw::publish_compute_indirect_count(
-                        frame_entry.owner,
-                        raw_handle,
-                        entry.published_count,
-                    )
-                });
-            if let Err(error) = result {
-                raw::release_indirect(frame_entry.owner, raw_handle);
+            if let Err(error) = raw::write_counter_bytes(
+                frame_entry.owner,
+                raw_handle,
+                &entry.bytes,
+                entry.published_count,
+            ) {
+                raw::release_counter(frame_entry.owner, raw_handle);
                 return Err(error.into());
             }
-            Ok(ResourceIdentity::Indirect(raw_handle))
+            Ok(ResourceIdentity::Counter(raw_handle))
         }
     })?;
     MATERIALIZED

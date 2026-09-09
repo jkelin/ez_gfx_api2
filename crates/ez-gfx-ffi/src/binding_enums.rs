@@ -77,19 +77,6 @@ pub enum EzGfxDiagnosticLevel {
     Error = 3,
 }
 
-/// Native surface platform.
-#[repr(u8)]
-pub enum EzGfxSurfacePlatform {
-    /// Win32 HWND and HINSTANCE handles.
-    Win32 = 0,
-    /// GLFW native window handle.
-    GLFW = 1,
-    /// Borrowed `CAMetalLayer` pointer.
-    MetalLayer = 2,
-    /// Windowless Vulkan headless surface; no native handles.
-    Headless = 3,
-}
-
 /// Source image encoding; values 128 through 255 are application decoders.
 #[repr(u8)]
 pub enum EzGfxSourceTextureFormat {

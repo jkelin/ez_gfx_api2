@@ -72,8 +72,8 @@ enum TransientState {
 }
 
 enum TransientHandle {
-    Structured(StructuredBufferHandle),
-    Indirect(IndirectBufferHandle),
+    Buffer(BufferHandle),
+    Counter(CounterBufferHandle),
 }
 
 struct TransientInner {
@@ -92,11 +92,11 @@ impl Drop for TransientInner {
         // Successful completion consumes raw transients. Only live, abandoned
         // transactions reach this release path after frame rollback.
         match self.handle {
-            TransientHandle::Structured(handle) => {
-                state::release_structured(self.context.handle, handle);
+            TransientHandle::Buffer(handle) => {
+                state::release_buffer(self.context.handle, handle);
             }
-            TransientHandle::Indirect(handle) => {
-                state::release_indirect(self.context.handle, handle);
+            TransientHandle::Counter(handle) => {
+                state::release_counter(self.context.handle, handle);
             }
         }
     }
@@ -147,52 +147,42 @@ impl<T: bytemuck::Pod> Buffer<T> {
     /// # Errors
     /// Returns [`Error`] when the context is dispatching a callback or the range is invalid.
     pub fn write(&self, start_index: usize, values: &[T]) -> Result<()> {
-        let context = Context {
-            inner: Rc::clone(&self.inner.context),
-        };
+        let context = Context { inner: Rc::clone(&self.inner.context), owner: false, };
         context.check_entry()?;
         self.inner.write(start_index, values)
     }
 }
 
-/// Context-acquired one-frame buffer carrying a separately publishable visible count.
+/// Context-acquired one-frame buffer with a shader-writable count.
 pub struct CounterBuffer<T: bytemuck::Pod> {
     inner: Rc<BufferInner>,
     marker: PhantomData<T>,
 }
 
 impl<T: bytemuck::Pod> CounterBuffer<T> {
-    /// Replaces a typed element range.
+    /// Replaces a typed element range and advances the initial visible count.
+    ///
+    /// GPU producers can replace that count with `set_count` or `add_count`.
     ///
     /// # Errors
     /// Returns [`Error`] when the context is dispatching a callback or the range is invalid.
     pub fn write(&self, start_index: usize, values: &[T]) -> Result<()> {
-        let context = Context {
-            inner: Rc::clone(&self.inner.context),
-        };
+        let context = Context { inner: Rc::clone(&self.inner.context), owner: false, };
         context.check_entry()?;
-        self.inner.write(start_index, values)
-    }
-
-    /// Publishes the visible element count.
-    ///
-    /// # Errors
-    /// Returns [`Error`] during callback dispatch or when the count exceeds capacity.
-    pub fn publish_count(&self, count: u32) -> Result<()> {
-        let context = Context {
-            inner: Rc::clone(&self.inner.context),
-        };
-        context.check_entry()?;
-        // Publication after a frame claim would diverge from the staged contents.
-        if self.inner.usage.get() != BufferUse::Available {
-            return Err(Error::NotReady);
-        }
-        if count > self.inner.element_count {
-            return Err(Error::InvalidArgument);
-        }
-        self.inner.published_count.set(count);
+        self.inner.write(start_index, values)?;
+        let end = start_index
+            .checked_add(values.len())
+            .and_then(|end| u32::try_from(end).ok())
+            .ok_or(Error::InvalidArgument)?;
+        self.inner.published_count.set(self.inner.published_count.get().max(end));
         Ok(())
     }
+}
+
+/// Context-acquired one-frame buffer containing exactly one POD value.
+pub struct ValueBuffer<T: bytemuck::Pod> {
+    inner: Rc<BufferInner>,
+    marker: PhantomData<T>,
 }
 
 impl Context {
@@ -255,6 +245,17 @@ impl Context {
         })
     }
 
+    /// Acquires a one-frame buffer containing exactly one POD value.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when the value is zero-sized, oversized, or the context is invalid.
+    pub fn acquire_value_buffer<T: bytemuck::Pod>(&self, value: T) -> Result<ValueBuffer<T>> {
+        Ok(ValueBuffer {
+            inner: self.allocate_buffer(1, Some(core::slice::from_ref(&value)), 0)?,
+            marker: PhantomData,
+        })
+    }
+
     /// Acquires a one-frame typed counter buffer by element count.
     ///
     /// # Errors
@@ -271,7 +272,7 @@ impl Context {
 
     /// Acquires a correctly-sized one-frame counter buffer initialized from POD data.
     ///
-    /// The initialized element count is published automatically.
+    /// The initialized element count becomes the GPU-visible initial count.
     ///
     /// # Errors
     /// Returns [`Error`] when the input is empty, oversized, zero-sized, or the context is invalid.
@@ -292,44 +293,39 @@ impl Context {
     }
 }
 
-enum BindingResource<'a> {
-    Structured(&'a Rc<BufferInner>),
-    Indirect(&'a Rc<BufferInner>),
-    RenderTarget(&'a Rc<RenderTargetInner>),
+enum DraftBinding {
+    Buffer(Rc<BufferInner>),
+    Counter(Rc<BufferInner>),
 }
 
-/// One named safe resource binding retained by a recorded frame.
-pub struct Binding<'a> {
-    name: String,
-    resource: BindingResource<'a>,
+mod bindable_buffer {
+    pub trait Sealed {}
 }
 
-impl<'a> Binding<'a> {
-    /// Binds a typed buffer.
-    pub fn buffer<T: bytemuck::Pod>(name: impl Into<String>, buffer: &'a Buffer<T>) -> Self {
-        Self {
-            name: name.into(),
-            resource: BindingResource::Structured(&buffer.inner),
-        }
-    }
+/// Buffer resource accepted by [`Frame::bind_buffer`].
+pub trait BindableBuffer: bindable_buffer::Sealed {
+    #[doc(hidden)]
+    fn bind_to_frame(&self, frame: &mut Frame, name: String) -> Result<()>;
+}
 
-    /// Binds a counter buffer.
-    pub fn counter_buffer<T: bytemuck::Pod>(
-        name: impl Into<String>,
-        buffer: &'a CounterBuffer<T>,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            resource: BindingResource::Indirect(&buffer.inner),
-        }
+impl<T: bytemuck::Pod> bindable_buffer::Sealed for Buffer<T> {}
+impl<T: bytemuck::Pod> BindableBuffer for Buffer<T> {
+    fn bind_to_frame(&self, frame: &mut Frame, name: String) -> Result<()> {
+        frame.bind_draft(name, DraftBinding::Buffer(Rc::clone(&self.inner)))
     }
+}
 
-    /// Binds a managed render target.
-    pub fn render_target(name: impl Into<String>, target: &'a RenderTarget) -> Self {
-        Self {
-            name: name.into(),
-            resource: BindingResource::RenderTarget(&target.inner),
-        }
+impl<T: bytemuck::Pod> bindable_buffer::Sealed for ValueBuffer<T> {}
+impl<T: bytemuck::Pod> BindableBuffer for ValueBuffer<T> {
+    fn bind_to_frame(&self, frame: &mut Frame, name: String) -> Result<()> {
+        frame.bind_draft(name, DraftBinding::Buffer(Rc::clone(&self.inner)))
+    }
+}
+
+impl<T: bytemuck::Pod> bindable_buffer::Sealed for CounterBuffer<T> {}
+impl<T: bytemuck::Pod> BindableBuffer for CounterBuffer<T> {
+    fn bind_to_frame(&self, frame: &mut Frame, name: String) -> Result<()> {
+        frame.bind_draft(name, DraftBinding::Counter(Rc::clone(&self.inner)))
     }
 }
 
@@ -359,6 +355,7 @@ pub struct Frame {
     poison: Option<Error>,
     terminal: bool,
     readbacks: Vec<PendingReadback>,
+    bindings: HashMap<String, DraftBinding>,
 }
 
 impl Frame {
@@ -402,11 +399,11 @@ impl Frame {
         for transient in &self.transients {
             if transient.state.replace(TransientState::Consumed) == TransientState::Live {
                 match transient.handle {
-                    TransientHandle::Structured(handle) => {
-                        state::release_structured(self.context.handle, handle);
+                    TransientHandle::Buffer(handle) => {
+                        state::release_buffer(self.context.handle, handle);
                     }
-                    TransientHandle::Indirect(handle) => {
-                        state::release_indirect(self.context.handle, handle);
+                    TransientHandle::Counter(handle) => {
+                        state::release_counter(self.context.handle, handle);
                     }
                 }
             }
@@ -414,174 +411,210 @@ impl Frame {
         }
     }
 
-    fn materialize_structured(&mut self, inner: &Rc<BufferInner>) -> Result<StructuredBufferHandle> {
-        self.ensure_context(&inner.context)?;
-        if let Some(handle) = self.transients.iter().find_map(|transient| {
+    fn materialize_buffer_state(
+        context: &Rc<ContextInner>,
+        transients: &mut Vec<Rc<TransientInner>>,
+        retained: &mut Vec<Rc<dyn Any>>,
+        inner: &Rc<BufferInner>,
+    ) -> Result<BufferHandle> {
+        if !Rc::ptr_eq(context, &inner.context) {
+            return Err(Error::InvalidContext);
+        }
+        if let Some(handle) = transients.iter().find_map(|transient| {
             Rc::ptr_eq(&transient.buffer, inner).then_some(&transient.handle)
         }) {
             return match handle {
-                TransientHandle::Structured(handle) => Ok(*handle),
-                TransientHandle::Indirect(_) => self.fail(Error::InvalidContext),
+                TransientHandle::Buffer(handle) => Ok(*handle),
+                TransientHandle::Counter(_) => Err(Error::InvalidContext),
             };
         }
         if inner.usage.get() != BufferUse::Available {
-            return self.fail(Error::NotReady);
+            return Err(Error::NotReady);
         }
-        let handle = match state::acquire_structured_sized(
-            self.context.handle,
-            inner.element_size,
-            inner.element_count,
-        ) {
-            Ok(handle) => handle,
-            Err(error) => return self.fail(error),
-        };
-        if let Err(error) = state::write_structured_bytes(
-            self.context.handle,
+        let handle =
+            state::acquire_buffer_sized(context.handle, inner.element_size, inner.element_count)?;
+        if let Err(error) = state::write_buffer_bytes(
+            context.handle,
             handle,
             inner.element_size,
             &inner.bytes.borrow(),
         ) {
-            state::release_structured(self.context.handle, handle);
-            return self.fail(error);
+            state::release_buffer(context.handle, handle);
+            return Err(error);
         }
         inner.usage.set(BufferUse::Claimed);
-        let transient = Rc::new(TransientInner {
-            context: Rc::clone(&self.context),
+        transients.push(Rc::new(TransientInner {
+            context: Rc::clone(context),
             buffer: Rc::clone(inner),
-            handle: TransientHandle::Structured(handle),
+            handle: TransientHandle::Buffer(handle),
             state: Cell::new(TransientState::Live),
-        });
-        self.transients.push(transient);
-        self.retain(inner);
+        }));
+        let retained_inner: Rc<dyn Any> = inner.clone();
+        retained.push(retained_inner);
         Ok(handle)
     }
 
-    fn materialize_counter(&mut self, inner: &Rc<BufferInner>) -> Result<IndirectBufferHandle> {
-        self.ensure_context(&inner.context)?;
+
+    fn materialize_counter_state(
+        context: &Rc<ContextInner>,
+        transients: &mut Vec<Rc<TransientInner>>,
+        retained: &mut Vec<Rc<dyn Any>>,
+        inner: &Rc<BufferInner>,
+    ) -> Result<CounterBufferHandle> {
+        if !Rc::ptr_eq(context, &inner.context) {
+            return Err(Error::InvalidContext);
+        }
         if inner.element_size as usize
             != core::mem::size_of::<ez_gfx_runtime::indirect::DrawIndexedCommand>()
         {
-            return self.fail(Error::InvalidArgument);
+            return Err(Error::InvalidArgument);
         }
-        if let Some(handle) = self.transients.iter().find_map(|transient| {
+        if let Some(handle) = transients.iter().find_map(|transient| {
             Rc::ptr_eq(&transient.buffer, inner).then_some(&transient.handle)
         }) {
             return match handle {
-                TransientHandle::Indirect(handle) => Ok(*handle),
-                TransientHandle::Structured(_) => self.fail(Error::InvalidContext),
+                TransientHandle::Counter(handle) => Ok(*handle),
+                TransientHandle::Buffer(_) => Err(Error::InvalidContext),
             };
         }
         if inner.usage.get() != BufferUse::Available {
-            return self.fail(Error::NotReady);
+            return Err(Error::NotReady);
         }
-        let handle = match state::acquire_indirect(self.context.handle, inner.element_count) {
-            Ok(handle) => handle,
-            Err(error) => return self.fail(error),
-        };
-        let staged =
-            state::write_indirect_bytes(self.context.handle, handle, &inner.bytes.borrow()).and_then(
-                |()| {
-                    state::publish_compute_indirect_count(
-                        self.context.handle,
-                        handle,
-                        inner.published_count.get(),
-                    )
-                },
-            );
-        if let Err(error) = staged {
-            state::release_indirect(self.context.handle, handle);
-            return self.fail(error);
+        let handle = state::acquire_counter(context.handle, inner.element_count)?;
+        if let Err(error) = state::write_counter_bytes(
+            context.handle,
+            handle,
+            &inner.bytes.borrow(),
+            inner.published_count.get(),
+        ) {
+            state::release_counter(context.handle, handle);
+            return Err(error);
         }
         inner.usage.set(BufferUse::Claimed);
-        let transient = Rc::new(TransientInner {
-            context: Rc::clone(&self.context),
+        transients.push(Rc::new(TransientInner {
+            context: Rc::clone(context),
             buffer: Rc::clone(inner),
-            handle: TransientHandle::Indirect(handle),
+            handle: TransientHandle::Counter(handle),
             state: Cell::new(TransientState::Live),
-        });
-        self.transients.push(transient);
-        self.retain(inner);
+        }));
+        let retained_inner: Rc<dyn Any> = inner.clone();
+        retained.push(retained_inner);
         Ok(handle)
     }
 
-    fn raw_bindings(&mut self, bindings: &[Binding<'_>]) -> Result<Vec<RawBinding>> {
-        let mut raw = Vec::with_capacity(bindings.len());
-        for binding in bindings {
-            let resource = match binding.resource {
-                BindingResource::Structured(inner) => {
-                    ResourceIdentity::Structured(self.materialize_structured(inner)?)
-                }
-                BindingResource::Indirect(inner) => {
-                    ResourceIdentity::Indirect(self.materialize_counter(inner)?)
-                }
-                BindingResource::RenderTarget(inner) => {
-                    self.ensure_context(&inner.context)?;
-                    let handle = match inner.managed_handle() {
-                        Ok(handle) => handle,
-                        Err(error) => return self.fail(error),
-                    };
-                    self.retain(inner);
-                    ResourceIdentity::RenderTarget(handle)
-                }
+    fn materialize_counter(&mut self, inner: &Rc<BufferInner>) -> Result<CounterBufferHandle> {
+        match Self::materialize_counter_state(
+            &self.context,
+            &mut self.transients,
+            &mut self.retained,
+            inner,
+        ) {
+            Ok(handle) => Ok(handle),
+            Err(error) => self.fail(error),
+        }
+    }
+
+    fn raw_bindings(&mut self) -> Result<Vec<RawBinding>> {
+        let mut raw = Vec::with_capacity(self.bindings.len());
+        for (name, binding) in &self.bindings {
+            let resource = match binding {
+                DraftBinding::Buffer(inner) => Self::materialize_buffer_state(
+                    &self.context,
+                    &mut self.transients,
+                    &mut self.retained,
+                    inner,
+                )
+                .map(ResourceIdentity::Buffer),
+                DraftBinding::Counter(inner) => Self::materialize_counter_state(
+                    &self.context,
+                    &mut self.transients,
+                    &mut self.retained,
+                    inner,
+                )
+                .map(ResourceIdentity::Counter),
+            };
+            let resource = match resource {
+                Ok(resource) => resource,
+                Err(error) => return self.fail(error),
             };
             raw.push(RawBinding {
-                name: binding.name.clone(),
+                name: name.clone(),
                 resource,
             });
         }
         Ok(raw)
     }
 
-    /// Records an indexed graphics operation.
+    /// Adds or replaces one named buffer in the frame binding set.
     ///
     /// # Errors
-    /// Returns [`Error`] when resources, bindings, constants, or recording state are invalid.
-    pub fn add_graphics(
+    /// Returns [`Error`] when the name, frame, resource state, or ownership is invalid.
+    pub fn bind_buffer<B: BindableBuffer + ?Sized>(
+        &mut self,
+        name: impl Into<String>,
+        buffer: &B,
+    ) -> Result<()> {
+        buffer.bind_to_frame(self, name.into())
+    }
+
+    fn bind_draft(&mut self, name: String, binding: DraftBinding) -> Result<()> {
+        if name.is_empty() || name.len() > 255 || name.as_bytes().contains(&0) {
+            return self.fail(Error::InvalidArgument);
+        }
+        let inner = match &binding {
+            DraftBinding::Buffer(inner) | DraftBinding::Counter(inner) => inner,
+        };
+        self.ensure_context(&inner.context)?;
+        let valid_state = match inner.usage.get() {
+            BufferUse::Available => true,
+            BufferUse::Claimed => self.transients.iter().any(|transient| {
+                transient.state.get() == TransientState::Live
+                    && Rc::ptr_eq(&transient.buffer, inner)
+            }),
+            BufferUse::Consumed => false,
+        };
+        if !valid_state {
+            return self.fail(Error::NotReady);
+        }
+        self.bindings.insert(name, binding);
+        Ok(())
+    }
+
+    /// Executes an indexed graphics operation from the current frame bindings.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when resources, bindings, or recording state are invalid.
+    pub fn execute_graphics(
         &mut self,
         shader: &Shader,
-        indirect: &CounterBuffer<ez_gfx_runtime::indirect::DrawIndexedCommand>,
-        bindings: &[Binding<'_>],
+        counter: &CounterBuffer<ez_gfx_runtime::indirect::DrawIndexedCommand>,
         state_desc: ez_gfx_hal::DynamicPipelineState,
-        push_constants: &[u8],
     ) -> Result<()> {
         self.ensure_context(&shader.inner.context)?;
-        let indirect_handle = self.materialize_counter(&indirect.inner)?;
-        let raw_bindings = self.raw_bindings(bindings)?;
+        let counter_handle = self.materialize_counter(&counter.inner)?;
+        let raw_bindings = self.raw_bindings()?;
         self.retain(&shader.inner);
         self.record(|context| {
-            state::render_add_graphics(
+            state::execute_graphics(
                 context,
                 shader.inner.handle,
-                indirect_handle,
+                counter_handle,
                 &raw_bindings,
                 state_desc,
-                push_constants,
             )
         })
     }
 
-    /// Records a compute dispatch.
+    /// Executes a compute dispatch from the current frame bindings.
     ///
     /// # Errors
     /// Returns [`Error`] when resources, bindings, dispatch, or recording state are invalid.
-    pub fn add_compute(
-        &mut self,
-        shader: &Shader,
-        groups: [u32; 3],
-        bindings: &[Binding<'_>],
-        push_constants: &[u8],
-    ) -> Result<()> {
+    pub fn execute_compute(&mut self, shader: &Shader, groups: [u32; 3]) -> Result<()> {
         self.ensure_context(&shader.inner.context)?;
-        let raw_bindings = self.raw_bindings(bindings)?;
+        let raw_bindings = self.raw_bindings()?;
         self.retain(&shader.inner);
         self.record(|context| {
-            state::render_add_compute(
-                context,
-                shader.inner.handle,
-                groups,
-                &raw_bindings,
-                push_constants,
-            )
+            state::execute_compute(context, shader.inner.handle, groups, &raw_bindings)
         })
     }
 
@@ -655,15 +688,6 @@ impl Frame {
         Ok(Readback { inner: request })
     }
 
-    /// Explicitly retains a texture used through the bindless heap.
-    ///
-    /// # Errors
-    /// Returns [`Error`] when the texture belongs to another context.
-    pub fn retain_texture(&mut self, texture: &Texture) -> Result<()> {
-        self.ensure_context(&texture.inner.context)?;
-        self.retain(&texture.inner);
-        Ok(())
-    }
 
     /// Configures a cached named render target for this frame.
     ///
@@ -828,9 +852,7 @@ impl Frame {
     /// # Errors
     /// Returns the exact first recording, submission, presentation, readback, or callback error.
     pub fn finish(mut self) -> Result<()> {
-        let context = Context {
-            inner: Rc::clone(&self.context),
-        };
+        let context = Context { inner: Rc::clone(&self.context), owner: false, };
         let result = if let Some(error) = self.poison {
             let _ = state::frame_abort(self.context.handle);
             self.release_aborted_transients();
@@ -978,9 +1000,7 @@ impl Surface {
     /// # Errors
     /// Returns [`Error`] when readiness or concurrent recording validation fails.
     pub fn begin_frame(&self) -> Result<Frame> {
-        let context = Context {
-            inner: Rc::clone(&self.inner.context),
-        };
+        let context = Context { inner: Rc::clone(&self.inner.context), owner: false, };
         context.check_entry()?;
         context.dispatch_events()?;
         state::frame_begin(context.raw())?;
@@ -994,6 +1014,7 @@ impl Surface {
             poison: None,
             terminal: false,
             readbacks: Vec::new(),
+            bindings: HashMap::new(),
         })
     }
 }
@@ -1016,6 +1037,7 @@ impl Context {
             poison: None,
             terminal: false,
             readbacks: Vec::new(),
+            bindings: HashMap::new(),
         })
     }
 }

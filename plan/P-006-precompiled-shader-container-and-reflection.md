@@ -2,7 +2,7 @@
 
 ## Problem
 
-Decide the format and serialization schema for precompiled shader modules containing target binaries (SPIR-V, DXIL, MSL) and reflection metadata (target declarations, load/store actions, bindings, push constants) so the runtime does not require Slang at startup, resolving conflicts between explicit target attributes and compiler optimizations.
+Decide the format and serialization schema for precompiled shader modules containing target binaries (SPIR-V, DXIL, MSL) and reflection metadata (target declarations, load/store actions, bindings) so the runtime does not require Slang at startup, resolving conflicts between explicit target attributes and compiler optimizations.
 
 ## Prompt context
 

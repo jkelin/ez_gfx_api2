@@ -1,13 +1,12 @@
 use super::{
-    BenchmarkRunner, Error, FrameInput, HostSurface, NativeSurface, PresentedFrame, ProgramReport,
-    Result, SceneInput, dispatch_window_input, publish_snapshot,
+    BenchmarkRunner, Error, FrameInput, PresentedFrame, ProgramReport, Result, SceneInput,
+    dispatch_window_input, publish_snapshot,
 };
 use ez_gfx::{Backend, Context, Event, Frame, Surface};
 use std::{
     cell::RefCell,
     ffi::OsString,
     io::Write,
-    path::Path,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -40,7 +39,6 @@ struct HostState {
     frame_limit: Option<u32>,
     visible: bool,
     window: Option<Window>,
-    host: Option<HostSurface>,
     width: u32,
     height: u32,
     pending_resize: Option<(u32, u32)>,
@@ -65,7 +63,6 @@ impl HostState {
             width,
             height,
             window: None,
-            host: None,
             pending_resize: None,
             pending_input: Vec::new(),
             redraw_ready: false,
@@ -77,13 +74,6 @@ impl HostState {
     fn fail(&mut self, error: impl Into<Error>) {
         self.error = Some(error.into());
         self.closed = true;
-    }
-
-    fn descriptor(&self) -> Result<NativeSurface> {
-        self.host
-            .as_ref()
-            .map(HostSurface::descriptor)
-            .ok_or_else(|| Error::message("native host was not resumed"))
     }
 
     fn initialize_window(&mut self, event_loop: &ActiveEventLoop) {
@@ -99,11 +89,6 @@ impl HostState {
             Ok(window) => window,
             Err(error) => return self.fail(error),
         };
-        let host = match HostSurface::attach(&window, self.width, self.height) {
-            Ok(host) => host,
-            Err(error) => return self.fail(error),
-        };
-        self.host = Some(host);
         self.window = Some(window);
     }
 
@@ -117,9 +102,6 @@ impl HostState {
                 self.width = size.width;
                 self.height = size.height;
                 self.pending_resize = Some((size.width, size.height));
-                if let Some(host) = &self.host {
-                    host.resize(size.width, size.height);
-                }
             }
             WindowEvent::RedrawRequested => self.redraw_ready = true,
             _ => {
@@ -188,13 +170,20 @@ impl Example {
             return Err(error);
         }
 
-        example.state.descriptor()?;
+        example
+            .state
+            .window
+            .as_ref()
+            .ok_or_else(|| Error::message("native host was not resumed"))?;
         Ok(example)
     }
 
-    /// Returns the validated native handles for explicit surface creation.
-    pub fn native_surface(&self) -> Result<NativeSurface> {
-        self.state.descriptor()
+    /// Returns the live host window used for surface creation.
+    pub fn window(&self) -> Result<&Window> {
+        self.state
+            .window
+            .as_ref()
+            .ok_or_else(|| Error::message("native host was not resumed"))
     }
 
     /// Returns whether graphics debug behavior was requested.
@@ -235,13 +224,6 @@ impl Example {
             }
         })?;
         Ok(())
-    }
-
-    /// Returns the parent directory of the examples package.
-    pub fn workspace_root() -> Result<&'static Path> {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .ok_or_else(|| Error::message("examples package has no workspace parent"))
     }
 
     fn pump_once(&mut self) -> Result<()> {

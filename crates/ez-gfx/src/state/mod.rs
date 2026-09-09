@@ -12,30 +12,27 @@ use std::{
 use ez_gfx_backend_dx12::native::{NativeContext as Dx12Context, NativeSurface as Dx12Surface};
 #[cfg(target_vendor = "apple")]
 use ez_gfx_backend_metal::native::{NativeContext as MetalContext, NativeSurface as MetalSurface};
-use ez_gfx_backend_vulkan::{
-    NativeContext as VulkanContext, NativeSurface as VulkanSurface,
-    SurfacePlatform as VulkanPlatform,
-};
+use ez_gfx_backend_vulkan::{NativeContext as VulkanContext, NativeSurface as VulkanSurface};
 use ez_gfx_core::{
     Backend,
     capability::AdapterInfo,
     handle::{
-        ContextHandle, GenerationalArena, HandleParts, IndexAllocationHandle, IndirectBufferHandle,
-        LocalHandle, PackedHandle, RenderTargetHandle, ShaderHandle, StructuredBufferHandle,
+        BufferHandle, ContextHandle, CounterBufferHandle, GenerationalArena, HandleParts,
+        IndexAllocationHandle, LocalHandle, PackedHandle, RenderTargetHandle, ShaderHandle,
         SurfaceHandle, TextureHandle, VertexAllocationHandle, VertexHeapHandle,
     },
 };
 use ez_gfx_hal::{
-    AllocationRequest, BufferRange, BufferTransfer, CompletionToken, DEFAULT_STAGING_POLICY,
-    DynamicPipelineState, ExecutionAction, ExecutionBarrier, ExecutionPass, FrameExecutionBackend,
-    FrameExecutionPlan, HalError, ImageMip, MemoryAllocator, MemoryClass, QueueKind,
-    ResourceAccess, ResourceState, SURFACE_DEFAULT_CLEAR, ShaderStage, TextureFormat,
+    AllocationRequest, BufferRange, BufferTransfer, COUNTER_BUFFER_ELEMENT_OFFSET, CompletionToken,
+    DEFAULT_STAGING_POLICY, DynamicPipelineState, ExecutionAction, ExecutionBarrier, ExecutionPass,
+    FrameExecutionBackend, FrameExecutionPlan, HalError, ImageMip, MemoryAllocator, MemoryClass,
+    QueueKind, ResourceAccess, ResourceState, SURFACE_DEFAULT_CLEAR, ShaderStage, TextureFormat,
     TextureRegion, staging_bucket_size,
 };
 use ez_gfx_runtime::render::{ExecutionError, execute_compiled_graph};
 use ez_gfx_runtime::{
     AdapterCatalog, AdapterReport, AdapterSelection, ContextIdentity, ContextOptions,
-    LifecycleError, ResourceKind, RuntimeError, SurfaceOptions, SurfacePlatform, SurfaceState,
+    HeadlessSurfaceOptions, LifecycleError, ResourceKind, RuntimeError, SurfaceState,
     admission_report,
     frame::{ExecutableNode, FrameRecorder},
     geometry::{GeometryError, GeometryManager},
@@ -70,6 +67,16 @@ enum NativeSurface {
     Dx12(Dx12Surface),
     #[cfg(target_vendor = "apple")]
     Metal(MetalSurface),
+}
+
+#[cfg(any(windows, target_vendor = "apple"))]
+pub(crate) enum SurfaceWindow {
+    #[cfg(windows)]
+    Win32 { window: usize, instance: usize },
+    #[cfg(target_vendor = "apple")]
+    AppKit { view: usize },
+    #[cfg(all(target_vendor = "apple", feature = "ffi"))]
+    MetalLayer { layer: usize },
 }
 
 enum NativeAllocation {
@@ -291,11 +298,11 @@ struct ContextState {
     allocations: HashMap<PackedHandle, (u64, NativeAllocation)>,
     allocation_ready: HashMap<PackedHandle, CompletionToken>,
     shaders: HashMap<ShaderHandle, ShaderRecord>,
-    indirects: HashMap<IndirectBufferHandle, IndexedIndirectBuffer>,
+    indirects: HashMap<CounterBufferHandle, IndexedIndirectBuffer>,
     textures: HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>,
     transient_buffers: HashMap<PackedHandle, TransientBuffer>,
-    structured_pool: HashMap<u32, ez_gfx_hal::ReusableStagingPool<NativeAllocation>>,
-    indirect_pool: ez_gfx_hal::ReusableStagingPool<NativeAllocation>,
+    buffer_pool: HashMap<u32, ez_gfx_hal::ReusableStagingPool<NativeAllocation>>,
+    counter_pool: ez_gfx_hal::ReusableStagingPool<NativeAllocation>,
     render_targets: HashMap<RenderTargetHandle, render_target::RenderTargetRecord>,
     texture_formats: HashMap<TextureHandle, TextureFormat>,
     texture_published_mips: HashMap<TextureHandle, u32>,
@@ -457,25 +464,6 @@ fn with_surface_mut<T>(
                 .ok_or(Error::InvalidContext)?,
         )
     })
-}
-
-pub(crate) fn abandon_context(context: ContextHandle) {
-    let Ok((local, _)) = context_local(context) else {
-        return;
-    };
-    if let Ok(mut handles) = CONTEXT_HANDLES.lock() {
-        let _ = handles.remove(local);
-    }
-    let _ = CONTEXTS.try_with(|contexts| {
-        let Ok(mut contexts) = contexts.try_borrow_mut() else {
-            return;
-        };
-        if let Some(state) = contexts.states.remove(&local) {
-            // Drop is nonblocking and may run during Windows loader/TLS teardown.
-            // Explicit `Context::close` is the only native destruction path.
-            std::mem::forget(state);
-        }
-    });
 }
 
 fn with_context_mut<T>(

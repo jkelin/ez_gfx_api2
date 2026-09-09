@@ -167,12 +167,12 @@ fn sampling_pipeline(context: &NativeContext) -> NativePipeline {
         &source.0,
         r#"
 [__AttributeUsage(_AttributeTargets.Var)]
-struct StructuredBufferAttribute { string name; };
+struct BufferAttribute { string name; };
 [__AttributeUsage(_AttributeTargets.Var)]
 struct BindlessTextureHeapAttribute { int capacity; };
 struct TextureEntry { Texture2D<float4> texture; SamplerState sampler; };
 struct TextureHeap { TextureEntry entries[1024]; };
-[StructuredBuffer("values")] RWStructuredBuffer<uint> values;
+[Buffer("values")] RWStructuredBuffer<uint> values;
 [BindlessTextureHeap(1024)] ParameterBlock<TextureHeap> texture_heap;
 [shader("compute")]
 [numthreads(1, 1, 1)]
@@ -312,7 +312,6 @@ fn enqueue_sample(
             &[NativeFrameAction::Compute(NativeComputeDispatch {
                 pipeline,
                 groups: [1, 1, 1],
-                push_constants: &[],
                 bindings: std::slice::from_ref(&binding),
             })],
             false,

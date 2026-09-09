@@ -15,11 +15,11 @@ struct Draw {
     uint first_instance;
 };
 
-[StructuredBuffer("primitives")]
+[Buffer("primitives")]
 StructuredBuffer<Primitive> primitives;
 
-[IndirectBuffer("draw_commands")]
-RWStructuredBuffer<Draw> draw_commands;
+[CounterBuffer("draw_commands")]
+CounterBuffer<Draw> draw_commands;
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
@@ -35,7 +35,8 @@ void computemain(uint3 id : SV_DispatchThreadID) {
     command.first_index = primitive.first_index;
     command.vertex_offset = int(primitive.vertex_offset);
     command.first_instance = 0;
-    draw_commands[0] = command;
+    draw_commands.set_count(1);
+    draw_commands.set(0, command);
 }
 
 [VertexHeap("positions")]

@@ -104,17 +104,11 @@ impl NativeContext {
             )
         }
         .map_err(map_vk)?;
-        let range = vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::ALL)
-            .offset(0)
-            .size(128);
         let set_layouts = [public, texture];
-        // SAFETY: `device.create_pipeline_layout` receives `public` created above and the context's `texture` layout, while `set_layouts` and `range` remain allocated for the call.
+        // SAFETY: `device.create_pipeline_layout` receives `public` created above and the context's `texture` layout, while `set_layouts` remains allocated for the call.
         match unsafe {
             device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default()
-                    .set_layouts(&set_layouts)
-                    .push_constant_ranges(core::slice::from_ref(&range)),
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts),
                 None,
             )
         } {

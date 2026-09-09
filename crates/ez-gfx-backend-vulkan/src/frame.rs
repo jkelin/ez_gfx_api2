@@ -6,6 +6,7 @@ use super::{
 };
 #[path = "frame_record.rs"]
 mod record;
+use ez_gfx_hal::COUNTER_BUFFER_ELEMENT_OFFSET;
 
 struct VulkanEncoding<'a> {
     device: &'a ash::Device,
@@ -908,17 +909,14 @@ fn validate_frame_plan(
                 pass_active = true;
             }
             NativeFrameAction::Compute(dispatch) => {
-                if pass_active
-                    || dispatch.groups.contains(&0)
-                    || dispatch.push_constants.len() > 128
-                    || !dispatch.push_constants.len().is_multiple_of(4)
-                {
+                if pass_active || dispatch.groups.contains(&0) {
                     return Err(HalError::InvalidArgument);
                 }
             }
             NativeFrameAction::Graphics(draw) => {
                 let indirect_size = u64::from(draw.draw_count)
                     .checked_mul(20)
+                    .and_then(|size| size.checked_add(COUNTER_BUFFER_ELEMENT_OFFSET))
                     .ok_or(HalError::InvalidArgument)?;
                 if !pass_active
                     || draw.width == 0
@@ -927,8 +925,6 @@ fn validate_frame_plan(
                     || draw.height > extent.1
                     || draw.draw_count == 0
                     || draw.indirect_buffer.allocation.size() < indirect_size
-                    || draw.push_constants.len() > 128
-                    || !draw.push_constants.len().is_multiple_of(4)
                 {
                     return Err(HalError::InvalidArgument);
                 }

@@ -23,17 +23,18 @@ use ez_gfx_ffi as ffi;
 use ez_gfx_ffi::{
     EzGfxAdapterClass, EzGfxAdapterDesc, EzGfxAdapterInfo, EzGfxBackendContextDesc, EzGfxBinding,
     EzGfxByteBuffer, EzGfxContextDesc, EzGfxDiagnostic, EzGfxDrawIndexedCommand, EzGfxDynamicState,
-    EzGfxEvent, EzGfxEventCallback, EzGfxEventKind, EzGfxHandleParts, EzGfxRenderTargetDesc,
-    EzGfxRenderTargetFormat, EzGfxRenderTargetUsage, EzGfxResult, EzGfxRuntimeRecord,
-    EzGfxShaderDesc, EzGfxSurfaceDesc, EzGfxTextureDesc, EzGfxUploadEvent, ez_gfx_adapter_count,
-    ez_gfx_adapter_query, ez_gfx_buffer_acquire, ez_gfx_buffer_release, ez_gfx_buffer_write,
-    ez_gfx_context_create, ez_gfx_context_create_backend, ez_gfx_context_destroy,
-    ez_gfx_context_register_callback, ez_gfx_context_wait_idle, ez_gfx_counter_buffer_acquire,
-    ez_gfx_counter_buffer_publish_count, ez_gfx_counter_buffer_release,
-    ez_gfx_counter_buffer_write_draws, ez_gfx_frame_abort, ez_gfx_frame_begin, ez_gfx_frame_end,
-    ez_gfx_frame_enqueue_texture_readback, ez_gfx_handle_inspect, ez_gfx_index_allocation_create,
-    ez_gfx_index_allocation_get_range, ez_gfx_index_allocation_remove, ez_gfx_render_target_create,
-    ez_gfx_render_target_destroy, ez_gfx_render_target_frame_begin, ez_gfx_render_target_get_clear,
+    EzGfxEvent, EzGfxEventCallback, EzGfxEventKind, EzGfxHandleParts, EzGfxHeadlessSurfaceDesc,
+    EzGfxRenderTargetDesc, EzGfxRenderTargetFormat, EzGfxRenderTargetUsage, EzGfxResult,
+    EzGfxRuntimeRecord, EzGfxShaderDesc, EzGfxTextureDesc, EzGfxUploadEvent,
+    EzGfxWindowSurfaceDesc, ez_gfx_adapter_count, ez_gfx_adapter_query, ez_gfx_buffer_acquire,
+    ez_gfx_buffer_release, ez_gfx_buffer_write, ez_gfx_context_create,
+    ez_gfx_context_create_backend, ez_gfx_context_destroy, ez_gfx_context_register_callback,
+    ez_gfx_context_wait_idle, ez_gfx_counter_buffer_acquire, ez_gfx_counter_buffer_publish_count,
+    ez_gfx_counter_buffer_release, ez_gfx_counter_buffer_write_draws, ez_gfx_frame_abort,
+    ez_gfx_frame_begin, ez_gfx_frame_end, ez_gfx_frame_enqueue_texture_readback,
+    ez_gfx_handle_inspect, ez_gfx_index_allocation_create, ez_gfx_index_allocation_get_range,
+    ez_gfx_index_allocation_remove, ez_gfx_render_target_create, ez_gfx_render_target_destroy,
+    ez_gfx_render_target_frame_begin, ez_gfx_render_target_get_clear,
     ez_gfx_render_target_get_extent, ez_gfx_render_target_get_format,
     ez_gfx_render_target_probe_format, ez_gfx_semantic_id, ez_gfx_shader_load_artifact,
     ez_gfx_texture_get_binding, ez_gfx_texture_get_residency, ez_gfx_texture_load,
@@ -78,52 +79,6 @@ fn adapter_codes_are_stable() {
 }
 
 #[test]
-fn headless_platform_rejects_non_vulkan_backends_before_native_calls() {
-    // Platform code 3 is headless (ABI 27): Vulkan-only with no native handles.
-    // Rejection happens in descriptor validation before any native call, on every host.
-    for backend in [2, 3] {
-        let desc = EzGfxBackendContextDesc {
-            enable_debug: 0,
-            enable_validation: 0,
-            surface_platform: 3,
-            backend,
-            texture_decode_workers: 0,
-            adapter_count: 0,
-            adapter: core::ptr::null(),
-        };
-        let mut context = 0;
-        assert_eq!(
-            {
-                // SAFETY: descriptor and output storage are live and aligned through the call.
-                unsafe { ez_gfx_context_create_backend(&raw const desc, &raw mut context) }
-            },
-            EzGfxResult::InvalidArgument,
-            "backend={backend}"
-        );
-        assert_eq!(context, 0);
-    }
-    // Unknown platform codes fail closed the same way.
-    let unknown = EzGfxBackendContextDesc {
-        enable_debug: 0,
-        enable_validation: 0,
-        surface_platform: 9,
-        backend: 1,
-        texture_decode_workers: 0,
-        adapter_count: 0,
-        adapter: core::ptr::null(),
-    };
-    let mut context = 0;
-    assert_eq!(
-        {
-            // SAFETY: descriptor and output storage are live and aligned through the call.
-            unsafe { ez_gfx_context_create_backend(&raw const unknown, &raw mut context) }
-        },
-        EzGfxResult::InvalidArgument
-    );
-    assert_eq!(context, 0);
-}
-
-#[test]
 fn adapter_selectors_reject_mismatched_pairs_before_delegating() {
     let valid = EzGfxAdapterDesc {
         stable_id: [0xA5; 16],
@@ -132,7 +87,6 @@ fn adapter_selectors_reject_mismatched_pairs_before_delegating() {
     let base = EzGfxContextDesc {
         enable_debug: 0,
         enable_validation: 0,
-        surface_platform: 0,
         texture_decode_workers: 0,
         adapter_count: 0,
         adapter: core::ptr::null(),
@@ -519,7 +473,6 @@ fn callback_registration_is_creator_thread_only() {
     let desc = EzGfxBackendContextDesc {
         enable_debug: 0,
         enable_validation: 0,
-        surface_platform: 3,
         backend: 1,
         texture_decode_workers: 0,
         adapter_count: 0,
@@ -585,7 +538,6 @@ fn context_creation_rejects_boundary_inputs_before_native_calls() {
     let invalid = EzGfxContextDesc {
         enable_debug: 2,
         enable_validation: 0,
-        surface_platform: 0,
         texture_decode_workers: 0,
         adapter_count: 0,
         adapter: core::ptr::null(),
@@ -606,8 +558,6 @@ fn context_lifecycle_rejects_cross_thread_destroy_and_invalidates_destroyed_hand
     let desc = EzGfxContextDesc {
         enable_debug: 0,
         enable_validation: 0,
-        // Win32 contexts need a Win32 host; every other non-Apple host runs headless.
-        surface_platform: if cfg!(windows) { 0 } else { 3 },
         texture_decode_workers: 0,
         adapter_count: 0,
         adapter: core::ptr::null(),
@@ -635,7 +585,7 @@ fn context_lifecycle_rejects_cross_thread_destroy_and_invalidates_destroyed_hand
 #[cfg(not(target_vendor = "apple"))]
 #[test]
 fn frame_handles_are_thread_local_terminal_and_context_owned() {
-    let native = common::TestContext::create(1);
+    let native = common::TestContext::create_with_validation(1, false);
     let context = native.context;
     let mut frame = 0;
     assert_eq!(
@@ -682,7 +632,7 @@ fn frame_handles_are_thread_local_terminal_and_context_owned() {
 #[cfg(windows)]
 #[test]
 fn explicit_dx12_context_allocates_writes_and_releases_buffer_memory() {
-    let native = common::TestContext::create(2);
+    let native = common::TestContext::create_with_validation(2, false);
     let context = native.context;
     let mut frame = 0;
     assert_eq!(
@@ -904,7 +854,7 @@ fn msaa_target_lifecycle(context: ffi::EzGfxContext, base: EzGfxRenderTargetDesc
 fn render_target_lifecycle_queries_probe_and_begin_on_hidden_context(backend: u8) {
     use common::TestContext;
 
-    let native = TestContext::create(backend);
+    let native = TestContext::create_with_validation(backend, false);
     let name = b"rt";
     let candidates = [1_u8];
     let base = EzGfxRenderTargetDesc {
@@ -1107,8 +1057,6 @@ fn explicit_adapter_selection_creates_and_rejects_hidden_contexts() {
     let desc = EzGfxBackendContextDesc {
         enable_debug: 0,
         enable_validation: 0,
-        // Win32 contexts need a Win32 host; every other non-Apple host runs headless.
-        surface_platform: if cfg!(windows) { 0 } else { 3 },
         backend: 1,
         texture_decode_workers: 0,
         adapter_count: 1,

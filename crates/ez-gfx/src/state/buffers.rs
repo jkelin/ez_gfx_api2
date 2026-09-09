@@ -1,9 +1,9 @@
 use crate::Result;
 
 use super::{
-    AllocationRequest, ContextHandle, ContextState, DrawIndexedCommand, Error,
-    IndexedIndirectBuffer, IndirectBufferHandle, MemoryClass, NativeAllocation, PackedHandle,
-    ResourceKind, StructuredBufferHandle, TransientBuffer, TransientUse, allocate_native,
+    AllocationRequest, BufferHandle, COUNTER_BUFFER_ELEMENT_OFFSET, ContextHandle, ContextState,
+    CounterBufferHandle, DrawIndexedCommand, Error, IndexedIndirectBuffer, MemoryClass,
+    NativeAllocation, PackedHandle, ResourceKind, TransientBuffer, TransientUse, allocate_native,
     completed_native_frame_value, free_native_allocation, map_allocation, map_lifecycle,
     result_status, retire_native_allocation, stage_upload, with_context_mut,
 };
@@ -11,34 +11,34 @@ use super::{
 /// Acquires a runtime-typed structured buffer for the C ABI.
 #[cfg(feature = "ffi")]
 #[doc(hidden)]
-pub fn acquire_structured_raw(
+pub fn acquire_buffer_raw(
     context: ContextHandle,
     element_size: u32,
     element_count: u32,
-) -> Result<StructuredBufferHandle> {
-    acquire_structured_raw_impl(context, element_size, element_count)
+) -> Result<BufferHandle> {
+    acquire_buffer_raw_impl(context, element_size, element_count)
 }
 
-pub(crate) fn acquire_structured_sized(
+pub(crate) fn acquire_buffer_sized(
     context: ContextHandle,
     element_size: u32,
     element_count: u32,
-) -> Result<StructuredBufferHandle> {
-    acquire_structured_raw_impl(context, element_size, element_count)
+) -> Result<BufferHandle> {
+    acquire_buffer_raw_impl(context, element_size, element_count)
 }
 
-fn acquire_structured_raw_impl(
+fn acquire_buffer_raw_impl(
     context: ContextHandle,
     element_size: u32,
     element_count: u32,
-) -> Result<StructuredBufferHandle> {
+) -> Result<BufferHandle> {
     let (_, size) = checked_element_range(element_size, element_count, 0, element_count)?;
     with_context_mut(context, |context| {
         require_recording(context)?;
         let completed = completed_native_frame_value(&mut context.native)?;
         let (reused, stale) = {
             let pool = context
-                .structured_pool
+                .buffer_pool
                 .entry(element_size)
                 .or_insert_with(|| ez_gfx_hal::ReusableStagingPool::new(256));
             let reused = pool.take(size, completed);
@@ -60,7 +60,7 @@ fn acquire_structured_raw_impl(
         };
         insert_transient(
             context,
-            ResourceKind::Structured,
+            ResourceKind::Buffer,
             size,
             allocation,
             TransientBuffer {
@@ -70,26 +70,29 @@ fn acquire_structured_raw_impl(
                 usage: TransientUse::Available,
             },
         )
-        .and_then(|packed| {
-            StructuredBufferHandle::from_packed(packed).map_err(|_| Error::NativeFailure)
-        })
+        .and_then(|packed| BufferHandle::from_packed(packed).map_err(|_| Error::NativeFailure))
     })
 }
 
-/// Allocates a per-frame indexed-indirect command buffer.
+/// Allocates a per-frame counter and indexed-command buffer.
+///
+/// The count occupies the first four bytes; commands begin at the shared aligned element offset.
 ///
 /// # Errors
 ///
 /// Returns an error outside frame recording, for invalid capacity, exhausted
-/// handles, or native allocation failure.
-pub fn acquire_indirect(context: ContextHandle, capacity: u32) -> Result<IndirectBufferHandle> {
+/// handles, overflow, or native allocation failure.
+pub fn acquire_counter(context: ContextHandle, capacity: u32) -> Result<CounterBufferHandle> {
     with_context_mut(context, |context| {
         require_recording(context)?;
         let buffer = IndexedIndirectBuffer::new(capacity).map_err(|_| Error::InvalidArgument)?;
-        let (_, size) = checked_element_range(20, capacity, 0, capacity)?;
+        let (_, command_size) = checked_element_range(20, capacity, 0, capacity)?;
+        let size = command_size
+            .checked_add(COUNTER_BUFFER_ELEMENT_OFFSET)
+            .ok_or(Error::InvalidArgument)?;
         let completed = completed_native_frame_value(&mut context.native)?;
-        let reused = context.indirect_pool.take(size, completed);
-        for allocation in context.indirect_pool.trim(completed) {
+        let reused = context.counter_pool.take(size, completed);
+        for allocation in context.counter_pool.trim(completed) {
             free_native_allocation(&mut context.native, allocation).map_err(map_allocation)?;
         }
         let (byte_capacity, allocation) = if let Some(reused) = reused {
@@ -104,7 +107,7 @@ pub fn acquire_indirect(context: ContextHandle, capacity: u32) -> Result<Indirec
         };
         let packed = insert_transient(
             context,
-            ResourceKind::Indirect,
+            ResourceKind::CounterBuffer,
             size,
             allocation,
             TransientBuffer {
@@ -114,7 +117,7 @@ pub fn acquire_indirect(context: ContextHandle, capacity: u32) -> Result<Indirec
                 usage: TransientUse::Available,
             },
         )?;
-        let typed = IndirectBufferHandle::from_packed(packed).map_err(|_| Error::NativeFailure)?;
+        let typed = CounterBufferHandle::from_packed(packed).map_err(|_| Error::NativeFailure)?;
         context.indirects.insert(typed, buffer);
         Ok(typed)
     })
@@ -135,15 +138,15 @@ pub fn acquire_indirect(context: ContextHandle, capacity: u32) -> Result<Indirec
         reason = "only raw FFI and state tests write typed commands"
     )
 )]
-pub fn write_indirect(
+pub fn write_counter_commands(
     context: ContextHandle,
-    indirect: IndirectBufferHandle,
+    indirect: CounterBufferHandle,
     start_index: u32,
     commands: &[DrawIndexedCommand],
 ) -> Result<()> {
     result_status(with_context_mut(context, |context| {
         let handle = indirect.packed();
-        validate_writable_transient(context, handle, ResourceKind::Indirect)?;
+        validate_writable_transient(context, handle, ResourceKind::CounterBuffer)?;
         let count = u32::try_from(commands.len()).map_err(|_| Error::InvalidArgument)?;
         context
             .indirects
@@ -151,11 +154,17 @@ pub fn write_indirect(
             .ok_or(Error::InvalidContext)?
             .write_batch(start_index, commands)
             .map_err(|_| Error::InvalidArgument)?;
+        let visible_count = context
+            .indirects
+            .get(&indirect)
+            .ok_or(Error::InvalidContext)?
+            .draw_count();
         if commands.is_empty() {
             return Ok(());
         }
         let offset = u64::from(start_index)
             .checked_mul(20)
+            .and_then(|offset| offset.checked_add(COUNTER_BUFFER_ELEMENT_OFFSET))
             .ok_or(Error::InvalidArgument)?;
         let byte_size = u64::from(count)
             .checked_mul(20)
@@ -180,26 +189,45 @@ pub fn write_indirect(
             ..
         } = context;
         let (_, allocation) = allocations.get(&handle).ok_or(Error::InvalidContext)?;
+        stage_upload(native, staging, allocation, 0, &visible_count.to_le_bytes())
+            .map_err(map_allocation)?;
         let token =
             stage_upload(native, staging, allocation, offset, &bytes).map_err(map_allocation)?;
         allocation_ready.insert(handle, token);
         Ok(())
     }))
 }
-/// Stages a complete packed indirect-command buffer without an intermediate command copy.
+fn counter_payload(bytes: &[u8], initial_count: u32) -> Result<Vec<u8>> {
+    // Padding is explicitly zeroed so no stale pooled bytes exist between the count and elements.
+    let element_offset =
+        usize::try_from(COUNTER_BUFFER_ELEMENT_OFFSET).map_err(|_| Error::InvalidArgument)?;
+    let payload_size = bytes
+        .len()
+        .checked_add(element_offset)
+        .ok_or(Error::InvalidArgument)?;
+    let mut payload = Vec::with_capacity(payload_size);
+    payload.extend_from_slice(&initial_count.to_le_bytes());
+    payload.resize(element_offset, 0);
+    payload.extend_from_slice(bytes);
+    Ok(payload)
+}
+
+/// Stages a complete counter-buffer payload without an intermediate command copy.
 ///
 /// # Errors
 ///
-/// Returns an error for stale, consumed, foreign, or incorrectly sized data.
+/// Returns an error for stale, consumed, foreign, incorrectly sized data, or an
+/// initial count exceeding capacity.
 #[doc(hidden)]
-pub fn write_indirect_bytes(
+pub fn write_counter_bytes(
     context: ContextHandle,
-    indirect: IndirectBufferHandle,
+    counter: CounterBufferHandle,
     bytes: &[u8],
+    initial_count: u32,
 ) -> Result<()> {
     result_status(with_context_mut(context, |context| {
-        let handle = indirect.packed();
-        validate_writable_transient(context, handle, ResourceKind::Indirect)?;
+        let handle = counter.packed();
+        validate_writable_transient(context, handle, ResourceKind::CounterBuffer)?;
         let metadata = context
             .transient_buffers
             .get(&handle)
@@ -209,10 +237,14 @@ pub fn write_indirect_bytes(
             .ok()
             .and_then(|count| count.checked_mul(metadata.element_size as usize))
             .ok_or(Error::InvalidArgument)?;
-        // Partial raw command initialization would leave unspecified command bytes visible.
-        if metadata.element_size != 20 || bytes.len() != expected {
+        // Partial command initialization would leave unspecified command bytes visible.
+        if metadata.element_size != 20
+            || bytes.len() != expected
+            || initial_count > metadata.element_count
+        {
             return Err(Error::InvalidArgument);
         }
+        let payload = counter_payload(bytes, initial_count)?;
         let ContextState {
             native,
             staging,
@@ -221,51 +253,28 @@ pub fn write_indirect_bytes(
             ..
         } = context;
         let (_, allocation) = allocations.get(&handle).ok_or(Error::InvalidContext)?;
-        let token = stage_upload(native, staging, allocation, 0, bytes).map_err(map_allocation)?;
+        let token =
+            stage_upload(native, staging, allocation, 0, &payload).map_err(map_allocation)?;
         allocation_ready.insert(handle, token);
         Ok(())
     }))
 }
 
-/// Publishes a CPU-known draw count for commands generated by a compute node.
-///
-/// This is separate from [`write_indirect`] because compute fills command
-/// bytes on the GPU while the current backends require a CPU-known draw count.
-///
-/// # Errors
-///
-/// Returns an error for a stale, consumed, foreign, or out-of-range handle.
-pub fn publish_compute_indirect_count(
-    context: ContextHandle,
-    indirect: IndirectBufferHandle,
-    count: u32,
-) -> Result<()> {
-    result_status(with_context_mut(context, |context| {
-        validate_writable_transient(context, indirect.packed(), ResourceKind::Indirect)?;
-        context
-            .indirects
-            .get_mut(&indirect)
-            .ok_or(Error::InvalidContext)?
-            .publish_generated_count(count)
-            .map_err(|_| Error::InvalidArgument)
-    }))
-}
-
-/// Writes runtime-typed structured elements for the C ABI.
+/// Writes runtime-typed buffer elements for the C ABI.
 #[cfg(feature = "ffi")]
 #[doc(hidden)]
-pub fn write_structured_raw(
+pub fn write_buffer_raw(
     context: ContextHandle,
-    structured: StructuredBufferHandle,
+    buffer: BufferHandle,
     start_index: u32,
     element_count: u32,
     element_size: u32,
     bytes: &[u8],
 ) -> Result<()> {
     let value_count = usize::try_from(element_count).map_err(|_| Error::InvalidArgument)?;
-    write_structured_raw_impl(
+    write_buffer_raw_impl(
         context,
-        structured,
+        buffer,
         start_index,
         element_size,
         bytes,
@@ -273,9 +282,9 @@ pub fn write_structured_raw(
     )
 }
 
-pub(crate) fn write_structured_bytes(
+pub(crate) fn write_buffer_bytes(
     context: ContextHandle,
-    structured: StructuredBufferHandle,
+    buffer: BufferHandle,
     element_size: u32,
     bytes: &[u8],
 ) -> Result<()> {
@@ -283,20 +292,20 @@ pub(crate) fn write_structured_bytes(
         .len()
         .checked_div(element_size as usize)
         .ok_or(Error::InvalidArgument)?;
-    write_structured_raw_impl(context, structured, 0, element_size, bytes, value_count)
+    write_buffer_raw_impl(context, buffer, 0, element_size, bytes, value_count)
 }
 
-fn write_structured_raw_impl(
+fn write_buffer_raw_impl(
     context: ContextHandle,
-    structured: StructuredBufferHandle,
+    buffer: BufferHandle,
     start_index: u32,
     element_size: u32,
     bytes: &[u8],
     value_count: usize,
 ) -> Result<()> {
     result_status(with_context_mut(context, |context| {
-        let handle = structured.packed();
-        validate_writable_transient(context, handle, ResourceKind::Structured)?;
+        let handle = buffer.packed();
+        validate_writable_transient(context, handle, ResourceKind::Buffer)?;
         let metadata = *context
             .transient_buffers
             .get(&handle)
@@ -332,19 +341,19 @@ fn write_structured_raw_impl(
     }))
 }
 
-/// Releases an indirect buffer that was not consumed by a recorded frame.
-pub fn release_indirect(context: ContextHandle, indirect: IndirectBufferHandle) {
+/// Releases a counter buffer that was not consumed by a recorded frame.
+pub fn release_counter(context: ContextHandle, counter: CounterBufferHandle) {
     let _ = release_transient(
         context,
-        indirect.packed(),
-        ResourceKind::Indirect,
-        Some(indirect),
+        counter.packed(),
+        ResourceKind::CounterBuffer,
+        Some(counter),
     );
 }
 
-/// Releases a structured buffer that was not consumed by a recorded frame.
-pub fn release_structured(context: ContextHandle, structured: StructuredBufferHandle) {
-    let _ = release_transient(context, structured.packed(), ResourceKind::Structured, None);
+/// Releases a buffer that was not consumed by a recorded frame.
+pub fn release_buffer(context: ContextHandle, buffer: BufferHandle) {
+    let _ = release_transient(context, buffer.packed(), ResourceKind::Buffer, None);
 }
 
 fn insert_transient(
@@ -370,7 +379,7 @@ fn release_transient(
     context_handle: ContextHandle,
     handle: PackedHandle,
     kind: ResourceKind,
-    indirect: Option<IndirectBufferHandle>,
+    indirect: Option<CounterBufferHandle>,
 ) -> Result<()> {
     with_context_mut(context_handle, |context| {
         context
@@ -429,8 +438,8 @@ pub(super) fn reclaim_available_transients(context: &mut ContextState) -> Result
             .remove(handle, kind)
             .map_err(map_lifecycle)?;
         context.transient_buffers.remove(&handle);
-        if kind == ResourceKind::Indirect
-            && let Ok(indirect) = IndirectBufferHandle::from_packed(handle)
+        if kind == ResourceKind::CounterBuffer
+            && let Ok(indirect) = CounterBufferHandle::from_packed(handle)
         {
             context.indirects.remove(&indirect);
         }
@@ -521,5 +530,17 @@ mod tests {
             checked_element_range(u32::MAX, u32::MAX, u32::MAX, 2),
             Err(Error::InvalidArgument)
         );
+    }
+
+    #[test]
+    fn counter_payload_places_elements_at_shared_aligned_offset() {
+        let command = [0x5a; 20];
+        let payload = counter_payload(&command, 7).unwrap();
+        let offset = usize::try_from(COUNTER_BUFFER_ELEMENT_OFFSET).unwrap();
+
+        assert_eq!(&payload[..4], &7_u32.to_le_bytes());
+        assert!(payload[4..offset].iter().all(|byte| *byte == 0));
+        assert_eq!(&payload[offset..], &command);
+        assert_eq!(payload.len(), offset + command.len());
     }
 }

@@ -1,7 +1,7 @@
 use super::{
-    AllocationRequest, BufferTransfer, CompletionToken, ContextIdentity, Error, GeometryAllocation,
-    GeometryError, HalError, HashMap, LifecycleError, MemoryAllocator, NativeAllocation,
-    NativeContext, NativeTexture, PackedHandle,
+    AllocationRequest, BufferTransfer, COUNTER_BUFFER_ELEMENT_OFFSET, CompletionToken,
+    ContextIdentity, Error, GeometryAllocation, GeometryError, HalError, HashMap, LifecycleError,
+    MemoryAllocator, NativeAllocation, NativeContext, NativeTexture, PackedHandle,
 };
 
 pub(super) fn map_frame(error: &ez_gfx_runtime::frame::FrameError) -> Error {
@@ -106,10 +106,10 @@ pub(super) fn vulkan_bindings<'a>(
 ) -> std::result::Result<Vec<ez_gfx_backend_vulkan::NativeBufferBinding<'a>>, HalError> {
     let mut native = Vec::new();
     for requirement in layout.requirements() {
-        if requirement.descriptor_count != 1 {
-            return Err(HalError::Unsupported);
-        }
         if requirement.kind == ez_gfx_runtime::binding::BindingKind::VertexHeap {
+            if requirement.descriptor_count != 1 {
+                return Err(HalError::Unsupported);
+            }
             let heap = vertex_heaps
                 .get(&requirement.name)
                 .ok_or(HalError::InvalidArgument)?;
@@ -132,11 +132,19 @@ pub(super) fn vulkan_bindings<'a>(
             .find(|binding| binding.name == requirement.name)
             .ok_or(HalError::InvalidArgument)?;
         let handle = match public.resource {
-            ez_gfx_runtime::binding::ResourceIdentity::Structured(handle) => handle.packed(),
-            ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle) => handle.packed(),
-            ez_gfx_runtime::binding::ResourceIdentity::RenderTarget(_) => {
-                return Err(HalError::Unsupported);
+            ez_gfx_runtime::binding::ResourceIdentity::Buffer(handle)
+                if requirement.kind == ez_gfx_runtime::binding::BindingKind::Buffer
+                    && requirement.descriptor_count == 1 =>
+            {
+                handle.packed()
             }
+            ez_gfx_runtime::binding::ResourceIdentity::Counter(handle)
+                if requirement.kind == ez_gfx_runtime::binding::BindingKind::CounterBuffer
+                    && requirement.descriptor_count == 2 =>
+            {
+                handle.packed()
+            }
+            _ => return Err(HalError::Unsupported),
         };
         let (size, allocation) = allocations.get(&handle).ok_or(HalError::InvalidArgument)?;
         #[cfg(not(any(windows, target_vendor = "apple")))]
@@ -145,12 +153,30 @@ pub(super) fn vulkan_bindings<'a>(
         let NativeAllocation::Vulkan(allocation) = allocation else {
             return Err(HalError::InvalidArgument);
         };
-        native.push(ez_gfx_backend_vulkan::NativeBufferBinding {
-            allocation,
-            offset: 0,
-            range: *size,
-            writable: requirement.writable,
-        });
+        if requirement.descriptor_count == 2 {
+            let command_size = size
+                .checked_sub(COUNTER_BUFFER_ELEMENT_OFFSET)
+                .ok_or(HalError::InvalidArgument)?;
+            native.push(ez_gfx_backend_vulkan::NativeBufferBinding {
+                allocation,
+                offset: 0,
+                range: 4,
+                writable: requirement.writable,
+            });
+            native.push(ez_gfx_backend_vulkan::NativeBufferBinding {
+                allocation,
+                offset: COUNTER_BUFFER_ELEMENT_OFFSET,
+                range: command_size,
+                writable: requirement.writable,
+            });
+        } else {
+            native.push(ez_gfx_backend_vulkan::NativeBufferBinding {
+                allocation,
+                offset: 0,
+                range: *size,
+                writable: requirement.writable,
+            });
+        }
     }
     Ok(native)
 }
@@ -164,10 +190,10 @@ pub(super) fn metal_bindings<'a>(
 ) -> std::result::Result<Vec<ez_gfx_backend_metal::native::NativeBufferBinding<'a>>, HalError> {
     let mut native = Vec::new();
     for requirement in layout.requirements() {
-        if requirement.descriptor_count != 1 {
-            return Err(HalError::Unsupported);
-        }
         if requirement.kind == ez_gfx_runtime::binding::BindingKind::VertexHeap {
+            if requirement.descriptor_count != 1 {
+                return Err(HalError::Unsupported);
+            }
             let heap = vertex_heaps
                 .get(&requirement.name)
                 .ok_or(HalError::InvalidArgument)?;
@@ -185,22 +211,38 @@ pub(super) fn metal_bindings<'a>(
             .iter()
             .find(|binding| binding.name == requirement.name)
             .ok_or(HalError::InvalidArgument)?;
-        let handle = match public.resource {
-            ez_gfx_runtime::binding::ResourceIdentity::Structured(handle) => handle.packed(),
-            ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle) => handle.packed(),
-            ez_gfx_runtime::binding::ResourceIdentity::RenderTarget(_) => {
-                return Err(HalError::Unsupported);
+        let (handle, count) = match public.resource {
+            ez_gfx_runtime::binding::ResourceIdentity::Buffer(handle)
+                if requirement.kind == ez_gfx_runtime::binding::BindingKind::Buffer
+                    && requirement.descriptor_count == 1 =>
+            {
+                (handle.packed(), 1)
             }
+            ez_gfx_runtime::binding::ResourceIdentity::Counter(handle)
+                if requirement.kind == ez_gfx_runtime::binding::BindingKind::CounterBuffer
+                    && requirement.descriptor_count == 2 =>
+            {
+                (handle.packed(), 2)
+            }
+            _ => return Err(HalError::Unsupported),
         };
         let (_, allocation) = allocations.get(&handle).ok_or(HalError::InvalidArgument)?;
         let NativeAllocation::Metal(allocation) = allocation else {
             return Err(HalError::InvalidArgument);
         };
-        native.push(ez_gfx_backend_metal::native::NativeBufferBinding {
-            allocation,
-            offset: 0,
-            index: requirement.binding as usize,
-        });
+        for descriptor in 0..count {
+            let offset = if descriptor == 0 {
+                0
+            } else {
+                usize::try_from(COUNTER_BUFFER_ELEMENT_OFFSET)
+                    .map_err(|_| HalError::InvalidArgument)?
+            };
+            native.push(ez_gfx_backend_metal::native::NativeBufferBinding {
+                allocation,
+                offset,
+                index: requirement.binding as usize + descriptor,
+            });
+        }
     }
     Ok(native)
 }
@@ -214,10 +256,10 @@ pub(super) fn dx12_bindings<'a>(
 ) -> std::result::Result<Vec<ez_gfx_backend_dx12::native::NativeBufferBinding<'a>>, HalError> {
     let mut native = Vec::new();
     for requirement in layout.requirements() {
-        if requirement.descriptor_count != 1 {
-            return Err(HalError::Unsupported);
-        }
         if requirement.kind == ez_gfx_runtime::binding::BindingKind::VertexHeap {
+            if requirement.descriptor_count != 1 {
+                return Err(HalError::Unsupported);
+            }
             let heap = vertex_heaps
                 .get(&requirement.name)
                 .ok_or(HalError::InvalidArgument)?;
@@ -235,22 +277,36 @@ pub(super) fn dx12_bindings<'a>(
             .iter()
             .find(|binding| binding.name == requirement.name)
             .ok_or(HalError::InvalidArgument)?;
-        let handle = match public.resource {
-            ez_gfx_runtime::binding::ResourceIdentity::Structured(handle) => handle.packed(),
-            ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle) => handle.packed(),
-            ez_gfx_runtime::binding::ResourceIdentity::RenderTarget(_) => {
-                return Err(HalError::Unsupported);
+        let (handle, count) = match public.resource {
+            ez_gfx_runtime::binding::ResourceIdentity::Buffer(handle)
+                if requirement.kind == ez_gfx_runtime::binding::BindingKind::Buffer
+                    && requirement.descriptor_count == 1 =>
+            {
+                (handle.packed(), 1)
             }
+            ez_gfx_runtime::binding::ResourceIdentity::Counter(handle)
+                if requirement.kind == ez_gfx_runtime::binding::BindingKind::CounterBuffer
+                    && requirement.descriptor_count == 2 =>
+            {
+                (handle.packed(), 2)
+            }
+            _ => return Err(HalError::Unsupported),
         };
         let (_, allocation) = allocations.get(&handle).ok_or(HalError::InvalidArgument)?;
         let NativeAllocation::Dx12(allocation) = allocation else {
             return Err(HalError::InvalidArgument);
         };
-        native.push(ez_gfx_backend_dx12::native::NativeBufferBinding {
-            allocation,
-            offset: 0,
-            writable: requirement.writable,
-        });
+        for descriptor in 0..count {
+            native.push(ez_gfx_backend_dx12::native::NativeBufferBinding {
+                allocation,
+                offset: if descriptor == 0 {
+                    0
+                } else {
+                    COUNTER_BUFFER_ELEMENT_OFFSET
+                },
+                writable: requirement.writable,
+            });
+        }
     }
     Ok(native)
 }

@@ -16,10 +16,10 @@ pub enum ResourceKind {
     Surface = 1,
     /// Compiled shader resource.
     Shader = 2,
-    /// Indirect command resource.
-    Indirect = 3,
-    /// Structured buffer resource.
-    Structured = 4,
+    /// Counter-buffer resource.
+    CounterBuffer = 3,
+    /// General buffer resource.
+    Buffer = 4,
     /// Texture resource.
     Texture = 5,
     /// Render-target resource.

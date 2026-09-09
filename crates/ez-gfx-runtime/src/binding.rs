@@ -4,19 +4,19 @@ use ez_gfx_artifact::Stage;
 use ez_gfx_core::{
     Backend,
     capability::MAX_BINDLESS_SAMPLED_TEXTURES,
-    handle::{IndirectBufferHandle, RenderTargetHandle, StructuredBufferHandle},
+    handle::{BufferHandle, CounterBufferHandle, RenderTargetHandle},
 };
 use serde::Deserialize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Classifies the GPU resource represented by a binding.
 pub enum BindingKind {
-    /// A structured buffer resource.
-    Structured,
+    /// A general buffer resource.
+    Buffer,
     /// A named vertex heap bound automatically by reflection.
     VertexHeap,
-    /// A buffer used for indirect GPU commands.
-    Indirect,
+    /// A buffer carrying a GPU-writable count and indirect commands.
+    CounterBuffer,
     /// A render-target resource.
     RenderTarget,
 }
@@ -24,10 +24,10 @@ pub enum BindingKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Associates a typed runtime handle with its GPU resource kind.
 pub enum ResourceIdentity {
-    /// A structured buffer handle.
-    Structured(StructuredBufferHandle),
-    /// An indirect-command buffer handle.
-    Indirect(IndirectBufferHandle),
+    /// A general buffer handle.
+    Buffer(BufferHandle),
+    /// A counter-buffer handle.
+    Counter(CounterBufferHandle),
     /// A render-target handle.
     RenderTarget(RenderTargetHandle),
 }
@@ -36,8 +36,8 @@ impl ResourceIdentity {
     /// Returns the GPU resource kind associated with this identity.
     pub const fn kind(&self) -> BindingKind {
         match self {
-            Self::Structured(_) => BindingKind::Structured,
-            Self::Indirect(_) => BindingKind::Indirect,
+            Self::Buffer(_) => BindingKind::Buffer,
+            Self::Counter(_) => BindingKind::CounterBuffer,
             Self::RenderTarget(_) => BindingKind::RenderTarget,
         }
     }
@@ -353,14 +353,22 @@ impl ReflectedBindings {
                         requirement.name.clone(),
                     ));
                 }
-            } else if requirements.iter().any(|existing| {
-                existing.space == requirement.space
-                    && existing.binding == requirement.binding
-                    && (self.backend != Backend::Dx12 || existing.writable == requirement.writable)
+            } else if let Some(binding) = requirements.iter().find_map(|existing| {
+                let same_namespace =
+                    self.backend != Backend::Dx12 || existing.writable == requirement.writable;
+                let existing_end = existing.binding.checked_add(existing.descriptor_count)?;
+                let requirement_end = requirement
+                    .binding
+                    .checked_add(requirement.descriptor_count)?;
+                (same_namespace
+                    && existing.space == requirement.space
+                    && existing.binding < requirement_end
+                    && requirement.binding < existing_end)
+                    .then_some(existing.binding.max(requirement.binding))
             }) {
                 return Err(BindingError::DuplicatePhysicalSlot {
                     space: requirement.space,
-                    binding: requirement.binding,
+                    binding,
                 });
             } else {
                 requirements.push(requirement.clone());
@@ -516,9 +524,9 @@ const fn one() -> u32 {
 /// Maps a reflected API resource tag to its supported binding kind.
 fn parse_kind(value: &str) -> Option<BindingKind> {
     match value {
-        "structured" => Some(BindingKind::Structured),
+        "buffer" => Some(BindingKind::Buffer),
         "vertex_heap" => Some(BindingKind::VertexHeap),
-        "indirect" => Some(BindingKind::Indirect),
+        "counter_buffer" => Some(BindingKind::CounterBuffer),
         "render_target" => Some(BindingKind::RenderTarget),
         _ => None,
     }

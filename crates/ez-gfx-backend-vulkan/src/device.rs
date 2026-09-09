@@ -3,10 +3,9 @@ use super::{
     AllocatorCreateDesc, Backend, CStr, CString, CompressionSupport,
     DEFAULT_ALLOCATION_BLOCK_POLICY, DeferredNativeResource, DeferredResource, DeviceProbe, Entry,
     FrameSlot, HalError, MemoryAllocator, NativeContext, NativeSurface, PendingDevice,
-    SemanticProfile, SurfacePlatform, TEXTURE_DESCRIPTOR_CAPACITY, create_frame_slots, khr,
-    map_allocation_hal, map_allocation_vk, map_allocator, map_allocator_hal, map_vk,
-    paired_texture_capacity, texture_descriptor_layout_bindings, texture_heap_rejection, transfer,
-    vk,
+    SemanticProfile, TEXTURE_DESCRIPTOR_CAPACITY, create_frame_slots, khr, map_allocation_hal,
+    map_allocation_vk, map_allocator, map_allocator_hal, map_vk, paired_texture_capacity,
+    texture_descriptor_layout_bindings, texture_heap_rejection, transfer, vk,
 };
 
 fn create_device_frame_state(
@@ -94,17 +93,29 @@ fn select_transfer_family(properties: &[vk::QueueFamilyProperties], graphics: u3
         .unwrap_or(graphics)
 }
 
+fn draw_feature_rejection(
+    vertex_storage: bool,
+    multi_draw: bool,
+    features12: &vk::PhysicalDeviceVulkan12Features<'_>,
+) -> Option<&'static str> {
+    if !vertex_storage {
+        Some("vertex_pipeline_stores_and_atomics")
+    } else if !multi_draw {
+        Some("multi_draw_indirect")
+    } else if features12.draw_indirect_count == 0 {
+        Some("draw_indirect_count")
+    } else {
+        None
+    }
+}
+
 impl NativeContext {
-    /// Creates a Vulkan context after validating the requested platform and optional validation layer.
+    /// Creates a Vulkan context with every surface extension supported on this target.
     ///
     /// # Errors
     ///
     /// Returns an error if the Vulkan loader or requested validation layer is unavailable, or instance setup fails.
-    pub fn create(
-        enable_debug: bool,
-        enable_validation: bool,
-        platform: SurfacePlatform,
-    ) -> Result<Self, HalError> {
+    pub fn create(enable_debug: bool, enable_validation: bool) -> Result<Self, HalError> {
         // SAFETY: loading performs symbol lookup only and errors when the Vulkan loader is unavailable.
         let entry = unsafe { Entry::load() }.map_err(|_| HalError::Unsupported)?;
         let app_name = CString::new("ez_gfx_api").map_err(|_| HalError::NativeFailure)?;
@@ -115,7 +126,9 @@ impl NativeContext {
             .engine_version(vk::make_api_version(0, 0, 1, 0))
             .api_version(vk::API_VERSION_1_3);
 
-        let headless_surface_enabled = if platform == SurfacePlatform::Headless {
+        // Headless support is optional: contexts remain usable for target-only work
+        // when the driver omits `VK_EXT_headless_surface`.
+        let headless_surface_enabled =
             // SAFETY: successful `Entry::load` initialized instance-extension enumeration.
             unsafe { entry.enumerate_instance_extension_properties(None) }
                 .map_err(map_vk)?
@@ -124,23 +137,15 @@ impl NativeContext {
                     // SAFETY: Vulkan guarantees a NUL-terminated fixed-size extension name.
                     (unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) })
                         == ash::ext::headless_surface::NAME
-                })
-        } else {
-            false
-        };
+                });
         let mut extensions = Vec::new();
-        match platform {
-            SurfacePlatform::Win32 => {
-                extensions.push(khr::surface::NAME.as_ptr());
-                extensions.push(khr::win32_surface::NAME.as_ptr());
-            }
-            SurfacePlatform::Headless if headless_surface_enabled => {
-                extensions.push(khr::surface::NAME.as_ptr());
-                extensions.push(ash::ext::headless_surface::NAME.as_ptr());
-            }
-            // Capable drivers may omit VK_EXT_headless_surface. Contexts remain
-            // usable for target-only work through a logical surfaceless target.
-            SurfacePlatform::Headless => {}
+        if cfg!(windows) || headless_surface_enabled {
+            extensions.push(khr::surface::NAME.as_ptr());
+        }
+        #[cfg(windows)]
+        extensions.push(khr::win32_surface::NAME.as_ptr());
+        if headless_surface_enabled {
+            extensions.push(ash::ext::headless_surface::NAME.as_ptr());
         }
         if enable_debug {
             extensions.push(ash::ext::debug_utils::NAME.as_ptr());
@@ -294,7 +299,7 @@ impl NativeContext {
     /// Ranking is bypassed but admission never is: an unknown identity fails
     /// `InvalidArgument`, disallowed software fails `InvalidArgument`, and a
     /// matched but inadmissible adapter fails `Unsupported`. A matched adapter
-    /// lacking core queue features also fails `Unsupported`.
+    /// lacking required draw or queue features also fails `Unsupported`.
     ///
     /// # Errors
     ///
@@ -312,8 +317,8 @@ impl NativeContext {
     /// Enumerates every physical device with a graphics queue, admitted or not.
     ///
     /// Rejected adapters stay listed so rejection diagnostics can name them;
-    /// devices without usable queues or core features are skipped because they
-    /// can never back a context. Surface presentation is checked at
+    /// devices without usable queues or required draw features are skipped
+    /// because they can never back a context. Surface presentation is checked at
     /// device-creation time, not here.
     ///
     /// # Errors
@@ -321,16 +326,9 @@ impl NativeContext {
     /// Returns an error if the Vulkan loader is unavailable or physical-device
     /// enumeration fails.
     pub fn enumerate_adapters() -> Result<Vec<AdapterInfo>, HalError> {
-        // A throwaway instance suffices: description needs properties, features,
-        // and queue families only. Drop reclaims context state; the instance
-        // handle follows the existing context lifecycle.
-        // Win32 instances need a Win32 loader; every other host probes headless.
-        let platform = if cfg!(windows) {
-            SurfacePlatform::Win32
-        } else {
-            SurfacePlatform::Headless
-        };
-        let probe = NativeContext::create(false, false, platform)?;
+        // A throwaway instance suffices: adapter enumeration is independent of
+        // surface creation, and dropping the probe reclaims the instance.
+        let probe = NativeContext::create(false, false)?;
         // SAFETY: the instance is live and owns returned physical-device handles.
         let devices = unsafe { probe.instance.enumerate_physical_devices() }.map_err(map_vk)?;
         let mut adapters = Vec::new();
@@ -339,7 +337,13 @@ impl NativeContext {
             let Ok(Some(candidate)) = probe.probe_device(physical, None) else {
                 continue;
             };
-            if !candidate.vertex_storage || !candidate.multi_draw {
+            if draw_feature_rejection(
+                candidate.vertex_storage,
+                candidate.multi_draw,
+                &candidate.features12,
+            )
+            .is_some()
+            {
                 continue;
             }
             adapters.push(candidate.adapter);
@@ -388,7 +392,13 @@ impl NativeContext {
             let Some(candidate) = self.probe_device(physical, surface)? else {
                 continue;
             };
-            if !candidate.vertex_storage || !candidate.multi_draw {
+            if draw_feature_rejection(
+                candidate.vertex_storage,
+                candidate.multi_draw,
+                &candidate.features12,
+            )
+            .is_some()
+            {
                 if selection.is_some_and(|(wanted, _)| wanted == candidate.adapter.stable_id()) {
                     return Err(HalError::Unsupported);
                 }
@@ -454,6 +464,7 @@ impl NativeContext {
             };
             let mut enabled12 = vk::PhysicalDeviceVulkan12Features::default()
                 .timeline_semaphore(features12.timeline_semaphore != 0)
+                .draw_indirect_count(features12.draw_indirect_count != 0)
                 .buffer_device_address(features12.buffer_device_address != 0)
                 .descriptor_indexing(features12.descriptor_indexing != 0)
                 .runtime_descriptor_array(features12.runtime_descriptor_array != 0)

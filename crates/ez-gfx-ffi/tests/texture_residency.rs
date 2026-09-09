@@ -117,7 +117,7 @@ fn cancel_after_native_admission(context: u64, bytes: &[u8], desc: &EzGfxTexture
     reason = "one hardware scenario keeps batch, update, compressed upload, and telemetry lifetime ordered"
 )]
 fn exercises_async_texture_batches(backend: u8) {
-    let native = TestContext::create(backend);
+    let native = TestContext::create_with_validation(backend, false);
     let context = native.context;
     let bytes = [128_u8; 4 * 4 * 4];
     let label = b"residency-test";

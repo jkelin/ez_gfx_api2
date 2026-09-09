@@ -16,7 +16,7 @@ struct Draw {
     uint first_instance;
 };
 
-struct Push {
+struct SceneParams {
     row_major float4x4 mvp;
     uint primitive_count;
     uint padding0;
@@ -25,19 +25,22 @@ struct Push {
 };
 
 [DepthPipeline]
-[push_constant]
-ConstantBuffer<Push> push;
+[Buffer("params")]
+StructuredBuffer<SceneParams> params;
 
-[StructuredBuffer("primitives")]
+[Buffer("primitives")]
 StructuredBuffer<Primitive> primitives;
 
-[IndirectBuffer("draw_commands")]
-RWStructuredBuffer<Draw> draw_commands;
+[CounterBuffer("draw_commands")]
+CounterBuffer<Draw> draw_commands;
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void computemain(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= push.primitive_count) {
+    if (id.x == 0) {
+        draw_commands.set_count(params[0].primitive_count);
+    }
+    if (id.x >= params[0].primitive_count) {
         return;
     }
 
@@ -48,7 +51,7 @@ void computemain(uint3 id : SV_DispatchThreadID) {
     command.first_index = primitive.first_index;
     command.vertex_offset = 0;
     command.first_instance = id.x;
-    draw_commands[id.x] = command;
+    draw_commands.set(id.x, command);
 }
 
 [VertexHeap("positions")]
@@ -66,7 +69,7 @@ struct VertexOutput {
 VertexOutput vertexmain(uint vertex_index : SV_VertexID, uint instance_index : SV_InstanceID) {
     Primitive primitive = primitives[instance_index];
     VertexOutput output;
-    output.position = mul(push.mvp, mul(primitive.transform, float4(positions[vertex_index].xyz, 1.0)));
+    output.position = mul(params[0].mvp, mul(primitive.transform, float4(positions[vertex_index].xyz, 1.0)));
 
     uint local_vertex = vertex_index - primitive.vertex_offset;
     float3 normal = normalize(mul((float3x3)primitive.transform, normals[local_vertex + primitive.normal_offset].xyz));

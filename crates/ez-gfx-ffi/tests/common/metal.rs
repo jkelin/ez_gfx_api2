@@ -1,6 +1,6 @@
 use ez_gfx_ffi::{
-    EzGfxBackendContextDesc, EzGfxResult, EzGfxSurfaceDesc, ez_gfx_context_create_backend,
-    ez_gfx_context_destroy, ez_gfx_context_init_device, ez_gfx_surface_create,
+    EzGfxBackendContextDesc, EzGfxResult, EzGfxWindowSurfaceDesc, ez_gfx_context_create_backend,
+    ez_gfx_context_destroy, ez_gfx_context_init_device, ez_gfx_surface_create_window,
     ez_gfx_surface_destroy,
 };
 use objc2::rc::Retained;
@@ -33,7 +33,6 @@ impl TestContext {
         let desc = EzGfxBackendContextDesc {
             enable_debug: 0,
             enable_validation: 0,
-            surface_platform: 2,
             backend,
             texture_decode_workers: 0,
             adapter_count: 0,
@@ -44,18 +43,15 @@ impl TestContext {
             unsafe { ez_gfx_context_create_backend(&raw const desc, &raw mut native.context) },
             EzGfxResult::Ok
         );
-        let surface_desc = EzGfxSurfaceDesc {
+        let surface_desc = EzGfxWindowSurfaceDesc {
             window: Retained::as_ptr(&native.layer).cast_mut().cast(),
             display: core::ptr::null_mut(),
-            platform: 2,
-            width: 64,
-            height: 64,
             cache_presented_snapshots: 0,
         };
         assert_eq!(
             // SAFETY: The retained unattached layer outlives the surface; all storage is live.
             unsafe {
-                ez_gfx_surface_create(
+                ez_gfx_surface_create_window(
                     native.context,
                     &raw const surface_desc,
                     &raw mut native.surface,

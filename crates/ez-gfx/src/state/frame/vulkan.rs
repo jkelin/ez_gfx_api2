@@ -358,11 +358,7 @@ fn vulkan_actions<'a>(
                 let index_node = *node as usize;
                 let payload = payloads.get(index_node).ok_or(Error::InvalidArgument)?;
                 match payload {
-                    ExecutableNode::Compute {
-                        groups,
-                        push_constants,
-                        ..
-                    } => {
+                    ExecutableNode::Compute { groups, .. } => {
                         let key = pipeline_keys[index_node]
                             .as_ref()
                             .ok_or(Error::InvalidArgument)?;
@@ -375,20 +371,18 @@ fn vulkan_actions<'a>(
                             ez_gfx_backend_vulkan::NativeComputeDispatch {
                                 pipeline,
                                 groups: *groups,
-                                push_constants,
                                 bindings: &binding_sets[index_node],
                             },
                         ));
                     }
                     ExecutableNode::Graphics {
-                        indirect,
-                        draw_count,
-                        push_constants,
+                        counter,
+                        draw_capacity,
                         ..
                     } => {
                         let indirect = state
                             .allocations
-                            .get(&indirect.packed())
+                            .get(&counter.packed())
                             .ok_or(Error::InvalidContext)?
                             .1
                             .vulkan()?;
@@ -407,8 +401,7 @@ fn vulkan_actions<'a>(
                                 pipeline,
                                 index_buffer: state.index.ok_or(Error::NotReady)?,
                                 indirect_buffer: indirect,
-                                draw_count: *draw_count,
-                                push_constants,
+                                draw_count: *draw_capacity,
                                 bindings: &binding_sets[index_node],
                             },
                         ));

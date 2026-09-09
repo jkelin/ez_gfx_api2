@@ -756,7 +756,62 @@ mod tests {
         );
 
         let contract = parse_xml(&xml).unwrap();
-        assert_eq!(contract.functions.len(), 58);
+        assert_eq!(contract.functions.len(), 61);
+        for (name, parameters) in [
+            ("ez_gfx_frame_bind", &["context", "frame", "binding"][..]),
+            (
+                "ez_gfx_frame_execute_compute",
+                &[
+                    "context",
+                    "frame",
+                    "shader",
+                    "dispatch_x",
+                    "dispatch_y",
+                    "dispatch_z",
+                ][..],
+            ),
+            (
+                "ez_gfx_frame_execute_graphics",
+                &["context", "frame", "shader", "buffer", "dynamic_state"][..],
+            ),
+            (
+                "ez_gfx_value_buffer_acquire",
+                &[
+                    "context",
+                    "value",
+                    "value_size",
+                    "debug_name",
+                    "debug_name_length",
+                    "out_buffer",
+                ][..],
+            ),
+        ] {
+            let function = contract
+                .functions
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("{name} is missing"));
+            assert_eq!(
+                function
+                    .children
+                    .iter()
+                    .map(|parameter| parameter.name.as_str())
+                    .collect::<Vec<_>>(),
+                parameters
+            );
+        }
+        for removed in [
+            "ez_gfx_frame_add_compute_pipeline",
+            "ez_gfx_frame_add_vertex_pipeline",
+        ] {
+            assert!(
+                contract
+                    .functions
+                    .iter()
+                    .all(|function| function.name != removed),
+                "{removed} compatibility alias remains"
+            );
+        }
 
         for function in &contract.functions {
             let suffix = function.name.strip_prefix("ez_gfx_").unwrap();

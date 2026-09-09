@@ -19,8 +19,7 @@ pub use ez_gfx_runtime::texture::{
 };
 pub use ez_gfx_runtime::upload::{UploadEvent, UploadResource, UploadStatus};
 pub use ez_gfx_runtime::{
-    AdapterReport, AdapterSelection, ContextOptions, LifecycleError, SurfaceOptions,
-    SurfacePlatform,
+    AdapterReport, AdapterSelection, ContextOptions, HeadlessSurfaceOptions, LifecycleError,
 };
 pub use state::TextureConfig;
 
@@ -30,8 +29,8 @@ pub use state::TextureConfig;
 pub mod raw {
     pub use crate::state::*;
     pub use ez_gfx_core::handle::{
-        ContextHandle, IndexAllocationHandle, IndirectBufferHandle, RenderTargetHandle,
-        ShaderHandle, StructuredBufferHandle, SurfaceHandle, TextureHandle, VertexAllocationHandle,
+        BufferHandle, ContextHandle, CounterBufferHandle, IndexAllocationHandle,
+        RenderTargetHandle, ShaderHandle, SurfaceHandle, TextureHandle, VertexAllocationHandle,
         VertexHeapHandle,
     };
     pub use ez_gfx_runtime::binding::{PublicBinding, ResourceIdentity};

@@ -108,10 +108,7 @@ pub(super) unsafe fn bind_dx12_compute_buffers(
         if binding.writable != *writable || binding.offset >= binding.allocation.allocation.size() {
             return Err(HalError::InvalidArgument);
         }
-        let root_index = u32::try_from(index)
-            .ok()
-            .and_then(|index| index.checked_add(1))
-            .ok_or(HalError::InvalidArgument)?;
+        let root_index = u32::try_from(index).map_err(|_| HalError::InvalidArgument)?;
         // SAFETY: the allocation resource is live and the validated offset stays within it.
         let address = unsafe {
             binding
@@ -146,10 +143,7 @@ pub(super) unsafe fn bind_dx12_graphics_buffers(
         if binding.writable != *writable || binding.offset >= binding.allocation.allocation.size() {
             return Err(HalError::InvalidArgument);
         }
-        let root_index = u32::try_from(index)
-            .ok()
-            .and_then(|index| index.checked_add(1))
-            .ok_or(HalError::InvalidArgument)?;
+        let root_index = u32::try_from(index).map_err(|_| HalError::InvalidArgument)?;
         // SAFETY: the allocation resource is live and the validated offset stays within it.
         let address = unsafe {
             binding

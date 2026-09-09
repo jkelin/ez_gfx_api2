@@ -131,15 +131,6 @@
         "EzGfxDiagnosticLevel_Error": {}
       }
     },
-    "enum:EzGfxSurfacePlatform": {
-      "attrs": {},
-      "children": {
-        "EzGfxSurfacePlatform_Win32": {},
-        "EzGfxSurfacePlatform_GLFW": {},
-        "EzGfxSurfacePlatform_MetalLayer": {},
-        "EzGfxSurfacePlatform_Headless": {}
-      }
-    },
     "enum:EzGfxSourceTextureFormat": {
       "attrs": {},
       "children": {
@@ -280,9 +271,6 @@
       "children": {
         "enable_debug": {},
         "enable_validation": {},
-        "surface_platform": {
-          "type": "EzGfxSurfacePlatform"
-        },
         "texture_decode_workers": {},
         "adapter_count": {},
         "adapter": {
@@ -296,9 +284,6 @@
       "children": {
         "enable_debug": {},
         "enable_validation": {},
-        "surface_platform": {
-          "type": "EzGfxSurfacePlatform"
-        },
         "backend": {
           "type": "EzGfxBackend"
         },
@@ -310,7 +295,7 @@
         }
       }
     },
-    "struct:EzGfxSurfaceDesc": {
+    "struct:EzGfxWindowSurfaceDesc": {
       "attrs": {},
       "children": {
         "window": {
@@ -319,9 +304,12 @@
         "display": {
           "nullable": "true"
         },
-        "platform": {
-          "type": "EzGfxSurfacePlatform"
-        },
+        "cache_presented_snapshots": {}
+      }
+    },
+    "struct:EzGfxHeadlessSurfaceDesc": {
+      "attrs": {},
+      "children": {
         "width": {
           "validation": "greater-than-zero"
         },
@@ -790,7 +778,7 @@
         }
       }
     },
-    "function:ez_gfx_surface_create": {
+    "function:ez_gfx_surface_create_window": {
       "attrs": {
         "return": "EzGfxResult",
         "managed": "surface-create",
@@ -798,10 +786,35 @@
       },
       "children": {
         "desc": {
-          "type": "const EzGfxSurfaceDesc *",
+          "type": "const EzGfxWindowSurfaceDesc *",
           "nullable": "false",
           "direction": "in",
-          "doc": "Window and initial extent."
+          "doc": "Borrowed native window handles."
+        },
+        "out_surface": {
+          "type": "EzGfxSurface *",
+          "direction": "out",
+          "doc": "Receives the opaque surface handle."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Context that owns the surface."
+        }
+      }
+    },
+    "function:ez_gfx_surface_create_headless": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "managed": "surface-create",
+        "returns-doc": "Returns EzGfxResult_Ok or a validation/native error."
+      },
+      "children": {
+        "desc": {
+          "type": "const EzGfxHeadlessSurfaceDesc *",
+          "nullable": "false",
+          "direction": "in",
+          "doc": "Headless extent and snapshot policy."
         },
         "out_surface": {
           "type": "EzGfxSurface *",
@@ -1333,7 +1346,7 @@
           "doc": "Exact UTF-8 debug-name bytes."
         },
         "debug_name_length": {
-          "validation": "greater-than-zero-at-most-boundary-limit",
+          "validation": "greater-than-zero-at-most-255",
           "doc": "Debug-name byte length."
         },
         "out_buffer": {
@@ -1419,7 +1432,31 @@
         }
       }
     },
-    "function:ez_gfx_frame_add_vertex_pipeline": {
+    "function:ez_gfx_frame_bind": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns validation, ownership, or frame status."
+      },
+      "children": {
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        },
+        "frame": {
+          "type": "EzGfxFrame",
+          "nullable": "false",
+          "doc": "Live owning frame."
+        },
+        "binding": {
+          "type": "const EzGfxBinding *",
+          "nullable": "false",
+          "direction": "in",
+          "doc": "One named resource binding."
+        }
+      }
+    },
+    "function:ez_gfx_frame_execute_graphics": {
       "attrs": {
         "return": "EzGfxResult",
         "returns-doc": "Returns validation or native status."
@@ -1429,6 +1466,11 @@
           "type": "EzGfxContext",
           "nullable": "false",
           "doc": "Owning context."
+        },
+        "frame": {
+          "type": "EzGfxFrame",
+          "nullable": "false",
+          "doc": "Live owning frame."
         },
         "shader": {
           "type": "EzGfxShader",
@@ -1438,41 +1480,17 @@
         "buffer": {
           "type": "EzGfxCounterBuffer",
           "nullable": "false",
-          "doc": "Counter buffer consumed by this frame for indirect commands."
-        },
-        "bindings": {
-          "type": "const EzGfxBinding *",
-          "nullable": "true",
-          "direction": "in",
-          "array-length": "binding_count",
-          "doc": "Resource bindings."
-        },
-        "binding_count": {
-          "doc": "Binding count."
+          "doc": "Counter buffer containing indexed draw commands."
         },
         "dynamic_state": {
           "type": "const EzGfxDynamicState *",
           "nullable": "true",
           "direction": "in",
-          "doc": "Optional state."
-        },
-        "push_constants": {
-          "nullable": "true",
-          "direction": "in",
-          "array-length": "push_constant_size",
-          "doc": "Push bytes."
-        },
-        "push_constant_size": {
-          "doc": "Push byte count."
-        },
-        "frame": {
-          "type": "EzGfxFrame",
-          "nullable": "false",
-          "doc": "Live owning frame."
+          "doc": "Optional dynamic pipeline state."
         }
       }
     },
-    "function:ez_gfx_frame_add_compute_pipeline": {
+    "function:ez_gfx_frame_execute_compute": {
       "attrs": {
         "return": "EzGfxResult",
         "returns-doc": "Returns validation or native status."
@@ -1483,43 +1501,27 @@
           "nullable": "false",
           "doc": "Owning context."
         },
+        "frame": {
+          "type": "EzGfxFrame",
+          "nullable": "false",
+          "doc": "Live owning frame."
+        },
         "shader": {
           "type": "EzGfxShader",
           "nullable": "false",
           "doc": "Compute shader."
         },
         "dispatch_x": {
+          "validation": "greater-than-zero",
           "doc": "X groups."
         },
         "dispatch_y": {
+          "validation": "greater-than-zero",
           "doc": "Y groups."
         },
         "dispatch_z": {
+          "validation": "greater-than-zero",
           "doc": "Z groups."
-        },
-        "bindings": {
-          "type": "const EzGfxBinding *",
-          "nullable": "true",
-          "direction": "in",
-          "array-length": "binding_count",
-          "doc": "Resource bindings."
-        },
-        "binding_count": {
-          "doc": "Binding count."
-        },
-        "push_constants": {
-          "nullable": "true",
-          "direction": "in",
-          "array-length": "push_constant_size",
-          "doc": "Push bytes."
-        },
-        "push_constant_size": {
-          "doc": "Push byte count."
-        },
-        "frame": {
-          "type": "EzGfxFrame",
-          "nullable": "false",
-          "doc": "Live owning frame."
         }
       }
     },
@@ -1878,6 +1880,46 @@
         }
       }
     },
+    "function:ez_gfx_value_buffer_acquire": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "managed": "utf8-string",
+        "returns-doc": "Returns validation or allocation status."
+      },
+      "children": {
+        "value": {
+          "nullable": "false",
+          "direction": "in",
+          "array-length": "value_size",
+          "doc": "Exact bytes of one value."
+        },
+        "value_size": {
+          "validation": "greater-than-zero-at-most-boundary-limit",
+          "doc": "Value byte size."
+        },
+        "debug_name": {
+          "type": "const char *",
+          "nullable": "false",
+          "direction": "in",
+          "array-length": "debug_name_length",
+          "doc": "Exact UTF-8 debug-name bytes."
+        },
+        "debug_name_length": {
+          "validation": "greater-than-zero-at-most-255",
+          "doc": "Debug-name byte length."
+        },
+        "out_buffer": {
+          "type": "EzGfxBuffer *",
+          "direction": "out",
+          "doc": "Receives the initialized owning handle."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
     "function:ez_gfx_buffer_acquire": {
       "attrs": {
         "return": "EzGfxResult",
@@ -1901,7 +1943,7 @@
           "doc": "Exact UTF-8 debug-name bytes."
         },
         "debug_name_length": {
-          "validation": "greater-than-zero-at-most-boundary-limit",
+          "validation": "greater-than-zero-at-most-255",
           "doc": "Debug-name byte length."
         },
         "out_buffer": {

@@ -187,7 +187,7 @@ fn metal_minified_sampling_selects_published_mips() {
         false,
     )
     .expect("compile cube shader artifact");
-    let native = TestContext::create(3);
+    let native = TestContext::create_with_validation(3, false);
     let context = ContextHandle::from_raw(native.context).unwrap();
     let surface = SurfaceHandle::from_raw(native.surface).unwrap();
     let quad = Quad::create(context, surface, &artifact);

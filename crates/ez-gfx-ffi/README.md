@@ -2,11 +2,11 @@
 
 `ez-gfx-ffi` is the C ABI boundary for the `ez-gfx` runtime. C and other foreign-language clients include [`bindings/c/include/ez_gfx_api.h`](../../bindings/c/include/ez_gfx_api.h). Rust declarations and documentation are authoritative; `tools/bindgen` generates the XML contract and C header. Rust clients should depend on `ez-gfx`, not `ez-gfx-ffi`.
 
-The complete [C textured cube](../../examples/02_textured_cube_c/README.md) exercises ABI 34 typed heap/allocation handles, one-frame compute-to-graphics buffers, presentation, creator-thread callbacks, stable error printing, and snapshot readback on Win32.
+The complete [C textured cube](../../examples/02_textured_cube_c/README.md) exercises ABI 35 typed heap/allocation handles, one-frame compute-to-graphics buffers, presentation, creator-thread callbacks, stable error printing, and snapshot readback on Win32.
 
 ## Compatibility and ownership
 
-Before any other call, require `ez_gfx_abi_version() == EZ_GFX_ABI_VERSION` (ABI 34). ABI 34 uses canonical `ez_gfx_{object}_{operation}` names and context-first signatures. Context-bound operations on an existing object place it second, including every frame operation as `(context, frame, ...)`. It provides creator-thread event callbacks, one-frame `EzGfxBuffer` and `EzGfxCounterBuffer` values, explicit generation-, kind-, owner-, state-, and frame-serial-validated `EzGfxFrame` handles, frame-scoped recording, auto-growing typed vertex heaps, a lazy context-owned index heap, and batched indirect writes.
+Before any other call, require `ez_gfx_abi_version() == EZ_GFX_ABI_VERSION` (ABI 35). ABI 35 removes surface-platform fields, splits window and headless surface creation, and uses canonical `ez_gfx_{object}_{operation}` names with context-first signatures. Context-bound operations on an existing object place it second, including every frame operation as `(context, frame, ...)`. It provides creator-thread event callbacks, one-frame `EzGfxBuffer` and `EzGfxCounterBuffer` values, explicit generation-, kind-, owner-, state-, and frame-serial-validated `EzGfxFrame` handles, frame-scoped recording, auto-growing typed vertex heaps, a lazy context-owned index heap, and batched indirect writes.
 
 `ez_gfx_handle_inspect` decodes a packed handle into its context/child slot and generation fields; it does not validate that the handle is live in a context. `ez_gfx_semantic_id` accepts an exact 1-to-255-byte canonical semantic name and writes its fixed 16-byte identifier. Semantic names are ASCII dot-separated identifiers: every non-empty segment starts with an ASCII letter and continues with ASCII letters, digits, or underscores. Empty segments, non-ASCII bytes, embedded NUL, and terminators included in the supplied length are invalid.
 
@@ -17,7 +17,7 @@ The context and all context/resource operations, including teardown, are creator
 `ez_gfx_shader_load_artifact(data, size, out_shader, context)` loads every stage present for the context backend/profile. Entry-point names remain artifact metadata and are not caller inputs.
 
 1. Create a context with `ez_gfx_context_create` or `ez_gfx_context_create_backend`.
-2. Create a presentation surface with `ez_gfx_surface_create`, then initialize its device with `ez_gfx_context_init_device`.
+2. Create a presentation surface with `ez_gfx_surface_create_window`, or a windowless surface with `ez_gfx_surface_create_headless`, then initialize its device with `ez_gfx_context_init_device`.
 3. Create/load persistent resources. Vertex heaps auto-grow; vertex upload and heap destruction require the typed heap. The context lazily owns its index heap. Geometry allocation handles retain their heap owner internally. Acquire and populate one-frame `EzGfxBuffer` and `EzGfxCounterBuffer` values through their owning context.
 4. Begin a surface frame with `ez_gfx_frame_begin(context, surface, out_frame)` or an offscreen frame with `ez_gfx_render_target_frame_begin(context, target, out_frame)`. Pass that frame to recording operations; the first binding claims each buffer.
 5. Consume the frame with `ez_gfx_frame_end`; it submits and presents surface frames. On early exit, consume it with `ez_gfx_frame_abort`. Terminal calls invalidate the frame and claimed buffers even when submission, presentation, or abort reports an error.

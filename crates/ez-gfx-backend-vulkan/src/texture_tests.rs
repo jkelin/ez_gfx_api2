@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     NativeBufferBinding, NativeComputeDispatch, NativeFrameAction, NativeFrameResource,
-    NativePipeline, NativeShader, PassAttachment, SurfacePlatform,
+    NativePipeline, NativeShader, PassAttachment,
 };
 use ez_gfx_compiler::{Target, compile_shader};
 use ez_gfx_core::{Backend, capability::SemanticProfile};
@@ -109,13 +109,7 @@ impl Drop for ShaderSource {
 
 fn context() -> NativeContext {
     // No surface is created, shown, or activated by these tests.
-    // Win32 instances need a Win32 loader; every other host probes headless.
-    let platform = if cfg!(windows) {
-        SurfacePlatform::Win32
-    } else {
-        SurfacePlatform::Headless
-    };
-    let mut context = NativeContext::create(false, false, platform).unwrap();
+    let mut context = NativeContext::create(false, false).unwrap();
     context.init_device(None).unwrap();
     context
 }
@@ -323,12 +317,12 @@ fn sampler_pipeline(context: &NativeContext, name: &str) -> (NativeShader, Nativ
         .open(&source.0)
         .unwrap();
     file.write_all(br#"[__AttributeUsage(_AttributeTargets.Var)]
-struct StructuredBufferAttribute { string name; };
+struct BufferAttribute { string name; };
 [__AttributeUsage(_AttributeTargets.Var)]
 struct BindlessTextureHeapAttribute { int capacity; };
 struct TextureEntry { Texture2D<float4> texture; SamplerState sampler; };
 struct TextureHeap { TextureEntry entries[1024]; };
-[StructuredBuffer("values")] RWStructuredBuffer<uint> values;
+[Buffer("values")] RWStructuredBuffer<uint> values;
 [BindlessTextureHeap(1024)] ParameterBlock<TextureHeap> texture_heap;
 [shader("compute")] [numthreads(1, 1, 1)]
 void computemain(uint3 id : SV_DispatchThreadID) {
@@ -378,7 +372,6 @@ fn dispatch(
             &[NativeFrameAction::Compute(NativeComputeDispatch {
                 pipeline,
                 groups: [count, 1, 1],
-                push_constants: &[],
                 bindings: &[NativeBufferBinding {
                     allocation: output,
                     offset: 0,

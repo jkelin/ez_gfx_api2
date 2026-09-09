@@ -28,6 +28,33 @@ impl NativeContext {
             presented_rgba8: Vec::new(),
         })
     }
+
+    /// Reads the current drawable extent reported by the window system.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no device is initialized or Vulkan rejects the query.
+    pub fn window_extent(&self, surface: &NativeSurface) -> Result<Option<(u32, u32)>, HalError> {
+        if surface.is_headless() {
+            return Ok(None);
+        }
+        let physical = self.physical_device.ok_or(HalError::NotReady)?;
+        // SAFETY: `physical` and `surface` belong to this live instance.
+        let capabilities = unsafe {
+            self.surface_loader
+                .get_physical_device_surface_capabilities(physical, surface.handle)
+        }
+        .map_err(map_vk)?;
+        let extent = capabilities.current_extent;
+        if extent.width == 0
+            || extent.height == 0
+            || extent.width == u32::MAX
+            || extent.height == u32::MAX
+        {
+            return Ok(None);
+        }
+        Ok(Some((extent.width, extent.height)))
+    }
     /// Acquires and presents one surface image; zero extents remain minimized.
     ///
     /// # Errors

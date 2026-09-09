@@ -161,7 +161,6 @@ fn context_decode_workers_flow_from_c_descriptor_to_creation() {
         let context_desc = EzGfxBackendContextDesc {
             enable_debug: 0,
             enable_validation: 0,
-            surface_platform: 0,
             backend: 2,
             texture_decode_workers: workers,
             adapter_count: 0,
@@ -228,7 +227,6 @@ fn context_decode_workers_flow_from_c_descriptor_to_creation() {
     let vulkan_desc = EzGfxBackendContextDesc {
         enable_debug: 0,
         enable_validation: 0,
-        surface_platform: 0,
         backend: 1,
         texture_decode_workers: 2,
         adapter_count: 0,

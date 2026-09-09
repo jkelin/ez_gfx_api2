@@ -85,7 +85,7 @@ fn begin_offscreen_frame(context: u64) -> (u64, u64) {
 
 #[cfg(not(target_vendor = "apple"))]
 fn geometry_uploads_use_real_device_buffers_and_transfer_fence(backend: u8) {
-    let native = common::TestContext::create(backend);
+    let native = common::TestContext::create_with_validation(backend, false);
     let context = native.context;
     let heap_name = b"position";
     let mut heap = 0;
@@ -209,7 +209,6 @@ fn dx12_texture_upload_becomes_resident_and_unload_invalidates_handle() {
     let context_desc = EzGfxBackendContextDesc {
         enable_debug: 0,
         enable_validation: 0,
-        surface_platform: 0,
         backend: 2,
         texture_decode_workers: 0,
         adapter_count: 0,
@@ -310,7 +309,7 @@ fn dx12_texture_upload_becomes_resident_and_unload_invalidates_handle() {
 
 #[cfg(not(target_vendor = "apple"))]
 fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
-    let native = common::TestContext::create(backend);
+    let native = common::TestContext::create_with_validation(backend, false);
     let context = native.context;
     let texture_desc = EzGfxTextureDesc {
         source_format: 1,

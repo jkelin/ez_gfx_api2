@@ -47,19 +47,6 @@ fn command_buffer_writes_batches_and_publishes_only_written_prefix() {
 }
 
 #[test]
-fn generated_count_publication_validates_capacity() {
-    let mut buffer = IndexedIndirectBuffer::new(2).unwrap();
-
-    buffer.publish_generated_count(2).unwrap();
-
-    assert_eq!(buffer.draw_count(), 2);
-    assert_eq!(
-        buffer.publish_generated_count(3),
-        Err(IndirectError::OutOfBounds)
-    );
-}
-
-#[test]
 fn invalid_viewports_and_scissors_fail() {
     assert_eq!(
         Viewport::new(0.0, 0.0, f32::NAN, 1.0, 0.0, 1.0),

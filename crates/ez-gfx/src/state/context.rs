@@ -4,20 +4,20 @@ use super::{
     AdapterCatalog, AdapterInfo, AdapterReport, AdapterSelection, Arc, AsyncTextureState, Backend,
     CONTEXT_HANDLES, CONTEXTS, ContextHandle, ContextIdentity, ContextOptions, ContextState,
     DiagnosticLevel, Error, FrameRecorder, GeometryManager, HalError, HashMap,
-    IndexAllocationHandle, NativeContext, NativeSurface, Observability, Ordering,
-    RenderTargetHandle, ResourceKind, RuntimeError, RuntimePhase, RuntimeRecord, RuntimeStatus,
-    SurfaceHandle, SurfaceOptions, SurfacePlatform, SurfaceRecord, SurfaceState, TextureRegistry,
+    HeadlessSurfaceOptions, IndexAllocationHandle, LocalHandle, NativeContext, NativeSurface,
+    Observability, Ordering, RenderTargetHandle, ResourceKind, RuntimeError, RuntimePhase,
+    RuntimeRecord, RuntimeStatus, SurfaceHandle, SurfaceRecord, SurfaceState, TextureRegistry,
     TextureUploadTelemetry, UploadEvent, UploadResource, UploadStatus, VertexAllocationHandle,
-    VulkanContext, VulkanPlatform, admission_report, completed_transfer_native, context_local,
+    VulkanContext, admission_report, completed_transfer_native, context_local,
     destroy_native_pipeline, destroy_native_shader, destroy_native_texture, free_native_allocation,
     map_allocation, map_hal, map_lifecycle, map_native_loss, map_texture,
     progress_texture_upload_events, pump_async_textures, render_target::destroy_all_render_targets,
     result_status, wait_native_idle, with_context_mut, with_surface_mut,
 };
 #[cfg(windows)]
-use super::{Dx12Context, Dx12Surface};
+use super::{Dx12Context, Dx12Surface, SurfaceWindow};
 #[cfg(target_vendor = "apple")]
-use super::{MetalContext, MetalSurface};
+use super::{MetalContext, MetalSurface, SurfaceWindow};
 
 /// Creates a graphics context.
 ///
@@ -68,8 +68,8 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         graphics_format: None,
         indirects: HashMap::new(),
         transient_buffers: HashMap::new(),
-        structured_pool: HashMap::new(),
-        indirect_pool: ez_gfx_hal::ReusableStagingPool::new(256),
+        buffer_pool: HashMap::new(),
+        counter_pool: ez_gfx_hal::ReusableStagingPool::new(256),
         texture_registry,
         texture_ready: HashMap::new(),
         pending_textures: HashMap::new(),
@@ -130,31 +130,11 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
 /// Returns an error when the backend/platform pair is unsupported or native context creation fails.
 fn build_native_context(options: &ContextOptions) -> Result<NativeContext> {
     Ok(match options.backend {
-        Backend::Vulkan if options.surface_platform == SurfacePlatform::Win32 => {
-            NativeContext::Vulkan(Box::new(
-                VulkanContext::create(
-                    options.enable_debug,
-                    options.enable_validation,
-                    VulkanPlatform::Win32,
-                )
+        Backend::Vulkan => NativeContext::Vulkan(Box::new(
+            VulkanContext::create(options.enable_debug, options.enable_validation)
                 .map_err(map_hal)?,
-            ))
-        }
-        Backend::Vulkan if options.surface_platform == SurfacePlatform::Headless => {
-            NativeContext::Vulkan(Box::new(
-                VulkanContext::create(
-                    options.enable_debug,
-                    options.enable_validation,
-                    VulkanPlatform::Headless,
-                )
-                .map_err(map_hal)?,
-            ))
-        }
-        Backend::Vulkan => return Err(Error::Unsupported),
+        )),
         Backend::Dx12 => {
-            if options.surface_platform != SurfacePlatform::Win32 {
-                return Err(Error::InvalidArgument);
-            }
             #[cfg(windows)]
             {
                 NativeContext::Dx12(Box::new(
@@ -167,9 +147,6 @@ fn build_native_context(options: &ContextOptions) -> Result<NativeContext> {
             }
         }
         Backend::Metal => {
-            if options.surface_platform != SurfacePlatform::MetalLayer {
-                return Err(Error::InvalidArgument);
-            }
             #[cfg(target_vendor = "apple")]
             {
                 NativeContext::Metal(Box::new(MetalContext::create_default().map_err(map_hal)?))
@@ -200,41 +177,18 @@ fn build_native_context_for_adapter(
     selection: AdapterSelection,
 ) -> Result<NativeContext> {
     Ok(match options.backend {
-        Backend::Vulkan if options.surface_platform == SurfacePlatform::Win32 => {
+        Backend::Vulkan => {
             let catalog =
                 AdapterCatalog::new(backend_adapters(Backend::Vulkan)).map_err(map_runtime)?;
             catalog
                 .select(selection.stable_id, selection.allow_software)
                 .map_err(map_runtime)?;
             NativeContext::Vulkan(Box::new(
-                VulkanContext::create(
-                    options.enable_debug,
-                    options.enable_validation,
-                    VulkanPlatform::Win32,
-                )
-                .map_err(map_hal)?,
+                VulkanContext::create(options.enable_debug, options.enable_validation)
+                    .map_err(map_hal)?,
             ))
         }
-        Backend::Vulkan if options.surface_platform == SurfacePlatform::Headless => {
-            let catalog =
-                AdapterCatalog::new(backend_adapters(Backend::Vulkan)).map_err(map_runtime)?;
-            catalog
-                .select(selection.stable_id, selection.allow_software)
-                .map_err(map_runtime)?;
-            NativeContext::Vulkan(Box::new(
-                VulkanContext::create(
-                    options.enable_debug,
-                    options.enable_validation,
-                    VulkanPlatform::Headless,
-                )
-                .map_err(map_hal)?,
-            ))
-        }
-        Backend::Vulkan => return Err(Error::Unsupported),
         Backend::Dx12 => {
-            if options.surface_platform != SurfacePlatform::Win32 {
-                return Err(Error::InvalidArgument);
-            }
             #[cfg(windows)]
             {
                 let catalog =
@@ -253,9 +207,6 @@ fn build_native_context_for_adapter(
             }
         }
         Backend::Metal => {
-            if options.surface_platform != SurfacePlatform::MetalLayer {
-                return Err(Error::InvalidArgument);
-            }
             #[cfg(target_vendor = "apple")]
             {
                 let catalog =
@@ -508,26 +459,44 @@ pub fn wait_idle(context: ContextHandle) -> Result<()> {
 /// Returns [`Error::InvalidContext`] for an invalid, stale, repeated, or wrong-thread
 /// destroy. Native wait/release failures are returned after terminal cleanup.
 pub fn destroy_context(context: ContextHandle) -> Result<()> {
+    let (local, owned) = remove_context(context)?;
+    cleanup_context_state(owned, remove_context_handle(local))
+}
+
+/// Best-effort owner-drop teardown; unavailable thread-local state means its
+/// own destructor has already invalidated and reclaimed the context.
+pub fn drop_context(context: ContextHandle) {
+    let Ok((local, owned)) = remove_context(context) else {
+        return;
+    };
+    let _ = cleanup_context_state(owned, remove_context_handle(local));
+}
+
+fn remove_context(context: ContextHandle) -> Result<(LocalHandle, ContextState)> {
     let (local, _) = context_local(context)?;
-    let owned = CONTEXTS.with(|contexts| {
-        let mut contexts = contexts
-            .try_borrow_mut()
-            .map_err(|_| Error::NativeFailure)?;
-        contexts
-            .states
-            .get(&local)
-            .ok_or(Error::InvalidContext)?
-            .identity
-            .check_thread()
-            .map_err(map_lifecycle)?;
-        contexts.states.remove(&local).ok_or(Error::InvalidContext)
-    })?;
-    let failure = match CONTEXT_HANDLES.lock() {
+    let owned = CONTEXTS
+        .try_with(|contexts| {
+            let mut contexts = contexts
+                .try_borrow_mut()
+                .map_err(|_| Error::NativeFailure)?;
+            contexts
+                .states
+                .get(&local)
+                .ok_or(Error::InvalidContext)?
+                .identity
+                .check_thread()
+                .map_err(map_lifecycle)?;
+            contexts.states.remove(&local).ok_or(Error::InvalidContext)
+        })
+        .map_err(|_| Error::InvalidContext)??;
+    Ok((local, owned))
+}
+
+fn remove_context_handle(local: LocalHandle) -> Option<Error> {
+    match CONTEXT_HANDLES.lock() {
         Ok(mut handles) => handles.remove(local).err().map(|_| Error::NativeFailure),
         Err(_) => Some(Error::NativeFailure),
-    };
-
-    cleanup_context_state(owned, failure)
+    }
 }
 pub(super) fn cleanup_context_state(
     mut owned: ContextState,
@@ -631,12 +600,12 @@ fn destroy_buffer_state(owned: &mut ContextState, failure: &mut Option<Error>) {
         free(allocation);
     }
     owned.transient_buffers.clear();
-    for (_, mut pool) in owned.structured_pool.drain() {
+    for (_, mut pool) in owned.buffer_pool.drain() {
         for allocation in pool.drain() {
             free(allocation);
         }
     }
-    for allocation in owned.indirect_pool.drain() {
+    for allocation in owned.counter_pool.drain() {
         free(allocation);
     }
     owned.indirects.clear();
@@ -659,65 +628,191 @@ fn destroy_buffer_state(owned: &mut ContextState, failure: &mut Option<Error>) {
     }
 }
 
-/// Creates a presentation surface.
+/// Creates a headless surface with an explicit initial extent.
 ///
 /// # Errors
 ///
-/// Returns an error for an invalid context or surface options, exhausted handles, or native surface failure.
-pub fn create_surface(context: ContextHandle, options: SurfaceOptions) -> Result<SurfaceHandle> {
+/// Returns an error for an invalid context, unsupported backend, exhausted
+/// handles, invalid extent, or native surface failure.
+pub fn create_surface_headless(
+    context: ContextHandle,
+    options: HeadlessSurfaceOptions,
+) -> Result<SurfaceHandle> {
     with_context_mut(context, |context| {
         context
             .identity
             .check_thread_and_health()
             .map_err(map_lifecycle)?;
-        if options.platform != context.options.surface_platform {
-            return Err(Error::InvalidArgument);
-        }
-        let headless = options.platform == SurfacePlatform::Headless;
         let native = match &mut context.native {
-            NativeContext::Vulkan(native) => NativeSurface::Vulkan(if headless {
-                native.create_headless_surface().map_err(map_hal)?
-            } else {
-                native
-                    .create_win32_surface(options.window as *mut _, options.display as *mut _)
-                    .map_err(map_hal)?
-            }),
+            NativeContext::Vulkan(native_context) => {
+                NativeSurface::Vulkan(native_context.create_headless_surface().map_err(map_hal)?)
+            }
             #[cfg(windows)]
-            NativeContext::Dx12(_) => {
-                NativeSurface::Dx12(Dx12Surface::new(options.window as *mut _).map_err(map_hal)?)
-            }
+            NativeContext::Dx12(_) => return Err(Error::Unsupported),
             #[cfg(target_vendor = "apple")]
-            NativeContext::Metal(_) => NativeSurface::Metal(
-                MetalSurface::new(options.window as *mut _, options.cache_presented_snapshots)
-                    .map_err(map_hal)?,
-            ),
+            NativeContext::Metal(_) => return Err(Error::Unsupported),
         };
-        let handle = match context.identity.insert(ResourceKind::Surface) {
-            Ok(handle) => handle,
-            Err(error) => {
-                destroy_native_surface(&mut context.native, native);
-                return Err(map_lifecycle(error));
-            }
-        };
-        let Ok(state) = SurfaceState::new(
+        let state = SurfaceState::new(
             options.width,
             options.height,
             options.cache_presented_snapshots,
-        ) else {
-            let _ = context.identity.remove(handle, ResourceKind::Surface);
-            destroy_native_surface(&mut context.native, native);
-            return Err(Error::InvalidArgument);
-        };
-        let Ok(handle) = SurfaceHandle::from_packed(handle) else {
-            let _ = context.identity.remove(handle, ResourceKind::Surface);
-            destroy_native_surface(&mut context.native, native);
-            return Err(Error::NativeFailure);
-        };
-        context
-            .surfaces
-            .insert(handle, SurfaceRecord { native, state });
-        Ok(handle)
+        )
+        .map_err(|_| Error::InvalidArgument)?;
+        insert_surface(context, native, state)
     })
+}
+
+/// Creates a surface from a target-native window handle.
+#[cfg(any(windows, target_vendor = "apple"))]
+pub(crate) fn create_surface_window(
+    context: ContextHandle,
+    window: SurfaceWindow,
+    cache_presented_snapshots: bool,
+) -> Result<SurfaceHandle> {
+    with_context_mut(context, |context| {
+        context
+            .identity
+            .check_thread_and_health()
+            .map_err(map_lifecycle)?;
+        let native = match (&mut context.native, window) {
+            #[cfg(windows)]
+            (NativeContext::Vulkan(native), SurfaceWindow::Win32 { window, instance }) => {
+                NativeSurface::Vulkan(
+                    native
+                        .create_win32_surface(window as *mut _, instance as *mut _)
+                        .map_err(map_hal)?,
+                )
+            }
+            #[cfg(windows)]
+            (NativeContext::Dx12(_), SurfaceWindow::Win32 { window, .. }) => {
+                NativeSurface::Dx12(Dx12Surface::new(window as *mut _).map_err(map_hal)?)
+            }
+            #[cfg(target_vendor = "apple")]
+            (NativeContext::Metal(_), SurfaceWindow::AppKit { view }) => NativeSurface::Metal(
+                MetalSurface::from_appkit_view(view as *mut _, cache_presented_snapshots)
+                    .map_err(map_hal)?,
+            ),
+            #[cfg(all(target_vendor = "apple", feature = "ffi"))]
+            (NativeContext::Metal(_), SurfaceWindow::MetalLayer { layer }) => NativeSurface::Metal(
+                MetalSurface::new(layer as *mut _, cache_presented_snapshots).map_err(map_hal)?,
+            ),
+            #[allow(
+                unreachable_patterns,
+                reason = "target-specific backends are conditional"
+            )]
+            _ => return Err(Error::Unsupported),
+        };
+        insert_surface(
+            context,
+            native,
+            SurfaceState::new_window(cache_presented_snapshots),
+        )
+    })
+}
+
+fn insert_surface(
+    context: &mut ContextState,
+    native: NativeSurface,
+    state: SurfaceState,
+) -> Result<SurfaceHandle> {
+    let handle = match context.identity.insert(ResourceKind::Surface) {
+        Ok(handle) => handle,
+        Err(error) => {
+            destroy_native_surface(&mut context.native, native);
+            return Err(map_lifecycle(error));
+        }
+    };
+    let Ok(surface) = SurfaceHandle::from_packed(handle) else {
+        let _ = context.identity.remove(handle, ResourceKind::Surface);
+        destroy_native_surface(&mut context.native, native);
+        return Err(Error::NativeFailure);
+    };
+    context
+        .surfaces
+        .insert(surface, SurfaceRecord { native, state });
+    Ok(surface)
+}
+
+/// Copies the current native window extent into the logical surface state.
+///
+/// # Errors
+///
+/// Returns an error for stale handles or a failed native window query.
+#[cfg(any(windows, target_vendor = "apple"))]
+pub fn sync_window_surface_extent(context: ContextHandle, surface: SurfaceHandle) -> Result<()> {
+    with_context_mut(context, |context| {
+        context
+            .identity
+            .resolve(surface.packed(), ResourceKind::Surface)
+            .map_err(map_lifecycle)?;
+        let record = context
+            .surfaces
+            .get(&surface)
+            .ok_or(Error::InvalidContext)?;
+        let extent = match (&context.native, &record.native) {
+            (NativeContext::Vulkan(native), NativeSurface::Vulkan(surface)) => {
+                native.window_extent(surface).map_err(map_hal)?
+            }
+            #[cfg(windows)]
+            (NativeContext::Dx12(_), NativeSurface::Dx12(surface)) => {
+                surface.window_extent().map_err(map_hal)?
+            }
+            #[cfg(target_vendor = "apple")]
+            (NativeContext::Metal(_), NativeSurface::Metal(surface)) => surface.window_extent(),
+            #[cfg(any(windows, target_vendor = "apple"))]
+            _ => return Err(Error::InvalidArgument),
+        };
+        if let Some((width, height)) = extent {
+            context
+                .surfaces
+                .get_mut(&surface)
+                .ok_or(Error::InvalidContext)?
+                .state
+                .resize(width, height)
+                .map_err(|_| Error::InvalidArgument)?;
+        }
+        Ok(())
+    })
+}
+
+/// Creates a window surface from opaque native handles at the C boundary.
+///
+/// # Errors
+///
+/// Returns an error when the target has no supported native window ABI or the
+/// handles are invalid for the selected backend.
+#[cfg(feature = "ffi")]
+pub fn create_surface_window_raw(
+    context: ContextHandle,
+    window: usize,
+    display: usize,
+    cache_presented_snapshots: bool,
+) -> Result<SurfaceHandle> {
+    #[cfg(windows)]
+    {
+        create_surface_window(
+            context,
+            SurfaceWindow::Win32 {
+                window,
+                instance: display,
+            },
+            cache_presented_snapshots,
+        )
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        let _ = display;
+        create_surface_window(
+            context,
+            SurfaceWindow::MetalLayer { layer: window },
+            cache_presented_snapshots,
+        )
+    }
+    #[cfg(not(any(windows, target_vendor = "apple")))]
+    {
+        let _ = (context, window, display, cache_presented_snapshots);
+        Err(Error::Unsupported)
+    }
 }
 
 /// Initializes a context device for a surface.

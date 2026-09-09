@@ -1,65 +1,43 @@
 //! Runtime integration and contract tests.
 
 use ez_gfx_core::Backend;
-use ez_gfx_runtime::{
-    ContextOptions, PublicApiError, SurfaceOptions, SurfacePlatform, SurfaceState,
-};
+use ez_gfx_runtime::{ContextOptions, HeadlessSurfaceOptions, PublicApiError, SurfaceState};
 
 #[test]
-fn context_flags_and_platform_are_closed_enums() {
+fn context_flags_are_validated_independently_of_backend() {
     assert_eq!(
-        ContextOptions::new(2, 0, 0),
+        ContextOptions::new(2, 0),
         Err(PublicApiError::InvalidBoolean)
     );
-    assert_eq!(
-        ContextOptions::new(0, 0, 2),
-        Err(PublicApiError::InvalidPlatform)
-    );
-    assert!(ContextOptions::new(1, 0, 0).is_ok());
+    for backend in [Backend::Vulkan, Backend::Dx12, Backend::Metal] {
+        assert!(ContextOptions::new_for_backend(1, 0, backend).is_ok());
+    }
 }
 
 #[test]
-fn context_backend_and_platform_pairs_are_validated() {
-    assert!(ContextOptions::new_for_backend(0, 0, 0, Backend::Dx12).is_ok());
-    assert!(ContextOptions::new_for_backend(0, 0, 2, Backend::Metal).is_ok());
+fn headless_surface_options_require_a_nonzero_extent() {
     assert_eq!(
-        ContextOptions::new_for_backend(0, 0, 2, Backend::Vulkan),
-        Err(PublicApiError::InvalidPlatform)
-    );
-    assert_eq!(
-        ContextOptions::new_for_backend(0, 0, 1, Backend::Dx12),
-        Err(PublicApiError::InvalidPlatform)
-    );
-}
-
-#[test]
-fn headless_platform_serves_windowless_vulkan_only() {
-    assert!(ContextOptions::new_for_backend(0, 0, 3, Backend::Vulkan).is_ok());
-    assert_eq!(
-        ContextOptions::new_for_backend(0, 0, 3, Backend::Dx12),
-        Err(PublicApiError::InvalidPlatform)
-    );
-    assert_eq!(
-        ContextOptions::new_for_backend(0, 0, 3, Backend::Metal),
-        Err(PublicApiError::InvalidPlatform)
-    );
-    assert_eq!(
-        SurfaceOptions::new(0, 0, SurfacePlatform::Headless, 64, 64, 0),
-        Ok(SurfaceOptions {
-            window: 0,
-            display: 0,
-            platform: SurfacePlatform::Headless,
+        HeadlessSurfaceOptions::new(64, 64, 0),
+        Ok(HeadlessSurfaceOptions {
             width: 64,
             height: 64,
-            cache_presented_snapshots: false
+            cache_presented_snapshots: false,
         })
+    );
+    assert_eq!(
+        HeadlessSurfaceOptions::new(0, 1, 0),
+        Err(PublicApiError::MixedZeroExtent)
+    );
+    assert_eq!(
+        HeadlessSurfaceOptions::new(0, 0, 0),
+        Err(PublicApiError::ZeroInitialExtent)
     );
 }
 
 #[test]
 fn context_decode_workers_default_to_zero_and_accept_explicit_counts() {
     // Zero preserves the default topology; the builder only records the request.
-    let default_options = ContextOptions::new(0, 0, 0).unwrap();
+    let default_options = ContextOptions::new(0, 0).unwrap();
     assert_eq!(default_options.texture_decode_workers, 0);
     let explicit = default_options.with_texture_decode_workers(3);
     assert_eq!(explicit.texture_decode_workers, 3);
@@ -67,34 +45,10 @@ fn context_decode_workers_default_to_zero_and_accept_explicit_counts() {
 }
 
 #[test]
-fn surface_contract_rejects_bad_handles_and_mixed_zero_extent() {
-    assert_eq!(
-        SurfaceOptions::new(0, 1, SurfacePlatform::Win32, 1, 1, 0),
-        Err(PublicApiError::MissingNativeHandle)
-    );
-    assert_eq!(
-        SurfaceOptions::new(1, 0, SurfacePlatform::Win32, 1, 1, 0),
-        Err(PublicApiError::MissingNativeHandle)
-    );
-    assert_eq!(
-        SurfaceOptions::new(1, 0, SurfacePlatform::Glfw, 1, 1, 0),
-        Ok(SurfaceOptions {
-            window: 1,
-            display: 0,
-            platform: SurfacePlatform::Glfw,
-            width: 1,
-            height: 1,
-            cache_presented_snapshots: false
-        })
-    );
-    assert_eq!(
-        SurfaceOptions::new(1, 1, SurfacePlatform::Win32, 0, 1, 0),
-        Err(PublicApiError::MixedZeroExtent)
-    );
-    assert_eq!(
-        SurfaceOptions::new(1, 1, SurfacePlatform::Win32, 0, 0, 0),
-        Err(PublicApiError::ZeroInitialExtent)
-    );
+fn window_surface_state_starts_without_an_extent() {
+    let state = SurfaceState::new_window(true);
+    assert_eq!(state.extent(), None);
+    assert!(state.snapshot_cache());
 }
 
 #[test]

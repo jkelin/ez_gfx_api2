@@ -26,7 +26,7 @@ fn frame_requires_ordered_begin_record_enqueue_submit_finish() {
     frame.begin().unwrap();
     assert_eq!(frame.begin(), Err(FrameError::AlreadyRecording));
     frame
-        .write_indirect(
+        .write_counter(
             0,
             DrawIndexedCommand {
                 index_count: 3,
@@ -65,12 +65,12 @@ fn frame_requires_ordered_begin_record_enqueue_submit_finish() {
 }
 
 #[test]
-fn indirect_bounds_and_missing_graph_are_rejected() {
+fn counter_bounds_and_missing_graph_are_rejected() {
     let mut frame = FrameRecorder::new(1).unwrap();
     frame.begin().unwrap();
     assert_eq!(
-        frame.write_indirect(1, DrawIndexedCommand::default()),
-        Err(FrameError::IndirectOutOfBounds)
+        frame.write_counter(1, DrawIndexedCommand::default()),
+        Err(FrameError::CounterOutOfBounds)
     );
 }
 

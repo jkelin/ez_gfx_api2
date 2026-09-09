@@ -4,7 +4,7 @@ use crate::{
     indirect::{DrawIndexedCommand, IndexedIndirectBuffer, IndirectError},
 };
 use ez_gfx_core::handle::{
-    IndirectBufferHandle, RenderTargetHandle, ShaderHandle, SurfaceHandle, TextureHandle,
+    CounterBufferHandle, RenderTargetHandle, ShaderHandle, SurfaceHandle, TextureHandle,
 };
 use ez_gfx_hal::{CompletionToken, DynamicPipelineState, ResourceState};
 
@@ -22,14 +22,14 @@ pub enum FrameState {
 #[derive(Clone, Debug, PartialEq)]
 /// Backend work associated with one compiled graph node.
 pub enum ExecutableNode {
-    /// A graphics draw node with shader, indirect, and dynamic state.
+    /// A graphics draw node with shader, counter buffer, and dynamic state.
     Graphics {
         /// Shader handle.
         shader: ShaderHandle,
-        /// Indirect buffer handle.
-        indirect: IndirectBufferHandle,
-        /// Number of draws.
-        draw_count: u32,
+        /// Counter buffer handle.
+        counter: CounterBufferHandle,
+        /// Maximum number of indirect draws.
+        draw_capacity: u32,
         /// Reflected resource bindings.
         bindings: Vec<PublicBinding>,
         /// Reflected shader layout.
@@ -38,8 +38,6 @@ pub enum ExecutableNode {
         pipeline_layout: PipelineLayout,
         /// Dynamic pipeline state.
         state: DynamicPipelineState,
-        /// Push-constant bytes.
-        push_constants: Vec<u8>,
     },
     /// A compute dispatch node.
     Compute {
@@ -51,8 +49,6 @@ pub enum ExecutableNode {
         bindings: Vec<PublicBinding>,
         /// Reflected shader layout.
         layout: ReflectedBindings,
-        /// Push-constant bytes.
-        push_constants: Vec<u8>,
     },
     /// A texture readback node.
     TextureReadback {
@@ -93,11 +89,11 @@ pub struct FrameRecorder {
     nodes: Vec<ExecutableNode>,
 }
 impl FrameRecorder {
-    /// Creates an idle recorder with the requested indirect draw capacity.
+    /// Creates an idle recorder with the requested counter-buffer capacity.
     ///
     /// # Errors
     ///
-    /// Returns `FrameError::InvalidCapacity` or `FrameError::IndirectOutOfBounds` if the indirect buffer rejects the requested capacity.
+    /// Returns `FrameError::InvalidCapacity` or `FrameError::CounterOutOfBounds` if the counter buffer rejects the requested capacity.
     pub fn new(indirect_capacity: u32) -> Result<Self, FrameError> {
         Ok(Self {
             state: FrameState::Idle,
@@ -132,9 +128,9 @@ impl FrameRecorder {
     ///
     /// # Errors
     ///
-    /// Returns `FrameError::NotRecording` when no recording is active, or an
-    /// indirect-buffer error if the index is invalid.
-    pub fn write_indirect(
+    /// Returns `FrameError::NotRecording` when no recording is active, or a
+    /// counter-buffer error if the index is invalid.
+    pub fn write_counter(
         &mut self,
         index: u32,
         command: DrawIndexedCommand,
@@ -265,10 +261,10 @@ impl FrameRecorder {
     }
 }
 
-/// Translates indirect-buffer failures into frame recording failures.
+/// Translates counter-buffer failures into frame recording failures.
 fn map_indirect(error: IndirectError) -> FrameError {
     match error {
-        IndirectError::OutOfBounds => FrameError::IndirectOutOfBounds,
+        IndirectError::OutOfBounds => FrameError::CounterOutOfBounds,
         _ => FrameError::InvalidCapacity,
     }
 }
@@ -276,7 +272,7 @@ fn map_indirect(error: IndirectError) -> FrameError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Failure reported while configuring or recording a frame.
 pub enum FrameError {
-    /// The requested indirect draw capacity is unsupported.
+    /// The requested counter-buffer capacity is unsupported.
     InvalidCapacity,
     /// Recording was requested while another recording is active.
     AlreadyRecording,
@@ -284,8 +280,8 @@ pub enum FrameError {
     NotRecording,
     /// Submission requires at least one recorded graph node.
     MissingGraph,
-    /// An indirect draw index exceeds the configured capacity.
-    IndirectOutOfBounds,
+    /// A counter-buffer draw index exceeds the configured capacity.
+    CounterOutOfBounds,
     /// Completion was requested before frame submission.
     NotSubmitted,
     /// Memory could not be reserved for another executable node.

@@ -10,8 +10,8 @@ use std::{
 use ez_gfx_core::{
     capability::CapabilityError,
     handle::{
-        ContextHandle, IndexAllocationHandle, IndirectBufferHandle, RenderTargetHandle,
-        ShaderHandle, StructuredBufferHandle, SurfaceHandle, TextureHandle, VertexAllocationHandle,
+        BufferHandle, ContextHandle, CounterBufferHandle, IndexAllocationHandle,
+        RenderTargetHandle, ShaderHandle, SurfaceHandle, TextureHandle, VertexAllocationHandle,
         VertexHeapHandle,
     },
 };
@@ -19,6 +19,9 @@ use ez_gfx_runtime::{
     LifecycleError,
     binding::{PublicBinding as RawBinding, ResourceIdentity},
 };
+use raw_window_handle::HasWindowHandle;
+#[cfg(any(windows, target_vendor = "apple"))]
+use raw_window_handle::RawWindowHandle;
 
 use crate::state;
 
@@ -133,8 +136,9 @@ impl Drop for DispatchGuard<'_> {
 
 impl Drop for ContextInner {
     fn drop(&mut self) {
-        if !self.closed.get() {
-            state::abandon_context(self.handle);
+        if !self.closed.replace(true) {
+            // TLS state may already have run its own destructor during thread exit.
+            state::drop_context(self.handle);
         }
     }
 }
@@ -142,10 +146,20 @@ impl Drop for ContextInner {
 /// Creator-thread graphics context.
 ///
 /// The `Rc` ownership marker deliberately makes this type `!Send` and `!Sync`.
-/// Dropping the last lease abandons native state without waiting; call [`Context::close`] for deterministic teardown.
-#[derive(Clone)]
+/// Explicit destruction and owner drop invalidate every context-owned resource.
 pub struct Context {
     inner: Rc<ContextInner>,
+    owner: bool,
+}
+
+impl Drop for Context {
+    fn drop(&mut self) {
+        if self.owner && !self.inner.closed.replace(true) {
+            // Drop cannot report native teardown failures; `destroy` remains the
+            // deterministic path when the caller needs the result.
+            state::drop_context(self.inner.handle);
+        }
+    }
 }
 
 impl Context {
@@ -163,6 +177,7 @@ impl Context {
                 next_readback: Cell::new(1),
                 closed: Cell::new(false),
             }),
+            owner: true,
         })
     }
 
@@ -345,20 +360,19 @@ impl Context {
         self.complete(state::texture_upload_telemetry(self.raw()))
     }
 
-    /// Deterministically destroys a uniquely owned context.
+    /// Deterministically destroys this context and every resource it owns.
+    ///
+    /// All outstanding resource wrappers become stale.
     ///
     /// # Errors
-    /// Returns `(self, Error::NotReady)` while child resource leases remain.
-    /// Native teardown errors are terminal and therefore do not return ownership.
-    pub fn close(self) -> std::result::Result<(), (Option<Self>, Error)> {
-        self.check_entry()
-            .map_err(|error| (Some(self.clone()), error))?;
-        let inner = match Rc::try_unwrap(self.inner) {
-            Ok(inner) => inner,
-            Err(inner) => return Err((Some(Self { inner }), Error::NotReady)),
-        };
-        inner.closed.set(true);
-        state::destroy_context(inner.handle).map_err(|error| (None, error))
+    /// Returns [`Error`] when teardown or pending event dispatch fails.
+    pub fn destroy(mut self) -> Result<()> {
+        self.check_entry()?;
+        if self.inner.closed.replace(true) {
+            return Err(Error::InvalidContext);
+        }
+        self.owner = false;
+        state::destroy_context(self.inner.handle)
     }
 
     /// Enumerates adapters visible to all compiled backends.
@@ -399,6 +413,7 @@ impl Surface {
     pub fn resize(&self, width: u32, height: u32) -> Result<()> {
         let context = Context {
             inner: Rc::clone(&self.inner.context),
+            owner: false,
         };
         context.check_entry()?;
         context.complete(state::resize_surface(
@@ -416,6 +431,7 @@ impl Surface {
     pub fn extent(&self) -> Result<(u32, u32)> {
         let context = Context {
             inner: Rc::clone(&self.inner.context),
+            owner: false,
         };
         context.check_entry()?;
         context.complete(state::surface_extent(
@@ -431,6 +447,7 @@ impl Surface {
     pub fn resize_pending(&self) -> Result<bool> {
         let context = Context {
             inner: Rc::clone(&self.inner.context),
+            owner: false,
         };
         context.check_entry()?;
         context.complete(state::surface_resize_pending(
@@ -446,6 +463,7 @@ impl Surface {
     pub fn set_snapshot_cache(&self, enabled: bool) -> Result<()> {
         let context = Context {
             inner: Rc::clone(&self.inner.context),
+            owner: false,
         };
         context.check_entry()?;
         context.complete(state::set_snapshot_cache(
@@ -457,16 +475,75 @@ impl Surface {
 }
 
 impl Context {
-    /// Creates, initializes, and sizes a surface atomically.
+    /// Creates and initializes a window surface from `raw-window-handle`.
+    ///
+    /// The drawable extent is queried from the native window after device
+    /// initialization; callers do not provide an initial size.
     ///
     /// # Errors
-    /// Returns [`Error`] when creation, device initialization, or initial sizing fails.
-    pub fn create_surface(&self, options: ez_gfx_runtime::SurfaceOptions) -> Result<Surface> {
+    /// Returns [`Error`] when the handle is unavailable or unsupported, or
+    /// when native surface creation, device initialization, or sizing fails.
+    pub fn create_surface_window<W>(
+        &self,
+        window: &W,
+        cache_presented_snapshots: bool,
+    ) -> Result<Surface>
+    where
+        W: HasWindowHandle + ?Sized,
+    {
         self.check_entry()?;
-        let handle = state::create_surface(self.raw(), options)?;
-        let initialized = state::init_device(self.raw(), handle).and_then(|()| {
-            state::resize_surface(self.raw(), handle, options.width, options.height)
-        });
+        let raw = window
+            .window_handle()
+            .map_err(|_| Error::InvalidArgument)?
+            .as_raw();
+        #[cfg(any(windows, target_vendor = "apple"))]
+        {
+            let window = match raw {
+                #[cfg(windows)]
+                RawWindowHandle::Win32(handle) => state::SurfaceWindow::Win32 {
+                    window: usize::from_ne_bytes(handle.hwnd.get().to_ne_bytes()),
+                    instance: usize::from_ne_bytes(
+                        handle
+                            .hinstance
+                            .ok_or(Error::InvalidArgument)?
+                            .get()
+                            .to_ne_bytes(),
+                    ),
+                },
+                #[cfg(target_vendor = "apple")]
+                RawWindowHandle::AppKit(handle) => state::SurfaceWindow::AppKit {
+                    view: handle.ns_view.as_ptr() as usize,
+                },
+                _ => return Err(Error::Unsupported),
+            };
+            let handle =
+                state::create_surface_window(self.raw(), window, cache_presented_snapshots)?;
+            let initialized = state::init_device(self.raw(), handle)
+                .and_then(|()| state::sync_window_surface_extent(self.raw(), handle));
+            self.publish_surface(handle, initialized)
+        }
+        #[cfg(not(any(windows, target_vendor = "apple")))]
+        {
+            let _ = (raw, cache_presented_snapshots);
+            Err(Error::Unsupported)
+        }
+    }
+
+    /// Creates, initializes, and sizes a headless surface atomically.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when creation, device initialization, or sizing fails.
+    pub fn create_surface_headless(
+        &self,
+        options: ez_gfx_runtime::HeadlessSurfaceOptions,
+    ) -> Result<Surface> {
+        self.check_entry()?;
+        let handle = state::create_surface_headless(self.raw(), options)?;
+        let initialized = state::init_device(self.raw(), handle);
+        self.publish_surface(handle, initialized)
+    }
+
+    fn publish_surface(&self, handle: SurfaceHandle, initialized: Result<()>) -> Result<Surface> {
         if let Err(error) = initialized {
             // A partially initialized surface is never published into the owning interface.
             state::destroy_surface(self.raw(), handle);
@@ -520,12 +597,6 @@ struct TextureInner {
     handle: TextureHandle,
 }
 
-impl Drop for TextureInner {
-    fn drop(&mut self) {
-        state::unload_texture(self.context.handle, self.handle);
-    }
-}
-
 /// Owning bindless texture.
 pub struct Texture {
     inner: Rc<TextureInner>,
@@ -539,6 +610,7 @@ impl Texture {
     pub fn binding(&self) -> Result<u32> {
         let context = Context {
             inner: Rc::clone(&self.inner.context),
+            owner: false,
         };
         context.check_entry()?;
         context.complete(state::texture_binding(
@@ -554,6 +626,7 @@ impl Texture {
     pub fn residency(&self) -> Result<(u32, u32)> {
         let context = Context {
             inner: Rc::clone(&self.inner.context),
+            owner: false,
         };
         context.check_entry()?;
         context.complete(state::texture_residency(
@@ -569,6 +642,7 @@ impl Texture {
     pub fn set_residency(&self, resident_mips: u32) -> Result<()> {
         let context = Context {
             inner: Rc::clone(&self.inner.context),
+            owner: false,
         };
         context.check_entry()?;
         context.complete(state::set_texture_residency(
@@ -585,6 +659,7 @@ impl Texture {
     pub fn update_region(&self, region: ez_gfx_hal::TextureRegion<'_>) -> Result<()> {
         let context = Context {
             inner: Rc::clone(&self.inner.context),
+            owner: false,
         };
         context.check_entry()?;
         context.complete(state::update_texture_region(
@@ -601,6 +676,7 @@ impl Texture {
     pub fn cancel_load(&self) -> Result<()> {
         let context = Context {
             inner: Rc::clone(&self.inner.context),
+            owner: false,
         };
         context.check_entry()?;
         context.complete(state::cancel_texture_load(
@@ -676,6 +752,7 @@ impl RenderTarget {
     pub fn format(&self) -> Result<ez_gfx_runtime::target::Format> {
         let context = Context {
             inner: Rc::clone(&self.inner.context),
+            owner: false,
         };
         context.check_entry()?;
         match &self.inner.backing {
@@ -698,6 +775,7 @@ impl RenderTarget {
     pub fn extent(&self) -> Result<(u32, u32)> {
         let context = Context {
             inner: Rc::clone(&self.inner.context),
+            owner: false,
         };
         context.check_entry()?;
         match &self.inner.backing {
@@ -720,6 +798,7 @@ impl RenderTarget {
     pub fn clear(&self) -> Result<ez_gfx_runtime::target::ClearValue> {
         let context = Context {
             inner: Rc::clone(&self.inner.context),
+            owner: false,
         };
         context.check_entry()?;
         match &self.inner.backing {
@@ -814,6 +893,7 @@ impl<T: bytemuck::Pod> VertexHeap<T> {
     pub fn upload(&self, vertices: &[T]) -> Result<VertexAllocation<T>> {
         let context = Context {
             inner: Rc::clone(&self.inner.context),
+            owner: false,
         };
         context.check_entry()?;
         let result = state::upload_vertices(self.inner.context.handle, self.inner.handle, vertices)
@@ -888,6 +968,7 @@ impl<T: bytemuck::Pod> VertexAllocation<T> {
     pub fn range(&self) -> Result<(u32, u32)> {
         let context = Context {
             inner: Rc::clone(&self.inner.heap.context),
+            owner: false,
         };
         context.check_entry()?;
         context.complete(state::vertex_allocation_range(
@@ -921,6 +1002,7 @@ impl IndexAllocation {
     pub fn range(&self) -> Result<(u32, u32)> {
         let context = Context {
             inner: Rc::clone(&self.inner.context),
+            owner: false,
         };
         context.check_entry()?;
         context.complete(state::index_allocation_range(

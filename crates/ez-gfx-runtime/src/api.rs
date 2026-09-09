@@ -1,19 +1,6 @@
 use ez_gfx_core::Backend;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Native window integration modes accepted by the runtime.
-pub enum SurfacePlatform {
-    /// Uses Win32 window and instance handles.
-    Win32,
-    /// Uses a GLFW-created native window.
-    Glfw,
-    /// Uses a Core Animation Metal layer.
-    MetalLayer,
-    /// Uses a windowless Vulkan headless surface; carries no native handles.
-    Headless,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Explicit adapter request carried by [`ContextOptions`].
 ///
 /// `None` (the default) keeps legacy first-fit device selection. `Some`
@@ -44,8 +31,6 @@ pub struct ContextOptions {
     pub enable_debug: bool,
     /// Enables backend validation checks.
     pub enable_validation: bool,
-    /// Selects the native surface integration mode.
-    pub surface_platform: SurfacePlatform,
     /// Selects the graphics backend.
     pub backend: Backend,
     /// Decode worker threads for async texture uploads. Zero selects the default
@@ -56,51 +41,28 @@ pub struct ContextOptions {
 }
 
 impl ContextOptions {
-    /// ABI booleans and backend/platform discriminants are validated before native setup.
+    /// Validates ABI booleans for a Vulkan context.
     ///
     /// # Errors
     ///
-    /// Returns `InvalidBoolean` when either boolean byte is not 0 or 1, or `InvalidPlatform` when the platform code is invalid or incompatible with Vulkan.
-    pub fn new(
-        enable_debug: u8,
-        enable_validation: u8,
-        surface_platform: u8,
-    ) -> Result<Self, PublicApiError> {
-        Self::new_for_backend(
-            enable_debug,
-            enable_validation,
-            surface_platform,
-            Backend::Vulkan,
-        )
+    /// Returns [`PublicApiError::InvalidBoolean`] when either byte is not zero or one.
+    pub fn new(enable_debug: u8, enable_validation: u8) -> Result<Self, PublicApiError> {
+        Self::new_for_backend(enable_debug, enable_validation, Backend::Vulkan)
     }
 
-    /// Backend/platform pairs are closed: DX12 requires Win32, Metal requires a layer, and Vulkan
-    /// accepts host-window platforms and headless, but never a Metal layer.
+    /// Validates ABI booleans for a context using `backend`.
     ///
     /// # Errors
     ///
-    /// Returns `InvalidBoolean` when either boolean byte is not 0 or 1, or `InvalidPlatform` when the platform code is invalid or incompatible with the selected backend.
+    /// Returns [`PublicApiError::InvalidBoolean`] when either byte is not zero or one.
     pub fn new_for_backend(
         enable_debug: u8,
         enable_validation: u8,
-        surface_platform: u8,
         backend: Backend,
     ) -> Result<Self, PublicApiError> {
-        let surface_platform = parse_platform(surface_platform)?;
-        if !matches!(
-            (backend, surface_platform),
-            (
-                Backend::Vulkan,
-                SurfacePlatform::Win32 | SurfacePlatform::Glfw | SurfacePlatform::Headless
-            ) | (Backend::Dx12, SurfacePlatform::Win32)
-                | (Backend::Metal, SurfacePlatform::MetalLayer)
-        ) {
-            return Err(PublicApiError::InvalidPlatform);
-        }
         Ok(Self {
             enable_debug: parse_bool(enable_debug)?,
             enable_validation: parse_bool(enable_validation)?,
-            surface_platform,
             backend,
             texture_decode_workers: 0,
             adapter_selection: None,
@@ -129,49 +91,30 @@ impl ContextOptions {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Native handles, dimensions, and presentation settings for a surface.
-pub struct SurfaceOptions {
-    /// Borrowed native window or Metal layer handle.
-    pub window: usize,
-    /// Borrowed native display or Win32 instance handle.
-    pub display: usize,
-    /// Identifies how the native handles are interpreted.
-    pub platform: SurfacePlatform,
+/// Presentation settings for a headless surface.
+pub struct HeadlessSurfaceOptions {
     /// Initial drawable width in pixels.
     pub width: u32,
     /// Initial drawable height in pixels.
     pub height: u32,
-    /// Enables caching of presented snapshots.
+    /// Enables caching of rendered snapshots.
     pub cache_presented_snapshots: bool,
 }
 
-impl SurfaceOptions {
-    /// GLFW may omit display; Win32 requires both borrowed handles; headless carries none.
+impl HeadlessSurfaceOptions {
+    /// Validates a headless surface descriptor.
     ///
     /// # Errors
     ///
-    /// Returns `MissingNativeHandle` for a null required handle, `MixedZeroExtent` or `ZeroInitialExtent` for an invalid extent, or `InvalidBoolean` when `cache` is not 0 or 1.
-    pub fn new(
-        window: usize,
-        display: usize,
-        platform: SurfacePlatform,
-        width: u32,
-        height: u32,
-        cache: u8,
-    ) -> Result<Self, PublicApiError> {
-        if (window == 0 && platform != SurfacePlatform::Headless)
-            || (platform == SurfacePlatform::Win32 && display == 0)
-        {
-            return Err(PublicApiError::MissingNativeHandle);
-        }
+    /// Returns [`PublicApiError::MixedZeroExtent`] or
+    /// [`PublicApiError::ZeroInitialExtent`] for an invalid extent, or
+    /// [`PublicApiError::InvalidBoolean`] when `cache` is not zero or one.
+    pub fn new(width: u32, height: u32, cache: u8) -> Result<Self, PublicApiError> {
         validate_extent(width, height)?;
         if width == 0 {
             return Err(PublicApiError::ZeroInitialExtent);
         }
         Ok(Self {
-            window,
-            display,
-            platform,
             width,
             height,
             cache_presented_snapshots: parse_bool(cache)?,
@@ -208,6 +151,16 @@ impl SurfaceState {
             resize_pending: false,
             snapshot_cache,
         })
+    }
+    /// Creates state for a window whose drawable extent has not been queried yet.
+    #[must_use]
+    pub const fn new_window(snapshot_cache: bool) -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            resize_pending: false,
+            snapshot_cache,
+        }
     }
 
     /// A 0x0 extent is a valid minimized transition reported as `NotReady`; mixed-zero is invalid.
@@ -258,9 +211,7 @@ impl SurfaceState {
 pub enum PublicApiError {
     /// A boolean byte was neither zero nor one.
     InvalidBoolean,
-    /// A platform code or backend/platform pairing is unsupported.
-    InvalidPlatform,
-    /// A required native window, display, or layer handle was null.
+    /// A native window handle was unavailable or unsupported.
     MissingNativeHandle,
     /// Exactly one extent dimension was zero.
     MixedZeroExtent,
@@ -280,21 +231,6 @@ fn parse_bool(value: u8) -> Result<bool, PublicApiError> {
         0 => Ok(false),
         1 => Ok(true),
         _ => Err(PublicApiError::InvalidBoolean),
-    }
-}
-
-/// Decodes an ABI platform discriminant.
-///
-/// # Errors
-///
-/// Returns `InvalidPlatform` when `value` is not a recognized platform discriminant.
-fn parse_platform(value: u8) -> Result<SurfacePlatform, PublicApiError> {
-    match value {
-        0 => Ok(SurfacePlatform::Win32),
-        1 => Ok(SurfacePlatform::Glfw),
-        2 => Ok(SurfacePlatform::MetalLayer),
-        3 => Ok(SurfacePlatform::Headless),
-        _ => Err(PublicApiError::InvalidPlatform),
     }
 }
 

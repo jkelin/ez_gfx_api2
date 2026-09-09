@@ -1,6 +1,6 @@
 # Rust examples
 
-The six numbered directories are linear procedural renderers hosted by one shared `Example`. `Example::new` hides native-window/options/context-surface creation and returns `(Example, Context, Surface)`. Each main directly owns the graphics objects, creates persistent resources in an inner scope, then loops over `wait_for_next_frame(&surface)`. The host hides clap configuration, winit inversion, native setup, resize, queued input, pacing, callbacks, benchmark, capture, and reporting. User code explicitly begins and configures each swapchain frame, records it, then calls `Example::handle_frame(frame, swapchain_target)`.
+The six numbered directories are linear procedural renderers hosted by one shared `Example`. `Example::new` creates the native host and each main creates its own platform-free `Context`, then calls `context.create_surface_window(example.window()?, ...)`. The host handles clap configuration, winit inversion, resize, queued input, pacing, callbacks, benchmark, capture, and reporting. User code explicitly begins and configures each swapchain frame, records it, then calls `Example::handle_frame(frame, swapchain_target)`.
 
 - [01 Triangle](01_triangle/README.md)
 - [02 Textured Cube](02_textured_cube/README.md)
@@ -11,7 +11,7 @@ The six numbered directories are linear procedural renderers hosted by one share
 
 The Rust examples enable `ktx2` and `basis`; the Sponza example therefore retains universal decoding. Library/FFI default builds omit those decoders. Enable both for universal KTX2, `ktx2` for native blocks, or `basis` for standalone Basis; see [texture admission](../docs/textures.md#admission-and-memory).
 
-The Win32 [`C textured cube`](02_textured_cube_c/README.md) is a separate ABI 34 flow. C uses an opaque generational `EzGfxFrame` and must explicitly call `ez_gfx_frame_end` or `ez_gfx_frame_abort`; Rust examples never use those raw completion functions.
+The Win32 [`C textured cube`](02_textured_cube_c/README.md) is a separate ABI 35 flow. C uses an opaque generational `EzGfxFrame` and must explicitly call `ez_gfx_frame_end` or `ez_gfx_frame_abort`; Rust examples never use those raw completion functions.
 
 | Binary | Complete renderer | Owned inputs |
 | --- | --- | --- |
@@ -22,9 +22,9 @@ The Win32 [`C textured cube`](02_textured_cube_c/README.md) is a separate ABI 34
 | `05_helmet` | `05_helmet/main.rs` | Slang source, target list, GLB |
 | `06_sponza_ktx2` | `06_sponza_ktx2/main.rs` | Slang source, target list |
 
-The original Sponza GLB is the only shared Rust asset: examples 03 and 06 consume `shared/assets/sponza.glb`. Shared support owns neutral data, native window attachment, input translation, observability, math, and mesh decoding. `shared/example.rs` is the single host for `ApplicationHandler`, native window, context/surface creation, resize, queued input, frame pacing, benchmark, capture, and reporting; each main owns its returned `Context` and `Surface`.
+The original Sponza GLB is the only shared Rust asset: examples 03 and 06 consume `shared/assets/sponza.glb`. Shared support owns neutral data, native window attachment, input translation, observability, math, and mesh decoding. `shared/example.rs` is the single host for `ApplicationHandler`, native window, resize, queued input, frame pacing, benchmark, capture, and reporting; each main owns its `Context` and `Surface`.
 
-Persistent resources are owning wrappers whose leases retain their context until `Drop`. The context owns the lazy singleton index heap. `Buffer<T>` and `CounterBuffer<T>` are acquired from `Context` for one frame, populated before first use, and claimed when bound. Same-frame reuse is valid; terminal completion invalidates them. Each loop explicitly begins and configures a swapchain frame before passing the frame and target to `Example::handle_frame`; no renderer manually releases individual safe resources. After the inner resource scope, each main drops `Surface`, consumes its caller-owned `Context` with `Context::close` to preserve teardown errors, then drops `Example`. Host `Drop` only publishes completed snapshot/report/benchmark data. Publication failures retain path, dimensions, hashes, and first-difference diagnostics where applicable and emit one stderr line. Normal automation exits nonzero; active unwinding preserves its original panic without a second failure.
+The context owns every graphics resource and destroys remaining resources when its owner is destroyed or dropped. Texture wrapper drop does not unload stable bindless heap entries. `Buffer<T>` and `CounterBuffer<T>` are acquired for one frame, populated before first use, and claimed when bound; same-frame reuse is valid and terminal completion invalidates them. Each loop explicitly begins and configures a swapchain frame before passing the frame and target to `Example::handle_frame`. Ordinary reverse declaration order handles example teardown without artificial scopes or explicit surface/context calls.
 
 Benchmark mode is available on every binary. Stable JSON identities are `01_triangle`, `02_textured_cube`, `03_compute_structured`, `04_imgui`, `05_helmet`, and `06_sponza_ktx2`; benchmark frame limits always override the ordinary max-frame setting with warmup + measured + one terminal capture frame.
 

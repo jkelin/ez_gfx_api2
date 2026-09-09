@@ -3,8 +3,8 @@
 mod shared;
 
 use ez_gfx::*;
-use glam::{DVec2, Mat4, Vec3};
-use shared::{input::*, math::*, mesh::*, *};
+use glam::{Mat4, Vec3};
+use shared::{math::*, mesh::*, *};
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
@@ -23,7 +23,7 @@ struct PrimitiveTextured {
 }
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct ScenePush {
+struct SceneParams {
     mvp: Mat4,
     primitive_count: u32,
     padding: [u32; 3],
@@ -95,185 +95,150 @@ mod tests {
 
 fn main() -> anyhow::Result<()> {
     let mut example = Example::new("06_sponza_ktx2", WIDTH, HEIGHT, "ez_gfx_api2")?;
-    let native = example.native_surface()?;
-    let backend = backend_config(native.platform, example.backend());
-    let [width, height] = example.surface_size();
+
+    let backend = backend_config(example.backend());
+
     let context = Context::new(ContextOptions {
         enable_debug: example.debug_enabled(),
         enable_validation: example.validation_enabled(),
-        surface_platform: backend.platform,
         backend: backend.backend,
         texture_decode_workers: 0,
         adapter_selection: None,
     })?;
-    let surface = context.create_surface(SurfaceOptions {
-        window: native.window,
-        display: native.display,
-        platform: backend.platform,
-        width,
-        height,
-        cache_presented_snapshots: true,
-    })?;
+    let surface = context.create_surface_window(example.window()?, true)?;
     example.register_observations(&context)?;
-    {
-        let workspace_root = Example::workspace_root()?;
-        let shader_bytes = ez_gfx_compiler::compile_shader(
-            &workspace_root.join("examples/06_sponza_ktx2/06_sponza_ktx2.slang"),
-            &[
-                ez_gfx_compiler::Target::Spirv,
-                ez_gfx_compiler::Target::Dxil,
-                ez_gfx_compiler::Target::Metal,
-            ],
-            !cfg!(target_vendor = "apple"),
-        )?;
-        let mesh = load_textured_glb(include_bytes!("../shared/assets/sponza.glb"))?;
-        let primitive_count = u32::try_from(mesh.primitives.len())?;
-        let primitive_ids = primitive_ids(&mesh.primitives, mesh.positions.len())?;
-        let primitive_bytes = u64::from(primitive_count)
-            .checked_mul(u64::try_from(std::mem::size_of::<PrimitiveTextured>())?)
-            .ok_or_else(|| anyhow::anyhow!("primitive records size overflow"))?;
-        if primitive_bytes > 16 * 1024 * 1024 {
-            anyhow::bail!("primitive records exceed ABI boundary");
-        }
-        let index_allocation = context.upload_indices(&mesh.indices)?;
-        let (first_index, _) = index_allocation.range()?;
-        let positions_heap = context.create_vertex_heap("positions")?;
-        let _positions = positions_heap.upload(&mesh.positions)?;
-        let normals_heap = context.create_vertex_heap("normals")?;
-        let _normals = normals_heap.upload(&mesh.normals)?;
-        let uvs_heap = context.create_vertex_heap("uvs")?;
-        let _uvs = uvs_heap.upload(&mesh.uvs)?;
-        let primitive_ids_heap = context.create_vertex_heap("primitive_ids")?;
-        let _primitive_ids_buffer = primitive_ids_heap.upload(&primitive_ids)?;
-        let repeat_sampler = TextureSamplerDesc {
-            min_filter: SamplerFilter::Linear,
-            mag_filter: SamplerFilter::Linear,
-            max_anisotropy: 1.0,
-            address_u: SamplerAddressMode::Repeat,
-            address_v: SamplerAddressMode::Repeat,
-            address_w: SamplerAddressMode::Repeat,
-        };
-        let fallback_config = TextureConfig {
+    let shader_bytes = ez_gfx_compiler::compile_shader(
+        std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/06_sponza_ktx2/06_sponza_ktx2.slang"
+        )),
+        &[
+            ez_gfx_compiler::Target::Spirv,
+            ez_gfx_compiler::Target::Dxil,
+            ez_gfx_compiler::Target::Metal,
+        ],
+        !cfg!(target_vendor = "apple"),
+    )?;
+    let mesh = load_textured_glb(include_bytes!("../shared/assets/sponza.glb"))?;
+    let primitive_count = u32::try_from(mesh.primitives.len())?;
+    let primitive_ids = primitive_ids(&mesh.primitives, mesh.positions.len())?;
+    let primitive_bytes = u64::from(primitive_count)
+        .checked_mul(u64::try_from(std::mem::size_of::<PrimitiveTextured>())?)
+        .ok_or_else(|| anyhow::anyhow!("primitive records size overflow"))?;
+    if primitive_bytes > 16 * 1024 * 1024 {
+        anyhow::bail!("primitive records exceed ABI boundary");
+    }
+    let index_allocation = context.upload_indices(&mesh.indices)?;
+    let (first_index, _) = index_allocation.range()?;
+    let positions_heap = context.create_vertex_heap("positions")?;
+    let _positions = positions_heap.upload(&mesh.positions)?;
+    let normals_heap = context.create_vertex_heap("normals")?;
+    let _normals = normals_heap.upload(&mesh.normals)?;
+    let uvs_heap = context.create_vertex_heap("uvs")?;
+    let _uvs = uvs_heap.upload(&mesh.uvs)?;
+    let primitive_ids_heap = context.create_vertex_heap("primitive_ids")?;
+    let _primitive_ids_buffer = primitive_ids_heap.upload(&primitive_ids)?;
+    let repeat_sampler = TextureSamplerDesc {
+        min_filter: SamplerFilter::Linear,
+        mag_filter: SamplerFilter::Linear,
+        max_anisotropy: 1.0,
+        address_u: SamplerAddressMode::Repeat,
+        address_v: SamplerAddressMode::Repeat,
+        address_w: SamplerAddressMode::Repeat,
+    };
+    let fallback_config = TextureConfig {
+        width: 1,
+        height: 1,
+        mip_count: 0,
+        destination: ez_gfx::TextureDestination::Rgba8Unorm,
+        sampler: repeat_sampler,
+    };
+    let fallback = context.load_texture(
+        TextureSource::Rgba8 {
             width: 1,
             height: 1,
+        },
+        &[255, 255, 255, 255],
+        false,
+        &fallback_config,
+    )?;
+    context.wait_idle()?;
+    let fallback_binding = fallback.binding()?;
+    let mut textures = vec![fallback];
+    let mut image_bindings = Vec::with_capacity(mesh.images.len());
+    for image in &mesh.images {
+        if image.mime_type != "image/ktx2" {
+            anyhow::bail!("Sponza base-color image is not KTX2");
+        }
+        let config = TextureConfig {
+            width: 0,
+            height: 0,
             mip_count: 0,
             destination: ez_gfx::TextureDestination::Rgba8Unorm,
-            sampler: repeat_sampler,
-        };
-        let fallback = context.load_texture(
-            TextureSource::Rgba8 {
-                width: 1,
-                height: 1,
+            sampler: TextureSamplerDesc {
+                max_anisotropy: 16.0,
+                ..repeat_sampler
             },
-            &[255, 255, 255, 255],
-            false,
-            &fallback_config,
-        )?;
-        context.wait_idle()?;
-        let fallback_binding = fallback.binding()?;
-        let mut textures = vec![fallback];
-        let mut image_bindings = Vec::with_capacity(mesh.images.len());
-        for image in &mesh.images {
-            if image.mime_type != "image/ktx2" {
-                anyhow::bail!("Sponza base-color image is not KTX2");
-            }
-            let config = TextureConfig {
-                width: 0,
-                height: 0,
-                mip_count: 0,
-                destination: ez_gfx::TextureDestination::Rgba8Unorm,
-                sampler: TextureSamplerDesc {
-                    max_anisotropy: 16.0,
-                    ..repeat_sampler
-                },
-            };
-            let texture =
-                match context.load_texture(TextureSource::Ktx2, &image.bytes, true, &config) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        return Err(anyhow::anyhow!("{error:?}"));
-                    }
-                };
-            context.wait_idle()?;
-            let binding = texture.binding()?;
-            image_bindings.push(binding);
-            textures.push(texture);
-        }
-        let records = mesh
-            .primitives
-            .iter()
-            .map(|primitive| PrimitiveTextured {
-                first_index: primitive.first_index + first_index,
-                index_count: primitive.index_count,
-                vertex_offset: primitive.vertex_offset,
-                normal_offset: primitive.normal_offset,
-                uv_offset: primitive.uv_offset,
-                texture_id: primitive
-                    .image
-                    .and_then(|index| image_bindings.get(index).copied())
-                    .unwrap_or(fallback_binding),
-                padding: [0; 2],
-                transform: row_major(primitive.transform),
-            })
-            .collect::<Vec<_>>();
-        let shader = context.load_shader(&shader_bytes)?;
-        let mut camera = OrbitCamera::new(90.0_f32.to_radians(), 8.0_f32.to_radians(), 0.45);
-        let clip_y = shared::clip_y(backend.backend);
-        let target = Vec3::new(0.0, -0.32, 0.0);
-        let mut push = ScenePush {
-            mvp: Mat4::IDENTITY,
-            primitive_count,
-            padding: [0; 3],
         };
-
-        while let Some(window_frame) = example.wait_for_next_frame(&surface)? {
-            let mut frame = surface.begin_frame()?;
-            let swapchain_target =
-                frame.configure_swapchain(window_frame.size, Format::Bgra8Srgb)?;
-            let input = window_frame.input;
-            let events = &window_frame.events;
-            for &event in events {
-                match event {
-                    SceneInput::CursorMoved { x, y } => camera.cursor(DVec2::new(x, y)),
-                    SceneInput::PrimaryButton(value) => camera.set_dragging(value),
-                    SceneInput::ScrollLines(lines) => camera.zoom(lines),
-                    _ => {}
-                }
+        let texture = match context.load_texture(TextureSource::Ktx2, &image.bytes, true, &config) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(anyhow::anyhow!("{error:?}"));
             }
-            push.mvp = row_major(
-                perspective(
-                    60.0_f32.to_radians(),
-                    input.width as f32 / input.height as f32,
-                    0.02,
-                    100.0,
-                    clip_y,
-                )? * camera.view(target)?,
-            );
-            // Buffers are one-frame values: the first bound frame consumes them.
-            let primitives = context.acquire_buffer_from(records.as_slice())?;
-            let indirect =
-                context.acquire_counter_buffer::<DrawIndexedCommand>(primitive_count as usize)?;
-            // Compute fills the draw commands; only the visible count is published up front.
-            indirect.publish_count(primitive_count)?;
-            let bindings = [
-                Binding::buffer("primitives", &primitives),
-                Binding::counter_buffer("draw_commands", &indirect),
-            ];
-            for texture in &textures {
-                frame.retain_texture(texture)?;
-            }
-            frame.add_compute(&shader, [primitive_count, 1, 1], &bindings, bytes_of(&push))?;
-            frame.add_graphics(
-                &shader,
-                &indirect,
-                &bindings,
-                DynamicPipelineState::from_abi(2, 0, 0, 0).unwrap(),
-                bytes_of(&push),
-            )?;
-            example.handle_frame(frame, swapchain_target)?;
-        }
+        };
+        context.wait_idle()?;
+        let binding = texture.binding()?;
+        image_bindings.push(binding);
+        textures.push(texture);
     }
-    drop(surface);
-    context.close().map_err(|(_, error)| error)?;
+    let records = mesh
+        .primitives
+        .iter()
+        .map(|primitive| PrimitiveTextured {
+            first_index: primitive.first_index + first_index,
+            index_count: primitive.index_count,
+            vertex_offset: primitive.vertex_offset,
+            normal_offset: primitive.normal_offset,
+            uv_offset: primitive.uv_offset,
+            texture_id: primitive
+                .image
+                .and_then(|index| image_bindings.get(index).copied())
+                .unwrap_or(fallback_binding),
+            padding: [0; 2],
+            transform: row_major(primitive.transform),
+        })
+        .collect::<Vec<_>>();
+    let shader = context.load_shader(&shader_bytes)?;
+    let mut camera = OrbitCamera::new(90.0_f32.to_radians(), 8.0_f32.to_radians(), 0.45)
+        .with_frustum(60.0_f32.to_radians(), 0.02, 100.0)
+        .with_clip_y(shared::clip_y(backend.backend));
+    let target = Vec3::new(0.0, -0.32, 0.0);
+    let mut params = SceneParams {
+        mvp: Mat4::IDENTITY,
+        primitive_count,
+        padding: [0; 3],
+    };
+
+    while let Some(window_frame) = example.wait_for_next_frame(&surface)? {
+        let mut frame = surface.begin_frame()?;
+        let swapchain_target = frame.configure_swapchain(window_frame.size, Format::Bgra8Srgb)?;
+        camera.handle_window_events(&window_frame.events);
+        params.mvp = row_major(camera.projection(window_frame.size)? * camera.view(target)?);
+        let primitives = context.acquire_buffer_from(records.as_slice())?;
+        let indirect =
+            context.acquire_counter_buffer::<DrawIndexedCommand>(primitive_count as usize)?;
+        let params_buffer = context.acquire_value_buffer(params)?;
+        frame.bind_buffer("params", &params_buffer)?;
+        frame.bind_buffer("primitives", &primitives)?;
+        frame.bind_buffer("draw_commands", &indirect)?;
+        frame.execute_compute(&shader, [primitive_count, 1, 1])?;
+
+        frame.execute_graphics(
+            &shader,
+            &indirect,
+            DynamicPipelineState::from_abi(2, 0, 0, 0).unwrap(),
+        )?;
+        example.handle_frame(frame, swapchain_target)?;
+    }
     Ok(())
 }

@@ -246,17 +246,13 @@ pub unsafe extern "C" fn ez_gfx_buffer_acquire(
                 .is_none_or(|size| size > EZ_GFX_MAX_BOUNDARY_BYTES)
             || out_buffer.is_null()
             || !out_buffer.is_aligned()
+            || debug_name_length > 255
             || validate_bounded_string(debug_name, debug_name_length).is_err()
         {
             return EzGfxResult::InvalidArgument;
         }
         let context = try_handle!(ContextHandle, context);
-        match buffer::insert(
-            context,
-            buffer::Kind::Structured,
-            element_size,
-            element_count,
-        ) {
+        match buffer::insert(context, buffer::Kind::Buffer, element_size, element_count) {
             Ok(handle) => {
                 // SAFETY: the validated caller-owned output remains writable for this call.
                 unsafe { out_buffer.write(handle) };
@@ -264,6 +260,52 @@ pub unsafe extern "C" fn ez_gfx_buffer_acquire(
             }
             Err(status) => status,
         }
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Acquires a one-frame buffer initialized with exactly one value.
+///
+/// # Safety
+///
+/// `value` must cover `value_size` readable bytes, `debug_name` its non-empty
+/// UTF-8 range, and `out_buffer` one writable, aligned handle.
+pub unsafe extern "C" fn ez_gfx_value_buffer_acquire(
+    context: EzGfxContext,
+    value: *const std::ffi::c_void,
+    value_size: u32,
+    debug_name: *const u8,
+    debug_name_length: usize,
+    out_buffer: *mut EzGfxBuffer,
+) -> EzGfxResult {
+    catch_status(|| {
+        // Zero-sized and oversized values fail before caller memory is read.
+        if value.is_null()
+            || value_size == 0
+            || value_size as usize > EZ_GFX_MAX_BOUNDARY_BYTES
+            || out_buffer.is_null()
+            || !out_buffer.is_aligned()
+            || debug_name_length > 255
+            || validate_bounded_string(debug_name, debug_name_length).is_err()
+        {
+            return EzGfxResult::InvalidArgument;
+        }
+        // SAFETY: the non-null caller range is bounded and remains readable for this call.
+        let bytes = unsafe { core::slice::from_raw_parts(value.cast::<u8>(), value_size as usize) };
+        let context = try_handle!(ContextHandle, context);
+        let handle = match buffer::insert(context, buffer::Kind::Buffer, value_size, 1) {
+            Ok(handle) => handle,
+            Err(status) => return status,
+        };
+        if let Err(status) =
+            buffer::write(handle, context, buffer::Kind::Buffer, 0, value_size, bytes)
+        {
+            let _ = buffer::remove(handle, context, buffer::Kind::Buffer);
+            return status;
+        }
+        // SAFETY: the validated caller-owned output remains writable through this write.
+        unsafe { out_buffer.write(handle) };
+        EzGfxResult::Ok
     })
 }
 
@@ -303,7 +345,7 @@ pub unsafe extern "C" fn ez_gfx_buffer_write(
         buffer::write(
             buffer,
             context,
-            buffer::Kind::Structured,
+            buffer::Kind::Buffer,
             start_index,
             element_size,
             bytes,
@@ -317,7 +359,7 @@ pub unsafe extern "C" fn ez_gfx_buffer_write(
 pub extern "C" fn ez_gfx_buffer_release(context: EzGfxContext, buffer: EzGfxBuffer) {
     catch_void(|| {
         if let Ok(context) = ContextHandle::from_raw(context) {
-            let _ = buffer::remove(buffer, context, buffer::Kind::Structured);
+            let _ = buffer::remove(buffer, context, buffer::Kind::Buffer);
         }
     });
 }

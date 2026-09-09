@@ -1,3 +1,4 @@
+use super::input::SceneInput;
 use glam::{DVec2, Mat3, Mat4, Vec3};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,6 +98,10 @@ pub struct OrbitCamera {
     pub yaw: f32,
     pub pitch: f32,
     pub distance: f32,
+    fovy: f32,
+    near: f32,
+    far: f32,
+    clip_y: ClipY,
     cursor: Option<DVec2>,
     dragging: bool,
 }
@@ -104,13 +109,80 @@ pub struct OrbitCamera {
 impl OrbitCamera {
     pub const fn new(yaw: f32, pitch: f32, distance: f32) -> Self {
         // Inputs are retained exactly so callers can choose their initial orbit without hidden normalization.
+        // The default frustum matches the 60-degree, 0.1-to-100 setup previously duplicated in examples,
+        // and the default clip matches the non-Apple host backend; examples override both via builders.
         Self {
             yaw,
             pitch,
             distance,
+            fovy: 60.0_f32.to_radians(),
+            near: 0.1,
+            far: 100.0,
+            clip_y: ClipY::Vulkan,
             cursor: None,
             dragging: false,
         }
+    }
+
+    /// Overrides the default projection frustum; returns the updated camera for chaining.
+    pub const fn with_frustum(mut self, fovy: f32, near: f32, far: f32) -> Self {
+        self.fovy = fovy;
+        self.near = near;
+        self.far = far;
+        self
+    }
+
+    /// Overrides the default clip-space convention; returns the updated camera for chaining.
+    pub const fn with_clip_y(mut self, clip_y: ClipY) -> Self {
+        self.clip_y = clip_y;
+        self
+    }
+
+    /// Applies one window-frame event to the orbit state.
+    ///
+    /// Returns whether the event was consumed; cursor, primary-button, and scroll
+    /// events are consumed, everything else (keys, text) is left for the caller.
+    pub fn handle_window_event(&mut self, event: SceneInput) -> bool {
+        match event {
+            SceneInput::CursorMoved { x, y } => {
+                self.cursor(DVec2::new(x, y));
+                true
+            }
+            SceneInput::PrimaryButton(dragging) => {
+                self.set_dragging(dragging);
+                true
+            }
+            SceneInput::ScrollLines(lines) => {
+                self.zoom(lines);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Applies a whole window frame's events; returns how many were consumed.
+    ///
+    /// Unconsumed events remain the caller's responsibility.
+    pub fn handle_window_events(&mut self, events: &[SceneInput]) -> usize {
+        events
+            .iter()
+            .copied()
+            .filter(|event| self.handle_window_event(*event))
+            .count()
+    }
+
+    /// Builds the aspect-correct projection for the current swapchain size.
+    ///
+    /// Degenerate (zero-sized) frames propagate through [`perspective`] as errors
+    /// instead of uploading NaNs.
+    pub fn projection(&self, size: [u32; 2]) -> crate::shared::Result<Mat4> {
+        perspective(
+            self.fovy,
+            size[0] as f32 / size[1] as f32,
+            self.near,
+            self.far,
+            self.clip_y,
+        )
     }
 
     pub fn cursor(&mut self, position: DVec2) {
@@ -295,5 +367,49 @@ mod tests {
                 16.0,
             ])
         );
+    }
+
+    #[test]
+    fn camera_consumes_orbit_events_and_leaves_keys_to_caller() {
+        use super::super::input::{SceneInput, SceneKey};
+
+        let mut camera = OrbitCamera::new(0.0, 0.0, 5.0);
+        assert!(camera.handle_window_event(SceneInput::PrimaryButton(true)));
+        let yaw_before = camera.yaw;
+        assert!(camera.handle_window_event(SceneInput::CursorMoved { x: 10.0, y: 0.0 }));
+        assert!(camera.handle_window_event(SceneInput::CursorMoved { x: 20.0, y: 0.0 }));
+        assert_ne!(camera.yaw, yaw_before);
+        let distance_before = camera.distance;
+        assert!(camera.handle_window_event(SceneInput::ScrollLines(1.0)));
+        assert!(camera.distance < distance_before);
+
+        assert!(!camera.handle_window_event(SceneInput::Character('x')));
+        assert!(!camera.handle_window_event(SceneInput::Key {
+            key: SceneKey::Escape,
+            pressed: true,
+        }));
+
+        let events = [
+            SceneInput::ScrollLines(1.0),
+            SceneInput::Key {
+                key: SceneKey::Escape,
+                pressed: true,
+            },
+        ];
+        assert_eq!(camera.handle_window_events(&events), 1);
+    }
+
+    #[test]
+    fn camera_projection_tracks_frame_size_and_rejects_degenerate_frames() {
+        let camera = OrbitCamera::new(0.0, 0.0, 5.0).with_clip_y(ClipY::Vulkan);
+        let square = camera.projection([480, 480]).unwrap();
+        let wide = camera.projection([960, 480]).unwrap();
+        assert_approx(square.x_axis.x, 2.0 * wide.x_axis.x);
+        assert!(camera.projection([640, 0]).is_err());
+        assert!(camera.projection([0, 480]).is_err());
+
+        let metal = OrbitCamera::new(0.0, 0.0, 5.0).with_clip_y(ClipY::Metal);
+        assert_eq!(square.y_axis.y.signum(), -1.0);
+        assert_eq!(metal.projection([480, 480]).unwrap().y_axis.y.signum(), 1.0);
     }
 }
