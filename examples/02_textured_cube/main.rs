@@ -18,10 +18,10 @@ struct Push {
 }
 
 fn main() -> anyhow::Result<()> {
-    let mut example = Example::new("02_textured_cube", WIDTH, HEIGHT, "ez_gfx_api2")?;
+    let (mut example, context, surface) =
+        Example::new("02_textured_cube", WIDTH, HEIGHT, "ez_gfx_api2")?;
     {
         let backend = example.backend();
-        let context = example.context();
         let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .ok_or_else(|| anyhow::anyhow!("examples package has no workspace parent"))?;
@@ -99,8 +99,8 @@ fn main() -> anyhow::Result<()> {
             texture_id,
             padding: [0; 3],
         };
-        while let Some(window_frame) = example.wait_for_next_frame()? {
-            let mut frame = example.surface().begin_frame()?;
+        while let Some(window_frame) = example.wait_for_next_frame(&surface)? {
+            let mut frame = surface.begin_frame()?;
             let swapchain_target =
                 frame.configure_swapchain(window_frame.size, Format::Bgra8Srgb)?;
             let input = window_frame.input;
@@ -130,9 +130,7 @@ fn main() -> anyhow::Result<()> {
                 vertex_offset: 0,
                 first_instance: 0,
             }];
-            let indirect = example
-                .context()
-                .acquire_counter_buffer_from(commands.as_slice())?;
+            let indirect = context.acquire_counter_buffer_from(commands.as_slice())?;
             frame.retain_texture(&texture)?;
             frame.add_graphics(
                 &shader,
@@ -144,6 +142,7 @@ fn main() -> anyhow::Result<()> {
             example.handle_frame(frame, swapchain_target)?;
         }
     }
-    example.close()?;
+    drop(surface);
+    context.close().map_err(|(_, error)| error)?;
     Ok(())
 }

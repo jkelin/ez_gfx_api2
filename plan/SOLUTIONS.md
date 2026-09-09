@@ -580,7 +580,7 @@ Sequence all P-001 through P-019 decisions into bounded milestones, obtain execu
 
 ### Decision
 
-Start with one end-to-end backend-neutral vertical slice, then require Vulkan, DX12, and Metal conformance, compressed assets/streaming/UI, and remaining selected work. Final cutover uses the shared `Example` host for winit inversion, owning context/surface, resize, input, automation, and consuming frame dispatch. It requires all six examples, ABI 34 gates, backend-required snapshots, every inherited TODO disposition, and no obsolete safe handle/free or multi-begin compatibility path.
+Start with one end-to-end backend-neutral vertical slice, then require Vulkan, DX12, and Metal conformance, compressed assets/streaming/UI, and remaining selected work. Final cutover uses the shared `Example` host for winit inversion, native context/surface creation, resize, input, automation, and consuming frame dispatch; each main owns the returned `Context` and `Surface`, scopes resources first, drops the surface, consumes `Context::close` to preserve teardown errors, and lets host `Drop` publish without graphics shutdown. Publication failures log and exit nonzero during normal automation without replacing an active unwind. It requires all six examples, ABI 34 gates, backend-required snapshots, every inherited TODO disposition, and no obsolete safe handle/free or multi-begin compatibility path.
 
 ### Performance and tradeoffs
 

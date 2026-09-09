@@ -102,10 +102,9 @@ fn imgui_key(key: SceneKey) -> Option<Key> {
 }
 
 fn main() -> anyhow::Result<()> {
-    let mut example = Example::new("04_imgui", WIDTH, HEIGHT, "ez_gfx_api2")?;
+    let (mut example, context, surface) = Example::new("04_imgui", WIDTH, HEIGHT, "ez_gfx_api2")?;
     {
         let backend = example.backend();
-        let context = example.context();
         let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .ok_or_else(|| anyhow::anyhow!("examples package has no workspace parent"))?;
@@ -171,7 +170,7 @@ fn main() -> anyhow::Result<()> {
             padding: 0.0,
         };
 
-        while let Some(window_frame) = example.wait_for_next_frame()? {
+        while let Some(window_frame) = example.wait_for_next_frame(&surface)? {
             let input = window_frame.input;
             let events = &window_frame.events;
             for &event in events {
@@ -232,9 +231,7 @@ fn main() -> anyhow::Result<()> {
                 );
                 std::mem::swap(&mut cpu_indices, &mut uploaded_indices);
             }
-            let commands = example
-                .context()
-                .acquire_buffer_from(cpu_commands.as_slice())?;
+            let commands = context.acquire_buffer_from(cpu_commands.as_slice())?;
             let draws = draw_counts
                 .iter()
                 .copied()
@@ -248,10 +245,8 @@ fn main() -> anyhow::Result<()> {
                 })
                 .collect::<Vec<_>>();
             // Counter initialization publishes the draw count automatically.
-            let indirect = example
-                .context()
-                .acquire_counter_buffer_from(draws.as_slice())?;
-            let mut frame = example.surface().begin_frame()?;
+            let indirect = context.acquire_counter_buffer_from(draws.as_slice())?;
+            let mut frame = surface.begin_frame()?;
             let swapchain_target =
                 frame.configure_swapchain(window_frame.size, Format::Bgra8Srgb)?;
             frame.retain_texture(&texture)?;
@@ -266,6 +261,7 @@ fn main() -> anyhow::Result<()> {
             example.handle_frame(frame, swapchain_target)?;
         }
     }
-    example.close()?;
+    drop(surface);
+    context.close().map_err(|(_, error)| error)?;
     Ok(())
 }

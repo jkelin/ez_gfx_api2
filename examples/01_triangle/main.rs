@@ -9,9 +9,9 @@ const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
 
 fn main() -> anyhow::Result<()> {
-    let mut example = Example::new("01_triangle", WIDTH, HEIGHT, "ez_gfx_api2")?;
+    let (mut example, context, surface) =
+        Example::new("01_triangle", WIDTH, HEIGHT, "ez_gfx_api2")?;
     {
-        let context = example.context();
         let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .ok_or_else(|| anyhow::anyhow!("examples package has no workspace parent"))?;
@@ -40,8 +40,8 @@ fn main() -> anyhow::Result<()> {
         let _positions = positions_heap.upload(&positions)?;
         let shader = context.load_shader(&shader_bytes)?;
 
-        while let Some(window_frame) = example.wait_for_next_frame()? {
-            let mut frame = example.surface().begin_frame()?;
+        while let Some(window_frame) = example.wait_for_next_frame(&surface)? {
+            let mut frame = surface.begin_frame()?;
             let swapchain_target =
                 frame.configure_swapchain(window_frame.size, Format::Bgra8Srgb)?;
             // Counter buffers are one-frame values: the first bound frame consumes them.
@@ -52,9 +52,7 @@ fn main() -> anyhow::Result<()> {
                 vertex_offset: 0,
                 first_instance: 0,
             }];
-            let indirect = example
-                .context()
-                .acquire_counter_buffer_from(commands.as_slice())?;
+            let indirect = context.acquire_counter_buffer_from(commands.as_slice())?;
             frame.add_graphics(
                 &shader,
                 &indirect,
@@ -65,6 +63,7 @@ fn main() -> anyhow::Result<()> {
             example.handle_frame(frame, swapchain_target)?;
         }
     }
-    example.close()?;
+    drop(surface);
+    context.close().map_err(|(_, error)| error)?;
     Ok(())
 }

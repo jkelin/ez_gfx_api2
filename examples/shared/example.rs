@@ -6,6 +6,7 @@ use ez_gfx::{Backend, Context, ContextOptions, Event, Frame, Surface, SurfaceOpt
 use std::{
     cell::RefCell,
     ffi::OsString,
+    io::Write,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -127,7 +128,7 @@ impl HostState {
     }
 }
 
-/// Owns process options, event pumping, the native host, graphics lifetime, pacing, and automation.
+/// Owns process options, event pumping, the native host, pacing, and automation.
 pub struct Example {
     identity: &'static str,
     backend_name: &'static str,
@@ -136,8 +137,6 @@ pub struct Example {
     report_stdout: bool,
     event_loop: Option<EventLoop<()>>,
     state: HostState,
-    context: Option<Context>,
-    surface: Option<Surface>,
     backend: Backend,
     observations: Rc<RefCell<Observations>>,
     benchmark: BenchmarkRunner,
@@ -147,13 +146,13 @@ pub struct Example {
 }
 
 impl Example {
-    /// Parses process options, then creates the native host and atomic context/surface pair.
+    /// Parses process options, then creates and returns the native host and graphics owners.
     pub fn new(
         identity: &'static str,
         width: u32,
         height: u32,
         title: &'static str,
-    ) -> Result<Self> {
+    ) -> Result<(Self, Context, Surface)> {
         let options = super::program_options().unwrap_or_else(|error| super::exit_config(error));
         if std::env::var_os("VK_LOADER_LAYERS_DISABLE").is_none() {
             // SAFETY: no event loop, worker, or graphics context exists yet.
@@ -171,8 +170,6 @@ impl Example {
             report_stdout: options.report,
             event_loop: Some(event_loop),
             state: HostState::new(title, width, height, options.frame_limit, options.visible),
-            context: None,
-            surface: None,
             backend: options.backend,
             observations: Rc::clone(&observations),
             benchmark: BenchmarkRunner::new(options.benchmark),
@@ -203,7 +200,8 @@ impl Example {
             platform: backend.platform,
             width: example.state.width,
             height: example.state.height,
-            cache_presented_snapshots: false,
+            // Metal terminal readback requires a non-framebuffer-only drawable.
+            cache_presented_snapshots: true,
         })?;
         let callback_observations = Rc::clone(&observations);
         context.register_callback(move |event| {
@@ -225,9 +223,7 @@ impl Example {
                 _ => {}
             }
         })?;
-        example.context = Some(context);
-        example.surface = Some(surface);
-        Ok(example)
+        Ok((example, context, surface))
     }
 
     fn pump_once(&mut self) -> Result<()> {
@@ -244,7 +240,7 @@ impl Example {
     }
 
     /// Pumps until host input is ready, or returns `None` after completion.
-    pub fn wait_for_next_frame(&mut self) -> Result<Option<WindowFrame>> {
+    pub fn wait_for_next_frame(&mut self, surface: &Surface) -> Result<Option<WindowFrame>> {
         if self.state.closed
             || self
                 .state
@@ -270,7 +266,7 @@ impl Example {
             return Ok(None);
         }
         if let Some((width, height)) = self.state.pending_resize.take() {
-            self.surface().resize(width, height)?;
+            surface.resize(width, height)?;
         }
 
         self.benchmark.begin_frame(self.frames);
@@ -331,30 +327,18 @@ impl Example {
         Ok(())
     }
 
-    pub fn context(&self) -> &Context {
-        self.context.as_ref().expect("context exists until close")
-    }
-
     pub fn backend(&self) -> Backend {
         self.backend
     }
 
-    pub fn surface(&self) -> &Surface {
-        self.surface.as_ref().expect("surface exists until close")
-    }
-
-    /// Drops caller resources first, deterministically tears down graphics, then publishes reports.
-    pub fn close(mut self) -> Result<()> {
-        self.surface.take();
-        let context = self.context.take().expect("context exists until close");
-        context.close().map_err(|(_, error)| error)?;
-        // Reports publish after teardown so the terminal capture stays outside benchmark timing.
+    fn publish_report(&mut self) -> Result<()> {
+        // An early return has no terminal report to publish.
         let Some(report) = self.report.take() else {
             return Ok(());
         };
         let frame = report.frame;
         publish_snapshot(
-            self.snapshot,
+            self.snapshot.take(),
             self.update_snapshots,
             frame.width,
             frame.height,
@@ -364,20 +348,42 @@ impl Example {
             frame.diagnostics,
             frame.dropped_observations,
             self.report_stdout,
-        );
+        )?;
         if let Some(benchmark) = report.benchmark {
             let frame_time_ns = benchmark.elapsed_ns as f64 / f64::from(benchmark.measured_frames);
             let fps = 1_000_000_000.0 / frame_time_ns;
-            println!(
+            writeln!(
+                std::io::stdout().lock(),
                 "{{\"benchmark\":\"{}\",\"backend\":\"{}\",\"warmup_frames\":{},\"measured_frames\":{},\"elapsed_ns\":{},\"frame_time_ns\":{frame_time_ns:.3},\"fps\":{fps:.3}}}",
                 self.identity,
                 self.backend_name,
                 benchmark.warmup_frames,
                 benchmark.measured_frames,
                 benchmark.elapsed_ns,
-            );
+            )
+            .map_err(Error::ReportOutput)?;
         }
         Ok(())
+    }
+}
+
+const fn should_exit_after_publication_failure(is_panicking: bool) -> bool {
+    // An active unwind must preserve its original panic instead of terminating the process here.
+    !is_panicking
+}
+
+impl Drop for Example {
+    fn drop(&mut self) {
+        if let Err(error) = self.publish_report() {
+            // Drop cannot report a secondary stderr failure without risking recursive failure.
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "example publication failed: {error}"
+            );
+            if should_exit_after_publication_failure(std::thread::panicking()) {
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -406,5 +412,52 @@ impl ClearFromSlice for Vec<u8> {
     fn clear_from_slice(&mut self, source: &[u8]) {
         self.clear();
         self.extend_from_slice(source);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publication_failure_exit_preserves_active_unwind() {
+        assert!(should_exit_after_publication_failure(false));
+        assert!(!should_exit_after_publication_failure(true));
+    }
+
+    #[test]
+    #[should_panic(expected = "sentinel unwind")]
+    fn publication_failure_does_not_double_panic_during_unwind() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing_snapshot = directory.path().join("missing.png");
+        let observations = Rc::new(RefCell::new(Observations::default()));
+        let _example = Example {
+            identity: "drop_regression",
+            backend_name: "vulkan",
+            snapshot: Some(missing_snapshot.into_os_string()),
+            update_snapshots: false,
+            report_stdout: false,
+            event_loop: None,
+            state: HostState::new("drop regression", 1, 1, Some(1), false),
+            backend: Backend::Vulkan,
+            observations,
+            benchmark: BenchmarkRunner::new(None),
+            frames: 1,
+            last_frame: Instant::now(),
+            report: Some(ProgramReport {
+                frame: PresentedFrame {
+                    width: 1,
+                    height: 1,
+                    frames: 1,
+                    rgba8: vec![0, 0, 0, 255],
+                    runtime_events: 0,
+                    diagnostics: 0,
+                    dropped_observations: 0,
+                },
+                benchmark: None,
+            }),
+        };
+
+        panic!("sentinel unwind");
     }
 }

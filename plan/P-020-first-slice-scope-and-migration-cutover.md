@@ -110,7 +110,7 @@ Treat compiler output validation, serialized reflection, API-shape checks, and C
 
 ### Selection rationale
 
-The initial vertical slice established an end-to-end executable path before backend expansion. Final Rust examples use the shared `Example` host for process options, winit inversion, native window, `Context`, `Surface`, resize, input, pacing, benchmark, capture, and reporting. Each procedural loop receives `WindowFrame`, explicitly begins and configures the swapchain transaction, records through `&mut Frame`, then calls `Example::handle_frame(frame, swapchain_target)`.
+The initial vertical slice established an end-to-end executable path before backend expansion. Final Rust examples use the shared `Example` host for process options, winit inversion, native window, context/surface creation, resize, input, pacing, benchmark, capture, and reporting. `Example::new` returns `(Example, Context, Surface)` so each main directly owns both graphics objects. Each procedural loop passes `&Surface` to receive `WindowFrame`, explicitly begins and configures the swapchain transaction, records through `&mut Frame`, then calls `Example::handle_frame(frame, swapchain_target)`.
 
 The safe cutover is ownership-only: resources release through `Drop`, `Frame::finish(self)` is consuming, unfinished frames abort on `Drop`, and no compatibility aliases retain manual safe destruction or the former multiple begin/end paths. ABI 34 keeps explicit C lifecycle functions over opaque generational handles.
 
@@ -135,5 +135,5 @@ Delivery latency and defect-rate comparisons remain unknown until measured. The 
 
 ### Validation actions
 
-1. Exercise all six renderers through the shared `Example` host and its owned frame lifecycle.
+1. Exercise all six renderers through the shared `Example` host with caller-owned `Context` and `Surface`, inner resource scopes, explicit surface drop, error-propagating `Context::close`, and host-only publication in `Example::drop`; publication failure exits nonzero except during an active unwind.
 2. Gate ABI 34 frame end/abort, one-frame buffer invalidation, opaque-handle validation, Rust wrapper drop order, and required Vulkan/DX12/Metal behavior.
