@@ -1,26 +1,64 @@
-# ez-gfx-api2
+# Easy Graphics API
 
-Rust/Cargo migration of the original `ez_gfx_api` with Vulkan, Direct3D 12, and Metal backends; backend-agnostic Slang shaders; compressed textures; and a compiler-free runtime.
+Abstraction layer over modern graphics APIs like Vulkan, DX12 and Metal. It provides unified interface to high-performance graphics using modern techniques within a compact API.
 
-## Architecture
+The intent of this library is to limit the user to only the high performance techniques and APIs which allows us to provide more convenience and safety. You will write fast code and you will like it.
 
-`ez-gfx-core` defines semantic IDs, layouts, capabilities, and packed generational handles. The safe [`ez-gfx`](crates/ez-gfx/README.md) interface starts with `Context::new` and atomic `Context::create_surface`. `Context` owns `Rc<ContextInner>`, and every owning resource wrapper retains its context/resource lease until `Drop`. Surfaces, shaders, textures, render targets, named vertex heaps, and vertex/index allocations release through `Drop`; no public safe destroy, release, or free functions exist. The index heap is a `Context` singleton. `ez-gfx-hal` remains the backend-neutral execution seam, with backend crates lowering it through `ash`, `windows`, and `objc2-metal`.
-Frames are explicit owners. `Surface::begin_frame()` returns a target-less `Frame`; `Frame::configure_swapchain(size, format)` attaches the surface and returns its logical `RenderTarget`. Named offscreen targets use `Context::begin_frame()` plus `Frame::configure_render_target(name, size, format)`. Recording methods take `&mut Frame`; `Frame::finish(self)` submits and presents, preserving exact errors. Dropping an unfinished frame aborts it. Context-acquired `Buffer<T>` and `CounterBuffer<T>` values are writable until first use, reusable within that frame, and invalid after its terminal path. Native backing returns to completion-safe pools. `RenderTarget::prepare_readback(&mut frame)` creates an owner-and-generation request.
-Texture loading is an unbounded, lossless, nonblocking CPU-to-transfer-queue pipeline subject to real payload and handle limits; see [Textures](docs/textures.md). Geometry lives in named device-local vertex heaps plus one singleton context-owned index heap; see [Geometry](docs/geometry.md).
+See [Examples](examples) for some code.
 
-Texture decoders are opt-in: add `features = ["ktx2", "basis"]` to the `ez-gfx` dependency for universal KTX2, or use `ktx2` alone for native KTX2 blocks and `basis` alone for standalone Basis. Default builds omit both the KTX2 parser and native transcoder; DDS/raw native mip ingestion needs neither. C ABI 33 carries DDS/raw source codes 8/9; rebuild bindings against the current header. See the [support and feature matrix](docs/textures.md#decode-transcode-and-mip-behavior).
+## Features
 
-[`ez-gfx-compiler`](crates/ez-gfx-compiler/README.md) compiles the root [`ez_gfx_api.slang`](ez_gfx_api.slang) module and application shaders to SPIR-V 1.5, Shader Model 6.5 DXIL, and Metal products. It writes [`.ezgfxshader`](crates/ez-gfx-artifact/README.md) files: a fixed, versioned frame around one bytechecked `rkyv` payload, with bounded lengths, a BLAKE3 digest, provenance, reflection, exactly one entry point per stage, and target coverage validation. Runtime callers load a stage set without naming entry points. Runtime crates and packages contain no compiler, Slang, DXC, source compilation, JIT, or fallback path.
+- Integrated [Slang shading language](https://shader-slang.org/) compiler with type-safe named buffer bindings
+  - Render targets and buffers are addressed by names rather than binding slots
+  - Shader reflection is used to automatically bind resources to the correct slots
+  - Shaders can be precompiled including reflected information
+- [Texture management](docs/textures.md)
+  - Managed growing texture heap for read only textures (not render targets) and bindless rendering
+  - Textures are loaded asynchronously with a parallel decoder supporting multiple common formats
+  - Textures are uploaded over a dedicated hardware transfer queue to the GPU to avoid stalling the graphics queue
+  - Support for KTX2 Basis Universal texture compression
+  - Asynchronous callback system notifiying the user that they can unload textures from memory after they have been uploaded to the GPU
+- [Geometry management](docs/geometry.md)
+  - Similiar to textures, geometry is loaded asynchronously and uploaded to the GPU over a dedicated transfer queue
+  - Single global index heap and multiple user-defined vertex heaps (ideally one for each vertex layout)
+  - Allows for efficient geometry (mesh/model) management and rendering
+- Render graph
+  - Each frame the user defines draw/compute operations in sequence and the library figures out dependencies based on render target and buffer usage
+  - Automatic synchronization of resources between passes
+  - (not yet implemented) Render graph allows for render target aliasing reducing memory usage
+- Unified buffer management
+  - User defined transient buffers each frame, these then rely on BAR to be synchronized to the GPU
+  - This is useful for dynamic data as well as Multidraw Indirect buffers
+- Multidraw Indirect bindless rendering only
+  - Dramatically reduced rendering API surface while retainig the high performace path
+  - MDI buffers can be filled on both CPU and GPU with simple APIs
+  - Strong distinction between Texture and Render Target enables further API simplification
+- Somewhat safe Rust API and C bindings
 
-## Build and examples
-Install [mise](https://mise.jdx.dev/) and run `mise tasks` for build, test, example, and packaging commands. Run `mise run test`: mise resolves pinned cargo-nextest 0.9.101, nextest runs all workspace tests without fail-fast and terminates each test at its first 60-second slow-timeout boundary; then workspace doctests run; retries are not configured. Each numbered binary lets the shared `Example` host parse CLI and environment options, create the native host and atomic context/surface pair, pace frames, and report automation. The procedural loop receives `WindowFrame`, begins and configures a swapchain frame explicitly, records through `&mut Frame`, then passes the frame and configured target to `Example::handle_frame`. Shader artifacts are compiled from adjacent Slang sources at startup; runtime crates and packages contain no compiler dependencies.
 
-The Win32 [`C textured cube`](examples/c/textured_cube/README.md) uses ABI 33 directly. `EzGfxFrame` is an opaque generational `uint64_t`. C begins surface or managed-target frames, then calls `ez_gfx_frame_end` or `ez_gfx_frame_abort`; every terminal result invalidates the frame and its claimed `EzGfxBuffer`/`EzGfxCounterBuffer` handles. Native buffer storage is completion-safely recycled. One registered callback receives upload, runtime, diagnostic, dropped-count, and borrowed readback events.
+## Prior work
 
-The shared `Example` host owns native window attachment. Win32 supplies HWND/HINSTANCE to Vulkan or DX12; macOS creates and retains a scale-aware `CAMetalLayer`. Surface construction is atomic: any native creation, device-initialization, or initial-resize failure destroys the unpublished surface and returns the original error without retaining a safe wrapper. Set `EZ_GFX_BACKEND` to `vulkan`, `dx12`, or, on macOS, `metal`; unsupported host/backend combinations fail explicitly.
+- [No Graphics API article](https://www.sebastianaaltonen.com/blog/no-graphics-api) and it's Vulkan based implementation [No GFX project](https://github.com/leotmp/no_gfx_api)
+  - More elegant and simpler abstraction over modern graphics hardware. However the Vulkan implementation relies on some very recent Vulkan features with poor hardware support. It's also less safe (because it's more general purpose) and has worse tooling support because of reliance of GPU pointers.
+- Established RHI abstractions like [bgfx](https://github.com/bkaradzic/bgfx), [wgpu](https://github.com/gfx-rs/wgpu), [Diligent Engine](https://github.com/DiligentGraphics/DiligentEngine) are more general purpose and focus on older features such as CPU driven rendering and resource management. Frequently with these libraries bindless rendering is a cutting edge capability with poor support, while in reality this feature has been cornerstone of high performance graphics for the last 15 years. Specifically for WGPU this is also influced by the fact that browsers have been dragging their feet with bindless support and as of 2026 it's still not available within WebGPU.
 
-## CI and packaging
+## Abstractins
 
-The backend matrix keeps hosted native runtime coverage explicit: macOS Metal native surfaces are compile-only because hosted runners lack a Metal device; Windows SwiftShader runs `vulkaninfoSDK` capability diagnostics and compile-checks native Vulkan surfaces because required descriptor indexing is unavailable; Windows DX12 and Linux Vulkan native runtime surfaces are likewise compile-only under documented host constraints. Platform-neutral artifact, runtime, FFI, and example contracts execute separately.
-
-`mise run package` packages the host target. Append `-- <target> <version> <output>` to override defaults. `xtask` verifies the Rust runtime dependency tree and the packaged runtime's actual PE/ELF/Mach-O dynamic imports, rejects compiler executables and native Slang/DXC libraries anywhere in the runtime package, requires compiler libraries from `SLANG_DIR` or `VULKAN_SDK`, emits sorted SHA-256 manifests, and creates ZIP archives on Windows or `.tar.gz` archives elsewhere. Run `cargo run -p xtask -- export-parity <runtime-library-or-package-root>` to enforce that import/package isolation and compare the permanent C header and `bindings.xml` ABI declarations—version, complete function signatures and pointer metadata, handle widths, struct layouts, enum values, and managed fixed extents—then compare their public function set with the packaged PE, ELF, or Mach-O exports. The package workflow runs this command for Windows x64, Linux x64, and Apple Silicon.
+- Context: The main object which owns the graphics device and all resources
+- Surface: Binding between Context and window or headless surface
+- Frame: A single frame of rendering for a particular surface. Encapsulates the render graph which is executed when the frame is submitted.
+  - Framerate is not necesserily tied to window refresh rate, in fact it is a good practice to run the render loop on a separate thread.
+  - The Frame is technically thread safe, but if you are using it from multiplle threads you are doing something wrong. You can fill up buffers from multiple threads before you begin a frame, but during frame construction you should just bind those buffers
+  - Each frame produces one swap of the swapchain
+- Buffer: transient array of data, consumed by a frame, that will be synchronized to the GPU when the frame is submitted.
+  - Buffers are automatically recycled across frames when it's safe to do so
+  - Counted Buffers also have a count u32 at the start of the buffer, this is ideal for Multidraw Indirect buffers which can be filled on the GPU and then consumed by the GPU.
+- Resource heaps
+  - Automatically growing collections of resources asynchronously filled on the CPU and consumed in a bindless fashion inside shaders
+  - Indexed by handles which are then reusable on the GPU (you pass the handles through buffers)
+  - Texture heap: stores read-only texture data including mip chains and samplers
+  - Index heap: used for storing index buffers for uploaded geometry
+  - Vertex heaps: user defined heaps for storing individual vertex arrays for geometry
+- Render targets: GPU resident transient images into which rendering is done
+  - Bound to individual frames and reused
+  - Can request read back onto the CPU
