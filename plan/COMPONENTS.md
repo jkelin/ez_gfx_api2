@@ -101,7 +101,7 @@ Backend-specific offscreen/readback fixtures provide PNG goldens and tolerances;
 
 ### P-020: Migration cutover â€” Clean ownership cutover
 
-The final cutover uses the shared `Example` host for winit inversion, native context/surface creation, resize, input, automation, and consuming frame dispatch. `Example::new` returns the host, `Context`, and `Surface`; each main directly owns the graphics objects, scopes resources first, drops the surface, and consumes `Context::close` before the host drops. Host `Drop` publishes completed automation output without graphics shutdown; publication failure logs and exits nonzero unless already unwinding. Rust exposes no compatibility aliases or manual frame/resource release; ABI 34 preserves the explicit C lifecycle.
+The final cutover uses the shared `Example` host for winit inversion, native window hosting, resize, input, automation, and consuming frame dispatch. `Example::new` returns only the host; each main visibly creates its `Context` with `Context::new(ContextOptions { .. })` and `Surface` with `context.create_surface(SurfaceOptions { .. })`, directly owns both graphics objects, scopes resources first, drops the surface, and consumes `Context::close` before the host drops. Host `Drop` publishes completed automation output without graphics shutdown; publication failure logs and exits nonzero unless already unwinding. Rust exposes no compatibility aliases or manual frame/resource release; ABI 34 preserves the explicit C lifecycle.
 
 ### P-021: Cross-backend shader execution semantics â€” Target-native layouts with canonical semantic ABI
 
