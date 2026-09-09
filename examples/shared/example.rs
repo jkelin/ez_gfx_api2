@@ -75,6 +75,37 @@ impl HostState {
         self.error = Some(error.into());
         self.closed = true;
     }
+    fn record_resize(&mut self, size: PhysicalSize<u32>) {
+        // Platform transitions may report one zero dimension. The graphics API
+        // represents every unavailable drawable as 0x0.
+        let (width, height) = if size.width == 0 || size.height == 0 {
+            (0, 0)
+        } else {
+            (size.width, size.height)
+        };
+        self.width = width;
+        self.height = height;
+        self.pending_resize = Some((width, height));
+        self.redraw_ready = true;
+    }
+
+    fn apply_pending_resize(
+        &mut self,
+        resize: impl FnOnce(u32, u32) -> ez_gfx::Result<()>,
+    ) -> Result<bool> {
+        let drawable_ready = self.width > 0 && self.height > 0;
+        let Some((width, height)) = self.pending_resize.take() else {
+            return Ok(drawable_ready);
+        };
+        match resize(width, height) {
+            Ok(()) if drawable_ready => Ok(true),
+            Err(ez_gfx::Error::NotReady) if !drawable_ready => Ok(false),
+            Ok(()) => Err(Error::message(
+                "minimized surface resize unexpectedly succeeded",
+            )),
+            Err(error) => Err(error.into()),
+        }
+    }
 
     fn initialize_window(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -98,12 +129,10 @@ impl HostState {
         }
         match &event {
             WindowEvent::CloseRequested => self.closed = true,
-            WindowEvent::Resized(size) if size.width > 0 && size.height > 0 => {
-                self.width = size.width;
-                self.height = size.height;
-                self.pending_resize = Some((size.width, size.height));
+            WindowEvent::Resized(size) => self.record_resize(*size),
+            WindowEvent::RedrawRequested if self.width > 0 && self.height > 0 => {
+                self.redraw_ready = true;
             }
-            WindowEvent::RedrawRequested => self.redraw_ready = true,
             _ => {
                 dispatch_window_input(&event, |input| self.pending_input.push(input));
             }
@@ -196,7 +225,7 @@ impl Example {
         self.validation_enabled
     }
 
-    /// Returns the current nonzero native surface size.
+    /// Returns the current native drawable size, or `[0, 0]` while minimized.
     pub const fn surface_size(&self) -> [u32; 2] {
         [self.state.width, self.state.height]
     }
@@ -241,46 +270,51 @@ impl Example {
 
     /// Pumps until host input is ready, or returns `None` after completion.
     pub fn wait_for_next_frame(&mut self, surface: &Surface) -> Result<Option<WindowFrame>> {
-        if self.state.closed
-            || self
+        loop {
+            if self.state.closed
+                || self
+                    .state
+                    .frame_limit
+                    .is_some_and(|limit| self.frames >= limit)
+            {
+                return Ok(None);
+            }
+            if self.state.visible
+                && let Some(window) = &self.state.window
+            {
+                window.request_redraw();
+            }
+
+            self.state.redraw_ready = false;
+            while !self.state.redraw_ready && !self.state.closed {
+                self.pump_once()?;
+            }
+            if let Some(error) = self.state.error.take() {
+                return Err(error);
+            }
+            if self.state.closed {
+                return Ok(None);
+            }
+            if !self
                 .state
-                .frame_limit
-                .is_some_and(|limit| self.frames >= limit)
-        {
-            return Ok(None);
-        }
-        if self.state.visible
-            && let Some(window) = &self.state.window
-        {
-            window.request_redraw();
-        }
+                .apply_pending_resize(|width, height| surface.resize(width, height))?
+            {
+                continue;
+            }
 
-        self.state.redraw_ready = false;
-        while !self.state.redraw_ready && !self.state.closed {
-            self.pump_once()?;
+            self.benchmark.begin_frame(self.frames);
+            let input = FrameInput {
+                width: self.state.width,
+                height: self.state.height,
+                delta_seconds: self.last_frame.elapsed().as_secs_f32(),
+            };
+            self.last_frame = Instant::now();
+            return Ok(Some(WindowFrame {
+                size: [self.state.width, self.state.height],
+                input,
+                events: std::mem::take(&mut self.state.pending_input),
+            }));
         }
-        if let Some(error) = self.state.error.take() {
-            return Err(error);
-        }
-        if self.state.closed {
-            return Ok(None);
-        }
-        if let Some((width, height)) = self.state.pending_resize.take() {
-            surface.resize(width, height)?;
-        }
-
-        self.benchmark.begin_frame(self.frames);
-        let input = FrameInput {
-            width: self.state.width,
-            height: self.state.height,
-            delta_seconds: self.last_frame.elapsed().as_secs_f32(),
-        };
-        self.last_frame = Instant::now();
-        Ok(Some(WindowFrame {
-            size: [self.state.width, self.state.height],
-            input,
-            events: std::mem::take(&mut self.state.pending_input),
-        }))
     }
 
     /// Consumes the pending frame and configures terminal swapchain readback.
@@ -393,8 +427,9 @@ impl ApplicationHandler for Example {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Hidden automation cannot depend on compositor redraw delivery.
-        if !self.state.visible {
+        // Hidden automation cannot depend on compositor redraw delivery, but a
+        // minimized window must still wait for a nonzero resize.
+        if !self.state.visible && self.state.width > 0 && self.state.height > 0 {
             self.state.redraw_ready = true;
         }
     }
@@ -418,6 +453,46 @@ impl ClearFromSlice for Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minimized_resize_waits_until_nonzero_restore() {
+        let mut state = HostState::new("resize", 640, 480, None, false);
+
+        state.record_resize(PhysicalSize::new(0, 480));
+        assert_eq!((state.width, state.height), (0, 0));
+        assert!(state.redraw_ready);
+        assert!(
+            !state
+                .apply_pending_resize(|width, height| {
+                    assert_eq!((width, height), (0, 0));
+                    Err(ez_gfx::Error::NotReady)
+                })
+                .unwrap()
+        );
+        assert_eq!(state.pending_resize, None);
+
+        state.record_resize(PhysicalSize::new(800, 600));
+        assert!(
+            state
+                .apply_pending_resize(|width, height| {
+                    assert_eq!((width, height), (800, 600));
+                    Ok(())
+                })
+                .unwrap()
+        );
+        assert_eq!((state.width, state.height), (800, 600));
+        assert_eq!(state.pending_resize, None);
+    }
+    #[test]
+    fn minimized_resize_propagates_unexpected_graphics_errors() {
+        let mut state = HostState::new("resize", 640, 480, None, false);
+        state.record_resize(PhysicalSize::new(0, 0));
+
+        assert!(matches!(
+            state.apply_pending_resize(|_, _| Err(ez_gfx::Error::NativeFailure)),
+            Err(Error::Graphics(ez_gfx::Error::NativeFailure))
+        ));
+    }
 
     #[test]
     fn publication_failure_exit_preserves_active_unwind() {

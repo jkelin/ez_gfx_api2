@@ -1094,7 +1094,13 @@ fn recycle_consumed_transients(
 ///
 /// Returns an error when the context is invalid or no completed readback is available.
 #[cfg_attr(feature = "ffi", doc(hidden))]
-#[cfg_attr(not(feature = "ffi"), allow(dead_code))]
+#[cfg_attr(
+    not(feature = "ffi"),
+    allow(
+        dead_code,
+        reason = "completed readbacks are consumed only by the FFI facade"
+    )
+)]
 pub fn frame_readbacks(context: ContextHandle) -> Result<Vec<Vec<u8>>> {
     with_context_mut(context, |context| {
         if context.last_readbacks.is_empty() {
