@@ -3,8 +3,9 @@
 use super::{
     CullMode, FrontFace, HalError, MTLCullMode, MTLIndexType, MTLPrimitiveType,
     MTLRenderCommandEncoder, MTLRenderStages, MTLResource, MTLResourceUsage, MTLTexture,
-    MTLWinding, MetalFrameEncoder, NativePipeline, PrimitiveTopology, ProtocolObject, c_void,
+    MTLWinding, MetalFrameEncoder, NativePipeline, PrimitiveTopology, ProtocolObject,
 };
+use ez_gfx_hal::COUNTER_BUFFER_ELEMENT_OFFSET;
 
 impl MetalFrameEncoder<'_> {
     pub(super) fn graphics(
@@ -115,15 +116,6 @@ impl MetalFrameEncoder<'_> {
                 if vertex_argument_encoder.is_none() && fragment_argument_encoder.is_none() => {}
             _ => return Err(HalError::InvalidArgument),
         }
-        if let Some(bytes) = core::ptr::NonNull::new(draw.push_constants.as_ptr() as *mut c_void)
-            && !draw.push_constants.is_empty()
-        {
-            // SAFETY: `bytes` points to the nonempty `draw.push_constants` storage for exactly `len()` bytes, and both `set*Bytes_length_atIndex` calls copy those bytes before that storage can be released.
-            unsafe {
-                encoder.setVertexBytes_length_atIndex(bytes, draw.push_constants.len(), 0);
-                encoder.setFragmentBytes_length_atIndex(bytes, draw.push_constants.len(), 0);
-            }
-        }
         let primitive = match draw.state.topology {
             PrimitiveTopology::TriangleList => MTLPrimitiveType::Triangle,
             PrimitiveTopology::PointList => MTLPrimitiveType::Point,
@@ -134,17 +126,21 @@ impl MetalFrameEncoder<'_> {
                 return Err(HalError::Unsupported);
             }
         };
+        let element_offset = usize::try_from(COUNTER_BUFFER_ELEMENT_OFFSET)
+            .map_err(|_| HalError::InvalidArgument)?;
         for command_index in 0..draw.draw_count {
-            // SAFETY: `NativeGraphicsDraw` supplies `draw_count` contiguous 20-byte indirect records and the referenced UInt32 index storage, so offsets `command_index * 20` and 0 are aligned and in bounds while `draw` holds both buffers.
+            // SAFETY: `NativeGraphicsDraw` supplies a four-byte count followed by
+            // padding to the shared element offset and `draw_count` contiguous
+            // 20-byte indirect records, while retaining both buffers.
             unsafe {
                 encoder.drawIndexedPrimitives_indexType_indexBuffer_indexBufferOffset_indirectBuffer_indirectBufferOffset(
-                                primitive,
-                                MTLIndexType::UInt32,
-                                &draw.index.buffer,
-                                0,
-                                &draw.indirect.buffer,
-                                command_index as usize * 20,
-                            );
+                    primitive,
+                    MTLIndexType::UInt32,
+                    &draw.index.buffer,
+                    0,
+                    &draw.indirect.buffer,
+                    element_offset + command_index as usize * 20,
+                );
             };
         }
 

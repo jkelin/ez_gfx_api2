@@ -44,18 +44,21 @@ pub use identity::*;
 pub use render_target::*;
 pub use texture::*;
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::{
+    collections::HashMap,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{LazyLock, Mutex},
+};
 
 use ez_gfx::raw::{
     ContextHandle, PublicBinding, RenderTargetHandle, ResourceIdentity, ShaderHandle,
     SurfaceHandle, TextureHandle,
 };
 use ez_gfx::{
-    Backend, ContextOptions, DrawIndexedCommand, DynamicPipelineState, SurfaceOptions,
-    SurfacePlatform, raw,
+    Backend, ContextOptions, DrawIndexedCommand, DynamicPipelineState, HeadlessSurfaceOptions, raw,
 };
-/// Identifies C ABI revision 34 for compatibility checks.
-pub const EZ_GFX_ABI_VERSION: u32 = 34;
+/// Identifies C ABI revision 36 for compatibility checks.
+pub const EZ_GFX_ABI_VERSION: u32 = 36;
 /// Caps any caller-provided byte range at 16 MiB.
 pub const EZ_GFX_MAX_BOUNDARY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -66,7 +69,7 @@ pub extern "C" fn ez_gfx_abi_version() -> u32 {
 }
 
 #[unsafe(no_mangle)]
-/// Creates a graphics context from debug, validation, and surface-platform options.
+/// Creates a graphics context from debug and validation options.
 ///
 /// # Safety
 ///
@@ -81,12 +84,9 @@ pub unsafe extern "C" fn ez_gfx_context_create(
         }
         // SAFETY: `desc` is non-null, and the caller keeps readable, properly aligned storage for one `EzGfxContextDesc` alive through this read.
         let desc = unsafe { desc.read() };
-        let Ok(options) = ContextOptions::new(
-            desc.enable_debug,
-            desc.enable_validation,
-            desc.surface_platform,
-        )
-        .map(|options| options.with_texture_decode_workers(desc.texture_decode_workers)) else {
+        let Ok(options) = ContextOptions::new(desc.enable_debug, desc.enable_validation)
+            .map(|options| options.with_texture_decode_workers(desc.texture_decode_workers))
+        else {
             return EzGfxResult::InvalidArgument;
         };
         let Ok(options) =
@@ -127,13 +127,10 @@ pub unsafe extern "C" fn ez_gfx_context_create_backend(
             3 => Backend::Metal,
             _ => return EzGfxResult::InvalidArgument,
         };
-        let Ok(options) = ContextOptions::new_for_backend(
-            desc.enable_debug,
-            desc.enable_validation,
-            desc.surface_platform,
-            backend,
-        )
-        .map(|options| options.with_texture_decode_workers(desc.texture_decode_workers)) else {
+        let Ok(options) =
+            ContextOptions::new_for_backend(desc.enable_debug, desc.enable_validation, backend)
+                .map(|options| options.with_texture_decode_workers(desc.texture_decode_workers))
+        else {
             return EzGfxResult::InvalidArgument;
         };
         let Ok(options) =
@@ -173,6 +170,7 @@ pub extern "C" fn ez_gfx_context_destroy(context: EzGfxContext) {
         let Ok(context) = ContextHandle::from_raw(context) else {
             return;
         };
+        clear_owner_binding_drafts(context);
         while frame::remove_owner_frame(context).is_some() {
             // A failing descendant abort cannot prevent invalidation or context teardown.
             let _ = catch_unwind(AssertUnwindSafe(|| raw::frame_abort(context)));
@@ -319,10 +317,15 @@ pub unsafe extern "C" fn ez_gfx_counter_buffer_acquire(
     out_buffer: *mut EzGfxCounterBuffer,
 ) -> EzGfxResult {
     catch_status(|| {
+        let byte_size = u64::from(element_size) * u64::from(element_count);
         if element_size == 0
             || element_count == 0
+            || usize::try_from(byte_size)
+                .ok()
+                .is_none_or(|size| size > EZ_GFX_MAX_BOUNDARY_BYTES)
             || out_buffer.is_null()
             || !out_buffer.is_aligned()
+            || debug_name_length > 255
             || validate_bounded_string(debug_name, debug_name_length).is_err()
         {
             return EzGfxResult::InvalidArgument;
@@ -410,36 +413,62 @@ pub extern "C" fn ez_gfx_counter_buffer_release(context: EzGfxContext, buffer: E
 }
 
 #[unsafe(no_mangle)]
-/// Records an indexed graphics pipeline operation with bindings, dynamic state, and push constants.
+/// Adds or replaces one named resource in the frame binding set.
 ///
 /// # Safety
 ///
-/// Non-null `bindings` must be readable for `binding_count` aligned entries; every binding name must be a non-null, non-empty exact UTF-8 byte range without embedded NUL bytes. Non-null `dynamic_state` must address one readable aligned value, and non-null `push_constants` must be readable for `push_constant_size` bytes.
-pub unsafe extern "C" fn ez_gfx_frame_add_vertex_pipeline(
+/// `binding` must address one readable, aligned value. Its name must be a
+/// non-empty UTF-8 byte range of at most 255 bytes with no embedded NUL.
+pub unsafe extern "C" fn ez_gfx_frame_bind(
+    context: EzGfxContext,
+    frame: EzGfxFrame,
+    binding: *const EzGfxBinding,
+) -> EzGfxResult {
+    catch_status(|| {
+        if binding.is_null() || !binding.is_aligned() {
+            return EzGfxResult::InvalidArgument;
+        }
+        // SAFETY: the validated pointer remains readable for one value through this read.
+        let binding = unsafe { binding.read() };
+        let (name, resource) = match validate_binding(frame, binding) {
+            Ok(binding) => binding,
+            Err(status) => return status,
+        };
+        let _ = try_frame!(context, frame);
+        let Ok(mut drafts) = FRAME_BINDINGS.lock() else {
+            return EzGfxResult::NativeFailure;
+        };
+        let draft = drafts.entry(frame).or_default();
+        // Replacement preserves the 16-name cap and leaves the prior resource unclaimed.
+        if !draft.contains_key(&name) && draft.len() == 16 {
+            return EzGfxResult::InvalidArgument;
+        }
+        draft.insert(name, resource);
+        EzGfxResult::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Executes an indexed graphics operation from the current frame bindings.
+///
+/// # Safety
+///
+/// Non-null `dynamic_state` must address one readable, aligned value.
+pub unsafe extern "C" fn ez_gfx_frame_execute_graphics(
     context: EzGfxContext,
     frame: EzGfxFrame,
     shader: EzGfxShader,
     buffer: EzGfxCounterBuffer,
-    bindings: *const EzGfxBinding,
-    binding_count: u32,
     dynamic_state: *const EzGfxDynamicState,
-    push_constants: *const std::ffi::c_void,
-    push_constant_size: u32,
 ) -> EzGfxResult {
     catch_status(|| {
-        if binding_count > 16
-            || binding_count != 0 && (bindings.is_null() || !bindings.is_aligned())
-            || !dynamic_state.is_null() && !dynamic_state.is_aligned()
-            || push_constant_size > 128
-            || !push_constant_size.is_multiple_of(4)
-            || push_constant_size != 0 && push_constants.is_null()
-        {
+        if !dynamic_state.is_null() && !dynamic_state.is_aligned() {
             return EzGfxResult::InvalidArgument;
         }
         let state = if dynamic_state.is_null() {
             [0, 0, 0, 0]
         } else {
-            // SAFETY: This branch establishes that `dynamic_state` is non-null, and the caller keeps readable, properly aligned storage for one `EzGfxDynamicState` alive through this read.
+            // SAFETY: the non-null pointer is aligned and remains readable through this read.
             let value = unsafe { dynamic_state.read() };
             [
                 value.cull_mode,
@@ -452,94 +481,49 @@ pub unsafe extern "C" fn ez_gfx_frame_add_vertex_pipeline(
         else {
             return EzGfxResult::InvalidArgument;
         };
-        let push = if push_constant_size == 0 {
-            &[][..]
-        } else {
-            // SAFETY: This branch has non-null `push_constants` and a checked nonzero size of at most 128 bytes; the caller keeps that alignment-1 byte range readable through graphics submission.
-            unsafe {
-                core::slice::from_raw_parts(
-                    push_constants.cast::<u8>(),
-                    push_constant_size as usize,
-                )
-            }
-        };
         if let Err(status) = buffer::validate(frame, buffer, buffer::Kind::Counter) {
             return status;
         }
-        let bindings = match validate_bindings(frame, bindings, binding_count) {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
         let context = try_frame!(context, frame);
         let shader = try_handle!(ShaderHandle, shader);
-        let bindings = match materialize_bindings(frame, bindings) {
-            Ok(value) => value,
+        let bindings = match materialized_bindings(frame) {
+            Ok(bindings) => bindings,
             Err(status) => return status,
         };
-        let indirect = match buffer::materialize(frame, buffer, buffer::Kind::Counter) {
-            Ok(ResourceIdentity::Indirect(handle)) => handle,
+        let counter = match buffer::materialize(frame, buffer, buffer::Kind::Counter) {
+            Ok(ResourceIdentity::Counter(handle)) => handle,
             Ok(_) => return EzGfxResult::InvalidContext,
             Err(status) => return status,
         };
-        raw::render_add_graphics(context, shader, indirect, &bindings, state, push)
-            .into_ffi_result()
+        raw::execute_graphics(context, shader, counter, &bindings, state).into_ffi_result()
     })
 }
 
 #[unsafe(no_mangle)]
-/// Records a compute dispatch with its shader, bindings, dimensions, and push constants.
-///
-/// # Safety
-///
-/// Non-null `bindings` must be readable for `binding_count` aligned entries; every binding name must be a non-null, non-empty exact UTF-8 byte range without embedded NUL bytes. Non-null `push_constants` must be readable for `push_constant_size` bytes.
-pub unsafe extern "C" fn ez_gfx_frame_add_compute_pipeline(
+/// Executes a compute dispatch from the current frame bindings.
+pub extern "C" fn ez_gfx_frame_execute_compute(
     context: EzGfxContext,
     frame: EzGfxFrame,
     shader: EzGfxShader,
     dispatch_x: u32,
     dispatch_y: u32,
     dispatch_z: u32,
-    bindings: *const EzGfxBinding,
-    binding_count: u32,
-    push_constants: *const std::ffi::c_void,
-    push_constant_size: u32,
 ) -> EzGfxResult {
     catch_status(|| {
-        if binding_count > 16
-            || binding_count != 0 && (bindings.is_null() || !bindings.is_aligned())
-            || push_constant_size > 128
-            || !push_constant_size.is_multiple_of(4)
-            || push_constant_size != 0 && push_constants.is_null()
-        {
+        if dispatch_x == 0 || dispatch_y == 0 || dispatch_z == 0 {
             return EzGfxResult::InvalidArgument;
         }
-        let push = if push_constant_size == 0 {
-            &[][..]
-        } else {
-            // SAFETY: This branch has non-null `push_constants` and a checked nonzero size of at most 128 bytes; the caller keeps that alignment-1 byte range readable through compute submission.
-            unsafe {
-                core::slice::from_raw_parts(
-                    push_constants.cast::<u8>(),
-                    push_constant_size as usize,
-                )
-            }
-        };
-        let bindings = match validate_bindings(frame, bindings, binding_count) {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
         let context = try_frame!(context, frame);
         let shader = try_handle!(ShaderHandle, shader);
-        let bindings = match materialize_bindings(frame, bindings) {
-            Ok(value) => value,
+        let bindings = match materialized_bindings(frame) {
+            Ok(bindings) => bindings,
             Err(status) => return status,
         };
-        raw::render_add_compute(
+        raw::execute_compute(
             context,
             shader,
             [dispatch_x, dispatch_y, dispatch_z],
             &bindings,
-            push,
         )
         .into_ffi_result()
     })
@@ -720,43 +704,73 @@ pub extern "C" fn ez_gfx_frame_abort(context: EzGfxContext, frame: EzGfxFrame) -
     })
 }
 #[unsafe(no_mangle)]
-/// Creates a Win32, GLFW, or Metal-layer presentation surface and returns its handle.
+/// Creates a native window presentation surface and returns its handle.
 ///
 /// # Safety
 ///
-/// A non-null `desc` must address one readable, aligned descriptor and non-null `out_surface` one writable, aligned handle. The descriptor's non-null platform objects must remain valid until the returned surface is destroyed.
-pub unsafe extern "C" fn ez_gfx_surface_create(
+/// A non-null `desc` must address one readable, aligned descriptor and
+/// `out_surface` one writable, aligned handle. Native objects must remain live
+/// until the returned surface is destroyed.
+pub unsafe extern "C" fn ez_gfx_surface_create_window(
     context: EzGfxContext,
-    desc: *const EzGfxSurfaceDesc,
+    desc: *const EzGfxWindowSurfaceDesc,
     out_surface: *mut EzGfxSurface,
 ) -> EzGfxResult {
     catch_status(|| {
         if desc.is_null() || out_surface.is_null() {
             return EzGfxResult::InvalidArgument;
         }
-        // SAFETY: `desc` is non-null, and the caller keeps readable, properly aligned storage for one `EzGfxSurfaceDesc` alive through this read.
+        // SAFETY: both pointers were validated and remain live through this call.
         let desc = unsafe { desc.read() };
-        let platform = match desc.platform {
-            0 => SurfacePlatform::Win32,
-            1 => SurfacePlatform::Glfw,
-            2 => SurfacePlatform::MetalLayer,
-            3 => SurfacePlatform::Headless,
+        let cache = match desc.cache_presented_snapshots {
+            0 => false,
+            1 => true,
             _ => return EzGfxResult::InvalidArgument,
         };
-        let Ok(options) = SurfaceOptions::new(
+        let context = try_handle!(ContextHandle, context);
+        match raw::create_surface_window_raw(
+            context,
             desc.window as usize,
             desc.display as usize,
-            platform,
-            desc.width,
-            desc.height,
-            desc.cache_presented_snapshots,
-        ) else {
+            cache,
+        ) {
+            Ok(handle) => {
+                // SAFETY: `out_surface` is non-null, aligned, and writable.
+                unsafe { out_surface.write(handle.into_raw()) };
+                EzGfxResult::Ok
+            }
+            Err(status) => status.into(),
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Creates a headless surface and returns its handle.
+///
+/// # Safety
+///
+/// A non-null `desc` must address one readable, aligned descriptor and
+/// `out_surface` one writable, aligned handle.
+pub unsafe extern "C" fn ez_gfx_surface_create_headless(
+    context: EzGfxContext,
+    desc: *const EzGfxHeadlessSurfaceDesc,
+    out_surface: *mut EzGfxSurface,
+) -> EzGfxResult {
+    catch_status(|| {
+        if desc.is_null() || out_surface.is_null() {
+            return EzGfxResult::InvalidArgument;
+        }
+        // SAFETY: both pointers were validated and remain live through this call.
+        let desc = unsafe { desc.read() };
+        let Ok(options) =
+            HeadlessSurfaceOptions::new(desc.width, desc.height, desc.cache_presented_snapshots)
+        else {
             return EzGfxResult::InvalidArgument;
         };
         let context = try_handle!(ContextHandle, context);
-        match raw::create_surface(context, options) {
+        match raw::create_surface_headless(context, options) {
             Ok(handle) => {
-                // SAFETY: `out_surface` is non-null, and the caller keeps writable, properly aligned storage for one `EzGfxSurface` alive through this write.
+                // SAFETY: `out_surface` is non-null, aligned, and writable.
                 unsafe { out_surface.write(handle.into_raw()) };
                 EzGfxResult::Ok
             }
@@ -772,11 +786,13 @@ pub extern "C" fn ez_gfx_context_init_device(
     surface: EzGfxSurface,
 ) -> EzGfxResult {
     catch_status(|| {
-        raw::init_device(
-            try_handle!(ContextHandle, context),
-            try_handle!(SurfaceHandle, surface),
-        )
-        .into_ffi_result()
+        let context = try_handle!(ContextHandle, context);
+        let surface = try_handle!(SurfaceHandle, surface);
+        let initialized = raw::init_device(context, surface);
+        #[cfg(any(windows, target_vendor = "apple"))]
+        let initialized =
+            initialized.and_then(|()| raw::sync_window_surface_extent(context, surface));
+        initialized.into_ffi_result()
     })
 }
 #[unsafe(no_mangle)]
@@ -931,97 +947,97 @@ fn catch_frame_terminal<T: IntoFfiResult>(
         }
         EzGfxResult::NativeFailure
     };
+    clear_binding_draft(frame_handle);
     buffer::clear_frame(frame_handle);
     result
 }
 
+#[derive(Clone, Copy)]
 enum ValidatedBindingResource {
     Buffer { handle: u64, kind: buffer::Kind },
     RenderTarget(RenderTargetHandle),
 }
 
-struct ValidatedBinding {
-    name: String,
-    resource: ValidatedBindingResource,
-}
+type FrameBindingDraft = HashMap<String, ValidatedBindingResource>;
+static FRAME_BINDINGS: LazyLock<Mutex<HashMap<EzGfxFrame, FrameBindingDraft>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Binding arrays are bounded and validated completely before any one-frame buffer is claimed.
-fn validate_bindings(
+/// Validates one foreign binding completely before it can enter a frame draft.
+fn validate_binding(
     frame: EzGfxFrame,
-    pointer: *const EzGfxBinding,
-    count: u32,
-) -> Result<Vec<ValidatedBinding>, EzGfxResult> {
-    if count == 0 {
-        return Ok(Vec::new());
-    }
-    if pointer.is_null() || count > 16 {
+    binding: EzGfxBinding,
+) -> Result<(String, ValidatedBindingResource), EzGfxResult> {
+    if binding.name_length > 255 {
         return Err(EzGfxResult::InvalidArgument);
     }
-    // SAFETY: `count` is checked in `1..=16`; the caller keeps `pointer` readable and aligned for that many `EzGfxBinding` values through binding conversion.
-    let raw = unsafe { core::slice::from_raw_parts(pointer, count as usize) };
-    let mut validated = Vec::with_capacity(raw.len());
-    for binding in raw {
-        let name = read_bounded_string(binding.name, binding.name_length)?;
-        let resource = match (
-            binding.buffer != 0,
-            binding.counter_buffer != 0,
-            binding.render_target != 0,
-        ) {
-            (true, false, false) => ValidatedBindingResource::Buffer {
-                handle: binding.buffer,
-                kind: buffer::Kind::Structured,
-            },
-            (false, true, false) => ValidatedBindingResource::Buffer {
-                handle: binding.counter_buffer,
-                kind: buffer::Kind::Counter,
-            },
-            (false, false, true) => {
-                let target = RenderTargetHandle::from_raw(binding.render_target)
-                    .map_err(|_| EzGfxResult::InvalidContext)?;
-                ValidatedBindingResource::RenderTarget(target)
-            }
-            _ => return Err(EzGfxResult::InvalidArgument),
-        };
-        validated.push(ValidatedBinding { name, resource });
-    }
-    // Validate every caller-owned name and resource shape before consulting frame
-    // state, so malformed foreign memory fails at the boundary deterministically.
+    let name = read_bounded_string(binding.name, binding.name_length)?;
+    let resource = match (
+        binding.buffer != 0,
+        binding.counter_buffer != 0,
+        binding.render_target != 0,
+    ) {
+        (true, false, false) => ValidatedBindingResource::Buffer {
+            handle: binding.buffer,
+            kind: buffer::Kind::Buffer,
+        },
+        (false, true, false) => ValidatedBindingResource::Buffer {
+            handle: binding.counter_buffer,
+            kind: buffer::Kind::Counter,
+        },
+        (false, false, true) => {
+            let target = RenderTargetHandle::from_raw(binding.render_target)
+                .map_err(|_| EzGfxResult::InvalidContext)?;
+            ValidatedBindingResource::RenderTarget(target)
+        }
+        _ => return Err(EzGfxResult::InvalidArgument),
+    };
     let frame_entry = frame::get(frame)?;
-    for binding in &validated {
-        match binding.resource {
-            ValidatedBindingResource::Buffer { handle, kind } => {
-                buffer::validate(frame, handle, kind)?;
-            }
-            ValidatedBindingResource::RenderTarget(target) => {
-                raw::render_target_extent(frame_entry.owner, target).map_err(EzGfxResult::from)?;
-            }
+    match resource {
+        ValidatedBindingResource::Buffer { handle, kind } => {
+            buffer::validate(frame, handle, kind)?;
+        }
+        ValidatedBindingResource::RenderTarget(target) => {
+            raw::render_target_extent(frame_entry.owner, target).map_err(EzGfxResult::from)?;
         }
     }
-
-    Ok(validated)
+    Ok((name, resource))
 }
 
-fn materialize_bindings(
-    frame: EzGfxFrame,
-    validated: Vec<ValidatedBinding>,
-) -> Result<Vec<PublicBinding>, EzGfxResult> {
-    validated
-        .into_iter()
-        .map(|binding| {
-            let resource = match binding.resource {
-                ValidatedBindingResource::Buffer { handle, kind } => {
-                    buffer::materialize(frame, handle, kind)?
-                }
-                ValidatedBindingResource::RenderTarget(target) => {
-                    ResourceIdentity::RenderTarget(target)
-                }
-            };
-            Ok(PublicBinding {
-                name: binding.name,
-                resource,
-            })
-        })
-        .collect()
+fn materialized_bindings(frame: EzGfxFrame) -> Result<Vec<PublicBinding>, EzGfxResult> {
+    let drafts = FRAME_BINDINGS
+        .lock()
+        .map_err(|_| EzGfxResult::NativeFailure)?;
+    let Some(draft) = drafts.get(&frame) else {
+        return Ok(Vec::new());
+    };
+    let mut bindings = Vec::with_capacity(draft.len());
+    for (name, binding) in draft {
+        let resource = match *binding {
+            ValidatedBindingResource::Buffer { handle, kind } => {
+                buffer::materialize(frame, handle, kind)?
+            }
+            ValidatedBindingResource::RenderTarget(target) => {
+                ResourceIdentity::RenderTarget(target)
+            }
+        };
+        bindings.push(PublicBinding {
+            name: name.clone(),
+            resource,
+        });
+    }
+    Ok(bindings)
+}
+
+fn clear_binding_draft(frame: EzGfxFrame) {
+    if let Ok(mut drafts) = FRAME_BINDINGS.lock() {
+        drafts.remove(&frame);
+    }
+}
+
+fn clear_owner_binding_drafts(owner: ContextHandle) {
+    if let Ok(mut drafts) = FRAME_BINDINGS.lock() {
+        drafts.retain(|frame, _| frame::get(*frame).is_ok_and(|entry| entry.owner != owner));
+    }
 }
 
 fn catch_void(operation: impl FnOnce()) {

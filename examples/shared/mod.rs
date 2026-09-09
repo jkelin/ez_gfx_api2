@@ -27,7 +27,7 @@ pub use example::{Example, WindowFrame};
     unused_imports,
     reason = "Standalone examples use different shared interfaces."
 )]
-pub use host::{BackendConfig, HostSurface, NativePlatform, NativeSurface, backend_config, clip_y};
+pub use host::{BackendConfig, backend_config, clip_y};
 #[allow(
     unused_imports,
     reason = "Standalone examples use different shared interfaces."

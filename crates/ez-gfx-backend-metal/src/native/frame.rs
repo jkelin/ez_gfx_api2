@@ -8,8 +8,9 @@ use super::{
     MTLResource, MTLResourceOptions, MTLResourceUsage, MTLSize, MTLStoreAction, MTLTexture,
     MTLWinding, MemoryAllocator, MemoryClass, NativeAllocation, NativeContext, NativeFrameAction,
     NativeFrameResource, NativeGraphicsDraw, NativePipeline, NativeSurface, NativeTexture,
-    PrimitiveTopology, ProtocolObject, QueueKind, ThreadBound, c_void, map_allocation_hal,
+    PrimitiveTopology, ProtocolObject, QueueKind, ThreadBound, map_allocation_hal,
 };
+use ez_gfx_hal::COUNTER_BUFFER_ELEMENT_OFFSET;
 
 type MetalDrawable = super::Retained<ProtocolObject<dyn CAMetalDrawable>>;
 
@@ -30,7 +31,9 @@ fn draw_ranges_fit(
     indirect_logical_size: u64,
     draw_count: u32,
 ) -> bool {
-    let required_indirect = u64::from(draw_count).checked_mul(20);
+    let required_indirect = u64::from(draw_count)
+        .checked_mul(20)
+        .and_then(|size| size.checked_add(COUNTER_BUFFER_ELEMENT_OFFSET));
     index_logical_size != 0
         && index_logical_size <= index_physical_size
         && indirect_logical_size <= indirect_physical_size
@@ -218,8 +221,6 @@ impl MetalFrameEncoder<'_> {
         if self.render_encoder.is_some()
             || dispatch.groups.contains(&0)
             || dispatch.threads_per_group.contains(&0)
-            || dispatch.push_constants.len() > 128
-            || !dispatch.push_constants.len().is_multiple_of(4)
         {
             return Err(HalError::InvalidArgument);
         }
@@ -270,15 +271,6 @@ impl MetalFrameEncoder<'_> {
             }
             (None, None, None) => {}
             _ => return Err(HalError::InvalidArgument),
-        }
-        if let Some(bytes) =
-            core::ptr::NonNull::new(dispatch.push_constants.as_ptr() as *mut c_void)
-            && !dispatch.push_constants.is_empty()
-        {
-            // SAFETY: `bytes` points to the nonempty `dispatch.push_constants` storage for exactly `len()` bytes, and `setBytes_length_atIndex` copies those bytes before that storage can be released.
-            unsafe {
-                encoder.setBytes_length_atIndex(bytes, dispatch.push_constants.len(), 0);
-            };
         }
         encoder.dispatchThreadgroups_threadsPerThreadgroup(
             metal_size(dispatch.groups),
@@ -408,8 +400,6 @@ impl NativeContext {
         argument_index: usize,
     ) -> Result<Option<usize>, HalError> {
         if draw.draw_count == 0
-            || draw.push_constants.len() > 128
-            || !draw.push_constants.len().is_multiple_of(4)
             || draw.state.topology == PrimitiveTopology::TriangleFan
             || !draw_ranges_fit(
                 draw.index.allocation.size(),
@@ -484,8 +474,6 @@ impl NativeContext {
         if dispatch.groups.contains(&0)
             || dispatch.threads_per_group.contains(&0)
             || thread_count.is_none_or(|count| count > state.maxTotalThreadsPerThreadgroup() as u64)
-            || dispatch.push_constants.len() > 128
-            || !dispatch.push_constants.len().is_multiple_of(4)
             || dispatch
                 .bindings
                 .iter()
@@ -1091,7 +1079,7 @@ impl NativeContext {
 #[cfg(test)]
 mod tests {
     use super::{NativeContext, buffer_range_fits, draw_ranges_fit, metal_size};
-    use ez_gfx_hal::BufferRange;
+    use ez_gfx_hal::{BufferRange, COUNTER_BUFFER_ELEMENT_OFFSET};
 
     #[test]
     fn buffer_barrier_range_must_fit_allocation() {
@@ -1107,12 +1095,13 @@ mod tests {
     }
 
     #[test]
-    fn indexed_indirect_logical_ranges_bound_native_reads() {
-        assert!(draw_ranges_fit(64, 64, 40, 40, 2));
-        assert!(!draw_ranges_fit(64, 0, 40, 40, 2));
-        assert!(!draw_ranges_fit(64, 65, 40, 40, 2));
-        assert!(!draw_ranges_fit(64, 64, 40, 39, 2));
-        assert!(!draw_ranges_fit(64, 64, 39, 40, 2));
+    fn indexed_indirect_logical_ranges_include_aligned_element_offset() {
+        let required = COUNTER_BUFFER_ELEMENT_OFFSET + 40;
+        assert!(draw_ranges_fit(64, 64, required, required, 2));
+        assert!(!draw_ranges_fit(64, 0, required, required, 2));
+        assert!(!draw_ranges_fit(64, 65, required, required, 2));
+        assert!(!draw_ranges_fit(64, 64, required, required - 1, 2));
+        assert!(!draw_ranges_fit(64, 64, required - 1, required, 2));
     }
 
     #[test]

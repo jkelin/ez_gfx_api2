@@ -5,6 +5,11 @@ use core::fmt;
 use ez_gfx_core::capability::{AdapterInfo, MAX_BINDLESS_SAMPLED_TEXTURES};
 
 const ALLOCATION_BLOCK_ALIGNMENT: u64 = 4 * 1024 * 1024;
+/// Portable byte offset of the element array in a counter buffer.
+///
+/// The count occupies the first four bytes; the gap keeps the element descriptor
+/// aligned for every supported storage-buffer backend.
+pub const COUNTER_BUFFER_ELEMENT_OFFSET: u64 = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Initial and maximum allocator block sizes for device-local and host-visible memory.

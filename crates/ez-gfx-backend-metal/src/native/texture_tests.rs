@@ -121,12 +121,12 @@ fn sampling_pipeline(context: &NativeContext) -> SamplingPipeline {
     std::fs::write(
         &source,
         r#"[__AttributeUsage(_AttributeTargets.Var)]
-struct StructuredBufferAttribute { string name; };
+struct BufferAttribute { string name; };
 [__AttributeUsage(_AttributeTargets.Var)]
 struct BindlessTextureHeapAttribute { int capacity; };
 struct TextureEntry { Texture2D<float4> texture; SamplerState sampler; };
 struct TextureHeap { TextureEntry entries[1024]; };
-[StructuredBuffer("values")]
+[Buffer("values")]
 RWStructuredBuffer<uint> values;
 [BindlessTextureHeap(1024)]
 ParameterBlock<TextureHeap> texture_heap;
@@ -207,7 +207,6 @@ fn enqueue_sample(
         pipeline: &pipeline.pipeline,
         groups: [1, 1, 1],
         threads_per_group: pipeline.threads,
-        push_constants: &[],
         bindings: std::slice::from_ref(&binding),
         texture_heap: Some(pipeline.heap),
         textures: &textures,
@@ -913,5 +912,200 @@ fn render_target_msaa_clear_resolves_into_sampled_texture() {
         assert_eq!(pixel, [255, 255, 0, 255]);
     }
     context.destroy_texture(target).unwrap();
+    context.wait_idle().unwrap();
+}
+
+#[test]
+fn zeroed_counter_tail_matches_single_counted_draw_pixels() {
+    use ez_gfx_hal::{
+        AttachmentLoadOp, AttachmentStoreOp, BufferRange, COUNTER_BUFFER_ELEMENT_OFFSET,
+        DynamicPipelineState, ExecutionBarrier, ExecutionPass, ExecutionRange, ImageSubresources,
+        QueueKind, ResourceAccess, ResourceState, ShaderStage,
+    };
+    use ez_gfx_runtime::target::Format;
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("counter_pixels.slang");
+    std::fs::write(
+        &source,
+        r#"[shader("vertex")]
+float4 vertexmain(uint vertex_id : SV_VertexID) : SV_Position {
+    float2 positions[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+    return float4(positions[vertex_id], 0.5, 1.0);
+}
+[shader("fragment")]
+float4 fragmentmain() : SV_Target {
+    return float4(1.0, 0.0, 0.0, 1.0);
+}
+"#,
+    )
+    .unwrap();
+    let artifact = compile_shader(&source, &[Target::Metal], false).unwrap();
+    let runtime =
+        RuntimeShader::load(&artifact, ez_gfx_core::Backend::Metal, SemanticProfile::V1).unwrap();
+    let products = runtime
+        .products()
+        .map(|(_, bytes)| bytes)
+        .collect::<Vec<_>>();
+    let (vertex, fragment) = runtime.graphics_pair().unwrap();
+    let graphics = (
+        vertex.0,
+        vertex.2.to_owned(),
+        fragment.0,
+        fragment.2.to_owned(),
+    );
+    let mut context = NativeContext::create_default().unwrap();
+    let shader = context.create_shader(&products).unwrap();
+    let pipeline = context
+        .create_graphics_pipeline(
+            &shader,
+            &graphics,
+            DynamicPipelineState::from_abi(0, 0, 0, 0).unwrap(),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+    let target = context
+        .create_render_target(Format::Rgba8Unorm, 64, 64, 31, 1)
+        .unwrap();
+    let mut index = context
+        .allocate(AllocationRequest::new(12, 4, MemoryClass::Upload, true, None).unwrap())
+        .unwrap();
+    for (slot, value) in [0_u32, 1, 2].into_iter().enumerate() {
+        context.mapped_slice_mut(&mut index).unwrap()[slot * 4..slot * 4 + 4]
+            .copy_from_slice(&value.to_le_bytes());
+    }
+    context.flush(&mut index, 0, 12).unwrap();
+
+    let render = |context: &mut NativeContext, capacity: u32| {
+        let indirect_size = COUNTER_BUFFER_ELEMENT_OFFSET + u64::from(capacity) * 20;
+        let mut indirect = context
+            .allocate(
+                AllocationRequest::new(indirect_size, 4, MemoryClass::Upload, true, None).unwrap(),
+            )
+            .unwrap();
+        let bytes = context.mapped_slice_mut(&mut indirect).unwrap();
+        bytes.fill(0);
+        bytes[..4].copy_from_slice(&1_u32.to_le_bytes());
+        let offset = COUNTER_BUFFER_ELEMENT_OFFSET as usize;
+        for (slot, value) in [3_u32, 1, 0, 0, 0].into_iter().enumerate() {
+            bytes[offset + slot * 4..offset + slot * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        context.flush(&mut indirect, 0, indirect_size).unwrap();
+
+        let attach = ResourceState::new(
+            QueueKind::Graphics,
+            ShaderStage::AllGraphics,
+            ResourceAccess::ColorAttachmentWrite,
+        )
+        .unwrap();
+        let sampled = ResourceState::new(
+            QueueKind::Graphics,
+            ShaderStage::Fragment,
+            ResourceAccess::SampledRead,
+        )
+        .unwrap();
+        let pass = ExecutionPass {
+            nodes: vec![0],
+            colors: vec![0],
+            depth: None,
+            area: [0, 0, 64, 64],
+            samples: 1,
+            load: AttachmentLoadOp::Clear,
+            store: AttachmentStoreOp::Store,
+        };
+        let image_range = ExecutionRange::Image(ImageSubresources::new(0, 1, 0, 1).unwrap());
+        let draw = NativeGraphicsDraw {
+            pipeline: &pipeline,
+            depth_required: false,
+            texture_heap: None,
+            state: DynamicPipelineState::from_abi(0, 0, 0, 0).unwrap(),
+            index: &index,
+            index_size: 12,
+            indirect: &indirect,
+            indirect_size,
+            draw_count: capacity,
+            bindings: &[],
+            textures: &[],
+        };
+        let actions = vec![
+            NativeFrameAction::Barrier {
+                barrier: ExecutionBarrier {
+                    node: 0,
+                    resource: 0,
+                    range: image_range,
+                    before: None,
+                    after: attach,
+                },
+                resource: NativeFrameResource::RenderTarget(&target),
+            },
+            NativeFrameAction::Barrier {
+                barrier: ExecutionBarrier {
+                    node: 0,
+                    resource: 1,
+                    range: ExecutionRange::Buffer(BufferRange::new(0, 12).unwrap()),
+                    before: None,
+                    after: ResourceState::new(
+                        QueueKind::Graphics,
+                        ShaderStage::Vertex,
+                        ResourceAccess::IndexRead,
+                    )
+                    .unwrap(),
+                },
+                resource: NativeFrameResource::Buffer(&index),
+            },
+            NativeFrameAction::Barrier {
+                barrier: ExecutionBarrier {
+                    node: 0,
+                    resource: 2,
+                    range: ExecutionRange::Buffer(BufferRange::new(0, indirect_size).unwrap()),
+                    before: None,
+                    after: ResourceState::new(
+                        QueueKind::Graphics,
+                        ShaderStage::Vertex,
+                        ResourceAccess::IndirectRead,
+                    )
+                    .unwrap(),
+                },
+                resource: NativeFrameResource::Buffer(&indirect),
+            },
+            NativeFrameAction::BeginPass {
+                pass: &pass,
+                colors: vec![PassAttachment {
+                    resource: NativeFrameResource::RenderTarget(&target),
+                    clear: [0.0, 0.0, 0.0, 1.0],
+                }],
+            },
+            NativeFrameAction::Graphics(draw),
+            NativeFrameAction::EndPass,
+            NativeFrameAction::Barrier {
+                barrier: ExecutionBarrier {
+                    node: 0,
+                    resource: 0,
+                    range: image_range,
+                    before: Some(attach),
+                    after: sampled,
+                },
+                resource: NativeFrameResource::RenderTarget(&target),
+            },
+        ];
+        context.execute_frame(None, &actions, false).unwrap();
+        let pixels = context.readback_texture_rgba8(&target, 64, 64).unwrap();
+        context.free(indirect).unwrap();
+        pixels
+    };
+
+    let single = render(&mut context, 1);
+    let padded = render(&mut context, 4);
+    assert_eq!(padded, single);
+    for pixel in padded.chunks_exact(4) {
+        assert_eq!(pixel, RED);
+    }
+
+    context.free(index).unwrap();
+    context.destroy_texture(target).unwrap();
+    context.destroy_pipeline(pipeline);
+    context.destroy_shader(shader);
     context.wait_idle().unwrap();
 }

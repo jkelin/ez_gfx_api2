@@ -1,9 +1,8 @@
 use super::*;
 use crate::state::{
-    Backend, ContextOptions, DrawIndexedCommand, Error, LifecycleError, acquire_indirect,
-    acquire_structured_sized, create_context, destroy_context, frame_begin, frame_submit,
-    publish_compute_indirect_count, release_indirect, release_structured, write_indirect,
-    write_structured_bytes,
+    Backend, ContextOptions, DrawIndexedCommand, Error, LifecycleError, acquire_buffer_sized,
+    acquire_counter, create_context, destroy_context, frame_begin, frame_submit, release_buffer,
+    release_counter, write_buffer_bytes, write_counter_commands,
 };
 
 fn test_context() -> Option<ContextHandle> {
@@ -14,14 +13,7 @@ fn test_context() -> Option<ContextHandle> {
     #[cfg(not(any(windows, target_vendor = "apple")))]
     let backend = Backend::Vulkan;
 
-    #[cfg(windows)]
-    let platform = 0;
-    #[cfg(target_vendor = "apple")]
-    let platform = 2;
-    #[cfg(not(any(windows, target_vendor = "apple")))]
-    // Linux Vulkan tests require the headless surface platform even without presentation.
-    let platform = 3;
-    let options = ContextOptions::new_for_backend(0, 0, platform, backend).unwrap();
+    let options = ContextOptions::new_for_backend(0, 0, backend).unwrap();
     let context = match create_context(options) {
         Ok(context) => context,
         // Optional hosted runners may expose no usable native device.
@@ -32,16 +24,8 @@ fn test_context() -> Option<ContextHandle> {
     #[cfg(not(any(windows, target_vendor = "apple")))]
     {
         // Vulkan initializes its device from a surface; a headless surface keeps this test hidden.
-        let options = crate::state::SurfaceOptions::new(
-            0,
-            0,
-            crate::state::SurfacePlatform::Headless,
-            1,
-            1,
-            0,
-        )
-        .unwrap();
-        let surface = match crate::state::create_surface(context, options) {
+        let options = crate::state::HeadlessSurfaceOptions::new(1, 1, 0).unwrap();
+        let surface = match crate::state::create_surface_headless(context, options) {
             Ok(surface) => surface,
             Err(Error::Unsupported) => {
                 destroy_context(context).unwrap();
@@ -77,16 +61,16 @@ fn successful_submission_retires_handles_and_same_frame_reuse_stays_interned() {
         return;
     };
     frame_begin(context).unwrap();
-    let structured = acquire_structured_sized(context, 4, 4).unwrap();
-    let indirect = acquire_indirect(context, 1).unwrap();
-    write_structured_bytes(
+    let structured = acquire_buffer_sized(context, 4, 4).unwrap();
+    let indirect = acquire_counter(context, 1).unwrap();
+    write_buffer_bytes(
         context,
         structured,
         4,
         bytemuck::cast_slice(&[1_u32, 2, 3, 4]),
     )
     .unwrap();
-    write_indirect(context, indirect, 0, &[draw()]).unwrap();
+    write_counter_commands(context, indirect, 0, &[draw()]).unwrap();
 
     with_context_mut(context, |state| {
         mark_transient_interned(state, structured.packed())?;
@@ -98,19 +82,15 @@ fn successful_submission_retires_handles_and_same_frame_reuse_stays_interned() {
     .unwrap();
 
     assert_eq!(
-        write_structured_bytes(context, structured, 4, bytemuck::cast_slice(&[9_u32])),
+        write_buffer_bytes(context, structured, 4, bytemuck::cast_slice(&[9_u32])),
         Err(Error::NotReady)
     );
     assert_eq!(
-        write_indirect(context, indirect, 0, &[draw()]),
+        write_counter_commands(context, indirect, 0, &[draw()]),
         Err(Error::NotReady)
     );
-    release_structured(context, structured);
-    release_indirect(context, indirect);
-    assert_eq!(
-        publish_compute_indirect_count(context, indirect, 1),
-        Err(Error::NotReady)
-    );
+    release_buffer(context, structured);
+    release_counter(context, indirect);
 
     // This is the exact post-finish transition used only after native submission succeeds;
     // hidden renderer smokes cover the preceding backend execution.
@@ -121,39 +101,39 @@ fn successful_submission_retires_handles_and_same_frame_reuse_stays_interned() {
         // Pending completion keeps both allocations pooled but unavailable.
         assert_eq!(
             state
-                .structured_pool
+                .buffer_pool
                 .get(&4)
                 .map(ez_gfx_hal::ReusableStagingPool::len),
             Some(1)
         );
-        assert_eq!(state.indirect_pool.len(), 1);
+        assert_eq!(state.counter_pool.len(), 1);
         Ok(())
     })
     .unwrap();
     assert_eq!(
-        write_structured_bytes(context, structured, 4, bytemuck::cast_slice(&[9_u32])),
+        write_buffer_bytes(context, structured, 4, bytemuck::cast_slice(&[9_u32])),
         Err(Error::Lifecycle(LifecycleError::StaleHandle))
     );
     assert_eq!(
-        write_indirect(context, indirect, 0, &[draw()]),
+        write_counter_commands(context, indirect, 0, &[draw()]),
         Err(Error::Lifecycle(LifecycleError::StaleHandle))
     );
 
     frame_begin(context).unwrap();
-    let fresh_structured = acquire_structured_sized(context, 4, 4).unwrap();
-    let fresh_indirect = acquire_indirect(context, 1).unwrap();
+    let fresh_structured = acquire_buffer_sized(context, 4, 4).unwrap();
+    let fresh_indirect = acquire_counter(context, 1).unwrap();
     assert_ne!(fresh_structured, structured);
     assert_ne!(fresh_indirect, indirect);
     with_context_mut(context, |state| {
         // The future completion token prevents premature native allocation reuse.
         assert_eq!(
             state
-                .structured_pool
+                .buffer_pool
                 .get(&4)
                 .map(ez_gfx_hal::ReusableStagingPool::len),
             Some(1)
         );
-        assert_eq!(state.indirect_pool.len(), 1);
+        assert_eq!(state.counter_pool.len(), 1);
         Ok(())
     })
     .unwrap();
@@ -166,7 +146,7 @@ fn submission_failure_restores_safe_handles_and_quarantines_unsafe_handles() {
         return;
     };
     frame_begin(context).unwrap();
-    let safe = acquire_structured_sized(context, 4, 1).unwrap();
+    let safe = acquire_buffer_sized(context, 4, 1).unwrap();
     with_context_mut(context, |state| {
         mark_transient_interned(state, safe.packed())?;
         state.frame.abort();
@@ -175,29 +155,29 @@ fn submission_failure_restores_safe_handles_and_quarantines_unsafe_handles() {
     .unwrap();
 
     assert_eq!(frame_submit(context), Err(Error::NotReady));
-    release_structured(context, safe);
+    release_buffer(context, safe);
     assert_eq!(
-        write_structured_bytes(context, safe, 4, bytemuck::cast_slice(&[1_u32])),
+        write_buffer_bytes(context, safe, 4, bytemuck::cast_slice(&[1_u32])),
         Err(Error::Lifecycle(LifecycleError::StaleHandle))
     );
 
     frame_begin(context).unwrap();
-    let unsafe_handle = acquire_indirect(context, 1).unwrap();
+    let unsafe_handle = acquire_counter(context, 1).unwrap();
     // Backends expose no safe post-submit failure injector. Exercise the exact
     // failure branch and assert its public stale-handle and quarantine contract.
     with_context_mut(context, |state| {
         mark_transient_interned(state, unsafe_handle.packed())?;
         invalidate_unsafe_transients(state);
         assert!(state.allocations.contains_key(&unsafe_handle.packed()));
-        assert!(state.indirect_pool.is_empty());
+        assert!(state.counter_pool.is_empty());
         Ok(())
     })
     .unwrap();
     assert_eq!(
-        write_indirect(context, unsafe_handle, 0, &[draw()]),
+        write_counter_commands(context, unsafe_handle, 0, &[draw()]),
         Err(Error::Lifecycle(LifecycleError::StaleHandle))
     );
-    let fresh = acquire_indirect(context, 1).unwrap();
+    let fresh = acquire_counter(context, 1).unwrap();
     assert_ne!(fresh, unsafe_handle);
     assert_eq!(destroy_context(context), Ok(()));
 }

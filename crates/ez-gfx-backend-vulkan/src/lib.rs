@@ -103,17 +103,6 @@ fn sampler_create_info(desc: TextureSamplerDesc, mip_count: u32) -> vk::SamplerC
         .max_lod(f32::from(u16::try_from(mip_count).unwrap_or(u16::MAX)))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Host window system accepted when creating a Vulkan context.
-pub enum SurfacePlatform {
-    /// A Win32 window and application instance.
-    Win32,
-    /// A GLFW window; GLFW supplies the platform-specific Vulkan extensions and surface.
-    Glfw,
-    /// A logical surfaceless target; no WSI extension or native surface is required.
-    Headless,
-}
-
 /// Borrowed Vulkan presentation surface and optional captured frame.
 pub struct NativeSurface {
     handle: vk::SurfaceKHR,
@@ -182,8 +171,6 @@ pub struct NativeDrawIndexed<'a> {
     pub indirect_buffer: &'a NativeAllocation,
     /// Number of indirect commands to execute.
     pub draw_count: u32,
-    /// Raw push-constant payload, limited by frame validation.
-    pub push_constants: &'a [u8],
     /// Reflected public buffer bindings.
     pub bindings: &'a [NativeBufferBinding<'a>],
 }
@@ -194,8 +181,6 @@ pub struct NativeComputeDispatch<'a> {
     pub pipeline: &'a NativePipeline,
     /// Workgroup count for each dispatch dimension.
     pub groups: [u32; 3],
-    /// Raw push-constant payload.
-    pub push_constants: &'a [u8],
     /// Reflected public buffer bindings.
     pub bindings: &'a [NativeBufferBinding<'a>],
 }

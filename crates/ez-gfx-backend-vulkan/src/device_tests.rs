@@ -10,6 +10,29 @@ fn family(flags: vk::QueueFlags, count: u32) -> vk::QueueFamilyProperties {
 }
 
 #[test]
+fn draw_admission_requires_indirect_count_and_core_draw_features() {
+    let supported = vk::PhysicalDeviceVulkan12Features {
+        draw_indirect_count: vk::TRUE,
+        ..Default::default()
+    };
+    assert_eq!(draw_feature_rejection(true, true, &supported), None);
+    assert_eq!(
+        draw_feature_rejection(false, true, &supported),
+        Some("vertex_pipeline_stores_and_atomics")
+    );
+    assert_eq!(
+        draw_feature_rejection(true, false, &supported),
+        Some("multi_draw_indirect")
+    );
+
+    let missing_count = vk::PhysicalDeviceVulkan12Features::default();
+    assert_eq!(
+        draw_feature_rejection(true, true, &missing_count),
+        Some("draw_indirect_count")
+    );
+}
+
+#[test]
 fn transfer_family_prefers_non_graphics_hardware_queue() {
     let families = [
         family(vk::QueueFlags::GRAPHICS | vk::QueueFlags::TRANSFER, 2),
@@ -46,13 +69,7 @@ fn enumeration_reports_unique_named_adapters() {
 #[test]
 fn explicit_selection_rejects_unknown_identity() {
     // No surface is created, shown, or activated by this test.
-    // Win32 instances need a Win32 loader; every other host probes headless.
-    let platform = if cfg!(windows) {
-        SurfacePlatform::Win32
-    } else {
-        SurfacePlatform::Headless
-    };
-    let mut context = NativeContext::create(false, false, platform).expect("Vulkan instance");
+    let mut context = NativeContext::create(false, false).expect("Vulkan instance");
     assert_eq!(
         context.init_device_for_adapter(None, [0xA5; 16], false),
         Err(HalError::InvalidArgument)
@@ -62,15 +79,9 @@ fn explicit_selection_rejects_unknown_identity() {
 #[test]
 fn explicit_selection_admits_enumerated_adapter() {
     // No surface is created, shown, or activated by this test.
-    // Win32 instances need a Win32 loader; every other host probes headless.
-    let platform = if cfg!(windows) {
-        SurfacePlatform::Win32
-    } else {
-        SurfacePlatform::Headless
-    };
     let adapters = NativeContext::enumerate_adapters().expect("Vulkan enumerates adapters");
     let wanted = adapters.first().expect("at least one adapter").stable_id();
-    let mut context = NativeContext::create(false, false, platform).expect("Vulkan instance");
+    let mut context = NativeContext::create(false, false).expect("Vulkan instance");
     let admitted = context
         .init_device_for_adapter(None, wanted, true)
         .expect("enumerated adapter initializes");

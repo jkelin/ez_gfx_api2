@@ -1,6 +1,6 @@
 import "../../ez_gfx_api";
 
-struct Push {
+struct UiParams {
     float2 display_size;
     float vertical_sign;
     float padding;
@@ -23,8 +23,8 @@ struct ImGuiCommand {
     uint pad;
 };
 
-[push_constant]
-ConstantBuffer<Push> push;
+[Buffer("params")]
+StructuredBuffer<UiParams> params;
 
 [VertexHeap("imgui_vertices")]
 StructuredBuffer<ImGuiVertex> vertices;
@@ -33,7 +33,7 @@ StructuredBuffer<ImGuiVertex> vertices;
 StructuredBuffer<uint> indices;
 
 
-[StructuredBuffer("imgui_commands")]
+[Buffer("imgui_commands")]
 StructuredBuffer<ImGuiCommand> commands;
 
 [BindlessTextureHeap(EZ_GFX_MAX_TEXTURES)]
@@ -56,8 +56,8 @@ VertexOutput vertexmain(uint vertex_index : SV_VertexID, uint instance_index : S
 
     VertexOutput output;
     output.position = float4(
-        (vertex.pos.x / push.display_size.x) * 2.0 - 1.0,
-        ((vertex.pos.y / push.display_size.y) * 2.0 - 1.0) * push.vertical_sign,
+        (vertex.pos.x / params[0].display_size.x) * 2.0 - 1.0,
+        ((vertex.pos.y / params[0].display_size.y) * 2.0 - 1.0) * params[0].vertical_sign,
         0.0,
         1.0);
     output.screen_pos = vertex.pos;

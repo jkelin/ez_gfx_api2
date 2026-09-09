@@ -10,32 +10,30 @@ mod common;
 use common::TestContext;
 use ez_gfx_compiler::{CompilerError, Target, compile_shader};
 use ez_gfx_ffi::{
-    EzGfxBinding, EzGfxDynamicState, EzGfxRenderTargetDesc, EzGfxResult, ez_gfx_buffer_acquire,
-    ez_gfx_buffer_release, ez_gfx_buffer_write, ez_gfx_context_wait_idle,
-    ez_gfx_counter_buffer_acquire, ez_gfx_counter_buffer_publish_count,
-    ez_gfx_counter_buffer_release, ez_gfx_frame_add_compute_pipeline,
-    ez_gfx_frame_add_vertex_pipeline, ez_gfx_frame_end, ez_gfx_render_target_create,
+    EzGfxBinding, EzGfxRenderTargetDesc, EzGfxResult, ez_gfx_buffer_acquire, ez_gfx_buffer_release,
+    ez_gfx_buffer_write, ez_gfx_context_wait_idle, ez_gfx_counter_buffer_acquire,
+    ez_gfx_counter_buffer_publish_count, ez_gfx_counter_buffer_release, ez_gfx_frame_bind,
+    ez_gfx_frame_end, ez_gfx_frame_execute_compute, ez_gfx_render_target_create,
     ez_gfx_render_target_destroy, ez_gfx_render_target_frame_begin, ez_gfx_shader_destroy,
-    ez_gfx_shader_load_artifact,
+    ez_gfx_shader_load_artifact, ez_gfx_value_buffer_acquire,
 };
 
-const COMPUTE_SOURCE: &str = r#"[__AttributeUsage(_AttributeTargets.Var)]
-struct StructuredBufferAttribute { string name; };
-[__AttributeUsage(_AttributeTargets.Var)]
-struct IndirectBufferAttribute { string name; };
+const COMPUTE_SOURCE: &str = r#"import "ez_gfx_api";
+
 struct Draw { uint index_count; uint instance_count; uint first_index; int vertex_offset; uint first_instance; };
 
-[StructuredBuffer("values")]
+[Buffer("values")]
 RWStructuredBuffer<uint> values;
-[IndirectBuffer("draw_commands")]
-RWStructuredBuffer<Draw> draw_commands;
+[CounterBuffer("draw_commands")]
+CounterBuffer<Draw> draw_commands;
 
 [shader("compute")]
 [numthreads(1,1,1)]
 void main(uint3 id: SV_DispatchThreadID) {
     values[id.x] += 1;
     Draw draw = { 3, 1, 0, 0, 0 };
-    draw_commands[id.x] = draw;
+    draw_commands.set_count(1);
+    draw_commands.set(id.x, draw);
 }
 "#;
 
@@ -82,83 +80,39 @@ fn dx12_compiles_sm65_pso_and_dispatches_on_hardware() {
 }
 fn reject_invalid_bindings_without_claiming(
     context: u64,
-    shader: u64,
     frame: u64,
     buffer: u64,
-    indirect: u64,
     value: &[u8; 4],
     binding_name: &[u8],
 ) -> u64 {
     let invalid_name = b"invalid";
-    let invalid_bindings = [
-        EzGfxBinding {
-            name: binding_name.as_ptr(),
-            name_length: binding_name.len(),
-            buffer,
-            counter_buffer: 0,
-            render_target: 0,
-        },
-        EzGfxBinding {
-            name: invalid_name.as_ptr(),
-            name_length: invalid_name.len(),
-            buffer: 0,
-            counter_buffer: 0,
-            render_target: 0,
-        },
-    ];
+    let invalid_binding = EzGfxBinding {
+        name: invalid_name.as_ptr(),
+        name_length: invalid_name.len(),
+        buffer: 0,
+        counter_buffer: 0,
+        render_target: 0,
+    };
     assert_eq!(
-        // SAFETY: Both binding records and names remain readable through validation.
-        unsafe {
-            ez_gfx_frame_add_compute_pipeline(
-                context,
-                frame,
-                shader,
-                1,
-                1,
-                1,
-                invalid_bindings.as_ptr(),
-                2,
-                core::ptr::null(),
-                0,
-            )
-        },
+        // SAFETY: The binding record and name remain readable through validation.
+        unsafe { ez_gfx_frame_bind(context, frame, &raw const invalid_binding) },
         EzGfxResult::InvalidArgument
     );
     assert_eq!(
-        // SAFETY: Failed validation must leave the first valid buffer writable.
+        // SAFETY: Failed validation must leave the valid buffer writable.
         unsafe { ez_gfx_buffer_write(context, buffer, 0, value.as_ptr().cast(), 1, 4) },
         EzGfxResult::Ok
     );
-    let state = EzGfxDynamicState {
-        cull_mode: 0,
-        front_face: 0,
-        primitive_type: 0,
-        blend_mode: 0,
-    };
     assert_eq!(
-        // SAFETY: The binding and state storage remain readable through validation.
+        // SAFETY: Null dynamic state selects the default; the zero counter is rejected.
         unsafe {
-            ez_gfx_frame_add_vertex_pipeline(
-                context,
-                frame,
-                shader,
-                0,
-                invalid_bindings.as_ptr(),
-                1,
-                &raw const state,
-                core::ptr::null(),
-                0,
-            )
+            ez_gfx_ffi::ez_gfx_frame_execute_graphics(context, frame, 0, 0, core::ptr::null())
         },
         EzGfxResult::InvalidContext
     );
     assert_eq!(
-        // SAFETY: Invalid indirect validation precedes the otherwise-valid buffer claim.
+        // SAFETY: Invalid counter validation occurs before any buffer can be claimed.
         unsafe { ez_gfx_buffer_write(context, buffer, 0, value.as_ptr().cast(), 1, 4) },
-        EzGfxResult::Ok
-    );
-    assert_eq!(
-        ez_gfx_counter_buffer_publish_count(context, indirect, 1),
         EzGfxResult::Ok
     );
 
@@ -188,11 +142,20 @@ fn reject_invalid_bindings_without_claiming(
 
 /// Each backend uses a distinct temporary directory so parallel native tests cannot race artifact output.
 #[cfg(not(target_vendor = "apple"))]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one hardware scenario keeps compile, bind, dispatch, and lifetime assertions ordered"
+)]
 fn run_compute_pipeline(backend: u8) {
     let root = std::env::temp_dir().join(format!("ez-gfx-pso-{}-{backend}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let source = root.join("compute.slang");
     std::fs::write(&source, COMPUTE_SOURCE).unwrap();
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ez_gfx_api.slang"),
+        root.join("ez_gfx_api.slang"),
+    )
+    .unwrap();
 
     #[cfg(windows)]
     let targets = &[Target::Spirv, Target::Dxil, Target::Metal];
@@ -204,7 +167,7 @@ fn run_compute_pipeline(backend: u8) {
         Err(error) => panic!("shader compilation failed: {error}"),
     };
 
-    let native = TestContext::create(backend);
+    let native = TestContext::create_with_validation(backend, backend == 1);
     let context = native.context;
 
     let mut shader = 0;
@@ -226,28 +189,19 @@ fn run_compute_pipeline(backend: u8) {
     let (frame, target) = begin_offscreen_frame(context);
 
     let binding_name = b"values";
+    let value = 41_u32.to_ne_bytes();
     let mut buffer = 0;
     assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe {
-                ez_gfx_buffer_acquire(
-                    context,
-                    4,
-                    1,
-                    binding_name.as_ptr(),
-                    binding_name.len(),
-                    &raw mut buffer,
-                )
-            }
-        },
-        EzGfxResult::Ok
-    );
-    let value = 41_u32.to_ne_bytes();
-    assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_buffer_write(context, buffer, 0, value.as_ptr().cast(), 1, 4) }
+        // SAFETY: Value, name, and output ranges remain live through the call.
+        unsafe {
+            ez_gfx_value_buffer_acquire(
+                context,
+                value.as_ptr().cast(),
+                u32::try_from(value.len()).unwrap(),
+                binding_name.as_ptr(),
+                binding_name.len(),
+                &raw mut buffer,
+            )
         },
         EzGfxResult::Ok
     );
@@ -270,54 +224,68 @@ fn run_compute_pipeline(backend: u8) {
         },
         EzGfxResult::Ok
     );
+    buffer = reject_invalid_bindings_without_claiming(context, frame, buffer, &value, binding_name);
+    let values_binding = EzGfxBinding {
+        name: binding_name.as_ptr(),
+        name_length: binding_name.len(),
+        buffer,
+        counter_buffer: 0,
+        render_target: 0,
+    };
     assert_eq!(
-        ez_gfx_counter_buffer_publish_count(context, indirect, 1),
+        // SAFETY: The binding and exact name range remain readable through the call.
+        unsafe { ez_gfx_frame_bind(context, frame, &raw const values_binding) },
         EzGfxResult::Ok
     );
-    buffer = reject_invalid_bindings_without_claiming(
-        context,
-        shader,
-        frame,
-        buffer,
-        indirect,
-        &value,
-        binding_name,
-    );
-    let bindings = [
-        EzGfxBinding {
-            name: binding_name.as_ptr(),
-            name_length: binding_name.len(),
-            buffer,
-            counter_buffer: 0,
-            render_target: 0,
-        },
-        EzGfxBinding {
-            name: indirect_name.as_ptr(),
-            name_length: indirect_name.len(),
-            buffer: 0,
-            counter_buffer: indirect,
-            render_target: 0,
-        },
-    ];
-
+    let mut replacement = 0;
     assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe {
-                ez_gfx_frame_add_compute_pipeline(
-                    context,
-                    frame,
-                    shader,
-                    1,
-                    1,
-                    1,
-                    bindings.as_ptr(),
-                    2,
-                    core::ptr::null(),
-                    0,
-                )
-            }
+        // SAFETY: Value, name, and output ranges remain live through the call.
+        unsafe {
+            ez_gfx_value_buffer_acquire(
+                context,
+                value.as_ptr().cast(),
+                u32::try_from(value.len()).unwrap(),
+                binding_name.as_ptr(),
+                binding_name.len(),
+                &raw mut replacement,
+            )
         },
+        EzGfxResult::Ok
+    );
+    let replacement_binding = EzGfxBinding {
+        buffer: replacement,
+        ..values_binding
+    };
+    assert_eq!(
+        // SAFETY: The replacement binding and name remain readable through the call.
+        unsafe { ez_gfx_frame_bind(context, frame, &raw const replacement_binding) },
+        EzGfxResult::Ok
+    );
+    assert_eq!(
+        // SAFETY: A never-executed replaced buffer remains writable and unclaimed.
+        unsafe { ez_gfx_buffer_write(context, buffer, 0, value.as_ptr().cast(), 1, 4) },
+        EzGfxResult::Ok
+    );
+    ez_gfx_buffer_release(context, buffer);
+    buffer = replacement;
+    let indirect_binding = EzGfxBinding {
+        name: indirect_name.as_ptr(),
+        name_length: indirect_name.len(),
+        buffer: 0,
+        counter_buffer: indirect,
+        render_target: 0,
+    };
+    assert_eq!(
+        // SAFETY: The binding and exact name range remain readable through the call.
+        unsafe { ez_gfx_frame_bind(context, frame, &raw const indirect_binding) },
+        EzGfxResult::Ok
+    );
+    assert_eq!(
+        ez_gfx_frame_execute_compute(context, frame, shader, 1, 1, 1),
+        EzGfxResult::Ok
+    );
+    assert_eq!(
+        ez_gfx_frame_execute_compute(context, frame, shader, 1, 1, 1),
         EzGfxResult::Ok
     );
     assert_eq!(

@@ -1,6 +1,6 @@
 # Textures
 
-Texture loading is asynchronous. Each safe `Texture` is an owning wrapper whose lease retains the shared `Rc<ContextInner>` and native texture until `Drop`; a Rayon pool performs decode/mip work and backend transfer owners submit device copies.
+Texture loading is asynchronous. Each safe `Texture` is a typed view into the context-owned bindless heap; dropping the wrapper does not unload or recycle its texture. A Rayon pool performs decode/mip work and backend transfer owners submit device copies.
 
 ## Public path
 
@@ -13,7 +13,7 @@ Events identify a typed texture, vertex allocation, or index allocation and repo
 - `Failed(status)`: terminal failure;
 - `Cancelled`: terminal cancellation.
 
-The upload queue is unbounded and lossless. It is separate from bounded runtime diagnostics. Applications must retain a callback and regularly reach graphics safe points; otherwise queued records retain memory until the last owning context/resource wrapper is dropped.
+The upload queue is unbounded and lossless. It is separate from bounded runtime diagnostics. Applications must retain a callback and regularly reach graphics safe points; otherwise queued records retain memory until context destruction.
 
 ```mermaid
 sequenceDiagram
@@ -32,11 +32,11 @@ sequenceDiagram
         GPU-->>Gfx: completion
         Gfx->>Queue: DeviceReady
         App->>Gfx: Texture::binding and use
-        App->>Gfx: drop Texture
-        Gfx->>GPU: retire after completion
+        App->>Gfx: continue using stable binding
+        App->>Gfx: destroy or drop Context
+        Gfx->>GPU: destroy retained textures after completion
     else failure
         Gfx->>Queue: Failed
-        App->>Gfx: drop Texture
     else cancel before readiness
         App->>Gfx: Texture::cancel_load
         Gfx->>Queue: Cancelled
@@ -47,7 +47,7 @@ sequenceDiagram
 
 After a texture `DeviceReady` event, obtain its stable bindless index from the owning `Texture`. Use a resident fallback until then. Binding, residency, and residency updates each perform a nonblocking owner-thread progress pass that drains completed decode work, admits transfers, and publishes completed residency. `Context::wait_idle` drains native work, then performs the same publication pass. None dequeues upload events or replaces event consumption.
 
-Cancellation wins only before initial readiness and emits `Cancelled`. Dropping `Texture` invalidates its lease and retires native storage safely; no public safe unload or destroy operation exists. Dropping the last context/resource owner cancels queued decode work, drains native work where possible, then drops remaining events and resources.
+Cancellation wins only before initial readiness and emits `Cancelled`. Dropping `Texture` releases only the Rust wrapper; the context retains its heap entry and native storage so stable bindless IDs remain valid until `Context::destroy` or context drop. Context teardown cancels queued decode work, drains native work where possible, then destroys retained textures, events, surfaces, and other resources.
 
 Device loss is terminal. Textures still in decode or awaiting transfer completion receive a terminal `Failed(DeviceLost)` event. Textures whose readiness was already published are not in that pending set and do not receive a retroactive upload failure.
 
@@ -82,9 +82,9 @@ C calls copy borrowed source bytes during the call, preserving asynchronous life
 
 ## Frame ownership
 
-Texture bindings are recorded only through `&mut Frame`. Surface recording uses `Surface::begin_frame()` and `Frame::configure_swapchain`; named targets use `Context::begin_frame()` and `Frame::configure_render_target`. `Frame::finish(self)` preserves exact errors, while dropping an unfinished frame aborts. `Buffer<T>` and `CounterBuffer<T>` are one-frame values: first binding claims them, same-frame reuse is allowed, and terminal frame paths invalidate public use while native backing remains completion-gated. `RenderTarget::prepare_readback(&mut frame)` creates and attaches an opaque owner-and-generation request, and completed metadata and bytes exist only during the registered callback.
+Texture bindings are recorded only through `&mut Frame`; the context-owned texture heap requires no per-frame retain call. Surface recording uses `Surface::begin_frame()` and `Frame::configure_swapchain`; named targets use `Context::begin_frame()` and `Frame::configure_render_target`. `Frame::finish(self)` preserves exact errors, while dropping an unfinished frame aborts. `Buffer<T>`, `CounterBuffer<T>`, and single-value `ValueBuffer<T>` are one-frame values: their first execute use claims them, current bindings persist across same-frame execute calls, and terminal frame paths clear bindings and invalidate claimed public use while native backing remains completion-gated. `RenderTarget::prepare_readback(&mut frame)` creates and attaches an opaque owner-and-generation request, and completed metadata and bytes exist only during the registered callback.
 
-## C ABI 34
+## C ABI 36
 
 Install `ez_gfx_context_register_callback(context, callback, user_data)`. The callback receives `EzGfxEventKind_Upload`, runtime, diagnostic, dropped-count, and readback events on the context creator thread at graphics safe points. Compare upload resource handles, resolve bindings after `EzGfxUploadStatus_DeviceReady`, and copy readback bytes before the callback returns. Passing a null callback clears the registration. Convert result codes with `ez_gfx_error_print`.
 
@@ -96,4 +96,4 @@ Frame recording imports only resources referenced by active work. Texture descri
 
 ## Verification and remaining evidence
 
-Pure queue and allocator transitions are covered by runtime tests. ABI layout tests cover callback event records, typed heap/allocation handles, one-frame buffer signatures, and the ABI 34 contract. Native backend behavior requires the Linux Vulkan, Windows DX12, and macOS Metal remote matrices.
+Pure queue and allocator transitions are covered by runtime tests. ABI layout tests cover callback event records, typed heap/allocation handles, one-frame buffer signatures, and the ABI 36 contract. Native backend behavior requires the Linux Vulkan, Windows DX12, and macOS Metal remote matrices.

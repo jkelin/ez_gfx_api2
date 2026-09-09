@@ -1,6 +1,6 @@
 # Geometry
 
-Geometry uses owning auto-growing named vertex heaps and one lazy context-owned device-local `u32` index heap. Their allocation wrappers retain both the shared `Rc<ContextInner>` and the parent resource lease. Structured and counter buffers are separate one-frame consumables.
+Geometry uses owning auto-growing named vertex heaps and one lazy context-owned device-local `u32` index heap. Their allocation wrappers retain both the shared `Rc<ContextInner>` and the parent resource lease. `Buffer`, `CounterBuffer`, and `ValueBuffer` are separate one-frame consumables bound by shader-declared name.
 
 ## Public path
 
@@ -46,6 +46,8 @@ StructuredBuffer<float4> positions;
 
 Reflection records `VertexHeap` separately from `StructuredBuffer`. Applications do not supply a `PublicBinding` for it. Frame recording imports the named heap automatically and each backend lowers it to its private descriptor layout. Vulkan, Direct3D 12, and Metal retain distinct physical layouts behind the same public contract.
 
+Buffer and counter resources bind by shader-declared name: `[Buffer("name")]` and `[CounterBuffer("name")]` reflect as `buffer` and `counter_buffer` binding kinds. `Frame::bind_buffer` adds or replaces one named entry in the frame binding set without materializing a never-executed replacement. `execute_compute` and `execute_graphics` materialize and read the current set without removing entries, so unchanged resources remain bound across same-frame compute and graphics work. Single POD constants bind the same way as `ValueBuffer`, not as push-constant bytes. ABI 36 exposes the same persistent frame-local set through `ez_gfx_frame_bind` and `ez_gfx_frame_execute_compute`/`graphics`; terminal end or abort clears it.
+
 The global index heap remains a native index-buffer binding. `DrawIndexedCommand::first_index` is the queried index allocation start plus any mesh-local index offset. Because a vertex heap is bound at byte offset zero, `vertex_offset` must include the queried vertex allocation start.
 
 ## Allocation and removal
@@ -69,9 +71,11 @@ The typed slice upload interface derives and checks count, stride, multiplicatio
 
 ## One-frame buffers
 
-Applications acquire `Buffer<T>` and `CounterBuffer<T>` from `Context`, then populate them before a frame first uses them. `acquire_buffer_from` and `acquire_counter_buffer_from` size and initialize storage from `BufferSource::one(&value)`, a slice, or a borrowed `Vec<T>` without an intermediate collection; arrays use `.as_slice()` to make element intent explicit. The counter helper publishes the input length.
+Applications acquire `Buffer<T>`, `CounterBuffer<T>`, and single-value `ValueBuffer<T>` (`acquire_value_buffer`) from `Context`, then populate them before a frame first uses them. `acquire_buffer_from` and `acquire_counter_buffer_from` size and initialize storage from `BufferSource::one(&value)`, a slice, or a borrowed `Vec<T>` without an intermediate collection; arrays use `.as_slice()` to make element intent explicit. The counter helper publishes the input length. Shaders use counters through `set_count`/`add_count`/`set`/`get` over a GPU-writable count plus elements.
 
-The first frame binding claims a buffer. Repeated bindings in that frame, including compute followed by graphics, share one native materialization. Writes and publication after claim fail with `NotReady`; any later frame use also fails. Finishing or aborting consumes the wrapper. Native allocations are recycled through completion-gated Vulkan, Direct3D 12, and Metal pools, or quarantined after indeterminate native failure.
+The first execute call using a bound buffer claims and materializes it. Later execute calls in that frame, including compute followed by graphics, reuse the same native materialization while the binding remains current. Replacing an unexecuted entry leaves its prior buffer unclaimed. Graphics counters require `DrawIndexedCommand` element size. Writes and publication after claim fail with `NotReady`; any later frame use also fails. Native counter storage places the `u32` count at byte 0, zeroes bytes 4..255, and starts the element/command region at shared HAL offset 256: 252 bytes of per-buffer padding satisfying Vulkan `minStorageBufferOffsetAlignment`. Vulkan and Direct3D 12 read the GPU count at byte 0 and the indirect commands at offset 256, while Metal encodes capacity and relies on zeroed tail commands as no-ops. Finishing or aborting consumes claimed wrappers and clears the binding set. Native allocations are recycled through completion-gated Vulkan, Direct3D 12, and Metal pools, or quarantined after indeterminate native failure.
+
+Evidence: FFI `counter_pixels` proves Vulkan/DX12 capacity-4 zero tails match capacity-1 pixels; DX12 additionally proves the GPU count suppresses a nonzero second command and the aligned command offset. A Metal native offscreen test proves capacity-4 zero tails match capacity-1 on Apple M2 Pro. A compiler artifact test proves exactly one `CounterBuffer` reflection per SPIR-V/DXIL/MSL target with `descriptor_count=2` and `ReadWrite`. Metal capacity encoding is emulation: no indirect-count opcode exists, so nonzero commands past the published count would still execute.
 
 ## Frame ownership
 
@@ -79,4 +83,4 @@ The first frame binding claims a buffer. Repeated bindings in that frame, includ
 
 ## Examples
 
-Each main visibly creates its `Context` with `Context::new(ContextOptions { .. })` and `Surface` with `context.create_surface(SurfaceOptions { .. })` and owns them directly. The shared `Example` host retains native window, resize/input/automation, observation callbacks, and consuming frame dispatch. Each procedural loop passes `&Surface` to `wait_for_next_frame`, calls `surface.begin_frame()`, explicitly configures the swapchain from `window_frame.size`, records, then passes both `Frame` and `RenderTarget` to `Example::handle_frame`. Inner resource scopes end first; each main then drops `Surface`, consumes `Context::close` to propagate teardown errors, and finally drops `Example`. Host `Drop` only publishes completed automation output. Publication failure emits one diagnostic and exits nonzero during normal automation, but does not replace an active unwind.
+Each main visibly creates its `Context` with platform-free `ContextOptions` and its `Surface` with `context.create_surface_window(example.window()?, ...)`. The safe API reads the initial drawable extent through the native window handle. The shared `Example` host retains window, resize/input/automation, observation callbacks, and consuming frame dispatch. Each procedural loop passes `&Surface` to `wait_for_next_frame`, calls `surface.begin_frame()`, explicitly configures the swapchain from `window_frame.size`, records, then passes both `Frame` and `RenderTarget` to `Example::handle_frame`. Ordinary reverse declaration order drops resources before `Context`; context drop destroys every remaining owned resource, including surfaces.

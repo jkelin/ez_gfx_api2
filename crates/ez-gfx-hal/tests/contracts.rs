@@ -1,8 +1,8 @@
 //! HAL allocation, layout, and synchronization contract tests.
 use ez_gfx_hal::{
     AllocationBlockPolicy, AllocationBlockPolicyError, AllocationError, AllocationRequest,
-    BufferRange, DEFAULT_ALLOCATION_BLOCK_POLICY, ImageSubresources, MemoryClass, QueueKind,
-    ResourceAccess, ResourceState, ShaderStage,
+    BufferRange, COUNTER_BUFFER_ELEMENT_OFFSET, DEFAULT_ALLOCATION_BLOCK_POLICY, ImageSubresources,
+    MemoryClass, QueueKind, ResourceAccess, ResourceState, ShaderStage,
 };
 
 #[test]
@@ -25,6 +25,13 @@ fn allocation_request_validates_size_alignment_mapping_and_alias_lifetime() {
     );
     assert!(AllocationRequest::new(64, 16, MemoryClass::Upload, true, None).is_ok());
     assert!(AllocationRequest::new(64, 16, MemoryClass::Transient, false, Some(7)).is_ok());
+}
+
+#[test]
+fn counter_buffer_element_offset_is_portably_aligned() {
+    assert_eq!(COUNTER_BUFFER_ELEMENT_OFFSET, 256);
+    assert!(COUNTER_BUFFER_ELEMENT_OFFSET.is_power_of_two());
+    assert!(COUNTER_BUFFER_ELEMENT_OFFSET >= size_of::<u32>() as u64);
 }
 
 #[test]

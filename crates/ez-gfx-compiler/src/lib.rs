@@ -468,9 +468,9 @@ fn collect_parameters<'a>(
             let mut depth_required = false;
             for attribute in variable.user_attributes() {
                 match attribute.name() {
-                    "StructuredBuffer" => api_attribute = Some(("structured", attribute)),
+                    "Buffer" => api_attribute = Some(("buffer", attribute)),
                     "VertexHeap" => api_attribute = Some(("vertex_heap", attribute)),
-                    "IndirectBuffer" => api_attribute = Some(("indirect", attribute)),
+                    "CounterBuffer" => api_attribute = Some(("counter_buffer", attribute)),
                     "ColorTarget" | "DepthTarget" => {
                         api_attribute = Some(("render_target", attribute));
                     }
@@ -690,6 +690,22 @@ fn select_texture_heap<T>(
     Ok(selected)
 }
 
+fn descriptor_count(api_kind: Option<&str>) -> u32 {
+    if api_kind == Some("counter_buffer") {
+        2
+    } else {
+        1
+    }
+}
+
+fn reflected_resource_access<'a>(api_kind: Option<&str>, access: &'a str) -> &'a str {
+    if api_kind == Some("counter_buffer") {
+        "ReadWrite"
+    } else {
+        access
+    }
+}
+
 fn compile_targets(
     linked: &shader_slang::ComponentType,
     request: &CompilationRequest,
@@ -797,7 +813,7 @@ fn compile_targets(
                 })
             });
         let depth_required = parameters.iter().any(|parameter| parameter.10);
-        let reflection = serde_json::json!({"entry": target.entry_point, "stage": format!("{:?}", target.stage), "profile": target.profile, "parameters": parameters.iter().map(|(name,kind,category,shape,access,semantic_name,api_kind,binding_index,binding_space,_,_,_)| serde_json::json!({"name":name,"kind":kind,"category":category,"resource_shape":shape,"resource_access":access,"semantic_name":semantic_name,"api_kind":api_kind,"binding_index":binding_index,"binding_space":binding_space,"descriptor_count":1})).collect::<Vec<_>>(), "texture_heap": texture_heap, "depth_required": depth_required, "workgroup_size": workgroup_size});
+        let reflection = serde_json::json!({"entry": target.entry_point, "stage": format!("{:?}", target.stage), "profile": target.profile, "parameters": parameters.iter().map(|(name,kind,category,shape,access,semantic_name,api_kind,binding_index,binding_space,_,_,_)| serde_json::json!({"name":name,"kind":kind,"category":category,"resource_shape":shape,"resource_access":reflected_resource_access(api_kind.as_deref(), access),"semantic_name":semantic_name,"api_kind":api_kind,"binding_index":binding_index,"binding_space":binding_space,"descriptor_count":descriptor_count(api_kind.as_deref())})).collect::<Vec<_>>(), "texture_heap": texture_heap, "depth_required": depth_required, "workgroup_size": workgroup_size});
         reflections.push(serde_json::json!({"target": format!("{:?}", target.target), "entry": target.entry_point, "stage": format!("{:?}", target.stage), "profile": target.profile, "reflection": reflection}));
         let blob = linked
             .entry_point_code(

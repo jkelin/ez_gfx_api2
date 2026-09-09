@@ -4,7 +4,7 @@ use std::collections::HashSet;
 #[cfg(not(target_vendor = "apple"))]
 fn vulkan_options() -> std::result::Result<ContextOptions, ez_gfx_runtime::PublicApiError> {
     // Win32 contexts need a Win32 host; every other non-Apple host runs headless.
-    ContextOptions::new_for_backend(0, 0, if cfg!(windows) { 0 } else { 3 }, Backend::Vulkan)
+    ContextOptions::new_for_backend(0, 0, Backend::Vulkan)
 }
 
 fn shader() -> ShaderHandle {
@@ -227,7 +227,7 @@ fn first_coarse_publication_records_handoff_telemetry_once() {
 
 #[cfg(windows)]
 fn dx12_context() -> ContextHandle {
-    create_context(ContextOptions::new_for_backend(0, 0, 0, Backend::Dx12).unwrap()).unwrap()
+    create_context(ContextOptions::new_for_backend(0, 0, Backend::Dx12).unwrap()).unwrap()
 }
 #[cfg(not(target_vendor = "apple"))]
 #[test]
@@ -281,19 +281,19 @@ fn context_decode_worker_count_reaches_pool_construction() {
 fn destroy_context_reclaims_populated_state_and_invalidates_handles() {
     let context = dx12_context();
     frame_begin(context).unwrap();
-    let structured = acquire_structured_sized(context, 1, 64).unwrap();
-    let indirect = acquire_indirect(context, 2).unwrap();
+    let structured = acquire_buffer_sized(context, 1, 64).unwrap();
+    let indirect = acquire_counter(context, 2).unwrap();
     assert!(create_vertex_heap(context, "vertices", 16).is_ok());
     assert_eq!(create_index_heap(context, 256), Ok(()));
 
     assert_eq!(destroy_context(context), Ok(()));
     assert_eq!(wait_idle(context), Err(Error::InvalidContext));
     assert_eq!(
-        write_structured_bytes(context, structured, 1, &[1; 16]),
+        write_buffer_bytes(context, structured, 1, &[1; 16]),
         Err(Error::InvalidContext)
     );
     assert_eq!(
-        publish_compute_indirect_count(context, indirect, 1),
+        write_counter_commands(context, indirect, 0, &[]),
         Err(Error::InvalidContext)
     );
     assert_eq!(destroy_context(context), Err(Error::InvalidContext));
@@ -322,11 +322,8 @@ fn thread_exit_context() -> ContextHandle {
 #[cfg(not(any(windows, target_vendor = "apple")))]
 fn thread_exit_context() -> ContextHandle {
     let context = create_context(vulkan_options().unwrap()).unwrap();
-    let surface = create_surface(
-        context,
-        SurfaceOptions::new(0, 0, SurfacePlatform::Headless, 1, 1, 0).unwrap(),
-    )
-    .unwrap();
+    let surface =
+        create_surface_headless(context, HeadlessSurfaceOptions::new(1, 1, 0).unwrap()).unwrap();
     assert_eq!(init_device(context, surface), Ok(()));
     context
 }
@@ -349,7 +346,7 @@ fn recursive_context_access_returns_native_failure_without_panicking() {
 fn thread_exit_invalidates_populated_context_handle() {
     let context = thread_exit_context();
     frame_begin(context).unwrap();
-    let _structured = acquire_structured_sized(context, 1, 64).unwrap();
+    let _structured = acquire_buffer_sized(context, 1, 64).unwrap();
     let cleanup = CONTEXTS.with(|contexts| contexts.borrow_mut().cleanup_for_thread_exit());
 
     assert_eq!(cleanup, Ok(()));
@@ -372,12 +369,12 @@ fn creator_thread_exit_returns_and_invalidates_context_handle() {
 fn destroyed_resource_handles_are_rejected_by_other_owners() {
     let first = dx12_context();
     frame_begin(first).unwrap();
-    let stale = acquire_structured_sized(first, 1, 64).unwrap();
+    let stale = acquire_buffer_sized(first, 1, 64).unwrap();
     let second = dx12_context();
 
     assert_eq!(destroy_context(first), Ok(()));
     assert_eq!(
-        write_structured_bytes(second, stale, 1, &[1; 16]),
+        write_buffer_bytes(second, stale, 1, &[1; 16]),
         Err(Error::Lifecycle(LifecycleError::WrongOwner))
     );
     assert_eq!(destroy_context(second), Ok(()));

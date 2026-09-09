@@ -13,7 +13,7 @@ Migrate the original Odin/Vulkan `ez_gfx_api` to Rust/Cargo while roughly preser
 - Runtime packages must not depend on or bundle the Slang compiler.
 - Vulkan, DX12, and Metal are required; Vulkan-only abstractions are incomplete.
 - Explicit shader target attributes are authoritative for target intent.
-- Rust uses the clean ownership interface; C/C# use the explicit ABI 34 lifecycle through the dedicated FFI seam.
+- Rust uses the clean context-owned interface; C/C# use the explicit ABI 36 lifecycle through the dedicated FFI seam.
 - External inputs and binary artifacts require validation; no panic crosses FFI.
 - OpenGL, DX11, software rasterizers, a custom shader DSL, and a custom window system are out of scope.
 - `gpu-allocator` 0.28 is the selected cross-backend Rust allocator.
@@ -29,7 +29,7 @@ A virtual workspace separates core types, runtime/artifact loading, offline in-p
 
 ### P-002: Public API and C ABI bindings â€” Owning Rust facade and raw FFI
 
-`Context` owns `Rc<ContextInner>`; owning resources retain context/resource leases and release through `Drop`. `Surface::begin_frame` and `Context::begin_frame` return target-less owning `Frame` values; configure methods attach logical swapchain or cached named targets. Recording borrows frames mutably, `Frame::finish(self)` preserves exact errors, and `Drop` aborts. ABI 34 alone exposes explicit lifecycle calls and opaque generational `u64` handles, including `EzGfxFrame`.
+One owning `Context` controls native lifetime and invalidates every descendant on destruction or drop. Resource wrappers retain memory-safe access but not an independent native context lifetime; texture wrapper drop intentionally leaves its stable bindless heap entry resident until context teardown. `Surface::begin_frame` and `Context::begin_frame` return target-less owning `Frame` values; configure methods attach logical swapchain or cached named targets. Recording borrows frames mutably, `Frame::finish(self)` preserves exact errors, and `Drop` aborts. ABI 36 alone exposes explicit lifecycle calls and opaque generational `u64` handles, including `EzGfxFrame`.
 
 ### P-003: Multi-backend hardware abstraction â€” Custom static raw HAL
 
@@ -65,7 +65,7 @@ Canonical target metadata preserves kind, usage, scale, sampleability, load/stor
 
 ### P-011: Vertex and index geometry heaps â€” Owning generation-checked leases
 
-Named vertex heaps and the singleton context-owned index heap use range free lists plus generation-checked allocation leases. Safe wrappers retain parent/context ownership and release through `Drop`; C retains explicit handle release.
+Named vertex heaps and the singleton context-owned index heap use range free lists plus generation-checked allocation leases. Safe wrappers retain parent/context ownership and release through `Drop`; C retains explicit handle release. One-frame `Buffer`, `CounterBuffer`, and single-value `ValueBuffer` bind by `[Buffer]`/`[CounterBuffer]` shader name in a persistent frame-local set; execute calls read the current set, and same-name replacement leaves a never-executed prior resource unclaimed. Native counters store the count at byte 0 with the element region at shared HAL offset 256 (bytes 4..255 zeroed, 252 bytes padding for Vulkan `minStorageBufferOffsetAlignment`); Vulkan/DX12 read the count at byte 0 and commands at offset 256, and Metal encodes capacity over zeroed tails (emulation: no indirect-count opcode).
 
 ### P-012: Transfer staging and batching â€” Timeline-recycled bucket pools with adaptive batches
 
@@ -73,7 +73,7 @@ Size-classed staging pools recycle after completion; a transfer owner batches co
 
 ### P-013: Explicit frame ownership
 
-Presented and managed-target begin functions return an owning `Frame`. Recording requires `&mut Frame`; `Frame::finish(self)` consumes it, returns recording/submit/present errors unchanged, and `Drop` aborts. Context-acquired buffers are claimed by their first frame, reusable only within it, and invalid after every terminal path; native backing is recycled only after completion.
+Presented and managed-target begin functions return an owning `Frame`. Recording requires `&mut Frame`; `Frame::finish(self)` consumes it, returns recording/submit/present errors unchanged, and `Drop` aborts. Named buffer/counter/value entries persist in the frame binding set until replaced or terminal completion; `execute_compute`/`execute_graphics` materialize and read without removing them. Context-acquired buffers are claimed by their first execution, reusable only within that frame, and invalid after every terminal path; native backing is recycled only after completion.
 
 ### P-014: Basis Universal and compressed textures â€” Feature-gated official transcoder wrapper
 
@@ -89,7 +89,7 @@ Standard indirect records pair with validated viewport/scissor side tables. Cons
 
 ### P-017: Owning surface and guarded presentation
 
-An owning `Surface` retains its context lease while the host retains the native window. Construction is atomic and rolls back partial native/init state. Zero extent returns `NotReady`; consuming frame completion presents; presentation targets reject shader reads and use transfer readback.
+An owning `Surface` carries memory-safe access to its context while the host retains the native window; context destruction still invalidates it. Window construction dispatches from `RawWindowHandle`, queries the initial native extent, and rolls back partial native/init state. Headless construction uses an explicit extent. Zero extent returns `NotReady`; consuming frame completion presents; presentation targets reject shader reads and use transfer readback.
 
 ### P-018: Async workers â€” Scoped Rayon compute pool and bounded transfer channel
 
@@ -101,7 +101,7 @@ Backend-specific offscreen/readback fixtures provide PNG goldens and tolerances;
 
 ### P-020: Migration cutover â€” Clean ownership cutover
 
-The final cutover uses the shared `Example` host for winit inversion, native window hosting, resize, input, automation, and consuming frame dispatch. `Example::new` returns only the host; each main visibly creates its `Context` with `Context::new(ContextOptions { .. })` and `Surface` with `context.create_surface(SurfaceOptions { .. })`, directly owns both graphics objects, scopes resources first, drops the surface, and consumes `Context::close` before the host drops. Host `Drop` publishes completed automation output without graphics shutdown; publication failure logs and exits nonzero unless already unwinding. Rust exposes no compatibility aliases or manual frame/resource release; ABI 34 preserves the explicit C lifecycle.
+The final cutover uses the shared `Example` host for winit inversion, native window hosting, resize, input, automation, and consuming frame dispatch. Each main creates platform-free `ContextOptions` and calls `Context::create_surface_window` with the host's `HasWindowHandle`; initial extent comes from the native window. Resources need no artificial scopes or ordered manual teardown: `Context::destroy` and owner drop invalidate and destroy all context-owned resources, including surfaces and retained texture-heap entries. Rust exposes no compatibility aliases or per-frame texture retention; ABI 36 preserves explicit C lifecycle and separate window/headless surface constructors.
 
 ### P-021: Cross-backend shader execution semantics â€” Target-native layouts with canonical semantic ABI
 
@@ -151,7 +151,7 @@ Target-native release CI builds pinned sources and publishes separate runtime/FF
 - Graph compiler -> HAL command recording and diagnostics: converts semantic declarations/resources into order, barriers, waits, merges, clears, alias boundaries, and correlated schedule events.
 - Worker orchestration -> texture/geometry ingestion -> event queue and frame policy: bounded jobs and payloads cross into transfer ownership; completion/error events flow to hosts, while submitted aggregate prefixes feed frame readiness.
 - Runtime event/diagnostic boundary -> host: all components publish bounded owned events; the host chooses polling thread/cadence, while overflow/loss/shutdown are explicit.
-- Surface/presentation -> HAL and validation: an owning `Surface` retains its context lease; borrowed host handles and observed extents enter, while atomic construction rollback and acquire/present/readback/loss results leave.
+- Surface/presentation -> HAL and validation: borrowed host window handles or explicit headless extents enter; context-owned lifetime, atomic construction rollback, and acquire/present/readback/loss results leave.
 - Validation/cutover -> release artifacts and every component: executes contracts, records adapter/driver/profile/provenance evidence, compares goldens, audits binary imports/signatures, and gates publication.
 
 ## End-to-end flows

@@ -254,11 +254,7 @@ fn dx12_actions<'a>(
             ExecutionAction::ExecuteNode(node) => {
                 let index_node = *node as usize;
                 match payloads.get(index_node).ok_or(Error::InvalidArgument)? {
-                    ExecutableNode::Compute {
-                        groups,
-                        push_constants,
-                        ..
-                    } => {
+                    ExecutableNode::Compute { groups, .. } => {
                         let key = pipeline_keys[index_node]
                             .as_ref()
                             .ok_or(Error::InvalidArgument)?;
@@ -271,20 +267,18 @@ fn dx12_actions<'a>(
                             ez_gfx_backend_dx12::native::NativeComputeDispatch {
                                 pipeline,
                                 groups: *groups,
-                                push_constants,
                                 bindings: &binding_sets[index_node],
                             },
                         ));
                     }
                     ExecutableNode::Graphics {
-                        indirect,
-                        draw_count,
-                        push_constants,
+                        counter,
+                        draw_capacity,
                         ..
                     } => {
                         let (indirect_size, NativeAllocation::Dx12(indirect)) = state
                             .allocations
-                            .get(&indirect.packed())
+                            .get(&counter.packed())
                             .ok_or(Error::InvalidContext)?
                         else {
                             return Err(Error::NativeFailure);
@@ -306,8 +300,7 @@ fn dx12_actions<'a>(
                                 index_size: state.index_size,
                                 indirect_buffer: indirect,
                                 indirect_size: *indirect_size,
-                                draw_count: *draw_count,
-                                push_constants,
+                                draw_count: *draw_capacity,
                                 bindings: &binding_sets[index_node],
                             },
                         ));

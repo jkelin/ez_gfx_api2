@@ -11,6 +11,7 @@ use super::{
     bind_dx12_compute_buffers, bind_dx12_graphics_buffers, copy_texture_to_readback,
     dx12_resource_state, map_windows, transition_barrier, uav_barrier,
 };
+use ez_gfx_hal::COUNTER_BUFFER_ELEMENT_OFFSET;
 
 const DRAW_INDEXED_ARGUMENT_BYTES: u64 = core::mem::size_of::<
     windows::Win32::Graphics::Direct3D12::D3D12_DRAW_INDEXED_ARGUMENTS,
@@ -132,8 +133,6 @@ fn validate_frame_plan(
             NativeFrameAction::Compute(dispatch) => {
                 if pass_active
                     || dispatch.groups.contains(&0)
-                    || dispatch.push_constants.len() > 128
-                    || !dispatch.push_constants.len().is_multiple_of(4)
                     || dispatch.bindings.len() != dispatch.pipeline.buffer_writable.len()
                     || dispatch
                         .bindings
@@ -148,11 +147,11 @@ fn validate_frame_plan(
                 }
             }
             NativeFrameAction::Graphics(draw) => {
-                let indirect_size = indirect_command_bytes(draw.draw_count);
+                let indirect_size = indirect_command_bytes(draw.draw_count)
+                    .checked_add(COUNTER_BUFFER_ELEMENT_OFFSET)
+                    .ok_or(HalError::InvalidArgument)?;
                 if !pass_active
                     || draw.draw_count == 0
-                    || draw.push_constants.len() > 128
-                    || !draw.push_constants.len().is_multiple_of(4)
                     || draw.bindings.len() != draw.pipeline.buffer_writable.len()
                     || draw.pipeline.topology.is_none()
                     || draw.pipeline.signature.is_none()
@@ -360,7 +359,7 @@ impl NativeContext {
                 continue;
             }
             let Ok(request) = AllocationRequest::new(
-                indirect_command_bytes(draw.draw_count),
+                indirect_command_bytes(draw.draw_count) + COUNTER_BUFFER_ELEMENT_OFFSET,
                 16,
                 MemoryClass::Device,
                 false,
@@ -723,9 +722,7 @@ impl DxFrameEncoder<'_> {
             self.list.SetPipelineState(&pipeline.state);
             self.list.SetComputeRootSignature(&pipeline.root);
             let table = u32::try_from(pipeline.buffer_writable.len())
-                .ok()
-                .and_then(|count| count.checked_add(1))
-                .ok_or(HalError::InvalidArgument)?;
+                .map_err(|_| HalError::InvalidArgument)?;
             self.list.SetComputeRootDescriptorTable(
                 table,
                 self.descriptor_heap.GetGPUDescriptorHandleForHeapStart(),
@@ -735,16 +732,6 @@ impl DxFrameEncoder<'_> {
                 self.sampler_heap.GetGPUDescriptorHandleForHeapStart(),
             );
             bind_dx12_compute_buffers(self.list, pipeline, dispatch.bindings)?;
-            if !dispatch.push_constants.is_empty() {
-                self.list.SetComputeRoot32BitConstants(
-                    0,
-                    u32::try_from(dispatch.push_constants.len())
-                        .map_err(|_| HalError::InvalidArgument)?
-                        / 4,
-                    dispatch.push_constants.as_ptr().cast(),
-                    0,
-                );
-            }
             self.list
                 .Dispatch(dispatch.groups[0], dispatch.groups[1], dispatch.groups[2]);
         }
@@ -793,7 +780,7 @@ impl DxFrameEncoder<'_> {
                 0,
                 &draw.indirect_buffer.resource,
                 0,
-                indirect_command_bytes(draw.draw_count),
+                indirect_command_bytes(draw.draw_count) + COUNTER_BUFFER_ELEMENT_OFFSET,
             );
             self.list.ResourceBarrier(&[
                 transition_barrier(
@@ -834,14 +821,12 @@ impl DxFrameEncoder<'_> {
         let indirect_resource = self.indirect_copies[action_index]
             .as_ref()
             .map_or(&draw.indirect_buffer.resource, |copy| &copy.resource);
-        // SAFETY: the encoder, `pipeline`, and `draw` references retain every command-list, state object, heap, resource, index-view, and push-constant pointer consumed by these recording calls until each call returns.
+        // SAFETY: the encoder, `pipeline`, and `draw` references retain every command-list, state object, heap, resource, index-view, and binding pointer consumed by these recording calls until each call returns.
         unsafe {
             self.list.SetPipelineState(&pipeline.state);
             self.list.SetGraphicsRootSignature(&pipeline.root);
             let table = u32::try_from(pipeline.buffer_writable.len())
-                .ok()
-                .and_then(|count| count.checked_add(1))
-                .ok_or(HalError::InvalidArgument)?;
+                .map_err(|_| HalError::InvalidArgument)?;
             self.list.SetGraphicsRootDescriptorTable(
                 table,
                 self.descriptor_heap.GetGPUDescriptorHandleForHeapStart(),
@@ -851,20 +836,16 @@ impl DxFrameEncoder<'_> {
                 self.sampler_heap.GetGPUDescriptorHandleForHeapStart(),
             );
             bind_dx12_graphics_buffers(self.list, pipeline, draw.bindings)?;
-            if !draw.push_constants.is_empty() {
-                self.list.SetGraphicsRoot32BitConstants(
-                    0,
-                    u32::try_from(draw.push_constants.len())
-                        .map_err(|_| HalError::InvalidArgument)?
-                        / 4,
-                    draw.push_constants.as_ptr().cast(),
-                    0,
-                );
-            }
             self.list.IASetPrimitiveTopology(topology);
             self.list.IASetIndexBuffer(Some(&raw const index_view));
-            self.list
-                .ExecuteIndirect(signature, draw.draw_count, indirect_resource, 0, None, 0);
+            self.list.ExecuteIndirect(
+                signature,
+                draw.draw_count,
+                indirect_resource,
+                COUNTER_BUFFER_ELEMENT_OFFSET,
+                Some(indirect_resource),
+                0,
+            );
         }
 
         Ok(())
@@ -1066,6 +1047,10 @@ mod tests {
     fn compute_written_indirect_copy_uses_logical_extent_before_render_pass() {
         assert_eq!(indirect_command_bytes(1), 20);
         assert_eq!(indirect_command_bytes(3), 60);
+        assert_eq!(
+            indirect_command_bytes(3) + COUNTER_BUFFER_ELEMENT_OFFSET,
+            316
+        );
         assert_eq!(validate_indirect_copy_phase(false), Ok(()));
         assert_eq!(
             validate_indirect_copy_phase(true),

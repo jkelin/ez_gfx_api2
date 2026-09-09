@@ -1,6 +1,7 @@
 //! Vulkan frame command recording for compute, graphics, readback, and present.
 
 use super::{HalError, VulkanEncoding, vk};
+use ez_gfx_hal::COUNTER_BUFFER_ELEMENT_OFFSET;
 
 pub(super) fn record_compute(
     encoding: &VulkanEncoding<'_>,
@@ -28,15 +29,6 @@ pub(super) fn record_compute(
             &[public, texture_set],
             &[],
         );
-        if !dispatch.push_constants.is_empty() {
-            encoding.device.cmd_push_constants(
-                encoding.command,
-                dispatch.pipeline.layout,
-                vk::ShaderStageFlags::ALL,
-                0,
-                dispatch.push_constants,
-            );
-        }
         encoding.device.cmd_dispatch(
             encoding.command,
             dispatch.groups[0],
@@ -102,17 +94,10 @@ pub(super) fn record_graphics(
             0,
             vk::IndexType::UINT32,
         );
-        if !draw.push_constants.is_empty() {
-            encoding.device.cmd_push_constants(
-                encoding.command,
-                draw.pipeline.layout,
-                vk::ShaderStageFlags::ALL,
-                0,
-                draw.push_constants,
-            );
-        }
-        encoding.device.cmd_draw_indexed_indirect(
+        encoding.device.cmd_draw_indexed_indirect_count(
             encoding.command,
+            draw.indirect_buffer.buffer,
+            COUNTER_BUFFER_ELEMENT_OFFSET,
             draw.indirect_buffer.buffer,
             0,
             draw.draw_count,

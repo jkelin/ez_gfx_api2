@@ -19,9 +19,9 @@ fn reflected_workgroup_size_controls_metal_invocation_count() {
     std::fs::write(
         &source,
         r#"[__AttributeUsage(_AttributeTargets.Var)]
-struct StructuredBufferAttribute { string name; };
+struct BufferAttribute { string name; };
 
-[StructuredBuffer("values")]
+[Buffer("values")]
 RWStructuredBuffer<uint> values;
 
 [shader("compute")]
@@ -66,7 +66,6 @@ void computemain(uint3 id : SV_DispatchThreadID) {
         pipeline: &pipeline,
         groups: [1, 1, 1],
         threads_per_group,
-        push_constants: &[],
         bindings: std::slice::from_ref(&native_binding),
         texture_heap: None,
         textures: &[],
@@ -96,13 +95,13 @@ fn compute_stage_samples_the_metal_texture_heap() {
     std::fs::write(
         &source,
         r#"[__AttributeUsage(_AttributeTargets.Var)]
-struct StructuredBufferAttribute { string name; };
+struct BufferAttribute { string name; };
 [__AttributeUsage(_AttributeTargets.Var)]
 struct BindlessTextureHeapAttribute { int capacity; };
 struct TextureEntry { Texture2D<float4> texture; SamplerState sampler; };
 struct TextureHeap { TextureEntry entries[1024]; };
 
-[StructuredBuffer("values")]
+[Buffer("values")]
 RWStructuredBuffer<uint> values;
 [BindlessTextureHeap(1024)]
 ParameterBlock<TextureHeap> texture_heap;
@@ -181,7 +180,6 @@ void computemain(uint3 id : SV_DispatchThreadID) {
         pipeline: &pipeline,
         groups: [1, 1, 1],
         threads_per_group: runtime.compute_workgroup_size().unwrap(),
-        push_constants: &[],
         bindings: std::slice::from_ref(&native_binding),
         texture_heap: Some(texture_heap),
         textures: &textures,

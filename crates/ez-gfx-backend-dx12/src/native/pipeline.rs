@@ -13,10 +13,9 @@ use super::{
     D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, D3D12_LOGIC_OP_NOOP,
     D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE, D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT,
     D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_RASTERIZER_DESC, D3D12_RENDER_TARGET_BLEND_DESC,
-    D3D12_ROOT_CONSTANTS, D3D12_ROOT_DESCRIPTOR, D3D12_ROOT_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER,
-    D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-    D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER_TYPE_SRV,
-    D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_ROOT_SIGNATURE_DESC,
+    D3D12_ROOT_DESCRIPTOR, D3D12_ROOT_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER,
+    D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+    D3D12_ROOT_PARAMETER_TYPE_SRV, D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_ROOT_SIGNATURE_DESC,
     D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, D3D12_ROOT_SIGNATURE_FLAG_NONE,
     D3D12_SHADER_BYTECODE, D3D12_SHADER_VISIBILITY_ALL, D3D12_STENCIL_OP_KEEP,
     D3D12SerializeRootSignature, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
@@ -70,18 +69,7 @@ impl NativeContext {
             RegisterSpace: 1,
             OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
         };
-        let mut parameters = Vec::with_capacity(descriptor_count + 3);
-        parameters.push(D3D12_ROOT_PARAMETER {
-            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-            Anonymous: D3D12_ROOT_PARAMETER_0 {
-                Constants: D3D12_ROOT_CONSTANTS {
-                    ShaderRegister: 0,
-                    RegisterSpace: 0,
-                    Num32BitValues: 32,
-                },
-            },
-            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-        });
+        let mut parameters = Vec::with_capacity(descriptor_count + 2);
         let mut writable = Vec::with_capacity(descriptor_count);
         for layout in layouts {
             if layout.descriptor_count == 0 || layout.descriptor_count > 2 {

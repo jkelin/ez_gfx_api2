@@ -4,7 +4,7 @@
 
 ## Lifecycle
 
-`Context::new` returns the creator-thread-affine owner. `Context::create_surface` atomically creates the native surface, initializes the device, and applies the initial extent; failure rolls back the unpublished surface. Persistent resources retain context and parent leases. Their `Drop` implementations delegate release to the internal raw seam, so safe Rust exposes no destroy, release, remove, or free functions.
+`Context::new` returns the creator-thread-affine owner without a surface-platform setting. `Context::create_surface_window` accepts `raw-window-handle` and queries the native drawable extent; `Context::create_surface_headless` accepts an explicit extent. Both initialize atomically and roll back unpublished surfaces on failure. `Context::destroy` and context owner drop invalidate and destroy every context-owned resource, including live surfaces. Texture wrappers do not unload context-owned heap entries when dropped.
 
 `Surface::begin_frame()` returns one target-less recording transaction. `Frame::configure_swapchain(size, format)` attaches the surface and yields its logical render target. `Context::begin_frame()` plus `Frame::configure_render_target(name, size, format)` selects a cached named target; extent or format changes recreate its native image. Recording requires `&mut Frame`. `Frame::finish(self)` consumes the transaction and preserves exact errors. Dropping an unfinished frame aborts because `Drop` cannot return errors.
 
@@ -32,4 +32,4 @@ The context-owned index heap is lazy behind `Context::upload_indices`. `Context:
 | [04 Dear ImGui](https://github.com/jkelin/ez_gfx_api2/blob/main/examples/04_imgui/README.md) | Dynamic UI buffers and per-command clipping |
 | [05 Helmet](https://github.com/jkelin/ez_gfx_api2/blob/main/examples/05_helmet/README.md) | GLB geometry and depth-tested rendering |
 | [06 Sponza KTX2](https://github.com/jkelin/ez_gfx_api2/blob/main/examples/06_sponza_ktx2/README.md) | KTX2 materials and compute-to-graphics flow |
-| [C textured cube](../../examples/02_textured_cube_c/README.md) | ABI 34 typed-heap, one-frame compute-to-graphics indexed-indirect cube |
+| [C textured cube](../../examples/02_textured_cube_c/README.md) | ABI 35 typed-heap, one-frame compute-to-graphics indexed-indirect cube |

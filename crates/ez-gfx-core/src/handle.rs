@@ -263,13 +263,13 @@ define_typed_handle!(
     "A validated shader handle."
 );
 define_typed_handle!(
-    IndirectBufferHandle,
+    CounterBufferHandle,
     HandleParts::Child { .. },
     ExpectedResource,
     "A validated indirect-command-buffer handle."
 );
 define_typed_handle!(
-    StructuredBufferHandle,
+    BufferHandle,
     HandleParts::Child { .. },
     ExpectedResource,
     "A validated structured-buffer handle."

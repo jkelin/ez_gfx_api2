@@ -1,12 +1,12 @@
 // Shared semantic declarations for every ez-gfx shader target.
 [__AttributeUsage(_AttributeTargets.Var)]
-struct StructuredBufferAttribute { string name; }
+struct BufferAttribute { string name; }
 
 [__AttributeUsage(_AttributeTargets.Var)]
 struct VertexHeapAttribute { string name; }
 
 [__AttributeUsage(_AttributeTargets.Var)]
-struct IndirectBufferAttribute { string name; }
+struct CounterBufferAttribute { string name; }
 
 [__AttributeUsage(_AttributeTargets.Var)]
 struct ColorTargetAttribute { string name; string access; }
@@ -16,6 +16,34 @@ struct BindlessTextureHeapAttribute { int capacity; }
 
 [__AttributeUsage(_AttributeTargets.Var)]
 struct DepthPipelineAttribute {}
+
+/// Two-descriptor counter storage: an atomic count followed by typed elements.
+struct CounterBuffer<T> {
+    RWStructuredBuffer<uint> count;
+    RWStructuredBuffer<T> elements;
+
+    [ForceInline]
+    void set_count(uint value) {
+        count[0] = value;
+    }
+
+    [ForceInline]
+    uint add_count(uint value) {
+        uint previous;
+        InterlockedAdd(count[0], value, previous);
+        return previous;
+    }
+
+    [ForceInline]
+    void set(uint index, T value) {
+        elements[index] = value;
+    }
+
+    [ForceInline]
+    T get(uint index) {
+        return elements[index];
+    }
+};
 
 static const uint EZ_GFX_MAX_TEXTURES = 1024;
 

@@ -154,10 +154,10 @@ fn exercise_backend(backend: u8) {
     let native = if backend == 1 {
         TestContext::create_with_validation(backend, true)
     } else {
-        TestContext::create(backend)
+        TestContext::create_with_validation(backend, false)
     };
     #[cfg(target_vendor = "apple")]
-    let native = TestContext::create(backend);
+    let native = TestContext::create_with_validation(backend, false);
     let context = ContextHandle::from_raw(native.context).unwrap();
     let surface = SurfaceHandle::from_raw(native.surface).unwrap();
     assert_eq!(surface_extent(context, surface).unwrap(), (64, 64));
@@ -1098,19 +1098,18 @@ impl Quad {
     }
 
     fn record(&self, texture_id: u32, capture: bool) {
-        // Use a previously resolved stable binding to exercise queued updates without CPU polling.
-        let mut push = [0_u8; 80];
+        let mut params = [0_u8; 80];
         for diagonal in [0, 5, 10, 15] {
-            push[diagonal * 4..diagonal * 4 + 4].copy_from_slice(&1.0_f32.to_ne_bytes());
+            params[diagonal * 4..diagonal * 4 + 4].copy_from_slice(&1.0_f32.to_ne_bytes());
         }
-        push[64..68].copy_from_slice(&texture_id.to_ne_bytes());
+        params[64..68].copy_from_slice(&texture_id.to_ne_bytes());
         assert_eq!(
             set_snapshot_cache(self.context, self.surface, capture),
             Ok(())
         );
         assert_eq!(begin_render(self.context, self.surface), Ok(()));
-        let indirect = acquire_indirect(self.context, 1).unwrap();
-        write_indirect(
+        let indirect = acquire_counter(self.context, 1).unwrap();
+        write_counter_commands(
             self.context,
             indirect,
             0,
@@ -1123,15 +1122,21 @@ impl Quad {
             }],
         )
         .unwrap();
+        let params_size = u32::try_from(params.len()).unwrap();
+        let params_buffer = acquire_buffer_raw(self.context, params_size, 1).unwrap();
+        write_buffer_raw(self.context, params_buffer, 0, 1, params_size, &params).unwrap();
+        let bindings = [PublicBinding {
+            name: "params".into(),
+            resource: ResourceIdentity::Buffer(params_buffer),
+        }];
         assert_eq!(
-            render_add_graphics(
+            execute_graphics(
                 self.context,
                 self.shader,
                 indirect,
-                &[],
+                &bindings,
                 // Disable culling: Vulkan and DX12 may use opposite framebuffer Y conventions.
                 DynamicPipelineState::from_abi(0, 0, 0, 0).unwrap(),
-                &push,
             ),
             Ok(())
         );

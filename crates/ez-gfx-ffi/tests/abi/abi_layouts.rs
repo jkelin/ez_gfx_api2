@@ -12,9 +12,8 @@ use super::*;
     reason = "sequential layout assertions share one ABI contract; splitting would hide drift"
 )]
 fn layouts_are_stable() {
-    // ABI 26 appends the adapter selector pair to both creation descriptors.
-    // Earlier fields keep their offsets; the trailing pointer raises size and
-    // alignment to the pointer width.
+    // ABI 35 removes the surface platform from context descriptors and splits
+    // window and headless surface creation into distinct layouts.
     assert_eq!(
         (
             size_of::<EzGfxContextDesc>(),
@@ -26,12 +25,11 @@ fn layouts_are_stable() {
         [
             offset_of!(EzGfxContextDesc, enable_debug),
             offset_of!(EzGfxContextDesc, enable_validation),
-            offset_of!(EzGfxContextDesc, surface_platform),
             offset_of!(EzGfxContextDesc, texture_decode_workers),
             offset_of!(EzGfxContextDesc, adapter_count),
-            offset_of!(EzGfxContextDesc, adapter)
+            offset_of!(EzGfxContextDesc, adapter),
         ],
-        [0, 1, 2, 4, 8, 16]
+        [0, 1, 4, 8, 16]
     );
     assert_eq!(
         (
@@ -44,13 +42,12 @@ fn layouts_are_stable() {
         [
             offset_of!(EzGfxBackendContextDesc, enable_debug),
             offset_of!(EzGfxBackendContextDesc, enable_validation),
-            offset_of!(EzGfxBackendContextDesc, surface_platform),
             offset_of!(EzGfxBackendContextDesc, backend),
             offset_of!(EzGfxBackendContextDesc, texture_decode_workers),
             offset_of!(EzGfxBackendContextDesc, adapter_count),
-            offset_of!(EzGfxBackendContextDesc, adapter)
+            offset_of!(EzGfxBackendContextDesc, adapter),
         ],
-        [0, 1, 2, 3, 4, 8, 16]
+        [0, 1, 2, 4, 8, 16]
     );
     assert_eq!(
         (
@@ -86,21 +83,33 @@ fn layouts_are_stable() {
     );
     assert_eq!(
         (
-            size_of::<EzGfxSurfaceDesc>(),
-            align_of::<EzGfxSurfaceDesc>()
+            size_of::<EzGfxWindowSurfaceDesc>(),
+            align_of::<EzGfxWindowSurfaceDesc>()
         ),
-        (32, 8)
+        (24, 8)
     );
     assert_eq!(
         [
-            offset_of!(EzGfxSurfaceDesc, window),
-            offset_of!(EzGfxSurfaceDesc, display),
-            offset_of!(EzGfxSurfaceDesc, platform),
-            offset_of!(EzGfxSurfaceDesc, width),
-            offset_of!(EzGfxSurfaceDesc, height),
-            offset_of!(EzGfxSurfaceDesc, cache_presented_snapshots)
+            offset_of!(EzGfxWindowSurfaceDesc, window),
+            offset_of!(EzGfxWindowSurfaceDesc, display),
+            offset_of!(EzGfxWindowSurfaceDesc, cache_presented_snapshots),
         ],
-        [0, 8, 16, 20, 24, 28]
+        [0, 8, 16]
+    );
+    assert_eq!(
+        (
+            size_of::<EzGfxHeadlessSurfaceDesc>(),
+            align_of::<EzGfxHeadlessSurfaceDesc>()
+        ),
+        (12, 4)
+    );
+    assert_eq!(
+        [
+            offset_of!(EzGfxHeadlessSurfaceDesc, width),
+            offset_of!(EzGfxHeadlessSurfaceDesc, height),
+            offset_of!(EzGfxHeadlessSurfaceDesc, cache_presented_snapshots),
+        ],
+        [0, 4, 8]
     );
     assert_eq!(
         (size_of::<EzGfxShaderDesc>(), align_of::<EzGfxShaderDesc>()),
@@ -337,8 +346,10 @@ fn all_public_export_signatures_are_stable() {
         ffi::ez_gfx_adapter_query;
     let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_context_wait_idle;
     let _: extern "C" fn(Handle) = ffi::ez_gfx_context_destroy;
-    let _: unsafe extern "C" fn(Handle, *const EzGfxSurfaceDesc, *mut Handle) -> Status =
-        ffi::ez_gfx_surface_create;
+    let _: unsafe extern "C" fn(Handle, *const EzGfxWindowSurfaceDesc, *mut Handle) -> Status =
+        ffi::ez_gfx_surface_create_window;
+    let _: unsafe extern "C" fn(Handle, *const EzGfxHeadlessSurfaceDesc, *mut Handle) -> Status =
+        ffi::ez_gfx_surface_create_headless;
     let _: extern "C" fn(Handle, Handle) -> Status = ffi::ez_gfx_context_init_device;
     let _: extern "C" fn(Handle, Handle, u32, u32) -> Status = ffi::ez_gfx_surface_resize;
     let _: unsafe extern "C" fn(Handle, Handle, *mut u32, *mut u32) -> Status =
@@ -392,29 +403,17 @@ fn all_public_export_signatures_are_stable() {
     ) -> Status = ffi::ez_gfx_counter_buffer_write_draws;
     let _: extern "C" fn(Handle, Handle, u32) -> Status = ffi::ez_gfx_counter_buffer_publish_count;
     let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_counter_buffer_release;
+    let _: unsafe extern "C" fn(Handle, Handle, *const EzGfxBinding) -> Status =
+        ffi::ez_gfx_frame_bind;
     let _: unsafe extern "C" fn(
         Handle,
         Handle,
         Handle,
         Handle,
-        *const EzGfxBinding,
-        u32,
         *const EzGfxDynamicState,
-        *const c_void,
-        u32,
-    ) -> Status = ffi::ez_gfx_frame_add_vertex_pipeline;
-    let _: unsafe extern "C" fn(
-        Handle,
-        Handle,
-        Handle,
-        u32,
-        u32,
-        u32,
-        *const EzGfxBinding,
-        u32,
-        *const c_void,
-        u32,
-    ) -> Status = ffi::ez_gfx_frame_add_compute_pipeline;
+    ) -> Status = ffi::ez_gfx_frame_execute_graphics;
+    let _: extern "C" fn(Handle, Handle, Handle, u32, u32, u32) -> Status =
+        ffi::ez_gfx_frame_execute_compute;
     let _: unsafe extern "C" fn(Handle, Handle, Handle, *mut u64) -> Status =
         ffi::ez_gfx_frame_enqueue_texture_readback;
     let _: extern "C" fn(Handle, Handle) -> Status = ffi::ez_gfx_frame_end;
@@ -439,6 +438,14 @@ fn all_public_export_signatures_are_stable() {
     let _: unsafe extern "C" fn(Handle, Handle, u32, *const c_void, u32, u32) -> Status =
         ffi::ez_gfx_buffer_write;
     let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_buffer_release;
+    let _: unsafe extern "C" fn(
+        Handle,
+        *const c_void,
+        u32,
+        *const u8,
+        usize,
+        *mut Handle,
+    ) -> Status = ffi::ez_gfx_value_buffer_acquire;
     let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_surface_destroy;
     let _: unsafe extern "C" fn(u64, *mut EzGfxHandleParts) -> Status = ffi::ez_gfx_handle_inspect;
     let _: unsafe extern "C" fn(*const u8, usize, *mut u8) -> Status = ffi::ez_gfx_semantic_id;
@@ -455,6 +462,58 @@ fn shader_load_v19_signature_and_boundary_validation_are_stable() {
         EzGfxResult::InvalidArgument
     );
     assert_eq!(shader, 99);
+}
+
+#[test]
+fn value_buffer_rejects_invalid_boundaries_without_writing_output() {
+    let value = 7_u32;
+    let name = b"value";
+    let mut buffer = 91_u64;
+    for (pointer, size, output) in [
+        (core::ptr::null(), 4, &raw mut buffer),
+        ((&raw const value).cast::<c_void>(), 0, &raw mut buffer),
+        (
+            (&raw const value).cast::<c_void>(),
+            u32::try_from(ffi::EZ_GFX_MAX_BOUNDARY_BYTES + 1).unwrap(),
+            &raw mut buffer,
+        ),
+        (
+            (&raw const value).cast::<c_void>(),
+            4,
+            core::ptr::null_mut(),
+        ),
+    ] {
+        assert_eq!(
+            // SAFETY: Live pointers cover their declared four-byte value; invalid pairs are rejected before access.
+            unsafe {
+                ffi::ez_gfx_value_buffer_acquire(
+                    0,
+                    pointer,
+                    size,
+                    name.as_ptr(),
+                    name.len(),
+                    output,
+                )
+            },
+            EzGfxResult::InvalidArgument
+        );
+    }
+    assert_eq!(buffer, 91);
+    assert_eq!(
+        // SAFETY: All pointer ranges are live and aligned; the invalid context is rejected before allocation.
+        unsafe {
+            ffi::ez_gfx_value_buffer_acquire(
+                0,
+                (&raw const value).cast(),
+                4,
+                name.as_ptr(),
+                name.len(),
+                &raw mut buffer,
+            )
+        },
+        EzGfxResult::InvalidContext
+    );
+    assert_eq!(buffer, 91);
 }
 
 #[test]
@@ -568,22 +627,14 @@ fn optional_and_nested_counted_strings_enforce_the_same_contract() {
         render_target: 0,
     };
     assert_eq!(
-        // SAFETY: The binding and its non-terminated exact name range remain readable for the call.
-        unsafe {
-            ffi::ez_gfx_frame_add_compute_pipeline(
-                0,
-                0,
-                child_handle,
-                1,
-                1,
-                1,
-                &raw const binding,
-                1,
-                core::ptr::null(),
-                0,
-            )
-        },
+        // SAFETY: The binding and its exact non-terminated name remain readable for the call.
+        unsafe { ffi::ez_gfx_frame_bind(0, 0, &raw const binding) },
         EzGfxResult::InvalidContext
+    );
+    assert_eq!(
+        // SAFETY: Null intentionally exercises pointer validation.
+        unsafe { ffi::ez_gfx_frame_bind(0, 0, core::ptr::null()) },
+        EzGfxResult::InvalidArgument
     );
 
     let invalid_utf8 = [0xff_u8];
@@ -591,10 +642,7 @@ fn optional_and_nested_counted_strings_enforce_the_same_contract() {
     for (name, name_length) in [
         (core::ptr::null(), 1),
         (binding_name.as_ptr(), 0),
-        (
-            binding_name.as_ptr(),
-            ffi::EZ_GFX_MAX_BOUNDARY_BYTES.saturating_add(1),
-        ),
+        (binding_name.as_ptr(), 256),
         (invalid_utf8.as_ptr(), invalid_utf8.len()),
         (embedded_nul.as_ptr(), embedded_nul.len()),
     ] {
@@ -605,20 +653,7 @@ fn optional_and_nested_counted_strings_enforce_the_same_contract() {
         };
         assert_eq!(
             // SAFETY: The binding is readable; valid name pointers own their declared ranges, while null and oversized ranges are rejected before dereference.
-            unsafe {
-                ffi::ez_gfx_frame_add_compute_pipeline(
-                    0,
-                    0,
-                    child_handle,
-                    1,
-                    1,
-                    1,
-                    &raw const invalid_binding,
-                    1,
-                    core::ptr::null(),
-                    0,
-                )
-            },
+            unsafe { ffi::ez_gfx_frame_bind(0, 0, &raw const invalid_binding) },
             EzGfxResult::InvalidArgument
         );
     }

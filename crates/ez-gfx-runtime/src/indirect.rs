@@ -72,23 +72,6 @@ impl IndexedIndirectBuffer {
         Ok(())
     }
 
-    /// Publishes the active count written by a GPU producer.
-    ///
-    /// CPU writes publish their range through [`Self::write_batch`]. This
-    /// explicit path exists only because GPU command generation cannot update
-    /// the CPU-side publication metadata.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`IndirectError::OutOfBounds`] if `count` exceeds capacity.
-    pub fn publish_generated_count(&mut self, count: u32) -> Result<(), IndirectError> {
-        if count as usize > self.commands.len() {
-            return Err(IndirectError::OutOfBounds);
-        }
-        self.draw_count = count;
-        Ok(())
-    }
-
     pub(crate) fn reset(&mut self) {
         self.draw_count = 0;
     }
@@ -96,6 +79,14 @@ impl IndexedIndirectBuffer {
     /// Returns the number of commands currently published for drawing.
     pub const fn draw_count(&self) -> u32 {
         self.draw_count
+    }
+    /// Returns the allocated indirect-command capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the allocated storage exceeds the u32 index space.
+    pub fn capacity(&self) -> u32 {
+        u32::try_from(self.commands.len()).expect("capacity originates from u32")
     }
     /// Returns the published prefix of the command storage.
     pub fn commands(&self) -> &[DrawIndexedCommand] {

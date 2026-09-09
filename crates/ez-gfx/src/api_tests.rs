@@ -11,6 +11,7 @@ assert_not_impl_any!(VertexAllocation<u32>: Send, Sync);
 assert_not_impl_any!(IndexAllocation: Send, Sync);
 assert_not_impl_any!(Buffer<u32>: Send, Sync);
 assert_not_impl_any!(CounterBuffer<ez_gfx_runtime::indirect::DrawIndexedCommand>: Send, Sync);
+assert_not_impl_any!(ValueBuffer<u32>: Send, Sync);
 assert_not_impl_any!(Frame: Send, Sync);
 
 #[test]
@@ -34,6 +35,22 @@ fn buffer_data_views_scalar_slice_and_vec_without_copying() {
     assert_eq!(vec_view.as_ptr(), values.as_ptr());
 }
 
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn value_buffer_stores_exactly_one_pod_value() -> Result<()> {
+    let (context, _surface) = headless()?;
+    let value = [7_u32, 11];
+
+    let buffer = context.acquire_value_buffer(value)?;
+
+    assert_eq!(buffer.inner.element_count, 1);
+    assert_eq!(
+        buffer.inner.bytes.borrow().as_slice(),
+        bytemuck::bytes_of(&value)
+    );
+    Ok(())
+}
+
 #[cfg(windows)]
 thread_local! {
     static LATE_CONTEXT: std::cell::RefCell<Option<Context>> = const {
@@ -44,19 +61,11 @@ thread_local! {
 #[cfg(not(target_vendor = "apple"))]
 fn headless() -> Result<(Context, Surface)> {
     let options =
-        ez_gfx_runtime::ContextOptions::new_for_backend(0, 0, 3, ez_gfx_core::Backend::Vulkan)
+        ez_gfx_runtime::ContextOptions::new_for_backend(0, 0, ez_gfx_core::Backend::Vulkan)
             .map_err(|_| Error::InvalidArgument)?;
     let context = Context::new(options)?;
-    let surface = context.create_surface(
-        ez_gfx_runtime::SurfaceOptions::new(
-            0,
-            0,
-            ez_gfx_runtime::SurfacePlatform::Headless,
-            1,
-            1,
-            0,
-        )
-        .map_err(|_| Error::InvalidArgument)?,
+    let surface = context.create_surface_headless(
+        ez_gfx_runtime::HeadlessSurfaceOptions::new(1, 1, 0).map_err(|_| Error::InvalidArgument)?,
     )?;
     Ok((context, surface))
 }
@@ -249,44 +258,18 @@ fn buffer_sources_infer_scalar_slice_and_vec_elements() -> Result<()> {
 
 #[cfg(not(target_vendor = "apple"))]
 #[test]
-fn claimed_buffer_is_single_frame_and_same_frame_reuses_materialization() -> Result<()> {
+fn replacing_unexecuted_binding_leaves_both_buffers_writable_after_abort() -> Result<()> {
     let (context, surface) = headless()?;
-    let structured = context.acquire_buffer_from([7_u32, 8].as_slice())?;
-    let draw = ez_gfx_runtime::indirect::DrawIndexedCommand {
-        index_count: 3,
-        instance_count: 1,
-        first_index: 0,
-        vertex_offset: 0,
-        first_instance: 0,
-    };
-    let counter = context.acquire_counter_buffer_from(BufferSource::one(&draw))?;
-    let mut first = surface.begin_frame()?;
-    let first_handle = first.materialize_structured(&structured.inner)?;
-    let counter_handle = first.materialize_counter(&counter.inner)?;
+    let first = context.acquire_buffer_from([7_u32].as_slice())?;
+    let replacement = context.acquire_buffer_from([8_u32].as_slice())?;
+    let mut frame = surface.begin_frame()?;
 
-    assert_eq!(
-        first.materialize_structured(&structured.inner)?,
-        first_handle
-    );
-    assert_eq!(first.materialize_counter(&counter.inner)?, counter_handle);
-    assert_eq!(structured.write(0, &[9]), Err(Error::NotReady));
-    assert_eq!(counter.publish_count(1), Err(Error::NotReady));
-    assert_eq!(first.finish(), Err(Error::NotReady));
-    assert!(structured.inner.usage.get() == BufferUse::Consumed);
-    assert!(counter.inner.usage.get() == BufferUse::Consumed);
-    assert_eq!(structured.write(0, &[9]), Err(Error::NotReady));
-    assert_eq!(counter.write(0, &[draw]), Err(Error::NotReady));
+    frame.bind_buffer("value", &first)?;
+    frame.bind_buffer("value", &replacement)?;
+    first.write(0, &[9])?;
+    drop(frame);
 
-    let mut later = surface.begin_frame()?;
-    assert_eq!(
-        later.materialize_structured(&structured.inner),
-        Err(Error::NotReady)
-    );
-    assert_eq!(
-        later.materialize_counter(&counter.inner),
-        Err(Error::NotReady)
-    );
-    drop(later);
+    replacement.write(0, &[10])?;
     Ok(())
 }
 
@@ -294,46 +277,42 @@ fn claimed_buffer_is_single_frame_and_same_frame_reuses_materialization() -> Res
 #[test]
 fn failed_atomic_surface_creation_does_not_block_later_surface() -> Result<()> {
     let options =
-        ez_gfx_runtime::ContextOptions::new_for_backend(0, 0, 3, ez_gfx_core::Backend::Vulkan)
+        ez_gfx_runtime::ContextOptions::new_for_backend(0, 0, ez_gfx_core::Backend::Vulkan)
             .map_err(|_| Error::InvalidArgument)?;
     let context = Context::new(options)?;
-    let invalid = ez_gfx_runtime::SurfaceOptions {
-        window: 0,
-        display: 0,
-        platform: ez_gfx_runtime::SurfacePlatform::Headless,
+    let invalid = ez_gfx_runtime::HeadlessSurfaceOptions {
         width: 0,
         height: 0,
         cache_presented_snapshots: false,
     };
     assert_eq!(
-        context.create_surface(invalid).err(),
+        context.create_surface_headless(invalid).err(),
         Some(Error::InvalidArgument)
     );
 
-    let valid = ez_gfx_runtime::SurfaceOptions::new(
-        0,
-        0,
-        ez_gfx_runtime::SurfacePlatform::Headless,
-        1,
-        1,
-        0,
-    )
-    .map_err(|_| Error::InvalidArgument)?;
-    let surface = context.create_surface(valid)?;
+    let valid =
+        ez_gfx_runtime::HeadlessSurfaceOptions::new(1, 1, 0).map_err(|_| Error::InvalidArgument)?;
+    let surface = context.create_surface_headless(valid)?;
     assert_eq!(surface.extent(), Ok((1, 1)));
     Ok(())
 }
 
 #[cfg(not(target_vendor = "apple"))]
 #[test]
-fn close_returns_ownership_until_child_leases_are_gone() -> Result<()> {
+fn destroy_invalidates_live_child_resources() -> Result<()> {
     let (context, surface) = headless()?;
-    let (returned, error) = context.close().expect_err("surface retains context");
-    assert_eq!(error, Error::NotReady);
-    let context = returned.expect("recoverable close returns ownership");
+    context.destroy()?;
+    assert_eq!(surface.extent(), Err(Error::InvalidContext));
+    Ok(())
+}
 
-    drop(surface);
-    context.close().map_err(|(_, error)| error)
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn context_drop_invalidates_live_child_resources() -> Result<()> {
+    let (context, surface) = headless()?;
+    drop(context);
+    assert_eq!(surface.extent(), Err(Error::InvalidContext));
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -341,13 +320,9 @@ fn close_returns_ownership_until_child_leases_are_gone() -> Result<()> {
 fn context_drop_after_state_tls_teardown_does_not_panic() {
     std::thread::spawn(|| {
         LATE_CONTEXT.with(|slot| {
-            let options = ez_gfx_runtime::ContextOptions::new_for_backend(
-                0,
-                0,
-                3,
-                ez_gfx_core::Backend::Vulkan,
-            )
-            .expect("valid options");
+            let options =
+                ez_gfx_runtime::ContextOptions::new_for_backend(0, 0, ez_gfx_core::Backend::Vulkan)
+                    .expect("valid options");
             *slot.borrow_mut() = Some(Context::new(options).expect("context"));
         });
     })

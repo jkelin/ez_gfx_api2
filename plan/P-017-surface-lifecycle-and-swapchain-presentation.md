@@ -77,7 +77,7 @@ Bundle `winit` directly into `ez_gfx_api` so calling `ez_gfx_create_window()` cr
 
 #### Approach and integration
 
-Maintain original Odin descriptor: `EzGfxSurfaceDesc` with raw `void* window`, `void* display`, and an enum `EzGfxSurfacePlatform (Win32, GLFW)`.
+Keep a C-only descriptor that tags opaque native pointers with a platform discriminator.
 
 #### Performance evidence
 
@@ -110,11 +110,13 @@ Maintain original Odin descriptor: `EzGfxSurfaceDesc` with raw `void* window`, `
 ### Selection rationale
 
 The selected surface lifecycle:
-1. accepts standard borrowed native handles while an owning `Surface` retains its context/resource lease;
-2. leaves OS window, event-loop, resize observation, and input ownership with the host;
-3. destroys the unpublished raw surface after any native-creation, initialization, or initial-resize failure;
-4. returns `NotReady` from `begin_frame` for zero drawable extent; and
-5. presents only through `Frame::finish(self)`, preserving the exact submit or present error.
+1. accepts a borrowed `HasWindowHandle` for window surfaces and a distinct explicit-extent headless constructor;
+2. derives the native integration from `RawWindowHandle` without platform fields in context or surface options;
+3. reads the initial drawable extent from the native window after device initialization;
+4. leaves OS window, event-loop, resize observation, and input ownership with the host;
+5. destroys the unpublished raw surface after any native-creation, initialization, or extent-query failure;
+6. returns `NotReady` from `begin_frame` for zero drawable extent; and
+7. presents only through `Frame::finish(self)`, preserving the exact submit or present error.
 
 ### Rejected alternatives
 
@@ -127,7 +129,7 @@ Minimization detection eliminates rendering and swapchain acquire work while the
 
 ### Key assumptions
 
-- The host keeps native window/display objects alive while `Surface` exists and forwards observed resize state.
+- The host keeps the object implementing `HasWindowHandle` alive while `Surface` exists and forwards later resize state.
 - The underlying display subsystem supports the selected backend's presentation mechanism.
 
 ### Risks and mitigations

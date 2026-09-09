@@ -110,9 +110,9 @@ Treat compiler output validation, serialized reflection, API-shape checks, and C
 
 ### Selection rationale
 
-The initial vertical slice established an end-to-end executable path before backend expansion. Final Rust examples use the shared `Example` host for process options, winit inversion, native window, resize, input, pacing, benchmark, capture, and reporting. `Example::new` returns only the host; each main visibly creates its `Context` with `Context::new(ContextOptions { .. })` and `Surface` with `context.create_surface(SurfaceOptions { .. })` so each main directly owns both graphics objects. Each procedural loop passes `&Surface` to receive `WindowFrame`, explicitly begins and configures the swapchain transaction, records through `&mut Frame`, then calls `Example::handle_frame(frame, swapchain_target)`.
+The initial vertical slice established an end-to-end executable path before backend expansion. Final Rust examples use the shared `Example` host for process options, winit inversion, native window, resize, input, pacing, benchmark, capture, and reporting. `Example::new` returns only the host; each main visibly creates a platform-free `Context` and calls `context.create_surface_window(example.window()?, ...)`. The surface constructor uses `raw-window-handle` and reads the initial native extent. Each procedural loop passes `&Surface` to receive `WindowFrame`, explicitly begins and configures the swapchain transaction, records through `&mut Frame`, then calls `Example::handle_frame(frame, swapchain_target)`.
 
-The safe cutover is ownership-only: resources release through `Drop`, `Frame::finish(self)` is consuming, unfinished frames abort on `Drop`, and no compatibility aliases retain manual safe destruction or the former multiple begin/end paths. ABI 34 keeps explicit C lifecycle functions over opaque generational handles.
+The safe cutover is context-owned: `Context::destroy` and context drop invalidate and release all remaining resources, including surfaces and retained texture-heap entries. Texture wrapper drop does not unload its stable bindless entry. Frames bind `Buffer`, `CounterBuffer`, and `ValueBuffer` by shader-declared name in a replaceable frame-local set that persists across execute calls; single values bind as value buffers rather than push constants. `Frame::finish(self)` is consuming, unfinished frames abort on `Drop`, and no compatibility aliases retain manual safe destruction or the former multiple begin/end paths. ABI 36 keeps explicit C lifecycle functions over opaque generational handles while splitting window and headless surface creation.
 
 ### Rejected alternatives
 
@@ -135,5 +135,5 @@ Delivery latency and defect-rate comparisons remain unknown until measured. The 
 
 ### Validation actions
 
-1. Exercise all six renderers through the shared `Example` host with caller-owned `Context` and `Surface`, inner resource scopes, explicit surface drop, error-propagating `Context::close`, and host-only publication in `Example::drop`; publication failure exits nonzero except during an active unwind.
-2. Gate ABI 34 frame end/abort, one-frame buffer invalidation, opaque-handle validation, Rust wrapper drop order, and required Vulkan/DX12/Metal behavior.
+1. Exercise all six renderers through the shared `Example` host with platform-free context creation, `raw-window-handle` surface creation, no artificial resource scopes, context-owned teardown, and host-only publication in `Example::drop`; publication failure exits nonzero except during an active unwind.
+2. Gate ABI 36 window/headless creation, frame end/abort, one-frame buffer invalidation, opaque-handle validation, Rust context destruction, and required Vulkan/DX12/Metal behavior.

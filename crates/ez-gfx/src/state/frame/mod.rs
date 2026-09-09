@@ -5,10 +5,10 @@ use super::dx12_bindings;
 #[cfg(target_vendor = "apple")]
 use super::metal_bindings;
 use super::{
-    Access, Backend, BufferRange, ContextHandle, ContextState, DiagnosticLevel,
-    DynamicPipelineState, Error, ExecutableNode, ExecutionAction, ExecutionBarrier, ExecutionError,
-    ExecutionPass, Format, FrameExecutionBackend, FrameExecutionPlan, FrameNativeResource,
-    GeometryAllocation, HashMap, ImageRange, IndirectBufferHandle, LoadOp,
+    Access, Backend, BufferRange, ContextHandle, ContextState, CounterBufferHandle,
+    DiagnosticLevel, DynamicPipelineState, Error, ExecutableNode, ExecutionAction,
+    ExecutionBarrier, ExecutionError, ExecutionPass, Format, FrameExecutionBackend,
+    FrameExecutionPlan, FrameNativeResource, GeometryAllocation, HashMap, ImageRange, LoadOp,
     MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext, NativePipeline, NativeShader,
     NativeSurface, NativeTexture, NodeDesc, PackedHandle, PassInfo, PipelineKey, QueueKind,
     RenderTargetHandle, RenderTargetRecord, ResourceAccess, ResourceDesc, ResourceId, ResourceKind,
@@ -283,7 +283,7 @@ fn add_binding_accesses(
     bindings: &[ez_gfx_runtime::binding::PublicBinding],
     queue: QueueKind,
     stage: ShaderStage,
-    combined_indirect: Option<IndirectBufferHandle>,
+    combined_indirect: Option<CounterBufferHandle>,
 ) -> Result<NodeDesc> {
     for requirement in layout.requirements() {
         if requirement.kind == ez_gfx_runtime::binding::BindingKind::VertexHeap {
@@ -310,8 +310,8 @@ fn add_binding_accesses(
             .find(|binding| binding.name == requirement.name)
             .ok_or(Error::InvalidArgument)?;
         let handle = match binding.resource {
-            ez_gfx_runtime::binding::ResourceIdentity::Structured(handle) => handle.packed(),
-            ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle) => handle.packed(),
+            ez_gfx_runtime::binding::ResourceIdentity::Buffer(handle) => handle.packed(),
+            ez_gfx_runtime::binding::ResourceIdentity::Counter(handle) => handle.packed(),
             ez_gfx_runtime::binding::ResourceIdentity::RenderTarget(_) => {
                 return Err(Error::Unsupported);
             }
@@ -540,7 +540,7 @@ fn graphics_node(
     context: &mut ContextState,
     layout: &ez_gfx_runtime::binding::ReflectedBindings,
     bindings: &[ez_gfx_runtime::binding::PublicBinding],
-    indirect: IndirectBufferHandle,
+    indirect: CounterBufferHandle,
     pipeline_layout: ez_gfx_runtime::binding::PipelineLayout,
 ) -> Result<NodeDesc> {
     // A bound render target replaces the surface color attachment; depth
@@ -639,7 +639,7 @@ fn graphics_node(
             .find(|binding| binding.name == requirement.name)?;
         matches!(
             binding.resource,
-            ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle) if handle == indirect
+            ez_gfx_runtime::binding::ResourceIdentity::Counter(handle) if handle == indirect
         )
         .then_some(requirement.writable)
     });
@@ -706,13 +706,12 @@ fn add_texture_accesses(
 /// # Errors
 ///
 /// Returns an error when validation, handle ownership, readiness, or a backend operation fails.
-pub fn render_add_graphics(
+pub fn execute_graphics(
     context: ContextHandle,
     shader: ShaderHandle,
-    indirect: IndirectBufferHandle,
+    counter: CounterBufferHandle,
     bindings: &[ez_gfx_runtime::binding::PublicBinding],
     state: DynamicPipelineState,
-    push_constants: &[u8],
 ) -> Result<()> {
     result_status(with_context_mut(context, |context| {
         let shader_handle = shader.packed();
@@ -720,10 +719,10 @@ pub fn render_add_graphics(
             .identity
             .resolve(shader_handle, ResourceKind::Shader)
             .map_err(map_lifecycle)?;
-        let indirect_handle = indirect.packed();
+        let counter_handle = counter.packed();
         context
             .identity
-            .resolve(indirect_handle, ResourceKind::Indirect)
+            .resolve(counter_handle, ResourceKind::CounterBuffer)
             .map_err(map_lifecycle)?;
         validate_binding_handles(context, bindings)?;
         let record = context.shaders.get(&shader).ok_or(Error::InvalidContext)?;
@@ -740,38 +739,33 @@ pub fn render_add_graphics(
         layout
             .validate(bindings)
             .map_err(|_| Error::InvalidArgument)?;
-        let draw_count = context
+        let draw_capacity = context
             .indirects
-            .get(&indirect)
+            .get(&counter)
             .ok_or(Error::InvalidContext)?
-            .draw_count();
-        if draw_count == 0 || push_constants.len() > 128 || !push_constants.len().is_multiple_of(4)
-        {
-            return Err(Error::InvalidArgument);
-        }
+            .capacity();
         let pipeline_layout = *record
             .graphics_layout
             .as_ref()
             .ok_or(Error::InvalidArgument)?;
-        let node = graphics_node(context, &layout, bindings, indirect, pipeline_layout)?;
+        let node = graphics_node(context, &layout, bindings, counter, pipeline_layout)?;
         context
             .frame
             .record_node(
                 node,
                 ExecutableNode::Graphics {
                     shader,
-                    indirect,
-                    draw_count,
+                    counter,
+                    draw_capacity,
                     bindings: bindings.to_vec(),
                     layout,
                     pipeline_layout,
                     state,
-                    push_constants: push_constants.to_vec(),
                 },
             )
             .map_err(|error| map_frame(&error))?;
         mark_transient_bindings_interned(context, bindings)?;
-        mark_transient_interned(context, indirect_handle)?;
+        mark_transient_interned(context, counter_handle)?;
         context.frame_has_graphics = true;
         Ok(())
     }))
@@ -781,12 +775,11 @@ pub fn render_add_graphics(
 /// # Errors
 ///
 /// Returns an error when validation, handle ownership, readiness, or a backend operation fails.
-pub fn render_add_compute(
+pub fn execute_compute(
     context: ContextHandle,
     shader: ShaderHandle,
     groups: [u32; 3],
     bindings: &[ez_gfx_runtime::binding::PublicBinding],
-    push_constants: &[u8],
 ) -> Result<()> {
     result_status(with_context_mut(context, |context| {
         let handle = shader.packed();
@@ -796,10 +789,7 @@ pub fn render_add_compute(
             .map_err(map_lifecycle)?;
         validate_binding_handles(context, bindings)?;
         let record = context.shaders.get(&shader).ok_or(Error::InvalidContext)?;
-        if groups.contains(&0)
-            || push_constants.len() > 128
-            || !push_constants.len().is_multiple_of(4)
-        {
+        if groups.contains(&0) {
             return Err(Error::InvalidArgument);
         }
         let layout = record
@@ -828,7 +818,6 @@ pub fn render_add_compute(
                     groups,
                     bindings: bindings.to_vec(),
                     layout,
-                    push_constants: push_constants.to_vec(),
                 },
             )
             .map_err(|error| map_frame(&error))?;
@@ -843,11 +832,11 @@ fn validate_binding_handles(
 ) -> Result<()> {
     for binding in bindings {
         let (packed, kind) = match binding.resource {
-            ez_gfx_runtime::binding::ResourceIdentity::Structured(handle) => {
-                (handle.packed(), ResourceKind::Structured)
+            ez_gfx_runtime::binding::ResourceIdentity::Buffer(handle) => {
+                (handle.packed(), ResourceKind::Buffer)
             }
-            ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle) => {
-                (handle.packed(), ResourceKind::Indirect)
+            ez_gfx_runtime::binding::ResourceIdentity::Counter(handle) => {
+                (handle.packed(), ResourceKind::CounterBuffer)
             }
             ez_gfx_runtime::binding::ResourceIdentity::RenderTarget(handle) => {
                 context
@@ -881,8 +870,8 @@ fn mark_transient_bindings_interned(
 ) -> Result<()> {
     for binding in bindings {
         let handle = match binding.resource {
-            ez_gfx_runtime::binding::ResourceIdentity::Structured(handle) => handle.packed(),
-            ez_gfx_runtime::binding::ResourceIdentity::Indirect(handle) => handle.packed(),
+            ez_gfx_runtime::binding::ResourceIdentity::Buffer(handle) => handle.packed(),
+            ez_gfx_runtime::binding::ResourceIdentity::Counter(handle) => handle.packed(),
             ez_gfx_runtime::binding::ResourceIdentity::RenderTarget(_) => continue,
         };
         mark_transient_interned(context, handle)?;
@@ -1038,8 +1027,8 @@ fn invalidate_unsafe_transients(context: &mut ContextState) {
     for handle in handles {
         if let Ok(kind) = context.identity.resource_kind(handle) {
             let _ = context.identity.remove(handle, kind);
-            if kind == ResourceKind::Indirect
-                && let Ok(typed) = IndirectBufferHandle::from_packed(handle)
+            if kind == ResourceKind::CounterBuffer
+                && let Ok(typed) = CounterBufferHandle::from_packed(handle)
             {
                 context.indirects.remove(&typed);
             }
@@ -1080,17 +1069,17 @@ fn recycle_consumed_transients(
             .remove(&handle)
             .ok_or(Error::InvalidContext)?;
         match kind {
-            ResourceKind::Structured => context
-                .structured_pool
+            ResourceKind::Buffer => context
+                .buffer_pool
                 .entry(metadata.element_size)
                 .or_insert_with(|| ez_gfx_hal::ReusableStagingPool::new(256))
                 .put(metadata.byte_capacity, allocation, Some(completion)),
-            ResourceKind::Indirect => {
+            ResourceKind::CounterBuffer => {
                 let typed =
-                    IndirectBufferHandle::from_packed(handle).map_err(|_| Error::NativeFailure)?;
+                    CounterBufferHandle::from_packed(handle).map_err(|_| Error::NativeFailure)?;
                 context.indirects.remove(&typed);
                 context
-                    .indirect_pool
+                    .counter_pool
                     .put(metadata.byte_capacity, allocation, Some(completion));
             }
             _ => return Err(Error::InvalidContext),

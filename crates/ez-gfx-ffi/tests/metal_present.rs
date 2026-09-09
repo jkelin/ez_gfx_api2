@@ -8,16 +8,17 @@ use ez_gfx_artifact::{
     Provenance, Stage, Target, TargetCompatibility, TargetVariant,
 };
 use ez_gfx_ffi::{
-    EzGfxBackendContextDesc, EzGfxDrawIndexedCommand, EzGfxDynamicState, EzGfxEvent,
-    EzGfxEventKind, EzGfxRenderTargetDesc, EzGfxResult, EzGfxSurfaceDesc, EzGfxTextureDesc,
+    EzGfxBackendContextDesc, EzGfxBinding, EzGfxDrawIndexedCommand, EzGfxDynamicState, EzGfxEvent,
+    EzGfxEventKind, EzGfxRenderTargetDesc, EzGfxResult, EzGfxTextureDesc, EzGfxWindowSurfaceDesc,
     ez_gfx_context_create_backend, ez_gfx_context_destroy, ez_gfx_context_init_device,
     ez_gfx_context_register_callback, ez_gfx_context_wait_idle, ez_gfx_counter_buffer_acquire,
-    ez_gfx_counter_buffer_write_draws, ez_gfx_frame_add_compute_pipeline,
-    ez_gfx_frame_add_vertex_pipeline, ez_gfx_frame_begin, ez_gfx_frame_end,
-    ez_gfx_frame_enqueue_texture_readback, ez_gfx_index_allocation_create,
+    ez_gfx_counter_buffer_write_draws, ez_gfx_frame_begin, ez_gfx_frame_bind, ez_gfx_frame_end,
+    ez_gfx_frame_enqueue_texture_readback, ez_gfx_frame_execute_compute,
+    ez_gfx_frame_execute_graphics, ez_gfx_index_allocation_create,
     ez_gfx_index_allocation_get_range, ez_gfx_render_target_create, ez_gfx_render_target_destroy,
     ez_gfx_render_target_frame_begin, ez_gfx_shader_destroy, ez_gfx_shader_load_artifact,
-    ez_gfx_surface_create, ez_gfx_surface_destroy, ez_gfx_texture_load, ez_gfx_texture_unload,
+    ez_gfx_surface_create_window, ez_gfx_surface_destroy, ez_gfx_texture_load,
+    ez_gfx_texture_unload, ez_gfx_value_buffer_acquire,
 };
 use objc2::rc::Retained;
 use objc2_core_foundation::CGSize;
@@ -107,7 +108,6 @@ fn metal_texture_readback_submits_without_a_surface() {
     let context_desc = EzGfxBackendContextDesc {
         enable_debug: 0,
         enable_validation: 0,
-        surface_platform: 2,
         backend: 3,
         texture_decode_workers: 0,
         adapter_count: 0,
@@ -202,7 +202,6 @@ fn metal_compute_submits_without_a_surface() {
     let context_desc = EzGfxBackendContextDesc {
         enable_debug: 0,
         enable_validation: 0,
-        surface_platform: 2,
         backend: 3,
         texture_decode_workers: 0,
         adapter_count: 0,
@@ -234,23 +233,7 @@ fn metal_compute_submits_without_a_surface() {
     );
     let (frame, target) = begin_offscreen_frame(context);
     assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe {
-                ez_gfx_frame_add_compute_pipeline(
-                    context,
-                    frame,
-                    shader,
-                    1,
-                    1,
-                    1,
-                    core::ptr::null(),
-                    0,
-                    core::ptr::null(),
-                    0,
-                )
-            }
-        },
+        ez_gfx_frame_execute_compute(context, frame, shader, 1, 1, 1),
         EzGfxResult::Ok
     );
     assert_eq!(ez_gfx_frame_end(context, frame), EzGfxResult::Ok);
@@ -259,6 +242,37 @@ fn metal_compute_submits_without_a_surface() {
     ez_gfx_shader_destroy(context, shader);
     ez_gfx_context_destroy(context);
     let _ = std::fs::remove_dir_all(root);
+}
+
+fn bind_params(context: u64, frame: u64, values: &[f32; 8]) {
+    let name = b"params";
+    let mut buffer = 0;
+    assert_eq!(
+        // SAFETY: Value, name, and output ranges remain live for the call.
+        unsafe {
+            ez_gfx_value_buffer_acquire(
+                context,
+                values.as_ptr().cast(),
+                u32::try_from(core::mem::size_of_val(values)).unwrap(),
+                name.as_ptr(),
+                name.len(),
+                &raw mut buffer,
+            )
+        },
+        EzGfxResult::Ok
+    );
+    let binding = EzGfxBinding {
+        name: name.as_ptr(),
+        name_length: name.len(),
+        buffer,
+        counter_buffer: 0,
+        render_target: 0,
+    };
+    assert_eq!(
+        // SAFETY: The binding and name remain readable through the call.
+        unsafe { ez_gfx_frame_bind(context, frame, &raw const binding) },
+        EzGfxResult::Ok
+    );
 }
 
 fn submit_render_nodes(context: u64, frame: u64, shader: u64, indirect: u64) {
@@ -271,82 +285,33 @@ fn submit_render_nodes(context: u64, frame: u64, shader: u64, indirect: u64) {
         primitive_type: 0,
         blend_mode: 1,
     };
+    bind_params(context, frame, &left);
     assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe {
-                ez_gfx_frame_add_vertex_pipeline(
-                    context,
-                    frame,
-                    shader,
-                    indirect,
-                    core::ptr::null(),
-                    0,
-                    &raw const alpha_blend,
-                    left.as_ptr().cast(),
-                    u32::try_from(core::mem::size_of_val(&left)).unwrap(),
-                )
-            }
+        // SAFETY: The state remains readable for the call.
+        unsafe {
+            ez_gfx_frame_execute_graphics(context, frame, shader, indirect, &raw const alpha_blend)
         },
         EzGfxResult::Ok
     );
     // This node separates the graphics passes. The second pass must load both attachments.
     assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe {
-                ez_gfx_frame_add_compute_pipeline(
-                    context,
-                    frame,
-                    shader,
-                    1,
-                    1,
-                    1,
-                    core::ptr::null(),
-                    0,
-                    core::ptr::null(),
-                    0,
-                )
-            }
+        ez_gfx_frame_execute_compute(context, frame, shader, 1, 1, 1),
+        EzGfxResult::Ok
+    );
+    bind_params(context, frame, &right);
+    assert_eq!(
+        // SAFETY: Null state selects the default dynamic state.
+        unsafe {
+            ez_gfx_frame_execute_graphics(context, frame, shader, indirect, core::ptr::null())
         },
         EzGfxResult::Ok
     );
+    bind_params(context, frame, &occluded);
+    // A third pass exercises attachment preservation across multiple graphics nodes.
     assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe {
-                ez_gfx_frame_add_vertex_pipeline(
-                    context,
-                    frame,
-                    shader,
-                    indirect,
-                    core::ptr::null(),
-                    0,
-                    core::ptr::null(),
-                    right.as_ptr().cast(),
-                    u32::try_from(core::mem::size_of_val(&right)).unwrap(),
-                )
-            }
-        },
-        EzGfxResult::Ok
-    );
-    // A farther blue draw overlaps the first pass. Preserved depth keeps the first red pixel.
-    assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe {
-                ez_gfx_frame_add_vertex_pipeline(
-                    context,
-                    frame,
-                    shader,
-                    indirect,
-                    core::ptr::null(),
-                    0,
-                    core::ptr::null(),
-                    occluded.as_ptr().cast(),
-                    u32::try_from(core::mem::size_of_val(&occluded)).unwrap(),
-                )
-            }
+        // SAFETY: Null state selects the default dynamic state.
+        unsafe {
+            ez_gfx_frame_execute_graphics(context, frame, shader, indirect, core::ptr::null())
         },
         EzGfxResult::Ok
     );
@@ -366,18 +331,14 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
     let context_desc = EzGfxBackendContextDesc {
         enable_debug: 0,
         enable_validation: 0,
-        surface_platform: 2,
         backend: 3,
         texture_decode_workers: 0,
         adapter_count: 0,
         adapter: core::ptr::null(),
     };
-    let surface_desc = EzGfxSurfaceDesc {
+    let surface_desc = EzGfxWindowSurfaceDesc {
         window: Retained::as_ptr(&layer).cast_mut().cast(),
         display: core::ptr::null_mut(),
-        platform: 2,
-        width: WIDTH,
-        height: HEIGHT,
         cache_presented_snapshots: u8::from(cache_presented_snapshots),
     };
     let mut context = 0;
@@ -392,7 +353,9 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_surface_create(context, &raw const surface_desc, &raw mut surface) }
+            unsafe {
+                ez_gfx_surface_create_window(context, &raw const surface_desc, &raw mut surface)
+            }
         },
         EzGfxResult::Ok
     );
@@ -587,7 +550,7 @@ kernel void computemain(uint thread_id [[thread_position_in_grid]]) {
     .unwrap();
     ez_gfx_compiler::build_metallib(source, library.clone()).unwrap();
     let metallib = std::fs::read(library).unwrap();
-    let metadata = br#"{"reflections":[{"target":"Metallib","entry":"vertexmain","stage":"Vertex","reflection":{"parameters":[]}},{"target":"Metallib","entry":"fragmentmain","stage":"Fragment","reflection":{"parameters":[],"depth_required":true}},{"target":"Metallib","entry":"computemain","stage":"Compute","reflection":{"parameters":[],"workgroup_size":[8,2,1]}}]}"#.to_vec();
+    let metadata = br#"{"reflections":[{"target":"Metallib","entry":"vertexmain","stage":"Vertex","reflection":{"parameters":[{"semantic_name":"params","api_kind":"buffer","binding_index":0,"binding_space":0}]}},{"target":"Metallib","entry":"fragmentmain","stage":"Fragment","reflection":{"parameters":[{"semantic_name":"params","api_kind":"buffer","binding_index":0,"binding_space":0}],"depth_required":true}},{"target":"Metallib","entry":"computemain","stage":"Compute","reflection":{"parameters":[],"workgroup_size":[8,2,1]}}]}"#.to_vec();
     let mut variants = Vec::new();
     for (stage, entry) in [
         (Stage::Vertex, "vertexmain"),

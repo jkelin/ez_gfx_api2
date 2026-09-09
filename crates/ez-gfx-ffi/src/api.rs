@@ -111,8 +111,6 @@ pub struct EzGfxContextDesc {
     pub enable_debug: u8,
     /// Enables graphics API validation when nonzero.
     pub enable_validation: u8,
-    /// Selects the native platform used to create presentation surfaces.
-    pub surface_platform: u8,
     /// Async texture decode worker threads; zero selects the default topology.
     pub texture_decode_workers: u32,
     /// Explicit adapter requests; zero keeps default ranking, one selects by identity.
@@ -167,8 +165,6 @@ pub struct EzGfxBackendContextDesc {
     pub enable_debug: u8,
     /// Enables graphics API validation when nonzero.
     pub enable_validation: u8,
-    /// Selects the native platform used to create presentation surfaces.
-    pub surface_platform: u8,
     /// Selects the graphics backend by its C ABI numeric code.
     pub backend: u8,
     /// Async texture decode worker threads; zero selects the default topology.
@@ -180,19 +176,25 @@ pub struct EzGfxBackendContextDesc {
 }
 #[derive(Clone, Copy)]
 #[repr(C)]
-/// Describes a native presentation surface and its initial extent.
-pub struct EzGfxSurfaceDesc {
+/// Describes a native presentation window.
+pub struct EzGfxWindowSurfaceDesc {
     /// Points to the platform-native window object.
     pub window: *mut c_void,
-    /// Points to the platform-native display or connection object.
+    /// Points to the platform-native display or application instance when required.
     pub display: *mut c_void,
-    /// Identifies the native window-system platform by its C ABI numeric code.
-    pub platform: u8,
+    /// Enables caching of presented surface snapshots when nonzero.
+    pub cache_presented_snapshots: u8,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+/// Describes a headless surface and its initial extent.
+pub struct EzGfxHeadlessSurfaceDesc {
     /// Specifies the initial surface width in pixels.
     pub width: u32,
     /// Specifies the initial surface height in pixels.
     pub height: u32,
-    /// Enables caching of presented surface snapshots when nonzero.
+    /// Enables caching of rendered snapshots when nonzero.
     pub cache_presented_snapshots: u8,
 }
 #[derive(Clone, Copy)]

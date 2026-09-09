@@ -21,7 +21,12 @@ use gpu_allocator::{
     AllocationSizes, MemoryLocation,
     metal::{Allocation, AllocationCreateDesc, Allocator, AllocatorCreateDesc},
 };
-use objc2::{rc::Retained, runtime::ProtocolObject};
+use objc2::{
+    msg_send,
+    rc::Retained,
+    runtime::{AnyObject, ProtocolObject},
+};
+use objc2_core_foundation::CGRect;
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTLArgumentBuffersTier, MTLArgumentEncoder, MTLBlendFactor, MTLBlitCommandEncoder, MTLBuffer,
@@ -118,8 +123,6 @@ pub struct NativeGraphicsDraw<'a> {
     pub indirect_size: u64,
     /// Number of indirect commands to encode.
     pub draw_count: u32,
-    /// Inline constant payload.
-    pub push_constants: &'a [u8],
     /// Reflected public buffer bindings.
     pub bindings: &'a [NativeBufferBinding<'a>],
     /// Textures referenced by the argument buffer.
@@ -134,8 +137,6 @@ pub struct NativeComputeDispatch<'a> {
     pub groups: [u32; 3],
     /// Threads launched in each workgroup, reflected from the compute entry point.
     pub threads_per_group: [u32; 3],
-    /// Inline constant payload.
-    pub push_constants: &'a [u8],
     /// Reflected public buffer bindings.
     pub bindings: &'a [NativeBufferBinding<'a>],
     /// Reflected compute texture argument-buffer layout, when present.
@@ -306,35 +307,86 @@ struct SurfaceDepth {
     extent: (u32, u32),
 }
 
-/// Borrowed `CAMetalLayer` and optional captured frame/depth state.
+/// Retained or borrowed `CAMetalLayer` and optional captured frame/depth state.
 pub struct NativeSurface {
     layer: usize,
+    _owned_layer: Option<ThreadBound<Retained<CAMetalLayer>>>,
     presented_rgba8: Vec<u8>,
     depth: Option<SurfaceDepth>,
 }
 impl NativeSurface {
-    /// The `CAMetalLayer` pointer is borrowed; this crate never releases the host's layer.
+    /// Borrows a caller-owned `CAMetalLayer`.
     ///
     /// # Errors
     ///
     /// Returns [`HalError::InvalidArgument`] when `layer` is null.
     pub fn new(layer: *mut c_void, capture_presented: bool) -> Result<Self, HalError> {
+        Self::from_layer(layer, None, capture_presented)
+    }
+
+    /// Creates and attaches a retained `CAMetalLayer` to an AppKit view.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HalError::InvalidArgument`] when `view` is null.
+    pub fn from_appkit_view(view: *mut c_void, capture_presented: bool) -> Result<Self, HalError> {
+        if view.is_null() {
+            return Err(HalError::InvalidArgument);
+        }
+        let layer = CAMetalLayer::new();
+        // SAFETY: `view` comes from a live `RawWindowHandle::AppKit` borrowed
+        // for the surface lifetime; these selectors are valid on `NSView`.
+        unsafe {
+            let view = &*(view as *const AnyObject);
+            let bounds: CGRect = msg_send![view, bounds];
+            let backing: CGRect = msg_send![view, convertRectToBacking: bounds];
+            layer.setFrame(bounds);
+            layer.setDrawableSize(backing.size);
+            let _: () = msg_send![view, setWantsLayer: true];
+            let _: () = msg_send![view, setLayer: Retained::as_ptr(&layer)];
+        }
+        let pointer = Retained::as_ptr(&layer) as *mut c_void;
+        Self::from_layer(pointer, Some(ThreadBound::new(layer)), capture_presented)
+    }
+
+    fn from_layer(
+        layer: *mut c_void,
+        owned_layer: Option<ThreadBound<Retained<CAMetalLayer>>>,
+        capture_presented: bool,
+    ) -> Result<Self, HalError> {
         if layer.is_null() {
             return Err(HalError::InvalidArgument);
         }
-        // SAFETY: the non-null layer is retained by the caller for this surface's lifetime.
+        // SAFETY: the layer is either retained by this surface or borrowed from
+        // the caller for the surface lifetime.
         let metal_layer = unsafe { &*(layer as *const CAMetalLayer) };
-        // Every surface graph resource is BGRA8 sRGB; there is no linear fallback.
         metal_layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm_sRGB);
-        // Capture needs shader-readable drawable textures; set this before nextDrawable.
         if capture_presented {
             metal_layer.setFramebufferOnly(false);
         }
         Ok(Self {
             layer: layer as usize,
+            _owned_layer: owned_layer,
             presented_rgba8: Vec::new(),
             depth: None,
         })
+    }
+
+    /// Reads the current nonzero drawable extent from the Metal layer.
+    #[must_use]
+    pub fn window_extent(&self) -> Option<(u32, u32)> {
+        // SAFETY: the layer is retained by this surface or by its caller.
+        let size = unsafe { &*(self.layer as *const CAMetalLayer) }.drawableSize();
+        let width = size.width.round();
+        let height = size.height.round();
+        if width <= 0.0
+            || height <= 0.0
+            || width > f64::from(u32::MAX)
+            || height > f64::from(u32::MAX)
+        {
+            return None;
+        }
+        Some((width as u32, height as u32))
     }
 
     /// Empty before the first cached presentation; successful captures replace the full frame.

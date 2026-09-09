@@ -1,6 +1,6 @@
 import "../../ez_gfx_api";
 
-struct Push {
+struct SceneParams {
     row_major float4x4 mvp;
     uint texture_id;
     uint padding0;
@@ -8,8 +8,8 @@ struct Push {
     uint padding2;
 };
 
-[push_constant]
-ConstantBuffer<Push> push;
+[Buffer("params")]
+StructuredBuffer<SceneParams> params;
 
 [VertexHeap("positions")]
 StructuredBuffer<float4> positions;
@@ -25,7 +25,7 @@ struct VertexOutput {
 [shader("vertex")]
 VertexOutput vertexmain(uint vertex_index : SV_VertexID) {
     VertexOutput output;
-    output.position = mul(push.mvp, float4(positions[vertex_index].xyz, 1.0));
+    output.position = mul(params[0].mvp, float4(positions[vertex_index].xyz, 1.0));
 
     uint corner = vertex_index & 3;
     output.uv = float2(
@@ -41,7 +41,7 @@ struct FragmentOutput {
 
 [shader("fragment")]
 FragmentOutput fragmentmain(VertexOutput input) {
-    TextureEntry entry = texture_heap.entries[push.texture_id];
+    TextureEntry entry = texture_heap.entries[params[0].texture_id];
 
     FragmentOutput output;
     output.color = entry.texture.Sample(entry.sampler, input.uv);

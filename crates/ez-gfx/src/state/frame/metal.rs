@@ -257,11 +257,10 @@ impl<'a> MetalActionInputs<'a> {
         let payload = self.payloads.get(index).ok_or(Error::InvalidArgument)?;
         match payload {
             ExecutableNode::Graphics {
-                indirect,
-                draw_count,
+                counter,
+                draw_capacity,
                 pipeline_layout,
                 state,
-                push_constants,
                 ..
             } => {
                 let key = self.prepared.keys[index]
@@ -274,7 +273,7 @@ impl<'a> MetalActionInputs<'a> {
                 };
                 let (indirect_size, NativeAllocation::Metal(indirect)) = self
                     .allocations
-                    .get(&indirect.packed())
+                    .get(&counter.packed())
                     .ok_or(Error::InvalidContext)?
                 else {
                     return Err(Error::NativeFailure);
@@ -289,18 +288,13 @@ impl<'a> MetalActionInputs<'a> {
                         index_size: self.index_size,
                         indirect,
                         indirect_size: *indirect_size,
-                        draw_count: *draw_count,
-                        push_constants,
+                        draw_count: *draw_capacity,
                         bindings: &self.binding_sets[index],
                         textures: self.native_textures,
                     },
                 ))
             }
-            ExecutableNode::Compute {
-                groups,
-                push_constants,
-                ..
-            } => {
+            ExecutableNode::Compute { groups, .. } => {
                 let key = self.prepared.keys[index]
                     .as_ref()
                     .ok_or(Error::InvalidArgument)?;
@@ -315,7 +309,6 @@ impl<'a> MetalActionInputs<'a> {
                         groups: *groups,
                         threads_per_group: self.prepared.workgroup_sizes[index]
                             .ok_or(Error::InvalidArgument)?,
-                        push_constants,
                         bindings: &self.binding_sets[index],
                         texture_heap: self.prepared.texture_heaps[index],
                         textures: self.native_textures,

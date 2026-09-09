@@ -2,9 +2,9 @@
 use core::mem::{align_of, size_of};
 
 use ez_gfx_core::handle::{
-    ContextHandle, GenerationalArena, HandleError, HandleParts, IndirectBufferHandle, LocalHandle,
-    PackedHandle, RenderTargetHandle, ShaderHandle, StructuredBufferHandle, SurfaceHandle,
-    TextureHandle, VertexHeapHandle,
+    BufferHandle, ContextHandle, CounterBufferHandle, GenerationalArena, HandleError, HandleParts,
+    LocalHandle, PackedHandle, RenderTargetHandle, ShaderHandle, SurfaceHandle, TextureHandle,
+    VertexHeapHandle,
 };
 
 #[test]
@@ -70,18 +70,16 @@ fn typed_handles_preserve_wire_layout_and_raw_values() {
             ShaderHandle::from_raw(resource_raw).unwrap().into_raw(),
         ),
         (
-            size_of::<IndirectBufferHandle>(),
-            align_of::<IndirectBufferHandle>(),
-            IndirectBufferHandle::from_raw(resource_raw)
+            size_of::<CounterBufferHandle>(),
+            align_of::<CounterBufferHandle>(),
+            CounterBufferHandle::from_raw(resource_raw)
                 .unwrap()
                 .into_raw(),
         ),
         (
-            size_of::<StructuredBufferHandle>(),
-            align_of::<StructuredBufferHandle>(),
-            StructuredBufferHandle::from_raw(resource_raw)
-                .unwrap()
-                .into_raw(),
+            size_of::<BufferHandle>(),
+            align_of::<BufferHandle>(),
+            BufferHandle::from_raw(resource_raw).unwrap().into_raw(),
         ),
         (
             size_of::<VertexHeapHandle>(),

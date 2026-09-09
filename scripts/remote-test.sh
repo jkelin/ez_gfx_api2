@@ -163,7 +163,7 @@ case "$platform" in
     tests='bash scripts/remote-cargo-test.sh ez-gfx-hal ez-gfx-backend-vulkan ez-gfx-backend-dx12 ez-gfx'
     ;;
   linux)
-    tests='bash scripts/remote-cargo-test.sh ez-gfx-hal ez-gfx-backend-vulkan ez-gfx'
+    tests='bash scripts/remote-cargo-test.sh ez-gfx-hal ez-gfx-backend-vulkan ez-gfx ez-gfx-ffi'
     remote_env+=' VK_LOADER_LAYERS_DISABLE=~implicit~'
     if [[ -n "${REMOTE_TEST_LINUX_SLANG_DIR:-}" ]]; then
       printf -v slang_dir_q '%q' "$REMOTE_TEST_LINUX_SLANG_DIR"

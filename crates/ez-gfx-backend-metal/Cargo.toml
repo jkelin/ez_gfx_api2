@@ -14,6 +14,7 @@ ez-gfx-runtime.workspace = true
 objc2.workspace = true
 objc2-metal = { workspace = true, features = ["dispatch2", "MTLAllocation", "MTLArgument", "MTLArgumentEncoder", "MTLBlitCommandEncoder", "MTLBuffer", "MTLCommandBuffer", "MTLCommandEncoder", "MTLCommandQueue", "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLDepthStencil", "MTLDevice", "MTLDrawable", "MTLEvent", "MTLHeap", "MTLLibrary", "MTLRenderCommandEncoder", "MTLRenderPass", "MTLRenderPipeline", "MTLResource", "MTLSampler", "MTLTexture", "MTLTypes"] }
 objc2-foundation.workspace = true
+objc2-core-foundation.workspace = true
 gpu-allocator = { workspace = true, features = ["std", "metal"] }
 dispatch2.workspace = true
 objc2-quartz-core.workspace = true

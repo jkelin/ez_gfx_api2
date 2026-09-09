@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EZ_GFX_ABI_VERSION 34u
+#define EZ_GFX_ABI_VERSION 36u
 
 #if defined(__clang__)
 #  if __has_attribute(access)
@@ -294,23 +294,6 @@ enum {
 };
 
 /**
- * EzGfxSurfacePlatform:
- * @EzGfxSurfacePlatform_Win32: Win32 HWND and HINSTANCE handles.
- * @EzGfxSurfacePlatform_GLFW: GLFW native window handle.
- * @EzGfxSurfacePlatform_MetalLayer: Borrowed `CAMetalLayer` pointer.
- * @EzGfxSurfacePlatform_Headless: Windowless Vulkan headless surface; no native handles.
- *
- * Native surface platform.
- */
-typedef uint8_t EzGfxSurfacePlatform;
-enum {
-    EzGfxSurfacePlatform_Win32 = 0,
-    EzGfxSurfacePlatform_GLFW = 1,
-    EzGfxSurfacePlatform_MetalLayer = 2,
-    EzGfxSurfacePlatform_Headless = 3,
-};
-
-/**
  * EzGfxSourceTextureFormat:
  * @EzGfxSourceTextureFormat_Rgb: Raw RGB pixels.
  * @EzGfxSourceTextureFormat_Rgba: Raw RGBA pixels.
@@ -494,7 +477,6 @@ typedef struct EzGfxAdapterInfo {
  * EzGfxBackendContextDesc:
  * @enable_debug: Enables graphics-backend debugging when nonzero.
  * @enable_validation: Enables graphics API validation when nonzero.
- * @surface_platform: Selects the native platform used to create presentation surfaces.
  * @backend: Selects the graphics backend by its C ABI numeric code.
  * @texture_decode_workers: Async texture decode worker threads; zero selects the default topology.
  * @adapter_count: Explicit adapter requests; zero keeps default ranking, one selects by identity.
@@ -505,7 +487,6 @@ typedef struct EzGfxAdapterInfo {
 typedef struct EzGfxBackendContextDesc {
     uint8_t enable_debug;
     uint8_t enable_validation;
-    EzGfxSurfacePlatform surface_platform;
     EzGfxBackend backend;
     uint32_t texture_decode_workers;
     uint32_t adapter_count;
@@ -513,24 +494,32 @@ typedef struct EzGfxBackendContextDesc {
 } EzGfxBackendContextDesc;
 
 /**
- * EzGfxSurfaceDesc:
+ * EzGfxWindowSurfaceDesc:
  * @window: Points to the platform-native window object.
- * @display: Points to the platform-native display or connection object.
- * @platform: Identifies the native window-system platform by its C ABI numeric code.
- * @width: Specifies the initial surface width in pixels.
- * @height: Specifies the initial surface height in pixels.
+ * @display: Points to the platform-native display or application instance when required.
  * @cache_presented_snapshots: Enables caching of presented surface snapshots when nonzero.
  *
- * Describes a native presentation surface and its initial extent.
+ * Describes a native presentation window.
  */
-typedef struct EzGfxSurfaceDesc {
+typedef struct EzGfxWindowSurfaceDesc {
     void * window;
     void * display;
-    EzGfxSurfacePlatform platform;
+    uint8_t cache_presented_snapshots;
+} EzGfxWindowSurfaceDesc;
+
+/**
+ * EzGfxHeadlessSurfaceDesc:
+ * @width: Specifies the initial surface width in pixels.
+ * @height: Specifies the initial surface height in pixels.
+ * @cache_presented_snapshots: Enables caching of rendered snapshots when nonzero.
+ *
+ * Describes a headless surface and its initial extent.
+ */
+typedef struct EzGfxHeadlessSurfaceDesc {
     uint32_t width;
     uint32_t height;
     uint8_t cache_presented_snapshots;
-} EzGfxSurfaceDesc;
+} EzGfxHeadlessSurfaceDesc;
 
 /**
  * EzGfxShaderDesc:
@@ -864,7 +853,6 @@ typedef struct EzGfxEvent {
  * EzGfxContextDesc:
  * @enable_debug: Enables graphics-backend debugging when nonzero.
  * @enable_validation: Enables graphics API validation when nonzero.
- * @surface_platform: Selects the native platform used to create presentation surfaces.
  * @texture_decode_workers: Async texture decode worker threads; zero selects the default topology.
  * @adapter_count: Explicit adapter requests; zero keeps default ranking, one selects by identity.
  * @adapter: Exactly `adapter_count` explicit requests; null if and only if zero.
@@ -874,7 +862,6 @@ typedef struct EzGfxEvent {
 typedef struct EzGfxContextDesc {
     uint8_t enable_debug;
     uint8_t enable_validation;
-    EzGfxSurfacePlatform surface_platform;
     uint32_t texture_decode_workers;
     uint32_t adapter_count;
     const EzGfxAdapterDesc * adapter;
@@ -1040,6 +1027,21 @@ EzGfxResult ez_gfx_index_allocation_remove(EzGfxContext context, EzGfxIndexAlloc
 EzGfxResult ez_gfx_buffer_acquire(EzGfxContext context, uint32_t element_size, uint32_t element_count, const char * debug_name, size_t debug_name_length, EzGfxBuffer * out_buffer) EZ_GFX_ACCESS(read_only, 4, 5) EZ_GFX_ACCESS(write_only, 6);
 
 /**
+ * ez_gfx_value_buffer_acquire:
+ * @context: Owning context.
+ * @value: Exact bytes of one value.
+ * @value_size: Value byte size.
+ * @debug_name: Exact UTF-8 debug-name bytes.
+ * @debug_name_length: Debug-name byte length.
+ * @out_buffer: Receives the initialized owning handle.
+ *
+ * Acquires a one-frame buffer initialized with exactly one value.
+ *
+ * Returns: Returns validation or allocation status.
+ */
+EzGfxResult ez_gfx_value_buffer_acquire(EzGfxContext context, const void * value, uint32_t value_size, const char * debug_name, size_t debug_name_length, EzGfxBuffer * out_buffer) EZ_GFX_ACCESS(read_only, 2, 3) EZ_GFX_ACCESS(read_only, 4, 5) EZ_GFX_ACCESS(write_only, 6);
+
+/**
  * ez_gfx_buffer_write:
  * @context: Owning context.
  * @buffer: Unconsumed buffer handle.
@@ -1101,7 +1103,7 @@ uint32_t ez_gfx_abi_version(void);
  * @desc: Context creation options.
  * @out_context: Receives the opaque context handle.
  *
- * Creates a graphics context from debug, validation, and surface-platform options.
+ * Creates a graphics context from debug and validation options.
  *
  * Returns: Returns EzGfxResult_Ok or a creation error.
  */
@@ -1239,41 +1241,45 @@ EzGfxResult ez_gfx_counter_buffer_publish_count(EzGfxContext context, EzGfxCount
 void ez_gfx_counter_buffer_release(EzGfxContext context, EzGfxCounterBuffer buffer);
 
 /**
- * ez_gfx_frame_add_vertex_pipeline:
+ * ez_gfx_frame_bind:
+ * @context: Owning context.
+ * @frame: Live owning frame.
+ * @binding: One named resource binding.
+ *
+ * Adds or replaces one named resource in the frame binding set.
+ *
+ * Returns: Returns validation, ownership, or frame status.
+ */
+EzGfxResult ez_gfx_frame_bind(EzGfxContext context, EzGfxFrame frame, const EzGfxBinding * binding) EZ_GFX_ACCESS(read_only, 3);
+
+/**
+ * ez_gfx_frame_execute_graphics:
  * @context: Owning context.
  * @frame: Live owning frame.
  * @shader: Graphics shader.
- * @buffer: Counter buffer consumed by this frame for indirect commands.
- * @bindings: Resource bindings.
- * @binding_count: Binding count.
- * @dynamic_state: Optional state.
- * @push_constants: Push bytes.
- * @push_constant_size: Push byte count.
+ * @buffer: Counter buffer containing indexed draw commands.
+ * @dynamic_state: Optional dynamic pipeline state.
  *
- * Records an indexed graphics pipeline operation with bindings, dynamic state, and push constants.
+ * Executes an indexed graphics operation from the current frame bindings.
  *
  * Returns: Returns validation or native status.
  */
-EzGfxResult ez_gfx_frame_add_vertex_pipeline(EzGfxContext context, EzGfxFrame frame, EzGfxShader shader, EzGfxCounterBuffer buffer, const EzGfxBinding * bindings, uint32_t binding_count, const EzGfxDynamicState * dynamic_state, const void * push_constants, uint32_t push_constant_size) EZ_GFX_ACCESS(read_only, 5, 6) EZ_GFX_ACCESS(read_only, 7) EZ_GFX_ACCESS(read_only, 8, 9);
+EzGfxResult ez_gfx_frame_execute_graphics(EzGfxContext context, EzGfxFrame frame, EzGfxShader shader, EzGfxCounterBuffer buffer, const EzGfxDynamicState * dynamic_state) EZ_GFX_ACCESS(read_only, 5);
 
 /**
- * ez_gfx_frame_add_compute_pipeline:
+ * ez_gfx_frame_execute_compute:
  * @context: Owning context.
  * @frame: Live owning frame.
  * @shader: Compute shader.
  * @dispatch_x: X groups.
  * @dispatch_y: Y groups.
  * @dispatch_z: Z groups.
- * @bindings: Resource bindings.
- * @binding_count: Binding count.
- * @push_constants: Push bytes.
- * @push_constant_size: Push byte count.
  *
- * Records a compute dispatch with its shader, bindings, dimensions, and push constants.
+ * Executes a compute dispatch from the current frame bindings.
  *
  * Returns: Returns validation or native status.
  */
-EzGfxResult ez_gfx_frame_add_compute_pipeline(EzGfxContext context, EzGfxFrame frame, EzGfxShader shader, uint32_t dispatch_x, uint32_t dispatch_y, uint32_t dispatch_z, const EzGfxBinding * bindings, uint32_t binding_count, const void * push_constants, uint32_t push_constant_size) EZ_GFX_ACCESS(read_only, 7, 8) EZ_GFX_ACCESS(read_only, 9, 10);
+EzGfxResult ez_gfx_frame_execute_compute(EzGfxContext context, EzGfxFrame frame, EzGfxShader shader, uint32_t dispatch_x, uint32_t dispatch_y, uint32_t dispatch_z);
 
 /**
  * ez_gfx_frame_enqueue_texture_readback:
@@ -1311,16 +1317,28 @@ EzGfxResult ez_gfx_frame_end(EzGfxContext context, EzGfxFrame frame);
 EzGfxResult ez_gfx_frame_abort(EzGfxContext context, EzGfxFrame frame);
 
 /**
- * ez_gfx_surface_create:
+ * ez_gfx_surface_create_window:
  * @context: Context that owns the surface.
- * @desc: Window and initial extent.
+ * @desc: Borrowed native window handles.
  * @out_surface: Receives the opaque surface handle.
  *
- * Creates a Win32, GLFW, or Metal-layer presentation surface and returns its handle.
+ * Creates a native window presentation surface and returns its handle.
  *
  * Returns: Returns EzGfxResult_Ok or a validation/native error.
  */
-EzGfxResult ez_gfx_surface_create(EzGfxContext context, const EzGfxSurfaceDesc * desc, EzGfxSurface * out_surface) EZ_GFX_ACCESS(read_only, 2) EZ_GFX_ACCESS(write_only, 3);
+EzGfxResult ez_gfx_surface_create_window(EzGfxContext context, const EzGfxWindowSurfaceDesc * desc, EzGfxSurface * out_surface) EZ_GFX_ACCESS(read_only, 2) EZ_GFX_ACCESS(write_only, 3);
+
+/**
+ * ez_gfx_surface_create_headless:
+ * @context: Context that owns the surface.
+ * @desc: Headless extent and snapshot policy.
+ * @out_surface: Receives the opaque surface handle.
+ *
+ * Creates a headless surface and returns its handle.
+ *
+ * Returns: Returns EzGfxResult_Ok or a validation/native error.
+ */
+EzGfxResult ez_gfx_surface_create_headless(EzGfxContext context, const EzGfxHeadlessSurfaceDesc * desc, EzGfxSurface * out_surface) EZ_GFX_ACCESS(read_only, 2) EZ_GFX_ACCESS(write_only, 3);
 
 /**
  * ez_gfx_context_init_device:

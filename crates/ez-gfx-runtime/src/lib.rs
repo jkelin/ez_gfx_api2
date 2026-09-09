@@ -32,7 +32,7 @@ pub mod texture;
 pub mod upload;
 
 pub use api::{
-    AdapterSelection, ContextOptions, PublicApiError, SurfaceOptions, SurfacePlatform, SurfaceState,
+    AdapterSelection, ContextOptions, HeadlessSurfaceOptions, PublicApiError, SurfaceState,
 };
 pub use lifecycle::{ContextHealth, ContextIdentity, LifecycleError, ResourceKind};
 
@@ -294,14 +294,14 @@ mod adapter_tests {
     #[test]
     fn adapter_selection_defaults_to_first_fit() {
         let options =
-            ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).expect("valid options");
+            ContextOptions::new_for_backend(0, 0, Backend::Vulkan).expect("valid options");
         assert_eq!(options.adapter_selection, None);
     }
 
     #[test]
     fn with_adapter_records_stable_identity_and_policy() {
         let options =
-            ContextOptions::new_for_backend(0, 0, 0, Backend::Vulkan).expect("valid options");
+            ContextOptions::new_for_backend(0, 0, Backend::Vulkan).expect("valid options");
         let selected = options.with_adapter([7; 16], true);
         assert_eq!(
             selected.adapter_selection,
