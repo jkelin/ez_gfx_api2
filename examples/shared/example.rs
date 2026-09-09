@@ -1,12 +1,13 @@
 use super::{
     BenchmarkRunner, Error, FrameInput, HostSurface, NativeSurface, PresentedFrame, ProgramReport,
-    Result, SceneInput, backend_config, dispatch_window_input, publish_snapshot,
+    Result, SceneInput, dispatch_window_input, publish_snapshot,
 };
-use ez_gfx::{Backend, Context, ContextOptions, Event, Frame, Surface, SurfaceOptions};
+use ez_gfx::{Backend, Context, Event, Frame, Surface};
 use std::{
     cell::RefCell,
     ffi::OsString,
     io::Write,
+    path::Path,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -138,6 +139,8 @@ pub struct Example {
     event_loop: Option<EventLoop<()>>,
     state: HostState,
     backend: Backend,
+    debug_enabled: bool,
+    validation_enabled: bool,
     observations: Rc<RefCell<Observations>>,
     benchmark: BenchmarkRunner,
     frames: u32,
@@ -146,13 +149,13 @@ pub struct Example {
 }
 
 impl Example {
-    /// Parses process options, then creates and returns the native host and graphics owners.
+    /// Parses process options, then creates the event loop and native window host.
     pub fn new(
         identity: &'static str,
         width: u32,
         height: u32,
         title: &'static str,
-    ) -> Result<(Self, Context, Surface)> {
+    ) -> Result<Self> {
         let options = super::program_options().unwrap_or_else(|error| super::exit_config(error));
         if std::env::var_os("VK_LOADER_LAYERS_DISABLE").is_none() {
             // SAFETY: no event loop, worker, or graphics context exists yet.
@@ -161,7 +164,6 @@ impl Example {
 
         let event_loop = EventLoop::new()?;
         event_loop.set_control_flow(ControlFlow::Poll);
-        let observations = Rc::new(RefCell::new(Observations::default()));
         let mut example = Self {
             identity,
             backend_name: super::host::backend_name_for(options.backend),
@@ -171,7 +173,9 @@ impl Example {
             event_loop: Some(event_loop),
             state: HostState::new(title, width, height, options.frame_limit, options.visible),
             backend: options.backend,
-            observations: Rc::clone(&observations),
+            debug_enabled: options.debug,
+            validation_enabled: options.validation,
+            observations: Rc::new(RefCell::new(Observations::default())),
             benchmark: BenchmarkRunner::new(options.benchmark),
             frames: 0,
             last_frame: Instant::now(),
@@ -184,26 +188,33 @@ impl Example {
             return Err(error);
         }
 
-        let native = example.state.descriptor()?;
-        let backend = backend_config(native.platform, options.backend);
-        let context = Context::new(ContextOptions {
-            enable_debug: options.debug,
-            enable_validation: options.validation,
-            surface_platform: backend.platform,
-            backend: backend.backend,
-            texture_decode_workers: 0,
-            adapter_selection: None,
-        })?;
-        let surface = context.create_surface(SurfaceOptions {
-            window: native.window,
-            display: native.display,
-            platform: backend.platform,
-            width: example.state.width,
-            height: example.state.height,
-            // Metal terminal readback requires a non-framebuffer-only drawable.
-            cache_presented_snapshots: true,
-        })?;
-        let callback_observations = Rc::clone(&observations);
+        example.state.descriptor()?;
+        Ok(example)
+    }
+
+    /// Returns the validated native handles for explicit surface creation.
+    pub fn native_surface(&self) -> Result<NativeSurface> {
+        self.state.descriptor()
+    }
+
+    /// Returns whether graphics debug behavior was requested.
+    pub const fn debug_enabled(&self) -> bool {
+        self.debug_enabled
+    }
+
+    /// Returns whether graphics validation was requested.
+    pub const fn validation_enabled(&self) -> bool {
+        self.validation_enabled
+    }
+
+    /// Returns the current nonzero native surface size.
+    pub const fn surface_size(&self) -> [u32; 2] {
+        [self.state.width, self.state.height]
+    }
+
+    /// Registers the observations used by snapshot, report, and benchmark automation.
+    pub fn register_observations(&self, context: &Context) -> Result<()> {
+        let callback_observations = Rc::clone(&self.observations);
         context.register_callback(move |event| {
             let mut observations = callback_observations.borrow_mut();
             match event {
@@ -223,7 +234,14 @@ impl Example {
                 _ => {}
             }
         })?;
-        Ok((example, context, surface))
+        Ok(())
+    }
+
+    /// Returns the parent directory of the examples package.
+    pub fn workspace_root() -> Result<&'static Path> {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or_else(|| Error::message("examples package has no workspace parent"))
     }
 
     fn pump_once(&mut self) -> Result<()> {
@@ -440,6 +458,8 @@ mod tests {
             event_loop: None,
             state: HostState::new("drop regression", 1, 1, Some(1), false),
             backend: Backend::Vulkan,
+            debug_enabled: false,
+            validation_enabled: false,
             observations,
             benchmark: BenchmarkRunner::new(None),
             frames: 1,

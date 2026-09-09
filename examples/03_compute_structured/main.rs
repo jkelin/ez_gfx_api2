@@ -18,13 +18,29 @@ struct ScenePush {
 }
 
 fn main() -> anyhow::Result<()> {
-    let (mut example, context, surface) =
-        Example::new("03_compute_structured", WIDTH, HEIGHT, "ez_gfx_api2")?;
+    let mut example = Example::new("03_compute_structured", WIDTH, HEIGHT, "ez_gfx_api2")?;
+    let native = example.native_surface()?;
+    let backend = backend_config(native.platform, example.backend());
+    let [width, height] = example.surface_size();
+    let context = Context::new(ContextOptions {
+        enable_debug: example.debug_enabled(),
+        enable_validation: example.validation_enabled(),
+        surface_platform: backend.platform,
+        backend: backend.backend,
+        texture_decode_workers: 0,
+        adapter_selection: None,
+    })?;
+    let surface = context.create_surface(SurfaceOptions {
+        window: native.window,
+        display: native.display,
+        platform: backend.platform,
+        width,
+        height,
+        cache_presented_snapshots: true,
+    })?;
+    example.register_observations(&context)?;
     {
-        let backend = example.backend();
-        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("examples package has no workspace parent"))?;
+        let workspace_root = Example::workspace_root()?;
         let shader_bytes = ez_gfx_compiler::compile_shader(
             &workspace_root.join("examples/03_compute_structured/03_compute_structured.slang"),
             &[
@@ -51,7 +67,7 @@ fn main() -> anyhow::Result<()> {
         let _normals = normals_heap.upload(&mesh.normals)?;
         let shader = context.load_shader(&shader_bytes)?;
         let mut camera = OrbitCamera::new((-30.0_f32).to_radians(), 52.0_f32.to_radians(), 2.2);
-        let clip_y = shared::clip_y(backend);
+        let clip_y = shared::clip_y(backend.backend);
         let target = Vec3::new(0.0, 0.55, 0.0);
         let mut push = ScenePush {
             mvp: Mat4::IDENTITY,

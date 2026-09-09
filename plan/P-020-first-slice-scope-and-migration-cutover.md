@@ -110,7 +110,7 @@ Treat compiler output validation, serialized reflection, API-shape checks, and C
 
 ### Selection rationale
 
-The initial vertical slice established an end-to-end executable path before backend expansion. Final Rust examples use the shared `Example` host for process options, winit inversion, native window, context/surface creation, resize, input, pacing, benchmark, capture, and reporting. `Example::new` returns `(Example, Context, Surface)` so each main directly owns both graphics objects. Each procedural loop passes `&Surface` to receive `WindowFrame`, explicitly begins and configures the swapchain transaction, records through `&mut Frame`, then calls `Example::handle_frame(frame, swapchain_target)`.
+The initial vertical slice established an end-to-end executable path before backend expansion. Final Rust examples use the shared `Example` host for process options, winit inversion, native window, resize, input, pacing, benchmark, capture, and reporting. `Example::new` returns only the host; each main visibly creates its `Context` with `Context::new(ContextOptions { .. })` and `Surface` with `context.create_surface(SurfaceOptions { .. })` so each main directly owns both graphics objects. Each procedural loop passes `&Surface` to receive `WindowFrame`, explicitly begins and configures the swapchain transaction, records through `&mut Frame`, then calls `Example::handle_frame(frame, swapchain_target)`.
 
 The safe cutover is ownership-only: resources release through `Drop`, `Frame::finish(self)` is consuming, unfinished frames abort on `Drop`, and no compatibility aliases retain manual safe destruction or the former multiple begin/end paths. ABI 33 keeps explicit C lifecycle functions over opaque generational handles.
 

@@ -9,12 +9,29 @@ const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
 
 fn main() -> anyhow::Result<()> {
-    let (mut example, context, surface) =
-        Example::new("01_triangle", WIDTH, HEIGHT, "ez_gfx_api2")?;
+    let mut example = Example::new("01_triangle", WIDTH, HEIGHT, "ez_gfx_api2")?;
+    let native = example.native_surface()?;
+    let backend = backend_config(native.platform, example.backend());
+    let [width, height] = example.surface_size();
+    let context = Context::new(ContextOptions {
+        enable_debug: example.debug_enabled(),
+        enable_validation: example.validation_enabled(),
+        surface_platform: backend.platform,
+        backend: backend.backend,
+        texture_decode_workers: 0,
+        adapter_selection: None,
+    })?;
+    let surface = context.create_surface(SurfaceOptions {
+        window: native.window,
+        display: native.display,
+        platform: backend.platform,
+        width,
+        height,
+        cache_presented_snapshots: true,
+    })?;
+    example.register_observations(&context)?;
     {
-        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("examples package has no workspace parent"))?;
+        let workspace_root = Example::workspace_root()?;
         let shader_bytes = ez_gfx_compiler::compile_shader(
             &workspace_root.join("examples/01_triangle/01_triangle.slang"),
             &[

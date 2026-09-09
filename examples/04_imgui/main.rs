@@ -102,12 +102,29 @@ fn imgui_key(key: SceneKey) -> Option<Key> {
 }
 
 fn main() -> anyhow::Result<()> {
-    let (mut example, context, surface) = Example::new("04_imgui", WIDTH, HEIGHT, "ez_gfx_api2")?;
+    let mut example = Example::new("04_imgui", WIDTH, HEIGHT, "ez_gfx_api2")?;
+    let native = example.native_surface()?;
+    let backend = backend_config(native.platform, example.backend());
+    let [width, height] = example.surface_size();
+    let context = Context::new(ContextOptions {
+        enable_debug: example.debug_enabled(),
+        enable_validation: example.validation_enabled(),
+        surface_platform: backend.platform,
+        backend: backend.backend,
+        texture_decode_workers: 0,
+        adapter_selection: None,
+    })?;
+    let surface = context.create_surface(SurfaceOptions {
+        window: native.window,
+        display: native.display,
+        platform: backend.platform,
+        width,
+        height,
+        cache_presented_snapshots: true,
+    })?;
+    example.register_observations(&context)?;
     {
-        let backend = example.backend();
-        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("examples package has no workspace parent"))?;
+        let workspace_root = Example::workspace_root()?;
         let shader_bytes = ez_gfx_compiler::compile_shader(
             &workspace_root.join("examples/04_imgui/04_imgui.slang"),
             &[
@@ -162,7 +179,7 @@ fn main() -> anyhow::Result<()> {
         let mut draw_counts = Vec::new();
         let mut push = Push {
             display_size: [640.0, 480.0],
-            vertical_sign: if backend == Backend::Vulkan {
+            vertical_sign: if backend.backend == Backend::Vulkan {
                 1.0
             } else {
                 -1.0
