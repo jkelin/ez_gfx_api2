@@ -1,9 +1,161 @@
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+
 use super::{
-    AllocationCreateDesc, AllocationError, AllocationScheme, DepthTarget, HalError, MemoryLocation,
-    NativeContext, NativeSurface, map_allocation_hal, map_allocator, map_vk, vk,
+    AllocationCreateDesc, AllocationError, AllocationScheme, CStr, DepthTarget, HalError,
+    MemoryLocation, NativeContext, NativeSurface, device::available_extension, khr,
+    map_allocation_hal, map_allocator, map_vk, vk,
 };
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "WSI extensions are independent Vulkan capabilities, not mutually exclusive states"
+)]
+pub(crate) struct WsiCapabilities {
+    pub(crate) surface: bool,
+    pub(crate) win32: bool,
+    pub(crate) wayland: bool,
+    pub(crate) xcb: bool,
+    pub(crate) xlib: bool,
+}
+
+impl WsiCapabilities {
+    pub(super) fn from_enabled(enabled: &[*const core::ffi::c_char]) -> Self {
+        let has = |name: &'static CStr| {
+            enabled.iter().any(|pointer| {
+                // SAFETY: instance extension policy returns only static Vulkan extension names.
+                unsafe { CStr::from_ptr(*pointer) == name }
+            })
+        };
+        Self {
+            surface: has(khr::surface::NAME),
+            win32: has(khr::win32_surface::NAME),
+            wayland: has(khr::wayland_surface::NAME),
+            xcb: has(khr::xcb_surface::NAME),
+            xlib: has(khr::xlib_surface::NAME),
+        }
+    }
+}
+
+/// Drawable extent disposition reported by a Vulkan window system.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeWindowExtent {
+    /// The window system reports an authoritative drawable extent.
+    Known(u32, u32),
+    /// The drawable is minimized and cannot present.
+    Minimized,
+    /// The window system requires the host to supply its configured extent.
+    HostManaged,
+}
+
+pub(crate) const fn classify_surface_extent(extent: vk::Extent2D) -> NativeWindowExtent {
+    if extent.width == u32::MAX || extent.height == u32::MAX {
+        NativeWindowExtent::HostManaged
+    } else if extent.width == 0 || extent.height == 0 {
+        NativeWindowExtent::Minimized
+    } else {
+        NativeWindowExtent::Known(extent.width, extent.height)
+    }
+}
+
+pub(crate) fn instance_extensions(
+    available: &[vk::ExtensionProperties],
+    enable_debug: bool,
+) -> (Vec<*const core::ffi::c_char>, vk::InstanceCreateFlags, bool) {
+    let native_wsi = [
+        khr::surface::NAME,
+        khr::win32_surface::NAME,
+        khr::wayland_surface::NAME,
+        khr::xcb_surface::NAME,
+        khr::xlib_surface::NAME,
+        ash::ext::headless_surface::NAME,
+        khr::portability_enumeration::NAME,
+    ];
+    let mut enabled = native_wsi
+        .into_iter()
+        .filter_map(|name| available_extension(available, name))
+        .collect::<Vec<_>>();
+    if enable_debug {
+        enabled.extend(available_extension(available, ash::ext::debug_utils::NAME));
+    }
+    let portability = available_extension(available, khr::portability_enumeration::NAME).is_some();
+    let headless = available_extension(available, ash::ext::headless_surface::NAME).is_some();
+    (
+        enabled,
+        if portability {
+            vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
+        } else {
+            vk::InstanceCreateFlags::empty()
+        },
+        headless,
+    )
+}
+
+pub(crate) const fn matched_surface_pair(
+    display: RawDisplayHandle,
+    window: RawWindowHandle,
+) -> bool {
+    matches!(
+        (display, window),
+        (RawDisplayHandle::Windows(_), RawWindowHandle::Win32(_))
+            | (RawDisplayHandle::Xlib(_), RawWindowHandle::Xlib(_))
+            | (RawDisplayHandle::Xcb(_), RawWindowHandle::Xcb(_))
+            | (RawDisplayHandle::Wayland(_), RawWindowHandle::Wayland(_))
+    )
+}
+pub(crate) const fn supported_surface_pair(
+    capabilities: WsiCapabilities,
+    display: RawDisplayHandle,
+    window: RawWindowHandle,
+) -> bool {
+    // Both VK_KHR_surface and the exact platform extension must be enabled before dispatch.
+    capabilities.surface
+        && match (display, window) {
+            (RawDisplayHandle::Windows(_), RawWindowHandle::Win32(_)) => capabilities.win32,
+            (RawDisplayHandle::Xlib(_), RawWindowHandle::Xlib(_)) => capabilities.xlib,
+            (RawDisplayHandle::Xcb(_), RawWindowHandle::Xcb(_)) => capabilities.xcb,
+            (RawDisplayHandle::Wayland(_), RawWindowHandle::Wayland(_)) => capabilities.wayland,
+            _ => false,
+        }
+}
 impl NativeContext {
+    /// Creates an owned Vulkan surface from a matched borrowed raw handle pair.
+    ///
+    /// # Safety
+    ///
+    /// `display` and `window` must be a matched pair belonging to the same live host. This function
+    /// must run on that host's creator thread. The host must remain alive until the returned surface
+    /// is destroyed by [`NativeContext::destroy_surface`] or native teardown is abandoned, after
+    /// which it must remain alive for the process lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the pair is unsupported, mismatched, or native creation fails.
+    pub unsafe fn create_surface(
+        &self,
+        display: RawDisplayHandle,
+        window: RawWindowHandle,
+    ) -> Result<NativeSurface, HalError> {
+        if !matched_surface_pair(display, window) {
+            return Err(HalError::InvalidArgument);
+        }
+        if !supported_surface_pair(self.wsi_capabilities, display, window) {
+            return Err(HalError::Unsupported);
+        }
+        // SAFETY: the pair was matched above and the safe owner retains the host value until
+        // after this surface is destroyed.
+        let handle = unsafe {
+            ash_window::create_surface(&self.entry_loader, &self.instance, display, window, None)
+        }
+        .map_err(map_vk)?;
+        if handle == vk::SurfaceKHR::null() {
+            return Err(HalError::NativeFailure);
+        }
+        Ok(NativeSurface {
+            handle,
+            presented_rgba8: Vec::new(),
+        })
+    }
     /// Creates a headless target without native host handles.
     ///
     /// Uses `VK_EXT_headless_surface` when the active ICD exposes it. Otherwise
@@ -29,14 +181,17 @@ impl NativeContext {
         })
     }
 
-    /// Reads the current drawable extent reported by the window system.
+    /// Reads the drawable extent disposition reported by the window system.
+    ///
+    /// `HostManaged` means Vulkan cannot provide the size (notably on Wayland); the toolkit-neutral
+    /// caller must forward its configure-event extent through the resize API.
     ///
     /// # Errors
     ///
     /// Returns an error when no device is initialized or Vulkan rejects the query.
-    pub fn window_extent(&self, surface: &NativeSurface) -> Result<Option<(u32, u32)>, HalError> {
+    pub fn window_extent(&self, surface: &NativeSurface) -> Result<NativeWindowExtent, HalError> {
         if surface.is_headless() {
-            return Ok(None);
+            return Err(HalError::InvalidArgument);
         }
         let physical = self.physical_device.ok_or(HalError::NotReady)?;
         // SAFETY: `physical` and `surface` belong to this live instance.
@@ -45,15 +200,7 @@ impl NativeContext {
                 .get_physical_device_surface_capabilities(physical, surface.handle)
         }
         .map_err(map_vk)?;
-        let extent = capabilities.current_extent;
-        if extent.width == 0
-            || extent.height == 0
-            || extent.width == u32::MAX
-            || extent.height == u32::MAX
-        {
-            return Ok(None);
-        }
-        Ok(Some((extent.width, extent.height)))
+        Ok(classify_surface_extent(capabilities.current_extent))
     }
     /// Acquires and presents one surface image; zero extents remain minimized.
     ///
@@ -162,19 +309,22 @@ impl NativeContext {
             .find(|format| format.format == vk::Format::B8G8R8A8_SRGB)
             .or_else(|| formats.first().copied())
             .ok_or(HalError::Unsupported)?;
-        let extent = if capabilities.current_extent.width == u32::MAX {
-            vk::Extent2D {
-                width: requested_width.clamp(
-                    capabilities.min_image_extent.width,
-                    capabilities.max_image_extent.width,
-                ),
-                height: requested_height.clamp(
-                    capabilities.min_image_extent.height,
-                    capabilities.max_image_extent.height,
-                ),
+        let extent = match classify_surface_extent(capabilities.current_extent) {
+            NativeWindowExtent::Known(width, height) => vk::Extent2D { width, height },
+            NativeWindowExtent::Minimized => return Err(HalError::NotReady),
+            NativeWindowExtent::HostManaged => {
+                if requested_width < capabilities.min_image_extent.width
+                    || requested_width > capabilities.max_image_extent.width
+                    || requested_height < capabilities.min_image_extent.height
+                    || requested_height > capabilities.max_image_extent.height
+                {
+                    return Err(HalError::InvalidArgument);
+                }
+                vk::Extent2D {
+                    width: requested_width,
+                    height: requested_height,
+                }
             }
-        } else {
-            capabilities.current_extent
         };
         if extent.width == 0 || extent.height == 0 {
             return Err(HalError::NotReady);
@@ -412,3 +562,7 @@ impl NativeContext {
             .map_err(|error| map_allocator(&error))
     }
 }
+
+#[cfg(test)]
+#[path = "surface_tests.rs"]
+mod tests;

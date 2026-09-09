@@ -1,6 +1,6 @@
 # C textured cube
 
-Minimal ABI 35 example: positions and normals use auto-growing typed heap handles, indices use the lazy context-owned singleton heap, and structured/counter buffers are one-frame values. The sample reacquires and populates both buffers each frame for compute-to-graphics use; the terminal frame consumes them, and only unconsumed failure paths release. A creator-thread callback receives runtime diagnostics and copies borrowed snapshot bytes.
+Minimal Vulkan ABI 37 example: GLFW owns a no-client-API window while ez-gfx creates its surface from tagged Win32, Xlib, or Wayland handles and queries the initial framebuffer extent. Typed geometry heaps persist; structured and counter buffers are reacquired per frame. A creator-thread callback copies borrowed snapshot bytes.
 
 ## Build
 
@@ -15,9 +15,9 @@ cmake --build target/c-examples/textured_cube-build --config Debug
 CMake defaults to workspace products. External packages may set:
 
 - `EZ_GFX_INCLUDE_DIR`: directory containing `ez_gfx_api.h`
-- `EZ_GFX_FFI_LIBRARY`: Windows import library
-- `EZ_GFX_FFI_DLL`: runtime DLL copied beside the executable
-- `EZ_GFX_COMPILER`: packaged `ez-gfx-compile.exe`
+- `EZ_GFX_FFI_LIBRARY`: platform link library
+- `EZ_GFX_FFI_RUNTIME`: runtime library copied beside the executable
+- `EZ_GFX_COMPILER`: packaged shader compiler
 - `EZ_GFX_SHADER_ARTIFACT`: generated artifact path
 
 For extracted Windows packages:
@@ -29,19 +29,18 @@ $Build = Join-Path $PWD "target\c-examples\textured-cube-package"
 cmake -S examples/02_textured_cube_c -B $Build `
   -DEZ_GFX_INCLUDE_DIR="$Runtime" `
   -DEZ_GFX_FFI_LIBRARY="$Runtime\ez_gfx_ffi.dll.lib" `
-  -DEZ_GFX_FFI_DLL="$Runtime\ez_gfx_ffi.dll" `
+  -DEZ_GFX_FFI_RUNTIME="$Runtime\ez_gfx_ffi.dll" `
   -DEZ_GFX_COMPILER="$Compiler\ez-gfx-compile.exe" `
   -DEZ_GFX_SHADER_ARTIFACT="$Build\textured_cube.ezgfxshader"
 cmake --build $Build --config Release
 ```
 
-CMake invokes `ez-gfx-compile` directly on `textured_cube.slang` with SPIR-V, DXIL, and Metal targets in development mode; no shader manifest or artifact is tracked.
+CMake fetches pinned GLFW and invokes `ez-gfx-compile` for SPIR-V, DXIL, and Metal development variants.
 
 Run one bounded frame and require a nonempty raw 640×480 RGBA snapshot:
 
 ```powershell
 target/c-examples/textured_cube-build/Debug/textured_cube.exe --backend vulkan --artifact target/c-examples/textured_cube-build/Debug/textured_cube.ezgfxshader --max-frames 1 --snapshot target/c-examples/vulkan.rgba --hidden
-target/c-examples/textured_cube-build/Debug/textured_cube.exe --backend dx12 --artifact target/c-examples/textured_cube-build/Debug/textured_cube.ezgfxshader --max-frames 1 --snapshot target/c-examples/dx12.rgba --hidden
 ```
 
-The host is intentionally Win32-only. The C ABI accepts a borrowed `CAMetalLayer`, but creating and retaining one requires Objective-C; a plain portable C Metal host would fake ownership. CI compiles the ABI header as C11 and C++17 on every OS and builds/links this sample on Windows. The Vulkan row runs with its configured software ICD. GitHub-hosted Windows does not guarantee a D3D12 feature-level 12.1 adapter, so that row is explicitly compile-only; run the DX12 command above on a hardware-capable host.
+The example is Vulkan-only because GLFW exposes the portable native handles required by Vulkan without adding any window-system dependency to library crates. Hidden runs remain non-activating. Minimized zero-size framebuffers pause rendering until restored; nonzero size changes use `ez_gfx_surface_resize`.

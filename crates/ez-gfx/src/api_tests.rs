@@ -14,6 +14,158 @@ assert_not_impl_any!(CounterBuffer<ez_gfx_runtime::indirect::DrawIndexedCommand>
 assert_not_impl_any!(ValueBuffer<u32>: Send, Sync);
 assert_not_impl_any!(Frame: Send, Sync);
 
+#[cfg(not(target_vendor = "apple"))]
+struct HostProbe(Rc<Cell<u32>>);
+
+#[cfg(not(target_vendor = "apple"))]
+impl HasWindowHandle for HostProbe {
+    fn window_handle(
+        &self,
+    ) -> std::result::Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError>
+    {
+        Err(raw_window_handle::HandleError::Unavailable)
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+impl HasDisplayHandle for HostProbe {
+    fn display_handle(
+        &self,
+    ) -> std::result::Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError>
+    {
+        Err(raw_window_handle::HandleError::Unavailable)
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+impl Drop for HostProbe {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn attach_host_probe(surface: &mut Surface, drops: &Rc<Cell<u32>>) {
+    Rc::get_mut(&mut surface.inner)
+        .expect("surface has one public owner")
+        .host = Some(Box::new(HostProbe(Rc::clone(drops))));
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn failed_window_surface_creation_retains_host_only_after_abandoned_rollback() {
+    for (error, expected_drops) in [(Error::NativeFailure, 1), (Error::TeardownAbandoned, 0)] {
+        let drops = Rc::new(Cell::new(0));
+
+        assert_eq!(
+            failed_window_surface_creation(HostProbe(Rc::clone(&drops)), error),
+            error
+        );
+        assert_eq!(drops.get(), expected_drops);
+    }
+}
+
+#[test]
+fn owned_host_disposition_follows_typed_teardown_result() {
+    struct DropProbe {
+        native_destroyed: Rc<Cell<bool>>,
+        drops: Rc<Cell<u32>>,
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            assert!(self.native_destroyed.get());
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    let drops = Rc::new(Cell::new(0));
+    let native_destroyed = Rc::new(Cell::new(false));
+    let mut completed_host = Some(DropProbe {
+        native_destroyed: Rc::clone(&native_destroyed),
+        drops: Rc::clone(&drops),
+    });
+    teardown_owned_host(&mut completed_host, || {
+        native_destroyed.set(true);
+        Ok(())
+    });
+    assert_eq!(drops.get(), 1);
+
+    let mut abandoned_host = Some(DropProbe {
+        native_destroyed: Rc::new(Cell::new(true)),
+        drops: Rc::clone(&drops),
+    });
+    teardown_owned_host(&mut abandoned_host, || Err(Error::TeardownAbandoned));
+    assert_eq!(drops.get(), 1);
+
+    let mut failed_host = Some(DropProbe {
+        native_destroyed: Rc::new(Cell::new(true)),
+        drops: Rc::clone(&drops),
+    });
+    teardown_owned_host(&mut failed_host, || Err(Error::InvalidContext));
+    assert_eq!(drops.get(), 1);
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn context_destroy_result_controls_later_surface_host_release() -> Result<()> {
+    for (outcome, expected_result, expected_drops) in [
+        (
+            state::CleanupTestOutcome::DrainedFailure(Error::DeviceLost),
+            Err(Error::DeviceLost),
+            1,
+        ),
+        (
+            state::CleanupTestOutcome::Undrained,
+            Err(Error::TeardownAbandoned),
+            0,
+        ),
+    ] {
+        let (context, mut surface) = headless()?;
+        let drops = Rc::new(Cell::new(0));
+        attach_host_probe(&mut surface, &drops);
+        state::inject_cleanup_outcome(context.raw(), outcome)?;
+
+        assert_eq!(context.destroy(), expected_result);
+        drop(surface);
+
+        assert_eq!(drops.get(), expected_drops);
+    }
+
+    let (context, mut surface) = headless()?;
+    let drops = Rc::new(Cell::new(0));
+    attach_host_probe(&mut surface, &drops);
+    let _ = state::cleanup_context_for_thread_exit();
+
+    assert_eq!(context.destroy(), Err(Error::InvalidContext));
+    drop(surface);
+
+    assert_eq!(drops.get(), 0);
+    Ok(())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn implicit_context_drop_result_controls_later_surface_host_release() -> Result<()> {
+    for (outcome, expected_drops) in [
+        (
+            state::CleanupTestOutcome::DrainedFailure(Error::DeviceLost),
+            1,
+        ),
+        (state::CleanupTestOutcome::Undrained, 0),
+    ] {
+        let (context, mut surface) = headless()?;
+        let drops = Rc::new(Cell::new(0));
+        attach_host_probe(&mut surface, &drops);
+        state::inject_cleanup_outcome(context.raw(), outcome)?;
+
+        drop(context);
+        drop(surface);
+
+        assert_eq!(drops.get(), expected_drops);
+    }
+    Ok(())
+}
 #[test]
 fn buffer_data_views_scalar_slice_and_vec_without_copying() {
     let scalar = 7_u32;

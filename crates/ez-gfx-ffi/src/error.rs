@@ -15,6 +15,9 @@ fn error_message(result: u8) -> &'static [u8] {
             b"asynchronous scheduling capacity unavailable"
         }
         value if value == EzGfxResult::Cancelled as u8 => b"asynchronous operation cancelled",
+        value if value == EzGfxResult::TeardownAbandoned as u8 => {
+            b"native teardown abandoned; borrowed host handles must remain alive"
+        }
         _ => b"unknown error",
     }
 }

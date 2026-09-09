@@ -49,6 +49,8 @@ pub enum EzGfxResult {
     QueueFull = 7,
     /// An asynchronous operation was cancelled before completion.
     Cancelled = 8,
+    /// Teardown completion is unproven; borrowed host handles must remain alive.
+    TeardownAbandoned = 9,
 }
 
 impl From<ez_gfx::Error> for EzGfxResult {
@@ -72,9 +74,25 @@ impl From<ez_gfx::Error> for EzGfxResult {
             ez_gfx::Error::Cancelled => Self::Cancelled,
             ez_gfx::Error::ReentrantCallback => Self::InvalidArgument,
             ez_gfx::Error::CallbackPanicked => Self::NativeFailure,
+            ez_gfx::Error::TeardownAbandoned => Self::TeardownAbandoned,
             _ => Self::NativeFailure,
         }
     }
+}
+/// Native window system selecting a portable window descriptor's handles.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub enum EzGfxNativeWindowSystem {
+    /// Win32 HWND and HINSTANCE handles.
+    Win32 = 0,
+    /// Xlib Display pointer and Window XID.
+    Xlib = 1,
+    /// XCB connection pointer and window value.
+    Xcb = 2,
+    /// Wayland display and surface pointers.
+    Wayland = 3,
+    /// `AppKit` `NSView` pointer.
+    AppKit = 4,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,14 +194,18 @@ pub struct EzGfxBackendContextDesc {
 }
 #[derive(Clone, Copy)]
 #[repr(C)]
-/// Describes a native presentation window.
+/// Describes a portable native presentation window without a caller-supplied extent.
 pub struct EzGfxWindowSurfaceDesc {
-    /// Points to the platform-native window object.
-    pub window: *mut c_void,
-    /// Points to the platform-native display or application instance when required.
-    pub display: *mut c_void,
+    /// Native window-system code from `EzGfxNativeWindowSystem`.
+    pub system: u8,
     /// Enables caching of presented surface snapshots when nonzero.
     pub cache_presented_snapshots: u8,
+    /// Must be zero.
+    pub reserved: [u8; 6],
+    /// First native handle slot; meaning follows `system`.
+    pub handle_a: u64,
+    /// Second native handle slot; meaning follows `system`.
+    pub handle_b: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -616,6 +638,7 @@ mod result_tests {
             (Error::DeviceLost, EzGfxResult::DeviceLost),
             (Error::QueueFull, EzGfxResult::QueueFull),
             (Error::Cancelled, EzGfxResult::Cancelled),
+            (Error::TeardownAbandoned, EzGfxResult::TeardownAbandoned),
             (
                 Error::Lifecycle(LifecycleError::WrongThread),
                 EzGfxResult::InvalidContext,

@@ -1,6 +1,6 @@
 use super::{
     AllocationRequest, AttachmentLoadOp, AttachmentStoreOp, BufferTransfer, CAMetalDrawable,
-    CAMetalLayer, CullMode, FrontFace, HalError, MAX_ARGUMENT_BUFFERS_PER_SLOT, MTLArgumentEncoder,
+    CullMode, FrontFace, HalError, MAX_ARGUMENT_BUFFERS_PER_SLOT, MTLArgumentEncoder,
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus,
     MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState,
     MTLCullMode, MTLDevice, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
@@ -879,8 +879,7 @@ impl NativeContext {
     ) -> Result<Option<MetalDrawable>, HalError> {
         if uses_surface {
             let surface = surface.ok_or(HalError::InvalidArgument)?;
-            // SAFETY: `NativeSurface::layer` is a non-null, properly aligned pointer to a `CAMetalLayer` retained by `surface`, so dereferencing it for the lifetime of this shared surface borrow is sound.
-            let layer = unsafe { &*(surface.layer as *const CAMetalLayer) };
+            let layer = surface.metal_layer();
             layer.setDevice(Some(&self.device));
             layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm_sRGB);
             let drawable = layer.nextDrawable().ok_or(HalError::NotReady)?;

@@ -23,7 +23,9 @@ Additional evidence: `AGENTS.md` ("Window lifetime, input, resize/minimize obser
 
 ## Resolved interface
 
-Zero extent returns `NotReady` from `begin_frame`. Presentation mode remains a validated `Surface` construction option.
+Zero extent returns `NotReady` from `begin_frame`.
+
+ABI 37 carries the window seam across C as `EzGfxWindowSurfaceDesc`: `EzGfxNativeWindowSystem` selects Win32, Xlib, Xcb, Wayland, or AppKit, and two `u64` slots carry that system's validated handles while reserved and unused slots stay zero. `EzGfxHeadlessSurfaceDesc` separately carries the explicit headless extent. Contexts select only the backend; the boundary validates discriminants, slots, XID narrowing, cache policy, and backend compatibility before native calls. Safe Rust retains an owned `HasWindowHandle + HasDisplayHandle` host in `Context::create_surface_window`. Native code queries authoritative initial drawable extents where the window system exposes one. Vulkan `UINT32_MAX` is a distinct host-managed state, notably on Wayland: `raw-window-handle` carries no dimensions, so the toolkit-neutral caller must forward the configure-event extent through `Surface::resize` before rendering. A native zero extent remains minimized and returns `NotReady`; it is never treated as host-managed.
 
 ## Candidate solutions
 
@@ -31,7 +33,7 @@ Zero extent returns `NotReady` from `begin_frame`. Presentation mode remains a v
 
 #### Approach and integration
 
-Construct an owning `Surface` from borrowed host-native handles. The wrapper retains `Rc<ContextInner>` and its resource lease until `Drop`; the host keeps the actual window/display objects alive for that interval. Construction is atomic: native surface creation, device initialization, and initial resize either all succeed or destroy the unpublished raw surface and return the original error without retaining a safe wrapper.
+Construct an owning `Surface` from borrowed host-native handles. The wrapper retains `Rc<ContextInner>` and its resource lease until `Drop`; the host keeps the actual window/display objects alive for that interval. Construction is atomic: native surface creation and device initialization either succeed or destroy the unpublished raw surface and return the original error without retaining a safe wrapper. An authoritative minimized initial extent fails with `NotReady`; a host-managed Vulkan extent publishes unready state until the host forwards a nonzero resize.
 
 `Surface::begin_frame()` creates a target-less owner; `Frame::configure_swapchain(size, format)` performs acquisition after resize handling inside the winit callback. Recording uses `&mut Frame`; `Frame::finish(self)` submits and presents, while `Frame::drop` aborts. Graph validation rejects shader reads from presentation targets; readback bytes are callback-scoped.
 
@@ -112,10 +114,10 @@ Keep a C-only descriptor that tags opaque native pointers with a platform discri
 The selected surface lifecycle:
 1. accepts a borrowed `HasWindowHandle` for window surfaces and a distinct explicit-extent headless constructor;
 2. derives the native integration from `RawWindowHandle` without platform fields in context or surface options;
-3. reads the initial drawable extent from the native window after device initialization;
-4. leaves OS window, event-loop, resize observation, and input ownership with the host;
-5. destroys the unpublished raw surface after any native-creation, initialization, or extent-query failure;
-6. returns `NotReady` from `begin_frame` for zero drawable extent; and
+3. reads an authoritative initial drawable extent from the native window after device initialization, while preserving Vulkan host-managed extent as a distinct unready state;
+4. leaves OS window, event-loop, resize observation, and input ownership with the host, including forwarding Wayland configure-event dimensions;
+5. destroys the unpublished raw surface after any native-creation, initialization, or authoritative extent-query failure;
+6. returns `NotReady` for a minimized zero extent and keeps host-managed undefined extent unready until an explicit resize; and
 7. presents only through `Frame::finish(self)`, preserving the exact submit or present error.
 
 ### Rejected alternatives
@@ -131,6 +133,15 @@ Minimization detection eliminates rendering and swapchain acquire work while the
 
 - The host keeps the object implementing `HasWindowHandle` alive while `Surface` exists and forwards later resize state.
 - The underlying display subsystem supports the selected backend's presentation mechanism.
+
+Metal completes host lifetime differently from Vulkan and DX12. `Layer::from_ns_view` independently
+retains a host-provided `CAMetalLayer`; when it creates an observer-backed sublayer, the observer
+holds only a weak root reference and synchronous detachment severs that relationship before surface
+destruction returns. The host may therefore release its `NSView` after successful surface teardown
+even while the retained layer waits for deferred GPU retirement. If later context teardown is
+abandoned, only independently owned Metal layer/GPU objects leak. Vulkan and DX12 instead retain
+borrowed window/display handles whenever queue drain cannot be proven, so their hosts must remain
+alive process-long.
 
 ### Risks and mitigations
 

@@ -1,29 +1,20 @@
 //! Native Metal rendering and presentation tests through the C ABI.
 #![cfg(target_vendor = "apple")]
 
-use std::path::Path;
+use std::{path::Path, process::Command};
 
 use ez_gfx_artifact::{
     AppleArchitecture, ApplePlatform, Artifact, CompatibilityVersion, MetalCompatibility,
     Provenance, Stage, Target, TargetCompatibility, TargetVariant,
 };
 use ez_gfx_ffi::{
-    EzGfxBackendContextDesc, EzGfxBinding, EzGfxDrawIndexedCommand, EzGfxDynamicState, EzGfxEvent,
-    EzGfxEventKind, EzGfxRenderTargetDesc, EzGfxResult, EzGfxTextureDesc, EzGfxWindowSurfaceDesc,
-    ez_gfx_context_create_backend, ez_gfx_context_destroy, ez_gfx_context_init_device,
-    ez_gfx_context_register_callback, ez_gfx_context_wait_idle, ez_gfx_counter_buffer_acquire,
-    ez_gfx_counter_buffer_write_draws, ez_gfx_frame_begin, ez_gfx_frame_bind, ez_gfx_frame_end,
+    EzGfxBackendContextDesc, EzGfxEvent, EzGfxEventKind, EzGfxRenderTargetDesc, EzGfxResult,
+    EzGfxTextureDesc, ez_gfx_context_create_backend, ez_gfx_context_destroy,
+    ez_gfx_context_register_callback, ez_gfx_context_wait_idle, ez_gfx_frame_end,
     ez_gfx_frame_enqueue_texture_readback, ez_gfx_frame_execute_compute,
-    ez_gfx_frame_execute_graphics, ez_gfx_index_allocation_create,
-    ez_gfx_index_allocation_get_range, ez_gfx_render_target_create, ez_gfx_render_target_destroy,
-    ez_gfx_render_target_frame_begin, ez_gfx_shader_destroy, ez_gfx_shader_load_artifact,
-    ez_gfx_surface_create_window, ez_gfx_surface_destroy, ez_gfx_texture_load,
-    ez_gfx_texture_unload, ez_gfx_value_buffer_acquire,
+    ez_gfx_render_target_create, ez_gfx_render_target_destroy, ez_gfx_render_target_frame_begin,
+    ez_gfx_shader_destroy, ez_gfx_shader_load_artifact, ez_gfx_texture_load, ez_gfx_texture_unload,
 };
-use objc2::rc::Retained;
-use objc2_core_foundation::CGSize;
-use objc2_metal::MTLPixelFormat;
-use objc2_quartz_core::CAMetalLayer;
 
 const WIDTH: u32 = 64;
 const HEIGHT: u32 = 64;
@@ -191,7 +182,7 @@ fn metal_texture_readback_submits_without_a_surface() {
         unsafe { ez_gfx_context_register_callback(context, None, core::ptr::null_mut()) },
         EzGfxResult::Ok
     );
-    ez_gfx_context_destroy(context);
+    assert_eq!(ez_gfx_context_destroy(context), EzGfxResult::Ok);
 }
 
 #[test]
@@ -240,255 +231,31 @@ fn metal_compute_submits_without_a_surface() {
     ez_gfx_render_target_destroy(context, target);
 
     ez_gfx_shader_destroy(context, shader);
-    ez_gfx_context_destroy(context);
+    assert_eq!(ez_gfx_context_destroy(context), EzGfxResult::Ok);
     let _ = std::fs::remove_dir_all(root);
 }
 
-fn bind_params(context: u64, frame: u64, values: &[f32; 8]) {
-    let name = b"params";
-    let mut buffer = 0;
-    assert_eq!(
-        // SAFETY: Value, name, and output ranges remain live for the call.
-        unsafe {
-            ez_gfx_value_buffer_acquire(
-                context,
-                values.as_ptr().cast(),
-                u32::try_from(core::mem::size_of_val(values)).unwrap(),
-                name.as_ptr(),
-                name.len(),
-                &raw mut buffer,
-            )
-        },
-        EzGfxResult::Ok
-    );
-    let binding = EzGfxBinding {
-        name: name.as_ptr(),
-        name_length: name.len(),
-        buffer,
-        counter_buffer: 0,
-        render_target: 0,
-    };
-    assert_eq!(
-        // SAFETY: The binding and name remain readable through the call.
-        unsafe { ez_gfx_frame_bind(context, frame, &raw const binding) },
-        EzGfxResult::Ok
-    );
-}
-
-fn submit_render_nodes(context: u64, frame: u64, shader: u64, indirect: u64) {
-    let left = [-0.45_f32, 0.0, 0.2, 0.0, 1.0, 0.0, 0.0, 0.5];
-    let right = [0.45_f32, 0.0, 0.2, 0.0, 0.0, 1.0, 0.0, 1.0];
-    let occluded = [-0.45_f32, 0.0, 0.8, 0.0, 0.0, 0.0, 1.0, 1.0];
-    let alpha_blend = EzGfxDynamicState {
-        cull_mode: 0,
-        front_face: 0,
-        primitive_type: 0,
-        blend_mode: 1,
-    };
-    bind_params(context, frame, &left);
-    assert_eq!(
-        // SAFETY: The state remains readable for the call.
-        unsafe {
-            ez_gfx_frame_execute_graphics(context, frame, shader, indirect, &raw const alpha_blend)
-        },
-        EzGfxResult::Ok
-    );
-    // This node separates the graphics passes. The second pass must load both attachments.
-    assert_eq!(
-        ez_gfx_frame_execute_compute(context, frame, shader, 1, 1, 1),
-        EzGfxResult::Ok
-    );
-    bind_params(context, frame, &right);
-    assert_eq!(
-        // SAFETY: Null state selects the default dynamic state.
-        unsafe {
-            ez_gfx_frame_execute_graphics(context, frame, shader, indirect, core::ptr::null())
-        },
-        EzGfxResult::Ok
-    );
-    bind_params(context, frame, &occluded);
-    // A third pass exercises attachment preservation across multiple graphics nodes.
-    assert_eq!(
-        // SAFETY: Null state selects the default dynamic state.
-        unsafe {
-            ez_gfx_frame_execute_graphics(context, frame, shader, indirect, core::ptr::null())
-        },
-        EzGfxResult::Ok
-    );
-    assert_eq!(ez_gfx_frame_end(context, frame), EzGfxResult::Ok);
-    assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
-}
-
-// The retained layer outlives surface destruction; disabled caching must leave readback empty.
 fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
-    let layer = CAMetalLayer::new();
-    layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm_sRGB);
-    layer.setDrawableSize(CGSize {
-        width: f64::from(WIDTH),
-        height: f64::from(HEIGHT),
-    });
+    let root = std::env::temp_dir().join(format!(
+        "ez-gfx-metal-present-helper-{}-{}",
+        std::process::id(),
+        u8::from(cache_presented_snapshots)
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let artifact_path = root.join("shader.ezgfxshader");
+    let output_path = root.join("presented.rgba");
+    std::fs::write(&artifact_path, artifact).unwrap();
 
-    let context_desc = EzGfxBackendContextDesc {
-        enable_debug: 0,
-        enable_validation: 0,
-        backend: 3,
-        texture_decode_workers: 0,
-        adapter_count: 0,
-        adapter: core::ptr::null(),
-    };
-    let surface_desc = EzGfxWindowSurfaceDesc {
-        window: Retained::as_ptr(&layer).cast_mut().cast(),
-        display: core::ptr::null_mut(),
-        cache_presented_snapshots: u8::from(cache_presented_snapshots),
-    };
-    let mut context = 0;
-    let mut surface = 0;
-    assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_context_create_backend(&raw const context_desc, &raw mut context) }
-        },
-        EzGfxResult::Ok
-    );
-    assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe {
-                ez_gfx_surface_create_window(context, &raw const surface_desc, &raw mut surface)
-            }
-        },
-        EzGfxResult::Ok
-    );
-    assert_eq!(
-        ez_gfx_context_init_device(context, surface),
-        EzGfxResult::Ok
-    );
-    let mut collected = Collected::default();
-    assert_eq!(
-        // SAFETY: `collected` remains alive until registration is explicitly cleared.
-        unsafe {
-            ez_gfx_context_register_callback(
-                context,
-                Some(collect_event),
-                (&raw mut collected).cast(),
-            )
-        },
-        EzGfxResult::Ok
-    );
+    let status = Command::new(env!("CARGO_BIN_EXE_metal_present"))
+        .arg(&artifact_path)
+        .arg(&output_path)
+        .arg(if cache_presented_snapshots { "1" } else { "0" })
+        .status()
+        .unwrap();
+    assert!(status.success(), "metal_present helper failed: {status}");
 
-    let mut shader = 0;
-    assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe {
-                ez_gfx_shader_load_artifact(
-                    context,
-                    artifact.as_ptr(),
-                    artifact.len(),
-                    &raw mut shader,
-                )
-            }
-        },
-        EzGfxResult::Ok
-    );
-    let label = b"metal-present";
-
-    let indices = [0_u32, 1, 2];
-    let mut index_allocation = 0;
-    assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe {
-                ez_gfx_index_allocation_create(
-                    context,
-                    indices.as_ptr().cast(),
-                    u32::try_from(indices.len()).unwrap(),
-                    &raw mut index_allocation,
-                )
-            }
-        },
-        EzGfxResult::Ok
-    );
-    let mut first_index = 0;
-    let mut index_count = 0;
-    assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe {
-                ez_gfx_index_allocation_get_range(
-                    context,
-                    index_allocation,
-                    &raw mut first_index,
-                    &raw mut index_count,
-                )
-            }
-        },
-        EzGfxResult::Ok
-    );
-    assert_eq!(index_count, 3);
-    let mut frame = 0;
-    assert_eq!(
-        // SAFETY: frame output storage is live and aligned.
-        unsafe { ez_gfx_frame_begin(context, surface, &raw mut frame) },
-        EzGfxResult::Ok
-    );
-    let mut indirect = 0;
-    assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe {
-                ez_gfx_counter_buffer_acquire(
-                    context,
-                    size_of::<EzGfxDrawIndexedCommand>() as u32,
-                    1,
-                    label.as_ptr(),
-                    label.len(),
-                    &raw mut indirect,
-                )
-            }
-        },
-        EzGfxResult::Ok
-    );
-    let command = EzGfxDrawIndexedCommand {
-        index_count: 3,
-        instance_count: 1,
-        first_index,
-        vertex_offset: 0,
-        first_instance: 0,
-    };
-    assert_eq!(
-        {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe {
-                ez_gfx_counter_buffer_write_draws(context, indirect, 0, &raw const command, 1)
-            }
-        },
-        EzGfxResult::Ok
-    );
-
-    submit_render_nodes(context, frame, shader, indirect);
-
-    let bytes = if cache_presented_snapshots {
-        let bytes = collected
-            .readback
-            .take()
-            .expect("presented readback event delivered");
-        assert_eq!(bytes.len(), WIDTH as usize * HEIGHT as usize * 4);
-        bytes
-    } else {
-        assert!(collected.readback.is_none());
-        Vec::new()
-    };
-    assert_eq!(
-        // SAFETY: clearing a live registration retains no user-data pointer.
-        unsafe { ez_gfx_context_register_callback(context, None, core::ptr::null_mut()) },
-        EzGfxResult::Ok
-    );
-
-    ez_gfx_shader_destroy(context, shader);
-    ez_gfx_surface_destroy(context, surface);
-    ez_gfx_context_destroy(context);
-    drop(layer);
+    let bytes = std::fs::read(&output_path).unwrap();
+    let _ = std::fs::remove_dir_all(root);
     bytes
 }
 

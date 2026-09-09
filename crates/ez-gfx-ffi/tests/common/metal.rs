@@ -12,7 +12,7 @@ pub struct TestContext {
     pub context: u64,
     pub surface: u64,
     // Never attached to an NSView or NSWindow; retained through native surface destruction.
-    layer: Retained<CAMetalLayer>,
+    layer: Option<Retained<CAMetalLayer>>,
 }
 
 impl TestContext {
@@ -28,7 +28,7 @@ impl TestContext {
         let mut native = Self {
             context: 0,
             surface: 0,
-            layer,
+            layer: Some(layer),
         };
         let desc = EzGfxBackendContextDesc {
             enable_debug: 0,
@@ -44,9 +44,11 @@ impl TestContext {
             EzGfxResult::Ok
         );
         let surface_desc = EzGfxWindowSurfaceDesc {
-            window: Retained::as_ptr(&native.layer).cast_mut().cast(),
-            display: core::ptr::null_mut(),
+            system: 4,
             cache_presented_snapshots: 0,
+            reserved: [0; 6],
+            handle_a: Retained::as_ptr(native.layer.as_ref().unwrap()) as usize as u64,
+            handle_b: 0,
         };
         assert_eq!(
             // SAFETY: The retained unattached layer outlives the surface; all storage is live.
@@ -69,12 +71,25 @@ impl TestContext {
 
 impl Drop for TestContext {
     fn drop(&mut self) {
-        // Partial construction also releases the context, without destroying absent handles.
-        if self.surface != 0 {
-            ez_gfx_surface_destroy(self.context, self.surface);
-        }
-        if self.context != 0 {
-            ez_gfx_context_destroy(self.context);
+        let surface = if self.surface == 0 {
+            EzGfxResult::Ok
+        } else {
+            ez_gfx_surface_destroy(self.context, self.surface)
+        };
+        let context = if self.context == 0 {
+            EzGfxResult::Ok
+        } else {
+            ez_gfx_context_destroy(self.context)
+        };
+        if surface != EzGfxResult::Ok || context != EzGfxResult::Ok {
+            if let Some(layer) = self.layer.take() {
+                // Failed teardown cannot prove that no native object still borrows the layer.
+                core::mem::forget(layer);
+            }
+            assert!(
+                std::thread::panicking(),
+                "fixture teardown failed: surface={surface:?} context={context:?}"
+            );
         }
     }
 }

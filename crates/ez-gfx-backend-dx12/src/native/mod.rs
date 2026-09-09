@@ -1,5 +1,6 @@
 use crate::{BACKEND, TEXTURE_DESCRIPTOR_CAPACITY};
 use core::{ffi::c_void, ptr};
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 use ez_gfx_core::capability::{
     AdapterCapabilities, AdapterClass, AdapterInfo, CompressionSupport, SemanticProfile,
@@ -68,7 +69,7 @@ use windows::Win32::Graphics::Direct3D12::{
 };
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE, HWND, RECT},
+        Foundation::{CloseHandle, HANDLE, HWND, RECT, WAIT_FAILED, WAIT_OBJECT_0},
         Graphics::{
             Direct3D::{D3D_FEATURE_LEVEL_12_1, ID3DBlob},
             Direct3D12::{
@@ -326,17 +327,29 @@ pub struct NativeSurface {
 }
 
 impl NativeSurface {
-    /// The HWND is borrowed and never destroyed by the graphics context.
+    /// Extracts a validated HWND from a matched Windows/Win32 raw handle pair.
+    ///
+    /// # Safety
+    ///
+    /// `display` and `window` must belong to the same live Windows host, and this function must run
+    /// on the host's creator thread. The host must remain alive until the returned surface is
+    /// destroyed by [`NativeContext::destroy_surface`] or native teardown is abandoned, after
+    /// which it must remain alive for the process lifetime.
     ///
     /// # Errors
     ///
-    /// Returns `HalError::InvalidArgument` if `window` is null.
-    pub fn new(window: *mut c_void) -> Result<Self, HalError> {
-        if window.is_null() {
+    /// Returns [`HalError::InvalidArgument`] for every non-Windows or mismatched pair.
+    pub unsafe fn new(
+        display: RawDisplayHandle,
+        window: RawWindowHandle,
+    ) -> Result<Self, HalError> {
+        let (RawDisplayHandle::Windows(_), RawWindowHandle::Win32(window)) = (display, window)
+        else {
             return Err(HalError::InvalidArgument);
-        }
+        };
         Ok(Self {
-            window: window as usize,
+            // Preserve the opaque HWND bit pattern even when its pointer-sized integer is negative.
+            window: window.hwnd.get().cast_unsigned(),
             swapchain: None,
             width: 0,
             height: 0,
@@ -394,6 +407,8 @@ pub struct NativeContext {
     fence_event: HANDLE,
     next_fence: u64,
     idle_drained: bool,
+    #[cfg(test)]
+    wait_idle_failure: Option<HalError>,
     next_transfer_fence: u64,
     next_texture_fence: u64,
     allocator: Option<Allocator>,
@@ -429,3 +444,38 @@ mod transfer;
 
 #[cfg(test)]
 mod texture_tests;
+
+#[cfg(test)]
+mod surface_tests {
+    use std::num::NonZeroIsize;
+
+    use raw_window_handle::{
+        RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowsDisplayHandle,
+        XlibDisplayHandle,
+    };
+
+    use super::*;
+
+    #[test]
+    fn surface_accepts_only_windows_win32_pairs() {
+        let window = RawWindowHandle::Win32(Win32WindowHandle::new(NonZeroIsize::new(1).unwrap()));
+
+        let surface =
+            // SAFETY: the synthetic matched pair is inspected only; no native call dereferences it.
+            unsafe {
+                NativeSurface::new(
+                    RawDisplayHandle::Windows(WindowsDisplayHandle::new()),
+                    window,
+                )
+            }
+            .unwrap();
+        assert_eq!(surface.window(), 1);
+
+        let mismatch = RawDisplayHandle::Xlib(XlibDisplayHandle::new(None, 0));
+        assert_eq!(
+            // SAFETY: mismatched handles are rejected before either synthetic value is used.
+            unsafe { NativeSurface::new(mismatch, window) }.err(),
+            Some(HalError::InvalidArgument)
+        );
+    }
+}

@@ -1,6 +1,6 @@
 # Rust examples
 
-The six numbered directories are linear procedural renderers hosted by one shared `Example`. `Example::new` creates the native host and each main creates its own platform-free `Context`, then calls `context.create_surface_window(example.window()?, ...)`. The host handles clap configuration, winit inversion, resize, queued input, pacing, callbacks, benchmark, capture, and reporting. User code explicitly begins and configures each swapchain frame, records it, then calls `Example::handle_frame(frame, swapchain_target)`.
+The six numbered directories are linear procedural renderers hosted by one shared `Example`. Each main creates a platform-free `Context`, then passes an owned clone of the winit host to `context.create_surface_window`; the surface retains it and queries its native drawable extent. The host handles winit inversion, resize, input, pacing, callbacks, benchmark, capture, and reporting.
 
 - [01 Triangle](01_triangle/README.md)
 - [02 Textured Cube](02_textured_cube/README.md)
@@ -11,7 +11,7 @@ The six numbered directories are linear procedural renderers hosted by one share
 
 The Rust examples enable `ktx2` and `basis`; the Sponza example therefore retains universal decoding. Library/FFI default builds omit those decoders. Enable both for universal KTX2, `ktx2` for native blocks, or `basis` for standalone Basis; see [texture admission](../docs/textures.md#admission-and-memory).
 
-The Win32 [`C textured cube`](02_textured_cube_c/README.md) is a separate ABI 35 flow. C uses an opaque generational `EzGfxFrame` and must explicitly call `ez_gfx_frame_end` or `ez_gfx_frame_abort`; Rust examples never use those raw completion functions.
+The portable GLFW [`C textured cube`](02_textured_cube_c/README.md) is a separate Vulkan ABI 37 flow using tagged native window handles. C owns its opaque generational frames and explicitly ends or aborts them.
 
 | Binary | Complete renderer | Owned inputs |
 | --- | --- | --- |

@@ -12,8 +12,7 @@ use super::*;
     reason = "sequential layout assertions share one ABI contract; splitting would hide drift"
 )]
 fn layouts_are_stable() {
-    // ABI 35 removes the surface platform from context descriptors and splits
-    // window and headless surface creation into distinct layouts.
+    // ABI 37 splits window and headless creation while retaining portable tagged window handles.
     assert_eq!(
         (
             size_of::<EzGfxContextDesc>(),
@@ -90,11 +89,13 @@ fn layouts_are_stable() {
     );
     assert_eq!(
         [
-            offset_of!(EzGfxWindowSurfaceDesc, window),
-            offset_of!(EzGfxWindowSurfaceDesc, display),
+            offset_of!(EzGfxWindowSurfaceDesc, system),
             offset_of!(EzGfxWindowSurfaceDesc, cache_presented_snapshots),
+            offset_of!(EzGfxWindowSurfaceDesc, reserved),
+            offset_of!(EzGfxWindowSurfaceDesc, handle_a),
+            offset_of!(EzGfxWindowSurfaceDesc, handle_b),
         ],
-        [0, 8, 16]
+        [0, 1, 2, 8, 16]
     );
     assert_eq!(
         (
@@ -345,7 +346,7 @@ fn all_public_export_signatures_are_stable() {
     let _: unsafe extern "C" fn(u8, *mut EzGfxAdapterInfo, u32, *mut u32) -> Status =
         ffi::ez_gfx_adapter_query;
     let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_context_wait_idle;
-    let _: extern "C" fn(Handle) = ffi::ez_gfx_context_destroy;
+    let _: extern "C" fn(Handle) -> Status = ffi::ez_gfx_context_destroy;
     let _: unsafe extern "C" fn(Handle, *const EzGfxWindowSurfaceDesc, *mut Handle) -> Status =
         ffi::ez_gfx_surface_create_window;
     let _: unsafe extern "C" fn(Handle, *const EzGfxHeadlessSurfaceDesc, *mut Handle) -> Status =
@@ -446,7 +447,7 @@ fn all_public_export_signatures_are_stable() {
         usize,
         *mut Handle,
     ) -> Status = ffi::ez_gfx_value_buffer_acquire;
-    let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_surface_destroy;
+    let _: extern "C" fn(Handle, Handle) -> Status = ffi::ez_gfx_surface_destroy;
     let _: unsafe extern "C" fn(u64, *mut EzGfxHandleParts) -> Status = ffi::ez_gfx_handle_inspect;
     let _: unsafe extern "C" fn(*const u8, usize, *mut u8) -> Status = ffi::ez_gfx_semantic_id;
 }

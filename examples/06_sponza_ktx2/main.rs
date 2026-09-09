@@ -105,7 +105,7 @@ fn main() -> anyhow::Result<()> {
         texture_decode_workers: 0,
         adapter_selection: None,
     })?;
-    let surface = context.create_surface_window(example.window()?, true)?;
+    let surface = context.create_surface_window(example.native_surface()?, true)?;
     example.register_observations(&context)?;
     let shader_bytes = ez_gfx_compiler::compile_shader(
         std::path::Path::new(concat!(

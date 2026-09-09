@@ -51,10 +51,6 @@ raw-window-handle = "0.6"
 thiserror.workspace = true
 winit = "0.30"
 
-[target.'cfg(target_vendor = "apple")'.dependencies]
-objc2.workspace = true
-objc2-core-foundation.workspace = true
-objc2-quartz-core.workspace = true
 
 
 [dev-dependencies]

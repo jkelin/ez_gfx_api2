@@ -31,15 +31,6 @@ fn allocates_maps_flushes_and_retires_upload_memory() {
 
 #[cfg(windows)]
 #[test]
-fn rejects_a_null_hwnd_before_swapchain_creation() {
-    assert!(matches!(
-        ez_gfx_backend_dx12::native::NativeSurface::new(core::ptr::null_mut()),
-        Err(ez_gfx_hal::HalError::InvalidArgument)
-    ));
-}
-
-#[cfg(windows)]
-#[test]
 fn uploads_each_texture_mip_under_a_distinct_fence() {
     use ez_gfx_hal::{
         ImageMip, QueueKind, SamplerAddressMode, SamplerFilter, TextureFormat, TextureRegion,

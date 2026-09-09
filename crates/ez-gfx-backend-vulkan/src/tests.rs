@@ -1,4 +1,51 @@
 use super::*;
+use crate::device::{cached_device_supports_surface, device_extensions};
+
+fn extension(name: &CStr) -> vk::ExtensionProperties {
+    let mut property = vk::ExtensionProperties::default();
+    // Test names are shorter than Vulkan's fixed extension-name storage and include the NUL.
+    for (destination, source) in property
+        .extension_name
+        .iter_mut()
+        .zip(name.to_bytes_with_nul())
+    {
+        *destination = i8::try_from(*source).unwrap();
+    }
+    property
+}
+
+fn enabled_has(enabled: &[*const core::ffi::c_char], name: &CStr) -> bool {
+    enabled.iter().any(|pointer| {
+        // SAFETY: extension policy returns pointers to static NUL-terminated Vulkan names.
+        (unsafe { CStr::from_ptr(*pointer) }) == name
+    })
+}
+
+#[test]
+fn device_policy_enables_advertised_swapchain_and_portability_subset() {
+    let available = [
+        extension(khr::swapchain::NAME),
+        extension(khr::portability_subset::NAME),
+    ];
+
+    let (enabled, swapchain) = device_extensions(&available);
+
+    assert!(enabled_has(&enabled, khr::swapchain::NAME));
+    assert!(enabled_has(&enabled, khr::portability_subset::NAME));
+    assert!(swapchain);
+
+    let (enabled, swapchain) = device_extensions(&[extension(khr::portability_subset::NAME)]);
+    assert!(!enabled_has(&enabled, khr::swapchain::NAME));
+    assert!(enabled_has(&enabled, khr::portability_subset::NAME));
+    assert!(!swapchain);
+}
+
+#[test]
+fn cached_headless_device_requires_enabled_swapchain_for_later_surface() {
+    assert!(cached_device_supports_surface(true, true));
+    assert!(cached_device_supports_surface(false, false));
+    assert!(!cached_device_supports_surface(true, false));
+}
 
 #[test]
 fn texture_heap_layout_matches_slang_bindless_contract() {

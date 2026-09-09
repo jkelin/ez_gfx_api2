@@ -22,8 +22,8 @@ ez-gfx-assets = { path = "../ez-gfx-assets" }
 crossbeam-channel.workspace = true
 ez-gfx-backend-vulkan = { path = "../ez-gfx-backend-vulkan" }
 
-thiserror.workspace = true
 raw-window-handle.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 static_assertions.workspace = true

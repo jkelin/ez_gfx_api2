@@ -101,13 +101,18 @@ pub struct TestContext {
     pub context: EzGfxContext,
     pub surface: EzGfxSurface,
     // Ownership keeps HWND/HINSTANCE alive through TestContext::drop.
-    _window: TestWindow,
+    window: Option<TestWindow>,
 }
 
 impl TestContext {
     // Validation is opt-in so existing fixture callers retain their original device requirements.
     pub fn create_with_validation(backend: u8, validation: bool) -> Self {
         let window = TestWindow::create_hidden();
+        let mut native = Self {
+            context: 0,
+            surface: 0,
+            window: Some(window),
+        };
         let desc = EzGfxBackendContextDesc {
             enable_debug: u8::from(validation),
             enable_validation: u8::from(validation),
@@ -116,47 +121,66 @@ impl TestContext {
             adapter_count: 0,
             adapter: core::ptr::null(),
         };
-        let mut context = 0;
+        let window = native.window.as_ref().unwrap();
         assert_eq!(
             {
                 // SAFETY: descriptor and output storage are live and correctly aligned through the FFI call.
-                unsafe { ez_gfx_context_create_backend(&raw const desc, &raw mut context) }
+                unsafe { ez_gfx_context_create_backend(&raw const desc, &raw mut native.context) }
             },
             EzGfxResult::Ok
         );
 
         let surface_desc = EzGfxWindowSurfaceDesc {
-            window: window.handle.0,
-            display: window.instance.0,
+            system: 0,
             cache_presented_snapshots: 0,
+            reserved: [0; 6],
+            handle_a: window.handle.0 as u64,
+            handle_b: window.instance.0 as u64,
         };
-        let mut surface = 0;
+        native.surface = 0;
         assert_eq!(
             {
                 // SAFETY: descriptor and output storage live through the call; `window` retains native handles until surface destruction.
                 unsafe {
-                    ez_gfx_surface_create_window(context, &raw const surface_desc, &raw mut surface)
+                    ez_gfx_surface_create_window(
+                        native.context,
+                        &raw const surface_desc,
+                        &raw mut native.surface,
+                    )
                 }
             },
             EzGfxResult::Ok
         );
         assert_eq!(
-            ez_gfx_context_init_device(context, surface),
+            ez_gfx_context_init_device(native.context, native.surface),
             EzGfxResult::Ok
         );
 
-        Self {
-            context,
-            surface,
-            // Ownership keeps HWND/HINSTANCE alive through TestContext::drop.
-            _window: window,
-        }
+        native
     }
 }
 
 impl Drop for TestContext {
     fn drop(&mut self) {
-        ez_gfx_surface_destroy(self.context, self.surface);
-        ez_gfx_context_destroy(self.context);
+        let surface = if self.surface == 0 {
+            EzGfxResult::Ok
+        } else {
+            ez_gfx_surface_destroy(self.context, self.surface)
+        };
+        let context = if self.context == 0 {
+            EzGfxResult::Ok
+        } else {
+            ez_gfx_context_destroy(self.context)
+        };
+        if surface != EzGfxResult::Ok || context != EzGfxResult::Ok {
+            if let Some(window) = self.window.take() {
+                // Failed teardown cannot prove that no native object still borrows the HWND.
+                core::mem::forget(window);
+            }
+            assert!(
+                std::thread::panicking(),
+                "fixture teardown failed: surface={surface:?} context={context:?}"
+            );
+        }
     }
 }

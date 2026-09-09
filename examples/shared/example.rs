@@ -1,6 +1,6 @@
 use super::{
-    BenchmarkRunner, Error, FrameInput, PresentedFrame, ProgramReport, Result, SceneInput,
-    dispatch_window_input, publish_snapshot,
+    BenchmarkRunner, Error, FrameInput, HostSurface, PresentedFrame, ProgramReport, Result,
+    SceneInput, dispatch_window_input, publish_snapshot,
 };
 use ez_gfx::{Backend, Context, Event, Frame, Surface};
 use std::{
@@ -8,6 +8,7 @@ use std::{
     ffi::OsString,
     io::Write,
     rc::Rc,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use winit::{
@@ -38,7 +39,7 @@ struct HostState {
     title: &'static str,
     frame_limit: Option<u32>,
     visible: bool,
-    window: Option<Window>,
+    window: Option<Arc<Window>>,
     width: u32,
     height: u32,
     pending_resize: Option<(u32, u32)>,
@@ -117,7 +118,7 @@ impl HostState {
             .with_visible(self.visible)
             .with_active(self.visible);
         let window = match event_loop.create_window(attributes) {
-            Ok(window) => window,
+            Ok(window) => Arc::new(window),
             Err(error) => return self.fail(error),
         };
         self.window = Some(window);
@@ -211,7 +212,15 @@ impl Example {
     pub fn window(&self) -> Result<&Window> {
         self.state
             .window
+            .as_deref()
+            .ok_or_else(|| Error::message("native host was not resumed"))
+    }
+    /// Returns an owned clone of the live host used for surface creation.
+    pub fn native_surface(&self) -> Result<HostSurface> {
+        self.state
+            .window
             .as_ref()
+            .map(|window| HostSurface::attach(Arc::clone(window)))
             .ok_or_else(|| Error::message("native host was not resumed"))
     }
 

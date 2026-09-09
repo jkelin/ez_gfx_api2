@@ -16,6 +16,7 @@ fn status_values_and_abi_version_are_stable() {
     assert_eq!(EzGfxResult::DeviceLost as u8, 6);
     assert_eq!(EzGfxResult::QueueFull as u8, 7);
     assert_eq!(EzGfxResult::Cancelled as u8, 8);
+    assert_eq!(EzGfxResult::TeardownAbandoned as u8, 9);
     assert_eq!(
         [
             EzGfxTextureError::None as u8,
@@ -31,7 +32,7 @@ fn status_values_and_abi_version_are_stable() {
         ],
         [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     );
-    assert_eq!(EZ_GFX_ABI_VERSION, 36);
+    assert_eq!(EZ_GFX_ABI_VERSION, 37);
 }
 
 #[test]
@@ -127,4 +128,39 @@ fn error_printer_validates_and_reports_required_capacity() {
         EzGfxResult::Ok
     );
     assert_eq!(&unknown, b"unknown error\0");
+}
+
+#[test]
+fn error_printer_reports_teardown_abandonment_bytes() {
+    const MESSAGE: &[u8] = b"native teardown abandoned; borrowed host handles must remain alive";
+    let mut required = 0;
+    assert_eq!(
+        // SAFETY: Null+zero is the documented size-query form and `required` is writable.
+        unsafe {
+            ez_gfx_error_print(
+                EzGfxResult::TeardownAbandoned as u8,
+                core::ptr::null_mut(),
+                0,
+                &raw mut required,
+            )
+        },
+        EzGfxResult::Ok
+    );
+    assert_eq!(required, MESSAGE.len() + 1);
+
+    let mut exact = vec![0_u8; required];
+    assert_eq!(
+        // SAFETY: `exact` and `required` remain writable for the call.
+        unsafe {
+            ez_gfx_error_print(
+                EzGfxResult::TeardownAbandoned as u8,
+                exact.as_mut_ptr(),
+                exact.len(),
+                &raw mut required,
+            )
+        },
+        EzGfxResult::Ok
+    );
+    assert_eq!(&exact[..exact.len() - 1], MESSAGE);
+    assert_eq!(exact[exact.len() - 1], 0);
 }

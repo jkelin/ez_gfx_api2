@@ -267,15 +267,12 @@ impl NativeContext {
             .map_err(|_| AllocationError::NativeFailure)
     }
 
-    /// Admits the selected adapter and initializes all device-owned queues and descriptor state.
+    /// Admits the selected adapter and initializes device-owned state.
     ///
     /// # Errors
     ///
-    /// Returns an error if the surface has a null Metal layer.
-    pub fn init_device(&self, surface: &NativeSurface) -> Result<AdapterInfo, HalError> {
-        if surface.layer == 0 {
-            return Err(HalError::InvalidArgument);
-        }
+    /// This implementation has no fallible surface-specific initialization.
+    pub fn init_device(&self, _surface: &NativeSurface) -> Result<AdapterInfo, HalError> {
         Ok(self.adapter.clone())
     }
 
