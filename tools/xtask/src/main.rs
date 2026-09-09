@@ -1,6 +1,5 @@
 //! Packaging and repository quality checks.
-mod declaration_parity;
-mod export_parity;
+mod runtime_audit;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
@@ -32,8 +31,6 @@ struct Cli {
 enum Task {
     /// Build compiler and runtime distribution archives.
     Package(PackageCommand),
-    /// Compare public C declarations with packaged runtime exports.
-    ExportParity(ExportParityCommand),
     /// Check tracked Rust files against the source-line limit.
     SourceLines,
 }
@@ -46,11 +43,6 @@ struct PackageCommand {
     version: Option<String>,
     /// Archive output directory.
     output: Option<PathBuf>,
-}
-#[derive(Args, Debug)]
-struct ExportParityCommand {
-    /// Packaged runtime library or package root containing it.
-    library: PathBuf,
 }
 
 fn main() {
@@ -65,7 +57,6 @@ fn dispatch(cli: Cli) -> Result<()> {
     match cli.task {
         Task::Package(command) => package(&command.resolve()?),
         Task::SourceLines => source_lines(),
-        Task::ExportParity(command) => export_parity::check(&command.library),
     }
 }
 
@@ -140,7 +131,10 @@ fn package(args: &PackageArgs) -> Result<()> {
     fs::create_dir_all(&compiler)
         .with_context(|| format!("create compiler package {}", compiler.display()))?;
 
-    copy_required("include/ez_gfx_api.h", runtime.join("ez_gfx_api.h"))?;
+    copy_required(
+        "bindings/c/include/ez_gfx_api.h",
+        runtime.join("ez_gfx_api.h"),
+    )?;
     copy_required("README.md", runtime.join("ROOT-README.md"))?;
     copy_required(
         "crates/ez-gfx-runtime/README.md",
@@ -168,8 +162,8 @@ fn package(args: &PackageArgs) -> Result<()> {
         copy_required(source, compiler.join(name))?;
     }
 
-    export_parity::audit_runtime_package_contents(&runtime)?;
-    let imports = export_parity::audit_runtime_library_file(&runtime.join(runtime_files[0]))?;
+    runtime_audit::audit_runtime_package_contents(&runtime)?;
+    let imports = runtime_audit::audit_runtime_library_file(&runtime.join(runtime_files[0]))?;
     println!(
         "runtime-import-audit: imports [{}], forbidden 0",
         imports.into_iter().collect::<Vec<_>>().join(", ")
@@ -511,8 +505,8 @@ fn physical_line_count(bytes: &[u8]) -> usize {
 #[cfg(test)]
 mod source_line_tests {
     use super::{
-        Cli, ExportParityCommand, PackageCommand, Task, existing_rust_paths, parse_rust_paths,
-        physical_line_count, source_line_diagnostics,
+        Cli, PackageCommand, Task, existing_rust_paths, parse_rust_paths, physical_line_count,
+        source_line_diagnostics,
     };
     use clap::{Parser, error::ErrorKind};
     use std::{
@@ -525,13 +519,6 @@ mod source_line_tests {
         assert!(matches!(
             Cli::try_parse_from(["xtask", "source-lines"]).unwrap().task,
             Task::SourceLines
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["xtask", "export-parity", "dist/runtime"])
-                .unwrap()
-                .task,
-            Task::ExportParity(ExportParityCommand { library })
-                if library == PathBuf::from("dist/runtime")
         ));
 
         let cli = Cli::try_parse_from([

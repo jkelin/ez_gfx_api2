@@ -13,7 +13,7 @@ Migrate the original Odin/Vulkan `ez_gfx_api` to Rust/Cargo while roughly preser
 - Runtime packages must not depend on or bundle the Slang compiler.
 - Vulkan, DX12, and Metal are required; Vulkan-only abstractions are incomplete.
 - Explicit shader target attributes are authoritative for target intent.
-- Rust uses the clean ownership interface; C/C# use the explicit ABI 33 lifecycle through the dedicated FFI seam.
+- Rust uses the clean ownership interface; C/C# use the explicit ABI 34 lifecycle through the dedicated FFI seam.
 - External inputs and binary artifacts require validation; no panic crosses FFI.
 - OpenGL, DX11, software rasterizers, a custom shader DSL, and a custom window system are out of scope.
 - `gpu-allocator` 0.28 is the selected cross-backend Rust allocator.
@@ -23,51 +23,51 @@ Migrate the original Odin/Vulkan `ez_gfx_api` to Rust/Cargo while roughly preser
 
 ## Selected-solution summary
 
-### P-001: Cargo workspace and delivery boundaries — Strict workspace boundary
+### P-001: Cargo workspace and delivery boundaries â€” Strict workspace boundary
 
 A virtual workspace separates core types, runtime/artifact loading, offline in-process Slang compiler bindings, FFI, backend dependencies, and optional decoders. Runtime dependency audits prevent compiler leakage; feature resolution follows the selected MSRV.
 
-### P-002: Public API and C ABI bindings — Owning Rust facade and raw FFI
+### P-002: Public API and C ABI bindings â€” Owning Rust facade and raw FFI
 
-`Context` owns `Rc<ContextInner>`; owning resources retain context/resource leases and release through `Drop`. `Surface::begin_frame` and `Context::begin_frame` return target-less owning `Frame` values; configure methods attach logical swapchain or cached named targets. Recording borrows frames mutably, `Frame::finish(self)` preserves exact errors, and `Drop` aborts. ABI 33 alone exposes explicit lifecycle calls and opaque generational `u64` handles, including `EzGfxFrame`.
+`Context` owns `Rc<ContextInner>`; owning resources retain context/resource leases and release through `Drop`. `Surface::begin_frame` and `Context::begin_frame` return target-less owning `Frame` values; configure methods attach logical swapchain or cached named targets. Recording borrows frames mutably, `Frame::finish(self)` preserves exact errors, and `Drop` aborts. ABI 34 alone exposes explicit lifecycle calls and opaque generational `u64` handles, including `EzGfxFrame`.
 
-### P-003: Multi-backend hardware abstraction — Custom static raw HAL
+### P-003: Multi-backend hardware abstraction â€” Custom static raw HAL
 
 A narrow backend-neutral contract is implemented directly over Vulkan, DX12, and Metal bindings. Capability discovery and state lowering remain backend-local; concrete dispatch avoids hot-path trait-object dependence.
 
-### P-004: GPU memory allocation — `gpu-allocator`
+### P-004: GPU memory allocation â€” `gpu-allocator`
 
 A HAL allocation interface carries size, alignment, memory class, mapping, retirement, and alias lifetime. `gpu-allocator` 0.28 supplies the Vulkan, DX12, and Metal implementations.
 
-### P-005: Universal Slang compilation — Native multi-target Slang
+### P-005: Universal Slang compilation â€” Native multi-target Slang
 
 Offline Slang compilation through `shader-slang`/slang-rs emits native SPIR-V, DXIL, and Metal products plus canonical metadata. Target attributes are captured before optimization and validated per target.
 
-### P-006: Precompiled shader container and reflection — Framed, validated `rkyv`
+### P-006: Precompiled shader container and reflection â€” Framed, validated `rkyv`
 
 A bounded, versioned `.ezgfxshader` file uses a fixed little-endian frame around one bytechecked `rkyv` payload. It stores stage-grouped target products, reflection, compiler provenance, and an execution digest. Runtime validates and loads it without JIT/compiler fallback.
 
-### P-007: Pipeline caching and descriptors — Global table plus frame-owned arenas
+### P-007: Pipeline caching and descriptors â€” Global table plus frame-owned arenas
 
 Stable generation-checked bindless indices are independent of PSO ownership. Transient descriptors belong to the owning `Frame` and are invalidated on completion or abort; native reuse remains GPU-completion-safe.
 
-### P-008: Render-graph hazards — Precise subresource state compiler
+### P-008: Render-graph hazards â€” Precise subresource state compiler
 
 A frame DAG tracks ranges/subresources, queues, stages, access, layouts, readers/writers, and history. It lowers precise transitions to each backend and rejects invalid/unreachable dependencies.
 
-### P-009: Pass coalescing and transient aliasing — Integrated greedy compiler
+### P-009: Pass coalescing and transient aliasing â€” Integrated greedy compiler
 
 Compatible adjacent nodes merge; first/last-use intervals assign compatible transient memory ranges. Persistent history is excluded and alias boundaries are emitted per backend.
 
-### P-010: Target declarations and formats — Shader authority with runtime probing
+### P-010: Target declarations and formats â€” Shader authority with runtime probing
 
 Canonical target metadata preserves kind, usage, scale, sampleability, load/store, abstract format candidates, and clears. Device capability queries resolve physical formats and report unsupported intent.
 
-### P-011: Vertex and index geometry heaps — Owning generation-checked leases
+### P-011: Vertex and index geometry heaps â€” Owning generation-checked leases
 
 Named vertex heaps and the singleton context-owned index heap use range free lists plus generation-checked allocation leases. Safe wrappers retain parent/context ownership and release through `Drop`; C retains explicit handle release.
 
-### P-012: Transfer staging and batching — Timeline-recycled bucket pools with adaptive batches
+### P-012: Transfer staging and batching â€” Timeline-recycled bucket pools with adaptive batches
 
 Size-classed staging pools recycle after completion; a transfer owner batches copies and flushes on explicit readiness/frame/threshold events. Independent ordered timeline domains avoid manager serialization.
 
@@ -75,15 +75,15 @@ Size-classed staging pools recycle after completion; a transfer owner batches co
 
 Presented and managed-target begin functions return an owning `Frame`. Recording requires `&mut Frame`; `Frame::finish(self)` consumes it, returns recording/submit/present errors unchanged, and `Drop` aborts. Context-acquired buffers are claimed by their first frame, reusable only within it, and invalid after every terminal path; native backing is recycled only after completion.
 
-### P-014: Basis Universal and compressed textures — Feature-gated official transcoder wrapper
+### P-014: Basis Universal and compressed textures â€” Feature-gated official transcoder wrapper
 
 An optional `basis-universal` wrapper handles universal `.basis`/KTX2 input and backend-supported BC/ASTC output; direct compressed payloads bypass transcoding.
 
-### P-015: Texture streaming and partial updates — Progressive mip streamer
+### P-015: Texture streaming and partial updates â€” Progressive mip streamer
 
 Coarse mips become sample-ready first; stable descriptors publish after handoff. Validated subregion updates and phase/byte telemetry support dynamic atlases and streaming.
 
-### P-016: Multi-draw indirect and dynamic state — Scissor-batched MDI
+### P-016: Multi-draw indirect and dynamic state â€” Scissor-batched MDI
 
 Standard indirect records pair with validated viewport/scissor side tables. Consecutive equal-state ranges batch native dynamic state updates while retaining compute-filled MDI.
 
@@ -91,51 +91,51 @@ Standard indirect records pair with validated viewport/scissor side tables. Cons
 
 An owning `Surface` retains its context lease while the host retains the native window. Construction is atomic and rolls back partial native/init state. Zero extent returns `NotReady`; consuming frame completion presents; presentation targets reject shader reads and use transfer readback.
 
-### P-018: Async workers — Scoped Rayon compute pool and bounded transfer channel
+### P-018: Async workers â€” Scoped Rayon compute pool and bounded transfer channel
 
 A library-owned CPU pool decodes/transcodes; a bounded channel feeds one transfer owner. Cancellation, shutdown, backpressure, and owned completion-event production are explicit.
 
-### P-019: Tests and golden snapshots — Real backend offscreen goldens
+### P-019: Tests and golden snapshots â€” Real backend offscreen goldens
 
 Backend-specific offscreen/readback fixtures provide PNG goldens and tolerances; deterministic IR/unit tests complement them. Missing required adapters are unavailable, never passing.
 
-### P-020: Migration cutover — Clean ownership cutover
+### P-020: Migration cutover â€” Clean ownership cutover
 
-The final cutover uses the shared `Example` host for winit inversion, context/surface ownership, resize, input, automation, and consuming frame dispatch. Rust exposes no compatibility aliases or manual frame/resource release; ABI 33 preserves the explicit C lifecycle.
+The final cutover uses the shared `Example` host for winit inversion, context/surface ownership, resize, input, automation, and consuming frame dispatch. Rust exposes no compatibility aliases or manual frame/resource release; ABI 34 preserves the explicit C lifecycle.
 
-### P-021: Cross-backend shader execution semantics — Target-native layouts with canonical semantic ABI
+### P-021: Cross-backend shader execution semantics â€” Target-native layouts with canonical semantic ABI
 
 One root Slang module defines stable semantic resource declarations, while `.ezgfxshader` retains target-native products and reflection. Each stage owns exactly one internal entry point; callers load without naming it. Runtime never assumes identical physical slots or aggregate layouts. DXIL variants target Shader Model 6.5 and use explicit descriptor tables/root descriptors; no 6.6-only direct heap indexing is part of the semantic ABI.
 
-### P-022: Backend, device, and capability admission — Single modern semantic floor
+### P-022: Backend, device, and capability admission â€” Single modern semantic floor
 
 Rust/FFI expose explicit adapter enumeration/selection and a deterministic default. One semantic capability floor maps to native features and limits, including Shader Model 6.5 as the lowest model required by implemented DXIL semantics; unsupported devices fail before manager creation. Cache and snapshot identity includes backend, stable device/driver identity, and profile schema.
 
-### P-023: Device loss and runtime recovery — Terminal lost runtime
+### P-023: Device loss and runtime recovery â€” Terminal lost runtime
 
 The first fatal device result atomically poisons the runtime. New work, outstanding tokens, leases, transfers, and callbacks fail exactly once; no path waits for lost GPU progress. Handles remain invalid, diagnostics remain bounded, and the host creates a fresh runtime.
 
-### P-024: Persistent pipeline cache lifecycle — Host-owned validated blobs
+### P-024: Persistent pipeline cache lifecycle â€” Host-owned validated blobs
 
 Runtime imports/exports bounded, validated, backend-specific cache envelopes. Hosts own filesystem paths, atomic commits, locks, quotas, eviction, and cross-process policy. Bad or absent data falls back uncached; cache I/O never enters the render hot path.
 
-### P-025: Metal shader artifact production — Offline metallib variants
+### P-025: Metal shader artifact production â€” Offline metallib variants
 
 Offline tooling converts Slang-generated MSL through Apple tools into `.metallib` products stored in `.ezgfxshader`; non-Apple builds retain portable MSL for coverage. Runtime selects a compatible product without source compilation, and Metal binary archives remain separate derived PSO caches.
 
-### P-026: Runtime threading and event delivery — Host-polled bounded event queue
+### P-026: Runtime threading and event delivery â€” Host-polled bounded event queue
 
 Each context owns a bounded queue of owned events. Hosts poll/drain on their chosen thread; frame recording remains context-affine and other concurrency is explicit. Overflow is observable and non-blocking; CPU shutdown barriers prevent callback/payload use after destruction.
 
-### P-027: Artifact integrity and provenance — Host-owned authenticity
+### P-027: Artifact integrity and provenance â€” Host-owned authenticity
 
 Runtime owns bounded parsing, compatibility checks, complete execution-content digests, and versioned provenance reporting. The host/package boundary owns signing and authenticity; the runtime never labels an unkeyed digest as authentication.
 
-### P-028: Local diagnostics and profiling — Bounded structured event stream
+### P-028: Local diagnostics and profiling â€” Bounded structured event stream
 
 All components emit typed, correlated local diagnostic/profiling events through P-026's queue. Events declare severity, category, IDs, sequence/domain, clocks, units, availability, and payload. Overflow emits a loss marker/count; no remote upload or hidden persistence exists.
 
-### P-029: Cross-platform native build and distribution — Centrally built separate signed artifacts
+### P-029: Cross-platform native build and distribution â€” Centrally built separate signed artifacts
 
 Target-native release CI builds pinned sources and publishes separate runtime/FFI, compiler/tool, and optional Basis packages with deterministic manifests, notices, provenance, signing/notarization, and binary-import audits proving compiler-free runtime delivery.
 
@@ -634,9 +634,9 @@ All external inputs fail closed. Required adapter absence blocks cutover; explic
 
 Pre-recursive pass pending. This document maps P-001 through P-020 and their selected solutions to cohesive components and cross-cutting concerns. A recursive audit must next inspect these component boundaries, interfaces, data flows, storage/cache/queue ownership, failure paths, deployment boundaries, and cross-component interactions for newly exposed consequential decisions; no fixed point is claimed.
 
-### Pass 2 — recursive Step 1 after Step 4
+### Pass 2 â€” recursive Step 1 after Step 4
 
-The component-boundary, interface, end-to-end data-flow, mutable/durable storage, cache, bounded-queue, failure/trust, deployment, hot-path, and cross-component interaction audit—reconciled with the independent coverage audit—found nine consequential decisions without selected solutions:
+The component-boundary, interface, end-to-end data-flow, mutable/durable storage, cache, bounded-queue, failure/trust, deployment, hot-path, and cross-component interaction auditâ€”reconciled with the independent coverage auditâ€”found nine consequential decisions without selected solutions:
 
 - P-021: cross-backend shader execution semantics, including the canonical coordinate, layout, binding, and specialization ABI required for genuinely universal Slang shaders.
 - P-022: backend/adapter selection and the exact capability-admission/tier policy consumed by HAL clients, caches, and validation profiles.
@@ -656,8 +656,8 @@ Each retained problem is decision-sized, crosses existing component ownership, a
 
 P-021 through P-029 are now integrated into the canonical component plan and flows. Ownership is explicit for semantic shader IDs versus target layouts/specialization, capability admission and its cache/test identity, terminal `Lost` fan-out and exactly-once outcomes, host-owned cache persistence/authenticity, Metal build/selection metadata, host-polled events, bounded local diagnostics, and native release products. P-004 is resolved by the selected allocator. A later recursive coverage pass is still required before claiming a fixed point.
 
-### Coverage Pass 3 — recursive Step 1 after second Step 4
+### Coverage Pass 3 â€” recursive Step 1 after second Step 4
 
 The component-boundary, interface, end-to-end flow, mutable/durable storage, cache, bounded-queue, failure/trust, deployment, performance, and cross-component interaction audit reached a fixed point. Every prompt requirement and consequential cross-cutting choice is owned by P-001 through P-029 with a selected solution.
 
-No P-030 problem was created. Remaining specifics—exact semantic-profile limits, source-convention constants, queue capacities, Apple/target matrix entries, cache envelope fields, diagnostic payload bounds, benchmark thresholds, and test fixtures—are implementation or validation refinements inside P-021 through P-029, not new decision boundaries.
+No P-030 problem was created. Remaining specificsâ€”exact semantic-profile limits, source-convention constants, queue capacities, Apple/target matrix entries, cache envelope fields, diagnostic payload bounds, benchmark thresholds, and test fixturesâ€”are implementation or validation refinements inside P-021 through P-029, not new decision boundaries.

@@ -10,15 +10,14 @@ use ez_gfx_artifact::{
 use ez_gfx_ffi::{
     EzGfxBackendContextDesc, EzGfxDrawIndexedCommand, EzGfxDynamicState, EzGfxEvent,
     EzGfxEventKind, EzGfxRenderTargetDesc, EzGfxResult, EzGfxSurfaceDesc, EzGfxTextureDesc,
-    ez_gfx_callback_register, ez_gfx_context_create_backend, ez_gfx_context_destroy,
-    ez_gfx_context_init_device, ez_gfx_context_wait_idle, ez_gfx_counter_buffer_acquire,
-    ez_gfx_counter_buffer_write_draws, ez_gfx_frame_begin, ez_gfx_frame_end,
-    ez_gfx_graph_enqueue_texture_readback, ez_gfx_index_allocation_get_range,
-    ez_gfx_render_add_compute_pipeline, ez_gfx_render_add_vertex_pipeline,
-    ez_gfx_render_target_create, ez_gfx_render_target_destroy, ez_gfx_render_target_frame_begin,
-    ez_gfx_shader_destroy, ez_gfx_shader_load_artifact, ez_gfx_surface_create,
-    ez_gfx_surface_destroy, ez_gfx_texture_load, ez_gfx_texture_unload,
-    ez_gfx_vertex_upload_indices,
+    ez_gfx_context_create_backend, ez_gfx_context_destroy, ez_gfx_context_init_device,
+    ez_gfx_context_register_callback, ez_gfx_context_wait_idle, ez_gfx_counter_buffer_acquire,
+    ez_gfx_counter_buffer_write_draws, ez_gfx_frame_add_compute_pipeline,
+    ez_gfx_frame_add_vertex_pipeline, ez_gfx_frame_begin, ez_gfx_frame_end,
+    ez_gfx_frame_enqueue_texture_readback, ez_gfx_index_allocation_create,
+    ez_gfx_index_allocation_get_range, ez_gfx_render_target_create, ez_gfx_render_target_destroy,
+    ez_gfx_render_target_frame_begin, ez_gfx_shader_destroy, ez_gfx_shader_load_artifact,
+    ez_gfx_surface_create, ez_gfx_surface_destroy, ez_gfx_texture_load, ez_gfx_texture_unload,
 };
 use objc2::rc::Retained;
 use objc2_core_foundation::CGSize;
@@ -72,7 +71,7 @@ fn begin_offscreen_frame(context: u64) -> (u64, u64) {
     let mut target = 0;
     // SAFETY: descriptor, format, and output storage remain live through the call.
     assert_eq!(
-        unsafe { ez_gfx_render_target_create(&raw const desc, 1, 1, &raw mut target, context) },
+        unsafe { ez_gfx_render_target_create(context, &raw const desc, 1, 1, &raw mut target) },
         EzGfxResult::Ok
     );
     let mut frame = 0;
@@ -146,11 +145,11 @@ fn metal_texture_readback_submits_without_a_surface() {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
                 ez_gfx_texture_load(
+                    context,
                     expected.as_ptr(),
                     expected.len(),
                     &raw const texture_desc,
                     &raw mut texture,
-                    context,
                 )
             }
         },
@@ -162,7 +161,11 @@ fn metal_texture_readback_submits_without_a_surface() {
     assert_eq!(
         // SAFETY: `collected` remains alive until registration is explicitly cleared.
         unsafe {
-            ez_gfx_callback_register(context, Some(collect_event), (&raw mut collected).cast())
+            ez_gfx_context_register_callback(
+                context,
+                Some(collect_event),
+                (&raw mut collected).cast(),
+            )
         },
         EzGfxResult::Ok
     );
@@ -170,20 +173,22 @@ fn metal_texture_readback_submits_without_a_surface() {
     let mut request_id = 0;
     assert_eq!(
         // SAFETY: request output is writable aligned test-owned storage.
-        unsafe { ez_gfx_graph_enqueue_texture_readback(texture, frame, &raw mut request_id) },
+        unsafe {
+            ez_gfx_frame_enqueue_texture_readback(context, frame, texture, &raw mut request_id)
+        },
         EzGfxResult::Ok
     );
     assert_ne!(request_id, 0);
-    assert_eq!(ez_gfx_frame_end(frame), EzGfxResult::Ok);
-    ez_gfx_render_target_destroy(target, context);
+    assert_eq!(ez_gfx_frame_end(context, frame), EzGfxResult::Ok);
+    ez_gfx_render_target_destroy(context, target);
 
     let actual = collected.readback.take().expect("readback event delivered");
     assert_eq!(actual, expected);
 
-    ez_gfx_texture_unload(texture, context);
+    ez_gfx_texture_unload(context, texture);
     assert_eq!(
         // SAFETY: clearing a live registration retains no user-data pointer.
-        unsafe { ez_gfx_callback_register(context, None, core::ptr::null_mut()) },
+        unsafe { ez_gfx_context_register_callback(context, None, core::ptr::null_mut()) },
         EzGfxResult::Ok
     );
     ez_gfx_context_destroy(context);
@@ -218,10 +223,10 @@ fn metal_compute_submits_without_a_surface() {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
                 ez_gfx_shader_load_artifact(
+                    context,
                     artifact.as_ptr(),
                     artifact.len(),
                     &raw mut shader,
-                    context,
                 )
             }
         },
@@ -232,7 +237,9 @@ fn metal_compute_submits_without_a_surface() {
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_render_add_compute_pipeline(
+                ez_gfx_frame_add_compute_pipeline(
+                    context,
+                    frame,
                     shader,
                     1,
                     1,
@@ -241,16 +248,15 @@ fn metal_compute_submits_without_a_surface() {
                     0,
                     core::ptr::null(),
                     0,
-                    frame,
                 )
             }
         },
         EzGfxResult::Ok
     );
-    assert_eq!(ez_gfx_frame_end(frame), EzGfxResult::Ok);
-    ez_gfx_render_target_destroy(target, context);
+    assert_eq!(ez_gfx_frame_end(context, frame), EzGfxResult::Ok);
+    ez_gfx_render_target_destroy(context, target);
 
-    ez_gfx_shader_destroy(shader, context);
+    ez_gfx_shader_destroy(context, shader);
     ez_gfx_context_destroy(context);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -269,7 +275,9 @@ fn submit_render_nodes(context: u64, frame: u64, shader: u64, indirect: u64) {
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_render_add_vertex_pipeline(
+                ez_gfx_frame_add_vertex_pipeline(
+                    context,
+                    frame,
                     shader,
                     indirect,
                     core::ptr::null(),
@@ -277,7 +285,6 @@ fn submit_render_nodes(context: u64, frame: u64, shader: u64, indirect: u64) {
                     &raw const alpha_blend,
                     left.as_ptr().cast(),
                     u32::try_from(core::mem::size_of_val(&left)).unwrap(),
-                    frame,
                 )
             }
         },
@@ -288,7 +295,9 @@ fn submit_render_nodes(context: u64, frame: u64, shader: u64, indirect: u64) {
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_render_add_compute_pipeline(
+                ez_gfx_frame_add_compute_pipeline(
+                    context,
+                    frame,
                     shader,
                     1,
                     1,
@@ -297,7 +306,6 @@ fn submit_render_nodes(context: u64, frame: u64, shader: u64, indirect: u64) {
                     0,
                     core::ptr::null(),
                     0,
-                    frame,
                 )
             }
         },
@@ -307,7 +315,9 @@ fn submit_render_nodes(context: u64, frame: u64, shader: u64, indirect: u64) {
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_render_add_vertex_pipeline(
+                ez_gfx_frame_add_vertex_pipeline(
+                    context,
+                    frame,
                     shader,
                     indirect,
                     core::ptr::null(),
@@ -315,7 +325,6 @@ fn submit_render_nodes(context: u64, frame: u64, shader: u64, indirect: u64) {
                     core::ptr::null(),
                     right.as_ptr().cast(),
                     u32::try_from(core::mem::size_of_val(&right)).unwrap(),
-                    frame,
                 )
             }
         },
@@ -326,7 +335,9 @@ fn submit_render_nodes(context: u64, frame: u64, shader: u64, indirect: u64) {
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_render_add_vertex_pipeline(
+                ez_gfx_frame_add_vertex_pipeline(
+                    context,
+                    frame,
                     shader,
                     indirect,
                     core::ptr::null(),
@@ -334,13 +345,12 @@ fn submit_render_nodes(context: u64, frame: u64, shader: u64, indirect: u64) {
                     core::ptr::null(),
                     occluded.as_ptr().cast(),
                     u32::try_from(core::mem::size_of_val(&occluded)).unwrap(),
-                    frame,
                 )
             }
         },
         EzGfxResult::Ok
     );
-    assert_eq!(ez_gfx_frame_end(frame), EzGfxResult::Ok);
+    assert_eq!(ez_gfx_frame_end(context, frame), EzGfxResult::Ok);
     assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
 }
 
@@ -382,19 +392,23 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_surface_create(&raw const surface_desc, &raw mut surface, context) }
+            unsafe { ez_gfx_surface_create(context, &raw const surface_desc, &raw mut surface) }
         },
         EzGfxResult::Ok
     );
     assert_eq!(
-        ez_gfx_context_init_device(surface, context),
+        ez_gfx_context_init_device(context, surface),
         EzGfxResult::Ok
     );
     let mut collected = Collected::default();
     assert_eq!(
         // SAFETY: `collected` remains alive until registration is explicitly cleared.
         unsafe {
-            ez_gfx_callback_register(context, Some(collect_event), (&raw mut collected).cast())
+            ez_gfx_context_register_callback(
+                context,
+                Some(collect_event),
+                (&raw mut collected).cast(),
+            )
         },
         EzGfxResult::Ok
     );
@@ -405,10 +419,10 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
                 ez_gfx_shader_load_artifact(
+                    context,
                     artifact.as_ptr(),
                     artifact.len(),
                     &raw mut shader,
-                    context,
                 )
             }
         },
@@ -422,11 +436,11 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_vertex_upload_indices(
+                ez_gfx_index_allocation_create(
+                    context,
                     indices.as_ptr().cast(),
                     u32::try_from(indices.len()).unwrap(),
                     &raw mut index_allocation,
-                    context,
                 )
             }
         },
@@ -439,10 +453,10 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
                 ez_gfx_index_allocation_get_range(
+                    context,
                     index_allocation,
                     &raw mut first_index,
                     &raw mut index_count,
-                    context,
                 )
             }
         },
@@ -461,12 +475,12 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
                 ez_gfx_counter_buffer_acquire(
+                    context,
                     size_of::<EzGfxDrawIndexedCommand>() as u32,
                     1,
                     label.as_ptr(),
                     label.len(),
                     &raw mut indirect,
-                    context,
                 )
             }
         },
@@ -483,7 +497,7 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_counter_buffer_write_draws(indirect, 0, &raw const command, 1, context)
+                ez_gfx_counter_buffer_write_draws(context, indirect, 0, &raw const command, 1)
             }
         },
         EzGfxResult::Ok
@@ -504,12 +518,12 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
     };
     assert_eq!(
         // SAFETY: clearing a live registration retains no user-data pointer.
-        unsafe { ez_gfx_callback_register(context, None, core::ptr::null_mut()) },
+        unsafe { ez_gfx_context_register_callback(context, None, core::ptr::null_mut()) },
         EzGfxResult::Ok
     );
 
-    ez_gfx_shader_destroy(shader, context);
-    ez_gfx_surface_destroy(surface, context);
+    ez_gfx_shader_destroy(context, shader);
+    ez_gfx_surface_destroy(context, surface);
     ez_gfx_context_destroy(context);
     drop(layer);
     bytes

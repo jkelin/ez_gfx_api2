@@ -14,6 +14,7 @@ members = [
     "crates/ez-gfx-backend-metal",
     "examples",
     "tools/xtask",
+    "tools/bindgen",
 ]
 resolver = "3"
 

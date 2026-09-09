@@ -10,7 +10,7 @@ use ez_gfx_ffi::{
 };
 use ez_gfx_ffi::{
     EzGfxResult, EzGfxTextureRegionDesc, EzGfxTextureUploadTelemetry,
-    ez_gfx_texture_get_upload_telemetry, ez_gfx_update_texture_region,
+    ez_gfx_texture_get_upload_telemetry, ez_gfx_texture_update_region,
 };
 #[test]
 fn layouts_and_export_signatures_are_stable() {
@@ -49,9 +49,9 @@ fn layouts_and_export_signatures_are_stable() {
         ],
         [0, 8, 16, 24]
     );
-    let _: unsafe extern "C" fn(u64, *const EzGfxTextureRegionDesc, u64) -> EzGfxResult =
-        ez_gfx_update_texture_region;
-    let _: unsafe extern "C" fn(*mut EzGfxTextureUploadTelemetry, u64) -> EzGfxResult =
+    let _: unsafe extern "C" fn(u64, u64, *const EzGfxTextureRegionDesc) -> EzGfxResult =
+        ez_gfx_texture_update_region;
+    let _: unsafe extern "C" fn(u64, *mut EzGfxTextureUploadTelemetry) -> EzGfxResult =
         ez_gfx_texture_get_upload_telemetry;
 }
 
@@ -59,12 +59,12 @@ fn layouts_and_export_signatures_are_stable() {
 fn null_streaming_descriptors_fail_before_context_access() {
     assert_eq!(
         // SAFETY: Null descriptor intentionally exercises checked boundary rejection.
-        unsafe { ez_gfx_update_texture_region(1, core::ptr::null(), 0) },
+        unsafe { ez_gfx_texture_update_region(0, 1, core::ptr::null()) },
         EzGfxResult::InvalidArgument
     );
     assert_eq!(
         // SAFETY: Null output intentionally exercises checked boundary rejection.
-        unsafe { ez_gfx_texture_get_upload_telemetry(core::ptr::null_mut(), 0) },
+        unsafe { ez_gfx_texture_get_upload_telemetry(0, core::ptr::null_mut()) },
         EzGfxResult::InvalidArgument
     );
 }
@@ -108,11 +108,11 @@ fn dds_and_raw_source_codes_pass_mapping_before_context_access() {
         // stay valid through this boundary-rejection call.
         let status = unsafe {
             ez_gfx_texture_load(
+                0,
                 DATA.as_ptr(),
                 DATA.len(),
                 &raw const desc,
                 &raw mut texture,
-                0,
             )
         };
         assert_eq!(
@@ -203,11 +203,11 @@ fn context_decode_workers_flow_from_c_descriptor_to_creation() {
                 // SAFETY: Pixel, descriptor, and output storage stay live through the admitted load.
                 unsafe {
                     ez_gfx_texture_load(
+                        context,
                         pixels.as_ptr(),
                         pixels.len(),
                         &raw const texture_desc,
                         &raw mut texture,
-                        context,
                     )
                 }
             },
@@ -218,9 +218,9 @@ fn context_decode_workers_flow_from_c_descriptor_to_creation() {
         let mut binding = 0;
         let status =
             // SAFETY: binding remains writable and both handles are live.
-            unsafe { ez_gfx_texture_get_binding(texture, &raw mut binding, context) };
+            unsafe { ez_gfx_texture_get_binding(context, texture, &raw mut binding) };
         assert_eq!(status, EzGfxResult::Ok, "workers={workers}");
-        ez_gfx_texture_unload(texture, context);
+        ez_gfx_texture_unload(context, texture);
         ez_gfx_context_destroy(context);
     }
 

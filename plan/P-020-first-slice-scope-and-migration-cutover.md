@@ -46,9 +46,9 @@ Treat a Vulkan-capable end-to-end path as the initial integration hypothesis: co
 
 #### Sources
 
-- `F:/Projects/oss/ez_gfx_api/examples/` — 6 original example applications.
-- `F:/Projects/oss/ez_gfx_api/TODO.md` — complete backlog of feature improvements.
-- [Cargo test documentation](https://doc.rust-lang.org/cargo/commands/cargo-test.html) — staged test execution and package boundaries.
+- `F:/Projects/oss/ez_gfx_api/examples/` â€” 6 original example applications.
+- `F:/Projects/oss/ez_gfx_api/TODO.md` â€” complete backlog of feature improvements.
+- [Cargo test documentation](https://doc.rust-lang.org/cargo/commands/cargo-test.html) â€” staged test execution and package boundaries.
 
 ### S-P-020-cross-backend-horizontal-slice: Cross-backend foundation before higher-level features
 
@@ -69,8 +69,8 @@ Treat all three required backend targets and universal shader outputs as the fir
 #### Sources
 
 - User prompt requirement for Vulkan, DX12, and Metal.
-- `F:/Projects/oss/ez_gfx_api/README.md` — shader-declared pipeline and render-graph concepts.
-- [Vulkan overview](https://docs.vulkan.org/guide/latest/what_is_vulkan.html) — backend capability context.
+- `F:/Projects/oss/ez_gfx_api/README.md` â€” shader-declared pipeline and render-graph concepts.
+- [Vulkan overview](https://docs.vulkan.org/guide/latest/what_is_vulkan.html) â€” backend capability context.
 
 ### S-P-020-minimal-headless-core-slice: Headless compiler/graph core before device execution
 
@@ -90,9 +90,9 @@ Treat compiler output validation, serialized reflection, API-shape checks, and C
 
 #### Sources
 
-- `F:/Projects/oss/ez_gfx_api/README.md` — render graph and shader-declared pipeline concepts.
-- `F:/Projects/oss/ez_gfx_api/CONTEXT.md` — render graph terminology and resource edges.
-- [Cargo workspaces documentation](https://doc.rust-lang.org/cargo/reference/workspaces.html) — workspace milestone organization.
+- `F:/Projects/oss/ez_gfx_api/README.md` â€” render graph and shader-declared pipeline concepts.
+- `F:/Projects/oss/ez_gfx_api/CONTEXT.md` â€” render graph terminology and resource edges.
+- [Cargo workspaces documentation](https://doc.rust-lang.org/cargo/reference/workspaces.html) â€” workspace milestone organization.
 
 ## Performance comparison
 
@@ -112,7 +112,7 @@ Treat compiler output validation, serialized reflection, API-shape checks, and C
 
 The initial vertical slice established an end-to-end executable path before backend expansion. Final Rust examples use the shared `Example` host for process options, winit inversion, native window, `Context`, `Surface`, resize, input, pacing, benchmark, capture, and reporting. Each procedural loop receives `WindowFrame`, explicitly begins and configures the swapchain transaction, records through `&mut Frame`, then calls `Example::handle_frame(frame, swapchain_target)`.
 
-The safe cutover is ownership-only: resources release through `Drop`, `Frame::finish(self)` is consuming, unfinished frames abort on `Drop`, and no compatibility aliases retain manual safe destruction or the former multiple begin/end paths. ABI 33 keeps explicit C lifecycle functions over opaque generational handles.
+The safe cutover is ownership-only: resources release through `Drop`, `Frame::finish(self)` is consuming, unfinished frames abort on `Drop`, and no compatibility aliases retain manual safe destruction or the former multiple begin/end paths. ABI 34 keeps explicit C lifecycle functions over opaque generational handles.
 
 ### Rejected alternatives
 
@@ -136,4 +136,4 @@ Delivery latency and defect-rate comparisons remain unknown until measured. The 
 ### Validation actions
 
 1. Exercise all six renderers through the shared `Example` host and its owned frame lifecycle.
-2. Gate ABI 33 frame end/abort, one-frame buffer invalidation, opaque-handle validation, Rust wrapper drop order, and required Vulkan/DX12/Metal behavior.
+2. Gate ABI 34 frame end/abort, one-frame buffer invalidation, opaque-handle validation, Rust wrapper drop order, and required Vulkan/DX12/Metal behavior.

@@ -1,7 +1,7 @@
 //! Stable C ABI result-code and diagnostic-string contracts.
 
 use ez_gfx_ffi::{
-    EZ_GFX_ABI_VERSION, EzGfxResult, EzGfxTextureError, ez_gfx_abi_version, ez_gfx_print_error,
+    EZ_GFX_ABI_VERSION, EzGfxResult, EzGfxTextureError, ez_gfx_abi_version, ez_gfx_error_print,
 };
 
 #[test]
@@ -31,7 +31,7 @@ fn status_values_and_abi_version_are_stable() {
         ],
         [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     );
-    assert_eq!(EZ_GFX_ABI_VERSION, 33);
+    assert_eq!(EZ_GFX_ABI_VERSION, 34);
 }
 
 #[test]
@@ -41,7 +41,7 @@ fn error_printer_validates_and_reports_required_capacity() {
     assert_eq!(
         // SAFETY: The test provides the documented pointer ranges.
         unsafe {
-            ez_gfx_print_error(
+            ez_gfx_error_print(
                 EzGfxResult::DeviceLost as u8,
                 core::ptr::null_mut(),
                 0,
@@ -57,7 +57,7 @@ fn error_printer_validates_and_reports_required_capacity() {
     assert_eq!(
         // SAFETY: The test provides the documented pointer ranges.
         unsafe {
-            ez_gfx_print_error(
+            ez_gfx_error_print(
                 EzGfxResult::DeviceLost as u8,
                 exact.as_mut_ptr(),
                 exact.len(),
@@ -74,7 +74,7 @@ fn error_printer_validates_and_reports_required_capacity() {
     assert_eq!(
         // SAFETY: The test provides the documented pointer ranges.
         unsafe {
-            ez_gfx_print_error(
+            ez_gfx_error_print(
                 EzGfxResult::DeviceLost as u8,
                 truncated.as_mut_ptr(),
                 truncated.len(),
@@ -89,7 +89,7 @@ fn error_printer_validates_and_reports_required_capacity() {
     assert_eq!(
         // SAFETY: The test provides the documented pointer ranges.
         unsafe {
-            ez_gfx_print_error(
+            ez_gfx_error_print(
                 EzGfxResult::DeviceLost as u8,
                 core::ptr::null_mut(),
                 1,
@@ -101,7 +101,7 @@ fn error_printer_validates_and_reports_required_capacity() {
     // SAFETY: Null output intentionally exercises checked rejection.
     assert_eq!(
         // SAFETY: The test provides the documented pointer ranges.
-        unsafe { ez_gfx_print_error(255, core::ptr::null_mut(), 0, core::ptr::null_mut()) },
+        unsafe { ez_gfx_error_print(255, core::ptr::null_mut(), 0, core::ptr::null_mut()) },
         EzGfxResult::InvalidArgument
     );
 
@@ -109,7 +109,7 @@ fn error_printer_validates_and_reports_required_capacity() {
     // SAFETY: Null+zero is the documented size-query form.
     assert_eq!(
         // SAFETY: The test provides the documented pointer ranges.
-        unsafe { ez_gfx_print_error(255, core::ptr::null_mut(), 0, &raw mut unknown_required,) },
+        unsafe { ez_gfx_error_print(255, core::ptr::null_mut(), 0, &raw mut unknown_required,) },
         EzGfxResult::Ok
     );
     let mut unknown = vec![0_u8; unknown_required];
@@ -117,7 +117,7 @@ fn error_printer_validates_and_reports_required_capacity() {
     assert_eq!(
         // SAFETY: The test provides the documented pointer ranges.
         unsafe {
-            ez_gfx_print_error(
+            ez_gfx_error_print(
                 255,
                 unknown.as_mut_ptr(),
                 unknown.len(),

@@ -1,12 +1,12 @@
 # ez-gfx-ffi
 
-`ez-gfx-ffi` is the C ABI boundary for the `ez-gfx` runtime. C and other foreign-language clients must include [`include/ez_gfx_api.h`](../../include/ez_gfx_api.h); the declarations and numeric values in that header are canonical. Rust clients should depend on `ez-gfx`, not `ez-gfx-ffi`.
+`ez-gfx-ffi` is the C ABI boundary for the `ez-gfx` runtime. C and other foreign-language clients include [`bindings/c/include/ez_gfx_api.h`](../../bindings/c/include/ez_gfx_api.h). Rust declarations and documentation are authoritative; `tools/bindgen` generates the XML contract and C header. Rust clients should depend on `ez-gfx`, not `ez-gfx-ffi`.
 
-The complete [C textured cube](../../examples/c/textured_cube/README.md) exercises ABI 33 typed heap/allocation handles, one-frame compute-to-graphics buffers, presentation, creator-thread callbacks, stable error printing, and snapshot readback on Win32.
+The complete [C textured cube](../../examples/02_textured_cube_c/README.md) exercises ABI 34 typed heap/allocation handles, one-frame compute-to-graphics buffers, presentation, creator-thread callbacks, stable error printing, and snapshot readback on Win32.
 
 ## Compatibility and ownership
 
-Before any other call, require `ez_gfx_abi_version() == EZ_GFX_ABI_VERSION` (ABI 33). ABI 33 provides creator-thread event callbacks, one-frame `EzGfxBuffer` and `EzGfxCounterBuffer` values, explicit generation-, kind-, owner-, state-, and frame-serial-validated `EzGfxFrame` handles, frame-scoped recording, auto-growing typed vertex heaps, a lazy context-owned index heap, and batched indirect writes.
+Before any other call, require `ez_gfx_abi_version() == EZ_GFX_ABI_VERSION` (ABI 34). ABI 34 uses canonical `ez_gfx_{object}_{operation}` names and context-first signatures. Context-bound operations on an existing object place it second, including every frame operation as `(context, frame, ...)`. It provides creator-thread event callbacks, one-frame `EzGfxBuffer` and `EzGfxCounterBuffer` values, explicit generation-, kind-, owner-, state-, and frame-serial-validated `EzGfxFrame` handles, frame-scoped recording, auto-growing typed vertex heaps, a lazy context-owned index heap, and batched indirect writes.
 
 `ez_gfx_handle_inspect` decodes a packed handle into its context/child slot and generation fields; it does not validate that the handle is live in a context. `ez_gfx_semantic_id` accepts an exact 1-to-255-byte canonical semantic name and writes its fixed 16-byte identifier. Semantic names are ASCII dot-separated identifiers: every non-empty segment starts with an ASCII letter and continues with ASCII letters, digits, or underscores. Empty segments, non-ASCII bytes, embedded NUL, and terminators included in the supplied length are invalid.
 
@@ -23,7 +23,7 @@ The context and all context/resource operations, including teardown, are creator
 5. Consume the frame with `ez_gfx_frame_end`; it submits and presents surface frames. On early exit, consume it with `ez_gfx_frame_abort`. Terminal calls invalidate the frame and claimed buffers even when submission, presentation, or abort reports an error.
 6. Release unconsumed C buffers and persistent C resources explicitly. Remove live geometry allocations before destroying typed heaps. Destroying the context aborts any remaining descendant frame, then tears down on the creator thread.
 
-Texture loading copies caller bytes and schedules unbounded CPU work subject to real allocation failure. `ez_gfx_callback_register` delivers source ownership transfer, device readiness, cancellation, terminal failure, runtime diagnostics, dropped-count reports, and borrowed readback bytes at creator-thread graphics safe points. Each requested readback returns a process-unique correlator and reports its texture handle and exact extent; callback bytes remain valid only for that invocation. Custom decoder callbacks may execute concurrently; successful output remains valid until ez-gfx copies it and calls the paired release callback.
+Texture loading copies caller bytes and schedules unbounded CPU work subject to real allocation failure. `ez_gfx_context_register_callback` delivers source ownership transfer, device readiness, cancellation, terminal failure, runtime diagnostics, dropped-count reports, and borrowed readback bytes at creator-thread graphics safe points. Each requested readback returns a process-unique correlator and reports its texture handle and exact extent; callback bytes remain valid only for that invocation. Custom decoder callbacks receive one exact borrowed source range and return owned decoded mip descriptions; malformed outputs are rejected and every accepted source is released exactly once.
 
 ## Boundary rules
 
@@ -33,6 +33,6 @@ Every `const char *` input has an adjacent `size_t` byte length. The pointer den
 
 Pointer-plus-count ranges must describe the complete range and stay within 16 MiB. Buffer acquire validates nonzero stride/count; buffer write validates start/count/stride and permits null data only for zero elements. Counter-buffer batch write likewise permits null commands only for zero count and rejects checked end overflow. Vertex/index uploads and artifacts remain nonempty and capped.
 
-Void destruction exports contain panics but cannot report stale, foreign, wrong-kind, or wrong-thread handles. Status-returning exports validate their complete boundary, convert the safe facade `Error` explicitly, and map contained panics to `EzGfxResult_NativeFailure`. `ez_gfx_print_error` uses caller-owned storage: null+zero queries the required NUL-inclusive size, sufficient storage receives stable UTF-8 plus NUL, and insufficient storage is rejected without modifying the buffer.
+Void destruction exports contain panics but cannot report stale, foreign, wrong-kind, or wrong-thread handles. Status-returning exports validate their complete boundary, convert the safe facade `Error` explicitly, and map contained panics to `EzGfxResult_NativeFailure`. `ez_gfx_error_print` uses caller-owned storage: null+zero queries the required NUL-inclusive size, sufficient storage receives stable UTF-8 plus NUL, and insufficient storage is rejected without modifying the buffer.
 
 The upload-event queue is lossless and unbounded; creator-thread graphics safe points deliver it through the registered callback. Runtime progress and diagnostic queues remain bounded and report dropped counts through that callback. `QueueFull` is retained for genuine counter/channel failure, not routine texture or transfer admission.

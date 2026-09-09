@@ -52,10 +52,10 @@ Transcoding occurs directly into staging buffer memory before transfer copy reco
 
 #### Sources
 
-- [Basis Universal GitHub & Transcoder Specification](https://github.com/BinomialLLC/basis_universal) — transcoding targets and format speeds.
-- [Docs.rs basis-universal](https://docs.rs/basis-universal) — official Rust transcoder bindings.
-- `F:/Projects/oss/ez_gfx_api/src/texture_manager.odin` — original KTX2 / decoder linkage.
-- `F:/Projects/oss/ez_gfx_api/TODO.md` — compressed texture and optional KTX2 linking requirements.
+- [Basis Universal GitHub & Transcoder Specification](https://github.com/BinomialLLC/basis_universal) â€” transcoding targets and format speeds.
+- [Docs.rs basis-universal](https://docs.rs/basis-universal) â€” official Rust transcoder bindings.
+- `F:/Projects/oss/ez_gfx_api/src/texture_manager.odin` â€” original KTX2 / decoder linkage.
+- `F:/Projects/oss/ez_gfx_api/TODO.md` â€” compressed texture and optional KTX2 linking requirements.
 
 ### S-P-014-direct-compressed-ktx2-ingestion: Pure Rust KTX2 parser with pre-compressed block textures
 
@@ -75,7 +75,7 @@ Implement pure-Rust KTX2 container reading using `ktx2` crate for directly pre-e
 
 #### Sources
 
-- [Docs.rs ktx2](https://docs.rs/ktx2) — pure Rust KTX2 container reader.
+- [Docs.rs ktx2](https://docs.rs/ktx2) â€” pure Rust KTX2 container reader.
 
 ### S-P-014-uncompressed-only-decoder: Incumbent uncompressed RGBA8 software expansion
 
@@ -93,9 +93,9 @@ Maintain the original Odin architecture: unpack all compressed textures to uncom
 
 #### Sources
 
-- `F:/Projects/oss/ez_gfx_api/src/texture_manager.odin` — incumbent implementation.
-- `F:/Projects/oss/ez_gfx_api/TODO.md` — format limitations.
-- [Khronos KTX specification](https://github.khronos.org/KTX-Specification/) — compressed texture container semantics.
+- `F:/Projects/oss/ez_gfx_api/src/texture_manager.odin` â€” incumbent implementation.
+- `F:/Projects/oss/ez_gfx_api/TODO.md` â€” format limitations.
+- [Khronos KTX specification](https://github.khronos.org/KTX-Specification/) â€” compressed texture container semantics.
 
 ## Performance comparison
 
@@ -146,7 +146,7 @@ Status on 2026-09-05; the historical selected solution above is unchanged.
 
 - [Runtime decoding](../crates/ez-gfx-runtime/src/texture.rs) now passes explicit native targets for universal KTX2. [Shared selection](../crates/ez-gfx-runtime/src/texture/basis.rs) preserves source sRGB and chooses ETC1S BC1/BC3 or UASTC BC7 on BC devices, ASTC on ASTC-only devices, and RGBA8 otherwise. The private standalone wrapper reads encoding/alpha/sRGB metadata; native BC1/BC3 build support is enabled.
 - [Optional features](../crates/ez-gfx-runtime/Cargo.toml) separate `ktx2` parsing from `basis` native transcoding. Default normal dependencies include neither; combined features include both without a shader compiler or Basis encoder. Native transcoder implementation uses `basisu_c_sys` plus the private standalone bridge rather than the candidate's named `basis-universal` crate.
-- [DDS](../crates/ez-gfx-runtime/src/texture/dds.rs) and [raw](../crates/ez-gfx-runtime/src/texture/raw.rs) ingest supported native mip layouts. ABI 33 carries source codes 8/9. Direct ingestion validates the whole chain before payload copies.
+- [DDS](../crates/ez-gfx-runtime/src/texture/dds.rs) and [raw](../crates/ez-gfx-runtime/src/texture/raw.rs) ingest supported native mip layouts. ABI 34 carries source codes 8/9. Direct ingestion validates the whole chain before payload copies.
 - R/Rg KTX2 `Auto` selects canonical RGBA8, preserving channel values and transfer metadata. Explicit compressed R/Rg remains unsupported without expanding the backend swizzle/re-encoding contract. Zstd/Zlib, wider BC/ASTC formats, HDR, arrays/cubes/3D, and native-container conversion are evaluated exclusions; [the texture contract](../docs/textures.md) lists exact restrictions.
 - The runtime still transcodes into owned CPU mip buffers before staging, not directly into mapped staging as the candidate proposed. The existing owner-thread allocation/transfer seam is retained.
 
@@ -158,17 +158,17 @@ Apple M2 Pro native evidence is now separate and positive: retained ETC1S/UASTC 
 
 ### Warm decode measurement
 
-Measured 2026-09-05 on AMD Ryzen 9 5950X, Windows x64, Rust 1.88.0 / LLVM 20.1.5 (`x86_64-pc-windows-msvc`), default Cargo release profile. An isolated development encoder converted the repository's `examples/02_textured_cube/cube.png` (1024×1024) using `basisu_c_sys` 0.9.0 sRGB defaults: UASTC LDR 4×4 without Zstd and ETC1S. Encoding and image loading were outside timing; the encoder feature was not added to runtime dependencies.
+Measured 2026-09-05 on AMD Ryzen 9 5950X, Windows x64, Rust 1.88.0 / LLVM 20.1.5 (`x86_64-pc-windows-msvc`), default Cargo release profile. An isolated development encoder converted the repository's `examples/02_textured_cube/cube.png` (1024Ã—1024) using `basisu_c_sys` 0.9.0 sRGB defaults: UASTC LDR 4Ã—4 without Zstd and ETC1S. Encoding and image loading were outside timing; the encoder feature was not added to runtime dependencies.
 
 Each row timed 128 decodes of retained input bytes on a Rayon pool after one warm-up decode. Times include decode/transcode, output allocation, and scheduling. Output MiB/s means total native mip bytes produced divided by 1,048,576 and elapsed wall time, not compressed-input throughput. UASTC input/output per job: 1,048,768/1,048,576 bytes; ETC1S input/BC1 output: 100,345/524,288 bytes.
 
 | Decode target | Threads | Jobs | Wall ms | Output MiB/s |
 | --- | ---: | ---: | ---: | ---: |
-| UASTC → BC7 | 1 | 128 | 1437.868 | 89.021 |
-| UASTC → BC7 | 4 | 128 | 432.785 | 295.759 |
-| UASTC → BC7 | 8 | 128 | 255.881 | 500.232 |
-| ETC1S → BC1 | 1 | 128 | 444.621 | 143.943 |
-| ETC1S → BC1 | 4 | 128 | 127.984 | 500.061 |
-| ETC1S → BC1 | 8 | 128 | 72.867 | 878.313 |
+| UASTC â†’ BC7 | 1 | 128 | 1437.868 | 89.021 |
+| UASTC â†’ BC7 | 4 | 128 | 432.785 | 295.759 |
+| UASTC â†’ BC7 | 8 | 128 | 255.881 | 500.232 |
+| ETC1S â†’ BC1 | 1 | 128 | 444.621 | 143.943 |
+| ETC1S â†’ BC1 | 4 | 128 | 127.984 | 500.061 |
+| ETC1S â†’ BC1 | 8 | 128 | 72.867 | 878.313 |
 
-These are warm, single-machine measurements, not cold-load results, baseline speedup claims, or full Sponza/streaming performance. GPU upload, staging, frame time, and cross-platform integration remain separate evidence. The throwaway harness was removed; two 32×32 derived UASTC fixtures remain for color/channel regressions with generation provenance in the test source.
+These are warm, single-machine measurements, not cold-load results, baseline speedup claims, or full Sponza/streaming performance. GPU upload, staging, frame time, and cross-platform integration remain separate evidence. The throwaway harness was removed; two 32Ã—32 derived UASTC fixtures remain for color/channel regressions with generation provenance in the test source.

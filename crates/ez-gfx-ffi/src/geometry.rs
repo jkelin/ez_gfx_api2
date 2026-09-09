@@ -15,11 +15,11 @@ use super::{
 ///
 /// `name` must cover `name_length` readable bytes and `out_heap` one writable handle.
 pub unsafe extern "C" fn ez_gfx_vertex_heap_create(
+    context: EzGfxContext,
     name: *const u8,
     name_length: usize,
     stride: u64,
     out_heap: *mut EzGfxVertexHeap,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         let name = match read_bounded_string(name, name_length) {
@@ -43,7 +43,7 @@ pub unsafe extern "C" fn ez_gfx_vertex_heap_create(
 
 #[unsafe(no_mangle)]
 /// Destroys the vertex heap selected by its typed handle.
-pub extern "C" fn ez_gfx_vertex_heap_destroy(heap: EzGfxVertexHeap, context: EzGfxContext) {
+pub extern "C" fn ez_gfx_vertex_heap_destroy(context: EzGfxContext, heap: EzGfxVertexHeap) {
     catch_void(|| {
         if let (Ok(context), Ok(heap)) = (
             ContextHandle::from_raw(context),
@@ -60,11 +60,11 @@ pub extern "C" fn ez_gfx_vertex_heap_destroy(heap: EzGfxVertexHeap, context: EzG
 /// # Safety
 ///
 /// `data` must cover `count * 4` bytes and `out_allocation` one writable handle.
-pub unsafe extern "C" fn ez_gfx_vertex_upload_indices(
+pub unsafe extern "C" fn ez_gfx_index_allocation_create(
+    context: EzGfxContext,
     data: *const std::ffi::c_void,
     count: u32,
     out_allocation: *mut EzGfxIndexAllocation,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         let size = match usize::try_from(u64::from(count) * 4) {
@@ -94,13 +94,13 @@ pub unsafe extern "C" fn ez_gfx_vertex_upload_indices(
 /// # Safety
 ///
 /// `data` and `out_allocation` must cover their documented ranges for this call.
-pub unsafe extern "C" fn ez_gfx_vertex_upload(
+pub unsafe extern "C" fn ez_gfx_vertex_heap_upload(
+    context: EzGfxContext,
     heap: EzGfxVertexHeap,
     data: *const std::ffi::c_void,
     element_count: u32,
     element_size: u64,
     out_allocation: *mut EzGfxVertexAllocation,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         let size = match u64::from(element_count)
@@ -139,10 +139,10 @@ pub unsafe extern "C" fn ez_gfx_vertex_upload(
 ///
 /// Both output pointers must address writable aligned `u32` values for this call.
 pub unsafe extern "C" fn ez_gfx_vertex_allocation_get_range(
+    context: EzGfxContext,
     allocation: EzGfxVertexAllocation,
     out_first: *mut u32,
     out_count: *mut u32,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         if out_first.is_null() || out_count.is_null() {
@@ -171,10 +171,10 @@ pub unsafe extern "C" fn ez_gfx_vertex_allocation_get_range(
 ///
 /// Both output pointers must address writable aligned `u32` values for this call.
 pub unsafe extern "C" fn ez_gfx_index_allocation_get_range(
+    context: EzGfxContext,
     allocation: EzGfxIndexAllocation,
     out_first: *mut u32,
     out_count: *mut u32,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         if out_first.is_null() || out_count.is_null() {
@@ -199,8 +199,8 @@ pub unsafe extern "C" fn ez_gfx_index_allocation_get_range(
 #[unsafe(no_mangle)]
 /// Removes a live vertex allocation after establishing GPU safety.
 pub extern "C" fn ez_gfx_vertex_allocation_remove(
-    allocation: EzGfxVertexAllocation,
     context: EzGfxContext,
+    allocation: EzGfxVertexAllocation,
 ) -> EzGfxResult {
     catch_status(|| {
         let context = try_handle!(ContextHandle, context);
@@ -212,8 +212,8 @@ pub extern "C" fn ez_gfx_vertex_allocation_remove(
 #[unsafe(no_mangle)]
 /// Removes a live index allocation after establishing GPU safety.
 pub extern "C" fn ez_gfx_index_allocation_remove(
-    allocation: EzGfxIndexAllocation,
     context: EzGfxContext,
+    allocation: EzGfxIndexAllocation,
 ) -> EzGfxResult {
     catch_status(|| {
         let context = try_handle!(ContextHandle, context);
@@ -230,12 +230,12 @@ pub extern "C" fn ez_gfx_index_allocation_remove(
 /// `debug_name` must cover its non-empty UTF-8 range and `out_buffer` one
 /// writable handle.
 pub unsafe extern "C" fn ez_gfx_buffer_acquire(
+    context: EzGfxContext,
     element_size: u32,
     element_count: u32,
     debug_name: *const u8,
     debug_name_length: usize,
     out_buffer: *mut EzGfxBuffer,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         let byte_size = u64::from(element_size) * u64::from(element_count);
@@ -275,12 +275,12 @@ pub unsafe extern "C" fn ez_gfx_buffer_acquire(
 /// `data` must cover `element_count * element_size` readable bytes, or may be
 /// null when `element_count` is zero.
 pub unsafe extern "C" fn ez_gfx_buffer_write(
-    buffer_handle: EzGfxBuffer,
+    context: EzGfxContext,
+    buffer: EzGfxBuffer,
     start_index: u32,
     data: *const std::ffi::c_void,
     element_count: u32,
     element_size: u32,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         let byte_size = match u64::from(element_count)
@@ -301,7 +301,7 @@ pub unsafe extern "C" fn ez_gfx_buffer_write(
         };
         let context = try_handle!(ContextHandle, context);
         buffer::write(
-            buffer_handle,
+            buffer,
             context,
             buffer::Kind::Structured,
             start_index,
@@ -314,10 +314,10 @@ pub unsafe extern "C" fn ez_gfx_buffer_write(
 
 #[unsafe(no_mangle)]
 /// Releases a context-owned buffer handle; zero and stale values are ignored.
-pub extern "C" fn ez_gfx_buffer_release(buffer_handle: EzGfxBuffer, context: EzGfxContext) {
+pub extern "C" fn ez_gfx_buffer_release(context: EzGfxContext, buffer: EzGfxBuffer) {
     catch_void(|| {
         if let Ok(context) = ContextHandle::from_raw(context) {
-            let _ = buffer::remove(buffer_handle, context, buffer::Kind::Structured);
+            let _ = buffer::remove(buffer, context, buffer::Kind::Structured);
         }
     });
 }

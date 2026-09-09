@@ -11,7 +11,7 @@ The six numbered directories are linear procedural renderers hosted by one share
 
 The Rust examples enable `ktx2` and `basis`; the Sponza example therefore retains universal decoding. Library/FFI default builds omit those decoders. Enable both for universal KTX2, `ktx2` for native blocks, or `basis` for standalone Basis; see [texture admission](../docs/textures.md#admission-and-memory).
 
-The Win32 [`C textured cube`](c/textured_cube/README.md) is a separate ABI 33 flow. C uses an opaque generational `EzGfxFrame` and must explicitly call `ez_gfx_frame_end` or `ez_gfx_frame_abort`; Rust examples never use those raw completion functions.
+The Win32 [`C textured cube`](02_textured_cube_c/README.md) is a separate ABI 34 flow. C uses an opaque generational `EzGfxFrame` and must explicitly call `ez_gfx_frame_end` or `ez_gfx_frame_abort`; Rust examples never use those raw completion functions.
 
 | Binary | Complete renderer | Owned inputs |
 | --- | --- | --- |

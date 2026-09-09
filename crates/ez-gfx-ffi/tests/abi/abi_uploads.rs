@@ -71,7 +71,7 @@ fn begin_offscreen_frame(context: u64) -> (u64, u64) {
     let mut target = 0;
     assert_eq!(
         // SAFETY: descriptor, format, and output storage remain live through the call.
-        unsafe { ez_gfx_render_target_create(&raw const desc, 1, 1, &raw mut target, context) },
+        unsafe { ez_gfx_render_target_create(context, &raw const desc, 1, 1, &raw mut target) },
         EzGfxResult::Ok
     );
     let mut frame = 0;
@@ -94,11 +94,11 @@ fn geometry_uploads_use_real_device_buffers_and_transfer_fence(backend: u8) {
             // SAFETY: the heap name and output are valid for this call.
             unsafe {
                 ez_gfx_vertex_heap_create(
+                    context,
                     heap_name.as_ptr(),
                     heap_name.len(),
                     16,
                     &raw mut heap,
-                    context,
                 )
             }
         },
@@ -112,13 +112,13 @@ fn geometry_uploads_use_real_device_buffers_and_transfer_fence(backend: u8) {
             {
                 // SAFETY: the vertex slice is readable for four 16-byte elements for this call.
                 unsafe {
-                    ez_gfx_vertex_upload(
+                    ez_gfx_vertex_heap_upload(
+                        context,
                         heap,
                         vertices.as_ptr().cast(),
                         4,
                         16,
                         &raw mut allocation,
-                        context,
                     )
                 }
             },
@@ -131,10 +131,10 @@ fn geometry_uploads_use_real_device_buffers_and_transfer_fence(backend: u8) {
             // SAFETY: both outputs are writable and the allocation/context handles are live.
             unsafe {
                 ez_gfx_vertex_allocation_get_range(
+                    context,
                     allocation,
                     &raw mut first,
                     &raw mut count,
-                    context,
                 )
             },
             EzGfxResult::Ok
@@ -151,11 +151,11 @@ fn geometry_uploads_use_real_device_buffers_and_transfer_fence(backend: u8) {
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_vertex_upload_indices(
+                ez_gfx_index_allocation_create(
+                    context,
                     indices.as_ptr().cast(),
                     3,
                     &raw mut index_allocation,
-                    context,
                 )
             }
         },
@@ -167,10 +167,10 @@ fn geometry_uploads_use_real_device_buffers_and_transfer_fence(backend: u8) {
         // SAFETY: both outputs are writable and the allocation/context handles are live.
         unsafe {
             ez_gfx_index_allocation_get_range(
+                context,
                 index_allocation,
                 &raw mut first,
                 &raw mut count,
-                context,
             )
         },
         EzGfxResult::Ok
@@ -179,15 +179,15 @@ fn geometry_uploads_use_real_device_buffers_and_transfer_fence(backend: u8) {
     assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
     for allocation in vertex_allocations {
         assert_eq!(
-            ez_gfx_vertex_allocation_remove(allocation, context),
+            ez_gfx_vertex_allocation_remove(context, allocation),
             EzGfxResult::Ok
         );
     }
     assert_eq!(
-        ez_gfx_index_allocation_remove(index_allocation, context),
+        ez_gfx_index_allocation_remove(context, index_allocation),
         EzGfxResult::Ok
     );
-    ez_gfx_vertex_heap_destroy(heap, context);
+    ez_gfx_vertex_heap_destroy(context, heap);
     drop(native);
 }
 
@@ -246,11 +246,11 @@ fn dx12_texture_upload_becomes_resident_and_unload_invalidates_handle() {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
                 ez_gfx_texture_load(
+                    context,
                     pixels.as_ptr(),
                     pixels.len(),
                     &raw const texture_desc,
                     &raw mut texture,
-                    context,
                 )
             }
         },
@@ -260,7 +260,11 @@ fn dx12_texture_upload_becomes_resident_and_unload_invalidates_handle() {
     assert_eq!(
         // SAFETY: `collected` outlives the registration below through explicit clearing.
         unsafe {
-            ez_gfx_callback_register(context, Some(collect_event), (&raw mut collected).cast())
+            ez_gfx_context_register_callback(
+                context,
+                Some(collect_event),
+                (&raw mut collected).cast(),
+            )
         },
         EzGfxResult::Ok
     );
@@ -269,7 +273,7 @@ fn dx12_texture_upload_becomes_resident_and_unload_invalidates_handle() {
         let mut binding = u32::MAX;
         let status =
             // SAFETY: binding remains writable and both handles are live.
-            unsafe { ez_gfx_texture_get_binding(texture, &raw mut binding, context) };
+            unsafe { ez_gfx_texture_get_binding(context, texture, &raw mut binding) };
         if status != EzGfxResult::NotReady || std::time::Instant::now() >= deadline {
             break status;
         }
@@ -288,16 +292,16 @@ fn dx12_texture_upload_becomes_resident_and_unload_invalidates_handle() {
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_texture_get_binding(texture, &raw mut binding, context) }
+            unsafe { ez_gfx_texture_get_binding(context, texture, &raw mut binding) }
         },
         EzGfxResult::Ok
     );
     assert_eq!(binding, 0);
-    ez_gfx_texture_unload(texture, context);
+    ez_gfx_texture_unload(context, texture);
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_texture_get_binding(texture, &raw mut binding, context) }
+            unsafe { ez_gfx_texture_get_binding(context, texture, &raw mut binding) }
         },
         EzGfxResult::InvalidContext
     );
@@ -339,7 +343,11 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
     assert_eq!(
         // SAFETY: `collected` outlives the registration below through explicit clearing.
         unsafe {
-            ez_gfx_callback_register(context, Some(collect_event), (&raw mut collected).cast())
+            ez_gfx_context_register_callback(
+                context,
+                Some(collect_event),
+                (&raw mut collected).cast(),
+            )
         },
         EzGfxResult::Ok
     );
@@ -348,11 +356,11 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
                 ez_gfx_texture_load(
+                    context,
                     pixels.as_ptr(),
                     pixels.len(),
                     &raw const texture_desc,
                     &raw mut texture,
-                    context,
                 )
             }
         },
@@ -365,13 +373,13 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
                 ez_gfx_counter_buffer_acquire(
+                    context,
                     u32::try_from(core::mem::size_of::<EzGfxDrawIndexedCommand>())
                         .expect("draw command size fits u32"),
                     1,
                     debug_name.as_ptr(),
                     debug_name.len(),
                     &raw mut indirect,
-                    context,
                 )
             }
         },
@@ -381,7 +389,7 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_counter_buffer_write_draws(indirect, 0, &raw const command, 1, context)
+                ez_gfx_counter_buffer_write_draws(context, indirect, 0, &raw const command, 1)
             }
         },
         EzGfxResult::Ok
@@ -390,16 +398,20 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
     let mut second_request = 0;
     assert_eq!(
         // SAFETY: each output points to writable aligned test-owned storage.
-        unsafe { ez_gfx_graph_enqueue_texture_readback(texture, frame, &raw mut first_request) },
+        unsafe {
+            ez_gfx_frame_enqueue_texture_readback(context, frame, texture, &raw mut first_request)
+        },
         EzGfxResult::Ok
     );
     assert_eq!(
         // SAFETY: repeated same-source requests remain separately correlated.
-        unsafe { ez_gfx_graph_enqueue_texture_readback(texture, frame, &raw mut second_request) },
+        unsafe {
+            ez_gfx_frame_enqueue_texture_readback(context, frame, texture, &raw mut second_request)
+        },
         EzGfxResult::Ok
     );
     assert_ne!(first_request, second_request);
-    assert_eq!(ez_gfx_frame_end(frame), EzGfxResult::Ok);
+    assert_eq!(ez_gfx_frame_end(context, frame), EzGfxResult::Ok);
     assert_eq!(collected.readbacks.len(), 2);
     assert_eq!(collected.readbacks[0].request_id, first_request);
     assert_eq!(collected.readbacks[1].request_id, second_request);
@@ -411,11 +423,11 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
     }));
     assert_eq!(
         // SAFETY: clearing a live registration needs no user data.
-        unsafe { ez_gfx_callback_register(context, None, core::ptr::null_mut()) },
+        unsafe { ez_gfx_context_register_callback(context, None, core::ptr::null_mut()) },
         EzGfxResult::Ok
     );
-    ez_gfx_render_target_destroy(target, context);
-    ez_gfx_texture_unload(texture, context);
+    ez_gfx_render_target_destroy(context, target);
+    ez_gfx_texture_unload(context, texture);
     drop(native);
 }
 

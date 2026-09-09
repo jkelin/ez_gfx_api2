@@ -97,13 +97,13 @@ jobs:
           vulkan_version: ${{ env.VULKAN_SDK_VERSION }}
           install_swiftshader: ${{ matrix.backend == 'vulkan-windows' }}
           cache: true
-      - name: Compile ABI v33 header as C11 and C++17
+      - name: Compile ABI v34 header as C11 and C++17
         shell: bash
         run: |
-          printf '#include "ez_gfx_api.h"\n_Static_assert(EZ_GFX_ABI_VERSION == 33u, "ABI version"); int main(void) { return 0; }\n' > "$RUNNER_TEMP/ez_gfx_header.c"
-          printf '#include "ez_gfx_api.h"\nstatic_assert(EZ_GFX_ABI_VERSION == 33u); int main() { return 0; }\n' > "$RUNNER_TEMP/ez_gfx_header.cpp"
-          clang -std=c11 -Werror -fsyntax-only -Iinclude "$RUNNER_TEMP/ez_gfx_header.c"
-          clang++ -std=c++17 -Werror -Wno-ignored-attributes -fsyntax-only -Iinclude "$RUNNER_TEMP/ez_gfx_header.cpp"
+          printf '#include "ez_gfx_api.h"\n_Static_assert(EZ_GFX_ABI_VERSION == 34u, "ABI version"); int main(void) { return 0; }\n' > "$RUNNER_TEMP/ez_gfx_header.c"
+          printf '#include "ez_gfx_api.h"\nstatic_assert(EZ_GFX_ABI_VERSION == 34u); int main() { return 0; }\n' > "$RUNNER_TEMP/ez_gfx_header.cpp"
+          clang -std=c11 -Werror -fsyntax-only -Ibindings/c/include "$RUNNER_TEMP/ez_gfx_header.c"
+          clang++ -std=c++17 -Werror -Wno-ignored-attributes -fsyntax-only -Ibindings/c/include "$RUNNER_TEMP/ez_gfx_header.cpp"
 
       # Hosted Lavapipe proves surfaceless Vulkan 1.3 instance creation. Native
       # GPU suites still compile only: admission and full rendering require
@@ -225,5 +225,5 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           cargo build -p ez-gfx-compiler --bin ez-gfx-compile
-          cmake -S examples/c/textured_cube -B target/c-examples/textured_cube-build
+          cmake -S examples/02_textured_cube_c -B target/c-examples/textured_cube-build
           cmake --build target/c-examples/textured_cube-build --config Debug

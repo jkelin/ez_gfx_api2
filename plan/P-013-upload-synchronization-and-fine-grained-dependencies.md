@@ -14,7 +14,7 @@ The former handle-based interface split frame begin, submit, presentation, and t
 
 ## C ABI
 
-ABI 33 represents `EzGfxFrame` as an opaque generational `u64`. `ez_gfx_frame_begin` creates surface frames; `ez_gfx_render_target_frame_begin` creates managed-target frames. The validated FFI exposes explicit `ez_gfx_frame_end` and `ez_gfx_frame_abort`; both invalidate the frame and its claimed buffer handles on every result.
+ABI 34 represents `EzGfxFrame` as an opaque generational `u64`. `ez_gfx_frame_begin` creates surface frames; `ez_gfx_render_target_frame_begin` creates managed-target frames. The validated FFI exposes explicit `ez_gfx_frame_end` and `ez_gfx_frame_abort`; both invalidate the frame and its claimed buffer handles on every result.
 
 ## Validation
 

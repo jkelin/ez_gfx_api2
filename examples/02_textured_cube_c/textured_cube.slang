@@ -1,4 +1,4 @@
-import "../../../ez_gfx_api";
+import "../../ez_gfx_api";
 
 struct Primitive {
     uint first_index;

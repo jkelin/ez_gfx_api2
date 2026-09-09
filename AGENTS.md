@@ -19,7 +19,8 @@ This repository is a Rust/Cargo migration of `ez_gfx_api`. Preserve the recogniz
 
 ## ABI and boundary changes
 
-- Change `include/ez_gfx_api.h`, `bindings/bindings.xml`, Rust exports/bindings, ABI version, export parity, layout probes, tests, and relevant docs atomically. Validate null/count/size pairs, arithmetic, UTF-8, enums/layouts, out-pointers, ownership, handles, and async lifetimes; no panic or unwind crosses C.
+- Treat `crates/ez-gfx-ffi` declarations and docs as the binding authority. Record only non-Rust facts such as managed overrides, validation, nullability, and access semantics in `crates/ez-gfx-ffi/src/bindings-metadata.json`. Run `cargo run -p ez-gfx-bindgen -- all`; never edit generated `bindings/bindings.xml` or `bindings/c/include/ez_gfx_api.h`. Change Rust exports, ABI version, metadata, generated outputs, layout probes, tests, and relevant docs atomically.
+  Public exports use `ez_gfx_{object}_{operation}`. Context-bound functions put `context` first; operations on an existing object put that object second, including every frame operation as `(context, frame, ...)`. Operations on a frame use `frame`, never `render` or `graph`, terminology. Constructors and queries without an existing object still put context first when context-bound. Context operations put context first. Global ABI, error, adapter, decoder, handle, and semantic utilities omit context. Do not retain compatibility aliases or shims.
 - Prefer fail-fast typed errors. Treat invalid external data, stale handles, lost devices, unsupported capabilities, and unavailable required adapters as explicit failures, never silent defaults.
 
 ## Dependencies and packaging

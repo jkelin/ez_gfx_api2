@@ -130,10 +130,6 @@ jobs:
                 "dist/${compiler}/${executable}" --help
               ;;
           esac
-      - name: Verify packaged C export parity
-        run: >-
-          cargo run -p xtask -- export-parity
-          "${{ steps.package_paths.outputs.runtime_dir }}"
       - name: Build packaged C consumer (compile-only)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -146,7 +142,7 @@ jobs:
           $compiler = (Resolve-Path $env:COMPILER_DIR).Path
           $build = Join-Path $env:RUNNER_TEMP "ez-gfx-textured-cube-package"
           $artifact = Join-Path $build "textured_cube.ezgfxshader"
-          cmake -S examples/c/textured_cube -B $build `
+          cmake -S examples/02_textured_cube_c -B $build `
             "-DEZ_GFX_INCLUDE_DIR=$runtime" `
             "-DEZ_GFX_FFI_LIBRARY=$(Join-Path $runtime 'ez_gfx_ffi.dll.lib')" `
             "-DEZ_GFX_FFI_DLL=$(Join-Path $runtime 'ez_gfx_ffi.dll')" `

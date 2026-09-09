@@ -15,14 +15,14 @@ use ez_gfx_runtime::texture::{TextureDecoder, TextureSource};
 
 #[cfg(all(feature = "ktx2", feature = "basis"))]
 use ez_gfx_ffi::{
-    EzGfxEvent, EzGfxEventKind, ez_gfx_callback_register, ez_gfx_frame_begin,
-    ez_gfx_graph_enqueue_texture_readback,
+    EzGfxEvent, EzGfxEventKind, ez_gfx_context_register_callback, ez_gfx_frame_begin,
+    ez_gfx_frame_enqueue_texture_readback,
 };
 use ez_gfx_ffi::{
     EzGfxResult, EzGfxTextureDesc, EzGfxTextureRegionDesc, EzGfxTextureUploadTelemetry,
     ez_gfx_texture_cancel, ez_gfx_texture_get_binding, ez_gfx_texture_get_residency,
     ez_gfx_texture_get_upload_telemetry, ez_gfx_texture_load, ez_gfx_texture_set_residency,
-    ez_gfx_texture_unload, ez_gfx_update_texture_region,
+    ez_gfx_texture_unload, ez_gfx_texture_update_region,
 };
 #[cfg(all(feature = "ktx2", feature = "basis"))]
 #[derive(Default)]
@@ -71,7 +71,7 @@ fn poll_texture_ready(context: u64, texture: u64) -> EzGfxResult {
     );
     let mut binding = 0;
     // SAFETY: binding remains writable and both handles are supplied by this test.
-    unsafe { ez_gfx_texture_get_binding(texture, &raw mut binding, context) }
+    unsafe { ez_gfx_texture_get_binding(context, texture, &raw mut binding) }
 }
 
 fn cancel_after_native_admission(context: u64, bytes: &[u8], desc: &EzGfxTextureDesc) {
@@ -79,7 +79,7 @@ fn cancel_after_native_admission(context: u64, bytes: &[u8], desc: &EzGfxTexture
     assert_eq!(
         // SAFETY: all byte, descriptor, and output storage remains live through this call.
         unsafe {
-            ez_gfx_texture_load(bytes.as_ptr(), bytes.len(), desc, &raw mut texture, context)
+            ez_gfx_texture_load(context, bytes.as_ptr(), bytes.len(), desc, &raw mut texture)
         },
         EzGfxResult::Ok
     );
@@ -90,7 +90,7 @@ fn cancel_after_native_admission(context: u64, bytes: &[u8], desc: &EzGfxTexture
         let status = {
             // SAFETY: both outputs remain live writable u32 storage.
             unsafe {
-                ez_gfx_texture_get_residency(texture, &raw mut resident, &raw mut total, context)
+                ez_gfx_texture_get_residency(context, texture, &raw mut resident, &raw mut total)
             }
         };
         if status == EzGfxResult::Ok {
@@ -103,7 +103,7 @@ fn cancel_after_native_admission(context: u64, bytes: &[u8], desc: &EzGfxTexture
         );
         std::thread::yield_now();
     }
-    assert_eq!(ez_gfx_texture_cancel(texture, context), EzGfxResult::Ok);
+    assert_eq!(ez_gfx_texture_cancel(context, texture), EzGfxResult::Ok);
     assert_eq!(
         poll_texture_ready(context, texture),
         EzGfxResult::InvalidContext
@@ -146,11 +146,11 @@ fn exercises_async_texture_batches(backend: u8) {
                     // SAFETY: all byte, descriptor, and output storage remains live through this call.
                     unsafe {
                         ez_gfx_texture_load(
+                            context,
                             bytes.as_ptr(),
                             bytes.len(),
                             &raw const desc,
                             texture,
-                            context,
                         )
                     }
                 },
@@ -191,7 +191,7 @@ fn exercises_async_texture_batches(backend: u8) {
         };
         assert_eq!(
             // SAFETY: The region descriptor and bytes remain live through admission.
-            unsafe { ez_gfx_update_texture_region(textures[0], &raw const region, context,) },
+            unsafe { ez_gfx_texture_update_region(context, textures[0], &raw const region) },
             EzGfxResult::Ok
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -223,10 +223,10 @@ fn exercises_async_texture_batches(backend: u8) {
                         // SAFETY: both outputs are live writable u32 storage and the handles remain live.
                         unsafe {
                             ez_gfx_texture_get_residency(
+                                context,
                                 texture,
                                 &raw mut resident,
                                 &raw mut total,
-                                context,
                             )
                         }
                     },
@@ -242,15 +242,15 @@ fn exercises_async_texture_batches(backend: u8) {
                 std::thread::yield_now();
             };
             assert_eq!(
-                ez_gfx_texture_set_residency(texture, 0, context),
+                ez_gfx_texture_set_residency(context, texture, 0),
                 EzGfxResult::InvalidArgument
             );
             assert_eq!(
-                ez_gfx_texture_set_residency(texture, total + 1, context),
+                ez_gfx_texture_set_residency(context, texture, total + 1),
                 EzGfxResult::InvalidArgument
             );
             assert_eq!(
-                ez_gfx_texture_set_residency(texture, 1, context),
+                ez_gfx_texture_set_residency(context, texture, 1),
                 EzGfxResult::Ok
             );
             assert_eq!(
@@ -258,10 +258,10 @@ fn exercises_async_texture_batches(backend: u8) {
                     // SAFETY: both outputs remain live writable u32 storage.
                     unsafe {
                         ez_gfx_texture_get_residency(
+                            context,
                             texture,
                             &raw mut resident,
                             &raw mut total,
-                            context,
                         )
                     }
                 },
@@ -269,19 +269,19 @@ fn exercises_async_texture_batches(backend: u8) {
             );
             assert_eq!((resident, total), (1, 3));
             assert_eq!(
-                ez_gfx_texture_set_residency(texture, total, context),
+                ez_gfx_texture_set_residency(context, texture, total),
                 EzGfxResult::Ok
             );
             let mut binding = u32::MAX;
             assert_eq!(
                 {
                     // SAFETY: `binding` is live writable u32 storage and the handles remain live.
-                    unsafe { ez_gfx_texture_get_binding(texture, &raw mut binding, context) }
+                    unsafe { ez_gfx_texture_get_binding(context, texture, &raw mut binding) }
                 },
                 EzGfxResult::Ok
             );
             assert_ne!(binding, u32::MAX);
-            ez_gfx_texture_unload(texture, context);
+            ez_gfx_texture_unload(context, texture);
         }
     }
 
@@ -307,11 +307,11 @@ fn exercises_async_texture_batches(backend: u8) {
             // SAFETY: Fixture, descriptor, and output storage remain live through this call.
             unsafe {
                 ez_gfx_texture_load(
+                    context,
                     basis.as_ptr(),
                     basis.len(),
                     &raw const compressed_desc,
                     &raw mut compressed,
-                    context,
                 )
             },
             EzGfxResult::Ok
@@ -335,7 +335,7 @@ fn exercises_async_texture_batches(backend: u8) {
         assert_eq!(
             // SAFETY: Outputs and handles remain live through this call.
             unsafe {
-                ez_gfx_texture_get_residency(compressed, &raw mut resident, &raw mut total, context)
+                ez_gfx_texture_get_residency(context, compressed, &raw mut resident, &raw mut total)
             },
             EzGfxResult::Ok
         );
@@ -352,7 +352,7 @@ fn exercises_async_texture_batches(backend: u8) {
         };
         assert_eq!(
             // SAFETY: The descriptor and compressed block bytes remain live through admission.
-            unsafe { ez_gfx_update_texture_region(compressed, &raw const region, context) },
+            unsafe { ez_gfx_texture_update_region(context, compressed, &raw const region) },
             EzGfxResult::Ok
         );
         assert_eq!(
@@ -364,7 +364,11 @@ fn exercises_async_texture_batches(backend: u8) {
         assert_eq!(
             // SAFETY: `collected` outlives the registration below through explicit clearing.
             unsafe {
-                ez_gfx_callback_register(context, Some(collect_event), (&raw mut collected).cast())
+                ez_gfx_context_register_callback(
+                    context,
+                    Some(collect_event),
+                    (&raw mut collected).cast(),
+                )
             },
             EzGfxResult::Ok
         );
@@ -377,18 +381,26 @@ fn exercises_async_texture_batches(backend: u8) {
         assert_eq!(
             // SAFETY: request output is writable aligned test-owned storage.
             unsafe {
-                ez_gfx_graph_enqueue_texture_readback(compressed, frame, &raw mut request_id)
+                ez_gfx_frame_enqueue_texture_readback(
+                    context,
+                    frame,
+                    compressed,
+                    &raw mut request_id,
+                )
             },
             EzGfxResult::InvalidArgument
         );
-        assert_eq!(ez_gfx_ffi::ez_gfx_frame_abort(frame), EzGfxResult::Ok);
+        assert_eq!(
+            ez_gfx_ffi::ez_gfx_frame_abort(context, frame),
+            EzGfxResult::Ok
+        );
         assert!(collected.readback.is_none());
         assert_eq!(
             // SAFETY: clearing a live registration needs no user data.
-            unsafe { ez_gfx_callback_register(context, None, core::ptr::null_mut()) },
+            unsafe { ez_gfx_context_register_callback(context, None, core::ptr::null_mut()) },
             EzGfxResult::Ok
         );
-        ez_gfx_texture_unload(compressed, context);
+        ez_gfx_texture_unload(context, compressed);
     }
     let mut telemetry = EzGfxTextureUploadTelemetry {
         decode_microseconds: 0,
@@ -398,7 +410,7 @@ fn exercises_async_texture_batches(backend: u8) {
     };
     assert_eq!(
         // SAFETY: Output storage remains writable through this call.
-        unsafe { ez_gfx_texture_get_upload_telemetry(&raw mut telemetry, context) },
+        unsafe { ez_gfx_texture_get_upload_telemetry(context, &raw mut telemetry) },
         EzGfxResult::Ok
     );
     assert!(telemetry.staging_bytes > 0);

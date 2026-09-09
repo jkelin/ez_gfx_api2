@@ -50,12 +50,12 @@ impl TestContext {
         assert_eq!(
             {
                 // SAFETY: descriptor and output storage live through the call; no native handles are borrowed.
-                unsafe { ez_gfx_surface_create(&raw const surface_desc, &raw mut surface, context) }
+                unsafe { ez_gfx_surface_create(context, &raw const surface_desc, &raw mut surface) }
             },
             EzGfxResult::Ok
         );
         assert_eq!(
-            ez_gfx_context_init_device(surface, context),
+            ez_gfx_context_init_device(context, surface),
             EzGfxResult::Ok
         );
 
@@ -65,7 +65,7 @@ impl TestContext {
 
 impl Drop for TestContext {
     fn drop(&mut self) {
-        ez_gfx_surface_destroy(self.surface, self.context);
+        ez_gfx_surface_destroy(self.context, self.surface);
         ez_gfx_context_destroy(self.context);
     }
 }

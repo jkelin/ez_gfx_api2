@@ -26,20 +26,19 @@ use ez_gfx_ffi::{
     EzGfxEvent, EzGfxEventCallback, EzGfxEventKind, EzGfxHandleParts, EzGfxRenderTargetDesc,
     EzGfxRenderTargetFormat, EzGfxRenderTargetUsage, EzGfxResult, EzGfxRuntimeRecord,
     EzGfxShaderDesc, EzGfxSurfaceDesc, EzGfxTextureDesc, EzGfxUploadEvent, ez_gfx_adapter_count,
-    ez_gfx_adapters_query, ez_gfx_buffer_acquire, ez_gfx_buffer_release, ez_gfx_buffer_write,
-    ez_gfx_callback_register, ez_gfx_context_create, ez_gfx_context_create_backend,
-    ez_gfx_context_destroy, ez_gfx_context_wait_idle, ez_gfx_counter_buffer_acquire,
+    ez_gfx_adapter_query, ez_gfx_buffer_acquire, ez_gfx_buffer_release, ez_gfx_buffer_write,
+    ez_gfx_context_create, ez_gfx_context_create_backend, ez_gfx_context_destroy,
+    ez_gfx_context_register_callback, ez_gfx_context_wait_idle, ez_gfx_counter_buffer_acquire,
     ez_gfx_counter_buffer_publish_count, ez_gfx_counter_buffer_release,
     ez_gfx_counter_buffer_write_draws, ez_gfx_frame_abort, ez_gfx_frame_begin, ez_gfx_frame_end,
-    ez_gfx_graph_enqueue_texture_readback, ez_gfx_handle_inspect,
+    ez_gfx_frame_enqueue_texture_readback, ez_gfx_handle_inspect, ez_gfx_index_allocation_create,
     ez_gfx_index_allocation_get_range, ez_gfx_index_allocation_remove, ez_gfx_render_target_create,
     ez_gfx_render_target_destroy, ez_gfx_render_target_frame_begin, ez_gfx_render_target_get_clear,
     ez_gfx_render_target_get_extent, ez_gfx_render_target_get_format,
     ez_gfx_render_target_probe_format, ez_gfx_semantic_id, ez_gfx_shader_load_artifact,
     ez_gfx_texture_get_binding, ez_gfx_texture_get_residency, ez_gfx_texture_load,
     ez_gfx_texture_unload, ez_gfx_vertex_allocation_get_range, ez_gfx_vertex_allocation_remove,
-    ez_gfx_vertex_heap_create, ez_gfx_vertex_heap_destroy, ez_gfx_vertex_upload,
-    ez_gfx_vertex_upload_indices,
+    ez_gfx_vertex_heap_create, ez_gfx_vertex_heap_destroy, ez_gfx_vertex_heap_upload,
 };
 
 #[test]
@@ -222,24 +221,24 @@ fn adapter_enumeration_reports_stable_diagnostics() {
     let mut written = 0;
     assert_eq!(
         // SAFETY: Output storage is live and aligned through the call.
-        unsafe { ez_gfx_adapters_query(2, core::ptr::null_mut(), 0, &raw mut written) },
+        unsafe { ez_gfx_adapter_query(2, core::ptr::null_mut(), 0, &raw mut written) },
         EzGfxResult::InvalidArgument
     );
     assert_eq!(
         // SAFETY: Null outputs intentionally exercise checked rejection.
-        unsafe { ez_gfx_adapters_query(0, core::ptr::null_mut(), 0, core::ptr::null_mut()) },
+        unsafe { ez_gfx_adapter_query(0, core::ptr::null_mut(), 0, core::ptr::null_mut()) },
         EzGfxResult::InvalidArgument
     );
     // A nonzero capacity with a null buffer fails; a null buffer with a
     // zero capacity queries the total instead.
     assert_eq!(
         // SAFETY: Output storage is live and aligned through the call.
-        unsafe { ez_gfx_adapters_query(0, core::ptr::null_mut(), 1, &raw mut written) },
+        unsafe { ez_gfx_adapter_query(0, core::ptr::null_mut(), 1, &raw mut written) },
         EzGfxResult::InvalidArgument
     );
     assert_eq!(
         // SAFETY: Output storage is live and aligned through the call.
-        unsafe { ez_gfx_adapters_query(0, core::ptr::null_mut(), 0, &raw mut written) },
+        unsafe { ez_gfx_adapter_query(0, core::ptr::null_mut(), 0, &raw mut written) },
         EzGfxResult::Ok
     );
     assert_eq!(written, total);
@@ -255,7 +254,7 @@ fn adapter_enumeration_reports_stable_diagnostics() {
     let mut infos = vec![blank; total as usize];
     assert_eq!(
         // SAFETY: The buffer names exactly `capacity` writable aligned entries; the written output is live and aligned.
-        unsafe { ez_gfx_adapters_query(0, infos.as_mut_ptr(), total, &raw mut written,) },
+        unsafe { ez_gfx_adapter_query(0, infos.as_mut_ptr(), total, &raw mut written,) },
         EzGfxResult::Ok
     );
     assert_eq!(written, total);
@@ -300,12 +299,12 @@ fn render_target_create_rejects_invalid_ranges_before_delegating() {
     // Null descriptors and outputs fail before any read; outputs stay untouched.
     assert_eq!(
         // SAFETY: Null descriptor intentionally exercises checked rejection; output storage is live and aligned.
-        unsafe { ez_gfx_render_target_create(core::ptr::null(), 64, 64, &raw mut target, 0) },
+        unsafe { ez_gfx_render_target_create(0, core::ptr::null(), 64, 64, &raw mut target) },
         EzGfxResult::InvalidArgument
     );
     assert_eq!(
         // SAFETY: Null output intentionally exercises checked rejection; the descriptor names live test-owned ranges.
-        unsafe { ez_gfx_render_target_create(&raw const base, 64, 64, core::ptr::null_mut(), 0) },
+        unsafe { ez_gfx_render_target_create(0, &raw const base, 64, 64, core::ptr::null_mut()) },
         EzGfxResult::InvalidArgument
     );
     assert_eq!(target, 7);
@@ -316,11 +315,11 @@ fn render_target_create_rejects_invalid_ranges_before_delegating() {
             // SAFETY: The descriptor names live test-owned ranges; zero extents are rejected before any native call.
             unsafe {
                 ez_gfx_render_target_create(
+                    0,
                     &raw const base,
                     width_in,
                     height_in,
                     &raw mut target,
-                    0,
                 )
             },
             EzGfxResult::InvalidArgument
@@ -363,7 +362,7 @@ fn render_target_create_rejects_invalid_ranges_before_delegating() {
     ] {
         assert_eq!(
             // SAFETY: Live pointers name the declared test-owned ranges; invalid fields are rejected before delegation.
-            unsafe { ez_gfx_render_target_create(&raw const desc, 64, 64, &raw mut target, 0) },
+            unsafe { ez_gfx_render_target_create(0, &raw const desc, 64, 64, &raw mut target) },
             EzGfxResult::InvalidArgument
         );
     }
@@ -378,7 +377,7 @@ fn render_target_create_rejects_invalid_ranges_before_delegating() {
     assert_eq!(
         // SAFETY: The candidate range is live; the unknown code is rejected before delegation.
         unsafe {
-            ez_gfx_render_target_create(&raw const bad_candidate, 64, 64, &raw mut target, 0)
+            ez_gfx_render_target_create(0, &raw const bad_candidate, 64, 64, &raw mut target)
         },
         EzGfxResult::InvalidArgument
     );
@@ -390,14 +389,14 @@ fn render_target_create_rejects_invalid_ranges_before_delegating() {
     };
     assert_eq!(
         // SAFETY: The descriptor names live test-owned ranges; the clear is rejected before delegation.
-        unsafe { ez_gfx_render_target_create(&raw const bad_clear, 64, 64, &raw mut target, 0) },
+        unsafe { ez_gfx_render_target_create(0, &raw const bad_clear, 64, 64, &raw mut target) },
         EzGfxResult::InvalidArgument
     );
 
     // A well-formed descriptor reaches the safe layer, which rejects the null context.
     assert_eq!(
         // SAFETY: The descriptor names live test-owned ranges with valid fields.
-        unsafe { ez_gfx_render_target_create(&raw const base, 64, 64, &raw mut target, 0) },
+        unsafe { ez_gfx_render_target_create(0, &raw const base, 64, 64, &raw mut target) },
         EzGfxResult::InvalidContext
     );
     assert_eq!(target, 7);
@@ -411,7 +410,7 @@ fn render_target_create_rejects_invalid_ranges_before_delegating() {
     };
     assert_eq!(
         // SAFETY: The descriptor names live test-owned ranges; the null context fails delegation.
-        unsafe { ez_gfx_render_target_create(&raw const depth, 64, 64, &raw mut target, 0) },
+        unsafe { ez_gfx_render_target_create(0, &raw const depth, 64, 64, &raw mut target) },
         EzGfxResult::InvalidContext
     );
     assert_eq!(target, 7);
@@ -431,17 +430,17 @@ fn render_target_queries_probe_and_begin_validate_handles() {
 
     assert_eq!(
         // SAFETY: Null format output intentionally exercises checked rejection.
-        unsafe { ez_gfx_render_target_get_format(0, core::ptr::null_mut(), 0) },
+        unsafe { ez_gfx_render_target_get_format(0, 0, core::ptr::null_mut()) },
         EzGfxResult::InvalidArgument
     );
     assert_eq!(
         // SAFETY: Null extent outputs intentionally exercise checked rejection.
-        unsafe { ez_gfx_render_target_get_extent(0, core::ptr::null_mut(), &raw mut height, 0) },
+        unsafe { ez_gfx_render_target_get_extent(0, 0, core::ptr::null_mut(), &raw mut height) },
         EzGfxResult::InvalidArgument
     );
     assert_eq!(
         // SAFETY: Null clear outputs intentionally exercise checked rejection.
-        unsafe { ez_gfx_render_target_get_clear(0, &raw mut use_clear, core::ptr::null_mut(), 0) },
+        unsafe { ez_gfx_render_target_get_clear(0, 0, &raw mut use_clear, core::ptr::null_mut()) },
         EzGfxResult::InvalidArgument
     );
     assert_eq!(format, 9);
@@ -452,29 +451,29 @@ fn render_target_queries_probe_and_begin_validate_handles() {
     // Malformed handles fail before any context access.
     assert_eq!(
         // SAFETY: Outputs are live and aligned; the zero handles fail validation first.
-        unsafe { ez_gfx_render_target_get_format(0, &raw mut format, 0) },
+        unsafe { ez_gfx_render_target_get_format(0, 0, &raw mut format) },
         EzGfxResult::InvalidContext
     );
     assert_eq!(
         // SAFETY: Outputs are live and aligned; the zero handles fail validation first.
-        unsafe { ez_gfx_render_target_get_extent(0, &raw mut width, &raw mut height, 0) },
+        unsafe { ez_gfx_render_target_get_extent(0, 0, &raw mut width, &raw mut height) },
         EzGfxResult::InvalidContext
     );
     assert_eq!(
         // SAFETY: Outputs are live and aligned; the zero handles fail validation first.
-        unsafe { ez_gfx_render_target_get_clear(0, &raw mut use_clear, color.as_mut_ptr(), 0) },
+        unsafe { ez_gfx_render_target_get_clear(0, 0, &raw mut use_clear, color.as_mut_ptr()) },
         EzGfxResult::InvalidContext
     );
     assert_eq!(
-        ez_gfx_render_target_probe_format(7, 1, 0),
+        ez_gfx_render_target_probe_format(0, 7, 1),
         EzGfxResult::InvalidArgument
     );
     assert_eq!(
-        ez_gfx_render_target_probe_format(1, 3, 0),
+        ez_gfx_render_target_probe_format(0, 1, 3),
         EzGfxResult::InvalidArgument
     );
     assert_eq!(
-        ez_gfx_render_target_probe_format(1, 1, 0),
+        ez_gfx_render_target_probe_format(0, 1, 1),
         EzGfxResult::InvalidContext
     );
     let mut frame = 0;
@@ -493,8 +492,8 @@ fn render_target_queries_probe_and_begin_validate_handles() {
 
 #[test]
 fn terminal_frame_calls_reject_null_and_stale_handles() {
-    assert_eq!(ez_gfx_frame_end(0), EzGfxResult::InvalidContext);
-    assert_eq!(ez_gfx_frame_abort(0), EzGfxResult::InvalidContext);
+    assert_eq!(ez_gfx_frame_end(0, 0), EzGfxResult::InvalidContext);
+    assert_eq!(ez_gfx_frame_abort(0, 0), EzGfxResult::InvalidContext);
 }
 
 #[test]
@@ -502,12 +501,12 @@ fn callback_registration_replaces_clears_and_validates_context() {
     unsafe extern "C" fn probe(_event: *const EzGfxEvent, _user_data: *mut c_void) {}
     assert_eq!(
         // SAFETY: no live context exists, so validation fails before touching user data.
-        unsafe { ez_gfx_callback_register(0, None, core::ptr::null_mut()) },
+        unsafe { ez_gfx_context_register_callback(0, None, core::ptr::null_mut()) },
         EzGfxResult::InvalidContext
     );
     assert_eq!(
         // SAFETY: no live context exists, so validation fails before touching user data.
-        unsafe { ez_gfx_callback_register(0, Some(probe), core::ptr::null_mut()) },
+        unsafe { ez_gfx_context_register_callback(0, Some(probe), core::ptr::null_mut()) },
         EzGfxResult::InvalidContext
     );
 }
@@ -538,7 +537,7 @@ fn callback_registration_is_creator_thread_only() {
     }
     let foreign = std::thread::spawn(move || {
         // SAFETY: clearing a callback retains no user-data pointer.
-        unsafe { ez_gfx_callback_register(context, None, core::ptr::null_mut()) }
+        unsafe { ez_gfx_context_register_callback(context, None, core::ptr::null_mut()) }
     })
     .join()
     .expect("foreign registration thread returns");
@@ -546,7 +545,7 @@ fn callback_registration_is_creator_thread_only() {
     assert_eq!(foreign, EzGfxResult::InvalidContext);
     assert_eq!(
         // SAFETY: clearing on the creator thread retains no user-data pointer.
-        unsafe { ez_gfx_callback_register(context, None, core::ptr::null_mut()) },
+        unsafe { ez_gfx_context_register_callback(context, None, core::ptr::null_mut()) },
         EzGfxResult::Ok
     );
     ez_gfx_context_destroy(context);
@@ -558,14 +557,14 @@ fn texture_residency_validates_both_output_pointers() {
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_texture_get_residency(0, core::ptr::null_mut(), &raw mut value, 0) }
+            unsafe { ez_gfx_texture_get_residency(0, 0, core::ptr::null_mut(), &raw mut value) }
         },
         EzGfxResult::InvalidArgument
     );
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_texture_get_residency(0, &raw mut value, core::ptr::null_mut(), 0) }
+            unsafe { ez_gfx_texture_get_residency(0, 0, &raw mut value, core::ptr::null_mut()) }
         },
         EzGfxResult::InvalidArgument
     );
@@ -637,18 +636,23 @@ fn context_lifecycle_rejects_cross_thread_destroy_and_invalidates_destroyed_hand
 #[test]
 fn frame_handles_are_thread_local_terminal_and_context_owned() {
     let native = common::TestContext::create(1);
+    let context = native.context;
     let mut frame = 0;
     assert_eq!(
         // SAFETY: frame output storage is live and aligned.
         unsafe { ez_gfx_frame_begin(native.context, native.surface, &raw mut frame) },
         EzGfxResult::Ok
     );
-    let foreign = std::thread::spawn(move || ez_gfx_frame_abort(frame))
+    assert_eq!(ez_gfx_frame_abort(0, frame), EzGfxResult::InvalidContext);
+    let foreign = std::thread::spawn(move || ez_gfx_frame_abort(context, frame))
         .join()
         .unwrap();
     assert_eq!(foreign, EzGfxResult::InvalidContext);
-    assert_eq!(ez_gfx_frame_abort(frame), EzGfxResult::Ok);
-    assert_eq!(ez_gfx_frame_end(frame), EzGfxResult::InvalidContext);
+    assert_eq!(ez_gfx_frame_abort(context, frame), EzGfxResult::Ok);
+    assert_eq!(
+        ez_gfx_frame_end(context, frame),
+        EzGfxResult::InvalidContext
+    );
 
     let mut ended = 0;
     assert_eq!(
@@ -656,8 +660,11 @@ fn frame_handles_are_thread_local_terminal_and_context_owned() {
         unsafe { ez_gfx_frame_begin(native.context, native.surface, &raw mut ended) },
         EzGfxResult::Ok
     );
-    assert_eq!(ez_gfx_frame_end(ended), EzGfxResult::NotReady);
-    assert_eq!(ez_gfx_frame_abort(ended), EzGfxResult::InvalidContext);
+    assert_eq!(ez_gfx_frame_end(context, ended), EzGfxResult::NotReady);
+    assert_eq!(
+        ez_gfx_frame_abort(context, ended),
+        EzGfxResult::InvalidContext
+    );
 
     let mut descendant = 0;
     assert_eq!(
@@ -666,7 +673,10 @@ fn frame_handles_are_thread_local_terminal_and_context_owned() {
         EzGfxResult::Ok
     );
     ez_gfx_context_destroy(native.context);
-    assert_eq!(ez_gfx_frame_abort(descendant), EzGfxResult::InvalidContext);
+    assert_eq!(
+        ez_gfx_frame_abort(context, descendant),
+        EzGfxResult::InvalidContext
+    );
 }
 
 #[cfg(windows)]
@@ -686,7 +696,7 @@ fn explicit_dx12_context_allocates_writes_and_releases_buffer_memory() {
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_buffer_acquire(16, 4, name.as_ptr(), name.len(), &raw mut buffer, context)
+                ez_gfx_buffer_acquire(context, 16, 4, name.as_ptr(), name.len(), &raw mut buffer)
             }
         },
         EzGfxResult::Ok
@@ -695,26 +705,26 @@ fn explicit_dx12_context_allocates_writes_and_releases_buffer_memory() {
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_buffer_write(buffer, 0, bytes.as_ptr().cast(), 4, 16, context) }
+            unsafe { ez_gfx_buffer_write(context, buffer, 0, bytes.as_ptr().cast(), 4, 16) }
         },
         EzGfxResult::Ok
     );
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_buffer_write(buffer, 0, bytes.as_ptr().cast(), 1, 65, context) }
+            unsafe { ez_gfx_buffer_write(context, buffer, 0, bytes.as_ptr().cast(), 1, 65) }
         },
         EzGfxResult::InvalidArgument
     );
-    ez_gfx_buffer_release(buffer, context);
+    ez_gfx_buffer_release(context, buffer);
     assert_eq!(
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
-            unsafe { ez_gfx_buffer_write(buffer, 0, bytes.as_ptr().cast(), 4, 16, context) }
+            unsafe { ez_gfx_buffer_write(context, buffer, 0, bytes.as_ptr().cast(), 4, 16) }
         },
         EzGfxResult::InvalidContext
     );
-    assert_eq!(ez_gfx_frame_abort(frame), EzGfxResult::Ok);
+    assert_eq!(ez_gfx_frame_abort(context, frame), EzGfxResult::Ok);
     assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
     ez_gfx_context_destroy(context);
     assert_eq!(
@@ -770,11 +780,11 @@ fn texture_descriptor_rejects_unsupported_pipeline_state_before_context_access()
                 // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
                 unsafe {
                     ez_gfx_texture_load(
+                        0,
                         pixels.as_ptr(),
                         pixels.len(),
                         &raw const desc,
                         &raw mut texture,
-                        0,
                     )
                 }
             },
@@ -858,13 +868,13 @@ fn malformed_handles_fail_without_touching_output() {
 fn msaa_target_lifecycle(context: ffi::EzGfxContext, base: EzGfxRenderTargetDesc) {
     // A 4-sample RGBA8 probe follows the device ceiling; the RTX runners admit
     // it, and a multisampled target then passes the full lifecycle below.
-    if ez_gfx_render_target_probe_format(1, 4, context) == EzGfxResult::Ok {
+    if ez_gfx_render_target_probe_format(context, 1, 4) == EzGfxResult::Ok {
         let msaa_desc = EzGfxRenderTargetDesc { samples: 4, ..base };
         let mut msaa = 0;
         assert_eq!(
             // SAFETY: The descriptor names live test-owned ranges; outputs are live and aligned.
             unsafe {
-                ez_gfx_render_target_create(&raw const msaa_desc, 64, 64, &raw mut msaa, context)
+                ez_gfx_render_target_create(context, &raw const msaa_desc, 64, 64, &raw mut msaa)
             },
             EzGfxResult::Ok
         );
@@ -872,16 +882,16 @@ fn msaa_target_lifecycle(context: ffi::EzGfxContext, base: EzGfxRenderTargetDesc
         let mut msaa_format = 0;
         assert_eq!(
             // SAFETY: Output storage is live and aligned through the call.
-            unsafe { ez_gfx_render_target_get_format(msaa, &raw mut msaa_format, context) },
+            unsafe { ez_gfx_render_target_get_format(context, msaa, &raw mut msaa_format) },
             EzGfxResult::Ok
         );
         assert_eq!(msaa_format, 1);
         // No frame begin here: the single begun frame below owns the test's
         // frame lifecycle, and a second begin would fail it.
-        ez_gfx_render_target_destroy(msaa, context);
+        ez_gfx_render_target_destroy(context, msaa);
         assert_eq!(
             // SAFETY: Output storage is live and aligned; the destroyed handle fails first.
-            unsafe { ez_gfx_render_target_get_format(msaa, &raw mut msaa_format, context) },
+            unsafe { ez_gfx_render_target_get_format(context, msaa, &raw mut msaa_format) },
             EzGfxResult::InvalidArgument
         );
     }
@@ -913,7 +923,7 @@ fn render_target_lifecycle_queries_probe_and_begin_on_hidden_context(backend: u8
     assert_eq!(
         // SAFETY: The descriptor names live test-owned ranges; outputs are live and aligned.
         unsafe {
-            ez_gfx_render_target_create(&raw const base, 64, 64, &raw mut target, native.context)
+            ez_gfx_render_target_create(native.context, &raw const base, 64, 64, &raw mut target)
         },
         EzGfxResult::Ok
     );
@@ -922,7 +932,7 @@ fn render_target_lifecycle_queries_probe_and_begin_on_hidden_context(backend: u8
     let mut format = 0;
     assert_eq!(
         // SAFETY: Output storage is live and aligned through the call.
-        unsafe { ez_gfx_render_target_get_format(target, &raw mut format, native.context) },
+        unsafe { ez_gfx_render_target_get_format(native.context, target, &raw mut format) },
         EzGfxResult::Ok
     );
     assert_eq!(format, 1);
@@ -930,7 +940,7 @@ fn render_target_lifecycle_queries_probe_and_begin_on_hidden_context(backend: u8
     assert_eq!(
         // SAFETY: Output storage is live and aligned through the call.
         unsafe {
-            ez_gfx_render_target_get_extent(target, &raw mut width, &raw mut height, native.context)
+            ez_gfx_render_target_get_extent(native.context, target, &raw mut width, &raw mut height)
         },
         EzGfxResult::Ok
     );
@@ -940,10 +950,10 @@ fn render_target_lifecycle_queries_probe_and_begin_on_hidden_context(backend: u8
         // SAFETY: `out_color` names four writable aligned floats through the call.
         unsafe {
             ez_gfx_render_target_get_clear(
+                native.context,
                 target,
                 &raw mut use_clear,
                 color.as_mut_ptr(),
-                native.context,
             )
         },
         EzGfxResult::Ok
@@ -960,7 +970,7 @@ fn render_target_lifecycle_queries_probe_and_begin_on_hidden_context(backend: u8
     assert_eq!(
         // SAFETY: The descriptor names live test-owned ranges; outputs are live and aligned.
         unsafe {
-            ez_gfx_render_target_create(&raw const no_clear, 32, 32, &raw mut plain, native.context)
+            ez_gfx_render_target_create(native.context, &raw const no_clear, 32, 32, &raw mut plain)
         },
         EzGfxResult::Ok
     );
@@ -969,25 +979,25 @@ fn render_target_lifecycle_queries_probe_and_begin_on_hidden_context(backend: u8
         // SAFETY: `out_color` names four writable aligned floats through the call.
         unsafe {
             ez_gfx_render_target_get_clear(
+                native.context,
                 plain,
                 &raw mut plain_flag,
                 plain_color.as_mut_ptr(),
-                native.context,
             )
         },
         EzGfxResult::Ok
     );
     assert_eq!(plain_flag, 0);
     assert_eq!(plain_color, [0.0; 4]);
-    ez_gfx_render_target_destroy(plain, native.context);
+    ez_gfx_render_target_destroy(native.context, plain);
 
     // Probing resolves the same declarations creation would admit.
     assert_eq!(
-        ez_gfx_render_target_probe_format(1, 1, native.context),
+        ez_gfx_render_target_probe_format(native.context, 1, 1),
         EzGfxResult::Ok
     );
     assert_eq!(
-        ez_gfx_render_target_probe_format(4, 1, native.context),
+        ez_gfx_render_target_probe_format(native.context, 4, 1),
         EzGfxResult::Unsupported
     );
 
@@ -1013,11 +1023,11 @@ fn render_target_lifecycle_queries_probe_and_begin_on_hidden_context(backend: u8
             // SAFETY: The descriptor names live test-owned ranges; outputs are live and aligned.
             unsafe {
                 ez_gfx_render_target_create(
+                    native.context,
                     &raw const desc,
                     64,
                     64,
                     &raw mut rejected,
-                    native.context,
                 )
             },
             EzGfxResult::Unsupported
@@ -1032,11 +1042,11 @@ fn render_target_lifecycle_queries_probe_and_begin_on_hidden_context(backend: u8
         unsafe { ez_gfx_render_target_frame_begin(native.context, target, &raw mut frame) },
         EzGfxResult::Ok
     );
-    assert_eq!(ez_gfx_frame_abort(frame), EzGfxResult::Ok);
-    ez_gfx_render_target_destroy(target, native.context);
+    assert_eq!(ez_gfx_frame_abort(native.context, frame), EzGfxResult::Ok);
+    ez_gfx_render_target_destroy(native.context, target);
     assert_eq!(
         // SAFETY: Output storage is live and aligned; the destroyed handle fails first.
-        unsafe { ez_gfx_render_target_get_format(target, &raw mut format, native.context) },
+        unsafe { ez_gfx_render_target_get_format(native.context, target, &raw mut format) },
         EzGfxResult::InvalidArgument
     );
     assert_eq!(
@@ -1080,7 +1090,7 @@ fn explicit_adapter_selection_creates_and_rejects_hidden_contexts() {
     let mut written = 0;
     assert_eq!(
         // SAFETY: The buffer names exactly `capacity` writable aligned entries; the written output is live and aligned.
-        unsafe { ez_gfx_adapters_query(1, infos.as_mut_ptr(), total, &raw mut written) },
+        unsafe { ez_gfx_adapter_query(1, infos.as_mut_ptr(), total, &raw mut written) },
         EzGfxResult::Ok
     );
     assert_eq!(written, total);
