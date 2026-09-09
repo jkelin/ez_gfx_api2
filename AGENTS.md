@@ -1,5 +1,7 @@
 # AGENTS.md
 
+The agent WILL NOT update README.md unless explicitly asked to. The README.md is managed by humans.
+
 ## Scope
 
 This repository is a Rust/Cargo migration of `ez_gfx_api`. Preserve the recognizable C/C# integration path while keeping the safe Rust API authoritative. Do not claim a feature is complete unless its implementation and required evidence exist.
