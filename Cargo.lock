@@ -812,6 +812,7 @@ dependencies = [
  "objc2-quartz-core 0.3.2",
  "raw-window-handle",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "winit",
 ]

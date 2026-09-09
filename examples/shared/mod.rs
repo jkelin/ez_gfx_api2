@@ -41,7 +41,7 @@ pub use observability::{ObservationCounts, drain_bounded};
 
 use clap::Parser;
 use ez_gfx::Backend;
-use std::{ffi::OsString, num::NonZeroU32, path::Path, process::Command, time::Instant};
+use std::{ffi::OsString, io::Write, num::NonZeroU32, path::Path, process::Command, time::Instant};
 /// Captured terminal frame and neutral observability totals.
 #[derive(Debug)]
 pub struct PresentedFrame {
@@ -354,6 +354,10 @@ fn snapshot_mismatch(expected: &[u8], actual: &[u8]) -> Option<SnapshotMismatch>
 }
 
 /// Applies a captured RGBA frame to the optional snapshot path and report stream.
+///
+/// # Errors
+///
+/// Returns a typed snapshot or output error without panicking.
 pub fn publish_snapshot(
     path: Option<OsString>,
     update: bool,
@@ -365,8 +369,9 @@ pub fn publish_snapshot(
     diagnostics: u32,
     dropped_observations: u64,
     report: bool,
-) {
+) -> Result<()> {
     if let Some(path) = path {
+        let display_path = Path::new(&path).display().to_string();
         if update {
             image::save_buffer_with_format(
                 &path,
@@ -376,45 +381,53 @@ pub fn publish_snapshot(
                 image::ColorType::Rgba8,
                 image::ImageFormat::Png,
             )
-            .unwrap_or_else(|error| panic!("update snapshot: {error}"));
+            .map_err(|source| Error::SnapshotUpdate {
+                path: display_path,
+                source,
+            })?;
         } else {
             let expected = image::open(&path)
-                .unwrap_or_else(|error| panic!("open snapshot: {error}"))
+                .map_err(|source| Error::SnapshotOpen {
+                    path: display_path.clone(),
+                    source,
+                })?
                 .into_rgba8();
-            assert!(
-                expected.dimensions() == (width, height),
-                "snapshot dimensions differ: expected_path={} expected={}x{} actual_path=<captured frame> actual={}x{}",
-                Path::new(&path).display(),
-                expected.width(),
-                expected.height(),
-                width,
-                height
-            );
+            if expected.dimensions() != (width, height) {
+                return Err(Error::SnapshotDimensions {
+                    path: display_path,
+                    expected_width: expected.width(),
+                    expected_height: expected.height(),
+                    actual_width: width,
+                    actual_height: height,
+                });
+            }
             if let Some(mismatch) = snapshot_mismatch(expected.as_raw(), rgba8) {
-                panic!(
-                    "snapshot pixels differ: expected_path={} expected_dimensions={}x{} expected_bytes={} expected_blake3={} actual_path=<captured frame> actual_dimensions={}x{} actual_bytes={} actual_blake3={} first_difference_index={} expected_byte={:?} actual_byte={:?}",
-                    Path::new(&path).display(),
-                    expected.width(),
-                    expected.height(),
-                    mismatch.expected_len,
-                    mismatch.expected_hash,
-                    width,
-                    height,
-                    mismatch.actual_len,
-                    mismatch.actual_hash,
-                    mismatch.first_difference.index,
-                    mismatch.first_difference.expected,
-                    mismatch.first_difference.actual
-                );
+                return Err(Error::SnapshotPixels {
+                    path: display_path,
+                    expected_width: expected.width(),
+                    expected_height: expected.height(),
+                    expected_len: mismatch.expected_len,
+                    expected_hash: mismatch.expected_hash,
+                    actual_width: width,
+                    actual_height: height,
+                    actual_len: mismatch.actual_len,
+                    actual_hash: mismatch.actual_hash,
+                    first_difference_index: mismatch.first_difference.index,
+                    expected_byte: mismatch.first_difference.expected,
+                    actual_byte: mismatch.first_difference.actual,
+                });
             }
         }
     }
     if report {
-        println!(
+        writeln!(
+            std::io::stdout().lock(),
             "ez-gfx-snapshot {width} {height} {frames} {} {runtime_events} {diagnostics} {dropped_observations}",
             blake3::hash(rgba8)
-        );
+        )
+        .map_err(Error::ReportOutput)?;
     }
+    Ok(())
 }
 
 /// Builds the smoke-test command with the stable automation environment.
@@ -433,8 +446,8 @@ pub fn snapshot_command(binary: &str, path: &Path, backend: &str) -> Command {
 #[cfg(test)]
 mod tests {
     use super::{
-        BenchmarkConfig, Cli, benchmark_frame_limit, parse_env_flag, program_options_from,
-        snapshot_mismatch,
+        BenchmarkConfig, Cli, Error, benchmark_frame_limit, parse_env_flag, program_options_from,
+        publish_snapshot, snapshot_mismatch,
     };
     use clap::Parser;
     use std::{collections::HashMap, ffi::OsString};
@@ -454,6 +467,52 @@ mod tests {
         assert_eq!(mismatch.first_difference.index, 1);
         assert_eq!(mismatch.first_difference.expected, Some(2));
         assert_eq!(mismatch.first_difference.actual, Some(9));
+    }
+
+    #[test]
+    fn snapshot_publication_returns_detailed_pixel_mismatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("expected.png");
+        image::save_buffer_with_format(
+            &path,
+            &[1, 2, 3, 4],
+            1,
+            1,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+
+        let error = publish_snapshot(
+            Some(path.into_os_string()),
+            false,
+            1,
+            1,
+            1,
+            &[1, 9, 3, 4],
+            0,
+            0,
+            0,
+            false,
+        )
+        .unwrap_err();
+
+        let Error::SnapshotPixels {
+            expected_len,
+            actual_len,
+            first_difference_index,
+            expected_byte,
+            actual_byte,
+            ..
+        } = error
+        else {
+            panic!("expected pixel mismatch, got {error}");
+        };
+        assert_eq!(expected_len, 4);
+        assert_eq!(actual_len, 4);
+        assert_eq!(first_difference_index, 1);
+        assert_eq!(expected_byte, Some(2));
+        assert_eq!(actual_byte, Some(9));
     }
 
     #[test]

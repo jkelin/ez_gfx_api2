@@ -94,10 +94,10 @@ mod tests {
 }
 
 fn main() -> anyhow::Result<()> {
-    let mut example = Example::new("06_sponza_ktx2", WIDTH, HEIGHT, "ez_gfx_api2")?;
+    let (mut example, context, surface) =
+        Example::new("06_sponza_ktx2", WIDTH, HEIGHT, "ez_gfx_api2")?;
     {
         let backend = example.backend();
-        let context = example.context();
         let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .ok_or_else(|| anyhow::anyhow!("examples package has no workspace parent"))?;
@@ -210,8 +210,8 @@ fn main() -> anyhow::Result<()> {
             padding: [0; 3],
         };
 
-        while let Some(window_frame) = example.wait_for_next_frame()? {
-            let mut frame = example.surface().begin_frame()?;
+        while let Some(window_frame) = example.wait_for_next_frame(&surface)? {
+            let mut frame = surface.begin_frame()?;
             let swapchain_target =
                 frame.configure_swapchain(window_frame.size, Format::Bgra8Srgb)?;
             let input = window_frame.input;
@@ -234,10 +234,9 @@ fn main() -> anyhow::Result<()> {
                 )? * camera.view(target)?,
             );
             // Buffers are one-frame values: the first bound frame consumes them.
-            let primitives = example.context().acquire_buffer_from(records.as_slice())?;
-            let indirect = example
-                .context()
-                .acquire_counter_buffer::<DrawIndexedCommand>(primitive_count as usize)?;
+            let primitives = context.acquire_buffer_from(records.as_slice())?;
+            let indirect =
+                context.acquire_counter_buffer::<DrawIndexedCommand>(primitive_count as usize)?;
             // Compute fills the draw commands; only the visible count is published up front.
             indirect.publish_count(primitive_count)?;
             let bindings = [
@@ -258,6 +257,7 @@ fn main() -> anyhow::Result<()> {
             example.handle_frame(frame, swapchain_target)?;
         }
     }
-    example.close()?;
+    drop(surface);
+    context.close().map_err(|(_, error)| error)?;
     Ok(())
 }
