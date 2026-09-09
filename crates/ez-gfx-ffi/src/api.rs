@@ -2,29 +2,29 @@ use core::ffi::c_void;
 
 /// Opaque 64-bit identifier used for graphics resources across the C ABI.
 pub type EzGfxHandle = u64;
-/// Opaque identifier for a graphics context.
+/// Opaque packed `u64` context handle; slot+1/generation occupy bits 0-39.
 pub type EzGfxContext = EzGfxHandle;
-/// Opaque identifier for a presentation surface.
+/// Opaque packed `u64` surface handle; child bits index the context identity arena and resolve only as a surface.
 pub type EzGfxSurface = EzGfxHandle;
-/// Opaque identifier for one live frame recording interval.
+/// Opaque generation-, kind-, owner-, state-, and frame-serial-validated live frame handle.
 pub type EzGfxFrame = EzGfxHandle;
 /// Stable process-unique identity for one enqueued readback request.
 pub type EzGfxReadbackRequest = u64;
-/// Opaque identifier for a compiled shader resource.
+/// Opaque packed `u64` shader handle; child bits index the context identity arena and resolve only as a shader.
 pub type EzGfxShader = EzGfxHandle;
-/// Opaque identifier for a frame-local counter buffer holding indexed draw commands.
+/// Opaque packed `u64` one-frame counter-buffer handle; child bits resolve only as indirect commands.
 pub type EzGfxCounterBuffer = EzGfxHandle;
-/// Opaque identifier for a frame-local shader-accessible one-frame buffer.
+/// Opaque packed `u64` one-frame buffer handle; child bits resolve only as structured data.
 pub type EzGfxBuffer = EzGfxHandle;
-/// Opaque identifier for a named vertex heap.
+/// Opaque named vertex heap whose owner and generation are validated.
 pub type EzGfxVertexHeap = EzGfxHandle;
-/// Opaque identifier for an allocation within a named vertex heap.
+/// Opaque allocation within a named vertex heap whose owner and generation are validated.
 pub type EzGfxVertexAllocation = EzGfxHandle;
-/// Opaque identifier for an allocation within the global index heap.
+/// Opaque allocation within the singleton index heap whose owner and generation are validated.
 pub type EzGfxIndexAllocation = EzGfxHandle;
-/// Opaque identifier for a sampled texture resource.
+/// Opaque packed `u64` texture handle; child bits index the context identity arena and resolve only as a texture.
 pub type EzGfxTexture = EzGfxHandle;
-/// Opaque identifier for a render-target resource.
+/// Opaque packed `u64` render-target handle; child bits index the context identity arena and resolve only as a render target.
 pub type EzGfxRenderTarget = EzGfxHandle;
 
 /// Stable C ABI result code.

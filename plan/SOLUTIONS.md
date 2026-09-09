@@ -13,14 +13,14 @@ Migrate the original Odin/Vulkan `ez_gfx_api` into a Rust/Cargo implementation t
 - Shipping runtime packages must not depend on or bundle the Slang compiler.
 - Vulkan, DX12, and Metal are required; Vulkan-only designs are incomplete.
 - Explicit shader target attributes remain the source of truth for render-target intent.
-- Rust exposes only the ownership-based interface. C/C# use the explicit ABI 33 lifecycle through `ez-gfx-ffi`.
+- Rust exposes only the ownership-based interface. C/C# use the explicit ABI 34 lifecycle through `ez-gfx-ffi`.
 - External inputs and binary artifacts require boundary validation.
 - Measurements from different or unspecified workloads are not averaged. Missing performance data remains unknown.
 - OpenGL, DX11, software rasterizers, a custom shader DSL, and a custom window system are out of scope.
 
 ### Assumptions
 
-- ABI 33 is the non-Rust compatibility seam; it does not dictate safe Rust ownership or retain safe compatibility aliases.
+- ABI 34 is the non-Rust compatibility seam; it does not dictate safe Rust ownership or retain safe compatibility aliases.
 - Supported hardware exposes sufficient modern bindless/indexing features. Devices below the declared capability floor receive an explicit unsupported error.
 - Slang, DXC/signing tools, and Apple Metal tools are available in compiler/build environments, not runtime deployments.
 - No repository-specific performance baseline exists for P-001 through P-020; every selected design carries explicit measurement actions.
@@ -68,7 +68,7 @@ Provide a safe ownership-based Rust interface while keeping a validated C seam. 
 
 `Surface::begin_frame()` and `Context::begin_frame()` return target-less owners. `Frame::configure_swapchain` attaches presentation; `Frame::configure_render_target` caches a named image and implicitly recreates it for size or format changes. `Frame::finish(self)` returns exact errors, while `Drop` aborts because it cannot report failure. `RenderTarget::prepare_readback` yields an opaque request delivered only through callback-scoped bytes.
 
-`ez-gfx-ffi` remains a validated adapter. ABI 33 uses opaque generation- and owner-checked `u64` handles, including `EzGfxFrame`. Surface and managed-target begin functions return explicit frame owners; `ez_gfx_frame_end` and `ez_gfx_frame_abort` invalidate on every result, while context destruction aborts descendants. C buffers are one-frame values: their first valid recording claims them, same-frame reuse is allowed, and terminal paths invalidate claimed handles while completion gates native recycling. Validate pointer/count pairs, arithmetic, UTF-8, layouts, handles, out-pointers, and asynchronous ownership; contain every panic.
+`ez-gfx-ffi` remains a validated adapter. ABI 34 uses opaque generation- and owner-checked `u64` handles, including `EzGfxFrame`. Surface and managed-target begin functions return explicit frame owners; `ez_gfx_frame_end` and `ez_gfx_frame_abort` invalidate on every result, while context destruction aborts descendants. C buffers are one-frame values: their first valid recording claims them, same-frame reuse is allowed, and terminal paths invalidate claimed handles while completion gates native recycling. Validate pointer/count pairs, arithmetic, UTF-8, layouts, handles, out-pointers, and asynchronous ownership; contain every panic.
 
 Surface construction is transactional: a native creation, device-initialization, or initial-resize failure destroys the unpublished raw surface and returns the original error without retaining a safe wrapper.
 
@@ -78,7 +78,7 @@ The safe interface gains lifetime locality at the cost of `Rc` increments and in
 
 ### Risks and validation
 
-Validate wrapper drop order, absence of reference cycles, exact submit/present errors, implicit abort, one-frame buffer claim and terminal invalidation, atomic surface rollback, stale/foreign/generation rejection, ABI 33 header/XML/export parity, layout probes, invalid calls, and panic containment.
+Validate wrapper drop order, absence of reference cycles, exact submit/present errors, implicit abort, one-frame buffer claim and terminal invalidation, atomic surface rollback, stale/foreign/generation rejection, ABI 34 generated-contract freshness, layout probes, invalid calls, and panic containment.
 
 ## P-003: Multi-backend hardware abstraction — Custom static raw HAL
 
@@ -336,7 +336,7 @@ Manage named bindless vertex heaps and one singleton context-owned index heap wi
 
 ### Decision
 
-GPU ranges use ordered free lists and generation-indexed identities. Safe heap and allocation wrappers retain their context and parent-resource leases; dropping an allocation retires its range, and dropping a heap retires it after child leases and recorded uses. The safe interface has no remove, destroy, release, or free operation. ABI 33 retains explicit opaque-handle release for C.
+GPU ranges use ordered free lists and generation-indexed identities. Safe heap and allocation wrappers retain their context and parent-resource leases; dropping an allocation retires its range, and dropping a heap retires it after child leases and recorded uses. The safe interface has no remove, destroy, release, or free operation. ABI 34 retains explicit opaque-handle release for C.
 
 `Buffer<T>` and `CounterBuffer<T>` belong to `Context` for one frame. Their first valid binding claims them; repeated compute/graphics use in that frame shares one native materialization, and every later write or frame use fails. Native reuse remains completion-gated or quarantined after an indeterminate failure.
 
@@ -389,7 +389,7 @@ Presented and managed-target begin functions return owning `Frame` values; all r
 
 `Frame::finish(self)` aborts and returns any prior recording error unchanged, otherwise submits and presents surface frames only after successful submission. It preserves the exact error from each phase. Dropping an unfinished frame aborts. Claimed `Buffer<T>` and `CounterBuffer<T>` values support same-frame reuse, then become invalid on every terminal path; native backing remains completion-gated or quarantined internally.
 
-ABI 33 exposes opaque generational `EzGfxFrame` handles from surface or managed-target begin. C terminates them with `ez_gfx_frame_end` or `ez_gfx_frame_abort`; every result invalidates the frame and its claimed buffer handles, and context destruction aborts descendants.
+ABI 34 exposes opaque generational `EzGfxFrame` handles from surface or managed-target begin. C terminates them with `ez_gfx_frame_end` or `ez_gfx_frame_abort`; every result invalidates the frame and its claimed buffer handles, and context destruction aborts descendants.
 
 ### Risks and validation
 
@@ -580,7 +580,7 @@ Sequence all P-001 through P-019 decisions into bounded milestones, obtain execu
 
 ### Decision
 
-Start with one end-to-end backend-neutral vertical slice, then require Vulkan, DX12, and Metal conformance, compressed assets/streaming/UI, and remaining selected work. Final cutover uses the shared `Example` host for winit inversion, native window hosting, resize, input, automation, and consuming frame dispatch; each main visibly creates its `Context` with `Context::new(ContextOptions { .. })` and `Surface` with `context.create_surface(SurfaceOptions { .. })`, scopes resources first, drops the surface, consumes `Context::close` to preserve teardown errors, and lets host `Drop` publish without graphics shutdown. Publication failures log and exit nonzero during normal automation without replacing an active unwind. It requires all six examples, ABI 33 gates, backend-required snapshots, every inherited TODO disposition, and no obsolete safe handles.
+Start with one end-to-end backend-neutral vertical slice, then require Vulkan, DX12, and Metal conformance, compressed assets/streaming/UI, and remaining selected work. Final cutover uses the shared `Example` host for winit inversion, native window hosting, resize, input, automation, and consuming frame dispatch; each main visibly creates its `Context` with `Context::new(ContextOptions { .. })` and `Surface` with `context.create_surface(SurfaceOptions { .. })`, scopes resources first, drops the surface, consumes `Context::close` to preserve teardown errors, and lets host `Drop` publish without graphics shutdown. Publication failures log and exit nonzero during normal automation without replacing an active unwind. It requires all six examples, ABI 34 gates, backend-required snapshots, every inherited TODO disposition, and no obsolete safe handle/free or multi-begin compatibility path.
 
 ### Performance and tradeoffs
 

@@ -176,11 +176,11 @@ pub extern "C" fn ez_gfx_texture_decoder_unregister(source_format: u8) -> EzGfxR
 ///
 /// Non-null `data` must be readable for `data_size` bytes, non-null `desc` readable for one aligned descriptor, and non-null `out_texture` writable for one aligned handle. The optional descriptor label must be either null with zero length or non-null and readable for its exact nonzero UTF-8 byte length without embedded NUL bytes.
 pub unsafe extern "C" fn ez_gfx_texture_load(
+    context: EzGfxContext,
     data: *const u8,
     data_size: usize,
     desc: *const EzGfxTextureDesc,
     out_texture: *mut EzGfxTexture,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         if data.is_null()
@@ -292,8 +292,8 @@ pub unsafe extern "C" fn ez_gfx_texture_load(
 #[unsafe(no_mangle)]
 /// Cancels a texture request before native transfer submission.
 pub extern "C" fn ez_gfx_texture_cancel(
-    texture: EzGfxTexture,
     context: EzGfxContext,
+    texture: EzGfxTexture,
 ) -> EzGfxResult {
     catch_status(|| {
         let texture = match texture_handle(texture) {
@@ -315,9 +315,9 @@ pub extern "C" fn ez_gfx_texture_cancel(
 ///
 /// A non-null `out_binding` must address one writable, aligned `u32` for this call.
 pub unsafe extern "C" fn ez_gfx_texture_get_binding(
+    context: EzGfxContext,
     texture: EzGfxTexture,
     out_binding: *mut u32,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         if out_binding.is_null() {
@@ -349,10 +349,10 @@ pub unsafe extern "C" fn ez_gfx_texture_get_binding(
 ///
 /// Each non-null output pointer must address one writable, aligned `u32` for this call.
 pub unsafe extern "C" fn ez_gfx_texture_get_residency(
+    context: EzGfxContext,
     texture: EzGfxTexture,
     out_resident_mips: *mut u32,
     out_total_mips: *mut u32,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         if out_resident_mips.is_null() || out_total_mips.is_null() {
@@ -383,9 +383,9 @@ pub unsafe extern "C" fn ez_gfx_texture_get_residency(
 #[unsafe(no_mangle)]
 /// Sets the contiguous coarse mip count exposed through the stable texture binding.
 pub extern "C" fn ez_gfx_texture_set_residency(
+    context: EzGfxContext,
     texture: EzGfxTexture,
     resident_mips: u32,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         let context = match context_handle(context) {
@@ -406,10 +406,10 @@ pub extern "C" fn ez_gfx_texture_set_residency(
 ///
 /// `desc` must address one readable aligned descriptor. Its non-null `data` must remain readable
 /// for exactly `data_size` bytes through this call.
-pub unsafe extern "C" fn ez_gfx_update_texture_region(
+pub unsafe extern "C" fn ez_gfx_texture_update_region(
+    context: EzGfxContext,
     texture: EzGfxTexture,
     desc: *const super::EzGfxTextureRegionDesc,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         if desc.is_null() {
@@ -454,8 +454,8 @@ pub unsafe extern "C" fn ez_gfx_update_texture_region(
 ///
 /// `out_telemetry` must address one writable aligned telemetry structure.
 pub unsafe extern "C" fn ez_gfx_texture_get_upload_telemetry(
-    out_telemetry: *mut super::EzGfxTextureUploadTelemetry,
     context: EzGfxContext,
+    out_telemetry: *mut super::EzGfxTextureUploadTelemetry,
 ) -> EzGfxResult {
     catch_status(|| {
         if out_telemetry.is_null() {
@@ -485,7 +485,7 @@ pub unsafe extern "C" fn ez_gfx_texture_get_upload_telemetry(
 
 #[unsafe(no_mangle)]
 /// Unloads a texture from the context.
-pub extern "C" fn ez_gfx_texture_unload(texture: EzGfxTexture, context: EzGfxContext) {
+pub extern "C" fn ez_gfx_texture_unload(context: EzGfxContext, texture: EzGfxTexture) {
     catch_void(|| {
         if let (Ok(context), Ok(texture)) = (context_handle(context), texture_handle(texture)) {
             raw::unload_texture(context, texture);

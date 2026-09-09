@@ -30,7 +30,7 @@ fn error_message(result: u8) -> &'static [u8] {
 ///
 /// `out_required` must address one writable, aligned `usize`. A nonzero
 /// `capacity` requires `buffer` to address that many writable bytes.
-pub unsafe extern "C" fn ez_gfx_print_error(
+pub unsafe extern "C" fn ez_gfx_error_print(
     result: u8,
     buffer: *mut u8,
     capacity: usize,

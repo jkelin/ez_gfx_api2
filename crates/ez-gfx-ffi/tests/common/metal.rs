@@ -56,15 +56,15 @@ impl TestContext {
             // SAFETY: The retained unattached layer outlives the surface; all storage is live.
             unsafe {
                 ez_gfx_surface_create(
+                    native.context,
                     &raw const surface_desc,
                     &raw mut native.surface,
-                    native.context,
                 )
             },
             EzGfxResult::Ok
         );
         assert_eq!(
-            ez_gfx_context_init_device(native.surface, native.context),
+            ez_gfx_context_init_device(native.context, native.surface),
             EzGfxResult::Ok
         );
         native
@@ -75,7 +75,7 @@ impl Drop for TestContext {
     fn drop(&mut self) {
         // Partial construction also releases the context, without destroying absent handles.
         if self.surface != 0 {
-            ez_gfx_surface_destroy(self.surface, self.context);
+            ez_gfx_surface_destroy(self.context, self.surface);
         }
         if self.context != 0 {
             ez_gfx_context_destroy(self.context);

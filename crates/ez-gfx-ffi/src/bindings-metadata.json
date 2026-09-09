@@ -1,0 +1,2029 @@
+{
+  "root": {
+    "version": "1",
+    "library": "ez_gfx_ffi"
+  },
+  "items": {
+    "handle:EzGfxContext": {
+      "attrs": {}
+    },
+    "handle:EzGfxSurface": {
+      "attrs": {}
+    },
+    "handle:EzGfxFrame": {
+      "attrs": {}
+    },
+    "handle:EzGfxReadbackRequest": {
+      "attrs": {}
+    },
+    "handle:EzGfxShader": {
+      "attrs": {}
+    },
+    "handle:EzGfxCounterBuffer": {
+      "attrs": {}
+    },
+    "handle:EzGfxBuffer": {
+      "attrs": {}
+    },
+    "handle:EzGfxVertexHeap": {
+      "attrs": {}
+    },
+    "handle:EzGfxVertexAllocation": {
+      "attrs": {}
+    },
+    "handle:EzGfxIndexAllocation": {
+      "attrs": {}
+    },
+    "handle:EzGfxTexture": {
+      "attrs": {}
+    },
+    "handle:EzGfxRenderTarget": {
+      "attrs": {}
+    },
+    "enum:EzGfxResult": {
+      "attrs": {},
+      "children": {
+        "EzGfxResult_Ok": {},
+        "EzGfxResult_InvalidArgument": {},
+        "EzGfxResult_InvalidContext": {},
+        "EzGfxResult_NativeFailure": {},
+        "EzGfxResult_NotReady": {},
+        "EzGfxResult_Unsupported": {},
+        "EzGfxResult_DeviceLost": {},
+        "EzGfxResult_QueueFull": {},
+        "EzGfxResult_Cancelled": {}
+      }
+    },
+    "enum:EzGfxTextureError": {
+      "attrs": {},
+      "children": {
+        "EzGfxTextureError_None": {},
+        "EzGfxTextureError_InvalidContext": {},
+        "EzGfxTextureError_InvalidArguments": {},
+        "EzGfxTextureError_UnsupportedFormat": {},
+        "EzGfxTextureError_OutOfTextureHandles": {},
+        "EzGfxTextureError_OutOfMemory": {},
+        "EzGfxTextureError_DecodeFailed": {},
+        "EzGfxTextureError_VulkanFailed": {},
+        "EzGfxTextureError_WorkerUnavailable": {},
+        "EzGfxTextureError_NotFound": {}
+      }
+    },
+    "enum:EzGfxShaderKind": {
+      "attrs": {},
+      "children": {
+        "EzGfxShaderKind_Graphics": {},
+        "EzGfxShaderKind_Compute": {}
+      }
+    },
+    "enum:EzGfxBackend": {
+      "attrs": {},
+      "children": {
+        "EzGfxBackend_Vulkan": {},
+        "EzGfxBackend_Dx12": {},
+        "EzGfxBackend_Metal": {}
+      }
+    },
+    "enum:EzGfxAdapterClass": {
+      "attrs": {},
+      "children": {
+        "EzGfxAdapterClass_Software": {},
+        "EzGfxAdapterClass_Other": {},
+        "EzGfxAdapterClass_Integrated": {},
+        "EzGfxAdapterClass_Discrete": {}
+      }
+    },
+    "enum:EzGfxRuntimePhase": {
+      "attrs": {},
+      "children": {
+        "EzGfxRuntimePhase_Admission": {},
+        "EzGfxRuntimePhase_Decode": {},
+        "EzGfxRuntimePhase_Upload": {},
+        "EzGfxRuntimePhase_Bind": {},
+        "EzGfxRuntimePhase_Submit": {},
+        "EzGfxRuntimePhase_Present": {},
+        "EzGfxRuntimePhase_Readback": {},
+        "EzGfxRuntimePhase_Device": {}
+      }
+    },
+    "enum:EzGfxUploadResourceKind": {
+      "attrs": {},
+      "children": {
+        "EzGfxUploadResourceKind_Texture": {},
+        "EzGfxUploadResourceKind_VertexAllocation": {},
+        "EzGfxUploadResourceKind_IndexAllocation": {}
+      }
+    },
+    "enum:EzGfxUploadStatus": {
+      "attrs": {},
+      "children": {
+        "EzGfxUploadStatus_SourceStaged": {},
+        "EzGfxUploadStatus_DeviceReady": {},
+        "EzGfxUploadStatus_Failed": {},
+        "EzGfxUploadStatus_Cancelled": {}
+      }
+    },
+    "enum:EzGfxDiagnosticLevel": {
+      "attrs": {},
+      "children": {
+        "EzGfxDiagnosticLevel_Info": {},
+        "EzGfxDiagnosticLevel_Warning": {},
+        "EzGfxDiagnosticLevel_Error": {}
+      }
+    },
+    "enum:EzGfxSurfacePlatform": {
+      "attrs": {},
+      "children": {
+        "EzGfxSurfacePlatform_Win32": {},
+        "EzGfxSurfacePlatform_GLFW": {},
+        "EzGfxSurfacePlatform_MetalLayer": {},
+        "EzGfxSurfacePlatform_Headless": {}
+      }
+    },
+    "enum:EzGfxSourceTextureFormat": {
+      "attrs": {},
+      "children": {
+        "EzGfxSourceTextureFormat_Rgb": {},
+        "EzGfxSourceTextureFormat_Rgba": {},
+        "EzGfxSourceTextureFormat_Bmp": {},
+        "EzGfxSourceTextureFormat_Jpeg": {},
+        "EzGfxSourceTextureFormat_Png": {},
+        "EzGfxSourceTextureFormat_Tga": {},
+        "EzGfxSourceTextureFormat_Ktx2": {},
+        "EzGfxSourceTextureFormat_Basis": {},
+        "EzGfxSourceTextureFormat_Dds": {},
+        "EzGfxSourceTextureFormat_Raw": {}
+      }
+    },
+    "enum:EzGfxTextureFilter": {
+      "attrs": {},
+      "children": {
+        "EzGfxTextureFilter_Nearest": {},
+        "EzGfxTextureFilter_Linear": {}
+      }
+    },
+    "enum:EzGfxTextureAddressMode": {
+      "attrs": {},
+      "children": {
+        "EzGfxTextureAddressMode_Repeat": {},
+        "EzGfxTextureAddressMode_ClampToEdge": {}
+      }
+    },
+    "enum:EzGfxTextureDestinationFormat": {
+      "attrs": {},
+      "children": {
+        "EzGfxTextureDestinationFormat_Rgba8Unorm": {},
+        "EzGfxTextureDestinationFormat_Auto": {},
+        "EzGfxTextureDestinationFormat_Rgba8Srgb": {},
+        "EzGfxTextureDestinationFormat_Bc1Unorm": {},
+        "EzGfxTextureDestinationFormat_Bc1Srgb": {},
+        "EzGfxTextureDestinationFormat_Bc3Unorm": {},
+        "EzGfxTextureDestinationFormat_Bc3Srgb": {},
+        "EzGfxTextureDestinationFormat_Bc7Unorm": {},
+        "EzGfxTextureDestinationFormat_Bc7Srgb": {},
+        "EzGfxTextureDestinationFormat_Astc4x4Unorm": {},
+        "EzGfxTextureDestinationFormat_Astc4x4Srgb": {}
+      }
+    },
+    "enum:EzGfxRenderTargetFormat": {
+      "attrs": {},
+      "children": {
+        "EzGfxRenderTargetFormat_Rgba8Unorm": {},
+        "EzGfxRenderTargetFormat_Bgra8Srgb": {},
+        "EzGfxRenderTargetFormat_Rgba16Float": {},
+        "EzGfxRenderTargetFormat_Depth32Float": {},
+        "EzGfxRenderTargetFormat_Bc7Unorm": {},
+        "EzGfxRenderTargetFormat_Astc4x4Unorm": {}
+      }
+    },
+    "enum:EzGfxRenderTargetUsage": {
+      "attrs": {},
+      "children": {
+        "EzGfxRenderTargetUsage_Color": {},
+        "EzGfxRenderTargetUsage_Depth": {},
+        "EzGfxRenderTargetUsage_Storage": {},
+        "EzGfxRenderTargetUsage_Sampled": {}
+      }
+    },
+    "enum:EzGfxCullMode": {
+      "attrs": {},
+      "children": {
+        "EzGfxCullMode_None": {},
+        "EzGfxCullMode_Front": {},
+        "EzGfxCullMode_Back": {}
+      }
+    },
+    "enum:EzGfxFrontFace": {
+      "attrs": {},
+      "children": {
+        "EzGfxFrontFace_CounterClockwise": {},
+        "EzGfxFrontFace_Clockwise": {}
+      }
+    },
+    "enum:EzGfxPrimitiveType": {
+      "attrs": {},
+      "children": {
+        "EzGfxPrimitiveType_TriangleList": {},
+        "EzGfxPrimitiveType_PointList": {},
+        "EzGfxPrimitiveType_LineList": {},
+        "EzGfxPrimitiveType_LineStrip": {},
+        "EzGfxPrimitiveType_TriangleStrip": {},
+        "EzGfxPrimitiveType_TriangleFan": {}
+      }
+    },
+    "enum:EzGfxBlendMode": {
+      "attrs": {},
+      "children": {
+        "EzGfxBlendMode_None": {},
+        "EzGfxBlendMode_Alpha": {}
+      }
+    },
+    "enum:EzGfxEventKind": {
+      "attrs": {},
+      "children": {
+        "EzGfxEventKind_Upload": {},
+        "EzGfxEventKind_Runtime": {},
+        "EzGfxEventKind_Diagnostic": {},
+        "EzGfxEventKind_ObservationsDropped": {},
+        "EzGfxEventKind_Readback": {},
+        "EzGfxEventKind_Snapshot": {}
+      }
+    },
+    "struct:EzGfxAdapterDesc": {
+      "attrs": {},
+      "children": {
+        "stable_id": {
+          "array-length": "16"
+        },
+        "allow_software": {}
+      }
+    },
+    "struct:EzGfxAdapterInfo": {
+      "attrs": {},
+      "children": {
+        "stable_id": {
+          "array-length": "16"
+        },
+        "backend": {
+          "type": "EzGfxBackend"
+        },
+        "adapter_class": {
+          "type": "EzGfxAdapterClass"
+        },
+        "admitted": {},
+        "software_rejected": {},
+        "error_count": {}
+      }
+    },
+    "struct:EzGfxContextDesc": {
+      "attrs": {},
+      "children": {
+        "enable_debug": {},
+        "enable_validation": {},
+        "surface_platform": {
+          "type": "EzGfxSurfacePlatform"
+        },
+        "texture_decode_workers": {},
+        "adapter_count": {},
+        "adapter": {
+          "type": "const EzGfxAdapterDesc *",
+          "nullable": "true"
+        }
+      }
+    },
+    "struct:EzGfxBackendContextDesc": {
+      "attrs": {},
+      "children": {
+        "enable_debug": {},
+        "enable_validation": {},
+        "surface_platform": {
+          "type": "EzGfxSurfacePlatform"
+        },
+        "backend": {
+          "type": "EzGfxBackend"
+        },
+        "texture_decode_workers": {},
+        "adapter_count": {},
+        "adapter": {
+          "type": "const EzGfxAdapterDesc *",
+          "nullable": "true"
+        }
+      }
+    },
+    "struct:EzGfxSurfaceDesc": {
+      "attrs": {},
+      "children": {
+        "window": {
+          "nullable": "false"
+        },
+        "display": {
+          "nullable": "true"
+        },
+        "platform": {
+          "type": "EzGfxSurfacePlatform"
+        },
+        "width": {
+          "validation": "greater-than-zero"
+        },
+        "height": {
+          "validation": "greater-than-zero"
+        },
+        "cache_presented_snapshots": {}
+      }
+    },
+    "struct:EzGfxShaderDesc": {
+      "attrs": {},
+      "children": {
+        "path": {
+          "type": "const char *",
+          "nullable": "false"
+        },
+        "path_length": {
+          "validation": "greater-than-zero-at-most-boundary-limit"
+        },
+        "vertex_entry": {
+          "type": "const char *",
+          "nullable": "true"
+        },
+        "vertex_entry_length": {
+          "validation": "zero-or-at-most-boundary-limit"
+        },
+        "fragment_entry": {
+          "type": "const char *",
+          "nullable": "true"
+        },
+        "fragment_entry_length": {
+          "validation": "zero-or-at-most-boundary-limit"
+        },
+        "compute_entry": {
+          "type": "const char *",
+          "nullable": "true"
+        },
+        "compute_entry_length": {
+          "validation": "zero-or-at-most-boundary-limit"
+        },
+        "kind": {
+          "type": "EzGfxShaderKind"
+        }
+      }
+    },
+    "struct:EzGfxTextureDesc": {
+      "attrs": {},
+      "children": {
+        "source_format": {
+          "type": "EzGfxSourceTextureFormat"
+        },
+        "destination_format": {
+          "type": "EzGfxTextureDestinationFormat"
+        },
+        "width": {
+          "validation": "greater-than-zero"
+        },
+        "height": {
+          "validation": "greater-than-zero"
+        },
+        "mip_count": {},
+        "generate_mips": {},
+        "min_filter": {
+          "type": "EzGfxTextureFilter"
+        },
+        "mag_filter": {
+          "type": "EzGfxTextureFilter"
+        },
+        "max_anisotropy": {},
+        "address_mode_u": {
+          "type": "EzGfxTextureAddressMode"
+        },
+        "address_mode_v": {
+          "type": "EzGfxTextureAddressMode"
+        },
+        "address_mode_w": {
+          "type": "EzGfxTextureAddressMode"
+        },
+        "debug_label": {
+          "type": "const char *",
+          "nullable": "true"
+        },
+        "debug_label_length": {
+          "validation": "zero-or-at-most-boundary-limit"
+        }
+      }
+    },
+    "struct:EzGfxDecodedTextureMip": {
+      "attrs": {},
+      "children": {
+        "width": {
+          "validation": "greater-than-zero"
+        },
+        "height": {
+          "validation": "greater-than-zero"
+        },
+        "data": {
+          "nullable": "false"
+        },
+        "data_size": {
+          "validation": "greater-than-zero"
+        }
+      }
+    },
+    "struct:EzGfxDecodedTexture": {
+      "attrs": {},
+      "children": {
+        "format": {
+          "type": "EzGfxTextureDestinationFormat"
+        },
+        "mip_count": {
+          "validation": "greater-than-zero"
+        },
+        "mips": {
+          "type": "const EzGfxDecodedTextureMip *",
+          "nullable": "false"
+        }
+      }
+    },
+    "struct:EzGfxTextureRegionDesc": {
+      "attrs": {},
+      "children": {
+        "mip_level": {},
+        "x": {},
+        "y": {},
+        "width": {
+          "validation": "greater-than-zero"
+        },
+        "height": {
+          "validation": "greater-than-zero"
+        },
+        "data": {
+          "nullable": "false"
+        },
+        "data_size": {
+          "validation": "greater-than-zero-at-most-boundary-limit"
+        }
+      }
+    },
+    "struct:EzGfxRenderTargetDesc": {
+      "attrs": {},
+      "children": {
+        "name": {
+          "nullable": "false"
+        },
+        "name_length": {
+          "validation": "greater-than-zero-at-most-boundary-limit"
+        },
+        "usage": {
+          "type": "EzGfxRenderTargetUsage"
+        },
+        "relative_scale": {},
+        "samples": {},
+        "candidate_formats": {
+          "nullable": "false"
+        },
+        "candidate_count": {
+          "validation": "greater-than-zero"
+        },
+        "sampleable": {},
+        "use_clear": {},
+        "clear_color": {
+          "array-length": "4"
+        }
+      }
+    },
+    "struct:EzGfxTextureUploadTelemetry": {
+      "attrs": {},
+      "children": {
+        "decode_microseconds": {},
+        "staging_bytes": {},
+        "queue_latency_microseconds": {},
+        "handoff_latency_microseconds": {}
+      }
+    },
+    "struct:EzGfxBinding": {
+      "attrs": {},
+      "children": {
+        "name": {
+          "type": "const char *",
+          "nullable": "false"
+        },
+        "name_length": {
+          "validation": "greater-than-zero-at-most-boundary-limit"
+        },
+        "buffer": {
+          "type": "EzGfxBuffer"
+        },
+        "counter_buffer": {
+          "type": "EzGfxCounterBuffer"
+        },
+        "render_target": {
+          "type": "EzGfxRenderTarget"
+        }
+      }
+    },
+    "struct:EzGfxDynamicState": {
+      "attrs": {},
+      "children": {
+        "cull_mode": {
+          "type": "EzGfxCullMode"
+        },
+        "front_face": {
+          "type": "EzGfxFrontFace"
+        },
+        "primitive_type": {
+          "type": "EzGfxPrimitiveType"
+        },
+        "blend_mode": {
+          "type": "EzGfxBlendMode"
+        }
+      }
+    },
+    "struct:EzGfxDrawIndexedCommand": {
+      "attrs": {},
+      "children": {
+        "index_count": {},
+        "instance_count": {},
+        "first_index": {},
+        "vertex_offset": {},
+        "first_instance": {}
+      }
+    },
+    "struct:EzGfxByteBuffer": {
+      "attrs": {},
+      "children": {
+        "length": {},
+        "data": {
+          "nullable": "true"
+        }
+      }
+    },
+    "struct:EzGfxRuntimeRecord": {
+      "attrs": {},
+      "children": {
+        "correlation_id": {},
+        "resource": {
+          "type": "uint64_t"
+        },
+        "backend": {
+          "type": "EzGfxBackend"
+        },
+        "phase": {
+          "type": "EzGfxRuntimePhase"
+        },
+        "status": {
+          "type": "EzGfxResult"
+        },
+        "_padding": {
+          "array-length": "5"
+        }
+      }
+    },
+    "struct:EzGfxUploadEvent": {
+      "attrs": {},
+      "children": {
+        "resource": {
+          "type": "uint64_t"
+        },
+        "resource_kind": {
+          "type": "EzGfxUploadResourceKind"
+        },
+        "status": {
+          "type": "EzGfxUploadStatus"
+        },
+        "error": {
+          "type": "EzGfxResult"
+        },
+        "_padding": {
+          "array-length": "5"
+        }
+      }
+    },
+    "struct:EzGfxDiagnostic": {
+      "attrs": {},
+      "children": {
+        "record": {
+          "type": "EzGfxRuntimeRecord"
+        },
+        "level": {
+          "type": "EzGfxDiagnosticLevel"
+        },
+        "_padding": {
+          "array-length": "7"
+        }
+      }
+    },
+    "struct:EzGfxEvent": {
+      "attrs": {},
+      "children": {
+        "kind": {
+          "type": "EzGfxEventKind"
+        },
+        "_pad_kind": {
+          "array-length": "7"
+        },
+        "upload": {
+          "type": "EzGfxUploadEvent"
+        },
+        "record": {
+          "type": "EzGfxRuntimeRecord"
+        },
+        "level": {},
+        "_pad_level": {
+          "array-length": "7"
+        },
+        "dropped": {},
+        "readback_request_id": {
+          "type": "EzGfxReadbackRequest"
+        },
+        "readback_texture": {
+          "type": "EzGfxTexture"
+        },
+        "readback_width": {},
+        "readback_height": {},
+        "readback_byte_count": {},
+        "readback_bytes": {
+          "nullable": "true"
+        }
+      }
+    },
+    "struct:EzGfxHandleParts": {
+      "attrs": {},
+      "children": {
+        "context_slot": {},
+        "context_generation": {},
+        "child_slot": {},
+        "child_generation": {},
+        "is_context": {},
+        "_padding": {
+          "array-length": "3"
+        }
+      }
+    },
+    "function:ez_gfx_abi_version": {
+      "attrs": {
+        "return": "uint32_t",
+        "returns-doc": "ABI version; no context is required."
+      }
+    },
+    "function:ez_gfx_error_print": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns Ok, or InvalidArgument for an invalid pointer/capacity pair or insufficient storage."
+      },
+      "children": {
+        "result": {
+          "type": "EzGfxResult",
+          "doc": "Result byte to describe; unknown values produce 'unknown error'."
+        },
+        "buffer": {
+          "type": "char *",
+          "nullable": "true",
+          "direction": "out",
+          "array-length": "capacity",
+          "doc": "Caller-owned UTF-8 output; null only for a zero-capacity size query."
+        },
+        "capacity": {
+          "doc": "Writable output bytes, or zero for a size query."
+        },
+        "out_required": {
+          "type": "size_t *",
+          "direction": "out",
+          "doc": "Required bytes including the trailing NUL."
+        }
+      }
+    },
+    "function:ez_gfx_context_create": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "managed": "context-create",
+        "returns-doc": "Returns EzGfxResult_Ok or a creation error."
+      },
+      "children": {
+        "desc": {
+          "type": "const EzGfxContextDesc *",
+          "nullable": "false",
+          "direction": "in",
+          "doc": "Context creation options."
+        },
+        "out_context": {
+          "type": "EzGfxContext *",
+          "direction": "out",
+          "doc": "Receives the opaque context handle."
+        }
+      }
+    },
+    "function:ez_gfx_context_create_backend": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "managed": "context-create",
+        "returns-doc": "Returns EzGfxResult_Ok or a validation, admission, or native error."
+      },
+      "children": {
+        "desc": {
+          "type": "const EzGfxBackendContextDesc *",
+          "nullable": "false",
+          "direction": "in",
+          "doc": "Backend context options."
+        },
+        "out_context": {
+          "type": "EzGfxContext *",
+          "direction": "out",
+          "doc": "Receives the opaque context handle."
+        }
+      }
+    },
+    "function:ez_gfx_adapter_count": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns EzGfxResult_Ok or EzGfxResult_InvalidArgument."
+      },
+      "children": {
+        "out_count": {
+          "direction": "out",
+          "doc": "Receives the number of enumerated adapters."
+        }
+      }
+    },
+    "function:ez_gfx_adapter_query": {
+      "attrs": {
+        "return": "EzGfxResult"
+      },
+      "children": {
+        "allow_software": {
+          "doc": "Non-zero admits software-class adapters in the diagnosis; zero or one."
+        },
+        "out_adapters": {
+          "type": "EzGfxAdapterInfo *",
+          "direction": "out",
+          "array-length": "capacity",
+          "doc": "Receives at most capacity entries; null if and only if capacity is zero."
+        },
+        "capacity": {
+          "doc": "Writable entry count of out_adapters; zero queries the total with a null buffer."
+        },
+        "out_written": {
+          "direction": "out",
+          "doc": "Receives entries written, or the total when capacity is zero."
+        }
+      }
+    },
+    "function:ez_gfx_context_wait_idle": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns EzGfxResult_Ok or an invalid-context, not-ready, native-failure, or device-loss result."
+      },
+      "children": {
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_context_destroy": {
+      "attrs": {
+        "return": "void",
+        "returns-doc": "No return value; wait or release failures cannot be reported through the stable ABI."
+      },
+      "children": {
+        "context": {
+          "nullable": "true",
+          "type": "EzGfxContext",
+          "doc": "Context to destroy on its creator thread; zero, stale, repeated, and wrong-thread calls are ignored."
+        }
+      }
+    },
+    "function:ez_gfx_surface_create": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "managed": "surface-create",
+        "returns-doc": "Returns EzGfxResult_Ok or a validation/native error."
+      },
+      "children": {
+        "desc": {
+          "type": "const EzGfxSurfaceDesc *",
+          "nullable": "false",
+          "direction": "in",
+          "doc": "Window and initial extent."
+        },
+        "out_surface": {
+          "type": "EzGfxSurface *",
+          "direction": "out",
+          "doc": "Receives the opaque surface handle."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Context that owns the surface."
+        }
+      }
+    },
+    "function:ez_gfx_context_init_device": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns EzGfxResult_Ok or a native failure."
+      },
+      "children": {
+        "surface": {
+          "type": "EzGfxSurface",
+          "doc": "Surface owned by context."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_surface_resize": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns EzGfxResult_Ok, EzGfxResult_NotReady, or an error."
+      },
+      "children": {
+        "surface": {
+          "type": "EzGfxSurface",
+          "doc": "Surface to resize."
+        },
+        "width": {
+          "doc": "New width; zero is valid only with zero height for minimized state."
+        },
+        "height": {
+          "doc": "New height; zero is valid only with zero width for minimized state."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_shader_load_artifact": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns EzGfxResult_Ok or validation/native failure."
+      },
+      "children": {
+        "data": {
+          "nullable": "false",
+          "direction": "in",
+          "array-length": "data_size",
+          "doc": "Artifact bytes."
+        },
+        "data_size": {
+          "validation": "greater-than-zero",
+          "doc": "Artifact byte count."
+        },
+        "out_shader": {
+          "type": "EzGfxShader *",
+          "direction": "out",
+          "doc": "Receives opaque shader handle."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_shader_destroy": {
+      "attrs": {
+        "return": "void",
+        "returns-doc": "No return value; stale handles are ignored."
+      },
+      "children": {
+        "shader": {
+          "type": "EzGfxShader",
+          "nullable": "false",
+          "doc": "Shader to destroy."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "true",
+          "doc": "Owning context; zero and stale values are ignored."
+        }
+      }
+    },
+    "function:ez_gfx_texture_load": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns queueing, validation, decode, or support status."
+      },
+      "children": {
+        "data": {
+          "nullable": "false",
+          "direction": "in",
+          "array-length": "data_size",
+          "doc": "Encoded or raw image bytes."
+        },
+        "data_size": {
+          "validation": "greater-than-zero",
+          "doc": "Input byte count."
+        },
+        "desc": {
+          "type": "const EzGfxTextureDesc *",
+          "nullable": "false",
+          "direction": "in",
+          "doc": "Texture decode and sampling description."
+        },
+        "out_texture": {
+          "type": "EzGfxTexture *",
+          "direction": "out",
+          "doc": "Receives opaque texture handle."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_texture_decoder_register": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns Ok or InvalidArgument."
+      },
+      "children": {
+        "source_format": {
+          "type": "EzGfxSourceTextureFormat",
+          "doc": "Custom source code."
+        },
+        "callback": {
+          "type": "EzGfxTextureDecoderCallback",
+          "nullable": "false",
+          "doc": "Concurrent decode callback."
+        },
+        "release": {
+          "type": "EzGfxTextureDecoderReleaseCallback",
+          "nullable": "false",
+          "doc": "Successful-output release callback."
+        },
+        "user_data": {
+          "nullable": "true",
+          "doc": "Application state retained through unregister and accepted work."
+        }
+      }
+    },
+    "function:ez_gfx_texture_decoder_unregister": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns Ok or InvalidArgument."
+      },
+      "children": {
+        "source_format": {
+          "type": "EzGfxSourceTextureFormat",
+          "doc": "Custom source code."
+        }
+      }
+    },
+    "function:ez_gfx_texture_cancel": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns Ok when cancellation wins, or InvalidArgument for a terminal or stale request."
+      },
+      "children": {
+        "texture": {
+          "type": "EzGfxTexture",
+          "nullable": "false",
+          "doc": "Texture request handle."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_texture_get_binding": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns EzGfxResult_NotReady while upload remains in flight."
+      },
+      "children": {
+        "texture": {
+          "type": "EzGfxTexture",
+          "nullable": "false",
+          "doc": "Texture handle."
+        },
+        "out_binding": {
+          "direction": "out",
+          "doc": "Receives binding index."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_texture_update_region": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns Ok on admission, QueueFull when scheduling or staging capacity is unavailable, or validation/native status."
+      },
+      "children": {
+        "texture": {
+          "type": "EzGfxTexture",
+          "nullable": "false",
+          "doc": "Resident texture handle."
+        },
+        "desc": {
+          "type": "const EzGfxTextureRegionDesc *",
+          "nullable": "false",
+          "direction": "in",
+          "doc": "Region and borrowed input bytes."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_texture_get_upload_telemetry": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns Ok or context/device status."
+      },
+      "children": {
+        "out_telemetry": {
+          "type": "EzGfxTextureUploadTelemetry *",
+          "nullable": "false",
+          "direction": "out",
+          "doc": "Receives a coherent counter snapshot."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_texture_get_residency": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns EzGfxResult_Ok or a validation or handle status."
+      },
+      "children": {
+        "texture": {
+          "type": "EzGfxTexture",
+          "nullable": "false",
+          "doc": "Texture handle."
+        },
+        "out_resident_mips": {
+          "direction": "out",
+          "doc": "Receives completed mip count, possibly zero while uploads are pending."
+        },
+        "out_total_mips": {
+          "direction": "out",
+          "doc": "Receives immutable decoded mip count."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_texture_set_residency": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns Ok when published, NotReady while uploads or safe descriptor rewrites remain pending, or a validation or handle status."
+      },
+      "children": {
+        "texture": {
+          "type": "EzGfxTexture",
+          "nullable": "false",
+          "doc": "Texture handle."
+        },
+        "resident_mips": {
+          "validation": "greater-than-zero",
+          "doc": "Requested contiguous coarse mip count."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_texture_unload": {
+      "attrs": {
+        "return": "void",
+        "returns-doc": "No return value; null or stale handles are ignored."
+      },
+      "children": {
+        "texture": {
+          "type": "EzGfxTexture",
+          "nullable": "false",
+          "doc": "Texture handle."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "true",
+          "doc": "Owning context; zero and stale values are ignored."
+        }
+      }
+    },
+    "function:ez_gfx_render_target_create": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns Ok, Unsupported for depth/storage/multisample, or validation/native status."
+      },
+      "children": {
+        "desc": {
+          "type": "const EzGfxRenderTargetDesc *",
+          "nullable": "false",
+          "direction": "in",
+          "doc": "Target name, usage, candidates, and clear value."
+        },
+        "width": {
+          "validation": "greater-than-zero",
+          "doc": "Target width in pixels."
+        },
+        "height": {
+          "validation": "greater-than-zero",
+          "doc": "Target height in pixels."
+        },
+        "out_target": {
+          "type": "EzGfxRenderTarget *",
+          "direction": "out",
+          "doc": "Receives the opaque render-target handle."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_render_target_destroy": {
+      "attrs": {
+        "return": "void",
+        "returns-doc": "No return value; null or stale handles are ignored."
+      },
+      "children": {
+        "target": {
+          "type": "EzGfxRenderTarget",
+          "doc": "Render target to destroy."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "true",
+          "doc": "Owning context; zero and stale values are ignored."
+        }
+      }
+    },
+    "function:ez_gfx_render_target_get_format": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns EzGfxResult_Ok or a validation or handle status."
+      },
+      "children": {
+        "target": {
+          "type": "EzGfxRenderTarget",
+          "nullable": "false",
+          "doc": "Render target to query."
+        },
+        "out_format": {
+          "direction": "out",
+          "doc": "Receives the format code from EzGfxRenderTargetFormat."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_render_target_get_extent": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns EzGfxResult_Ok or a validation or handle status."
+      },
+      "children": {
+        "target": {
+          "type": "EzGfxRenderTarget",
+          "nullable": "false",
+          "doc": "Render target to query."
+        },
+        "out_width": {
+          "direction": "out",
+          "doc": "Receives width in pixels."
+        },
+        "out_height": {
+          "direction": "out",
+          "doc": "Receives height in pixels."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_render_target_get_clear": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns EzGfxResult_Ok or a validation or handle status."
+      },
+      "children": {
+        "target": {
+          "type": "EzGfxRenderTarget",
+          "nullable": "false",
+          "doc": "Render target to query."
+        },
+        "out_use_clear": {
+          "direction": "out",
+          "doc": "Receives zero or one."
+        },
+        "out_color": {
+          "direction": "out",
+          "array-length": "4",
+          "doc": "Receives four color components; zeros when no clear is stored."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_render_target_probe_format": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns Ok when resolvable, Unsupported otherwise, or validation status."
+      },
+      "children": {
+        "format": {
+          "doc": "Format code from EzGfxRenderTargetFormat."
+        },
+        "samples": {
+          "doc": "Requested multisample count; one of 1, 2, 4, or 8."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_render_target_frame_begin": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns state, handle, or capability status."
+      },
+      "children": {
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        },
+        "target": {
+          "type": "EzGfxRenderTarget",
+          "nullable": "false",
+          "doc": "Render target to render into."
+        },
+        "out_frame": {
+          "type": "EzGfxFrame *",
+          "direction": "out",
+          "doc": "Receives the live frame handle."
+        }
+      }
+    },
+    "function:ez_gfx_frame_begin": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns readiness or handle status."
+      },
+      "children": {
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        },
+        "surface": {
+          "type": "EzGfxSurface",
+          "nullable": "false",
+          "doc": "Surface to acquire."
+        },
+        "out_frame": {
+          "type": "EzGfxFrame *",
+          "direction": "out",
+          "doc": "Receives the live frame handle."
+        }
+      }
+    },
+    "function:ez_gfx_counter_buffer_acquire": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns validation or allocation status."
+      },
+      "children": {
+        "element_size": {
+          "validation": "greater-than-zero",
+          "doc": "Element stride in bytes."
+        },
+        "element_count": {
+          "validation": "greater-than-zero",
+          "doc": "Allocated element count."
+        },
+        "debug_name": {
+          "type": "const char *",
+          "nullable": "false",
+          "direction": "in",
+          "array-length": "debug_name_length",
+          "doc": "Exact UTF-8 debug-name bytes."
+        },
+        "debug_name_length": {
+          "validation": "greater-than-zero-at-most-boundary-limit",
+          "doc": "Debug-name byte length."
+        },
+        "out_buffer": {
+          "type": "EzGfxCounterBuffer *",
+          "direction": "out",
+          "doc": "Receives the owning handle."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_counter_buffer_write_draws": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns ownership, overflow, or bounds status."
+      },
+      "children": {
+        "buffer": {
+          "type": "EzGfxCounterBuffer",
+          "nullable": "false",
+          "doc": "Unconsumed counter buffer."
+        },
+        "start_index": {
+          "doc": "First command slot."
+        },
+        "commands": {
+          "type": "const EzGfxDrawIndexedCommand *",
+          "nullable": "true",
+          "direction": "in",
+          "array-length": "command_count",
+          "doc": "Contiguous command data; null only when count is zero."
+        },
+        "command_count": {
+          "validation": "at-most-boundary-limit",
+          "doc": "Number of commands."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_counter_buffer_publish_count": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns ownership or bounds status."
+      },
+      "children": {
+        "buffer": {
+          "type": "EzGfxCounterBuffer",
+          "nullable": "false",
+          "doc": "Unconsumed counter buffer."
+        },
+        "count": {
+          "doc": "Known generated-command count."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_counter_buffer_release": {
+      "attrs": {
+        "return": "void",
+        "returns-doc": "No return value; stale and zero handles are ignored."
+      },
+      "children": {
+        "buffer": {
+          "type": "EzGfxCounterBuffer",
+          "nullable": "true",
+          "doc": "Counter buffer; zero and stale values are ignored."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "true",
+          "doc": "Owning context; zero and stale values are ignored."
+        }
+      }
+    },
+    "function:ez_gfx_frame_add_vertex_pipeline": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns validation or native status."
+      },
+      "children": {
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        },
+        "shader": {
+          "type": "EzGfxShader",
+          "nullable": "false",
+          "doc": "Graphics shader."
+        },
+        "buffer": {
+          "type": "EzGfxCounterBuffer",
+          "nullable": "false",
+          "doc": "Counter buffer consumed by this frame for indirect commands."
+        },
+        "bindings": {
+          "type": "const EzGfxBinding *",
+          "nullable": "true",
+          "direction": "in",
+          "array-length": "binding_count",
+          "doc": "Resource bindings."
+        },
+        "binding_count": {
+          "doc": "Binding count."
+        },
+        "dynamic_state": {
+          "type": "const EzGfxDynamicState *",
+          "nullable": "true",
+          "direction": "in",
+          "doc": "Optional state."
+        },
+        "push_constants": {
+          "nullable": "true",
+          "direction": "in",
+          "array-length": "push_constant_size",
+          "doc": "Push bytes."
+        },
+        "push_constant_size": {
+          "doc": "Push byte count."
+        },
+        "frame": {
+          "type": "EzGfxFrame",
+          "nullable": "false",
+          "doc": "Live owning frame."
+        }
+      }
+    },
+    "function:ez_gfx_frame_add_compute_pipeline": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns validation or native status."
+      },
+      "children": {
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        },
+        "shader": {
+          "type": "EzGfxShader",
+          "nullable": "false",
+          "doc": "Compute shader."
+        },
+        "dispatch_x": {
+          "doc": "X groups."
+        },
+        "dispatch_y": {
+          "doc": "Y groups."
+        },
+        "dispatch_z": {
+          "doc": "Z groups."
+        },
+        "bindings": {
+          "type": "const EzGfxBinding *",
+          "nullable": "true",
+          "direction": "in",
+          "array-length": "binding_count",
+          "doc": "Resource bindings."
+        },
+        "binding_count": {
+          "doc": "Binding count."
+        },
+        "push_constants": {
+          "nullable": "true",
+          "direction": "in",
+          "array-length": "push_constant_size",
+          "doc": "Push bytes."
+        },
+        "push_constant_size": {
+          "doc": "Push byte count."
+        },
+        "frame": {
+          "type": "EzGfxFrame",
+          "nullable": "false",
+          "doc": "Live owning frame."
+        }
+      }
+    },
+    "function:ez_gfx_frame_enqueue_texture_readback": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns frame, handle, or output-pointer status."
+      },
+      "children": {
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        },
+        "texture": {
+          "type": "EzGfxTexture",
+          "nullable": "false",
+          "doc": "Texture to read back."
+        },
+        "frame": {
+          "type": "EzGfxFrame",
+          "nullable": "false",
+          "doc": "Live owning frame."
+        },
+        "out_request_id": {
+          "type": "EzGfxReadbackRequest *",
+          "direction": "out",
+          "doc": "Receives the stable request correlator."
+        }
+      }
+    },
+    "function:ez_gfx_frame_end": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns submission or presentation status; every result invalidates the handle."
+      },
+      "children": {
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        },
+        "frame": {
+          "type": "EzGfxFrame",
+          "nullable": "false",
+          "doc": "Live frame to consume."
+        }
+      }
+    },
+    "function:ez_gfx_frame_abort": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns abort status; every result invalidates the handle."
+      },
+      "children": {
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        },
+        "frame": {
+          "type": "EzGfxFrame",
+          "nullable": "false",
+          "doc": "Live frame to abort."
+        }
+      }
+    },
+    "function:ez_gfx_context_register_callback": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns context, callback, or dispatch status."
+      },
+      "children": {
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        },
+        "callback": {
+          "type": "EzGfxEventCallback",
+          "nullable": "true",
+          "doc": "Callback to install; null clears the registration."
+        },
+        "user_data": {
+          "nullable": "true",
+          "doc": "Application state borrowed only during callback invocation."
+        }
+      }
+    },
+    "function:ez_gfx_surface_get_extent": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns EzGfxResult_NotReady while minimized."
+      },
+      "children": {
+        "surface": {
+          "type": "EzGfxSurface",
+          "doc": "Surface to query."
+        },
+        "out_width": {
+          "direction": "out",
+          "doc": "Receives width."
+        },
+        "out_height": {
+          "direction": "out",
+          "doc": "Receives height."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_surface_resize_pending": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns EzGfxResult_Ok or an error."
+      },
+      "children": {
+        "surface": {
+          "type": "EzGfxSurface",
+          "doc": "Surface to query."
+        },
+        "out_pending": {
+          "direction": "out",
+          "doc": "Receives 0 or 1."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_surface_set_snapshot_cache": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns EzGfxResult_Ok or a validation error."
+      },
+      "children": {
+        "surface": {
+          "type": "EzGfxSurface",
+          "doc": "Surface to configure."
+        },
+        "enabled": {
+          "validation": "zero-or-one",
+          "doc": "Must be zero or one."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_vertex_heap_create": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns validation, allocation, or native status."
+      },
+      "children": {
+        "name": {
+          "type": "const char *",
+          "nullable": "false",
+          "direction": "in",
+          "array-length": "name_length",
+          "doc": "Exact UTF-8 heap-name bytes."
+        },
+        "name_length": {
+          "validation": "greater-than-zero-at-most-boundary-limit",
+          "doc": "Heap-name byte length."
+        },
+        "stride": {
+          "validation": "greater-than-zero",
+          "doc": "Vertex stride."
+        },
+        "out_heap": {
+          "type": "EzGfxVertexHeap *",
+          "direction": "out",
+          "doc": "Receives the heap handle."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning initialized context."
+        }
+      }
+    },
+    "function:ez_gfx_vertex_heap_destroy": {
+      "attrs": {
+        "return": "void",
+        "returns-doc": "Stale and foreign handles are ignored."
+      },
+      "children": {
+        "heap": {
+          "type": "EzGfxVertexHeap",
+          "nullable": "false",
+          "doc": "Vertex heap to destroy."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "true",
+          "doc": "Owning context; zero and stale values are ignored."
+        }
+      }
+    },
+    "function:ez_gfx_index_allocation_create": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns upload or validation status."
+      },
+      "children": {
+        "data": {
+          "nullable": "false",
+          "direction": "in",
+          "array-length": "count",
+          "array-byte-size": "4",
+          "doc": "Packed uint32 index values."
+        },
+        "count": {
+          "validation": "greater-than-zero",
+          "doc": "Index count."
+        },
+        "out_allocation": {
+          "type": "EzGfxIndexAllocation *",
+          "direction": "out",
+          "doc": "Receives the allocation handle."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_vertex_heap_upload": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns upload, ownership, or validation status."
+      },
+      "children": {
+        "heap": {
+          "type": "EzGfxVertexHeap",
+          "nullable": "false",
+          "doc": "Owning vertex heap."
+        },
+        "data": {
+          "nullable": "false",
+          "direction": "in",
+          "array-length": "element_count",
+          "array-byte-size": "element_size",
+          "doc": "Vertex bytes."
+        },
+        "element_count": {
+          "validation": "greater-than-zero",
+          "doc": "Vertex count."
+        },
+        "element_size": {
+          "validation": "greater-than-zero",
+          "doc": "Must equal heap stride."
+        },
+        "out_allocation": {
+          "type": "EzGfxVertexAllocation *",
+          "direction": "out",
+          "doc": "Receives the allocation handle."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_vertex_allocation_get_range": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns validation or ownership status."
+      },
+      "children": {
+        "allocation": {
+          "type": "EzGfxVertexAllocation",
+          "doc": "Vertex allocation."
+        },
+        "out_first": {
+          "direction": "out",
+          "doc": "Receives first vertex."
+        },
+        "out_count": {
+          "direction": "out",
+          "doc": "Receives vertex count."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_index_allocation_get_range": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns validation or ownership status."
+      },
+      "children": {
+        "allocation": {
+          "type": "EzGfxIndexAllocation",
+          "doc": "Index allocation."
+        },
+        "out_first": {
+          "direction": "out",
+          "doc": "Receives first index."
+        },
+        "out_count": {
+          "direction": "out",
+          "doc": "Receives index count."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_vertex_allocation_remove": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns validation or ownership status."
+      },
+      "children": {
+        "allocation": {
+          "type": "EzGfxVertexAllocation",
+          "doc": "Vertex allocation."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_index_allocation_remove": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns validation or ownership status."
+      },
+      "children": {
+        "allocation": {
+          "type": "EzGfxIndexAllocation",
+          "doc": "Index allocation."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_buffer_acquire": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "managed": "utf8-string",
+        "returns-doc": "Returns validation or allocation status."
+      },
+      "children": {
+        "element_size": {
+          "validation": "greater-than-zero",
+          "doc": "Element stride in bytes."
+        },
+        "element_count": {
+          "validation": "greater-than-zero",
+          "doc": "Allocated element count."
+        },
+        "debug_name": {
+          "type": "const char *",
+          "nullable": "false",
+          "direction": "in",
+          "array-length": "debug_name_length",
+          "doc": "Exact UTF-8 debug-name bytes."
+        },
+        "debug_name_length": {
+          "validation": "greater-than-zero-at-most-boundary-limit",
+          "doc": "Debug-name byte length."
+        },
+        "out_buffer": {
+          "type": "EzGfxBuffer *",
+          "direction": "out",
+          "doc": "Receives the owning handle."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_buffer_write": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "managed": "structured-write",
+        "returns-doc": "Returns validation, ownership, or range status."
+      },
+      "children": {
+        "buffer": {
+          "type": "EzGfxBuffer",
+          "doc": "Unconsumed buffer handle."
+        },
+        "start_index": {
+          "doc": "First destination element."
+        },
+        "data": {
+          "nullable": "true",
+          "direction": "in",
+          "array-length": "element_count",
+          "array-byte-size": "element_size",
+          "doc": "Element bytes; null only when count is zero."
+        },
+        "element_count": {
+          "doc": "Number of elements to copy."
+        },
+        "element_size": {
+          "validation": "greater-than-zero",
+          "doc": "Must equal the acquired stride."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_buffer_release": {
+      "attrs": {
+        "return": "void",
+        "returns-doc": "Stale handles are ignored."
+      },
+      "children": {
+        "buffer": {
+          "type": "EzGfxBuffer",
+          "doc": "Buffer handle; zero and stale values are ignored."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "true",
+          "doc": "Owning context; zero and stale values are ignored."
+        }
+      }
+    },
+    "function:ez_gfx_surface_destroy": {
+      "attrs": {
+        "return": "void",
+        "returns-doc": "No return value; null handles are ignored."
+      },
+      "children": {
+        "surface": {
+          "type": "EzGfxSurface",
+          "doc": "Surface to destroy."
+        },
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "true",
+          "doc": "Owning context; zero and stale values are ignored."
+        }
+      }
+    },
+    "function:ez_gfx_handle_inspect": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns EzGfxResult_Ok or a handle validation error."
+      },
+      "children": {
+        "handle": {
+          "nullable": "false",
+          "doc": "Packed handle to decode."
+        },
+        "out_parts": {
+          "type": "EzGfxHandleParts *",
+          "direction": "out",
+          "doc": "Receives context and optional child slot generations."
+        }
+      }
+    },
+    "function:ez_gfx_semantic_id": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns EzGfxResult_Ok or EzGfxResult_InvalidArgument."
+      },
+      "children": {
+        "name": {
+          "nullable": "false",
+          "direction": "in",
+          "array-length": "length",
+          "doc": "Exact ASCII dot-separated name bytes; each non-empty segment starts with a letter and continues with letters, digits, or underscores; embedded NUL is invalid."
+        },
+        "length": {
+          "validation": "canonical-semantic-name-1-to-255-bytes",
+          "doc": "Name byte count in the inclusive range 1..255."
+        },
+        "out_id": {
+          "direction": "out",
+          "array-length": "16",
+          "doc": "Receives exactly 16 identifier bytes."
+        }
+      }
+    }
+  }
+}

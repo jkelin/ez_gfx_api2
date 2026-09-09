@@ -84,7 +84,7 @@ pub unsafe extern "C" fn ez_gfx_adapter_count(out_count: *mut u32) -> EzGfxResul
 /// A non-null `out_adapters` must address `capacity` writable, aligned
 /// entries, and a non-null `out_written` one writable, aligned `u32`, for
 /// this call.
-pub unsafe extern "C" fn ez_gfx_adapters_query(
+pub unsafe extern "C" fn ez_gfx_adapter_query(
     allow_software: u8,
     out_adapters: *mut EzGfxAdapterInfo,
     capacity: u32,

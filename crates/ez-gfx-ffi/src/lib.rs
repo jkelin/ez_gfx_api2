@@ -10,15 +10,19 @@ macro_rules! try_handle {
     };
 }
 macro_rules! try_frame {
-    ($raw:expr) => {
-        match crate::frame::get($raw) {
-            Ok(entry) => entry.owner,
+    ($context:expr, $frame:expr) => {{
+        let context = try_handle!(ez_gfx::raw::ContextHandle, $context);
+        match crate::frame::get($frame) {
+            Ok(entry) if entry.owner == context => context,
+            Ok(_) => return EzGfxResult::InvalidContext,
             Err(status) => return status,
         }
-    };
+    }};
 }
 mod adapter;
 mod api;
+#[doc(hidden)]
+pub mod binding_enums;
 mod bounded_string;
 mod buffer;
 mod callback;
@@ -50,8 +54,8 @@ use ez_gfx::{
     Backend, ContextOptions, DrawIndexedCommand, DynamicPipelineState, SurfaceOptions,
     SurfacePlatform, raw,
 };
-/// Identifies C ABI revision 33 for compatibility checks.
-pub const EZ_GFX_ABI_VERSION: u32 = 33;
+/// Identifies C ABI revision 34 for compatibility checks.
+pub const EZ_GFX_ABI_VERSION: u32 = 34;
 /// Caps any caller-provided byte range at 16 MiB.
 pub const EZ_GFX_MAX_BOUNDARY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -190,7 +194,7 @@ pub extern "C" fn ez_gfx_context_destroy(context: EzGfxContext) {
 ///
 /// `user_data` must remain valid until the callback is replaced, cleared, or
 /// its context is destroyed.
-pub unsafe extern "C" fn ez_gfx_callback_register(
+pub unsafe extern "C" fn ez_gfx_context_register_callback(
     context: EzGfxContext,
     callback: EzGfxEventCallback,
     user_data: *mut core::ffi::c_void,
@@ -212,10 +216,10 @@ pub unsafe extern "C" fn ez_gfx_callback_register(
 /// Non-null `data` must be readable for `data_size` bytes, and non-null
 /// `out_shader` must be writable for one aligned handle.
 pub unsafe extern "C" fn ez_gfx_shader_load_artifact(
+    context: EzGfxContext,
     data: *const u8,
     data_size: usize,
     out_shader: *mut EzGfxShader,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         if data.is_null()
@@ -241,7 +245,7 @@ pub unsafe extern "C" fn ez_gfx_shader_load_artifact(
 
 #[unsafe(no_mangle)]
 /// Destroys a shader previously loaded into the context.
-pub extern "C" fn ez_gfx_shader_destroy(shader: EzGfxShader, context: EzGfxContext) {
+pub extern "C" fn ez_gfx_shader_destroy(context: EzGfxContext, shader: EzGfxShader) {
     catch_void(|| {
         if let (Ok(context), Ok(shader)) = (
             ContextHandle::from_raw(context),
@@ -307,18 +311,18 @@ pub unsafe extern "C" fn ez_gfx_frame_begin(
 ///
 /// The name and output pointer must cover their documented readable/writable ranges.
 pub unsafe extern "C" fn ez_gfx_counter_buffer_acquire(
+    context: EzGfxContext,
     element_size: u32,
     element_count: u32,
     debug_name: *const u8,
     debug_name_length: usize,
-    out_indirect: *mut EzGfxCounterBuffer,
-    context: EzGfxContext,
+    out_buffer: *mut EzGfxCounterBuffer,
 ) -> EzGfxResult {
     catch_status(|| {
         if element_size == 0
             || element_count == 0
-            || out_indirect.is_null()
-            || !out_indirect.is_aligned()
+            || out_buffer.is_null()
+            || !out_buffer.is_aligned()
             || validate_bounded_string(debug_name, debug_name_length).is_err()
         {
             return EzGfxResult::InvalidArgument;
@@ -327,7 +331,7 @@ pub unsafe extern "C" fn ez_gfx_counter_buffer_acquire(
         match buffer::insert(context, buffer::Kind::Counter, element_size, element_count) {
             Ok(handle) => {
                 // SAFETY: the validated output remains writable and aligned for this call.
-                unsafe { out_indirect.write(handle) };
+                unsafe { out_buffer.write(handle) };
                 EzGfxResult::Ok
             }
             Err(status) => status,
@@ -343,11 +347,11 @@ pub unsafe extern "C" fn ez_gfx_counter_buffer_acquire(
 /// `commands` must cover `command_count` readable commands, or may be null when
 /// `command_count` is zero.
 pub unsafe extern "C" fn ez_gfx_counter_buffer_write_draws(
-    indirect: EzGfxCounterBuffer,
+    context: EzGfxContext,
+    buffer: EzGfxCounterBuffer,
     start_index: u32,
     commands: *const EzGfxDrawIndexedCommand,
     command_count: u32,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         let byte_size = match usize::try_from(command_count)
@@ -371,7 +375,7 @@ pub unsafe extern "C" fn ez_gfx_counter_buffer_write_draws(
             return EzGfxResult::InvalidArgument;
         };
         buffer::write(
-            indirect,
+            buffer,
             context,
             buffer::Kind::Counter,
             start_index,
@@ -385,25 +389,22 @@ pub unsafe extern "C" fn ez_gfx_counter_buffer_write_draws(
 #[unsafe(no_mangle)]
 /// Publishes a CPU-known count for compute-generated indirect commands.
 pub extern "C" fn ez_gfx_counter_buffer_publish_count(
-    indirect: EzGfxCounterBuffer,
-    count: u32,
     context: EzGfxContext,
+    buffer: EzGfxCounterBuffer,
+    count: u32,
 ) -> EzGfxResult {
     catch_status(|| {
         let context = try_handle!(ContextHandle, context);
-        buffer::publish(indirect, context, count).map_or_else(|status| status, |()| EzGfxResult::Ok)
+        buffer::publish(buffer, context, count).map_or_else(|status| status, |()| EzGfxResult::Ok)
     })
 }
 
 #[unsafe(no_mangle)]
 /// Releases an unconsumed counter buffer.
-pub extern "C" fn ez_gfx_counter_buffer_release(
-    indirect: EzGfxCounterBuffer,
-    context: EzGfxContext,
-) {
+pub extern "C" fn ez_gfx_counter_buffer_release(context: EzGfxContext, buffer: EzGfxCounterBuffer) {
     catch_void(|| {
         if let Ok(context) = ContextHandle::from_raw(context) {
-            let _ = buffer::remove(indirect, context, buffer::Kind::Counter);
+            let _ = buffer::remove(buffer, context, buffer::Kind::Counter);
         }
     });
 }
@@ -414,15 +415,16 @@ pub extern "C" fn ez_gfx_counter_buffer_release(
 /// # Safety
 ///
 /// Non-null `bindings` must be readable for `binding_count` aligned entries; every binding name must be a non-null, non-empty exact UTF-8 byte range without embedded NUL bytes. Non-null `dynamic_state` must address one readable aligned value, and non-null `push_constants` must be readable for `push_constant_size` bytes.
-pub unsafe extern "C" fn ez_gfx_render_add_vertex_pipeline(
+pub unsafe extern "C" fn ez_gfx_frame_add_vertex_pipeline(
+    context: EzGfxContext,
+    frame: EzGfxFrame,
     shader: EzGfxShader,
-    indirect: EzGfxCounterBuffer,
+    buffer: EzGfxCounterBuffer,
     bindings: *const EzGfxBinding,
     binding_count: u32,
     dynamic_state: *const EzGfxDynamicState,
     push_constants: *const std::ffi::c_void,
     push_constant_size: u32,
-    frame: EzGfxFrame,
 ) -> EzGfxResult {
     catch_status(|| {
         if binding_count > 16
@@ -461,20 +463,20 @@ pub unsafe extern "C" fn ez_gfx_render_add_vertex_pipeline(
                 )
             }
         };
-        if let Err(status) = buffer::validate(frame, indirect, buffer::Kind::Counter) {
+        if let Err(status) = buffer::validate(frame, buffer, buffer::Kind::Counter) {
             return status;
         }
         let bindings = match validate_bindings(frame, bindings, binding_count) {
             Ok(value) => value,
             Err(status) => return status,
         };
-        let context = try_frame!(frame);
+        let context = try_frame!(context, frame);
         let shader = try_handle!(ShaderHandle, shader);
         let bindings = match materialize_bindings(frame, bindings) {
             Ok(value) => value,
             Err(status) => return status,
         };
-        let indirect = match buffer::materialize(frame, indirect, buffer::Kind::Counter) {
+        let indirect = match buffer::materialize(frame, buffer, buffer::Kind::Counter) {
             Ok(ResourceIdentity::Indirect(handle)) => handle,
             Ok(_) => return EzGfxResult::InvalidContext,
             Err(status) => return status,
@@ -490,7 +492,9 @@ pub unsafe extern "C" fn ez_gfx_render_add_vertex_pipeline(
 /// # Safety
 ///
 /// Non-null `bindings` must be readable for `binding_count` aligned entries; every binding name must be a non-null, non-empty exact UTF-8 byte range without embedded NUL bytes. Non-null `push_constants` must be readable for `push_constant_size` bytes.
-pub unsafe extern "C" fn ez_gfx_render_add_compute_pipeline(
+pub unsafe extern "C" fn ez_gfx_frame_add_compute_pipeline(
+    context: EzGfxContext,
+    frame: EzGfxFrame,
     shader: EzGfxShader,
     dispatch_x: u32,
     dispatch_y: u32,
@@ -499,7 +503,6 @@ pub unsafe extern "C" fn ez_gfx_render_add_compute_pipeline(
     binding_count: u32,
     push_constants: *const std::ffi::c_void,
     push_constant_size: u32,
-    frame: EzGfxFrame,
 ) -> EzGfxResult {
     catch_status(|| {
         if binding_count > 16
@@ -525,7 +528,7 @@ pub unsafe extern "C" fn ez_gfx_render_add_compute_pipeline(
             Ok(value) => value,
             Err(status) => return status,
         };
-        let context = try_frame!(frame);
+        let context = try_frame!(context, frame);
         let shader = try_handle!(ShaderHandle, shader);
         let bindings = match materialize_bindings(frame, bindings) {
             Ok(value) => value,
@@ -548,16 +551,17 @@ pub unsafe extern "C" fn ez_gfx_render_add_compute_pipeline(
 /// # Safety
 ///
 /// `out_request_id` must address one writable, aligned `u64`.
-pub unsafe extern "C" fn ez_gfx_graph_enqueue_texture_readback(
-    texture: EzGfxTexture,
+pub unsafe extern "C" fn ez_gfx_frame_enqueue_texture_readback(
+    context: EzGfxContext,
     frame: EzGfxFrame,
+    texture: EzGfxTexture,
     out_request_id: *mut u64,
 ) -> EzGfxResult {
     catch_status(|| {
         if out_request_id.is_null() || !out_request_id.is_aligned() {
             return EzGfxResult::InvalidArgument;
         }
-        let context = try_frame!(frame);
+        let context = try_frame!(context, frame);
         let texture_handle = try_handle!(TextureHandle, texture);
         let (width, height) = match raw::texture_extent(context, texture_handle) {
             Ok(extent) => extent,
@@ -587,12 +591,9 @@ pub unsafe extern "C" fn ez_gfx_graph_enqueue_texture_readback(
 /// Queued upload, runtime, and diagnostic events dispatch before ordered
 /// requested readbacks. Persistent presentation captures are trailing
 /// `Snapshot` events with request ID zero.
-pub extern "C" fn ez_gfx_frame_end(frame: EzGfxFrame) -> EzGfxResult {
+pub extern "C" fn ez_gfx_frame_end(context: EzGfxContext, frame: EzGfxFrame) -> EzGfxResult {
     catch_frame_terminal(frame, || {
-        let owner = match frame::get(frame) {
-            Ok(entry) => entry.owner,
-            Err(status) => return status,
-        };
+        let owner = try_frame!(context, frame);
         if let Err(status) = callback::check_entry(owner) {
             let _ = frame::remove(frame, frame::FrameState::Aborted);
             callback::take_frame(frame);
@@ -698,12 +699,9 @@ fn readback_extent(entry: &frame::FrameEntry, aux: Option<&callback::FrameAux>) 
 
 #[unsafe(no_mangle)]
 /// Consumes a frame without submitting; every result invalidates the handle.
-pub extern "C" fn ez_gfx_frame_abort(frame: EzGfxFrame) -> EzGfxResult {
+pub extern "C" fn ez_gfx_frame_abort(context: EzGfxContext, frame: EzGfxFrame) -> EzGfxResult {
     catch_frame_terminal(frame, || {
-        let owner = match frame::get(frame) {
-            Ok(entry) => entry.owner,
-            Err(status) => return status,
-        };
+        let owner = try_frame!(context, frame);
         if let Err(status) = callback::check_entry(owner) {
             let _ = frame::remove(frame, frame::FrameState::Aborted);
             callback::take_frame(frame);
@@ -728,9 +726,9 @@ pub extern "C" fn ez_gfx_frame_abort(frame: EzGfxFrame) -> EzGfxResult {
 ///
 /// A non-null `desc` must address one readable, aligned descriptor and non-null `out_surface` one writable, aligned handle. The descriptor's non-null platform objects must remain valid until the returned surface is destroyed.
 pub unsafe extern "C" fn ez_gfx_surface_create(
+    context: EzGfxContext,
     desc: *const EzGfxSurfaceDesc,
     out_surface: *mut EzGfxSurface,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         if desc.is_null() || out_surface.is_null() {
@@ -770,8 +768,8 @@ pub unsafe extern "C" fn ez_gfx_surface_create(
 #[unsafe(no_mangle)]
 /// Initializes the context device for the specified presentation surface.
 pub extern "C" fn ez_gfx_context_init_device(
-    surface: EzGfxSurface,
     context: EzGfxContext,
+    surface: EzGfxSurface,
 ) -> EzGfxResult {
     catch_status(|| {
         raw::init_device(
@@ -784,10 +782,10 @@ pub extern "C" fn ez_gfx_context_init_device(
 #[unsafe(no_mangle)]
 /// Requests new pixel dimensions for a presentation surface.
 pub extern "C" fn ez_gfx_surface_resize(
+    context: EzGfxContext,
     surface: EzGfxSurface,
     width: u32,
     height: u32,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         raw::resize_surface(
@@ -807,10 +805,10 @@ pub extern "C" fn ez_gfx_surface_resize(
 ///
 /// Each non-null output pointer must address one writable, aligned `u32` for this call.
 pub unsafe extern "C" fn ez_gfx_surface_get_extent(
+    context: EzGfxContext,
     surface: EzGfxSurface,
     out_width: *mut u32,
     out_height: *mut u32,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         if out_width.is_null() || out_height.is_null() {
@@ -839,9 +837,9 @@ pub unsafe extern "C" fn ez_gfx_surface_get_extent(
 ///
 /// A non-null `out_pending` must address one writable, aligned `i32` for this call.
 pub unsafe extern "C" fn ez_gfx_surface_resize_pending(
+    context: EzGfxContext,
     surface: EzGfxSurface,
     out_pending: *mut i32,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         if out_pending.is_null() {
@@ -865,9 +863,9 @@ pub unsafe extern "C" fn ez_gfx_surface_resize_pending(
 #[unsafe(no_mangle)]
 /// Enables or disables caching of presented snapshots for a surface.
 pub extern "C" fn ez_gfx_surface_set_snapshot_cache(
+    context: EzGfxContext,
     surface: EzGfxSurface,
     enabled: i32,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         let context = try_handle!(ContextHandle, context);
@@ -882,7 +880,7 @@ pub extern "C" fn ez_gfx_surface_set_snapshot_cache(
 
 #[unsafe(no_mangle)]
 /// Destroys a presentation surface owned by the context.
-pub extern "C" fn ez_gfx_surface_destroy(surface: EzGfxSurface, context: EzGfxContext) {
+pub extern "C" fn ez_gfx_surface_destroy(context: EzGfxContext, surface: EzGfxSurface) {
     catch_void(|| {
         if let (Ok(context), Ok(surface)) = (
             ContextHandle::from_raw(context),

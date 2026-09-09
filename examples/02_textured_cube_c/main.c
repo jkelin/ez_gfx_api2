@@ -9,8 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if EZ_GFX_ABI_VERSION != 33u
-#error "textured_cube requires ez-gfx ABI v33"
+#if EZ_GFX_ABI_VERSION != 34u
+#error "textured_cube requires ez-gfx ABI v34"
 #endif
 
 #define WIDTH 640u
@@ -73,7 +73,7 @@ static int checked(EzGfxResult result, const char *operation) {
     size_t required = 0;
 
     if (result == EzGfxResult_Ok) return 1;
-    if (ez_gfx_print_error(result, message, sizeof(message), &required) != EzGfxResult_Ok) {
+    if (ez_gfx_error_print(result, message, sizeof(message), &required) != EzGfxResult_Ok) {
         snprintf(message, sizeof(message), "unknown error");
     }
     fprintf(stderr, "%s: %s (%u)\n", operation, message, (unsigned)result);
@@ -337,21 +337,21 @@ int main(int argc, char **argv) {
 
     context_desc = (EzGfxBackendContextDesc){0, 0, EzGfxSurfacePlatform_Win32, options.backend, 0};
     if (!checked(ez_gfx_context_create_backend(&context_desc, &context), "create context")) goto cleanup;
-    if (!checked(ez_gfx_callback_register(context, observe, &observations), "register callback")) goto cleanup;
+    if (!checked(ez_gfx_context_register_callback(context, observe, &observations), "register callback")) goto cleanup;
     surface_desc = (EzGfxSurfaceDesc){window, instance, EzGfxSurfacePlatform_Win32,
         WIDTH, HEIGHT, options.snapshot_path != NULL};
-    if (!checked(ez_gfx_surface_create(&surface_desc, &surface, context), "create surface")) goto cleanup;
-    if (!checked(ez_gfx_context_init_device(surface, context), "initialize surface device")) goto cleanup;
-    if (!checked(ez_gfx_surface_resize(surface, WIDTH, HEIGHT, context), "resize surface")) goto cleanup;
-    if (!checked(ez_gfx_vertex_upload_indices(INDICES, 36, &indices, context), "upload indices")) goto cleanup;
-    if (!checked(ez_gfx_index_allocation_get_range(indices, &first_index, &index_count, context), "query index allocation")) goto cleanup;
-    if (!checked(ez_gfx_vertex_heap_create("positions", sizeof("positions") - 1, sizeof(Vec4), &positions_heap, context), "create positions heap")) goto cleanup;
-    if (!checked(ez_gfx_vertex_upload(positions_heap, POSITIONS, 24, sizeof(Vec4), &positions, context), "upload positions")) goto cleanup;
-    if (!checked(ez_gfx_vertex_heap_create("normals", sizeof("normals") - 1, sizeof(Vec4), &normals_heap, context), "create normals heap")) goto cleanup;
-    if (!checked(ez_gfx_vertex_upload(normals_heap, NORMALS, 24, sizeof(Vec4), &normals, context), "upload normals")) goto cleanup;
+    if (!checked(ez_gfx_surface_create(context, &surface_desc, &surface), "create surface")) goto cleanup;
+    if (!checked(ez_gfx_context_init_device(context, surface), "initialize surface device")) goto cleanup;
+    if (!checked(ez_gfx_surface_resize(context, surface, WIDTH, HEIGHT), "resize surface")) goto cleanup;
+    if (!checked(ez_gfx_index_allocation_create(context, INDICES, 36, &indices), "upload indices")) goto cleanup;
+    if (!checked(ez_gfx_index_allocation_get_range(context, indices, &first_index, &index_count), "query index allocation")) goto cleanup;
+    if (!checked(ez_gfx_vertex_heap_create(context, "positions", sizeof("positions") - 1, sizeof(Vec4), &positions_heap), "create positions heap")) goto cleanup;
+    if (!checked(ez_gfx_vertex_heap_upload(context, positions_heap, POSITIONS, 24, sizeof(Vec4), &positions), "upload positions")) goto cleanup;
+    if (!checked(ez_gfx_vertex_heap_create(context, "normals", sizeof("normals") - 1, sizeof(Vec4), &normals_heap), "create normals heap")) goto cleanup;
+    if (!checked(ez_gfx_vertex_heap_upload(context, normals_heap, NORMALS, 24, sizeof(Vec4), &normals), "upload normals")) goto cleanup;
 
     primitive = (Primitive){first_index, index_count, 0, 0};
-    if (!checked(ez_gfx_shader_load_artifact(artifact, artifact_size, &shader, context), "load shader artifact")) goto cleanup;
+    if (!checked(ez_gfx_shader_load_artifact(context, artifact, artifact_size, &shader), "load shader artifact")) goto cleanup;
 
     dynamic_state = (EzGfxDynamicState){EzGfxCullMode_None, EzGfxFrontFace_CounterClockwise,
         EzGfxPrimitiveType_TriangleList, EzGfxBlendMode_None};
@@ -364,37 +364,35 @@ int main(int argc, char **argv) {
         }
         if (!g_running) break;
         /* Buffers are one-frame values: the first bound frame consumes them. */
-        if (!checked(ez_gfx_buffer_acquire(sizeof(Primitive), 1, "primitives", sizeof("primitives") - 1, &primitives, context), "acquire primitives")) goto cleanup;
-        if (!checked(ez_gfx_buffer_write(primitives, 0, &primitive, 1, sizeof(Primitive), context), "write primitives")) goto cleanup;
-        if (!checked(ez_gfx_counter_buffer_acquire(sizeof(EzGfxDrawIndexedCommand), 1, "draw commands", sizeof("draw commands") - 1, &indirect, context), "acquire indirect")) goto cleanup;
+        if (!checked(ez_gfx_buffer_acquire(context, sizeof(Primitive), 1, "primitives", sizeof("primitives") - 1, &primitives), "acquire primitives")) goto cleanup;
+        if (!checked(ez_gfx_buffer_write(context, primitives, 0, &primitive, 1, sizeof(Primitive)), "write primitives")) goto cleanup;
+        if (!checked(ez_gfx_counter_buffer_acquire(context, sizeof(EzGfxDrawIndexedCommand), 1, "draw commands", sizeof("draw commands") - 1, &indirect), "acquire indirect")) goto cleanup;
         /* Compute fills the draw commands; only the visible count is published up front. */
-        if (!checked(ez_gfx_counter_buffer_publish_count(indirect, 1, context), "publish compute indirect count")) goto cleanup;
+        if (!checked(ez_gfx_counter_buffer_publish_count(context, indirect, 1), "publish compute indirect count")) goto cleanup;
         if (!checked(ez_gfx_frame_begin(context, surface, &active_frame), "begin frame")) goto cleanup;
         bindings[0] = (EzGfxBinding){"primitives", sizeof("primitives") - 1, primitives, 0, 0};
         bindings[1] = (EzGfxBinding){"draw_commands", sizeof("draw_commands") - 1, 0, indirect, 0};
-        if (!checked(ez_gfx_render_add_compute_pipeline(shader, 1, 1, 1, bindings, 2,
-                NULL, 0, active_frame), "record compute")) {
-            (void)ez_gfx_frame_abort(active_frame);
+        if (!checked(ez_gfx_frame_add_compute_pipeline(context, active_frame, shader, 1, 1, 1, bindings, 2, NULL, 0), "record compute")) {
+            (void)ez_gfx_frame_abort(context, active_frame);
             active_frame = 0;
             /* Abort consumes claimed handles; release covers any handle the failed call did not claim. */
-            ez_gfx_buffer_release(primitives, context);
+            ez_gfx_buffer_release(context, primitives);
             primitives = 0;
-            ez_gfx_counter_buffer_release(indirect, context);
+            ez_gfx_counter_buffer_release(context, indirect);
             indirect = 0;
             goto cleanup;
         }
-        if (!checked(ez_gfx_render_add_vertex_pipeline(shader, indirect, bindings, 2,
-                &dynamic_state, NULL, 0, active_frame), "record graphics")) {
-            (void)ez_gfx_frame_abort(active_frame);
+        if (!checked(ez_gfx_frame_add_vertex_pipeline(context, active_frame, shader, indirect, bindings, 2, &dynamic_state, NULL, 0), "record graphics")) {
+            (void)ez_gfx_frame_abort(context, active_frame);
             active_frame = 0;
             /* Abort consumes claimed handles; release covers any handle the failed call did not claim. */
-            ez_gfx_buffer_release(primitives, context);
+            ez_gfx_buffer_release(context, primitives);
             primitives = 0;
-            ez_gfx_counter_buffer_release(indirect, context);
+            ez_gfx_counter_buffer_release(context, indirect);
             indirect = 0;
             goto cleanup;
         }
-        frame_result = ez_gfx_frame_end(active_frame);
+        frame_result = ez_gfx_frame_end(context, active_frame);
         active_frame = 0;
         /* The terminal frame consumes both buffers. */
         primitives = 0;
@@ -414,11 +412,11 @@ int main(int argc, char **argv) {
     success = 1;
 
 cleanup:
-    if (active_frame != 0) (void)ez_gfx_frame_abort(active_frame);
-    if (context != 0 && primitives != 0) ez_gfx_buffer_release(primitives, context);
-    if (context != 0 && indirect != 0) ez_gfx_counter_buffer_release(indirect, context);
+    if (active_frame != 0) (void)ez_gfx_frame_abort(context, active_frame);
+    if (context != 0 && primitives != 0) ez_gfx_buffer_release(context, primitives);
+    if (context != 0 && indirect != 0) ez_gfx_counter_buffer_release(context, indirect);
     if (context != 0) {
-        (void)ez_gfx_callback_register(context, NULL, NULL);
+        (void)ez_gfx_context_register_callback(context, NULL, NULL);
         ez_gfx_context_destroy(context);
     }
     if (window != NULL && IsWindow(window)) DestroyWindow(window);

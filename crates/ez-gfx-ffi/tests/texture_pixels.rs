@@ -567,11 +567,11 @@ fn assert_abi_odd_base_unsupported(
         // SAFETY: Input/descriptor remain readable and the output handle writable through the call.
         unsafe {
             ez_gfx_texture_load(
+                context.into_raw(),
                 bytes.as_ptr(),
                 bytes.len(),
                 &raw const desc,
                 &raw mut texture,
-                context.into_raw(),
             )
         },
         EzGfxResult::Ok
@@ -581,7 +581,7 @@ fn assert_abi_odd_base_unsupported(
         let mut binding = 0;
         // SAFETY: binding remains writable and both handles are live.
         let status =
-            unsafe { ez_gfx_texture_get_binding(texture, &raw mut binding, context.into_raw()) };
+            unsafe { ez_gfx_texture_get_binding(context.into_raw(), texture, &raw mut binding) };
         if status != EzGfxResult::NotReady {
             assert_eq!(status, EzGfxResult::Unsupported, "{format:?} ABI odd base");
             break;
@@ -592,7 +592,7 @@ fn assert_abi_odd_base_unsupported(
         );
         std::thread::yield_now();
     }
-    ez_gfx_texture_unload(texture, context.into_raw());
+    ez_gfx_texture_unload(context.into_raw(), texture);
 }
 
 fn exercise_odd_mip(

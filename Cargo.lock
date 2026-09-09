@@ -759,6 +759,7 @@ dependencies = [
  "ez-gfx-hal",
  "ez-gfx-runtime",
  "gpu-allocator",
+ "libloading",
  "parking_lot",
 ]
 
@@ -768,6 +769,18 @@ version = "0.1.0"
 dependencies = [
  "basisu_c_sys",
  "cc",
+]
+
+[[package]]
+name = "ez-gfx-bindgen"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "quick-xml",
+ "serde",
+ "serde_json",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1921,6 +1934,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "memchr",
+ "serde",
 ]
 
 [[package]]
@@ -3119,7 +3133,6 @@ dependencies = [
  "clap",
  "flate2",
  "object",
- "quick-xml",
  "sha2",
  "tar",
  "walkdir",

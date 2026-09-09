@@ -65,11 +65,11 @@ fn map_target_error(error: TargetError) -> EzGfxResult {
 /// `out_target` one writable, aligned handle, and `desc.candidate_formats`
 /// exactly `desc.candidate_count` readable format codes, for this call.
 pub unsafe extern "C" fn ez_gfx_render_target_create(
+    context: EzGfxContext,
     desc: *const EzGfxRenderTargetDesc,
     width: u32,
     height: u32,
     out_target: *mut EzGfxRenderTarget,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         if desc.is_null() || out_target.is_null() || width == 0 || height == 0 {
@@ -141,7 +141,7 @@ pub unsafe extern "C" fn ez_gfx_render_target_create(
 
 #[unsafe(no_mangle)]
 /// Destroys a render target and clears any bound override; stale handles are ignored.
-pub extern "C" fn ez_gfx_render_target_destroy(target: EzGfxRenderTarget, context: EzGfxContext) {
+pub extern "C" fn ez_gfx_render_target_destroy(context: EzGfxContext, target: EzGfxRenderTarget) {
     catch_void(|| {
         if let (Ok(context), Ok(target)) = (context_handle(context), render_target_handle(target)) {
             raw::destroy_render_target(context, target);
@@ -156,9 +156,9 @@ pub extern "C" fn ez_gfx_render_target_destroy(target: EzGfxRenderTarget, contex
 ///
 /// A non-null `out_format` must address one writable, aligned `u8` for this call.
 pub unsafe extern "C" fn ez_gfx_render_target_get_format(
+    context: EzGfxContext,
     target: EzGfxRenderTarget,
     out_format: *mut u8,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         if out_format.is_null() {
@@ -190,10 +190,10 @@ pub unsafe extern "C" fn ez_gfx_render_target_get_format(
 ///
 /// Each non-null output pointer must address one writable, aligned `u32` for this call.
 pub unsafe extern "C" fn ez_gfx_render_target_get_extent(
+    context: EzGfxContext,
     target: EzGfxRenderTarget,
     out_width: *mut u32,
     out_height: *mut u32,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         if out_width.is_null() || out_height.is_null() {
@@ -232,10 +232,10 @@ pub unsafe extern "C" fn ez_gfx_render_target_get_extent(
 /// Non-null `out_use_clear` must address one writable, aligned `u8` and
 /// non-null `out_color` four writable, aligned `f32` values, for this call.
 pub unsafe extern "C" fn ez_gfx_render_target_get_clear(
+    context: EzGfxContext,
     target: EzGfxRenderTarget,
     out_use_clear: *mut u8,
     out_color: *mut f32,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         if out_use_clear.is_null() || out_color.is_null() {
@@ -278,9 +278,9 @@ pub unsafe extern "C" fn ez_gfx_render_target_get_clear(
 ///
 /// This function dereferences no pointers.
 pub extern "C" fn ez_gfx_render_target_probe_format(
+    context: EzGfxContext,
     format: u8,
     samples: u8,
-    context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
         let format = match format_from_abi(format) {

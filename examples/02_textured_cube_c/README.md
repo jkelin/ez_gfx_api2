@@ -1,6 +1,6 @@
 # C textured cube
 
-Minimal ABI 33 example: positions and normals use auto-growing typed heap handles, indices use the lazy context-owned singleton heap, and structured/counter buffers are one-frame values. The sample reacquires and populates both buffers each frame for compute-to-graphics use; the terminal frame consumes them, and only unconsumed failure paths release. A creator-thread callback receives runtime diagnostics and copies borrowed snapshot bytes.
+Minimal ABI 34 example: positions and normals use auto-growing typed heap handles, indices use the lazy context-owned singleton heap, and structured/counter buffers are one-frame values. The sample reacquires and populates both buffers each frame for compute-to-graphics use; the terminal frame consumes them, and only unconsumed failure paths release. A creator-thread callback receives runtime diagnostics and copies borrowed snapshot bytes.
 
 ## Build
 
@@ -8,7 +8,7 @@ From the repository root:
 
 ```powershell
 cargo build -p ez-gfx-ffi -p ez-gfx-compiler
-cmake -S examples/c/textured_cube -B target/c-examples/textured_cube-build
+cmake -S examples/02_textured_cube_c -B target/c-examples/textured_cube-build
 cmake --build target/c-examples/textured_cube-build --config Debug
 ```
 
@@ -26,7 +26,7 @@ For extracted Windows packages:
 $Runtime = "C:\sdk\ez-gfx-runtime-x86_64-pc-windows-msvc-0.1.0"
 $Compiler = "C:\sdk\ez-gfx-compiler-x86_64-pc-windows-msvc-0.1.0"
 $Build = Join-Path $PWD "target\c-examples\textured-cube-package"
-cmake -S examples/c/textured_cube -B $Build `
+cmake -S examples/02_textured_cube_c -B $Build `
   -DEZ_GFX_INCLUDE_DIR="$Runtime" `
   -DEZ_GFX_FFI_LIBRARY="$Runtime\ez_gfx_ffi.dll.lib" `
   -DEZ_GFX_FFI_DLL="$Runtime\ez_gfx_ffi.dll" `

@@ -10,7 +10,7 @@ Define safe ownership for named vertex heaps, their allocations, the singleton c
 - A vertex allocation retains its parent heap; every owning wrapper retains `Rc<ContextInner>`.
 - The index heap is a singleton owned by `Context`; `IndexAllocation` retains the context.
 - Structured and counter buffers are context-acquired one-frame values: first use claims them, same-frame reuse is valid, and terminal frame paths invalidate them.
-- ABI 33 retains explicit opaque-handle lifecycle functions and rejects stale, foreign, wrong-kind, and duplicate handles.
+- ABI 34 retains explicit opaque-handle lifecycle functions and rejects stale, foreign, wrong-kind, and duplicate handles.
 
 ## Retired exploration
 
@@ -20,7 +20,7 @@ The selected ordered range free list and generation-indexed identity remain. All
 
 ## Selected solution
 
-Named auto-growing vertex heaps and one lazy context-owned index heap use ordered range free lists and generation-checked allocation identities. Safe heap and allocation wrappers retain `Rc<ContextInner>` plus their parent resource leases. Dropping an allocation retires its range; a drop during recording waits for that frame's terminal completion, so no public per-frame retain method is needed. ABI 33 retains explicit opaque-handle release and rejects stale, foreign, wrong-kind, and duplicate handles.
+Named auto-growing vertex heaps and one lazy context-owned index heap use ordered range free lists and generation-checked allocation identities. Safe heap and allocation wrappers retain `Rc<ContextInner>` plus their parent resource leases. Dropping an allocation retires its range; a drop during recording waits for that frame's terminal completion, so no public per-frame retain method is needed. ABI 34 retains explicit opaque-handle release and rejects stale, foreign, wrong-kind, and duplicate handles.
 
 Frame readiness conservatively covers imported named vertex heaps and the singleton index heap. `Buffer<T>` and `CounterBuffer<T>` are materialized once for their claiming frame, support repeated compute/graphics use there, and are invalid afterward. Native storage returns to completion-gated backend pools.
 
