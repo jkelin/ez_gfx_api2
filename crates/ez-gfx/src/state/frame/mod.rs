@@ -19,6 +19,8 @@ use super::{
     wait_native_idle, with_context_mut,
 };
 
+mod binding;
+
 #[cfg(test)]
 mod transient_tests;
 type NativeTextureMap = HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>;
@@ -724,7 +726,6 @@ pub fn execute_graphics(
             .identity
             .resolve(counter_handle, ResourceKind::CounterBuffer)
             .map_err(map_lifecycle)?;
-        validate_binding_handles(context, bindings)?;
         let record = context.shaders.get(&shader).ok_or(Error::InvalidContext)?;
         let layout = record
             .runtime
@@ -736,8 +737,10 @@ pub fn execute_graphics(
                     .and_then(|fragment| vertex.merge(&fragment))
             })
             .map_err(|_| Error::InvalidArgument)?;
+        let bindings = binding::select_bindings(&layout, bindings);
+        validate_binding_handles(context, &bindings)?;
         layout
-            .validate(bindings)
+            .validate(&bindings)
             .map_err(|_| Error::InvalidArgument)?;
         let draw_capacity = context
             .indirects
@@ -748,7 +751,7 @@ pub fn execute_graphics(
             .graphics_layout
             .as_ref()
             .ok_or(Error::InvalidArgument)?;
-        let node = graphics_node(context, &layout, bindings, counter, pipeline_layout)?;
+        let node = graphics_node(context, &layout, &bindings, counter, pipeline_layout)?;
         context
             .frame
             .record_node(
@@ -757,14 +760,14 @@ pub fn execute_graphics(
                     shader,
                     counter,
                     draw_capacity,
-                    bindings: bindings.to_vec(),
+                    bindings: bindings.clone(),
                     layout,
                     pipeline_layout,
                     state,
                 },
             )
             .map_err(|error| map_frame(&error))?;
-        mark_transient_bindings_interned(context, bindings)?;
+        mark_transient_bindings_interned(context, &bindings)?;
         mark_transient_interned(context, counter_handle)?;
         context.frame_has_graphics = true;
         Ok(())
@@ -787,7 +790,6 @@ pub fn execute_compute(
             .identity
             .resolve(handle, ResourceKind::Shader)
             .map_err(map_lifecycle)?;
-        validate_binding_handles(context, bindings)?;
         let record = context.shaders.get(&shader).ok_or(Error::InvalidContext)?;
         if groups.contains(&0) {
             return Err(Error::InvalidArgument);
@@ -796,14 +798,16 @@ pub fn execute_compute(
             .runtime
             .bindings(ez_gfx_artifact::Stage::Compute)
             .map_err(|_| Error::InvalidArgument)?;
+        let bindings = binding::select_bindings(&layout, bindings);
+        validate_binding_handles(context, &bindings)?;
         layout
-            .validate(bindings)
+            .validate(&bindings)
             .map_err(|_| Error::InvalidArgument)?;
         let node = add_binding_accesses(
             context,
             NodeDesc::new("compute", QueueKind::Compute),
             &layout,
-            bindings,
+            &bindings,
             QueueKind::Compute,
             ShaderStage::Compute,
             None,
@@ -816,12 +820,12 @@ pub fn execute_compute(
                 ExecutableNode::Compute {
                     shader,
                     groups,
-                    bindings: bindings.to_vec(),
+                    bindings: bindings.clone(),
                     layout,
                 },
             )
             .map_err(|error| map_frame(&error))?;
-        mark_transient_bindings_interned(context, bindings)?;
+        mark_transient_bindings_interned(context, &bindings)?;
         Ok(())
     }))
 }

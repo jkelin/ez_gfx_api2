@@ -10,6 +10,8 @@ ez-gfx-core.workspace = true
 ez-gfx-hal.workspace = true
 ez-gfx-runtime.workspace = true
 ash.workspace = true
+ash-window.workspace = true
+raw-window-handle.workspace = true
 gpu-allocator = { workspace = true, features = ["std", "vulkan"] }
 parking_lot.workspace = true
 libloading.workspace = true

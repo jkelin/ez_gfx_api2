@@ -2,15 +2,15 @@
 
 `ez-gfx-ffi` is the C ABI boundary for the `ez-gfx` runtime. C and other foreign-language clients include [`bindings/c/include/ez_gfx_api.h`](../../bindings/c/include/ez_gfx_api.h). Rust declarations and documentation are authoritative; `tools/bindgen` generates the XML contract and C header. Rust clients should depend on `ez-gfx`, not `ez-gfx-ffi`.
 
-The complete [C textured cube](../../examples/02_textured_cube_c/README.md) exercises ABI 35 typed heap/allocation handles, one-frame compute-to-graphics buffers, presentation, creator-thread callbacks, stable error printing, and snapshot readback on Win32.
+The complete [C textured cube](../../examples/02_textured_cube_c/README.md) exercises ABI 37 portable GLFW window handles, typed heap/allocation handles, one-frame compute-to-graphics buffers, presentation, creator-thread callbacks, stable error printing, and snapshot readback.
 
 ## Compatibility and ownership
 
-Before any other call, require `ez_gfx_abi_version() == EZ_GFX_ABI_VERSION` (ABI 35). ABI 35 removes surface-platform fields, splits window and headless surface creation, and uses canonical `ez_gfx_{object}_{operation}` names with context-first signatures. Context-bound operations on an existing object place it second, including every frame operation as `(context, frame, ...)`. It provides creator-thread event callbacks, one-frame `EzGfxBuffer` and `EzGfxCounterBuffer` values, explicit generation-, kind-, owner-, state-, and frame-serial-validated `EzGfxFrame` handles, frame-scoped recording, auto-growing typed vertex heaps, a lazy context-owned index heap, and batched indirect writes.
+Before any other call, require `ez_gfx_abi_version() == EZ_GFX_ABI_VERSION` (ABI 37). Window and headless creation use separate descriptors. `EzGfxWindowSurfaceDesc` carries a validated native-window-system tag and handles but no extent; native code queries the drawable size. `EzGfxHeadlessSurfaceDesc` alone carries an explicit extent. Operations use canonical `ez_gfx_{object}_{operation}` names and context-first signatures.
 
 `ez_gfx_handle_inspect` decodes a packed handle into its context/child slot and generation fields; it does not validate that the handle is live in a context. `ez_gfx_semantic_id` accepts an exact 1-to-255-byte canonical semantic name and writes its fixed 16-byte identifier. Semantic names are ASCII dot-separated identifiers: every non-empty segment starts with an ASCII letter and continues with ASCII letters, digits, or underscores. Empty segments, non-ASCII bytes, embedded NUL, and terminators included in the supplied length are invalid.
 
-The context and all context/resource operations, including teardown, are creator-thread-affine in the delegated runtime. Buffer handles are writable until the first frame claims them. Repeated uses in that frame share one materialization; every later write or frame use is rejected, and every terminal frame path invalidates the public handles while native allocations return to completion-safe pools. Frame handles are thread-local: every recording operation requires its live frame, and `ez_gfx_frame_end` or `ez_gfx_frame_abort` consumes it on every result. Context destruction aborts live descendant frames before teardown. The host owns native surface pointers until surface destruction; the runtime owns created graphics resources and native objects.
+Context and resource operations, including status-returning teardown, are creator-thread-affine. Buffer handles are writable until first claimed by a frame; terminal frame paths invalidate claimed handles. Window hosts must outlive successful surface teardown. `TeardownAbandoned` means native work could not be proven complete, so borrowed host handles must remain alive process-long.
 
 ## Call order
 

@@ -1,5 +1,5 @@
 use super::{
-    CAMetalDrawable, CAMetalLayer, DeferredResource, HalError, MTLCommandBuffer, MTLCommandQueue,
+    CAMetalDrawable, DeferredResource, HalError, MTLCommandBuffer, MTLCommandQueue,
     MTLCompareFunction, MTLDepthStencilDescriptor, MTLDevice, MTLPixelFormat, MTLStorageMode,
     MTLTextureDescriptor, MTLTextureUsage, NativeContext, NativeSurface, ProtocolObject,
     SurfaceDepth, ThreadBound, map_allocation_hal,
@@ -75,8 +75,7 @@ impl NativeContext {
         if must_wait {
             self.complete_frame_slot(slot)?;
         }
-        // SAFETY: the host promises that the opaque platform handle is a live CAMetalLayer.
-        let layer = unsafe { &*(surface.layer as *const CAMetalLayer) };
+        let layer = surface.metal_layer();
         layer.setDevice(Some(&self.device));
         let drawable = layer.nextDrawable().ok_or(HalError::NotReady)?;
         let command = self.queue.commandBuffer().ok_or(HalError::NativeFailure)?;
@@ -92,8 +91,19 @@ impl NativeContext {
         Ok(())
     }
 
-    /// Destroys backend-owned state associated with a borrowed host surface.
-    pub fn destroy_surface(&mut self, surface: NativeSurface) {
+    /// Retires backend-owned state after severing every borrowed host relationship.
+    ///
+    /// P-017 differs from Vulkan and DX12 here: deferred retirement retains only an independently
+    /// owned `CAMetalLayer` and GPU resources, never the `NSView`. A backend-created observer layer
+    /// weakly references the root layer, and removal severs that relationship synchronously.
+    /// Therefore returning `true` permits immediate host release even while layer retirement waits
+    /// for submitted work; later context abandonment leaks only independently owned objects.
+    pub fn destroy_surface(&mut self, mut surface: NativeSurface) -> bool {
+        // Host-provided CAMetalLayers are independently retained. Backend-created observer layers
+        // weakly reference the root layer; removal severs their only host relationship.
+        surface.detach_from_host();
+        // Surface retirement performs no allocator operation and is therefore infallible.
         let _ = self.defer_resource(DeferredResource::Surface(surface));
+        true
     }
 }

@@ -501,7 +501,7 @@ fn callback_registration_is_creator_thread_only() {
         unsafe { ez_gfx_context_register_callback(context, None, core::ptr::null_mut()) },
         EzGfxResult::Ok
     );
-    ez_gfx_context_destroy(context);
+    assert_eq!(ez_gfx_context_destroy(context), EzGfxResult::Ok);
 }
 
 #[test]
@@ -571,11 +571,14 @@ fn context_lifecycle_rejects_cross_thread_destroy_and_invalidates_destroyed_hand
         EzGfxResult::Ok
     );
     assert_ne!(context, 0);
-    std::thread::spawn(move || ez_gfx_context_destroy(context))
-        .join()
-        .unwrap();
+    assert_eq!(
+        std::thread::spawn(move || ez_gfx_context_destroy(context))
+            .join()
+            .unwrap(),
+        EzGfxResult::InvalidContext
+    );
     assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::NotReady);
-    ez_gfx_context_destroy(context);
+    assert_eq!(ez_gfx_context_destroy(context), EzGfxResult::Ok);
     assert_eq!(
         ez_gfx_context_wait_idle(context),
         EzGfxResult::InvalidContext
@@ -585,7 +588,7 @@ fn context_lifecycle_rejects_cross_thread_destroy_and_invalidates_destroyed_hand
 #[cfg(not(target_vendor = "apple"))]
 #[test]
 fn frame_handles_are_thread_local_terminal_and_context_owned() {
-    let native = common::TestContext::create_with_validation(1, false);
+    let mut native = common::TestContext::create_with_validation(1, false);
     let context = native.context;
     let mut frame = 0;
     assert_eq!(
@@ -622,7 +625,9 @@ fn frame_handles_are_thread_local_terminal_and_context_owned() {
         unsafe { ez_gfx_frame_begin(native.context, native.surface, &raw mut descendant) },
         EzGfxResult::Ok
     );
-    ez_gfx_context_destroy(native.context);
+    assert_eq!(ez_gfx_context_destroy(native.context), EzGfxResult::Ok);
+    native.context = 0;
+    native.surface = 0;
     assert_eq!(
         ez_gfx_frame_abort(context, descendant),
         EzGfxResult::InvalidContext
@@ -632,7 +637,7 @@ fn frame_handles_are_thread_local_terminal_and_context_owned() {
 #[cfg(windows)]
 #[test]
 fn explicit_dx12_context_allocates_writes_and_releases_buffer_memory() {
-    let native = common::TestContext::create_with_validation(2, false);
+    let mut native = common::TestContext::create_with_validation(2, false);
     let context = native.context;
     let mut frame = 0;
     assert_eq!(
@@ -676,7 +681,9 @@ fn explicit_dx12_context_allocates_writes_and_releases_buffer_memory() {
     );
     assert_eq!(ez_gfx_frame_abort(context, frame), EzGfxResult::Ok);
     assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
-    ez_gfx_context_destroy(context);
+    assert_eq!(ez_gfx_context_destroy(context), EzGfxResult::Ok);
+    native.context = 0;
+    native.surface = 0;
     assert_eq!(
         ez_gfx_context_wait_idle(context),
         EzGfxResult::InvalidContext
@@ -1069,7 +1076,7 @@ fn explicit_adapter_selection_creates_and_rejects_hidden_contexts() {
         EzGfxResult::Ok
     );
     assert_ne!(context, 0);
-    ez_gfx_context_destroy(context);
+    assert_eq!(ez_gfx_context_destroy(context), EzGfxResult::Ok);
 
     // An unknown stable identity fails as a caller error without a device.
     let unknown = EzGfxAdapterDesc {

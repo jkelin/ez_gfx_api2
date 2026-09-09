@@ -12,8 +12,8 @@ use super::{
     DeferredNativeResource, DeferredResource, HalError, ID3D12CommandQueue, ID3D12DescriptorHeap,
     ID3D12Device, ID3D12DeviceVersion, ID3D12Fence, IDXGIAdapter4, IDXGIFactory4, INFINITE,
     Interface, MemoryAllocator, NativeContext, NativeSurface, QueueKind, SemanticProfile,
-    TEXTURE_DESCRIPTOR_CAPACITY, WaitForSingleObject, adapter_id, create_frame_slots,
-    map_allocator, map_windows, transfer,
+    TEXTURE_DESCRIPTOR_CAPACITY, WAIT_FAILED, WAIT_OBJECT_0, WaitForSingleObject, adapter_id,
+    create_frame_slots, map_allocator, map_windows, transfer,
 };
 
 fn initialize_context(
@@ -124,6 +124,8 @@ fn initialize_context(
         texture_worker: Some(texture_worker),
         next_fence: 1,
         idle_drained: false,
+        #[cfg(test)]
+        wait_idle_failure: None,
         allocator: Some(allocator),
         next_transfer_fence: 1,
         next_texture_fence: 1,
@@ -393,11 +395,50 @@ impl NativeContext {
         Ok(self.adapter_info.clone())
     }
 
+    fn wait_for_fence(
+        &self,
+        fence: &ID3D12Fence,
+        value: u64,
+        timeout: u32,
+    ) -> Result<(), HalError> {
+        // SAFETY: the context retains this device fence throughout every status read.
+        let completed = unsafe { fence.GetCompletedValue() };
+        if completed == u64::MAX {
+            return Err(HalError::DeviceLost);
+        }
+        if completed >= value {
+            return Ok(());
+        }
+
+        // SAFETY: the context keeps both the fence and its waitable event alive through the wait.
+        unsafe { fence.SetEventOnCompletion(value, self.fence_event) }.map_err(map_windows)?;
+        // SAFETY: fence_event is a live waitable event retained by this context.
+        let status = unsafe { WaitForSingleObject(self.fence_event, timeout) };
+        if status == WAIT_FAILED {
+            return Err(HalError::NativeFailure);
+        }
+        if status != WAIT_OBJECT_0 {
+            return Err(HalError::NativeFailure);
+        }
+
+        // An event wake is not accepted as drain proof until the fence itself confirms completion.
+        // SAFETY: the retained fence remains live after the event wake.
+        let completed = unsafe { fence.GetCompletedValue() };
+        if completed == u64::MAX {
+            Err(HalError::DeviceLost)
+        } else if completed < value {
+            Err(HalError::NativeFailure)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Waits for submitted native work and reclaims completed deferred resources.
     ///
     /// # Errors
     ///
-    /// Returns an error if the fence counter overflows, fence signaling or event registration fails, or deferred resource reclamation fails.
+    /// Returns an error if fence signaling, event registration/waiting, post-wake completion
+    /// confirmation, worker drain, or deferred resource reclamation fails.
     pub fn wait_idle(&mut self) -> Result<(), HalError> {
         self.idle_drained = false;
         let mut native_drained = true;
@@ -419,25 +460,19 @@ impl NativeContext {
                 native_drained = false;
             }
         }
+        #[cfg(test)]
+        if let Some(error) = self.wait_idle_failure.take() {
+            // Fault injection occupies the native-wait failure point, before release is proven.
+            return Err(error);
+        }
         let value = self.next_fence;
         self.next_fence = self
             .next_fence
             .checked_add(1)
             .ok_or(HalError::NativeFailure)?;
-        // SAFETY: Signal uses the command queue and fence created from the same ID3D12Device and retained in self; value is the next monotonically allocated fence value.
+        // SAFETY: Signal uses the queue and fence created from the same retained D3D12 device.
         unsafe { self.queue.Signal(&self.fence, value) }.map_err(map_windows)?;
-        // SAFETY: GetCompletedValue takes no raw arguments, and self.fence's wrapper retains the ID3D12Fence COM receiver throughout the call.
-        if unsafe { self.fence.GetCompletedValue() } < value {
-            // SAFETY: SetEventOnCompletion receives the CreateEventW event stored in self, and exclusive self access keeps that HANDLE and the ID3D12Fence receiver retained through the call.
-            unsafe { self.fence.SetEventOnCompletion(value, self.fence_event) }
-                .map_err(map_windows)?;
-            // SAFETY: WaitForSingleObject receives fence_event, a waitable event HANDLE returned by CreateEventW, and exclusive self access keeps it unclosed for the wait.
-            unsafe { WaitForSingleObject(self.fence_event, INFINITE) };
-        }
-        // SAFETY: the retained graphics fence reports device removal as u64::MAX.
-        if unsafe { self.fence.GetCompletedValue() } == u64::MAX {
-            return Err(HalError::DeviceLost);
-        }
+        self.wait_for_fence(&self.fence, value, INFINITE)?;
         // SAFETY: both transfer fences belong to this live device and their workers retain them.
         let transfer_value = if self
             .transfer_worker
@@ -448,9 +483,7 @@ impl NativeContext {
         } else {
             self.next_transfer_fence.saturating_sub(1)
         };
-        // SAFETY: the transfer fence remains live while polling its worker's terminal value.
-        let mut transfer_completed = unsafe { self.transfer_fence.GetCompletedValue() };
-        while transfer_value != 0 && transfer_completed < transfer_value {
+        if transfer_value != 0 {
             if let Some(error) = self
                 .transfer_worker
                 .as_ref()
@@ -458,20 +491,7 @@ impl NativeContext {
             {
                 return Err(error.to_hal_error());
             }
-            // SAFETY: the worker signals every accepted transfer value, and this short timed wait
-            // lets the caller observe worker or device failure rather than hanging indefinitely.
-            unsafe {
-                self.transfer_fence
-                    .SetEventOnCompletion(transfer_value, self.fence_event)
-            }
-            .map_err(map_windows)?;
-            // SAFETY: `fence_event` remains live and waitable throughout this method.
-            unsafe { WaitForSingleObject(self.fence_event, 10) };
-            // SAFETY: the transfer fence remains live after the timed event wait.
-            transfer_completed = unsafe { self.transfer_fence.GetCompletedValue() };
-        }
-        if transfer_completed == u64::MAX {
-            return Err(HalError::DeviceLost);
+            self.wait_for_fence(&self.transfer_fence, transfer_value, INFINITE)?;
         }
         // SAFETY: the texture fence remains live while the context owns it.
         let texture_value = if self
@@ -483,9 +503,7 @@ impl NativeContext {
         } else {
             self.next_texture_fence.saturating_sub(1)
         };
-        // SAFETY: the texture fence remains live while polling its worker's terminal value.
-        let mut texture_completed = unsafe { self.texture_fence.GetCompletedValue() };
-        while texture_value != 0 && texture_completed < texture_value {
+        if texture_value != 0 {
             if let Some(error) = self
                 .texture_worker
                 .as_ref()
@@ -493,20 +511,7 @@ impl NativeContext {
             {
                 return Err(error.to_hal_error());
             }
-            // SAFETY: the worker signals every accepted texture-transfer value, and this timed wait
-            // lets the caller observe worker or device failure rather than hanging indefinitely.
-            unsafe {
-                self.texture_fence
-                    .SetEventOnCompletion(texture_value, self.fence_event)
-            }
-            .map_err(map_windows)?;
-            // SAFETY: `fence_event` remains live and waitable throughout this method.
-            unsafe { WaitForSingleObject(self.fence_event, 10) };
-            // SAFETY: the texture fence remains live after the timed event wait.
-            texture_completed = unsafe { self.texture_fence.GetCompletedValue() };
-        }
-        if texture_completed == u64::MAX {
-            return Err(HalError::DeviceLost);
+            self.wait_for_fence(&self.texture_fence, texture_value, INFINITE)?;
         }
         self.idle_drained = native_drained;
         if worker_failed {

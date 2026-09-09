@@ -71,6 +71,28 @@ fn graphics_pipeline_keys_include_state_attachment_and_texture_interface() {
 }
 
 #[cfg(not(target_vendor = "apple"))]
+#[test]
+fn surface_insert_rollback_reports_abandonment_for_every_failure_branch() {
+    for failure in [
+        SurfaceInsertTestFailure::IdentityInsertion,
+        SurfaceInsertTestFailure::InvalidPackedHandle,
+    ] {
+        for (rollback_abandoned, expected) in [
+            (false, Error::NativeFailure),
+            (true, Error::TeardownAbandoned),
+        ] {
+            let context = create_context(vulkan_options().unwrap()).unwrap();
+            inject_surface_insert_failure(context, failure, rollback_abandoned).unwrap();
+
+            assert_eq!(
+                create_surface_headless(context, HeadlessSurfaceOptions::new(1, 1, 0).unwrap()),
+                Err(expected)
+            );
+            assert_eq!(destroy_context(context), Ok(()));
+        }
+    }
+}
+#[cfg(not(target_vendor = "apple"))]
 fn texture_config() -> TextureConfig {
     TextureConfig {
         width: 1,
@@ -330,6 +352,18 @@ fn thread_exit_context() -> ContextHandle {
 
 #[cfg(not(target_vendor = "apple"))]
 #[test]
+fn native_extent_sync_preserves_explicit_headless_extent() {
+    let context = create_context(vulkan_options().unwrap()).unwrap();
+    let surface =
+        create_surface_headless(context, HeadlessSurfaceOptions::new(3, 5, 0).unwrap()).unwrap();
+
+    assert_eq!(sync_window_surface_extent(context, surface), Ok(()));
+    assert_eq!(surface_extent(context, surface), Ok((3, 5)));
+    assert_eq!(destroy_context(context), Ok(()));
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
 fn recursive_context_access_returns_native_failure_without_panicking() {
     let context = thread_exit_context();
 
@@ -349,6 +383,9 @@ fn thread_exit_invalidates_populated_context_handle() {
     let _structured = acquire_buffer_sized(context, 1, 64).unwrap();
     let cleanup = CONTEXTS.with(|contexts| contexts.borrow_mut().cleanup_for_thread_exit());
 
+    #[cfg(windows)]
+    assert_eq!(cleanup, Err(Error::TeardownAbandoned));
+    #[cfg(not(windows))]
     assert_eq!(cleanup, Ok(()));
     assert_eq!(wait_idle(context), Err(Error::InvalidContext));
 }

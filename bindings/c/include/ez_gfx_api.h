@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EZ_GFX_ABI_VERSION 36u
+#define EZ_GFX_ABI_VERSION 37u
 
 #if defined(__clang__)
 #  if __has_attribute(access)
@@ -72,6 +72,7 @@ typedef uint64_t EzGfxRenderTarget;
  * @EzGfxResult_DeviceLost: The graphics device was lost.
  * @EzGfxResult_QueueFull: Asynchronous scheduling or staging capacity is unavailable.
  * @EzGfxResult_Cancelled: An asynchronous operation was cancelled before completion.
+ * @EzGfxResult_TeardownAbandoned: Teardown completion is unproven; borrowed host handles must remain alive.
  *
  * Stable C ABI result code.
  */
@@ -86,6 +87,26 @@ enum {
     EzGfxResult_DeviceLost = 6,
     EzGfxResult_QueueFull = 7,
     EzGfxResult_Cancelled = 8,
+    EzGfxResult_TeardownAbandoned = 9,
+};
+
+/**
+ * EzGfxNativeWindowSystem:
+ * @EzGfxNativeWindowSystem_Win32: Win32 HWND and HINSTANCE handles.
+ * @EzGfxNativeWindowSystem_Xlib: Xlib Display pointer and Window XID.
+ * @EzGfxNativeWindowSystem_Xcb: XCB connection pointer and window value.
+ * @EzGfxNativeWindowSystem_Wayland: Wayland display and surface pointers.
+ * @EzGfxNativeWindowSystem_AppKit: `AppKit` `NSView` pointer.
+ *
+ * Native window system selecting a portable window descriptor's handles.
+ */
+typedef uint8_t EzGfxNativeWindowSystem;
+enum {
+    EzGfxNativeWindowSystem_Win32 = 0,
+    EzGfxNativeWindowSystem_Xlib = 1,
+    EzGfxNativeWindowSystem_Xcb = 2,
+    EzGfxNativeWindowSystem_Wayland = 3,
+    EzGfxNativeWindowSystem_AppKit = 4,
 };
 
 /**
@@ -495,16 +516,20 @@ typedef struct EzGfxBackendContextDesc {
 
 /**
  * EzGfxWindowSurfaceDesc:
- * @window: Points to the platform-native window object.
- * @display: Points to the platform-native display or application instance when required.
+ * @system: Native window-system code from `EzGfxNativeWindowSystem`.
  * @cache_presented_snapshots: Enables caching of presented surface snapshots when nonzero.
+ * @reserved: Must be zero.
+ * @handle_a: First native handle slot; meaning follows `system`.
+ * @handle_b: Second native handle slot; meaning follows `system`.
  *
- * Describes a native presentation window.
+ * Describes a portable native presentation window without a caller-supplied extent.
  */
 typedef struct EzGfxWindowSurfaceDesc {
-    void * window;
-    void * display;
+    EzGfxNativeWindowSystem system;
     uint8_t cache_presented_snapshots;
+    uint8_t reserved[6];
+    uint64_t handle_a;
+    uint64_t handle_b;
 } EzGfxWindowSurfaceDesc;
 
 /**
@@ -1132,13 +1157,13 @@ EzGfxResult ez_gfx_context_wait_idle(EzGfxContext context);
 
 /**
  * ez_gfx_context_destroy:
- * @context: Context to destroy on its creator thread; zero, stale, repeated, and wrong-thread calls are ignored.
+ * @context: Context to destroy on its creator thread; zero, stale, repeated, and wrong-thread calls report EzGfxResult_InvalidContext.
  *
- * Destroys the graphics context after aborting every live descendant frame.
+ * Destroys the graphics context after aborting every live descendant frame. Reentrant entry or a boundary panic reports `TeardownAbandoned` because teardown completion is unproven.
  *
- * Returns: No return value; wait or release failures cannot be reported through the stable ABI.
+ * Returns: Returns EzGfxResult_Ok once teardown drains, EzGfxResult_InvalidContext for zero, stale, repeated, or wrong-thread handles, EzGfxResult_TeardownAbandoned when native completion is unproven or reentrant entry or a boundary panic prevents teardown, or another typed error only after terminal drained cleanup.
  */
-void ez_gfx_context_destroy(EzGfxContext context);
+EzGfxResult ez_gfx_context_destroy(EzGfxContext context);
 
 /**
  * ez_gfx_context_register_callback:
@@ -1319,12 +1344,12 @@ EzGfxResult ez_gfx_frame_abort(EzGfxContext context, EzGfxFrame frame);
 /**
  * ez_gfx_surface_create_window:
  * @context: Context that owns the surface.
- * @desc: Borrowed native window handles.
+ * @desc: Portable tagged native window handles; no caller extent. After device initialization, host-managed or undefined Vulkan extents require ez_gfx_surface_resize with the current host framebuffer extent before the first frame.
  * @out_surface: Receives the opaque surface handle.
  *
- * Creates a native window presentation surface and returns its handle.
+ * Creates a native window presentation surface and returns its handle. After device initialization, host-managed or undefined Vulkan extents require one `ez_gfx_surface_resize` with the current host framebuffer extent before the first frame.
  *
- * Returns: Returns EzGfxResult_Ok or a validation/native error.
+ * Returns: Returns EzGfxResult_Ok, EzGfxResult_TeardownAbandoned when failed post-native publication cannot prove surface release, or a validation/native error.
  */
 EzGfxResult ez_gfx_surface_create_window(EzGfxContext context, const EzGfxWindowSurfaceDesc * desc, EzGfxSurface * out_surface) EZ_GFX_ACCESS(read_only, 2) EZ_GFX_ACCESS(write_only, 3);
 
@@ -1343,9 +1368,9 @@ EzGfxResult ez_gfx_surface_create_headless(EzGfxContext context, const EzGfxHead
 /**
  * ez_gfx_context_init_device:
  * @context: Owning context.
- * @surface: Surface owned by context.
+ * @surface: Surface owned by context. Host-managed or undefined Vulkan extents require an initial host resize after successful initialization.
  *
- * Initializes the context device for the specified presentation surface.
+ * Initializes the context device for the specified presentation surface. A successful window initialization with a host-managed or undefined Vulkan extent remains unready until `ez_gfx_surface_resize` publishes the current host framebuffer extent.
  *
  * Returns: Returns EzGfxResult_Ok or a native failure.
  */
@@ -1354,11 +1379,11 @@ EzGfxResult ez_gfx_context_init_device(EzGfxContext context, EzGfxSurface surfac
 /**
  * ez_gfx_surface_resize:
  * @context: Owning context.
- * @surface: Surface to resize.
+ * @surface: Surface to resize or initialize with a host-managed framebuffer extent.
  * @width: New width; zero is valid only with zero height for minimized state.
  * @height: New height; zero is valid only with zero width for minimized state.
  *
- * Requests new pixel dimensions for a presentation surface.
+ * Requests new pixel dimensions and publishes host-managed window extents for a presentation surface.
  *
  * Returns: Returns EzGfxResult_Ok, EzGfxResult_NotReady, or an error.
  */
@@ -1403,14 +1428,14 @@ EzGfxResult ez_gfx_surface_set_snapshot_cache(EzGfxContext context, EzGfxSurface
 
 /**
  * ez_gfx_surface_destroy:
- * @context: Owning context; zero and stale values are ignored.
- * @surface: Surface to destroy.
+ * @context: Owning context; zero, stale, and wrong-thread handles report EzGfxResult_InvalidContext.
+ * @surface: Surface to destroy; zero, stale, foreign, and repeated handles report EzGfxResult_InvalidContext.
  *
  * Destroys a presentation surface owned by the context.
  *
- * Returns: No return value; null handles are ignored.
+ * Returns: Returns EzGfxResult_Ok once teardown drains, EzGfxResult_InvalidContext for zero, stale, foreign, repeated, or wrong-thread handles, EzGfxResult_TeardownAbandoned when submitted native work cannot be proven complete, or another typed backend result.
  */
-void ez_gfx_surface_destroy(EzGfxContext context, EzGfxSurface surface);
+EzGfxResult ez_gfx_surface_destroy(EzGfxContext context, EzGfxSurface surface);
 
 /**
  * ez_gfx_render_target_create:

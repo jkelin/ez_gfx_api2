@@ -297,13 +297,16 @@ impl NativeContext {
     }
 
     /// Destroys backend-owned state associated with a borrowed host surface.
-    pub fn destroy_surface(&mut self, mut surface: NativeSurface) {
+    ///
+    /// Returns `false` only when native work could not drain and the surface was abandoned.
+    pub fn destroy_surface(&mut self, mut surface: NativeSurface) -> bool {
         let _ = self.wait_idle();
         if !self.is_drained() {
-            // Preserve swapchain buffers and depth storage still referenced by GPU work.
+            // Preserve swapchain buffers, depth storage, and the host retained by the safe layer.
             core::mem::forget(surface);
-            return;
+            return false;
         }
         let _ = self.destroy_surface_depth(&mut surface);
+        true
     }
 }

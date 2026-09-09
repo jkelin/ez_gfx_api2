@@ -29,6 +29,7 @@ use gpu_allocator::{
 
 /// Identifies resources and contexts from this adapter as Vulkan-backed.
 pub const BACKEND: Backend = Backend::Vulkan;
+pub use surface::NativeWindowExtent;
 /// Descriptor set reserved for the bindless texture heap.
 pub const TEXTURE_DESCRIPTOR_SET: u32 = 1;
 /// Binding containing sampled images in the texture heap.
@@ -445,6 +446,7 @@ pub struct NativeContext {
     instance: Instance,
     surface_loader: khr::surface::Instance,
     headless_surface_enabled: bool,
+    wsi_capabilities: surface::WsiCapabilities,
     physical_device: Option<vk::PhysicalDevice>,
     adapter_info: Option<AdapterInfo>,
     device: Option<ash::Device>,

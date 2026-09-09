@@ -15,6 +15,7 @@ members = [
     "examples",
     "tools/xtask",
     "tools/bindgen",
+    "tools/metal-surface-host-check",
 ]
 resolver = "3"
 
@@ -60,11 +61,14 @@ clap = { version = "4.6.6", features = ["derive"] }
 tempfile = "3.27.0"
 static_assertions = "1.1.0"
 ash = { version = "0.38.0", default-features = false, features = ["loaded", "std"] }
+ash-window = "0.13"
+raw-window-metal = "1.1"
 windows = { version = "0.62.2", default-features = false }
 libloading = "0.8.9"
 objc2 = { version = "0.6.2", default-features = false, features = ["std"] }
 objc2-metal = { version = "0.3.2", default-features = false, features = ["MTLDevice"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSString"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSResponder", "NSView", "objc2-quartz-core"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false }
 gpu-allocator = { version = "0.28.0", default-features = false }
 image = { version = "0.25.10", default-features = false, features = ["bmp", "jpeg", "png", "tga"] }

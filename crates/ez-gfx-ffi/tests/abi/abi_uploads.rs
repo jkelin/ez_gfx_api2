@@ -304,7 +304,7 @@ fn dx12_texture_upload_becomes_resident_and_unload_invalidates_handle() {
         },
         EzGfxResult::InvalidContext
     );
-    ez_gfx_context_destroy(context);
+    assert_eq!(ez_gfx_context_destroy(context), EzGfxResult::Ok);
 }
 
 #[cfg(not(target_vendor = "apple"))]

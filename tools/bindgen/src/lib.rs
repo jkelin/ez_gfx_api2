@@ -638,16 +638,16 @@ fn write_section(
 #[cfg(test)]
 mod tests {
     use super::*;
-    const VOID_NOOP_TEARDOWNS: [&str; 8] = [
-        "ez_gfx_context_destroy",
+    const VOID_NOOP_TEARDOWNS: [&str; 6] = [
         "ez_gfx_shader_destroy",
         "ez_gfx_counter_buffer_release",
-        "ez_gfx_surface_destroy",
         "ez_gfx_vertex_heap_destroy",
         "ez_gfx_buffer_release",
         "ez_gfx_texture_unload",
         "ez_gfx_render_target_destroy",
     ];
+    /// Destroy exports that report typed teardown completion, including abandonment.
+    const STATUS_TEARDOWNS: [&str; 2] = ["ez_gfx_context_destroy", "ez_gfx_surface_destroy"];
 
     fn assert_context_contract(function: &Decl, position: usize) {
         assert_eq!(position, 0, "{} must put context first", function.name);
@@ -659,12 +659,21 @@ mod tests {
             function.name
         );
         let no_op_teardown = VOID_NOOP_TEARDOWNS.contains(&function.name.as_str());
+        let status_teardown = STATUS_TEARDOWNS.contains(&function.name.as_str());
         let returns_void = function.attrs.get("return").map(String::as_str) == Some("void");
         assert_eq!(
             returns_void, no_op_teardown,
             "{} has an unexpected context teardown contract",
             function.name
         );
+        if status_teardown {
+            assert_eq!(
+                function.attrs.get("return").map(String::as_str),
+                Some("EzGfxResult"),
+                "{} must report typed teardown completion",
+                function.name
+            );
+        }
         assert_eq!(
             parameter.attrs.get("nullable").map(String::as_str),
             Some(if no_op_teardown { "true" } else { "false" }),

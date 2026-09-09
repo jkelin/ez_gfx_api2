@@ -1,3 +1,5 @@
+use super::surface::{WsiCapabilities, instance_extensions};
+
 use super::{
     AdapterCapabilities, AdapterClass, AdapterInfo, AllocationError, AllocationSizes, Allocator,
     AllocatorCreateDesc, Backend, CStr, CString, CompressionSupport,
@@ -12,6 +14,7 @@ fn create_device_frame_state(
     instance: &ash::Instance,
     pending: &mut PendingDevice,
     queue_family: u32,
+    swapchain_enabled: bool,
 ) -> Result<(vk::DescriptorSet, Vec<FrameSlot>), HalError> {
     let device = pending.device.as_ref().ok_or(HalError::NativeFailure)?;
     let bindings = texture_descriptor_layout_bindings();
@@ -70,12 +73,14 @@ fn create_device_frame_state(
     .into_iter()
     .next()
     .ok_or(HalError::NativeFailure)?;
-    pending.swapchain_loader = Some(khr::swapchain::Device::new(instance, device));
-    pending.image_available = Some(
-        // SAFETY: `create_semaphore` uses `pending.device`, no custom allocator, and a default create-info value whose storage lasts through the call.
-        unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
-            .map_err(map_vk)?,
-    );
+    if swapchain_enabled {
+        pending.swapchain_loader = Some(khr::swapchain::Device::new(instance, device));
+        pending.image_available = Some(
+            // SAFETY: `create_semaphore` uses `pending.device`, no custom allocator, and a default create-info value whose storage lasts through the call.
+            unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
+                .map_err(map_vk)?,
+        );
+    }
     let frame_slots = create_frame_slots(device, queue_family)?;
 
     Ok((descriptor_set, frame_slots))
@@ -108,6 +113,37 @@ fn draw_feature_rejection(
         None
     }
 }
+pub(super) fn available_extension(
+    available: &[vk::ExtensionProperties],
+    name: &'static CStr,
+) -> Option<*const core::ffi::c_char> {
+    available
+        .iter()
+        .any(|extension| {
+            // SAFETY: Vulkan guarantees a NUL-terminated fixed-size extension name.
+            (unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) }) == name
+        })
+        .then_some(name.as_ptr())
+}
+pub(crate) fn device_extensions(
+    available: &[vk::ExtensionProperties],
+) -> (Vec<*const core::ffi::c_char>, bool) {
+    let swapchain = available_extension(available, khr::swapchain::NAME).is_some();
+    let mut enabled = Vec::with_capacity(2);
+    enabled.extend(swapchain.then_some(khr::swapchain::NAME.as_ptr()));
+    enabled.extend(
+        available_extension(available, khr::portability_subset::NAME)
+            .map(|_| khr::portability_subset::NAME.as_ptr()),
+    );
+    (enabled, swapchain)
+}
+
+pub(crate) const fn cached_device_supports_surface(
+    wants_surface: bool,
+    swapchain_enabled: bool,
+) -> bool {
+    !wants_surface || swapchain_enabled
+}
 
 impl NativeContext {
     /// Creates a Vulkan context with every surface extension supported on this target.
@@ -126,30 +162,11 @@ impl NativeContext {
             .engine_version(vk::make_api_version(0, 0, 1, 0))
             .api_version(vk::API_VERSION_1_3);
 
-        // Headless support is optional: contexts remain usable for target-only work
-        // when the driver omits `VK_EXT_headless_surface`.
-        let headless_surface_enabled =
-            // SAFETY: successful `Entry::load` initialized instance-extension enumeration.
-            unsafe { entry.enumerate_instance_extension_properties(None) }
-                .map_err(map_vk)?
-                .iter()
-                .any(|extension| {
-                    // SAFETY: Vulkan guarantees a NUL-terminated fixed-size extension name.
-                    (unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) })
-                        == ash::ext::headless_surface::NAME
-                });
-        let mut extensions = Vec::new();
-        if cfg!(windows) || headless_surface_enabled {
-            extensions.push(khr::surface::NAME.as_ptr());
-        }
-        #[cfg(windows)]
-        extensions.push(khr::win32_surface::NAME.as_ptr());
-        if headless_surface_enabled {
-            extensions.push(ash::ext::headless_surface::NAME.as_ptr());
-        }
-        if enable_debug {
-            extensions.push(ash::ext::debug_utils::NAME.as_ptr());
-        }
+        // SAFETY: successful `Entry::load` initialized instance-extension enumeration.
+        let available_extensions =
+            unsafe { entry.enumerate_instance_extension_properties(None) }.map_err(map_vk)?;
+        let (extensions, instance_flags, headless_surface_enabled) =
+            instance_extensions(&available_extensions, enable_debug);
 
         let validation =
             CString::new("VK_LAYER_KHRONOS_validation").map_err(|_| HalError::NativeFailure)?;
@@ -169,6 +186,7 @@ impl NativeContext {
         }
 
         let create = vk::InstanceCreateInfo::default()
+            .flags(instance_flags)
             .application_info(&app)
             .enabled_extension_names(&extensions)
             .enabled_layer_names(&layers);
@@ -181,6 +199,7 @@ impl NativeContext {
             instance,
             surface_loader,
             headless_surface_enabled,
+            wsi_capabilities: WsiCapabilities::from_enabled(&extensions),
             physical_device: None,
             device: None,
             idle_drained: true,
@@ -226,51 +245,6 @@ impl NativeContext {
             depth_target: None,
         };
         Ok(context)
-    }
-
-    /// Win32 handles are borrowed; null handles are rejected before the native call.
-    #[cfg(windows)]
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if either Win32 handle is null or Vulkan surface creation fails.
-    pub fn create_win32_surface(
-        &self,
-        window: *mut core::ffi::c_void,
-        display: *mut core::ffi::c_void,
-    ) -> Result<NativeSurface, HalError> {
-        if window.is_null() || display.is_null() {
-            return Err(HalError::InvalidArgument);
-        }
-        let Self {
-            entry_loader,
-            instance,
-            ..
-        } = self;
-        let loader = khr::win32_surface::Instance::new(entry_loader, instance);
-        let create = vk::Win32SurfaceCreateInfoKHR::default()
-            .hwnd(window as isize)
-            .hinstance(display as isize);
-        // SAFETY: validated handles are borrowed from the host and Vulkan copies them during creation.
-        let handle = unsafe { loader.create_win32_surface(&create, None) }.map_err(map_vk)?;
-        Ok(NativeSurface {
-            handle,
-            presented_rgba8: Vec::new(),
-        })
-    }
-
-    #[cfg(not(windows))]
-    /// Creates a Vulkan surface from borrowed Win32 handles.
-    ///
-    /// # Errors
-    ///
-    /// Returns `HalError::Unsupported` on non-Windows platforms.
-    pub fn create_win32_surface(
-        &self,
-        _window: *mut core::ffi::c_void,
-        _display: *mut core::ffi::c_void,
-    ) -> Result<NativeSurface, HalError> {
-        Err(HalError::Unsupported)
     }
 
     /// Returns the admitted adapter after device initialization.
@@ -365,6 +339,9 @@ impl NativeContext {
             self.graphics_queue_family,
             self.adapter_info.as_ref(),
         ) {
+            if !cached_device_supports_surface(surface.is_some(), self.swapchain_loader.is_some()) {
+                return Err(HalError::Unsupported);
+            }
             if let Some((wanted, _)) = selection
                 && adapter.stable_id() != wanted
             {
@@ -494,15 +471,21 @@ impl NativeContext {
                 .vertex_pipeline_stores_and_atomics(vertex_storage)
                 .multi_draw_indirect(multi_draw)
                 .sampler_anisotropy(core_features.sampler_anisotropy != 0);
-            let swapchain_extensions = [khr::swapchain::NAME.as_ptr()];
-            let enabled_extensions = if surface.is_some() {
-                swapchain_extensions.as_slice()
-            } else {
-                &[]
-            };
+            // Portability devices require `VK_KHR_portability_subset`; ordinary devices omit it.
+            // SAFETY: `physical` belongs to this live instance.
+            let available_device_extensions = unsafe {
+                self.instance
+                    .enumerate_device_extension_properties(physical)
+            }
+            .map_err(map_vk)?;
+            let (enabled_extensions, swapchain_enabled) =
+                device_extensions(&available_device_extensions);
+            if surface.is_some() && !swapchain_enabled {
+                continue;
+            }
             let create = vk::DeviceCreateInfo::default()
                 .enabled_features(&enabled_core)
-                .enabled_extension_names(enabled_extensions)
+                .enabled_extension_names(&enabled_extensions)
                 .queue_create_infos(&queue_infos)
                 .push_next(&mut enabled11)
                 .push_next(&mut enabled12)
@@ -673,8 +656,12 @@ impl NativeContext {
                 std::sync::Arc::new(parking_lot::Mutex::new(()))
             };
             let graphics_lock = self.graphics_queue_lock.clone();
-            let (descriptor_set, frame_slots) =
-                create_device_frame_state(&self.instance, &mut pending, queue_family)?;
+            let (descriptor_set, frame_slots) = create_device_frame_state(
+                &self.instance,
+                &mut pending,
+                queue_family,
+                swapchain_enabled,
+            )?;
 
             let transfer_worker = transfer::start_worker(
                 worker_device.clone(),
@@ -986,12 +973,14 @@ impl NativeContext {
     }
 
     /// Destroys backend-owned state associated with a borrowed host surface.
-    pub fn destroy_surface(&mut self, surface: NativeSurface) {
+    ///
+    /// Returns `false` only when native work could not drain and the surface was abandoned.
+    pub fn destroy_surface(&mut self, surface: NativeSurface) -> bool {
         let _ = self.wait_idle();
         if !self.is_drained() {
             // Keep the surface and swapchain alive when submitted uses cannot retire.
             core::mem::forget(surface);
-            return;
+            return false;
         }
         let _ = self.destroy_depth_target();
         if let Some(device) = self.device.as_ref() {
@@ -1014,6 +1003,7 @@ impl NativeContext {
             unsafe { self.surface_loader.destroy_surface(surface.handle, None) };
         }
         drop(surface);
+        true
     }
 
     ///

@@ -1,3 +1,10 @@
+use std::sync::Arc;
+
+use raw_window_handle::{
+    DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, WindowHandle,
+};
+use winit::window::Window;
+
 use clap::ValueEnum;
 use ez_gfx::Backend;
 
@@ -58,6 +65,29 @@ pub const fn clip_y(backend: Backend) -> crate::shared::math::ClipY {
         Backend::Vulkan => crate::shared::math::ClipY::Vulkan,
         Backend::Dx12 => crate::shared::math::ClipY::Dx12,
         Backend::Metal => crate::shared::math::ClipY::Metal,
+    }
+}
+/// Cloneable owner passed into the graphics surface.
+#[derive(Clone)]
+pub struct HostSurface {
+    window: Arc<Window>,
+}
+
+impl HostSurface {
+    pub fn attach(window: Arc<Window>) -> Self {
+        Self { window }
+    }
+}
+
+impl HasWindowHandle for HostSurface {
+    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+        self.window.window_handle()
+    }
+}
+
+impl HasDisplayHandle for HostSurface {
+    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+        self.window.display_handle()
     }
 }
 

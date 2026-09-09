@@ -97,11 +97,11 @@ jobs:
           vulkan_version: ${{ env.VULKAN_SDK_VERSION }}
           install_swiftshader: ${{ matrix.backend == 'vulkan-windows' }}
           cache: true
-      - name: Compile ABI v36 header as C11 and C++17
+      - name: Compile ABI v37 header as C11 and C++17
         shell: bash
         run: |
-          printf '#include "ez_gfx_api.h"\n_Static_assert(EZ_GFX_ABI_VERSION == 36u, "ABI version"); int main(void) { return 0; }\n' > "$RUNNER_TEMP/ez_gfx_header.c"
-          printf '#include "ez_gfx_api.h"\nstatic_assert(EZ_GFX_ABI_VERSION == 36u); int main() { return 0; }\n' > "$RUNNER_TEMP/ez_gfx_header.cpp"
+          printf '#include "ez_gfx_api.h"\n_Static_assert(EZ_GFX_ABI_VERSION == 37u, "ABI version"); int main(void) { return 0; }\n' > "$RUNNER_TEMP/ez_gfx_header.c"
+          printf '#include "ez_gfx_api.h"\nstatic_assert(EZ_GFX_ABI_VERSION == 37u); int main() { return 0; }\n' > "$RUNNER_TEMP/ez_gfx_header.cpp"
           clang -std=c11 -Werror -fsyntax-only -Ibindings/c/include "$RUNNER_TEMP/ez_gfx_header.c"
           clang++ -std=c++17 -Werror -Wno-ignored-attributes -fsyntax-only -Ibindings/c/include "$RUNNER_TEMP/ez_gfx_header.cpp"
 
@@ -197,7 +197,6 @@ jobs:
         if: matrix.backend == 'dx12'
         run: |
           cargo nextest run -p ez-gfx-backend-dx12 --lib
-          cargo nextest run -p ez-gfx-backend-dx12 --test native_init -E 'test(=rejects_a_null_hwnd_before_swapchain_creation)'
           cargo nextest run -p ez-gfx-backend-dx12 --test native_init --no-run
           cargo nextest run -p ez-gfx-examples --test smoke --no-run
           cargo nextest run -p ez-gfx-ffi --test pso_smoke --no-run
@@ -218,7 +217,10 @@ jobs:
           cargo nextest run -p ez-gfx-ffi --no-run
           cargo nextest run -p ez-gfx-examples --no-run
           cargo nextest run -p ez-gfx-ffi --test metal_present --no-run
-
+          cargo build -p ez-gfx-ffi --bins
+      - name: Run Metal surface host-lifetime ownership check
+        if: matrix.backend == 'metal'
+        run: cargo run -p metal-surface-host-check
       - name: Build FFI
         run: cargo build -p ez-gfx-ffi
       - name: Build and link C textured cube

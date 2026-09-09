@@ -145,7 +145,7 @@ jobs:
           cmake -S examples/02_textured_cube_c -B $build `
             "-DEZ_GFX_INCLUDE_DIR=$runtime" `
             "-DEZ_GFX_FFI_LIBRARY=$(Join-Path $runtime 'ez_gfx_ffi.dll.lib')" `
-            "-DEZ_GFX_FFI_DLL=$(Join-Path $runtime 'ez_gfx_ffi.dll')" `
+            "-DEZ_GFX_FFI_RUNTIME=$(Join-Path $runtime 'ez_gfx_ffi.dll')" `
             "-DEZ_GFX_COMPILER=$(Join-Path $compiler 'ez-gfx-compile.exe')" `
             "-DEZ_GFX_SHADER_ARTIFACT=$artifact"
           cmake --build $build --config Release

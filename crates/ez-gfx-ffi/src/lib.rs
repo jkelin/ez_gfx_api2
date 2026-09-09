@@ -57,10 +57,86 @@ use ez_gfx::raw::{
 use ez_gfx::{
     Backend, ContextOptions, DrawIndexedCommand, DynamicPipelineState, HeadlessSurfaceOptions, raw,
 };
-/// Identifies C ABI revision 36 for compatibility checks.
-pub const EZ_GFX_ABI_VERSION: u32 = 36;
+use raw_window_handle::{
+    AppKitDisplayHandle, AppKitWindowHandle, RawDisplayHandle, RawWindowHandle,
+    WaylandDisplayHandle, WaylandWindowHandle, Win32WindowHandle, WindowsDisplayHandle,
+    XcbDisplayHandle, XcbWindowHandle, XlibDisplayHandle, XlibWindowHandle,
+};
+/// Identifies C ABI revision 37 for compatibility checks.
+pub const EZ_GFX_ABI_VERSION: u32 = 37;
 /// Caps any caller-provided byte range at 16 MiB.
 pub const EZ_GFX_MAX_BOUNDARY_BYTES: usize = 16 * 1024 * 1024;
+fn nonzero_native_ptr(bits: u64) -> Result<core::ptr::NonNull<core::ffi::c_void>, EzGfxResult> {
+    let addr = usize::try_from(bits).map_err(|_| EzGfxResult::InvalidArgument)?;
+    core::ptr::NonNull::new(addr as *mut core::ffi::c_void).ok_or(EzGfxResult::InvalidArgument)
+}
+
+fn nonzero_win32_value(bits: u64) -> Result<core::num::NonZeroIsize, EzGfxResult> {
+    let addr = usize::try_from(bits).map_err(|_| EzGfxResult::InvalidArgument)?;
+    core::num::NonZeroIsize::new(isize::from_ne_bytes(addr.to_ne_bytes()))
+        .ok_or(EzGfxResult::InvalidArgument)
+}
+
+fn nonzero_xid(bits: u64) -> Result<u32, EzGfxResult> {
+    let xid = u32::try_from(bits).map_err(|_| EzGfxResult::InvalidArgument)?;
+    (xid != 0)
+        .then_some(xid)
+        .ok_or(EzGfxResult::InvalidArgument)
+}
+
+fn native_window_handles(
+    system: u8,
+    reserved: [u8; 6],
+    handle_a: u64,
+    handle_b: u64,
+) -> Result<(RawDisplayHandle, RawWindowHandle), EzGfxResult> {
+    if reserved != [0; 6] {
+        return Err(EzGfxResult::InvalidArgument);
+    }
+    match system {
+        value if value == EzGfxNativeWindowSystem::Win32 as u8 => {
+            let mut window = Win32WindowHandle::new(nonzero_win32_value(handle_a)?);
+            window.hinstance = Some(nonzero_win32_value(handle_b)?);
+            Ok((
+                RawDisplayHandle::Windows(WindowsDisplayHandle::new()),
+                RawWindowHandle::Win32(window),
+            ))
+        }
+        value if value == EzGfxNativeWindowSystem::Xlib as u8 => Ok((
+            RawDisplayHandle::Xlib(XlibDisplayHandle::new(
+                Some(nonzero_native_ptr(handle_a)?),
+                0,
+            )),
+            RawWindowHandle::Xlib(XlibWindowHandle::new(core::ffi::c_ulong::from(
+                nonzero_xid(handle_b)?,
+            ))),
+        )),
+        value if value == EzGfxNativeWindowSystem::Xcb as u8 => Ok((
+            RawDisplayHandle::Xcb(XcbDisplayHandle::new(
+                Some(nonzero_native_ptr(handle_a)?),
+                0,
+            )),
+            RawWindowHandle::Xcb(XcbWindowHandle::new(
+                core::num::NonZeroU32::new(nonzero_xid(handle_b)?)
+                    .ok_or(EzGfxResult::InvalidArgument)?,
+            )),
+        )),
+        value if value == EzGfxNativeWindowSystem::Wayland as u8 => Ok((
+            RawDisplayHandle::Wayland(WaylandDisplayHandle::new(nonzero_native_ptr(handle_a)?)),
+            RawWindowHandle::Wayland(WaylandWindowHandle::new(nonzero_native_ptr(handle_b)?)),
+        )),
+        value if value == EzGfxNativeWindowSystem::AppKit as u8 => {
+            if handle_b != 0 {
+                return Err(EzGfxResult::InvalidArgument);
+            }
+            Ok((
+                RawDisplayHandle::AppKit(AppKitDisplayHandle::new()),
+                RawWindowHandle::AppKit(AppKitWindowHandle::new(nonzero_native_ptr(handle_a)?)),
+            ))
+        }
+        _ => Err(EzGfxResult::InvalidArgument),
+    }
+}
 
 #[unsafe(no_mangle)]
 /// Returns the C ABI revision supported by this library.
@@ -164,12 +240,17 @@ pub extern "C" fn ez_gfx_context_wait_idle(context: EzGfxContext) -> EzGfxResult
     })
 }
 #[unsafe(no_mangle)]
-/// Destroys the graphics context after aborting every live descendant frame.
-pub extern "C" fn ez_gfx_context_destroy(context: EzGfxContext) {
-    catch_void(|| {
-        let Ok(context) = ContextHandle::from_raw(context) else {
-            return;
-        };
+/// Destroys the graphics context after aborting every live descendant frame. Reentrant entry or
+/// a boundary panic reports `TeardownAbandoned` because teardown completion is unproven.
+pub extern "C" fn ez_gfx_context_destroy(context: EzGfxContext) -> EzGfxResult {
+    catch_context_destroy(|| {
+        let context = try_handle!(ContextHandle, context);
+        if callback::check_entry(context).is_err() {
+            return EzGfxResult::TeardownAbandoned;
+        }
+        if raw::validate_context_owner(context).is_err() {
+            return EzGfxResult::InvalidContext;
+        }
         clear_owner_binding_drafts(context);
         while frame::remove_owner_frame(context).is_some() {
             // A failing descendant abort cannot prevent invalidation or context teardown.
@@ -177,8 +258,8 @@ pub extern "C" fn ez_gfx_context_destroy(context: EzGfxContext) {
         }
         buffer::remove_owner(context);
         callback::remove(context);
-        let _ = raw::destroy_context(context);
-    });
+        raw::destroy_context(context).into_ffi_result()
+    })
 }
 #[unsafe(no_mangle)]
 /// Replaces the context event callback and delivers pending events.
@@ -704,13 +785,17 @@ pub extern "C" fn ez_gfx_frame_abort(context: EzGfxContext, frame: EzGfxFrame) -
     })
 }
 #[unsafe(no_mangle)]
-/// Creates a native window presentation surface and returns its handle.
+/// Creates a native window presentation surface and returns its handle. After device
+/// initialization, host-managed or undefined Vulkan extents require one `ez_gfx_surface_resize`
+/// with the current host framebuffer extent before the first frame.
 ///
 /// # Safety
 ///
 /// A non-null `desc` must address one readable, aligned descriptor and
-/// `out_surface` one writable, aligned handle. Native objects must remain live
-/// until the returned surface is destroyed.
+/// `out_surface` one writable, aligned handle. The descriptor's native handles must be a matched
+/// pair from one live host on the context creator thread. They must remain live until successful
+/// surface teardown. If creation or teardown returns `TeardownAbandoned`, retain them for the
+/// process lifetime.
 pub unsafe extern "C" fn ez_gfx_surface_create_window(
     context: EzGfxContext,
     desc: *const EzGfxWindowSurfaceDesc,
@@ -727,13 +812,15 @@ pub unsafe extern "C" fn ez_gfx_surface_create_window(
             1 => true,
             _ => return EzGfxResult::InvalidArgument,
         };
+        let (display, window) =
+            match native_window_handles(desc.system, desc.reserved, desc.handle_a, desc.handle_b) {
+                Ok(handles) => handles,
+                Err(status) => return status,
+            };
         let context = try_handle!(ContextHandle, context);
-        match raw::create_surface_window_raw(
-            context,
-            desc.window as usize,
-            desc.display as usize,
-            cache,
-        ) {
+        // SAFETY: descriptor validation constructed a matched handle pair; the FFI contract keeps
+        // its host live through successful teardown or process-long after unproven teardown.
+        match unsafe { raw::create_surface_window_raw(context, display, window, cache) } {
             Ok(handle) => {
                 // SAFETY: `out_surface` is non-null, aligned, and writable.
                 unsafe { out_surface.write(handle.into_raw()) };
@@ -780,7 +867,9 @@ pub unsafe extern "C" fn ez_gfx_surface_create_headless(
 }
 
 #[unsafe(no_mangle)]
-/// Initializes the context device for the specified presentation surface.
+/// Initializes the context device for the specified presentation surface. A successful window
+/// initialization with a host-managed or undefined Vulkan extent remains unready until
+/// `ez_gfx_surface_resize` publishes the current host framebuffer extent.
 pub extern "C" fn ez_gfx_context_init_device(
     context: EzGfxContext,
     surface: EzGfxSurface,
@@ -788,15 +877,14 @@ pub extern "C" fn ez_gfx_context_init_device(
     catch_status(|| {
         let context = try_handle!(ContextHandle, context);
         let surface = try_handle!(SurfaceHandle, surface);
-        let initialized = raw::init_device(context, surface);
-        #[cfg(any(windows, target_vendor = "apple"))]
-        let initialized =
-            initialized.and_then(|()| raw::sync_window_surface_extent(context, surface));
+        let initialized = raw::init_device(context, surface)
+            .and_then(|()| raw::sync_window_surface_extent(context, surface));
         initialized.into_ffi_result()
     })
 }
 #[unsafe(no_mangle)]
-/// Requests new pixel dimensions for a presentation surface.
+/// Requests new pixel dimensions and publishes host-managed window extents for a presentation
+/// surface.
 pub extern "C" fn ez_gfx_surface_resize(
     context: EzGfxContext,
     surface: EzGfxSurface,
@@ -896,15 +984,18 @@ pub extern "C" fn ez_gfx_surface_set_snapshot_cache(
 
 #[unsafe(no_mangle)]
 /// Destroys a presentation surface owned by the context.
-pub extern "C" fn ez_gfx_surface_destroy(context: EzGfxContext, surface: EzGfxSurface) {
-    catch_void(|| {
-        if let (Ok(context), Ok(surface)) = (
-            ContextHandle::from_raw(context),
-            SurfaceHandle::from_raw(surface),
-        ) {
-            raw::destroy_surface(context, surface);
+pub extern "C" fn ez_gfx_surface_destroy(
+    context: EzGfxContext,
+    surface: EzGfxSurface,
+) -> EzGfxResult {
+    catch_status(|| {
+        let context = try_handle!(ContextHandle, context);
+        let surface = try_handle!(SurfaceHandle, surface);
+        if let Err(status) = callback::check_entry(context) {
+            return status;
         }
-    });
+        raw::destroy_surface(context, surface).into_ffi_result()
+    })
 }
 
 trait IntoFfiResult {
@@ -931,6 +1022,29 @@ fn catch_status<T: IntoFfiResult>(operation: impl FnOnce() -> T) -> EzGfxResult 
     catch_unwind(AssertUnwindSafe(operation))
         .map(IntoFfiResult::into_ffi_result)
         .unwrap_or(EzGfxResult::NativeFailure)
+}
+
+fn catch_context_destroy<T: IntoFfiResult>(operation: impl FnOnce() -> T) -> EzGfxResult {
+    // Any panic or reentrant rejection leaves context teardown unproven.
+    if callback::is_invoking() {
+        return EzGfxResult::TeardownAbandoned;
+    }
+    catch_unwind(AssertUnwindSafe(operation))
+        .map(IntoFfiResult::into_ffi_result)
+        .unwrap_or(EzGfxResult::TeardownAbandoned)
+}
+
+#[cfg(test)]
+mod context_destroy_tests {
+    use super::*;
+
+    #[test]
+    fn panic_maps_to_teardown_abandoned() {
+        assert_eq!(
+            catch_context_destroy(|| -> EzGfxResult { panic!("injected teardown panic") }),
+            EzGfxResult::TeardownAbandoned
+        );
+    }
 }
 
 fn catch_frame_terminal<T: IntoFfiResult>(

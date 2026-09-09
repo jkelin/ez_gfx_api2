@@ -69,14 +69,10 @@ enum NativeSurface {
     Metal(MetalSurface),
 }
 
-#[cfg(any(windows, target_vendor = "apple"))]
-pub(crate) enum SurfaceWindow {
-    #[cfg(windows)]
-    Win32 { window: usize, instance: usize },
-    #[cfg(target_vendor = "apple")]
-    AppKit { view: usize },
-    #[cfg(all(target_vendor = "apple", feature = "ffi"))]
-    MetalLayer { layer: usize },
+#[derive(Clone, Copy)]
+pub(crate) struct SurfaceWindow {
+    pub(crate) display: raw_window_handle::RawDisplayHandle,
+    pub(crate) window: raw_window_handle::RawWindowHandle,
 }
 
 enum NativeAllocation {
@@ -168,6 +164,7 @@ struct RetiredTexture {
 struct SurfaceRecord {
     native: NativeSurface,
     state: SurfaceState,
+    is_window: bool,
 }
 
 struct GeometryAllocation {
@@ -290,6 +287,20 @@ struct TransientBuffer {
     usage: TransientUse,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CleanupTestOutcome {
+    DrainedFailure(Error),
+    Undrained,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SurfaceInsertTestFailure {
+    IdentityInsertion,
+    InvalidPackedHandle,
+}
+
 struct ContextState {
     identity: ContextIdentity,
     options: ContextOptions,
@@ -344,6 +355,12 @@ struct ContextState {
     frame_render_target: Option<RenderTargetHandle>,
     last_readbacks: Vec<Vec<u8>>,
     observability: Observability,
+    #[cfg(test)]
+    cleanup_test_outcome: Option<CleanupTestOutcome>,
+    #[cfg(test)]
+    surface_insert_test_failure: Option<SurfaceInsertTestFailure>,
+    #[cfg(test)]
+    surface_rollback_test_abandoned: bool,
 }
 
 type ContextHandleArena = GenerationalArena<()>;
@@ -379,12 +396,17 @@ impl ThreadContexts {
 
         #[cfg(windows)]
         {
+            let abandoned = !self.states.is_empty();
             for (_, state) in self.states.drain() {
                 // Windows TLS destructors run under loader lock; native cleanup or joining can deadlock.
-                // Loader-lock callers must use this abandon path only, never destroy/wait_idle.
+                // Loader-lock callers must abandon GPU owners rather than claim successful cleanup.
                 std::mem::forget(state);
             }
-            result
+            if abandoned {
+                Err(Error::TeardownAbandoned)
+            } else {
+                result
+            }
         }
 
         #[cfg(not(windows))]
@@ -392,7 +414,7 @@ impl ThreadContexts {
             let mut result = result;
             for (_, state) in self.states.drain() {
                 let cleanup = context::cleanup_context_state(state, None);
-                if result.is_ok() {
+                if cleanup == Err(Error::TeardownAbandoned) || result.is_ok() {
                     result = cleanup;
                 }
             }
@@ -411,6 +433,11 @@ thread_local! {
     static CONTEXTS: RefCell<ThreadContexts> = RefCell::new(ThreadContexts {
         states: HashMap::new(),
     });
+}
+
+#[cfg(test)]
+pub(crate) fn cleanup_context_for_thread_exit() -> Result<()> {
+    CONTEXTS.with(|contexts| contexts.borrow_mut().cleanup_for_thread_exit())
 }
 
 mod buffers;
@@ -432,6 +459,8 @@ use native::{
 };
 mod render_target;
 mod shader;
+mod surface;
+use surface::destroy_native_surface;
 mod texture;
 
 pub use buffers::*;
@@ -440,6 +469,7 @@ pub use frame::*;
 pub use geometry::*;
 pub use render_target::*;
 pub use shader::*;
+pub use surface::*;
 pub use texture::*;
 
 fn with_surface_mut<T>(

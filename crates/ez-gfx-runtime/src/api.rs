@@ -68,7 +68,6 @@ impl ContextOptions {
             adapter_selection: None,
         })
     }
-
     /// Requests an explicit adapter by stable identity. The request bypasses
     /// default ranking but never bypasses admission: unknown identities fail
     /// `InvalidArgument`, disallowed software fails `InvalidArgument`, and

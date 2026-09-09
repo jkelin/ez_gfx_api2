@@ -1,4 +1,4 @@
-use core::{cell::Cell, ffi::c_void, marker::PhantomData, mem::ManuallyDrop, ops::Deref};
+use core::{cell::Cell, marker::PhantomData, mem::ManuallyDrop, ops::Deref};
 
 use crate::{
     BACKEND, TEXTURE_DESCRIPTOR_CAPACITY,
@@ -21,12 +21,10 @@ use gpu_allocator::{
     AllocationSizes, MemoryLocation,
     metal::{Allocation, AllocationCreateDesc, Allocator, AllocatorCreateDesc},
 };
-use objc2::{
-    msg_send,
-    rc::Retained,
-    runtime::{AnyObject, ProtocolObject},
-};
-use objc2_core_foundation::CGRect;
+use objc2::{rc::Retained, runtime::ProtocolObject};
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+use raw_window_metal::Layer;
+
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTLArgumentBuffersTier, MTLArgumentEncoder, MTLBlendFactor, MTLBlitCommandEncoder, MTLBuffer,
@@ -41,6 +39,102 @@ use objc2_metal::{
     MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage, MTLWinding,
 };
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
+const fn detach_backend_layer(pre_existing: bool) -> bool {
+    !pre_existing
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrawableExtent {
+    Existing(u32, u32),
+    Derived(u32, u32),
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "finite, rounded dimensions are proven positive and within u32 before casting"
+)]
+fn validated_pixel_extent(dimensions: [f64; 2]) -> Option<(u32, u32)> {
+    let [width, height] = dimensions.map(f64::round);
+    // Zero/negative values are minimized; nonfinite and post-rounding overflow cannot name pixels.
+    if !width.is_finite()
+        || !height.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+        || width > f64::from(u32::MAX)
+        || height > f64::from(u32::MAX)
+    {
+        return None;
+    }
+
+    Some((width as u32, height as u32))
+}
+
+fn resolve_drawable_extent(
+    drawable: [f64; 2],
+    bounds: [f64; 2],
+    contents_scale: f64,
+) -> Option<DrawableExtent> {
+    if drawable != [0.0, 0.0] {
+        return validated_pixel_extent(drawable)
+            .map(|(width, height)| DrawableExtent::Existing(width, height));
+    }
+
+    // A zero drawable may precede the first drawable acquisition. Invalid scale or bounds must
+    // remain NotReady rather than manufacturing a size for a minimized or malformed native layer.
+    if !contents_scale.is_finite() || contents_scale <= 0.0 {
+        return None;
+    }
+    validated_pixel_extent([bounds[0] * contents_scale, bounds[1] * contents_scale])
+        .map(|(width, height)| DrawableExtent::Derived(width, height))
+}
+
+#[cfg(test)]
+mod surface_extent_tests {
+    use super::{DrawableExtent, resolve_drawable_extent};
+
+    #[test]
+    fn drawable_extent_takes_precedence_over_layer_geometry() {
+        assert_eq!(
+            resolve_drawable_extent([640.0, 480.0], [10.0, 20.0], 3.0),
+            Some(DrawableExtent::Existing(640, 480))
+        );
+    }
+
+    #[test]
+    fn zero_drawable_extent_falls_back_to_scaled_layer_bounds() {
+        assert_eq!(
+            resolve_drawable_extent([0.0, 0.0], [320.0, 240.0], 2.0),
+            Some(DrawableExtent::Derived(640, 480))
+        );
+    }
+
+    #[test]
+    fn zero_or_partial_extents_remain_minimized() {
+        for (drawable, bounds, scale) in [
+            ([0.0, 0.0], [0.0, 480.0], 1.0),
+            ([0.0, 0.0], [640.0, 0.0], 1.0),
+            ([640.0, 0.0], [640.0, 480.0], 1.0),
+            ([0.0, 480.0], [640.0, 480.0], 1.0),
+        ] {
+            assert_eq!(resolve_drawable_extent(drawable, bounds, scale), None);
+        }
+    }
+
+    #[test]
+    fn nonfinite_or_overflowing_geometry_is_rejected() {
+        for (drawable, bounds, scale) in [
+            ([f64::NAN, 480.0], [640.0, 480.0], 1.0),
+            ([640.0, f64::INFINITY], [640.0, 480.0], 1.0),
+            ([0.0, 0.0], [f64::NAN, 480.0], 1.0),
+            ([0.0, 0.0], [640.0, 480.0], f64::INFINITY),
+            ([0.0, 0.0], [f64::from(u32::MAX), 480.0], 2.0),
+        ] {
+            assert_eq!(resolve_drawable_extent(drawable, bounds, scale), None);
+        }
+    }
+}
+
 /// Retains a non-`Send` Objective-C value for access and destruction on its creating thread.
 #[doc(hidden)]
 pub struct ThreadBound<T> {
@@ -307,89 +401,102 @@ struct SurfaceDepth {
     extent: (u32, u32),
 }
 
-/// Retained or borrowed `CAMetalLayer` and optional captured frame/depth state.
+/// Retained `CAMetalLayer`; a created observer layer weakly references its host until detached.
 pub struct NativeSurface {
-    layer: usize,
-    _owned_layer: Option<ThreadBound<Retained<CAMetalLayer>>>,
+    layer: ThreadBound<Layer>,
     presented_rgba8: Vec<u8>,
+    detach_on_destroy: bool,
     depth: Option<SurfaceDepth>,
 }
 impl NativeSurface {
-    /// Borrows a caller-owned `CAMetalLayer`.
+    /// Obtains and retains a Metal layer from a matched `AppKit` handle pair.
+    ///
+    /// # Safety
+    ///
+    /// The handles must belong to the same live `AppKit` host and this must run on the main thread.
     ///
     /// # Errors
     ///
-    /// Returns [`HalError::InvalidArgument`] when `layer` is null.
-    pub fn new(layer: *mut c_void, capture_presented: bool) -> Result<Self, HalError> {
-        Self::from_layer(layer, None, capture_presented)
-    }
-
-    /// Creates and attaches a retained `CAMetalLayer` to an AppKit view.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HalError::InvalidArgument`] when `view` is null.
-    pub fn from_appkit_view(view: *mut c_void, capture_presented: bool) -> Result<Self, HalError> {
-        if view.is_null() {
-            return Err(HalError::InvalidArgument);
-        }
-        let layer = CAMetalLayer::new();
-        // SAFETY: `view` comes from a live `RawWindowHandle::AppKit` borrowed
-        // for the surface lifetime; these selectors are valid on `NSView`.
-        unsafe {
-            let view = &*(view as *const AnyObject);
-            let bounds: CGRect = msg_send![view, bounds];
-            let backing: CGRect = msg_send![view, convertRectToBacking: bounds];
-            layer.setFrame(bounds);
-            layer.setDrawableSize(backing.size);
-            let _: () = msg_send![view, setWantsLayer: true];
-            let _: () = msg_send![view, setLayer: Retained::as_ptr(&layer)];
-        }
-        let pointer = Retained::as_ptr(&layer) as *mut c_void;
-        Self::from_layer(pointer, Some(ThreadBound::new(layer)), capture_presented)
-    }
-
-    fn from_layer(
-        layer: *mut c_void,
-        owned_layer: Option<ThreadBound<Retained<CAMetalLayer>>>,
+    /// Returns [`HalError::InvalidArgument`] for mismatched handles or a non-main-thread call.
+    pub unsafe fn new(
+        display: RawDisplayHandle,
+        window: RawWindowHandle,
         capture_presented: bool,
     ) -> Result<Self, HalError> {
-        if layer.is_null() {
+        let (RawDisplayHandle::AppKit(_), RawWindowHandle::AppKit(window)) = (display, window)
+        else {
+            return Err(HalError::InvalidArgument);
+        };
+        if objc2::MainThreadMarker::new().is_none() {
             return Err(HalError::InvalidArgument);
         }
-        // SAFETY: the layer is either retained by this surface or borrowed from
-        // the caller for the surface lifetime.
-        let metal_layer = unsafe { &*(layer as *const CAMetalLayer) };
+        // SAFETY: the raw handle borrows a live NSView retained by the safe surface host.
+        let layer = unsafe { Layer::from_ns_view(window.ns_view) };
+        let detach_on_destroy = detach_backend_layer(layer.pre_existing());
+        // SAFETY: Layer retains a non-null CAMetalLayer.
+        let metal_layer = unsafe { &*layer.as_ptr().cast::<CAMetalLayer>().as_ptr() };
         metal_layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm_sRGB);
         if capture_presented {
             metal_layer.setFramebufferOnly(false);
         }
         Ok(Self {
-            layer: layer as usize,
-            _owned_layer: owned_layer,
+            layer: ThreadBound::new(layer),
             presented_rgba8: Vec::new(),
+            detach_on_destroy,
             depth: None,
         })
     }
 
-    /// Reads the current nonzero drawable extent from the Metal layer.
-    #[must_use]
-    pub fn window_extent(&self) -> Option<(u32, u32)> {
-        // SAFETY: the layer is retained by this surface or by its caller.
-        let size = unsafe { &*(self.layer as *const CAMetalLayer) }.drawableSize();
-        let width = size.width.round();
-        let height = size.height.round();
-        if width <= 0.0
-            || height <= 0.0
-            || width > f64::from(u32::MAX)
-            || height > f64::from(u32::MAX)
-        {
-            return None;
-        }
-        Some((width as u32, height as u32))
+    fn metal_layer(&self) -> &CAMetalLayer {
+        // SAFETY: Layer retains a non-null CAMetalLayer.
+        unsafe { &*self.layer.as_ptr().cast::<CAMetalLayer>().as_ptr() }
     }
 
-    /// Empty before the first cached presentation; successful captures replace the full frame.
+    fn detach_from_host(&mut self) {
+        if self.detach_on_destroy {
+            self.metal_layer().removeFromSuperlayer();
+            self.detach_on_destroy = false;
+        }
+    }
+
+    /// Reads the current drawable extent, deriving an uninitialized size from native layer geometry.
+    #[must_use]
+    pub fn window_extent(&self) -> Option<(u32, u32)> {
+        let layer = self.metal_layer();
+        let drawable = layer.drawableSize();
+        let resolved = if drawable.width == 0.0 && drawable.height == 0.0 {
+            let bounds = layer.bounds();
+            resolve_drawable_extent(
+                [drawable.width, drawable.height],
+                [bounds.size.width, bounds.size.height],
+                layer.contentsScale(),
+            )
+        } else {
+            resolve_drawable_extent([drawable.width, drawable.height], [0.0, 0.0], 1.0)
+        }?;
+
+        match resolved {
+            DrawableExtent::Existing(width, height) => Some((width, height)),
+            DrawableExtent::Derived(width, height) => {
+                layer.setDrawableSize(objc2_core_foundation::CGSize {
+                    width: f64::from(width),
+                    height: f64::from(height),
+                });
+                Some((width, height))
+            }
+        }
+    }
+
+    /// Updates the layer drawable extent after a host resize or DPI change.
+    pub fn resize(&self, width: u32, height: u32) {
+        self.metal_layer()
+            .setDrawableSize(objc2_core_foundation::CGSize {
+                width: f64::from(width),
+                height: f64::from(height),
+            });
+    }
+
+    /// Empty before the first cached presentation.
     pub fn presented_rgba8(&self) -> &[u8] {
         &self.presented_rgba8
     }

@@ -647,7 +647,42 @@ fn partial_native_copy_failure_drains_before_idle_returns_and_preserves_future_f
     context.free(destination).unwrap();
     context.destroy_texture(texture).unwrap();
     context.destroy_pipeline(pipeline);
-    assert!(matches!(context.wait_idle(), Err(HalError::NativeFailure)));
+    let surface = NativeSurface {
+        window: 1,
+        swapchain: None,
+        buffers: Vec::new(),
+        rtv_heap: None,
+        width: 0,
+        height: 0,
+        presented: Vec::new(),
+        depth: None,
+    };
+    assert!(
+        context.destroy_surface(surface),
+        "typed worker failure still permits surface release after native queues drain"
+    );
+}
+
+#[test]
+fn surface_destroy_abandons_only_when_worker_drain_is_unprovable() {
+    let mut context = NativeContext::create_default(false).unwrap();
+    context.wait_idle_failure = Some(HalError::DeviceLost);
+    let surface = NativeSurface {
+        window: 1,
+        swapchain: None,
+        buffers: Vec::new(),
+        rtv_heap: None,
+        width: 0,
+        height: 0,
+        presented: Vec::new(),
+        depth: None,
+    };
+
+    assert!(!context.destroy_surface(surface));
+    assert!(!context.is_drained());
+
+    // A later successful native wait restores proof and permits normal device teardown.
+    context.wait_idle().unwrap();
 }
 
 #[test]

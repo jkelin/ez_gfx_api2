@@ -13,7 +13,7 @@ Migrate the original Odin/Vulkan `ez_gfx_api` to Rust/Cargo while roughly preser
 - Runtime packages must not depend on or bundle the Slang compiler.
 - Vulkan, DX12, and Metal are required; Vulkan-only abstractions are incomplete.
 - Explicit shader target attributes are authoritative for target intent.
-- Rust uses the clean context-owned interface; C/C# use the explicit ABI 36 lifecycle through the dedicated FFI seam.
+- Rust uses the clean context-owned interface; C/C# use the explicit ABI 37 lifecycle through the dedicated FFI seam.
 - External inputs and binary artifacts require validation; no panic crosses FFI.
 - OpenGL, DX11, software rasterizers, a custom shader DSL, and a custom window system are out of scope.
 - `gpu-allocator` 0.28 is the selected cross-backend Rust allocator.
@@ -29,7 +29,7 @@ A virtual workspace separates core types, runtime/artifact loading, offline in-p
 
 ### P-002: Public API and C ABI bindings â€” Owning Rust facade and raw FFI
 
-One owning `Context` controls native lifetime and invalidates every descendant on destruction or drop. Resource wrappers retain memory-safe access but not an independent native context lifetime; texture wrapper drop intentionally leaves its stable bindless heap entry resident until context teardown. `Surface::begin_frame` and `Context::begin_frame` return target-less owning `Frame` values; configure methods attach logical swapchain or cached named targets. Recording borrows frames mutably, `Frame::finish(self)` preserves exact errors, and `Drop` aborts. ABI 36 alone exposes explicit lifecycle calls and opaque generational `u64` handles, including `EzGfxFrame`.
+One owning `Context` controls native lifetime and invalidates every descendant on destruction or drop. Resource wrappers retain memory-safe access but not an independent native context lifetime; texture wrapper drop intentionally leaves its stable bindless heap entry resident until context teardown. `Surface::begin_frame` and `Context::begin_frame` return target-less owning `Frame` values; configure methods attach logical swapchain or cached named targets. Recording borrows frames mutably, `Frame::finish(self)` preserves exact errors, and `Drop` aborts. ABI 37 alone exposes explicit lifecycle calls and opaque generational `u64` handles, including `EzGfxFrame`.
 
 ### P-003: Multi-backend hardware abstraction â€” Custom static raw HAL
 
@@ -101,7 +101,7 @@ Backend-specific offscreen/readback fixtures provide PNG goldens and tolerances;
 
 ### P-020: Migration cutover â€” Clean ownership cutover
 
-The final cutover uses the shared `Example` host for winit inversion, native window hosting, resize, input, automation, and consuming frame dispatch. Each main creates platform-free `ContextOptions` and calls `Context::create_surface_window` with the host's `HasWindowHandle`; initial extent comes from the native window. Resources need no artificial scopes or ordered manual teardown: `Context::destroy` and owner drop invalidate and destroy all context-owned resources, including surfaces and retained texture-heap entries. Rust exposes no compatibility aliases or per-frame texture retention; ABI 36 preserves explicit C lifecycle and separate window/headless surface constructors.
+The final cutover uses the shared `Example` host for winit inversion, native window hosting, resize, input, automation, and consuming frame dispatch. Each main creates platform-free `ContextOptions` and calls `Context::create_surface_window` with the host's `HasWindowHandle`; initial extent comes from the native window. Resources need no artificial scopes or ordered manual teardown: `Context::destroy` and owner drop invalidate and destroy all context-owned resources, including surfaces and retained texture-heap entries. Rust exposes no compatibility aliases or per-frame texture retention; ABI 37 preserves explicit C lifecycle and separate window/headless surface constructors.
 
 ### P-021: Cross-backend shader execution semantics â€” Target-native layouts with canonical semantic ABI
 

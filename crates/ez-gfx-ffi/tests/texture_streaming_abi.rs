@@ -220,7 +220,7 @@ fn context_decode_workers_flow_from_c_descriptor_to_creation() {
             unsafe { ez_gfx_texture_get_binding(context, texture, &raw mut binding) };
         assert_eq!(status, EzGfxResult::Ok, "workers={workers}");
         ez_gfx_texture_unload(context, texture);
-        ez_gfx_context_destroy(context);
+        assert_eq!(ez_gfx_context_destroy(context), EzGfxResult::Ok);
     }
 
     // The Vulkan descriptor path parses the same trailing field.
@@ -240,5 +240,5 @@ fn context_decode_workers_flow_from_c_descriptor_to_creation() {
         },
         EzGfxResult::Ok
     );
-    ez_gfx_context_destroy(vulkan);
+    assert_eq!(ez_gfx_context_destroy(vulkan), EzGfxResult::Ok);
 }

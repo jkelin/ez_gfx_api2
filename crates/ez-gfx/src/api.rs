@@ -19,9 +19,11 @@ use ez_gfx_runtime::{
     LifecycleError,
     binding::{PublicBinding as RawBinding, ResourceIdentity},
 };
-use raw_window_handle::HasWindowHandle;
-#[cfg(any(windows, target_vendor = "apple"))]
-use raw_window_handle::RawWindowHandle;
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+
+trait SurfaceHost: HasWindowHandle + HasDisplayHandle {}
+
+impl<T> SurfaceHost for T where T: HasWindowHandle + HasDisplayHandle {}
 
 use crate::state;
 
@@ -59,6 +61,9 @@ pub enum Error {
     /// A registered event callback panicked and was removed.
     #[error("graphics event callback panicked")]
     CallbackPanicked,
+    /// Native teardown was abandoned because submitted work could not be proven complete.
+    #[error("native teardown abandoned; borrowed host handles must remain alive")]
+    TeardownAbandoned,
     /// Preserves a lifecycle or handle-validation cause.
     #[error(transparent)]
     Lifecycle(#[from] LifecycleError),
@@ -117,6 +122,22 @@ struct CachedRenderTarget {
     extent: (u32, u32),
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ContextTeardownDisposition {
+    Live,
+    Released,
+    Unproven,
+}
+
+fn terminal_teardown_disposition(result: &Result<()>) -> ContextTeardownDisposition {
+    if matches!(result, Err(Error::TeardownAbandoned)) {
+        ContextTeardownDisposition::Unproven
+    } else {
+        // Every other result is returned only after terminal cleanup released native ownership.
+        ContextTeardownDisposition::Released
+    }
+}
+
 struct ContextInner {
     handle: ContextHandle,
     callback: RefCell<Option<Box<EventCallback>>>,
@@ -124,6 +145,7 @@ struct ContextInner {
     render_targets: RefCell<HashMap<String, CachedRenderTarget>>,
     closed: Cell<bool>,
     next_readback: Cell<u64>,
+    teardown: Cell<ContextTeardownDisposition>,
 }
 
 struct DispatchGuard<'a>(&'a Cell<bool>);
@@ -138,7 +160,8 @@ impl Drop for ContextInner {
     fn drop(&mut self) {
         if !self.closed.replace(true) {
             // TLS state may already have run its own destructor during thread exit.
-            state::drop_context(self.handle);
+            let result = state::drop_context(self.handle);
+            self.teardown.set(terminal_teardown_disposition(&result));
         }
     }
 }
@@ -157,7 +180,10 @@ impl Drop for Context {
         if self.owner && !self.inner.closed.replace(true) {
             // Drop cannot report native teardown failures; `destroy` remains the
             // deterministic path when the caller needs the result.
-            state::drop_context(self.inner.handle);
+            let result = state::drop_context(self.inner.handle);
+            self.inner
+                .teardown
+                .set(terminal_teardown_disposition(&result));
         }
     }
 }
@@ -176,6 +202,7 @@ impl Context {
                 dispatching: Cell::new(false),
                 next_readback: Cell::new(1),
                 closed: Cell::new(false),
+                teardown: Cell::new(ContextTeardownDisposition::Live),
             }),
             owner: true,
         })
@@ -368,11 +395,16 @@ impl Context {
     /// Returns [`Error`] when teardown or pending event dispatch fails.
     pub fn destroy(mut self) -> Result<()> {
         self.check_entry()?;
+        state::validate_context_owner(self.inner.handle)?;
         if self.inner.closed.replace(true) {
             return Err(Error::InvalidContext);
         }
         self.owner = false;
-        state::destroy_context(self.inner.handle)
+        let result = state::destroy_context(self.inner.handle);
+        self.inner
+            .teardown
+            .set(terminal_teardown_disposition(&result));
+        result
     }
 
     /// Enumerates adapters visible to all compiled backends.
@@ -392,11 +424,53 @@ struct SurfaceInner {
     context: Rc<ContextInner>,
     handle: SurfaceHandle,
     target: RefCell<Option<Rc<RenderTargetInner>>>,
+    // Keep the host alive until backend surface destruction releases every borrowed handle.
+    host: Option<Box<dyn SurfaceHost>>,
+}
+
+fn failed_window_surface_creation<W>(host: W, error: Error) -> Error {
+    if error == Error::TeardownAbandoned {
+        // Failed native rollback may still borrow the host, so it must share the native leak.
+        core::mem::forget(host);
+    }
+    error
+}
+
+fn teardown_owned_host<T>(host: &mut Option<T>, destroy_native: impl FnOnce() -> Result<()>) {
+    match destroy_native() {
+        Ok(()) => {
+            // Native handles are gone, so releasing the owner is now safe.
+            drop(host.take());
+        }
+        Err(Error::TeardownAbandoned) => {
+            if let Some(host) = host.take() {
+                // Abandoned native objects still borrow this host and intentionally share their leak.
+                core::mem::forget(host);
+            }
+        }
+        Err(_) => {
+            if let Some(host) = host.take() {
+                // A valid safe surface cannot become stale or wrong-thread during drop. If that
+                // invariant is ever broken, preserve the possibly borrowed host conservatively.
+                core::mem::forget(host);
+            }
+        }
+    }
 }
 
 impl Drop for SurfaceInner {
     fn drop(&mut self) {
-        state::destroy_surface(self.context.handle, self.handle);
+        match self.context.teardown.get() {
+            ContextTeardownDisposition::Live => teardown_owned_host(&mut self.host, || {
+                state::destroy_surface(self.context.handle, self.handle)
+            }),
+            ContextTeardownDisposition::Released => {
+                teardown_owned_host(&mut self.host, || Ok(()));
+            }
+            ContextTeardownDisposition::Unproven => {
+                teardown_owned_host(&mut self.host, || Err(Error::TeardownAbandoned));
+            }
+        }
     }
 }
 
@@ -477,56 +551,44 @@ impl Surface {
 impl Context {
     /// Creates and initializes a window surface from `raw-window-handle`.
     ///
-    /// The drawable extent is queried from the native window after device
-    /// initialization; callers do not provide an initial size.
+    /// An authoritative native extent is queried after device initialization. Window systems that
+    /// report a host-managed extent, notably Wayland, publish the surface unready until the
+    /// toolkit-neutral caller forwards its configure-event dimensions through [`Surface::resize`].
+    /// Callers never provide dimensions in the creation descriptor.
     ///
     /// # Errors
-    /// Returns [`Error`] when the handle is unavailable or unsupported, or
-    /// when native surface creation, device initialization, or sizing fails.
+    /// Returns [`Error`] when the handle is unavailable or unsupported, native creation or device
+    /// initialization fails, or the authoritative native extent is minimized. If post-native
+    /// publication rollback returns [`Error::TeardownAbandoned`], the host is intentionally retained
+    /// for the process lifetime.
     pub fn create_surface_window<W>(
         &self,
-        window: &W,
+        host: W,
         cache_presented_snapshots: bool,
     ) -> Result<Surface>
     where
-        W: HasWindowHandle + ?Sized,
+        W: HasWindowHandle + HasDisplayHandle + 'static,
     {
         self.check_entry()?;
-        let raw = window
+        let display = host
+            .display_handle()
+            .map_err(|_| Error::InvalidArgument)?
+            .as_raw();
+        let window = host
             .window_handle()
             .map_err(|_| Error::InvalidArgument)?
             .as_raw();
-        #[cfg(any(windows, target_vendor = "apple"))]
-        {
-            let window = match raw {
-                #[cfg(windows)]
-                RawWindowHandle::Win32(handle) => state::SurfaceWindow::Win32 {
-                    window: usize::from_ne_bytes(handle.hwnd.get().to_ne_bytes()),
-                    instance: usize::from_ne_bytes(
-                        handle
-                            .hinstance
-                            .ok_or(Error::InvalidArgument)?
-                            .get()
-                            .to_ne_bytes(),
-                    ),
-                },
-                #[cfg(target_vendor = "apple")]
-                RawWindowHandle::AppKit(handle) => state::SurfaceWindow::AppKit {
-                    view: handle.ns_view.as_ptr() as usize,
-                },
-                _ => return Err(Error::Unsupported),
-            };
-            let handle =
-                state::create_surface_window(self.raw(), window, cache_presented_snapshots)?;
-            let initialized = state::init_device(self.raw(), handle)
-                .and_then(|()| state::sync_window_surface_extent(self.raw(), handle));
-            self.publish_surface(handle, initialized)
-        }
-        #[cfg(not(any(windows, target_vendor = "apple")))]
-        {
-            let _ = (raw, cache_presented_snapshots);
-            Err(Error::Unsupported)
-        }
+        let handle = match state::create_surface_window(
+            self.raw(),
+            state::SurfaceWindow { display, window },
+            cache_presented_snapshots,
+        ) {
+            Ok(handle) => handle,
+            Err(error) => return Err(failed_window_surface_creation(host, error)),
+        };
+        let initialized = state::init_device(self.raw(), handle)
+            .and_then(|()| state::sync_window_surface_extent(self.raw(), handle));
+        self.publish_surface(handle, initialized, Some(Box::new(host)))
     }
 
     /// Creates, initializes, and sizes a headless surface atomically.
@@ -540,13 +602,19 @@ impl Context {
         self.check_entry()?;
         let handle = state::create_surface_headless(self.raw(), options)?;
         let initialized = state::init_device(self.raw(), handle);
-        self.publish_surface(handle, initialized)
+        self.publish_surface(handle, initialized, None)
     }
 
-    fn publish_surface(&self, handle: SurfaceHandle, initialized: Result<()>) -> Result<Surface> {
+    fn publish_surface(
+        &self,
+        handle: SurfaceHandle,
+        initialized: Result<()>,
+        mut host: Option<Box<dyn SurfaceHost>>,
+    ) -> Result<Surface> {
         if let Err(error) = initialized {
-            // A partially initialized surface is never published into the owning interface.
-            state::destroy_surface(self.raw(), handle);
+            // Preserve the initialization failure while disposing of the host according to the
+            // typed native teardown result.
+            teardown_owned_host(&mut host, || state::destroy_surface(self.raw(), handle));
             return Err(error);
         }
         self.complete(Ok(Surface {
@@ -554,6 +622,7 @@ impl Context {
                 context: Rc::clone(&self.inner),
                 handle,
                 target: RefCell::new(None),
+                host,
             }),
         }))
     }

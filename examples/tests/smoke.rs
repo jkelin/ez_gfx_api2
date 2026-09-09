@@ -49,12 +49,24 @@ const TARGET_BACKENDS: &[&str] = &["vulkan", "dx12"];
 const TARGET_BACKENDS: &[&str] = &["vulkan"];
 static CAPTURE_ID: AtomicU64 = AtomicU64::new(0);
 
+const fn uses_reference_snapshot(backend: &str) -> bool {
+    // Unknown and secondary backends must never overwrite Vulkan's immutable reference.
+    matches!(backend.as_bytes(), b"vulkan")
+}
+
+#[test]
+fn snapshot_reference_policy_is_vulkan_only() {
+    for (backend, expected) in [("vulkan", true), ("dx12", false), ("metal", false)] {
+        assert_eq!(uses_reference_snapshot(backend), expected, "{backend}");
+    }
+}
+
 fn snapshot(binary: &str, file: &str, backend: &str) -> anyhow::Result<(String, image::RgbaImage)> {
     let reference = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("snapshots")
         .join(file);
-    // Secondary backends use isolated captures because rasterization permits backend-specific edge pixels.
-    let temporary = backend != TARGET_BACKENDS[0];
+    // Only Vulkan owns immutable references; every other backend captures independently.
+    let temporary = !uses_reference_snapshot(backend);
     let path = if temporary {
         std::env::temp_dir().join(format!(
             "ez-gfx-smoke-{}-{}-{backend}-{file}",

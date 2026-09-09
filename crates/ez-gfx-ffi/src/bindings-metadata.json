@@ -51,7 +51,8 @@
         "EzGfxResult_Unsupported": {},
         "EzGfxResult_DeviceLost": {},
         "EzGfxResult_QueueFull": {},
-        "EzGfxResult_Cancelled": {}
+        "EzGfxResult_Cancelled": {},
+        "EzGfxResult_TeardownAbandoned": {}
       }
     },
     "enum:EzGfxTextureError": {
@@ -298,13 +299,15 @@
     "struct:EzGfxWindowSurfaceDesc": {
       "attrs": {},
       "children": {
-        "window": {
-          "nullable": "false"
+        "system": {
+          "type": "EzGfxNativeWindowSystem"
         },
-        "display": {
-          "nullable": "true"
+        "cache_presented_snapshots": {},
+        "reserved": {
+          "array-length": "6"
         },
-        "cache_presented_snapshots": {}
+        "handle_a": {},
+        "handle_b": {}
       }
     },
     "struct:EzGfxHeadlessSurfaceDesc": {
@@ -767,14 +770,14 @@
     },
     "function:ez_gfx_context_destroy": {
       "attrs": {
-        "return": "void",
-        "returns-doc": "No return value; wait or release failures cannot be reported through the stable ABI."
+        "return": "EzGfxResult",
+        "returns-doc": "Returns EzGfxResult_Ok once teardown drains, EzGfxResult_InvalidContext for zero, stale, repeated, or wrong-thread handles, EzGfxResult_TeardownAbandoned when native completion is unproven or reentrant entry or a boundary panic prevents teardown, or another typed error only after terminal drained cleanup."
       },
       "children": {
         "context": {
-          "nullable": "true",
+          "nullable": "false",
           "type": "EzGfxContext",
-          "doc": "Context to destroy on its creator thread; zero, stale, repeated, and wrong-thread calls are ignored."
+          "doc": "Context to destroy on its creator thread; zero, stale, repeated, and wrong-thread calls report EzGfxResult_InvalidContext."
         }
       }
     },
@@ -782,14 +785,14 @@
       "attrs": {
         "return": "EzGfxResult",
         "managed": "surface-create",
-        "returns-doc": "Returns EzGfxResult_Ok or a validation/native error."
+        "returns-doc": "Returns EzGfxResult_Ok, EzGfxResult_TeardownAbandoned when failed post-native publication cannot prove surface release, or a validation/native error."
       },
       "children": {
         "desc": {
           "type": "const EzGfxWindowSurfaceDesc *",
           "nullable": "false",
           "direction": "in",
-          "doc": "Borrowed native window handles."
+          "doc": "Portable tagged native window handles; no caller extent. After device initialization, host-managed or undefined Vulkan extents require ez_gfx_surface_resize with the current host framebuffer extent before the first frame."
         },
         "out_surface": {
           "type": "EzGfxSurface *",
@@ -836,7 +839,7 @@
       "children": {
         "surface": {
           "type": "EzGfxSurface",
-          "doc": "Surface owned by context."
+          "doc": "Surface owned by context. Host-managed or undefined Vulkan extents require an initial host resize after successful initialization."
         },
         "context": {
           "type": "EzGfxContext",
@@ -853,7 +856,7 @@
       "children": {
         "surface": {
           "type": "EzGfxSurface",
-          "doc": "Surface to resize."
+          "doc": "Surface to resize or initialize with a host-managed framebuffer extent."
         },
         "width": {
           "doc": "New width; zero is valid only with zero height for minimized state."
@@ -2012,18 +2015,19 @@
     },
     "function:ez_gfx_surface_destroy": {
       "attrs": {
-        "return": "void",
-        "returns-doc": "No return value; null handles are ignored."
+        "return": "EzGfxResult",
+        "returns-doc": "Returns EzGfxResult_Ok once teardown drains, EzGfxResult_InvalidContext for zero, stale, foreign, repeated, or wrong-thread handles, EzGfxResult_TeardownAbandoned when submitted native work cannot be proven complete, or another typed backend result."
       },
       "children": {
         "surface": {
           "type": "EzGfxSurface",
-          "doc": "Surface to destroy."
+          "nullable": "false",
+          "doc": "Surface to destroy; zero, stale, foreign, and repeated handles report EzGfxResult_InvalidContext."
         },
         "context": {
           "type": "EzGfxContext",
-          "nullable": "true",
-          "doc": "Owning context; zero and stale values are ignored."
+          "nullable": "false",
+          "doc": "Owning context; zero, stale, and wrong-thread handles report EzGfxResult_InvalidContext."
         }
       }
     },
@@ -2066,6 +2070,10 @@
           "doc": "Receives exactly 16 identifier bytes."
         }
       }
+    },
+    "enum:EzGfxNativeWindowSystem": {
+      "attrs": {},
+      "children": {}
     }
   }
 }
