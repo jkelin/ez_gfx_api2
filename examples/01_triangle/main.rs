@@ -9,8 +9,7 @@ const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
 
 fn main() -> anyhow::Result<()> {
-    let (program, config) = ExampleProgram::new("01_triangle", WIDTH, HEIGHT, "ez_gfx_api2");
-    let mut example = Example::new(config)?;
+    let mut example = Example::new("01_triangle", WIDTH, HEIGHT, "ez_gfx_api2")?;
     {
         let context = example.context();
         let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -38,28 +37,24 @@ fn main() -> anyhow::Result<()> {
         let indices = context.upload_indices(&[0_u32, 1, 2])?;
         let first_index = indices.range()?.0;
         let positions_heap = context.create_vertex_heap("positions")?;
-        let positions = positions_heap.upload(&positions)?;
+        let _positions = positions_heap.upload(&positions)?;
         let shader = context.load_shader(&shader_bytes)?;
-        let indirect = context.acquire_counted_buffer::<DrawIndexedCommand>(1)?;
-        indirect.write(
-            0,
-            &[DrawIndexedCommand {
-                index_count: 3,
-                instance_count: 1,
-                first_index,
-                vertex_offset: 0,
-                first_instance: 0,
-            }],
-        )?;
-
-        indirect.publish_count(1)?;
 
         while let Some(window_frame) = example.wait_for_next_frame()? {
             let mut frame = example.surface().begin_frame()?;
             let swapchain_target =
                 frame.configure_swapchain(window_frame.size, Format::Bgra8Srgb)?;
-            frame.retain_vertex_allocation(&positions)?;
-            frame.retain_index_allocation(&indices)?;
+            // Counter buffers are one-frame values: the first bound frame consumes them.
+            let commands = [DrawIndexedCommand {
+                index_count: 3,
+                instance_count: 1,
+                first_index,
+                vertex_offset: 0,
+                first_instance: 0,
+            }];
+            let indirect = example
+                .context()
+                .acquire_counter_buffer_from(commands.as_slice())?;
             frame.add_graphics(
                 &shader,
                 &indirect,
@@ -70,7 +65,6 @@ fn main() -> anyhow::Result<()> {
             example.handle_frame(frame, swapchain_target)?;
         }
     }
-    let report = example.close()?;
-    program.finish(report);
+    example.close()?;
     Ok(())
 }

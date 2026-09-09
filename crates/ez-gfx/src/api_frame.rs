@@ -1,4 +1,71 @@
 #[derive(Clone, Copy, Eq, PartialEq)]
+enum BufferUse {
+    Available,
+    Claimed,
+    Consumed,
+}
+
+mod buffer_data {
+    pub trait Sealed {}
+
+    impl<T: bytemuck::Pod> Sealed for super::BufferSource<'_, T> {}
+    impl<T: bytemuck::Pod> Sealed for &[T] {}
+    impl<T: bytemuck::Pod> Sealed for &Vec<T> {}
+}
+
+/// Explicit source for one POD buffer element.
+///
+/// Slices and vectors can be passed directly to context acquisition helpers.
+/// Arrays use `.as_slice()` so they cannot be mistaken for one array-valued element.
+pub struct BufferSource<'a, T: bytemuck::Pod> {
+    value: &'a T,
+}
+
+impl<'a, T: bytemuck::Pod> BufferSource<'a, T> {
+    /// Borrows one element without allocating an intermediate collection.
+    pub const fn one(value: &'a T) -> Self {
+        Self { value }
+    }
+}
+
+/// POD input accepted by context buffer acquisition helpers.
+pub trait BufferData: buffer_data::Sealed {
+    /// Element stored by the acquired buffer.
+    type Element: bytemuck::Pod;
+
+    #[doc(hidden)]
+    fn as_buffer_slice(&self) -> &[Self::Element];
+}
+
+impl<T: bytemuck::Pod> BufferData for BufferSource<'_, T> {
+    type Element = T;
+
+    fn as_buffer_slice(&self) -> &[T] {
+        core::slice::from_ref(self.value)
+    }
+}
+
+impl<T: bytemuck::Pod> BufferData for &[T] {
+    type Element = T;
+
+    fn as_buffer_slice(&self) -> &[T] {
+        self
+    }
+}
+
+impl<T: bytemuck::Pod> BufferData for &Vec<T> {
+    type Element = T;
+
+    fn as_buffer_slice(&self) -> &[T] {
+        self
+    }
+}
+
+fn buffer_data_slice<D: BufferData + ?Sized>(data: &D) -> &[D::Element] {
+    data.as_buffer_slice()
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum TransientState {
     Live,
     Consumed,
@@ -18,10 +85,7 @@ struct TransientInner {
 
 impl Drop for TransientInner {
     fn drop(&mut self) {
-        // Exactly one increment accompanies each materialization, and the frame owns this lease.
-        self.buffer
-            .borrowed
-            .set(self.buffer.borrowed.get().saturating_sub(1));
+        // The frame owns the sole native lease after successful materialization.
         if self.state.get() != TransientState::Live {
             return;
         }
@@ -44,13 +108,13 @@ struct BufferInner {
     element_count: u32,
     bytes: RefCell<Vec<u8>>,
     published_count: Cell<u32>,
-    borrowed: Cell<u32>,
+    usage: Cell<BufferUse>,
 }
 
 impl BufferInner {
     fn write<T: bytemuck::Pod>(&self, start_index: usize, values: &[T]) -> Result<()> {
-        // Zero-sized types and range overflow are rejected below; imported snapshots are immutable.
-        if self.borrowed.get() != 0 {
+        // Claimed and consumed one-frame values cannot be rewritten.
+        if self.usage.get() != BufferUse::Available {
             return Err(Error::NotReady);
         }
         if core::mem::size_of::<T>() != self.element_size as usize {
@@ -91,13 +155,13 @@ impl<T: bytemuck::Pod> Buffer<T> {
     }
 }
 
-/// Context-owned typed buffer carrying a separately publishable visible count.
-pub struct CountedBuffer<T: bytemuck::Pod> {
+/// Context-acquired one-frame buffer carrying a separately publishable visible count.
+pub struct CounterBuffer<T: bytemuck::Pod> {
     inner: Rc<BufferInner>,
     marker: PhantomData<T>,
 }
 
-impl<T: bytemuck::Pod> CountedBuffer<T> {
+impl<T: bytemuck::Pod> CounterBuffer<T> {
     /// Replaces a typed element range.
     ///
     /// # Errors
@@ -119,8 +183,8 @@ impl<T: bytemuck::Pod> CountedBuffer<T> {
             inner: Rc::clone(&self.inner.context),
         };
         context.check_entry()?;
-        // Publication changes metadata only, but must not diverge from an imported snapshot.
-        if self.inner.borrowed.get() != 0 {
+        // Publication after a frame claim would diverge from the staged contents.
+        if self.inner.usage.get() != BufferUse::Available {
             return Err(Error::NotReady);
         }
         if count > self.inner.element_count {
@@ -132,7 +196,12 @@ impl<T: bytemuck::Pod> CountedBuffer<T> {
 }
 
 impl Context {
-    fn allocate_buffer<T: bytemuck::Pod>(&self, element_count: usize) -> Result<Rc<BufferInner>> {
+    fn allocate_buffer<T: bytemuck::Pod>(
+        &self,
+        element_count: usize,
+        initial: Option<&[T]>,
+        published_count: u32,
+    ) -> Result<Rc<BufferInner>> {
         // Empty and zero-sized buffers cannot produce valid native bindings.
         self.check_entry()?;
         let element_size =
@@ -142,37 +211,82 @@ impl Context {
             .checked_mul(element_count as usize)
             .filter(|size| element_size != 0 && element_count != 0 && *size <= 16 * 1024 * 1024)
             .ok_or(Error::InvalidArgument)?;
+        let bytes = match initial {
+            Some(values) if values.len() == element_count as usize => {
+                bytemuck::cast_slice(values).to_vec()
+            }
+            Some(_) => return Err(Error::InvalidArgument),
+            None => vec![0; byte_count],
+        };
         Ok(Rc::new(BufferInner {
             context: Rc::clone(&self.inner),
             element_size,
             element_count,
-            bytes: RefCell::new(vec![0; byte_count]),
-            published_count: Cell::new(0),
-            borrowed: Cell::new(0),
+            bytes: RefCell::new(bytes),
+            published_count: Cell::new(published_count),
+            usage: Cell::new(BufferUse::Available),
         }))
     }
 
-    /// Acquires a reusable typed buffer by element count.
+    /// Acquires a one-frame typed buffer by element count.
     ///
     /// # Errors
     /// Returns [`Error`] when the count, type size, or context is invalid.
     pub fn acquire_buffer<T: bytemuck::Pod>(&self, element_count: usize) -> Result<Buffer<T>> {
         Ok(Buffer {
-            inner: self.allocate_buffer::<T>(element_count)?,
+            inner: self.allocate_buffer::<T>(element_count, None, 0)?,
             marker: PhantomData,
         })
     }
 
-    /// Acquires a reusable typed counted buffer by element count.
+    /// Acquires a correctly-sized one-frame typed buffer initialized from POD data.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when the input is empty, oversized, zero-sized, or the context is invalid.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the source type carries element inference and prevents scalar/array ambiguity"
+    )]
+    pub fn acquire_buffer_from<D: BufferData>(&self, data: D) -> Result<Buffer<D::Element>> {
+        let values = buffer_data_slice(&data);
+        Ok(Buffer {
+            inner: self.allocate_buffer(values.len(), Some(values), 0)?,
+            marker: PhantomData,
+        })
+    }
+
+    /// Acquires a one-frame typed counter buffer by element count.
     ///
     /// # Errors
     /// Returns [`Error`] when the count, type size, or context is invalid.
-    pub fn acquire_counted_buffer<T: bytemuck::Pod>(
+    pub fn acquire_counter_buffer<T: bytemuck::Pod>(
         &self,
         element_count: usize,
-    ) -> Result<CountedBuffer<T>> {
-        Ok(CountedBuffer {
-            inner: self.allocate_buffer::<T>(element_count)?,
+    ) -> Result<CounterBuffer<T>> {
+        Ok(CounterBuffer {
+            inner: self.allocate_buffer::<T>(element_count, None, 0)?,
+            marker: PhantomData,
+        })
+    }
+
+    /// Acquires a correctly-sized one-frame counter buffer initialized from POD data.
+    ///
+    /// The initialized element count is published automatically.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when the input is empty, oversized, zero-sized, or the context is invalid.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the source type carries element inference and prevents scalar/array ambiguity"
+    )]
+    pub fn acquire_counter_buffer_from<D: BufferData>(
+        &self,
+        data: D,
+    ) -> Result<CounterBuffer<D::Element>> {
+        let values = buffer_data_slice(&data);
+        let published_count = u32::try_from(values.len()).map_err(|_| Error::InvalidArgument)?;
+        Ok(CounterBuffer {
+            inner: self.allocate_buffer(values.len(), Some(values), published_count)?,
             marker: PhantomData,
         })
     }
@@ -199,10 +313,10 @@ impl<'a> Binding<'a> {
         }
     }
 
-    /// Binds a counted buffer.
-    pub fn counted_buffer<T: bytemuck::Pod>(
+    /// Binds a counter buffer.
+    pub fn counter_buffer<T: bytemuck::Pod>(
         name: impl Into<String>,
-        buffer: &'a CountedBuffer<T>,
+        buffer: &'a CounterBuffer<T>,
     ) -> Self {
         Self {
             name: name.into(),
@@ -280,22 +394,23 @@ impl Frame {
     fn consume_transients(&self) {
         for transient in &self.transients {
             transient.state.set(TransientState::Consumed);
+            transient.buffer.usage.set(BufferUse::Consumed);
         }
     }
 
     fn release_aborted_transients(&self) {
         for transient in &self.transients {
-            if transient.state.replace(TransientState::Consumed) != TransientState::Live {
-                continue;
-            }
-            match transient.handle {
-                TransientHandle::Structured(handle) => {
-                    state::release_structured(self.context.handle, handle);
+            if transient.state.replace(TransientState::Consumed) == TransientState::Live {
+                match transient.handle {
+                    TransientHandle::Structured(handle) => {
+                        state::release_structured(self.context.handle, handle);
+                    }
+                    TransientHandle::Indirect(handle) => {
+                        state::release_indirect(self.context.handle, handle);
+                    }
                 }
-                TransientHandle::Indirect(handle) => {
-                    state::release_indirect(self.context.handle, handle);
-                }
             }
+            transient.buffer.usage.set(BufferUse::Consumed);
         }
     }
 
@@ -308,6 +423,9 @@ impl Frame {
                 TransientHandle::Structured(handle) => Ok(*handle),
                 TransientHandle::Indirect(_) => self.fail(Error::InvalidContext),
             };
+        }
+        if inner.usage.get() != BufferUse::Available {
+            return self.fail(Error::NotReady);
         }
         let handle = match state::acquire_structured_sized(
             self.context.handle,
@@ -326,7 +444,7 @@ impl Frame {
             state::release_structured(self.context.handle, handle);
             return self.fail(error);
         }
-        inner.borrowed.set(inner.borrowed.get().saturating_add(1));
+        inner.usage.set(BufferUse::Claimed);
         let transient = Rc::new(TransientInner {
             context: Rc::clone(&self.context),
             buffer: Rc::clone(inner),
@@ -338,7 +456,7 @@ impl Frame {
         Ok(handle)
     }
 
-    fn materialize_counted(&mut self, inner: &Rc<BufferInner>) -> Result<IndirectBufferHandle> {
+    fn materialize_counter(&mut self, inner: &Rc<BufferInner>) -> Result<IndirectBufferHandle> {
         self.ensure_context(&inner.context)?;
         if inner.element_size as usize
             != core::mem::size_of::<ez_gfx_runtime::indirect::DrawIndexedCommand>()
@@ -353,28 +471,28 @@ impl Frame {
                 TransientHandle::Structured(_) => self.fail(Error::InvalidContext),
             };
         }
+        if inner.usage.get() != BufferUse::Available {
+            return self.fail(Error::NotReady);
+        }
         let handle = match state::acquire_indirect(self.context.handle, inner.element_count) {
             Ok(handle) => handle,
             Err(error) => return self.fail(error),
         };
-        let commands = inner
-            .bytes
-            .borrow()
-            .chunks_exact(inner.element_size as usize)
-            .map(bytemuck::pod_read_unaligned)
-            .collect::<Vec<ez_gfx_runtime::indirect::DrawIndexedCommand>>();
-        let staged = state::write_indirect(self.context.handle, handle, 0, &commands).and_then(|()| {
-            state::publish_compute_indirect_count(
-                self.context.handle,
-                handle,
-                inner.published_count.get(),
-            )
-        });
+        let staged =
+            state::write_indirect_bytes(self.context.handle, handle, &inner.bytes.borrow()).and_then(
+                |()| {
+                    state::publish_compute_indirect_count(
+                        self.context.handle,
+                        handle,
+                        inner.published_count.get(),
+                    )
+                },
+            );
         if let Err(error) = staged {
             state::release_indirect(self.context.handle, handle);
             return self.fail(error);
         }
-        inner.borrowed.set(inner.borrowed.get().saturating_add(1));
+        inner.usage.set(BufferUse::Claimed);
         let transient = Rc::new(TransientInner {
             context: Rc::clone(&self.context),
             buffer: Rc::clone(inner),
@@ -394,7 +512,7 @@ impl Frame {
                     ResourceIdentity::Structured(self.materialize_structured(inner)?)
                 }
                 BindingResource::Indirect(inner) => {
-                    ResourceIdentity::Indirect(self.materialize_counted(inner)?)
+                    ResourceIdentity::Indirect(self.materialize_counter(inner)?)
                 }
                 BindingResource::RenderTarget(inner) => {
                     self.ensure_context(&inner.context)?;
@@ -421,13 +539,13 @@ impl Frame {
     pub fn add_graphics(
         &mut self,
         shader: &Shader,
-        indirect: &CountedBuffer<ez_gfx_runtime::indirect::DrawIndexedCommand>,
+        indirect: &CounterBuffer<ez_gfx_runtime::indirect::DrawIndexedCommand>,
         bindings: &[Binding<'_>],
         state_desc: ez_gfx_hal::DynamicPipelineState,
         push_constants: &[u8],
     ) -> Result<()> {
         self.ensure_context(&shader.inner.context)?;
-        let indirect_handle = self.materialize_counted(&indirect.inner)?;
+        let indirect_handle = self.materialize_counter(&indirect.inner)?;
         let raw_bindings = self.raw_bindings(bindings)?;
         self.retain(&shader.inner);
         self.record(|context| {
@@ -547,18 +665,6 @@ impl Frame {
         Ok(())
     }
 
-    /// Retains a vertex allocation and its owning heap through completion.
-    ///
-    /// # Errors
-    /// Returns [`Error`] when the allocation belongs to another context.
-    pub fn retain_vertex_allocation<T: bytemuck::Pod>(
-        &mut self,
-        allocation: &VertexAllocation<T>,
-    ) -> Result<()> {
-        self.ensure_context(&allocation.inner.heap.context)?;
-        self.retain(&allocation.inner);
-        Ok(())
-    }
     /// Configures a cached named render target for this frame.
     ///
     /// A format or extent change atomically replaces the cached native image;
@@ -643,15 +749,6 @@ impl Frame {
     }
 
 
-    /// Retains an index allocation through completion.
-    ///
-    /// # Errors
-    /// Returns [`Error`] when the allocation belongs to another context.
-    pub fn retain_index_allocation(&mut self, allocation: &IndexAllocation) -> Result<()> {
-        self.ensure_context(&allocation.inner.context)?;
-        self.retain(&allocation.inner);
-        Ok(())
-    }
     /// Attaches the frame's surface swapchain and returns its logical render target.
     ///
     /// The returned target retains the surface and exposes the configured extent

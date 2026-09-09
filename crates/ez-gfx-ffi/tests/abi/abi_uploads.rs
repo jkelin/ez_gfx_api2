@@ -364,7 +364,7 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_counted_buffer_acquire(
+                ez_gfx_counter_buffer_acquire(
                     u32::try_from(core::mem::size_of::<EzGfxDrawIndexedCommand>())
                         .expect("draw command size fits u32"),
                     1,
@@ -381,7 +381,7 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_counted_buffer_write_draws(indirect, 0, &raw const command, 1, context)
+                ez_gfx_counter_buffer_write_draws(indirect, 0, &raw const command, 1, context)
             }
         },
         EzGfxResult::Ok

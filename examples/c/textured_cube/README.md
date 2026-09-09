@@ -1,6 +1,6 @@
 # C textured cube
 
-Minimal ABI 32 example: positions and normals use auto-growing typed heap handles, indices use the lazy context-owned singleton heap, and structured/counted buffers retain context-owned CPU storage until explicit release. The sample allocates and populates both buffers before its frame loop; each frame imports them for compute-to-graphics use. A creator-thread callback receives runtime diagnostics and copies borrowed snapshot bytes.
+Minimal ABI 33 example: positions and normals use auto-growing typed heap handles, indices use the lazy context-owned singleton heap, and structured/counter buffers are one-frame values. The sample reacquires and populates both buffers each frame for compute-to-graphics use; the terminal frame consumes them, and only unconsumed failure paths release. A creator-thread callback receives runtime diagnostics and copies borrowed snapshot bytes.
 
 ## Build
 

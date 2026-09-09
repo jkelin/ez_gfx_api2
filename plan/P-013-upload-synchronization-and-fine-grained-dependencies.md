@@ -2,11 +2,11 @@
 
 ## Decision
 
-`Surface::begin_frame()` and `Context::begin_frame()` create target-less owning frames. `Frame::configure_swapchain` or `Frame::configure_render_target` attaches one target. All graph, render, texture, geometry, buffer, and counted-buffer recording operates through `&mut Frame`.
+`Surface::begin_frame()` and `Context::begin_frame()` create target-less owning frames. `Frame::configure_swapchain` or `Frame::configure_render_target` attaches one target. All graph, render, texture, geometry, buffer, and counter-buffer recording operates through `&mut Frame`.
 
 At `Frame::finish(self)`, only reachable recorded work is submitted. A prior recording error aborts and is returned unchanged. Submission errors return unchanged and skip presentation; presentation errors return unchanged after successful submission.
 
-Dropped unfinished frames abort. Finish, recording failure, submission failure, presentation failure, and abort all end the recording transaction, release imported buffers for reuse, and keep native backing completion-gated or quarantined internally.
+Dropped unfinished frames abort. Finish, recording failure, submission failure, presentation failure, and abort consume every claimed buffer. Native backing remains completion-gated or quarantined internally; wrappers never return to writable state.
 
 ## Retired compatibility design
 
@@ -14,8 +14,8 @@ The former handle-based interface split frame begin, submit, presentation, and t
 
 ## C ABI
 
-ABI 32 represents `EzGfxFrame` as an opaque generational `u64`. `ez_gfx_frame_begin` creates surface frames; `ez_gfx_render_target_frame_begin` creates managed-target frames. The validated FFI exposes explicit `ez_gfx_frame_end` and `ez_gfx_frame_abort`; both invalidate on every result, and context destruction aborts descendant frames.
+ABI 33 represents `EzGfxFrame` as an opaque generational `u64`. `ez_gfx_frame_begin` creates surface frames; `ez_gfx_render_target_frame_begin` creates managed-target frames. The validated FFI exposes explicit `ez_gfx_frame_end` and `ez_gfx_frame_abort`; both invalidate the frame and its claimed buffer handles on every result.
 
 ## Validation
 
-Cover recording, submit, and present error identity; implicit abort; persistent-buffer import exclusion and reuse after every terminal path; stale, foreign, and double-completed C frames; and Rust/C/header/XML/export/layout parity.
+Cover recording, submit, and present error identity; implicit abort; one-frame buffer claim, same-frame reuse, terminal invalidation, stale/foreign/double-completed C frames and buffers; and Rust/C/header/XML/export/layout parity.

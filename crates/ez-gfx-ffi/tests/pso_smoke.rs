@@ -10,10 +10,11 @@ mod common;
 use common::TestContext;
 use ez_gfx_compiler::{CompilerError, Target, compile_shader};
 use ez_gfx_ffi::{
-    EzGfxBinding, EzGfxRenderTargetDesc, EzGfxResult, ez_gfx_buffer_acquire, ez_gfx_buffer_release,
-    ez_gfx_buffer_write, ez_gfx_context_wait_idle, ez_gfx_counted_buffer_acquire,
-    ez_gfx_counted_buffer_publish_count, ez_gfx_counted_buffer_release, ez_gfx_frame_end,
-    ez_gfx_render_add_compute_pipeline, ez_gfx_render_target_create, ez_gfx_render_target_destroy,
+    EzGfxBinding, EzGfxDynamicState, EzGfxRenderTargetDesc, EzGfxResult, ez_gfx_buffer_acquire,
+    ez_gfx_buffer_release, ez_gfx_buffer_write, ez_gfx_context_wait_idle,
+    ez_gfx_counter_buffer_acquire, ez_gfx_counter_buffer_publish_count,
+    ez_gfx_counter_buffer_release, ez_gfx_frame_end, ez_gfx_render_add_compute_pipeline,
+    ez_gfx_render_add_vertex_pipeline, ez_gfx_render_target_create, ez_gfx_render_target_destroy,
     ez_gfx_render_target_frame_begin, ez_gfx_shader_destroy, ez_gfx_shader_load_artifact,
 };
 
@@ -77,6 +78,109 @@ fn vulkan_compiles_binds_and_executes_compute_pipeline() {
 #[test]
 fn dx12_compiles_sm65_pso_and_dispatches_on_hardware() {
     run_compute_pipeline(2);
+}
+fn reject_invalid_bindings_without_claiming(
+    context: u64,
+    shader: u64,
+    frame: u64,
+    buffer: u64,
+    indirect: u64,
+    value: &[u8; 4],
+    binding_name: &[u8],
+) -> u64 {
+    let invalid_name = b"invalid";
+    let invalid_bindings = [
+        EzGfxBinding {
+            name: binding_name.as_ptr(),
+            name_length: binding_name.len(),
+            buffer,
+            counter_buffer: 0,
+            render_target: 0,
+        },
+        EzGfxBinding {
+            name: invalid_name.as_ptr(),
+            name_length: invalid_name.len(),
+            buffer: 0,
+            counter_buffer: 0,
+            render_target: 0,
+        },
+    ];
+    assert_eq!(
+        // SAFETY: Both binding records and names remain readable through validation.
+        unsafe {
+            ez_gfx_render_add_compute_pipeline(
+                shader,
+                1,
+                1,
+                1,
+                invalid_bindings.as_ptr(),
+                2,
+                core::ptr::null(),
+                0,
+                frame,
+            )
+        },
+        EzGfxResult::InvalidArgument
+    );
+    assert_eq!(
+        // SAFETY: Failed validation must leave the first valid buffer writable.
+        unsafe { ez_gfx_buffer_write(buffer, 0, value.as_ptr().cast(), 1, 4, context) },
+        EzGfxResult::Ok
+    );
+    let state = EzGfxDynamicState {
+        cull_mode: 0,
+        front_face: 0,
+        primitive_type: 0,
+        blend_mode: 0,
+    };
+    assert_eq!(
+        // SAFETY: The binding and state storage remain readable through validation.
+        unsafe {
+            ez_gfx_render_add_vertex_pipeline(
+                shader,
+                0,
+                invalid_bindings.as_ptr(),
+                1,
+                &raw const state,
+                core::ptr::null(),
+                0,
+                frame,
+            )
+        },
+        EzGfxResult::InvalidContext
+    );
+    assert_eq!(
+        // SAFETY: Invalid indirect validation precedes the otherwise-valid buffer claim.
+        unsafe { ez_gfx_buffer_write(buffer, 0, value.as_ptr().cast(), 1, 4, context) },
+        EzGfxResult::Ok
+    );
+    assert_eq!(
+        ez_gfx_counter_buffer_publish_count(indirect, 1, context),
+        EzGfxResult::Ok
+    );
+
+    ez_gfx_buffer_release(buffer, context);
+    let mut replacement = 0;
+    assert_eq!(
+        // SAFETY: The name and output storage remain valid through reacquisition.
+        unsafe {
+            ez_gfx_buffer_acquire(
+                4,
+                1,
+                binding_name.as_ptr(),
+                binding_name.len(),
+                &raw mut replacement,
+                context,
+            )
+        },
+        EzGfxResult::Ok
+    );
+    assert_eq!(
+        // SAFETY: The reacquired buffer accepts the same live source value.
+        unsafe { ez_gfx_buffer_write(replacement, 0, value.as_ptr().cast(), 1, 4, context) },
+        EzGfxResult::Ok
+    );
+    replacement
 }
 
 /// Each backend uses a distinct temporary directory so parallel native tests cannot race artifact output.
@@ -150,7 +254,7 @@ fn run_compute_pipeline(backend: u8) {
         {
             // SAFETY: The name and output ranges remain valid for the call.
             unsafe {
-                ez_gfx_counted_buffer_acquire(
+                ez_gfx_counter_buffer_acquire(
                     u32::try_from(core::mem::size_of::<ez_gfx_ffi::EzGfxDrawIndexedCommand>())
                         .expect("draw command size fits u32"),
                     1,
@@ -164,22 +268,31 @@ fn run_compute_pipeline(backend: u8) {
         EzGfxResult::Ok
     );
     assert_eq!(
-        ez_gfx_counted_buffer_publish_count(indirect, 1, context),
+        ez_gfx_counter_buffer_publish_count(indirect, 1, context),
         EzGfxResult::Ok
+    );
+    buffer = reject_invalid_bindings_without_claiming(
+        context,
+        shader,
+        frame,
+        buffer,
+        indirect,
+        &value,
+        binding_name,
     );
     let bindings = [
         EzGfxBinding {
             name: binding_name.as_ptr(),
             name_length: binding_name.len(),
             buffer,
-            counted_buffer: 0,
+            counter_buffer: 0,
             render_target: 0,
         },
         EzGfxBinding {
             name: indirect_name.as_ptr(),
             name_length: indirect_name.len(),
             buffer: 0,
-            counted_buffer: indirect,
+            counter_buffer: indirect,
             render_target: 0,
         },
     ];
@@ -211,7 +324,7 @@ fn run_compute_pipeline(backend: u8) {
         EzGfxResult::NotReady
     );
     assert_eq!(
-        ez_gfx_counted_buffer_publish_count(indirect, 1, context),
+        ez_gfx_counter_buffer_publish_count(indirect, 1, context),
         EzGfxResult::NotReady
     );
     assert_eq!(ez_gfx_frame_end(frame), EzGfxResult::Ok);
@@ -219,17 +332,17 @@ fn run_compute_pipeline(backend: u8) {
     assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
     assert_eq!(
         {
-            // SAFETY: Context-owned CPU storage is writable again after frame completion.
+            // SAFETY: The source range remains valid; the consumed handle is rejected before copy.
             unsafe { ez_gfx_buffer_write(buffer, 0, value.as_ptr().cast(), 1, 4, context) }
         },
-        EzGfxResult::Ok
+        EzGfxResult::InvalidContext
     );
     assert_eq!(
-        ez_gfx_counted_buffer_publish_count(indirect, 1, context),
-        EzGfxResult::Ok
+        ez_gfx_counter_buffer_publish_count(indirect, 1, context),
+        EzGfxResult::InvalidContext
     );
     ez_gfx_buffer_release(buffer, context);
-    ez_gfx_counted_buffer_release(indirect, context);
+    ez_gfx_counter_buffer_release(indirect, context);
 
     ez_gfx_shader_destroy(shader, context);
     drop(native);

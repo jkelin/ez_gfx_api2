@@ -12,9 +12,9 @@ pub type EzGfxFrame = EzGfxHandle;
 pub type EzGfxReadbackRequest = u64;
 /// Opaque identifier for a compiled shader resource.
 pub type EzGfxShader = EzGfxHandle;
-/// Opaque identifier for a frame-local counted buffer holding indexed draw commands.
-pub type EzGfxCountedBuffer = EzGfxHandle;
-/// Opaque identifier for a frame-local shader-accessible buffer.
+/// Opaque identifier for a frame-local counter buffer holding indexed draw commands.
+pub type EzGfxCounterBuffer = EzGfxHandle;
+/// Opaque identifier for a frame-local shader-accessible one-frame buffer.
 pub type EzGfxBuffer = EzGfxHandle;
 /// Opaque identifier for a named vertex heap.
 pub type EzGfxVertexHeap = EzGfxHandle;
@@ -393,8 +393,8 @@ pub struct EzGfxBinding {
     pub name_length: usize,
     /// Identifies the buffer assigned to the binding.
     pub buffer: EzGfxBuffer,
-    /// Identifies the counted command buffer assigned to the binding.
-    pub counted_buffer: EzGfxCountedBuffer,
+    /// Identifies the counter command buffer assigned to the binding.
+    pub counter_buffer: EzGfxCounterBuffer,
     /// Identifies the render target assigned to the binding.
     pub render_target: EzGfxRenderTarget,
 }

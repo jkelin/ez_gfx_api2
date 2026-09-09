@@ -73,7 +73,10 @@ pub(super) fn start_recording(context: &mut ContextState) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error when the context is stale, foreign, unhealthy, or not recording.
-#[cfg(feature = "ffi")]
+#[cfg_attr(
+    not(feature = "ffi"),
+    allow(dead_code, reason = "only the C frame registry mirrors raw serials")
+)]
 #[doc(hidden)]
 pub fn current_frame_serial(context: ContextHandle) -> Result<u64> {
     with_context_mut(context, |context| {
@@ -910,6 +913,7 @@ fn mark_transient_interned(context: &mut ContextState, handle: PackedHandle) -> 
 pub fn frame_submit(context: ContextHandle) -> Result<()> {
     result_status(with_context_mut(context, |context| {
         let mut native_started = false;
+        let frame_serial = context.frame_serial;
         let result = (|| {
             // Updates admitted after draw recording still precede submission. Refresh their
             // dependencies so a cached resource entry cannot retain an older ready value.
@@ -955,6 +959,11 @@ pub fn frame_submit(context: ContextHandle) -> Result<()> {
                 .frame
                 .finish()
                 .map_err(|error| map_frame(&error))?;
+            super::geometry::finalize_recording_range_drops(
+                adapter.context,
+                frame_serial,
+                Some(completion),
+            )?;
             recycle_consumed_transients(adapter.context, completion)?;
             super::buffers::reclaim_available_transients(adapter.context)?;
             let record = runtime_record(adapter.context, 0, RuntimePhase::Submit, Ok(()));
@@ -965,6 +974,8 @@ pub fn frame_submit(context: ContextHandle) -> Result<()> {
             context.frame.abort();
             if !native_started || wait_native_idle(&mut context.native).is_ok() {
                 rollback_transient_internment(context);
+                let completion = last_native_frame_completion(&context.native).ok();
+                super::geometry::finalize_recording_range_drops(context, frame_serial, completion)?;
             } else {
                 invalidate_unsafe_transients(context);
             }
@@ -990,9 +1001,12 @@ pub fn frame_abort(context: ContextHandle) -> Result<()> {
             .identity
             .check_thread_and_health()
             .map_err(map_lifecycle)?;
+        let frame_serial = context.frame_serial;
         context.frame.abort();
         rollback_transient_internment(context);
         context.frame_resources.clear();
+        let completion = last_native_frame_completion(&context.native).ok();
+        super::geometry::finalize_recording_range_drops(context, frame_serial, completion)?;
         context.frame_native_resources.clear();
         context.frame_vertex_heaps.clear();
         context.frame_index = None;

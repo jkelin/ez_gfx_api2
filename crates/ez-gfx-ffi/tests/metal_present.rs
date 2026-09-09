@@ -11,8 +11,8 @@ use ez_gfx_ffi::{
     EzGfxBackendContextDesc, EzGfxDrawIndexedCommand, EzGfxDynamicState, EzGfxEvent,
     EzGfxEventKind, EzGfxRenderTargetDesc, EzGfxResult, EzGfxSurfaceDesc, EzGfxTextureDesc,
     ez_gfx_callback_register, ez_gfx_context_create_backend, ez_gfx_context_destroy,
-    ez_gfx_context_init_device, ez_gfx_context_wait_idle, ez_gfx_counted_buffer_acquire,
-    ez_gfx_counted_buffer_write_draws, ez_gfx_frame_begin, ez_gfx_frame_end,
+    ez_gfx_context_init_device, ez_gfx_context_wait_idle, ez_gfx_counter_buffer_acquire,
+    ez_gfx_counter_buffer_write_draws, ez_gfx_frame_begin, ez_gfx_frame_end,
     ez_gfx_graph_enqueue_texture_readback, ez_gfx_index_allocation_get_range,
     ez_gfx_render_add_compute_pipeline, ez_gfx_render_add_vertex_pipeline,
     ez_gfx_render_target_create, ez_gfx_render_target_destroy, ez_gfx_render_target_frame_begin,
@@ -460,7 +460,7 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_counted_buffer_acquire(
+                ez_gfx_counter_buffer_acquire(
                     size_of::<EzGfxDrawIndexedCommand>() as u32,
                     1,
                     label.as_ptr(),
@@ -483,7 +483,7 @@ fn render(artifact: &[u8], cache_presented_snapshots: bool) -> Vec<u8> {
         {
             // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
             unsafe {
-                ez_gfx_counted_buffer_write_draws(indirect, 0, &raw const command, 1, context)
+                ez_gfx_counter_buffer_write_draws(indirect, 0, &raw const command, 1, context)
             }
         },
         EzGfxResult::Ok

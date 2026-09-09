@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<ez-gfx-bindings version="1" abi-version="32" library="ez_gfx_ffi">
+<ez-gfx-bindings version="1" abi-version="33" library="ez_gfx_ffi">
   <description>Public EzGfx C ABI. This file is manually maintained; generated headers and managed bindings are derived from it.</description>
   <handles>
     <handle name="EzGfxContext" doc="Opaque packed u64 context handle (slot+1/generation in bits 0-39)." />
@@ -7,8 +7,8 @@
     <handle name="EzGfxFrame" doc="Opaque generation-, kind-, and owner-validated live frame handle." />
     <handle name="EzGfxReadbackRequest" doc="Stable process-unique identity for one enqueued readback request." />
     <handle name="EzGfxShader" doc="Opaque packed u64 shader handle; child bits index the context identity arena and resolve only as Shader." />
-    <handle name="EzGfxCountedBuffer" doc="Opaque packed u64 counted-buffer handle; child bits index the context identity arena and resolve only as Indirect." />
-    <handle name="EzGfxBuffer" doc="Opaque packed u64 buffer handle; child bits index the context identity arena and resolve only as Structured." />
+    <handle name="EzGfxCounterBuffer" doc="Opaque packed u64 one-frame counter-buffer handle; child bits index the context identity arena and resolve only as Indirect." />
+    <handle name="EzGfxBuffer" doc="Opaque packed u64 one-frame buffer handle; child bits index the context identity arena and resolve only as Structured." />
     <handle name="EzGfxVertexHeap" doc="Owner- and generation-validated named vertex-heap handle." />
     <handle name="EzGfxVertexAllocation" doc="Owner- and generation-validated allocation within a named vertex heap." />
     <handle name="EzGfxIndexAllocation" doc="Owner- and generation-validated allocation within the global index heap." />
@@ -270,7 +270,7 @@
       <field name="name" type="const char *" nullable="false" doc="Exactly name_length UTF-8 bytes; no NUL terminator is required." />
       <field name="name_length" type="size_t" validation="greater-than-zero-at-most-boundary-limit" doc="Binding-name byte length." />
       <field name="buffer" type="EzGfxBuffer" doc="Optional buffer handle." />
-      <field name="counted_buffer" type="EzGfxCountedBuffer" doc="Optional counted-command buffer handle." />
+      <field name="counter_buffer" type="EzGfxCounterBuffer" doc="Optional one-frame counter-command buffer handle." />
       <field name="render_target" type="EzGfxRenderTarget" doc="Optional render-target handle." />
     </struct>
     <struct name="EzGfxDynamicState" doc="Optional dynamic state overrides.">
@@ -513,37 +513,37 @@
       <param name="out_frame" type="EzGfxFrame *" direction="out" doc="Receives the live frame handle." />
       <returns doc="Returns readiness or handle status." />
     </function>
-    <function name="ez_gfx_counted_buffer_acquire" return="EzGfxResult" doc="Acquires a context-owned counted buffer.">
+    <function name="ez_gfx_counter_buffer_acquire" return="EzGfxResult" doc="Acquires a context-owned one-frame counter buffer.">
       <param name="element_size" type="uint32_t" validation="greater-than-zero" doc="Element stride in bytes." />
       <param name="element_count" type="uint32_t" validation="greater-than-zero" doc="Allocated element count." />
       <param name="debug_name" type="const char *" nullable="false" direction="in" array-length="debug_name_length" doc="Exact UTF-8 debug-name bytes." />
       <param name="debug_name_length" type="size_t" validation="greater-than-zero-at-most-boundary-limit" doc="Debug-name byte length." />
-      <param name="out_buffer" type="EzGfxCountedBuffer *" direction="out" doc="Receives the owning handle." />
+      <param name="out_buffer" type="EzGfxCounterBuffer *" direction="out" doc="Receives the owning handle." />
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
       <returns doc="Returns validation or allocation status." />
     </function>
-    <function name="ez_gfx_counted_buffer_write_draws" return="EzGfxResult" doc="Writes a contiguous draw-command range.">
-      <param name="buffer" type="EzGfxCountedBuffer" nullable="false" doc="Context-owned counted buffer." />
+    <function name="ez_gfx_counter_buffer_write_draws" return="EzGfxResult" doc="Writes a contiguous draw-command range before consumption.">
+      <param name="buffer" type="EzGfxCounterBuffer" nullable="false" doc="Unconsumed counter buffer." />
       <param name="start_index" type="uint32_t" doc="First command slot." />
       <param name="commands" type="const EzGfxDrawIndexedCommand *" nullable="true" direction="in" array-length="command_count" doc="Contiguous command data; null only when count is zero." />
       <param name="command_count" type="uint32_t" validation="at-most-boundary-limit" doc="Number of commands." />
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
       <returns doc="Returns ownership, overflow, or bounds status." />
     </function>
-    <function name="ez_gfx_counted_buffer_publish_count" return="EzGfxResult" doc="Publishes a CPU-known visible count.">
-      <param name="buffer" type="EzGfxCountedBuffer" nullable="false" doc="Context-owned counted buffer." />
+    <function name="ez_gfx_counter_buffer_publish_count" return="EzGfxResult" doc="Publishes a CPU-known visible count before consumption.">
+      <param name="buffer" type="EzGfxCounterBuffer" nullable="false" doc="Unconsumed counter buffer." />
       <param name="count" type="uint32_t" doc="Known generated-command count." />
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
       <returns doc="Returns ownership or bounds status." />
     </function>
-    <function name="ez_gfx_counted_buffer_release" return="void" doc="Releases a context-owned counted buffer.">
-      <param name="buffer" type="EzGfxCountedBuffer" nullable="true" doc="Counted buffer; zero is ignored." />
+    <function name="ez_gfx_counter_buffer_release" return="void" doc="Releases an unconsumed counter buffer.">
+      <param name="buffer" type="EzGfxCounterBuffer" nullable="true" doc="Counter buffer; zero and stale values are ignored." />
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
       <returns doc="No return value; stale and zero handles are ignored." />
     </function>
     <function name="ez_gfx_render_add_vertex_pipeline" return="EzGfxResult" doc="Records a graphics pipeline and indexed-indirect draw.">
       <param name="shader" type="EzGfxShader" nullable="false" doc="Graphics shader." />
-      <param name="buffer" type="EzGfxCountedBuffer" nullable="false" doc="Counted indirect commands." />
+      <param name="buffer" type="EzGfxCounterBuffer" nullable="false" doc="Counter buffer consumed by this frame for indirect commands." />
       <param name="bindings" type="const EzGfxBinding *" nullable="true" direction="in" array-length="binding_count" doc="Resource bindings." />
       <param name="binding_count" type="uint32_t" doc="Binding count." />
       <param name="dynamic_state" type="const EzGfxDynamicState *" nullable="true" direction="in" doc="Optional state." />
@@ -656,7 +656,7 @@
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
       <returns doc="Returns validation or ownership status." />
     </function>
-    <function name="ez_gfx_buffer_acquire" return="EzGfxResult" managed="utf8-string" doc="Acquires a context-owned structured buffer.">
+    <function name="ez_gfx_buffer_acquire" return="EzGfxResult" managed="utf8-string" doc="Acquires a context-owned one-frame structured buffer.">
       <param name="element_size" type="uint32_t" validation="greater-than-zero" doc="Element stride in bytes." />
       <param name="element_count" type="uint32_t" validation="greater-than-zero" doc="Allocated element count." />
       <param name="debug_name" type="const char *" nullable="false" direction="in" array-length="debug_name_length" doc="Exact UTF-8 debug-name bytes." />
@@ -665,8 +665,8 @@
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
       <returns doc="Returns validation or allocation status." />
     </function>
-    <function name="ez_gfx_buffer_write" return="EzGfxResult" managed="structured-write" doc="Copies a validated element range into a context-owned buffer.">
-      <param name="buffer" type="EzGfxBuffer" doc="Context-owned buffer handle." />
+    <function name="ez_gfx_buffer_write" return="EzGfxResult" managed="structured-write" doc="Copies a validated element range before consumption.">
+      <param name="buffer" type="EzGfxBuffer" doc="Unconsumed buffer handle." />
       <param name="start_index" type="uint32_t" doc="First destination element." />
       <param name="data" type="const void *" nullable="true" direction="in" array-length="element_count" array-byte-size="element_size" doc="Element bytes; null only when count is zero." />
       <param name="element_count" type="uint32_t" doc="Number of elements to copy." />
@@ -674,8 +674,8 @@
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
       <returns doc="Returns validation, ownership, or range status." />
     </function>
-    <function name="ez_gfx_buffer_release" return="void" doc="Releases a context-owned buffer.">
-      <param name="buffer" type="EzGfxBuffer" doc="Buffer handle; zero is ignored." />
+    <function name="ez_gfx_buffer_release" return="void" doc="Releases an unconsumed buffer.">
+      <param name="buffer" type="EzGfxBuffer" doc="Buffer handle; zero and stale values are ignored." />
       <param name="context" type="EzGfxContext" nullable="false" doc="Owning context." />
       <returns doc="Stale handles are ignored." />
     </function>

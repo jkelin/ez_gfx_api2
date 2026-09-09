@@ -179,7 +179,7 @@ fn layouts_are_stable() {
             offset_of!(EzGfxBinding, name),
             offset_of!(EzGfxBinding, name_length),
             offset_of!(EzGfxBinding, buffer),
-            offset_of!(EzGfxBinding, counted_buffer),
+            offset_of!(EzGfxBinding, counter_buffer),
             offset_of!(EzGfxBinding, render_target)
         ],
         [0, 8, 16, 24, 32]
@@ -382,16 +382,16 @@ fn all_public_export_signatures_are_stable() {
         ffi::ez_gfx_render_target_frame_begin;
     let _: unsafe extern "C" fn(Handle, Handle, *mut Handle) -> Status = ffi::ez_gfx_frame_begin;
     let _: unsafe extern "C" fn(u32, u32, *const u8, usize, *mut Handle, Handle) -> Status =
-        ffi::ez_gfx_counted_buffer_acquire;
+        ffi::ez_gfx_counter_buffer_acquire;
     let _: unsafe extern "C" fn(
         Handle,
         u32,
         *const EzGfxDrawIndexedCommand,
         u32,
         Handle,
-    ) -> Status = ffi::ez_gfx_counted_buffer_write_draws;
-    let _: extern "C" fn(Handle, u32, Handle) -> Status = ffi::ez_gfx_counted_buffer_publish_count;
-    let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_counted_buffer_release;
+    ) -> Status = ffi::ez_gfx_counter_buffer_write_draws;
+    let _: extern "C" fn(Handle, u32, Handle) -> Status = ffi::ez_gfx_counter_buffer_publish_count;
+    let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_counter_buffer_release;
     let _: unsafe extern "C" fn(
         Handle,
         Handle,
@@ -465,7 +465,7 @@ fn counted_strings_reject_invalid_ranges_before_reading_or_delegating() {
     assert_eq!(
         // SAFETY: `valid` is readable for exactly its nonzero byte length and intentionally has no terminator.
         unsafe {
-            ez_gfx_counted_buffer_acquire(20, 1, valid.as_ptr(), valid.len(), &raw mut indirect, 0)
+            ez_gfx_counter_buffer_acquire(20, 1, valid.as_ptr(), valid.len(), &raw mut indirect, 0)
         },
         EzGfxResult::InvalidContext
     );
@@ -482,7 +482,7 @@ fn counted_strings_reject_invalid_ranges_before_reading_or_delegating() {
     ] {
         assert_eq!(
             // SAFETY: Valid pointers name the declared test-owned ranges; oversized and null ranges are rejected before dereference.
-            unsafe { ez_gfx_counted_buffer_acquire(20, 1, pointer, length, &raw mut indirect, 0) },
+            unsafe { ez_gfx_counter_buffer_acquire(20, 1, pointer, length, &raw mut indirect, 0) },
             EzGfxResult::InvalidArgument
         );
     }
@@ -562,7 +562,7 @@ fn optional_and_nested_counted_strings_enforce_the_same_contract() {
         name: binding_name.as_ptr(),
         name_length: binding_name.len(),
         buffer: child_handle,
-        counted_buffer: 0,
+        counter_buffer: 0,
         render_target: 0,
     };
     assert_eq!(

@@ -2,7 +2,7 @@
 
 Showcases a GLB scene rendered from reflected named vertex heaps, with structured primitive records and compute-generated indexed-indirect commands.
 
-`main.rs` retains typed position/normal heaps and allocations plus persistent `Buffer<BasicPrimitive>` and `CountedBuffer<DrawIndexedCommand>` values. Each linear-loop iteration updates input, explicitly configures the swapchain, imports both buffers for compute and graphics, and passes the frame and target to `Example::handle_frame`.
+`main.rs` uploads typed position/normal geometry once. Each linear-loop iteration updates input, acquires one-frame `Buffer<BasicPrimitive>` and `CounterBuffer<DrawIndexedCommand>` values, explicitly configures the swapchain, records compute-generated commands and graphics, and passes the frame and target to `Example::handle_frame`.
 
 Run:
 

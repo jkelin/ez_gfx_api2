@@ -10,8 +10,29 @@ assert_not_impl_any!(VertexHeap<u32>: Send, Sync);
 assert_not_impl_any!(VertexAllocation<u32>: Send, Sync);
 assert_not_impl_any!(IndexAllocation: Send, Sync);
 assert_not_impl_any!(Buffer<u32>: Send, Sync);
-assert_not_impl_any!(CountedBuffer<ez_gfx_runtime::indirect::DrawIndexedCommand>: Send, Sync);
+assert_not_impl_any!(CounterBuffer<ez_gfx_runtime::indirect::DrawIndexedCommand>: Send, Sync);
 assert_not_impl_any!(Frame: Send, Sync);
+
+#[test]
+fn buffer_data_views_scalar_slice_and_vec_without_copying() {
+    let scalar = 7_u32;
+    let array = [1_u32, 2, 3];
+    let slice = &array[1..];
+    let values = vec![4_u32, 5];
+    let scalar_source = BufferSource::one(&scalar);
+    let values_source = &values;
+
+    let scalar_view = buffer_data_slice(&scalar_source);
+    let slice_view = buffer_data_slice(&slice);
+    let vec_view = buffer_data_slice(&values_source);
+
+    assert_eq!(scalar_view, &[7]);
+    assert_eq!(slice_view, &[2, 3]);
+    assert_eq!(vec_view, &[4, 5]);
+    assert_eq!(scalar_view.as_ptr(), &raw const scalar);
+    assert_eq!(slice_view.as_ptr(), slice.as_ptr());
+    assert_eq!(vec_view.as_ptr(), values.as_ptr());
+}
 
 #[cfg(windows)]
 thread_local! {
@@ -118,23 +139,18 @@ fn frame_retains_surface_after_public_wrapper_drop() -> Result<()> {
 }
 #[cfg(not(target_vendor = "apple"))]
 #[test]
-fn frame_retains_vertex_allocation_and_its_heap_in_drop_order() -> Result<()> {
+fn allocation_drop_during_recording_does_not_reuse_its_range() -> Result<()> {
     let (context, surface) = headless()?;
-    let heap = context.create_vertex_heap::<f32>("retained.positions")?;
+    let heap = context.create_vertex_heap::<f32>("recording.positions")?;
     let allocation = heap.upload(&[0.0])?;
-    let heap_lease = Rc::downgrade(&heap.inner);
-    let allocation_lease = Rc::downgrade(&allocation.inner);
-    let mut frame = surface.begin_frame()?;
-    frame.retain_vertex_allocation(&allocation)?;
+    let first_range = allocation.range()?;
+    let frame = surface.begin_frame()?;
 
     drop(allocation);
-    drop(heap);
-    assert!(allocation_lease.upgrade().is_some());
-    assert!(heap_lease.upgrade().is_some());
+    let later = heap.upload(&[1.0])?;
 
+    assert_ne!(later.range()?.0, first_range.0);
     drop(frame);
-    assert!(allocation_lease.upgrade().is_none());
-    assert!(heap_lease.upgrade().is_none());
     Ok(())
 }
 
@@ -202,15 +218,75 @@ fn repeated_render_target_readbacks_keep_distinct_callback_identities() -> Resul
 
 #[cfg(not(target_vendor = "apple"))]
 #[test]
-fn persistent_buffer_survives_terminal_frame_error() -> Result<()> {
-    let (context, surface) = headless()?;
-    let structured = context.acquire_buffer::<u32>(1)?;
-    structured.write(0, &[7])?;
-    let first = surface.begin_frame()?;
-    assert_eq!(first.finish(), Err(Error::NotReady));
+fn buffer_sources_infer_scalar_slice_and_vec_elements() -> Result<()> {
+    let (context, _surface) = headless()?;
+    let scalar = 7_u32;
+    let array = [8_u32, 9];
+    let slice = array.as_slice();
+    let values = vec![10_u32, 11];
 
-    structured.write(0, &[9])?;
-    drop(surface.begin_frame()?);
+    let scalar_buffer = context.acquire_buffer_from(BufferSource::one(&scalar))?;
+    let slice_buffer = context.acquire_buffer_from(slice)?;
+    let vec_buffer = context.acquire_buffer_from(&values)?;
+
+    assert_eq!(scalar_buffer.inner.element_count, 1);
+    assert_eq!(slice_buffer.inner.element_count, 2);
+    assert_eq!(vec_buffer.inner.element_count, 2);
+    assert_eq!(
+        scalar_buffer.inner.bytes.borrow().as_slice(),
+        bytemuck::bytes_of(&scalar)
+    );
+    assert_eq!(
+        slice_buffer.inner.bytes.borrow().as_slice(),
+        bytemuck::cast_slice::<u32, u8>(slice)
+    );
+    assert_eq!(
+        vec_buffer.inner.bytes.borrow().as_slice(),
+        bytemuck::cast_slice::<u32, u8>(&values)
+    );
+    Ok(())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn claimed_buffer_is_single_frame_and_same_frame_reuses_materialization() -> Result<()> {
+    let (context, surface) = headless()?;
+    let structured = context.acquire_buffer_from([7_u32, 8].as_slice())?;
+    let draw = ez_gfx_runtime::indirect::DrawIndexedCommand {
+        index_count: 3,
+        instance_count: 1,
+        first_index: 0,
+        vertex_offset: 0,
+        first_instance: 0,
+    };
+    let counter = context.acquire_counter_buffer_from(BufferSource::one(&draw))?;
+    let mut first = surface.begin_frame()?;
+    let first_handle = first.materialize_structured(&structured.inner)?;
+    let counter_handle = first.materialize_counter(&counter.inner)?;
+
+    assert_eq!(
+        first.materialize_structured(&structured.inner)?,
+        first_handle
+    );
+    assert_eq!(first.materialize_counter(&counter.inner)?, counter_handle);
+    assert_eq!(structured.write(0, &[9]), Err(Error::NotReady));
+    assert_eq!(counter.publish_count(1), Err(Error::NotReady));
+    assert_eq!(first.finish(), Err(Error::NotReady));
+    assert!(structured.inner.usage.get() == BufferUse::Consumed);
+    assert!(counter.inner.usage.get() == BufferUse::Consumed);
+    assert_eq!(structured.write(0, &[9]), Err(Error::NotReady));
+    assert_eq!(counter.write(0, &[draw]), Err(Error::NotReady));
+
+    let mut later = surface.begin_frame()?;
+    assert_eq!(
+        later.materialize_structured(&structured.inner),
+        Err(Error::NotReady)
+    );
+    assert_eq!(
+        later.materialize_counter(&counter.inner),
+        Err(Error::NotReady)
+    );
+    drop(later);
     Ok(())
 }
 

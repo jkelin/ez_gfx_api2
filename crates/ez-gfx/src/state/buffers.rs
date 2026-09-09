@@ -128,6 +128,13 @@ pub fn acquire_indirect(context: ContextHandle, capacity: u32) -> Result<Indirec
 ///
 /// Returns an error for a stale, consumed, foreign, or out-of-range handle,
 /// checked arithmetic failure, or failed upload.
+#[cfg_attr(
+    not(any(test, feature = "ffi")),
+    allow(
+        dead_code,
+        reason = "only raw FFI and state tests write typed commands"
+    )
+)]
 pub fn write_indirect(
     context: ContextHandle,
     indirect: IndirectBufferHandle,
@@ -175,6 +182,46 @@ pub fn write_indirect(
         let (_, allocation) = allocations.get(&handle).ok_or(Error::InvalidContext)?;
         let token =
             stage_upload(native, staging, allocation, offset, &bytes).map_err(map_allocation)?;
+        allocation_ready.insert(handle, token);
+        Ok(())
+    }))
+}
+/// Stages a complete packed indirect-command buffer without an intermediate command copy.
+///
+/// # Errors
+///
+/// Returns an error for stale, consumed, foreign, or incorrectly sized data.
+#[doc(hidden)]
+pub fn write_indirect_bytes(
+    context: ContextHandle,
+    indirect: IndirectBufferHandle,
+    bytes: &[u8],
+) -> Result<()> {
+    result_status(with_context_mut(context, |context| {
+        let handle = indirect.packed();
+        validate_writable_transient(context, handle, ResourceKind::Indirect)?;
+        let metadata = context
+            .transient_buffers
+            .get(&handle)
+            .copied()
+            .ok_or(Error::InvalidContext)?;
+        let expected = usize::try_from(metadata.element_count)
+            .ok()
+            .and_then(|count| count.checked_mul(metadata.element_size as usize))
+            .ok_or(Error::InvalidArgument)?;
+        // Partial raw command initialization would leave unspecified command bytes visible.
+        if metadata.element_size != 20 || bytes.len() != expected {
+            return Err(Error::InvalidArgument);
+        }
+        let ContextState {
+            native,
+            staging,
+            allocations,
+            allocation_ready,
+            ..
+        } = context;
+        let (_, allocation) = allocations.get(&handle).ok_or(Error::InvalidContext)?;
+        let token = stage_upload(native, staging, allocation, 0, bytes).map_err(map_allocation)?;
         allocation_ready.insert(handle, token);
         Ok(())
     }))

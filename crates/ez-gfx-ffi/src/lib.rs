@@ -50,8 +50,8 @@ use ez_gfx::{
     Backend, ContextOptions, DrawIndexedCommand, DynamicPipelineState, SurfaceOptions,
     SurfacePlatform, raw,
 };
-/// Identifies C ABI revision 32 for compatibility checks.
-pub const EZ_GFX_ABI_VERSION: u32 = 32;
+/// Identifies C ABI revision 33 for compatibility checks.
+pub const EZ_GFX_ABI_VERSION: u32 = 33;
 /// Caps any caller-provided byte range at 16 MiB.
 pub const EZ_GFX_MAX_BOUNDARY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -301,17 +301,17 @@ pub unsafe extern "C" fn ez_gfx_frame_begin(
 }
 
 #[unsafe(no_mangle)]
-/// Acquires a context-owned counted buffer with a runtime element stride.
+/// Acquires a context-owned one-frame counter buffer with a runtime element stride.
 ///
 /// # Safety
 ///
 /// The name and output pointer must cover their documented readable/writable ranges.
-pub unsafe extern "C" fn ez_gfx_counted_buffer_acquire(
+pub unsafe extern "C" fn ez_gfx_counter_buffer_acquire(
     element_size: u32,
     element_count: u32,
     debug_name: *const u8,
     debug_name_length: usize,
-    out_indirect: *mut EzGfxCountedBuffer,
+    out_indirect: *mut EzGfxCounterBuffer,
     context: EzGfxContext,
 ) -> EzGfxResult {
     catch_status(|| {
@@ -324,7 +324,7 @@ pub unsafe extern "C" fn ez_gfx_counted_buffer_acquire(
             return EzGfxResult::InvalidArgument;
         }
         let context = try_handle!(ContextHandle, context);
-        match buffer::insert(context, buffer::Kind::Counted, element_size, element_count) {
+        match buffer::insert(context, buffer::Kind::Counter, element_size, element_count) {
             Ok(handle) => {
                 // SAFETY: the validated output remains writable and aligned for this call.
                 unsafe { out_indirect.write(handle) };
@@ -342,8 +342,8 @@ pub unsafe extern "C" fn ez_gfx_counted_buffer_acquire(
 ///
 /// `commands` must cover `command_count` readable commands, or may be null when
 /// `command_count` is zero.
-pub unsafe extern "C" fn ez_gfx_counted_buffer_write_draws(
-    indirect: EzGfxCountedBuffer,
+pub unsafe extern "C" fn ez_gfx_counter_buffer_write_draws(
+    indirect: EzGfxCounterBuffer,
     start_index: u32,
     commands: *const EzGfxDrawIndexedCommand,
     command_count: u32,
@@ -373,7 +373,7 @@ pub unsafe extern "C" fn ez_gfx_counted_buffer_write_draws(
         buffer::write(
             indirect,
             context,
-            buffer::Kind::Counted,
+            buffer::Kind::Counter,
             start_index,
             element_size,
             bytes,
@@ -384,8 +384,8 @@ pub unsafe extern "C" fn ez_gfx_counted_buffer_write_draws(
 
 #[unsafe(no_mangle)]
 /// Publishes a CPU-known count for compute-generated indirect commands.
-pub extern "C" fn ez_gfx_counted_buffer_publish_count(
-    indirect: EzGfxCountedBuffer,
+pub extern "C" fn ez_gfx_counter_buffer_publish_count(
+    indirect: EzGfxCounterBuffer,
     count: u32,
     context: EzGfxContext,
 ) -> EzGfxResult {
@@ -396,14 +396,14 @@ pub extern "C" fn ez_gfx_counted_buffer_publish_count(
 }
 
 #[unsafe(no_mangle)]
-/// Releases a context-owned counted buffer.
-pub extern "C" fn ez_gfx_counted_buffer_release(
-    indirect: EzGfxCountedBuffer,
+/// Releases an unconsumed counter buffer.
+pub extern "C" fn ez_gfx_counter_buffer_release(
+    indirect: EzGfxCounterBuffer,
     context: EzGfxContext,
 ) {
     catch_void(|| {
         if let Ok(context) = ContextHandle::from_raw(context) {
-            let _ = buffer::remove(indirect, context, buffer::Kind::Counted);
+            let _ = buffer::remove(indirect, context, buffer::Kind::Counter);
         }
     });
 }
@@ -416,7 +416,7 @@ pub extern "C" fn ez_gfx_counted_buffer_release(
 /// Non-null `bindings` must be readable for `binding_count` aligned entries; every binding name must be a non-null, non-empty exact UTF-8 byte range without embedded NUL bytes. Non-null `dynamic_state` must address one readable aligned value, and non-null `push_constants` must be readable for `push_constant_size` bytes.
 pub unsafe extern "C" fn ez_gfx_render_add_vertex_pipeline(
     shader: EzGfxShader,
-    indirect: EzGfxCountedBuffer,
+    indirect: EzGfxCounterBuffer,
     bindings: *const EzGfxBinding,
     binding_count: u32,
     dynamic_state: *const EzGfxDynamicState,
@@ -461,13 +461,20 @@ pub unsafe extern "C" fn ez_gfx_render_add_vertex_pipeline(
                 )
             }
         };
-        let bindings = match read_bindings(frame, bindings, binding_count) {
+        if let Err(status) = buffer::validate(frame, indirect, buffer::Kind::Counter) {
+            return status;
+        }
+        let bindings = match validate_bindings(frame, bindings, binding_count) {
             Ok(value) => value,
             Err(status) => return status,
         };
         let context = try_frame!(frame);
         let shader = try_handle!(ShaderHandle, shader);
-        let indirect = match buffer::materialize(frame, indirect, buffer::Kind::Counted) {
+        let bindings = match materialize_bindings(frame, bindings) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let indirect = match buffer::materialize(frame, indirect, buffer::Kind::Counter) {
             Ok(ResourceIdentity::Indirect(handle)) => handle,
             Ok(_) => return EzGfxResult::InvalidContext,
             Err(status) => return status,
@@ -514,12 +521,16 @@ pub unsafe extern "C" fn ez_gfx_render_add_compute_pipeline(
                 )
             }
         };
-        let bindings = match read_bindings(frame, bindings, binding_count) {
+        let bindings = match validate_bindings(frame, bindings, binding_count) {
             Ok(value) => value,
             Err(status) => return status,
         };
         let context = try_frame!(frame);
         let shader = try_handle!(ShaderHandle, shader);
+        let bindings = match materialize_bindings(frame, bindings) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
         raw::render_add_compute(
             context,
             shader,
@@ -926,12 +937,22 @@ fn catch_frame_terminal<T: IntoFfiResult>(
     result
 }
 
-/// Binding arrays are bounded; every item requires one UTF-8 name and exactly one non-null typed handle.
-fn read_bindings(
+enum ValidatedBindingResource {
+    Buffer { handle: u64, kind: buffer::Kind },
+    RenderTarget(RenderTargetHandle),
+}
+
+struct ValidatedBinding {
+    name: String,
+    resource: ValidatedBindingResource,
+}
+
+/// Binding arrays are bounded and validated completely before any one-frame buffer is claimed.
+fn validate_bindings(
     frame: EzGfxFrame,
     pointer: *const EzGfxBinding,
     count: u32,
-) -> Result<Vec<PublicBinding>, EzGfxResult> {
+) -> Result<Vec<ValidatedBinding>, EzGfxResult> {
     if count == 0 {
         return Ok(Vec::new());
     }
@@ -940,29 +961,69 @@ fn read_bindings(
     }
     // SAFETY: `count` is checked in `1..=16`; the caller keeps `pointer` readable and aligned for that many `EzGfxBinding` values through binding conversion.
     let raw = unsafe { core::slice::from_raw_parts(pointer, count as usize) };
-    let mut bindings = Vec::with_capacity(raw.len());
+    let mut validated = Vec::with_capacity(raw.len());
     for binding in raw {
         let name = read_bounded_string(binding.name, binding.name_length)?;
         let resource = match (
             binding.buffer != 0,
-            binding.counted_buffer != 0,
+            binding.counter_buffer != 0,
             binding.render_target != 0,
         ) {
-            (true, false, false) => {
-                buffer::materialize(frame, binding.buffer, buffer::Kind::Structured)?
+            (true, false, false) => ValidatedBindingResource::Buffer {
+                handle: binding.buffer,
+                kind: buffer::Kind::Structured,
+            },
+            (false, true, false) => ValidatedBindingResource::Buffer {
+                handle: binding.counter_buffer,
+                kind: buffer::Kind::Counter,
+            },
+            (false, false, true) => {
+                let target = RenderTargetHandle::from_raw(binding.render_target)
+                    .map_err(|_| EzGfxResult::InvalidContext)?;
+                ValidatedBindingResource::RenderTarget(target)
             }
-            (false, true, false) => {
-                buffer::materialize(frame, binding.counted_buffer, buffer::Kind::Counted)?
-            }
-            (false, false, true) => ResourceIdentity::RenderTarget(
-                RenderTargetHandle::from_raw(binding.render_target)
-                    .map_err(|_| EzGfxResult::InvalidContext)?,
-            ),
             _ => return Err(EzGfxResult::InvalidArgument),
         };
-        bindings.push(PublicBinding { name, resource });
+        validated.push(ValidatedBinding { name, resource });
     }
-    Ok(bindings)
+    // Validate every caller-owned name and resource shape before consulting frame
+    // state, so malformed foreign memory fails at the boundary deterministically.
+    let frame_entry = frame::get(frame)?;
+    for binding in &validated {
+        match binding.resource {
+            ValidatedBindingResource::Buffer { handle, kind } => {
+                buffer::validate(frame, handle, kind)?;
+            }
+            ValidatedBindingResource::RenderTarget(target) => {
+                raw::render_target_extent(frame_entry.owner, target).map_err(EzGfxResult::from)?;
+            }
+        }
+    }
+
+    Ok(validated)
+}
+
+fn materialize_bindings(
+    frame: EzGfxFrame,
+    validated: Vec<ValidatedBinding>,
+) -> Result<Vec<PublicBinding>, EzGfxResult> {
+    validated
+        .into_iter()
+        .map(|binding| {
+            let resource = match binding.resource {
+                ValidatedBindingResource::Buffer { handle, kind } => {
+                    buffer::materialize(frame, handle, kind)?
+                }
+                ValidatedBindingResource::RenderTarget(target) => {
+                    ResourceIdentity::RenderTarget(target)
+                }
+            };
+            Ok(PublicBinding {
+                name: binding.name,
+                resource,
+            })
+        })
+        .collect()
 }
 
 fn catch_void(operation: impl FnOnce()) {

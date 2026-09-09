@@ -13,7 +13,7 @@ Migrate the original Odin/Vulkan `ez_gfx_api` to Rust/Cargo while roughly preser
 - Runtime packages must not depend on or bundle the Slang compiler.
 - Vulkan, DX12, and Metal are required; Vulkan-only abstractions are incomplete.
 - Explicit shader target attributes are authoritative for target intent.
-- Rust uses the clean ownership interface; C/C# use the explicit ABI 32 lifecycle through the dedicated FFI seam.
+- Rust uses the clean ownership interface; C/C# use the explicit ABI 33 lifecycle through the dedicated FFI seam.
 - External inputs and binary artifacts require validation; no panic crosses FFI.
 - OpenGL, DX11, software rasterizers, a custom shader DSL, and a custom window system are out of scope.
 - `gpu-allocator` 0.28 is the selected cross-backend Rust allocator.
@@ -29,7 +29,7 @@ A virtual workspace separates core types, runtime/artifact loading, offline in-p
 
 ### P-002: Public API and C ABI bindings — Owning Rust facade and raw FFI
 
-`Context` owns `Rc<ContextInner>`; owning resources retain context/resource leases and release through `Drop`. `Surface::begin_frame` and `Context::begin_frame` return target-less owning `Frame` values; configure methods attach logical swapchain or cached named targets. Recording borrows frames mutably, `Frame::finish(self)` preserves exact errors, and `Drop` aborts. ABI 32 alone exposes explicit lifecycle calls and opaque generational `u64` handles, including `EzGfxFrame`.
+`Context` owns `Rc<ContextInner>`; owning resources retain context/resource leases and release through `Drop`. `Surface::begin_frame` and `Context::begin_frame` return target-less owning `Frame` values; configure methods attach logical swapchain or cached named targets. Recording borrows frames mutably, `Frame::finish(self)` preserves exact errors, and `Drop` aborts. ABI 33 alone exposes explicit lifecycle calls and opaque generational `u64` handles, including `EzGfxFrame`.
 
 ### P-003: Multi-backend hardware abstraction — Custom static raw HAL
 
@@ -73,7 +73,7 @@ Size-classed staging pools recycle after completion; a transfer owner batches co
 
 ### P-013: Explicit frame ownership
 
-Presented and managed-target begin functions return an owning `Frame`. Recording requires `&mut Frame`; `Frame::finish(self)` consumes it, returns recording/submit/present errors unchanged, and `Drop` aborts. Context-owned buffers are imported immutably for a transaction and reusable after every terminal path.
+Presented and managed-target begin functions return an owning `Frame`. Recording requires `&mut Frame`; `Frame::finish(self)` consumes it, returns recording/submit/present errors unchanged, and `Drop` aborts. Context-acquired buffers are claimed by their first frame, reusable only within it, and invalid after every terminal path; native backing is recycled only after completion.
 
 ### P-014: Basis Universal and compressed textures — Feature-gated official transcoder wrapper
 
@@ -101,7 +101,7 @@ Backend-specific offscreen/readback fixtures provide PNG goldens and tolerances;
 
 ### P-020: Migration cutover — Clean ownership cutover
 
-The final cutover uses the shared `Example` host for winit inversion, context/surface ownership, resize, input, automation, and consuming frame dispatch. Rust exposes no compatibility aliases or manual frame/resource release; ABI 32 preserves the explicit C lifecycle.
+The final cutover uses the shared `Example` host for winit inversion, context/surface ownership, resize, input, automation, and consuming frame dispatch. Rust exposes no compatibility aliases or manual frame/resource release; ABI 33 preserves the explicit C lifecycle.
 
 ### P-021: Cross-backend shader execution semantics — Target-native layouts with canonical semantic ABI
 

@@ -112,7 +112,7 @@ Treat compiler output validation, serialized reflection, API-shape checks, and C
 
 The initial vertical slice established an end-to-end executable path before backend expansion. Final Rust examples use the shared `Example` host for process options, winit inversion, native window, `Context`, `Surface`, resize, input, pacing, benchmark, capture, and reporting. Each procedural loop receives `WindowFrame`, explicitly begins and configures the swapchain transaction, records through `&mut Frame`, then calls `Example::handle_frame(frame, swapchain_target)`.
 
-The safe cutover is ownership-only: resources release through `Drop`, `Frame::finish(self)` is consuming, unfinished frames abort on `Drop`, and no compatibility aliases retain manual safe destruction or the former multiple begin/end paths. ABI 32 keeps explicit C lifecycle functions over opaque generational handles.
+The safe cutover is ownership-only: resources release through `Drop`, `Frame::finish(self)` is consuming, unfinished frames abort on `Drop`, and no compatibility aliases retain manual safe destruction or the former multiple begin/end paths. ABI 33 keeps explicit C lifecycle functions over opaque generational handles.
 
 ### Rejected alternatives
 
@@ -136,4 +136,4 @@ Delivery latency and defect-rate comparisons remain unknown until measured. The 
 ### Validation actions
 
 1. Exercise all six renderers through the shared `Example` host and its owned frame lifecycle.
-2. Gate ABI 32 frame end/abort, opaque-handle validation, Rust wrapper drop order, and required Vulkan/DX12/Metal behavior.
+2. Gate ABI 33 frame end/abort, one-frame buffer invalidation, opaque-handle validation, Rust wrapper drop order, and required Vulkan/DX12/Metal behavior.

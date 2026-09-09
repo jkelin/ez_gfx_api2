@@ -94,8 +94,7 @@ mod tests {
 }
 
 fn main() -> anyhow::Result<()> {
-    let (program, config) = ExampleProgram::new("06_sponza_ktx2", WIDTH, HEIGHT, "ez_gfx_api2");
-    let mut example = Example::new(config)?;
+    let mut example = Example::new("06_sponza_ktx2", WIDTH, HEIGHT, "ez_gfx_api2")?;
     {
         let backend = example.backend();
         let context = example.context();
@@ -123,13 +122,13 @@ fn main() -> anyhow::Result<()> {
         let index_allocation = context.upload_indices(&mesh.indices)?;
         let (first_index, _) = index_allocation.range()?;
         let positions_heap = context.create_vertex_heap("positions")?;
-        let positions = positions_heap.upload(&mesh.positions)?;
+        let _positions = positions_heap.upload(&mesh.positions)?;
         let normals_heap = context.create_vertex_heap("normals")?;
-        let normals = normals_heap.upload(&mesh.normals)?;
+        let _normals = normals_heap.upload(&mesh.normals)?;
         let uvs_heap = context.create_vertex_heap("uvs")?;
-        let uvs = uvs_heap.upload(&mesh.uvs)?;
+        let _uvs = uvs_heap.upload(&mesh.uvs)?;
         let primitive_ids_heap = context.create_vertex_heap("primitive_ids")?;
-        let primitive_ids_buffer = primitive_ids_heap.upload(&primitive_ids)?;
+        let _primitive_ids_buffer = primitive_ids_heap.upload(&primitive_ids)?;
         let repeat_sampler = TextureSamplerDesc {
             min_filter: SamplerFilter::Linear,
             mag_filter: SamplerFilter::Linear,
@@ -210,11 +209,6 @@ fn main() -> anyhow::Result<()> {
             primitive_count,
             padding: [0; 3],
         };
-        let primitives = context.acquire_buffer::<PrimitiveTextured>(records.len())?;
-        primitives.write(0, &records)?;
-        let indirect =
-            context.acquire_counted_buffer::<DrawIndexedCommand>(primitive_count as usize)?;
-        indirect.publish_count(primitive_count)?;
 
         while let Some(window_frame) = example.wait_for_next_frame()? {
             let mut frame = example.surface().begin_frame()?;
@@ -239,15 +233,17 @@ fn main() -> anyhow::Result<()> {
                     clip_y,
                 )? * camera.view(target)?,
             );
+            // Buffers are one-frame values: the first bound frame consumes them.
+            let primitives = example.context().acquire_buffer_from(records.as_slice())?;
+            let indirect = example
+                .context()
+                .acquire_counter_buffer::<DrawIndexedCommand>(primitive_count as usize)?;
+            // Compute fills the draw commands; only the visible count is published up front.
+            indirect.publish_count(primitive_count)?;
             let bindings = [
                 Binding::buffer("primitives", &primitives),
-                Binding::counted_buffer("draw_commands", &indirect),
+                Binding::counter_buffer("draw_commands", &indirect),
             ];
-            frame.retain_vertex_allocation(&positions)?;
-            frame.retain_vertex_allocation(&normals)?;
-            frame.retain_vertex_allocation(&uvs)?;
-            frame.retain_vertex_allocation(&primitive_ids_buffer)?;
-            frame.retain_index_allocation(&index_allocation)?;
             for texture in &textures {
                 frame.retain_texture(texture)?;
             }
@@ -262,7 +258,6 @@ fn main() -> anyhow::Result<()> {
             example.handle_frame(frame, swapchain_target)?;
         }
     }
-    let report = example.close()?;
-    program.finish(report);
+    example.close()?;
     Ok(())
 }

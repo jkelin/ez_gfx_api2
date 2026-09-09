@@ -102,8 +102,7 @@ fn imgui_key(key: SceneKey) -> Option<Key> {
 }
 
 fn main() -> anyhow::Result<()> {
-    let (program, config) = ExampleProgram::new("04_imgui", WIDTH, HEIGHT, "ez_gfx_api2");
-    let mut example = Example::new(config)?;
+    let mut example = Example::new("04_imgui", WIDTH, HEIGHT, "ez_gfx_api2")?;
     {
         let backend = example.backend();
         let context = example.context();
@@ -235,11 +234,7 @@ fn main() -> anyhow::Result<()> {
             }
             let commands = example
                 .context()
-                .acquire_buffer::<ImGuiCommand>(cpu_commands.len())?;
-            commands.write(0, &cpu_commands)?;
-            let indirect = example
-                .context()
-                .acquire_counted_buffer::<DrawIndexedCommand>(draw_counts.len())?;
+                .acquire_buffer_from(cpu_commands.as_slice())?;
             let draws = draw_counts
                 .iter()
                 .copied()
@@ -252,15 +247,14 @@ fn main() -> anyhow::Result<()> {
                     first_instance: index as u32,
                 })
                 .collect::<Vec<_>>();
-            indirect.write(0, &draws)?;
-            indirect.publish_count(u32::try_from(draws.len())?)?;
+            // Counter initialization publishes the draw count automatically.
+            let indirect = example
+                .context()
+                .acquire_counter_buffer_from(draws.as_slice())?;
             let mut frame = example.surface().begin_frame()?;
             let swapchain_target =
                 frame.configure_swapchain(window_frame.size, Format::Bgra8Srgb)?;
             frame.retain_texture(&texture)?;
-            frame.retain_index_allocation(&identity_indices)?;
-            frame.retain_vertex_allocation(vertices.as_ref().expect("uploaded ImGui vertices"))?;
-            frame.retain_vertex_allocation(indices.as_ref().expect("uploaded ImGui indices"))?;
             let bindings = [Binding::buffer("imgui_commands", &commands)];
             frame.add_graphics(
                 &shader,
@@ -272,7 +266,6 @@ fn main() -> anyhow::Result<()> {
             example.handle_frame(frame, swapchain_target)?;
         }
     }
-    let report = example.close()?;
-    program.finish(report);
+    example.close()?;
     Ok(())
 }

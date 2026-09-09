@@ -5,12 +5,12 @@ use crate::Result;
 use super::{
     AllocationRequest, CompletionToken, ContextHandle, ContextState, DEFAULT_STAGING_POLICY, Error,
     GeometryAllocation, GeometryError, IndexAllocationHandle, MemoryClass, NativeAllocation,
-    NativeContext, ResourceKind, RetiredGeometry, RetiredGeometryRange, RetiredRangeKind,
-    RetiredVertexHeap, UploadEvent, UploadResource, UploadStatus, VertexAllocationHandle,
-    VertexHeapHandle, allocate_native, completed_native_frame_value, completed_transfer_native,
-    copy_native, free_native_allocation, last_native_frame_completion, map_allocation,
-    map_geometry, map_lifecycle, result_status, staging_bucket_size, with_context_mut,
-    write_native,
+    NativeContext, ResourceKind, RetiredGeometry, RetiredGeometryRange, RetiredRangeGraphics,
+    RetiredRangeKind, RetiredVertexHeap, UploadEvent, UploadResource, UploadStatus,
+    VertexAllocationHandle, VertexHeapHandle, allocate_native, completed_native_frame_value,
+    completed_transfer_native, copy_native, free_native_allocation, last_native_frame_completion,
+    map_allocation, map_geometry, map_lifecycle, result_status, staging_bucket_size,
+    with_context_mut, write_native,
 };
 
 const INITIAL_GEOMETRY_HEAP_BYTES: u64 = 64 * 1024;
@@ -334,9 +334,12 @@ fn reclaim_retired_geometry(context: &mut ContextState) -> Result<()> {
         let mut index = 0;
         while index < context.retired_geometry_ranges.len() {
             let retired = &context.retired_geometry_ranges[index];
-            let graphics_ready = retired
-                .graphics
-                .is_none_or(|completion| completion.value <= graphics);
+            let graphics_ready = match retired.graphics {
+                RetiredRangeGraphics::Prior(completion) => {
+                    completion.is_none_or(|completion| completion.value <= graphics)
+                }
+                RetiredRangeGraphics::Recording(_) => false,
+            };
             if retired.transfer.value > transfer || !graphics_ready {
                 index += 1;
                 continue;
@@ -651,6 +654,30 @@ pub fn index_allocation_range(
     })
 }
 
+fn retired_range_graphics(context: &ContextState) -> RetiredRangeGraphics {
+    // A drop during recording may precede the heap's lazy import, so every such
+    // range waits for that transaction rather than guessing whether shaders use it.
+    if context.frame.state() == ez_gfx_runtime::frame::FrameState::Recording {
+        RetiredRangeGraphics::Recording(context.frame_serial)
+    } else {
+        RetiredRangeGraphics::Prior(last_native_frame_completion(&context.native).ok())
+    }
+}
+
+pub(super) fn finalize_recording_range_drops(
+    context: &mut ContextState,
+    serial: u64,
+    completion: Option<CompletionToken>,
+) -> Result<()> {
+    for retired in &mut context.retired_geometry_ranges {
+        if matches!(retired.graphics, RetiredRangeGraphics::Recording(candidate) if candidate == serial)
+        {
+            retired.graphics = RetiredRangeGraphics::Prior(completion);
+        }
+    }
+    reclaim_retired_geometry(context)
+}
+
 /// Retires a vertex range without blocking resource `Drop`.
 ///
 /// # Errors
@@ -667,7 +694,7 @@ pub fn remove_vertices(context: ContextHandle, handle: VertexAllocationHandle) -
             .geometry_last_transfer
             .remove(&handle.packed())
             .ok_or(Error::InvalidContext)?;
-        let graphics = last_native_frame_completion(&context.native).ok();
+        let graphics = retired_range_graphics(context);
         context
             .identity
             .remove(handle.packed(), ResourceKind::VertexAllocation)
@@ -698,7 +725,7 @@ pub fn remove_indices(context: ContextHandle, handle: IndexAllocationHandle) -> 
             .geometry_last_transfer
             .remove(&handle.packed())
             .ok_or(Error::InvalidContext)?;
-        let graphics = last_native_frame_completion(&context.native).ok();
+        let graphics = retired_range_graphics(context);
         context
             .identity
             .remove(handle.packed(), ResourceKind::IndexAllocation)

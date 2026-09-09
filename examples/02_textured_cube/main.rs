@@ -18,8 +18,7 @@ struct Push {
 }
 
 fn main() -> anyhow::Result<()> {
-    let (program, config) = ExampleProgram::new("02_textured_cube", WIDTH, HEIGHT, "ez_gfx_api2");
-    let mut example = Example::new(config)?;
+    let mut example = Example::new("02_textured_cube", WIDTH, HEIGHT, "ez_gfx_api2")?;
     {
         let backend = example.backend();
         let context = example.context();
@@ -68,7 +67,7 @@ fn main() -> anyhow::Result<()> {
         let index_allocation = context.upload_indices(&indices)?;
         let (first_index, _) = index_allocation.range()?;
         let positions_heap = context.create_vertex_heap("positions")?;
-        let positions_handle = positions_heap.upload(&positions)?;
+        let _positions_handle = positions_heap.upload(&positions)?;
         let config = TextureConfig {
             width: 0,
             height: 0,
@@ -100,19 +99,6 @@ fn main() -> anyhow::Result<()> {
             texture_id,
             padding: [0; 3],
         };
-        let indirect = context.acquire_counted_buffer::<DrawIndexedCommand>(1)?;
-        indirect.write(
-            0,
-            &[DrawIndexedCommand {
-                index_count,
-                instance_count: 1,
-                first_index,
-                vertex_offset: 0,
-                first_instance: 0,
-            }],
-        )?;
-
-        indirect.publish_count(1)?;
         while let Some(window_frame) = example.wait_for_next_frame()? {
             let mut frame = example.surface().begin_frame()?;
             let swapchain_target =
@@ -136,8 +122,17 @@ fn main() -> anyhow::Result<()> {
                     clip_y,
                 )? * camera.view(Vec3::ZERO)?,
             );
-            frame.retain_vertex_allocation(&positions_handle)?;
-            frame.retain_index_allocation(&index_allocation)?;
+            // Counter buffers are one-frame values: the first bound frame consumes them.
+            let commands = [DrawIndexedCommand {
+                index_count,
+                instance_count: 1,
+                first_index,
+                vertex_offset: 0,
+                first_instance: 0,
+            }];
+            let indirect = example
+                .context()
+                .acquire_counter_buffer_from(commands.as_slice())?;
             frame.retain_texture(&texture)?;
             frame.add_graphics(
                 &shader,
@@ -149,7 +144,6 @@ fn main() -> anyhow::Result<()> {
             example.handle_frame(frame, swapchain_target)?;
         }
     }
-    let report = example.close()?;
-    program.finish(report);
+    example.close()?;
     Ok(())
 }

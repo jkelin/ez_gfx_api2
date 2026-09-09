@@ -1,10 +1,11 @@
 use super::{
-    BenchmarkConfig, BenchmarkRunner, Error, FrameInput, HostSurface, NativeSurface,
-    PresentedFrame, ProgramReport, Result, SceneInput, backend_config, dispatch_window_input,
+    BenchmarkRunner, Error, FrameInput, HostSurface, NativeSurface, PresentedFrame, ProgramReport,
+    Result, SceneInput, backend_config, dispatch_window_input, publish_snapshot,
 };
 use ez_gfx::{Backend, Context, ContextOptions, Event, Frame, Surface, SurfaceOptions};
 use std::{
     cell::RefCell,
+    ffi::OsString,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -16,20 +17,6 @@ use winit::{
     platform::pump_events::{EventLoopExtPumpEvents, PumpStatus},
     window::{Window, WindowId},
 };
-
-/// Window and automation settings for one example.
-#[derive(Clone, Copy, Debug)]
-pub struct ExampleConfig {
-    pub width: u32,
-    pub height: u32,
-    pub title: &'static str,
-    pub frame_limit: Option<u32>,
-    pub benchmark: Option<BenchmarkConfig>,
-    pub(crate) backend: Backend,
-    pub(crate) visible: bool,
-    pub(crate) debug: bool,
-    pub(crate) validation: bool,
-}
 
 /// Host input and timing for one pending frame.
 pub struct WindowFrame {
@@ -47,7 +34,9 @@ struct Observations {
 }
 
 struct HostState {
-    config: ExampleConfig,
+    title: &'static str,
+    frame_limit: Option<u32>,
+    visible: bool,
     window: Option<Window>,
     host: Option<HostSurface>,
     width: u32,
@@ -60,11 +49,19 @@ struct HostState {
 }
 
 impl HostState {
-    fn new(config: ExampleConfig) -> Self {
+    fn new(
+        title: &'static str,
+        width: u32,
+        height: u32,
+        frame_limit: Option<u32>,
+        visible: bool,
+    ) -> Self {
         Self {
-            width: config.width,
-            height: config.height,
-            config,
+            title,
+            frame_limit,
+            visible,
+            width,
+            height,
             window: None,
             host: None,
             pending_resize: None,
@@ -92,15 +89,15 @@ impl HostState {
             return;
         }
         let attributes = Window::default_attributes()
-            .with_title(self.config.title)
-            .with_inner_size(PhysicalSize::new(self.config.width, self.config.height))
-            .with_visible(self.config.visible)
-            .with_active(self.config.visible);
+            .with_title(self.title)
+            .with_inner_size(PhysicalSize::new(self.width, self.height))
+            .with_visible(self.visible)
+            .with_active(self.visible);
         let window = match event_loop.create_window(attributes) {
             Ok(window) => window,
             Err(error) => return self.fail(error),
         };
-        let host = match HostSurface::attach(&window, self.config.width, self.config.height) {
+        let host = match HostSurface::attach(&window, self.width, self.height) {
             Ok(host) => host,
             Err(error) => return self.fail(error),
         };
@@ -130,8 +127,13 @@ impl HostState {
     }
 }
 
-/// Owns event pumping, the native host, graphics lifetime, pacing, and automation.
+/// Owns process options, event pumping, the native host, graphics lifetime, pacing, and automation.
 pub struct Example {
+    identity: &'static str,
+    backend_name: &'static str,
+    snapshot: Option<OsString>,
+    update_snapshots: bool,
+    report_stdout: bool,
     event_loop: Option<EventLoop<()>>,
     state: HostState,
     context: Option<Context>,
@@ -145,11 +147,14 @@ pub struct Example {
 }
 
 impl Example {
-    /// Creates the native host and atomic context/surface pair.
-    pub fn new(config: ExampleConfig) -> Result<Self> {
-        if config.frame_limit == Some(0) {
-            return Err(Error::message("frame limit must be positive"));
-        }
+    /// Parses process options, then creates the native host and atomic context/surface pair.
+    pub fn new(
+        identity: &'static str,
+        width: u32,
+        height: u32,
+        title: &'static str,
+    ) -> Result<Self> {
+        let options = super::program_options().unwrap_or_else(|error| super::exit_config(error));
         if std::env::var_os("VK_LOADER_LAYERS_DISABLE").is_none() {
             // SAFETY: no event loop, worker, or graphics context exists yet.
             unsafe { std::env::set_var("VK_LOADER_LAYERS_DISABLE", "~implicit~") };
@@ -159,13 +164,18 @@ impl Example {
         event_loop.set_control_flow(ControlFlow::Poll);
         let observations = Rc::new(RefCell::new(Observations::default()));
         let mut example = Self {
+            identity,
+            backend_name: super::host::backend_name_for(options.backend),
+            snapshot: options.snapshot,
+            update_snapshots: options.update_snapshots,
+            report_stdout: options.report,
             event_loop: Some(event_loop),
-            state: HostState::new(config),
+            state: HostState::new(title, width, height, options.frame_limit, options.visible),
             context: None,
             surface: None,
-            backend: config.backend,
+            backend: options.backend,
             observations: Rc::clone(&observations),
-            benchmark: BenchmarkRunner::new(config.benchmark),
+            benchmark: BenchmarkRunner::new(options.benchmark),
             frames: 0,
             last_frame: Instant::now(),
             report: None,
@@ -178,10 +188,10 @@ impl Example {
         }
 
         let native = example.state.descriptor()?;
-        let backend = backend_config(native.platform, config.backend);
+        let backend = backend_config(native.platform, options.backend);
         let context = Context::new(ContextOptions {
-            enable_debug: config.debug,
-            enable_validation: config.validation,
+            enable_debug: options.debug,
+            enable_validation: options.validation,
             surface_platform: backend.platform,
             backend: backend.backend,
             texture_decode_workers: 0,
@@ -238,13 +248,12 @@ impl Example {
         if self.state.closed
             || self
                 .state
-                .config
                 .frame_limit
                 .is_some_and(|limit| self.frames >= limit)
         {
             return Ok(None);
         }
-        if self.state.config.visible
+        if self.state.visible
             && let Some(window) = &self.state.window
         {
             window.request_redraw();
@@ -291,7 +300,6 @@ impl Example {
         }
         let terminal = self
             .state
-            .config
             .frame_limit
             .is_some_and(|limit| self.frames.saturating_add(1) >= limit);
         let _readback = terminal
@@ -303,7 +311,6 @@ impl Example {
         self.benchmark.end_frame(self.frames);
         if self
             .state
-            .config
             .frame_limit
             .is_some_and(|limit| self.frames >= limit)
         {
@@ -336,12 +343,41 @@ impl Example {
         self.surface.as_ref().expect("surface exists until close")
     }
 
-    /// Drops caller resources first, then deterministically tears down the surface and context.
-    pub fn close(mut self) -> Result<Option<ProgramReport>> {
+    /// Drops caller resources first, deterministically tears down graphics, then publishes reports.
+    pub fn close(mut self) -> Result<()> {
         self.surface.take();
         let context = self.context.take().expect("context exists until close");
         context.close().map_err(|(_, error)| error)?;
-        Ok(self.report.take())
+        // Reports publish after teardown so the terminal capture stays outside benchmark timing.
+        let Some(report) = self.report.take() else {
+            return Ok(());
+        };
+        let frame = report.frame;
+        publish_snapshot(
+            self.snapshot,
+            self.update_snapshots,
+            frame.width,
+            frame.height,
+            frame.frames,
+            &frame.rgba8,
+            frame.runtime_events,
+            frame.diagnostics,
+            frame.dropped_observations,
+            self.report_stdout,
+        );
+        if let Some(benchmark) = report.benchmark {
+            let frame_time_ns = benchmark.elapsed_ns as f64 / f64::from(benchmark.measured_frames);
+            let fps = 1_000_000_000.0 / frame_time_ns;
+            println!(
+                "{{\"benchmark\":\"{}\",\"backend\":\"{}\",\"warmup_frames\":{},\"measured_frames\":{},\"elapsed_ns\":{},\"frame_time_ns\":{frame_time_ns:.3},\"fps\":{fps:.3}}}",
+                self.identity,
+                self.backend_name,
+                benchmark.warmup_frames,
+                benchmark.measured_frames,
+                benchmark.elapsed_ns,
+            );
+        }
+        Ok(())
     }
 }
 
@@ -352,7 +388,7 @@ impl ApplicationHandler for Example {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         // Hidden automation cannot depend on compositor redraw delivery.
-        if !self.state.config.visible {
+        if !self.state.visible {
             self.state.redraw_ready = true;
         }
     }

@@ -181,11 +181,16 @@ enum RetiredRangeKind {
     Index,
 }
 
+enum RetiredRangeGraphics {
+    Prior(Option<CompletionToken>),
+    Recording(u64),
+}
+
 struct RetiredGeometryRange {
     handle: PackedHandle,
     kind: RetiredRangeKind,
     transfer: CompletionToken,
-    graphics: Option<CompletionToken>,
+    graphics: RetiredRangeGraphics,
 }
 
 struct RetiredVertexHeap {

@@ -21,7 +21,7 @@ const FIELD_MASK_U32: u32 = (1 << 24) - 1;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Kind {
     Structured = 1,
-    Counted = 2,
+    Counter = 2,
 }
 
 struct Entry {
@@ -63,7 +63,7 @@ fn decode(handle: u64) -> Result<(u32, u32, Kind), EzGfxResult> {
     }
     let kind = match (handle >> KIND_SHIFT) & 0xFF {
         1 => Kind::Structured,
-        2 => Kind::Counted,
+        2 => Kind::Counter,
         _ => return Err(EzGfxResult::InvalidContext),
     };
     let slot = handle & FIELD_MASK;
@@ -195,7 +195,7 @@ pub(crate) fn write(
             .checked_mul(element_size as usize)
             .ok_or(EzGfxResult::InvalidArgument)?;
         entry.bytes[byte_start..byte_end].copy_from_slice(bytes);
-        if kind == Kind::Counted {
+        if kind == Kind::Counter {
             let published = u32::try_from(end).map_err(|_| EzGfxResult::InvalidArgument)?;
             entry.published_count = entry.published_count.max(published);
         }
@@ -205,11 +205,22 @@ pub(crate) fn write(
 
 pub(crate) fn publish(handle: u64, owner: ContextHandle, count: u32) -> Result<(), EzGfxResult> {
     require_not_materialized(handle)?;
-    with_entry(handle, owner, Kind::Counted, |entry| {
+    with_entry(handle, owner, Kind::Counter, |entry| {
         if count > entry.element_count {
             return Err(EzGfxResult::InvalidArgument);
         }
         entry.published_count = count;
+        Ok(())
+    })
+}
+pub(crate) fn validate(frame: EzGfxFrame, handle: u64, kind: Kind) -> Result<(), EzGfxResult> {
+    let frame_entry = crate::frame::get(frame)?;
+    with_entry(handle, frame_entry.owner, kind, |entry| {
+        if kind == Kind::Counter
+            && entry.element_size as usize != core::mem::size_of::<DrawIndexedCommand>()
+        {
+            return Err(EzGfxResult::InvalidArgument);
+        }
         Ok(())
     })
 }
@@ -249,19 +260,14 @@ pub(crate) fn materialize(
             }
             Ok(ResourceIdentity::Structured(raw_handle))
         }
-        Kind::Counted => {
+        Kind::Counter => {
             if entry.element_size as usize != core::mem::size_of::<DrawIndexedCommand>() {
                 return Err(EzGfxResult::InvalidArgument);
             }
             let raw_handle = raw::acquire_indirect(frame_entry.owner, entry.element_count)
                 .map_err(EzGfxResult::from)?;
-            let commands = entry
-                .bytes
-                .chunks_exact(entry.element_size as usize)
-                .map(bytemuck::pod_read_unaligned)
-                .collect::<Vec<DrawIndexedCommand>>();
-            let result =
-                raw::write_indirect(frame_entry.owner, raw_handle, 0, &commands).and_then(|()| {
+            let result = raw::write_indirect_bytes(frame_entry.owner, raw_handle, &entry.bytes)
+                .and_then(|()| {
                     raw::publish_compute_indirect_count(
                         frame_entry.owner,
                         raw_handle,
@@ -315,9 +321,39 @@ pub(crate) fn remove(handle: u64, owner: ContextHandle, kind: Kind) -> Result<()
 }
 
 pub(crate) fn clear_frame(frame: EzGfxFrame) {
-    // Per-frame native materializations expire; context-owned CPU contents remain reusable.
-    if let Ok(mut materialized) = MATERIALIZED.lock() {
+    // Terminal frame ownership consumes every public buffer first claimed by
+    // this frame. The raw allocation has already entered completion-safe reuse
+    // or rollback handling in the authoritative runtime.
+    let handles = if let Ok(mut materialized) = MATERIALIZED.lock() {
+        let handles = materialized
+            .keys()
+            .filter_map(|(candidate, handle)| (*candidate == frame).then_some(*handle))
+            .collect::<Vec<_>>();
         materialized.retain(|(candidate, _), _| *candidate != frame);
+        handles
+    } else {
+        return;
+    };
+    let Ok(mut registry) = BUFFERS.lock() else {
+        return;
+    };
+    for handle in handles {
+        let Ok((index, generation, _)) = decode(handle) else {
+            continue;
+        };
+        let Some(slot) = registry.slots.get_mut(index as usize) else {
+            continue;
+        };
+        if slot.generation != generation || slot.entry.is_none() {
+            continue;
+        }
+        slot.entry = None;
+        if slot.generation == FIELD_MASK_U32 {
+            slot.retired = true;
+        } else {
+            slot.generation += 1;
+            registry.free.push(index);
+        }
     }
 }
 
