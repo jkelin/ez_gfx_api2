@@ -59,6 +59,8 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         allocations: HashMap::new(),
         allocation_ready: HashMap::new(),
         shaders: HashMap::new(),
+        frame_shaders: std::collections::HashSet::new(),
+        pending_shader_destroys: std::collections::HashSet::new(),
         textures: HashMap::new(),
         render_targets: HashMap::new(),
         texture_formats: HashMap::new(),
@@ -75,6 +77,7 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         texture_registry,
         texture_ready: HashMap::new(),
         pending_textures: HashMap::new(),
+        texture_transfer_bytes: HashMap::new(),
         texture_handoffs: HashMap::new(),
         texture_telemetry: Arc::new(TextureUploadTelemetry::default()),
         async_textures,
@@ -104,6 +107,7 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         last_readbacks: Vec::new(),
         active_surface: None,
         frame_presented: false,
+        frame_capture_surface: None,
         observability,
         #[cfg(test)]
         cleanup_test_outcome: None,
@@ -619,6 +623,7 @@ pub(super) fn cleanup_context_state(
     owned.texture_last_transfer.clear();
     owned.texture_ready.clear();
     owned.texture_handoffs.clear();
+    owned.texture_transfer_bytes.clear();
     if let Err(error) = owned.texture_registry.clear() {
         failure.get_or_insert_with(|| map_texture(error));
     }

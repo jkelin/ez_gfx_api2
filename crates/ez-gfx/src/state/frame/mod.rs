@@ -13,7 +13,7 @@ use super::{
     NativeSurface, NativeTexture, NodeDesc, PackedHandle, PassInfo, PipelineKey, QueueKind,
     RenderTargetHandle, RenderTargetRecord, ResourceAccess, ResourceDesc, ResourceId, ResourceKind,
     ResourceLifetime, ResourceState, RuntimePhase, SURFACE_DEFAULT_CLEAR, ShaderHandle,
-    ShaderRecord, ShaderStage, StoreOp, TextureFormat, TextureHandle, TextureId,
+    ShaderRecord, ShaderStage, StoreOp, SurfaceHandle, TextureFormat, TextureHandle, TextureId,
     execute_compiled_graph, last_native_frame_completion, map_frame, map_hal, map_lifecycle,
     native_layouts, pipeline_layout_key, result_status, runtime_record, vulkan_bindings,
     wait_native_idle, with_context_mut,
@@ -67,6 +67,7 @@ pub(super) fn start_recording(context: &mut ContextState) -> Result<()> {
     context.frame_has_graphics = false;
     context.last_readbacks.clear();
     context.frame_presented = false;
+    context.frame_capture_surface = None;
     Ok(())
 }
 
@@ -91,6 +92,34 @@ pub fn current_frame_serial(context: ContextHandle) -> Result<u64> {
         }
         Ok(context.frame_serial)
     })
+}
+
+/// Requests capture of this frame's presented surface without changing persistent cache policy.
+///
+/// # Errors
+///
+/// Returns an error unless `surface` is the active surface of a recording frame.
+pub fn frame_request_presented_readback(
+    context: ContextHandle,
+    surface: SurfaceHandle,
+) -> Result<()> {
+    result_status(with_context_mut(context, |context| {
+        context
+            .identity
+            .check_thread_and_health()
+            .map_err(map_lifecycle)?;
+        if context.frame.state() != ez_gfx_runtime::frame::FrameState::Recording
+            || context.active_surface != Some(surface)
+        {
+            return Err(Error::NotReady);
+        }
+        context.frame_capture_surface = Some(surface);
+        Ok(())
+    }))
+}
+
+const fn should_capture_presented(snapshot_cache: bool, frame_request: bool) -> bool {
+    snapshot_cache || frame_request
 }
 
 fn intern_buffer_resource(context: &mut ContextState, handle: PackedHandle) -> Result<ResourceId> {
@@ -710,31 +739,42 @@ fn add_texture_accesses(
 /// Returns an error when validation, handle ownership, readiness, or a backend operation fails.
 pub fn execute_graphics(
     context: ContextHandle,
-    shader: ShaderHandle,
+    vertex_shader: ShaderHandle,
+    fragment_shader: ShaderHandle,
     counter: CounterBufferHandle,
     bindings: &[ez_gfx_runtime::binding::PublicBinding],
     state: DynamicPipelineState,
 ) -> Result<()> {
     result_status(with_context_mut(context, |context| {
-        let shader_handle = shader.packed();
-        context
-            .identity
-            .resolve(shader_handle, ResourceKind::Shader)
-            .map_err(map_lifecycle)?;
+        for shader in [vertex_shader, fragment_shader] {
+            context
+                .identity
+                .resolve(shader.packed(), ResourceKind::Shader)
+                .map_err(map_lifecycle)?;
+        }
         let counter_handle = counter.packed();
         context
             .identity
             .resolve(counter_handle, ResourceKind::CounterBuffer)
             .map_err(map_lifecycle)?;
-        let record = context.shaders.get(&shader).ok_or(Error::InvalidContext)?;
-        let layout = record
+        let vertex = context
+            .shaders
+            .get(&vertex_shader)
+            .filter(|record| record.stage == ez_gfx_artifact::Stage::Vertex)
+            .ok_or(Error::InvalidContext)?;
+        let fragment = context
+            .shaders
+            .get(&fragment_shader)
+            .filter(|record| record.stage == ez_gfx_artifact::Stage::Fragment)
+            .ok_or(Error::InvalidContext)?;
+        let layout = vertex
             .runtime
             .bindings(ez_gfx_artifact::Stage::Vertex)
-            .and_then(|vertex| {
-                record
+            .and_then(|vertex_layout| {
+                fragment
                     .runtime
                     .bindings(ez_gfx_artifact::Stage::Fragment)
-                    .and_then(|fragment| vertex.merge(&fragment))
+                    .and_then(|fragment_layout| vertex_layout.merge(&fragment_layout))
             })
             .map_err(|_| Error::InvalidArgument)?;
         let bindings = binding::select_bindings(&layout, bindings);
@@ -747,17 +787,24 @@ pub fn execute_graphics(
             .get(&counter)
             .ok_or(Error::InvalidContext)?
             .capacity();
-        let pipeline_layout = *record
-            .graphics_layout
-            .as_ref()
-            .ok_or(Error::InvalidArgument)?;
+        let pipeline_layout = vertex
+            .runtime
+            .pipeline_layout(ez_gfx_artifact::Stage::Vertex)
+            .and_then(|vertex_layout| {
+                fragment
+                    .runtime
+                    .pipeline_layout(ez_gfx_artifact::Stage::Fragment)
+                    .and_then(|fragment_layout| vertex_layout.merge(&fragment_layout))
+            })
+            .map_err(|_| Error::InvalidArgument)?;
         let node = graphics_node(context, &layout, &bindings, counter, pipeline_layout)?;
         context
             .frame
             .record_node(
                 node,
                 ExecutableNode::Graphics {
-                    shader,
+                    vertex_shader,
+                    fragment_shader,
                     counter,
                     draw_capacity,
                     bindings: bindings.clone(),
@@ -767,6 +814,8 @@ pub fn execute_graphics(
                 },
             )
             .map_err(|error| map_frame(&error))?;
+        context.frame_shaders.insert(vertex_shader);
+        context.frame_shaders.insert(fragment_shader);
         mark_transient_bindings_interned(context, &bindings)?;
         mark_transient_interned(context, counter_handle)?;
         context.frame_has_graphics = true;
@@ -790,7 +839,11 @@ pub fn execute_compute(
             .identity
             .resolve(handle, ResourceKind::Shader)
             .map_err(map_lifecycle)?;
-        let record = context.shaders.get(&shader).ok_or(Error::InvalidContext)?;
+        let record = context
+            .shaders
+            .get(&shader)
+            .filter(|record| record.stage == ez_gfx_artifact::Stage::Compute)
+            .ok_or(Error::InvalidContext)?;
         if groups.contains(&0) {
             return Err(Error::InvalidArgument);
         }
@@ -825,6 +878,7 @@ pub fn execute_compute(
                 },
             )
             .map_err(|error| map_frame(&error))?;
+        context.frame_shaders.insert(shader);
         mark_transient_bindings_interned(context, &bindings)?;
         Ok(())
     }))
@@ -977,6 +1031,7 @@ pub fn frame_submit(context: ContextHandle) -> Result<()> {
                 .observability
                 .push_diagnostic(DiagnosticLevel::Error, record);
         }
+        super::shader::release_frame_shaders(context);
         result
     }))
 }
@@ -996,6 +1051,7 @@ pub fn frame_abort(context: ContextHandle) -> Result<()> {
             .map_err(map_lifecycle)?;
         let frame_serial = context.frame_serial;
         context.frame.abort();
+        super::shader::release_frame_shaders(context);
         rollback_transient_internment(context);
         context.frame_resources.clear();
         let completion = last_native_frame_completion(&context.native).ok();
@@ -1008,6 +1064,7 @@ pub fn frame_abort(context: ContextHandle) -> Result<()> {
         context.frame_depth = None;
         context.frame_has_graphics = false;
         context.frame_presented = false;
+        context.frame_capture_surface = None;
         Ok(())
     }))
 }
@@ -1040,6 +1097,23 @@ fn invalidate_unsafe_transients(context: &mut ContextState) {
         context.transient_buffers.remove(&handle);
         // Native ownership is uncertain after a failed idle drain. Keep the
         // allocation quarantined in `allocations` for terminal context cleanup.
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::should_capture_presented;
+
+    #[test]
+    fn presented_capture_combines_persistent_and_one_frame_requests() {
+        for (cache, request, expected) in [
+            (false, false, false),
+            (false, true, true),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            assert_eq!(should_capture_presented(cache, request), expected);
+        }
     }
 }
 

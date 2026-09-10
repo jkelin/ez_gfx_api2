@@ -411,6 +411,16 @@ impl<J: Send + 'static> TransferWorker<J> {
             .state
             .lock()
             .map_err(|_| TransferWorkerError::Failed)?;
+        if state.submitted < value {
+            // A targeted caller needs the current partial batch now. Wake the worker instead of
+            // inheriting the OS timeout granularity used by the throughput batching deadline.
+            let (ready, _dropped) = channel();
+            self.sender
+                .as_ref()
+                .ok_or(TransferWorkerError::Failed)?
+                .send(Message::Flush(ready))
+                .map_err(|_| self.admission_error())?;
+        }
         loop {
             if self.failed() {
                 return Err(self.admission_error());

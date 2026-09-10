@@ -17,13 +17,15 @@ mod apple {
     use core::mem::size_of;
     use ez_gfx_ffi::{
         EzGfxBackendContextDesc, EzGfxBinding, EzGfxDrawIndexedCommand, EzGfxDynamicState,
-        EzGfxResult, EzGfxWindowSurfaceDesc, ez_gfx_context_create_backend, ez_gfx_context_destroy,
+        EzGfxResult, EzGfxWindowSurfaceDesc, ez_gfx_compute_shader_destroy,
+        ez_gfx_compute_shader_load, ez_gfx_context_create_backend, ez_gfx_context_destroy,
         ez_gfx_context_init_device, ez_gfx_context_register_callback, ez_gfx_context_wait_idle,
-        ez_gfx_counter_buffer_acquire, ez_gfx_counter_buffer_write_draws, ez_gfx_frame_begin,
+        ez_gfx_counter_buffer_acquire, ez_gfx_counter_buffer_write_draws,
+        ez_gfx_fragment_shader_destroy, ez_gfx_fragment_shader_load, ez_gfx_frame_begin,
         ez_gfx_frame_bind, ez_gfx_frame_end, ez_gfx_frame_execute_compute,
         ez_gfx_frame_execute_graphics, ez_gfx_index_allocation_create,
-        ez_gfx_index_allocation_get_range, ez_gfx_shader_destroy, ez_gfx_shader_load_artifact,
-        ez_gfx_surface_create_window, ez_gfx_surface_destroy, ez_gfx_value_buffer_acquire,
+        ez_gfx_index_allocation_get_range, ez_gfx_surface_create_window, ez_gfx_surface_destroy,
+        ez_gfx_value_buffer_acquire, ez_gfx_vertex_shader_destroy, ez_gfx_vertex_shader_load,
     };
     use objc2::{MainThreadMarker, rc::Retained};
     use objc2_app_kit::NSView;
@@ -64,7 +66,14 @@ mod apple {
         );
     }
 
-    fn submit_render_nodes(context: u64, frame: u64, shader: u64, indirect: u64) {
+    fn submit_render_nodes(
+        context: u64,
+        frame: u64,
+        compute_shader: u64,
+        vertex_shader: u64,
+        fragment_shader: u64,
+        indirect: u64,
+    ) {
         let left = [-0.45_f32, 0.0, 0.2, 0.0, 1.0, 0.0, 0.0, 0.5];
         let right = [0.45_f32, 0.0, 0.2, 0.0, 0.0, 1.0, 0.0, 1.0];
         let occluded = [-0.45_f32, 0.0, 0.8, 0.0, 0.0, 0.0, 1.0, 1.0];
@@ -81,7 +90,8 @@ mod apple {
                 ez_gfx_frame_execute_graphics(
                     context,
                     frame,
-                    shader,
+                    vertex_shader,
+                    fragment_shader,
                     indirect,
                     &raw const alpha_blend,
                 )
@@ -89,14 +99,21 @@ mod apple {
             EzGfxResult::Ok
         );
         assert_eq!(
-            ez_gfx_frame_execute_compute(context, frame, shader, 1, 1, 1),
+            ez_gfx_frame_execute_compute(context, frame, compute_shader, 1, 1, 1),
             EzGfxResult::Ok
         );
         bind_params(context, frame, &right);
         assert_eq!(
             // SAFETY: Null state selects the default dynamic state.
             unsafe {
-                ez_gfx_frame_execute_graphics(context, frame, shader, indirect, core::ptr::null())
+                ez_gfx_frame_execute_graphics(
+                    context,
+                    frame,
+                    vertex_shader,
+                    fragment_shader,
+                    indirect,
+                    core::ptr::null(),
+                )
             },
             EzGfxResult::Ok
         );
@@ -104,7 +121,14 @@ mod apple {
         assert_eq!(
             // SAFETY: Null state selects the default dynamic state.
             unsafe {
-                ez_gfx_frame_execute_graphics(context, frame, shader, indirect, core::ptr::null())
+                ez_gfx_frame_execute_graphics(
+                    context,
+                    frame,
+                    vertex_shader,
+                    fragment_shader,
+                    indirect,
+                    core::ptr::null(),
+                )
             },
             EzGfxResult::Ok
         );
@@ -198,21 +222,41 @@ mod apple {
             EzGfxResult::Ok
         );
 
-        let mut shader = 0;
-        assert_eq!(
-            {
-                // SAFETY: Non-null arguments use live runner-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+        let mut compute_shader = 0;
+        let mut vertex_shader = 0;
+        let mut fragment_shader = 0;
+        for (entry, output, load) in [
+            (
+                b"computemain".as_slice(),
+                &raw mut compute_shader,
+                ez_gfx_compute_shader_load as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
+            ),
+            (
+                b"vertexmain".as_slice(),
+                &raw mut vertex_shader,
+                ez_gfx_vertex_shader_load as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
+            ),
+            (
+                b"fragmentmain".as_slice(),
+                &raw mut fragment_shader,
+                ez_gfx_fragment_shader_load as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
+            ),
+        ] {
+            assert_eq!(
+                // SAFETY: Artifact, exact entry name, and output storage remain live.
                 unsafe {
-                    ez_gfx_shader_load_artifact(
+                    load(
                         context,
                         artifact.as_ptr(),
                         artifact.len(),
-                        &raw mut shader,
+                        entry.as_ptr(),
+                        entry.len(),
+                        output,
                     )
-                }
-            },
-            EzGfxResult::Ok
-        );
+                },
+                EzGfxResult::Ok
+            );
+        }
         let label = b"metal-present";
 
         let indices = [0_u32, 1, 2];
@@ -288,7 +332,14 @@ mod apple {
             EzGfxResult::Ok
         );
 
-        submit_render_nodes(context, frame, shader, indirect);
+        submit_render_nodes(
+            context,
+            frame,
+            compute_shader,
+            vertex_shader,
+            fragment_shader,
+            indirect,
+        );
 
         let bytes = if cache_presented_snapshots {
             let bytes = collected
@@ -307,7 +358,9 @@ mod apple {
             EzGfxResult::Ok
         );
 
-        ez_gfx_shader_destroy(context, shader);
+        ez_gfx_compute_shader_destroy(context, compute_shader);
+        ez_gfx_vertex_shader_destroy(context, vertex_shader);
+        ez_gfx_fragment_shader_destroy(context, fragment_shader);
         teardown(view, context, surface);
         bytes
     }

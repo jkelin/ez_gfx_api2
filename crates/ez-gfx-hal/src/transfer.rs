@@ -115,6 +115,17 @@ impl<T> ReusableStagingPool<T> {
         self.entries.len()
     }
 
+    /// Total bucket capacity retained across every staging entry.
+    ///
+    /// Capacities accumulate with saturation: a diagnostic total must never wrap.
+    pub fn retained_bytes(&self) -> u64 {
+        // Buckets are reused whole, so retained capacity (not live occupancy) is the
+        // honest cache size; per-entry capacities cannot overflow `u64` when saturated.
+        self.entries
+            .iter()
+            .fold(0_u64, |total, entry| total.saturating_add(entry.capacity))
+    }
+
     /// Reports whether no bucket is retained.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -268,6 +279,30 @@ mod tests {
             received.into_iter().collect::<Vec<_>>(),
             [vec![(1, 0), (2, 0)], vec![(1, 1)], vec![(3, 0)],]
         );
+    }
+
+    #[test]
+    fn targeted_flush_wakes_a_partial_batch_before_following_work() {
+        let (sent, received) = channel();
+        let mut worker = TransferWorker::new_ordered_with_shutdown(
+            StagingPolicy::new(1, 8, 8, 8).unwrap(),
+            |_| 1,
+            |_| 1,
+            |value: &u64| *value,
+            move |jobs| {
+                sent.send(jobs).unwrap();
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+
+        worker.submit(1).unwrap();
+        worker.flush_through(1).unwrap();
+        worker.submit(2).unwrap();
+        worker.shutdown();
+
+        assert_eq!(received.into_iter().collect::<Vec<_>>(), [vec![1], vec![2]]);
     }
 
     #[test]

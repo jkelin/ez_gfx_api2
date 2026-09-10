@@ -137,6 +137,8 @@ struct Cli {
     #[arg(long)]
     report: bool,
     #[arg(long)]
+    frame_timings: bool,
+    #[arg(long)]
     snapshot: Option<OsString>,
     #[arg(long)]
     update_snapshots: bool,
@@ -159,6 +161,7 @@ pub(crate) struct ProgramOptions {
     pub(crate) benchmark: Option<BenchmarkConfig>,
     pub(crate) visible: bool,
     pub(crate) report: bool,
+    pub(crate) frame_timings: bool,
     pub(crate) snapshot: Option<OsString>,
     pub(crate) update_snapshots: bool,
     pub(crate) debug: bool,
@@ -268,6 +271,11 @@ fn program_options_from(
     let frame_limit = benchmark.map_or(Ok(requested_limit), |config| {
         benchmark_frame_limit(config).map(Some)
     })?;
+    if cli.frame_timings && frame_limit.is_none() {
+        return Err(Error::message(
+            "--frame-timings requires a finite frame limit",
+        ));
+    }
 
     let env_flag_value = |name| -> Result<bool> {
         let value = env_text(name, &env)?;
@@ -278,6 +286,7 @@ fn program_options_from(
         frame_limit,
         benchmark,
         visible: !(cli.hidden || env_flag_value("EZ_GFX_EXAMPLE_HIDDEN")?),
+        frame_timings: cli.frame_timings,
         report: cli.report || env("EZ_GFX_EXAMPLE_REPORT").is_some(),
         snapshot: cli.snapshot.or_else(|| env("EZ_GFX_EXAMPLE_SNAPSHOT")),
         update_snapshots: cli.update_snapshots
@@ -578,11 +587,13 @@ mod tests {
             "2",
             "--benchmark-frames",
             "4",
+            "--frame-timings",
         ])
         .unwrap();
         let options = program_options_from(cli, |_| None).unwrap();
 
         assert!(!options.visible);
+        assert!(options.frame_timings);
         assert_eq!(options.frame_limit, Some(7));
         assert_eq!(
             options.benchmark,
@@ -590,6 +601,15 @@ mod tests {
                 warmup_frames: 2,
                 measured_frames: 4,
             })
+        );
+    }
+
+    #[test]
+    fn frame_timings_require_a_finite_run() {
+        let cli = Cli::try_parse_from(["example", "--frame-timings"]).unwrap();
+        assert_eq!(
+            program_options_from(cli, |_| None).unwrap_err().to_string(),
+            "--frame-timings requires a finite frame limit"
         );
     }
 

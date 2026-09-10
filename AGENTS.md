@@ -16,7 +16,7 @@ This repository is a Rust/Cargo migration of `ez_gfx_api`. Preserve the recogniz
 ## Shader and artifact contracts
 
 - Use one root shared, backend-agnostic Slang module and one source convention; user shaders contain no physical Vulkan syntax or backend-specific binding assumptions.
-- `.ezgfxshader` is a versioned, bounded, validated `rkyv` container. Validate sizes, counts, ranges, versions, digests, reflection, target coverage, and entry/stage identity before allocation or backend calls. Require exactly one entrypoint per stage; reject malformed, incompatible, ambiguous, or mismatched artifacts closed. Runtime selects precompiled target data and never compiles.
+- `.ezgfxshader` is a versioned, bounded, validated `rkyv` container. Validate sizes, counts, ranges, versions, digests, reflection, target coverage, and `(stage, entry-point name)` identity before allocation or backend calls. Permit multiple names per stage, require exact stage/name selection, and reject duplicate products, malformed, incompatible, ambiguous, or mismatched artifacts closed. Runtime selects precompiled target data and never compiles.
 - Preserve canonical semantic resource IDs while retaining target-native layouts and specializations. DXIL semantics target Shader Model 6.5; do not introduce Shader Model 6.6 direct-heap requirements.
 
 ## ABI and boundary changes

@@ -10,14 +10,15 @@ mod common;
 use std::sync::LazyLock;
 
 use common::TestContext;
-use ez_gfx_compiler::{Target, compile_shader};
+use ez_gfx_compiler::{EasyGraphicsCompiler, Target};
 use ez_gfx_ffi::{
     EzGfxDrawIndexedCommand, EzGfxDynamicState, EzGfxEvent, EzGfxEventKind, EzGfxResult,
     ez_gfx_context_register_callback, ez_gfx_counter_buffer_acquire,
-    ez_gfx_counter_buffer_publish_count, ez_gfx_counter_buffer_write_draws, ez_gfx_frame_begin,
+    ez_gfx_counter_buffer_publish_count, ez_gfx_counter_buffer_write_draws,
+    ez_gfx_fragment_shader_destroy, ez_gfx_fragment_shader_load, ez_gfx_frame_begin,
     ez_gfx_frame_end, ez_gfx_frame_execute_graphics, ez_gfx_index_allocation_create,
-    ez_gfx_index_allocation_get_range, ez_gfx_index_allocation_remove, ez_gfx_shader_destroy,
-    ez_gfx_shader_load_artifact, ez_gfx_surface_set_snapshot_cache,
+    ez_gfx_index_allocation_get_range, ez_gfx_index_allocation_remove,
+    ez_gfx_surface_set_snapshot_cache, ez_gfx_vertex_shader_destroy, ez_gfx_vertex_shader_load,
 };
 
 const WIDTH: u32 = 64;
@@ -99,7 +100,8 @@ fn assert_red(bytes: &[u8]) {
 
 struct Fixture {
     native: TestContext,
-    shader: u64,
+    vertex_shader: u64,
+    fragment_shader: u64,
     index_allocation: u64,
     captures: Box<Captures>,
 }
@@ -108,19 +110,35 @@ impl Fixture {
     fn new(backend: u8) -> Self {
         let native = TestContext::create_with_validation(backend, backend == 1);
         let artifact = artifact();
-        let mut shader = 0;
-        assert_eq!(
-            // SAFETY: artifact and output storage remain live and aligned through the call.
-            unsafe {
-                ez_gfx_shader_load_artifact(
-                    native.context,
-                    artifact.as_ptr(),
-                    artifact.len(),
-                    &raw mut shader,
-                )
-            },
-            EzGfxResult::Ok
-        );
+        let mut vertex_shader = 0;
+        let mut fragment_shader = 0;
+        for (entry, output, load) in [
+            (
+                b"vertexmain".as_slice(),
+                &raw mut vertex_shader,
+                ez_gfx_vertex_shader_load as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
+            ),
+            (
+                b"fragmentmain".as_slice(),
+                &raw mut fragment_shader,
+                ez_gfx_fragment_shader_load as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
+            ),
+        ] {
+            assert_eq!(
+                // SAFETY: artifact, entry, and output storage remain live and aligned.
+                unsafe {
+                    load(
+                        native.context,
+                        artifact.as_ptr(),
+                        artifact.len(),
+                        entry.as_ptr(),
+                        entry.len(),
+                        output,
+                    )
+                },
+                EzGfxResult::Ok
+            );
+        }
         let indices = [0_u32, 1, 2];
         let mut index_allocation = 0;
         assert_eq!(
@@ -153,7 +171,8 @@ impl Fixture {
         );
         Self {
             native,
-            shader,
+            vertex_shader,
+            fragment_shader,
             index_allocation,
             captures,
         }
@@ -241,7 +260,8 @@ impl Fixture {
                 ez_gfx_frame_execute_graphics(
                     self.native.context,
                     frame,
-                    self.shader,
+                    self.vertex_shader,
+                    self.fragment_shader,
                     counter,
                     &raw const state,
                 )
@@ -262,7 +282,8 @@ impl Drop for Fixture {
             ez_gfx_context_register_callback(self.native.context, None, core::ptr::null_mut())
         };
         ez_gfx_index_allocation_remove(self.native.context, self.index_allocation);
-        ez_gfx_shader_destroy(self.native.context, self.shader);
+        ez_gfx_vertex_shader_destroy(self.native.context, self.vertex_shader);
+        ez_gfx_fragment_shader_destroy(self.native.context, self.fragment_shader);
     }
 }
 
@@ -314,10 +335,10 @@ FragmentOutput fragmentmain(VertexOutput input) {
         let targets = &[Target::Spirv, Target::Dxil];
         #[cfg(not(windows))]
         let targets = &[Target::Spirv];
-        let artifact =
-            compile_shader(&source, targets, false).expect("compile indirect pixel shader");
+        let artifact = EasyGraphicsCompiler::compile_shader(&source, targets, false)
+            .expect("compile indirect pixel shader");
         let _ = std::fs::remove_dir_all(root);
-        artifact
+        artifact.save_shader()
     });
     &ARTIFACT
 }

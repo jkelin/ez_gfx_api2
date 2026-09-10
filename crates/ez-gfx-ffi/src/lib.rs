@@ -31,6 +31,7 @@ mod frame;
 mod geometry;
 mod identity;
 mod render_target;
+mod shader;
 mod texture;
 
 pub use adapter::*;
@@ -42,6 +43,7 @@ pub use error::*;
 pub use geometry::*;
 pub use identity::*;
 pub use render_target::*;
+pub use shader::*;
 pub use texture::*;
 
 use std::{
@@ -62,8 +64,8 @@ use raw_window_handle::{
     WaylandDisplayHandle, WaylandWindowHandle, Win32WindowHandle, WindowsDisplayHandle,
     XcbDisplayHandle, XcbWindowHandle, XlibDisplayHandle, XlibWindowHandle,
 };
-/// Identifies C ABI revision 37 for compatibility checks.
-pub const EZ_GFX_ABI_VERSION: u32 = 37;
+/// Identifies C ABI revision 39 for compatibility checks.
+pub const EZ_GFX_ABI_VERSION: u32 = 39;
 /// Caps any caller-provided byte range at 16 MiB.
 pub const EZ_GFX_MAX_BOUNDARY_BYTES: usize = 16 * 1024 * 1024;
 fn nonzero_native_ptr(bits: u64) -> Result<core::ptr::NonNull<core::ffi::c_void>, EzGfxResult> {
@@ -287,54 +289,6 @@ pub unsafe extern "C" fn ez_gfx_context_register_callback(
     })
 }
 
-/// Loads every stage from a compiler-produced shader artifact; no source compiler is linked into this runtime.
-#[unsafe(no_mangle)]
-///
-/// # Safety
-///
-/// Non-null `data` must be readable for `data_size` bytes, and non-null
-/// `out_shader` must be writable for one aligned handle.
-pub unsafe extern "C" fn ez_gfx_shader_load_artifact(
-    context: EzGfxContext,
-    data: *const u8,
-    data_size: usize,
-    out_shader: *mut EzGfxShader,
-) -> EzGfxResult {
-    catch_status(|| {
-        if data.is_null()
-            || out_shader.is_null()
-            || data_size == 0
-            || data_size > EZ_GFX_MAX_BOUNDARY_BYTES
-        {
-            return EzGfxResult::InvalidArgument;
-        }
-        // SAFETY: `data_size` is checked in `1..=EZ_GFX_MAX_BOUNDARY_BYTES`; the caller keeps `data` readable for that many `u8` values through shader loading.
-        let bytes = unsafe { core::slice::from_raw_parts(data, data_size) };
-        let context = try_handle!(ContextHandle, context);
-        match raw::load_shader(context, bytes) {
-            Ok(shader) => {
-                // SAFETY: `out_shader` is non-null, and the caller keeps writable, properly aligned storage for one `EzGfxShader` alive through this write.
-                unsafe { out_shader.write(shader.into_raw()) };
-                EzGfxResult::Ok
-            }
-            Err(status) => status.into(),
-        }
-    })
-}
-
-#[unsafe(no_mangle)]
-/// Destroys a shader previously loaded into the context.
-pub extern "C" fn ez_gfx_shader_destroy(context: EzGfxContext, shader: EzGfxShader) {
-    catch_void(|| {
-        if let (Ok(context), Ok(shader)) = (
-            ContextHandle::from_raw(context),
-            ShaderHandle::from_raw(shader),
-        ) {
-            raw::destroy_shader(context, shader);
-        }
-    });
-}
-
 #[unsafe(no_mangle)]
 /// Begins one surface frame and returns its explicit owner handle.
 ///
@@ -538,7 +492,8 @@ pub unsafe extern "C" fn ez_gfx_frame_bind(
 pub unsafe extern "C" fn ez_gfx_frame_execute_graphics(
     context: EzGfxContext,
     frame: EzGfxFrame,
-    shader: EzGfxShader,
+    vertex_shader: EzGfxVertexShader,
+    fragment_shader: EzGfxFragmentShader,
     buffer: EzGfxCounterBuffer,
     dynamic_state: *const EzGfxDynamicState,
 ) -> EzGfxResult {
@@ -566,7 +521,8 @@ pub unsafe extern "C" fn ez_gfx_frame_execute_graphics(
             return status;
         }
         let context = try_frame!(context, frame);
-        let shader = try_handle!(ShaderHandle, shader);
+        let vertex_shader = try_handle!(ShaderHandle, vertex_shader);
+        let fragment_shader = try_handle!(ShaderHandle, fragment_shader);
         let bindings = match materialized_bindings(frame) {
             Ok(bindings) => bindings,
             Err(status) => return status,
@@ -576,7 +532,15 @@ pub unsafe extern "C" fn ez_gfx_frame_execute_graphics(
             Ok(_) => return EzGfxResult::InvalidContext,
             Err(status) => return status,
         };
-        raw::execute_graphics(context, shader, counter, &bindings, state).into_ffi_result()
+        raw::execute_graphics(
+            context,
+            vertex_shader,
+            fragment_shader,
+            counter,
+            &bindings,
+            state,
+        )
+        .into_ffi_result()
     })
 }
 
@@ -585,7 +549,7 @@ pub unsafe extern "C" fn ez_gfx_frame_execute_graphics(
 pub extern "C" fn ez_gfx_frame_execute_compute(
     context: EzGfxContext,
     frame: EzGfxFrame,
-    shader: EzGfxShader,
+    shader: EzGfxComputeShader,
     dispatch_x: u32,
     dispatch_y: u32,
     dispatch_z: u32,

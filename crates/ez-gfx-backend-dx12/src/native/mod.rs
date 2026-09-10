@@ -93,9 +93,11 @@ use windows::{
                     DXGI_SAMPLE_DESC,
                 },
                 CreateDXGIFactory1, DXGI_ADAPTER_FLAG3_SOFTWARE, DXGI_ERROR_NOT_FOUND,
-                DXGI_ERROR_UNSUPPORTED, DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
-                DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-                DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter4, IDXGIFactory4, IDXGISwapChain4,
+                DXGI_ERROR_UNSUPPORTED, DXGI_FEATURE_PRESENT_ALLOW_TEARING, DXGI_PRESENT,
+                DXGI_PRESENT_ALLOW_TEARING, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
+                DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
+                DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter4,
+                IDXGIFactory4, IDXGIFactory5, IDXGISwapChain4,
             },
         },
         System::Threading::{CreateEventW, INFINITE, WaitForSingleObject},
@@ -103,6 +105,9 @@ use windows::{
     },
     core::Interface,
 };
+
+/// Flip-model interval zero replaces queued stale frames instead of blocking for vertical blank.
+const PRESENT_SYNC_INTERVAL: u32 = 0;
 
 /// D3D12 buffer resource and its allocator ownership record.
 pub struct NativeAllocation {
@@ -319,6 +324,7 @@ pub struct NativeSurface {
     window: usize,
     swapchain: Option<IDXGISwapChain4>,
     buffers: Vec<ID3D12Resource>,
+    allow_tearing: bool,
     rtv_heap: Option<ID3D12DescriptorHeap>,
     width: u32,
     height: u32,
@@ -351,6 +357,7 @@ impl NativeSurface {
             // Preserve the opaque HWND bit pattern even when its pointer-sized integer is negative.
             window: window.hwnd.get().cast_unsigned(),
             swapchain: None,
+            allow_tearing: false,
             width: 0,
             height: 0,
             buffers: Vec::new(),

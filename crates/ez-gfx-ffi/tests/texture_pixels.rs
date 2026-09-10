@@ -25,7 +25,7 @@ use ez_gfx::{
     LifecycleError, SamplerAddressMode, SamplerFilter, TextureDestination, TextureError,
     TextureFormat, TextureRegion, TextureSamplerDesc, TextureSource,
 };
-use ez_gfx_compiler::{Target, compile_shader};
+use ez_gfx_compiler::{EasyGraphicsCompiler, Target};
 use ez_gfx_ffi::EzGfxResult;
 
 fn frame_readback(context: ContextHandle) -> ez_gfx::Result<Vec<u8>> {
@@ -140,7 +140,7 @@ fn exercise_backend(backend: u8) {
         let targets = &[Target::Spirv];
         #[cfg(target_vendor = "apple")]
         let targets = &[Target::Metal];
-        compile_shader(
+        EasyGraphicsCompiler::compile_shader(
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../examples/02_textured_cube/02_textured_cube.slang"),
             targets,
@@ -148,6 +148,7 @@ fn exercise_backend(backend: u8) {
             cfg!(windows),
         )
         .expect("compile cube shader artifact")
+        .save_shader()
     });
     #[cfg(not(target_vendor = "apple"))]
     // A missing Vulkan validation layer is a failure, never a silent unvalidated run.
@@ -189,7 +190,8 @@ fn exercise_backend(backend: u8) {
     assert_eq!(remove_vertices(context, quad.positions), Ok(()));
     assert_eq!(remove_indices(context, quad.indices), Ok(()));
     destroy_vertex_heap(context, quad.positions_heap);
-    destroy_shader(context, quad.shader);
+    destroy_shader(context, quad.vertex_shader);
+    destroy_shader(context, quad.fragment_shader);
     destroy_index_heap(context);
     drop(native);
 }
@@ -1046,7 +1048,8 @@ fn solid_block(format: TextureFormat, channel: usize) -> Vec<u8> {
 struct Quad {
     context: ContextHandle,
     surface: SurfaceHandle,
-    shader: ShaderHandle,
+    vertex_shader: ShaderHandle,
+    fragment_shader: ShaderHandle,
     positions_heap: VertexHeapHandle,
     positions: VertexAllocationHandle,
     indices: IndexAllocationHandle,
@@ -1072,7 +1075,15 @@ impl Quad {
         Self {
             context,
             surface,
-            shader: load_shader(context, artifact).unwrap(),
+            vertex_shader: load_shader(context, artifact, ez_gfx::Stage::Vertex, "vertexmain")
+                .unwrap(),
+            fragment_shader: load_shader(
+                context,
+                artifact,
+                ez_gfx::Stage::Fragment,
+                "fragmentmain",
+            )
+            .unwrap(),
             positions_heap,
             positions,
             indices: index_allocation,
@@ -1132,7 +1143,8 @@ impl Quad {
         assert_eq!(
             execute_graphics(
                 self.context,
-                self.shader,
+                self.vertex_shader,
+                self.fragment_shader,
                 indirect,
                 &bindings,
                 // Disable culling: Vulkan and DX12 may use opposite framebuffer Y conventions.

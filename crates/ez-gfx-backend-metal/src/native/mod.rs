@@ -43,6 +43,9 @@ const fn detach_backend_layer(pre_existing: bool) -> bool {
     !pre_existing
 }
 
+/// Disable Core Animation's default display-refresh synchronization for throughput-oriented hosts.
+const DISPLAY_SYNC_ENABLED: bool = false;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DrawableExtent {
     Existing(u32, u32),
@@ -436,6 +439,7 @@ impl NativeSurface {
         // SAFETY: Layer retains a non-null CAMetalLayer.
         let metal_layer = unsafe { &*layer.as_ptr().cast::<CAMetalLayer>().as_ptr() };
         metal_layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm_sRGB);
+        metal_layer.setDisplaySyncEnabled(DISPLAY_SYNC_ENABLED);
         if capture_presented {
             metal_layer.setFramebufferOnly(false);
         }
@@ -546,3 +550,13 @@ mod transfer;
 
 #[cfg(test)]
 mod texture_tests;
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::DISPLAY_SYNC_ENABLED;
+
+    #[test]
+    fn presentation_does_not_wait_for_display_refresh() {
+        assert!(!DISPLAY_SYNC_ENABLED);
+    }
+}

@@ -9,9 +9,9 @@ use std::{
 
 /// Maximum encoded artifact size accepted by the container format.
 pub const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
-const MAGIC: &[u8; 8] = b"EZSHDR04";
+const MAGIC: &[u8; 8] = b"EZSHDR05";
 /// Current framed rkyv shader artifact format version.
-pub const ARTIFACT_FORMAT_VERSION: u32 = 4;
+pub const ARTIFACT_FORMAT_VERSION: u32 = 5;
 const HEADER_BYTES: usize = 56;
 const MAX_STRING: usize = 16 * 1024;
 const MAX_VARIANTS: usize = 64;
@@ -361,19 +361,19 @@ pub struct Artifact {
     pub metadata: Vec<u8>,
     /// Compiler provenance for the artifact.
     pub provenance: Provenance,
-    /// Target variants with the same nonempty concrete target-product set for every stage.
+    /// Target variants with the same nonempty concrete target-product set for every entry point.
     pub variants: Vec<TargetVariant>,
     digest: [u8; 32],
 }
 
 impl Artifact {
-    /// Validates metadata, provenance, uniqueness, stage entry points, and uniform selected target
-    /// products across every declared stage.
+    /// Validates metadata, provenance, uniqueness, entry points, and uniform selected target
+    /// products across every declared `(stage, entry point)` pair.
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid metadata/provenance, invalid variant count, duplicate variants
-    /// or stages, inconsistent stage target coverage, or archive serialization failure.
+    /// Returns an error for invalid metadata/provenance, invalid variant count, duplicate variants,
+    /// inconsistent target coverage, or archive serialization failure.
     pub fn new(
         metadata: Vec<u8>,
         provenance: Provenance,
@@ -495,6 +495,129 @@ impl Artifact {
     }
 }
 
+/// Validated host-side shader artifact data shared by the offline compiler and runtime facade.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompiledShader {
+    bytes: Vec<u8>,
+}
+
+impl CompiledShader {
+    /// Validates and owns serialized `.ezgfxshader` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the artifact validation error for malformed or incompatible bytes.
+    pub fn load(bytes: &[u8]) -> Result<Self, ArtifactError> {
+        Artifact::decode(bytes)?;
+        Ok(Self {
+            bytes: bytes.to_vec(),
+        })
+    }
+
+    /// Serializes this validated shader.
+    #[must_use]
+    pub fn save_shader(&self) -> Vec<u8> {
+        self.bytes.clone()
+    }
+
+    /// Loads one exact compute entry point into `loader`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the loader's validation or native creation error.
+    pub fn load_compute_shader<L: ShaderLoader>(
+        &self,
+        loader: &L,
+        entry_point: &str,
+    ) -> Result<L::ComputeShader, L::Error> {
+        loader.load_compute_shader(self.bytes.as_slice(), entry_point)
+    }
+
+    /// Loads one exact vertex entry point into `loader`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the loader's validation or native creation error.
+    pub fn load_vertex_shader<L: ShaderLoader>(
+        &self,
+        loader: &L,
+        entry_point: &str,
+    ) -> Result<L::VertexShader, L::Error> {
+        loader.load_vertex_shader(self.bytes.as_slice(), entry_point)
+    }
+
+    /// Loads one exact fragment entry point into `loader`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the loader's validation or native creation error.
+    pub fn load_fragment_shader<L: ShaderLoader>(
+        &self,
+        loader: &L,
+        entry_point: &str,
+    ) -> Result<L::FragmentShader, L::Error> {
+        loader.load_fragment_shader(self.bytes.as_slice(), entry_point)
+    }
+}
+
+/// Runtime boundary implemented by a context that owns loaded stage shaders.
+pub trait ShaderLoader {
+    /// Compute-stage owning handle.
+    type ComputeShader;
+    /// Vertex-stage owning handle.
+    type VertexShader;
+    /// Fragment-stage owning handle.
+    type FragmentShader;
+    /// Runtime loading error.
+    type Error;
+
+    /// Loads one named compute entry point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the artifact or entry point is invalid.
+    fn load_compute_shader(
+        &self,
+        artifact: &[u8],
+        entry_point: &str,
+    ) -> Result<Self::ComputeShader, Self::Error>;
+
+    /// Loads one named vertex entry point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the artifact or entry point is invalid.
+    fn load_vertex_shader(
+        &self,
+        artifact: &[u8],
+        entry_point: &str,
+    ) -> Result<Self::VertexShader, Self::Error>;
+
+    /// Loads one named fragment entry point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the artifact or entry point is invalid.
+    fn load_fragment_shader(
+        &self,
+        artifact: &[u8],
+        entry_point: &str,
+    ) -> Result<Self::FragmentShader, Self::Error>;
+}
+impl AsRef<[u8]> for CompiledShader {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl core::ops::Deref for CompiledShader {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+
 fn validate_archived_payload(payload: &ArchivedArtifactPayload) -> Result<(), ArtifactError> {
     let metadata = payload.metadata.as_slice();
     if metadata.is_empty()
@@ -563,13 +686,15 @@ fn serialize_payload(
     provenance: &Provenance,
     variants: &[TargetVariant],
 ) -> Result<AlignedVec<16>, ArtifactError> {
-    let mut stages = BTreeMap::<Stage, StagePayload>::new();
+    let mut stages = BTreeMap::<(Stage, String), StagePayload>::new();
     for variant in variants {
-        let stage = stages.entry(variant.stage).or_insert_with(|| StagePayload {
-            stage: variant.stage,
-            entry_point: variant.entry_point.clone(),
-            products: Vec::new(),
-        });
+        let stage = stages
+            .entry((variant.stage, variant.entry_point.clone()))
+            .or_insert_with(|| StagePayload {
+                stage: variant.stage,
+                entry_point: variant.entry_point.clone(),
+                products: Vec::new(),
+            });
         stage.products.push(TargetProduct {
             target: variant.target,
             profile: variant.profile.clone(),
@@ -588,8 +713,8 @@ fn expand_stages(stages: &[StagePayload]) -> Result<Vec<TargetVariant>, Artifact
     let mut seen = BTreeSet::new();
     let mut variants = Vec::new();
     for stage in stages {
-        if !seen.insert(stage.stage) {
-            return Err(ArtifactError::DuplicateStage(stage.stage));
+        if !seen.insert((stage.stage, stage.entry_point.as_str())) {
+            return Err(ArtifactError::DuplicateEntryPoint { stage: stage.stage });
         }
         if stage.products.is_empty() {
             return Err(ArtifactError::InvalidVariantCount);
@@ -658,32 +783,28 @@ fn validate_payload(
     }
 
     let mut seen = BTreeSet::new();
-    let mut stages = BTreeMap::new();
+    let mut entries = BTreeMap::new();
     let mut selected_targets = 0_u8;
     for variant in variants {
         validate_variant(variant)?;
         validate_compatibility(variant.target, &variant.compatibility)?;
         let target_bit = 1_u8 << (variant.target as u8 - 1);
         selected_targets |= target_bit;
-        if let Some((entry, targets)) = stages.get_mut(&variant.stage) {
-            if *entry != variant.entry_point.as_str() {
-                return Err(ArtifactError::DuplicateStage(variant.stage));
-            }
-            *targets |= target_bit;
-        } else {
-            stages.insert(variant.stage, (variant.entry_point.as_str(), target_bit));
-        }
+        *entries
+            .entry((variant.stage, variant.entry_point.as_str()))
+            .or_insert(0_u8) |= target_bit;
         if !seen.insert((
             variant.target,
             variant.stage,
+            variant.entry_point.as_str(),
             variant.profile.as_str(),
             &variant.compatibility,
         )) {
             return Err(ArtifactError::DuplicateVariant);
         }
     }
-    for (&stage, (_, targets)) in &stages {
-        if *targets != selected_targets {
+    for (&(stage, _), &targets) in &entries {
+        if targets != selected_targets {
             return Err(ArtifactError::InconsistentTargetCoverage { stage });
         }
     }
@@ -737,10 +858,13 @@ pub enum ArtifactError {
     InvalidVariantCount,
     /// A variant contains no compiled bytes.
     EmptyVariant,
-    /// Two variants have the same target identity.
+    /// Two variants have the same target, stage, entry-point, profile, and compatibility identity.
     DuplicateVariant,
-    /// A stage names more than one logical entry point.
-    DuplicateStage(Stage),
+    /// The encoded stage table repeats the same stage and entry-point identity.
+    DuplicateEntryPoint {
+        /// Repeated shader stage.
+        stage: Stage,
+    },
     /// A stage does not contain the artifact's exact selected concrete target-product set.
     InconsistentTargetCoverage {
         /// Stage whose concrete target-product set differs from the artifact union.
@@ -850,5 +974,34 @@ mod preflight_tests {
             &oversized_variants,
             ArtifactError::InvalidVariantCount,
         );
+    }
+
+    #[test]
+    fn same_stage_entry_points_round_trip_independently() {
+        let variants = ["first", "second"]
+            .into_iter()
+            .map(|entry| {
+                TargetVariant::new(
+                    Target::Spirv,
+                    Stage::Compute,
+                    entry,
+                    "ez-gfx-v1",
+                    TargetCompatibility::portable(Target::Spirv).unwrap(),
+                    entry.as_bytes().to_vec(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let artifact = Artifact::new(
+            br#"{"reflections":[]}"#.to_vec(),
+            Provenance::new("compiler", "1", vec![], "toolchain"),
+            variants,
+        )
+        .unwrap();
+
+        let decoded = Artifact::decode(&artifact.encode().unwrap()).unwrap();
+        assert_eq!(decoded.variants.len(), 2);
+        assert_eq!(decoded.variants[0].entry_point, "first");
+        assert_eq!(decoded.variants[1].entry_point, "second");
     }
 }

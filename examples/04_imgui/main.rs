@@ -113,9 +113,9 @@ fn main() -> anyhow::Result<()> {
         texture_decode_workers: 0,
         adapter_selection: None,
     })?;
-    let surface = context.create_surface_window(example.native_surface()?, true)?;
+    let surface = context.create_surface_window(example.native_surface()?, false)?;
     example.register_observations(&context)?;
-    let shader_bytes = ez_gfx_compiler::compile_shader(
+    let shader_bytes = ez_gfx_compiler::EasyGraphicsCompiler::compile_shader(
         std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/04_imgui/04_imgui.slang"
@@ -161,7 +161,8 @@ fn main() -> anyhow::Result<()> {
     let identity_start = identity_indices.range()?.0;
     let vertices_heap = context.create_vertex_heap("imgui_vertices")?;
     let indices_heap = context.create_vertex_heap("imgui_indices")?;
-    let shader = context.load_shader(&shader_bytes)?;
+    let vertex_shader = shader_bytes.load_vertex_shader(&context, "vertexmain")?;
+    let fragment_shader = shader_bytes.load_fragment_shader(&context, "fragmentmain")?;
     let mut vertices = None;
     let mut indices = None;
     let mut cpu_vertices = Vec::new();
@@ -259,11 +260,13 @@ fn main() -> anyhow::Result<()> {
         frame.bind_buffer("params", &params_buffer)?;
         frame.bind_buffer("imgui_commands", &commands)?;
         frame.execute_graphics(
-            &shader,
+            &vertex_shader,
+            &fragment_shader,
             &indirect,
             DynamicPipelineState::from_abi(0, 0, 0, 1).unwrap(),
         )?;
         example.handle_frame(frame, swapchain_target)?;
+        example.update_title(&context);
     }
     Ok(())
 }

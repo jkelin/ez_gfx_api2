@@ -1,5 +1,5 @@
 use super::*;
-use ez_gfx_compiler::{Target, compile_shader};
+use ez_gfx_compiler::{EasyGraphicsCompiler, Target};
 use ez_gfx_core::{Backend, capability::SemanticProfile};
 use ez_gfx_runtime::shader::RuntimeShader;
 use std::{
@@ -187,9 +187,16 @@ void computemain(uint3 id : SV_DispatchThreadID) {
 "#,
     )
     .unwrap();
-    let artifact = compile_shader(&source.0, &[Target::Dxil], false).unwrap();
-    let runtime = RuntimeShader::load(&artifact, Backend::Dx12, SemanticProfile::V1).unwrap();
-    let (product, _, _) = runtime.compute_product().unwrap();
+    let artifact = EasyGraphicsCompiler::compile_shader(&source.0, &[Target::Dxil], false).unwrap();
+    let runtime = RuntimeShader::load(
+        &artifact,
+        Backend::Dx12,
+        SemanticProfile::V1,
+        ez_gfx_artifact::Stage::Compute,
+        "computemain",
+    )
+    .unwrap();
+    let (product, _, _) = runtime.shader_product();
     let products = runtime
         .products()
         .map(|(_, bytes)| bytes)
@@ -651,6 +658,7 @@ fn partial_native_copy_failure_drains_before_idle_returns_and_preserves_future_f
         window: 1,
         swapchain: None,
         buffers: Vec::new(),
+        allow_tearing: false,
         rtv_heap: None,
         width: 0,
         height: 0,
@@ -671,6 +679,7 @@ fn surface_destroy_abandons_only_when_worker_drain_is_unprovable() {
         window: 1,
         swapchain: None,
         buffers: Vec::new(),
+        allow_tearing: false,
         rtv_heap: None,
         width: 0,
         height: 0,

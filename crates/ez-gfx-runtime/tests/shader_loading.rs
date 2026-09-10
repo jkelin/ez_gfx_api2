@@ -37,6 +37,8 @@ fn load(bytes: &[u8], backend: Backend) -> Result<RuntimeShader, ShaderLoadError
         bytes,
         backend,
         SemanticProfile::V1,
+        Stage::Compute,
+        "main",
         (backend == Backend::Metal).then_some(&METAL_ENVIRONMENT),
     )
 }
@@ -292,6 +294,8 @@ fn metal_selection_is_compatible_and_deterministic() {
             &bytes,
             Backend::Metal,
             SemanticProfile::V1,
+            Stage::Compute,
+            "main",
             Some(&incompatible),
         ),
         Err(ShaderLoadError::MissingProduct {
@@ -306,6 +310,8 @@ fn selects_backend_profile_and_every_available_stage() {
         &artifact(Target::Metallib),
         Backend::Dx12,
         SemanticProfile::V1,
+        Stage::Compute,
+        "main",
     )
     .unwrap();
     assert_eq!(shader.product(Stage::Compute).unwrap(), b"dxil");
@@ -318,7 +324,13 @@ fn selects_backend_profile_and_every_available_stage() {
 #[test]
 fn metal_runtime_requires_offline_metallib_and_never_uses_msl() {
     assert_eq!(
-        RuntimeShader::load(&artifact(Target::Msl), Backend::Metal, SemanticProfile::V1),
+        RuntimeShader::load(
+            &artifact(Target::Msl),
+            Backend::Metal,
+            SemanticProfile::V1,
+            Stage::Compute,
+            "main",
+        ),
         Err(ShaderLoadError::MissingProduct {
             stage: Stage::Compute
         })
@@ -328,7 +340,13 @@ fn metal_runtime_requires_offline_metallib_and_never_uses_msl() {
 #[test]
 fn malformed_and_missing_backend_coverage_fail_without_fallback() {
     assert!(matches!(
-        RuntimeShader::load(b"bad", Backend::Vulkan, SemanticProfile::V1),
+        RuntimeShader::load(
+            b"bad",
+            Backend::Vulkan,
+            SemanticProfile::V1,
+            Stage::Compute,
+            "main",
+        ),
         Err(ShaderLoadError::Artifact(_))
     ));
 
@@ -355,7 +373,13 @@ fn malformed_and_missing_backend_coverage_fail_without_fallback() {
     .encode()
     .unwrap();
     assert_eq!(
-        RuntimeShader::load(&bytes, Backend::Vulkan, SemanticProfile::V1),
+        RuntimeShader::load(
+            &bytes,
+            Backend::Vulkan,
+            SemanticProfile::V1,
+            Stage::Compute,
+            "main",
+        ),
         Err(ShaderLoadError::MissingProduct {
             stage: Stage::Compute
         })
@@ -363,83 +387,80 @@ fn malformed_and_missing_backend_coverage_fail_without_fallback() {
 }
 
 #[test]
-fn pipeline_stage_pairing_requires_exact_vertex_fragment_or_compute_products() {
-    let variants = [Target::Spirv, Target::Dxil, Target::Metallib]
+fn named_entry_selection_is_exact_and_stage_typed() {
+    let entries = [
+        (Stage::Compute, "first", 1_u8),
+        (Stage::Compute, "second", 2_u8),
+        (Stage::Vertex, "vertexmain", 3_u8),
+    ];
+    let variants = entries
         .into_iter()
-        .flat_map(|target| {
-            [Stage::Vertex, Stage::Fragment]
-                .into_iter()
-                .map(move |stage| {
-                    TargetVariant::new(
-                        target,
-                        stage,
-                        format!("{stage:?}"),
-                        "ez-gfx-v1",
-                        compatibility(target),
-                        vec![target as u8 + stage as u8 + 1],
-                    )
-                    .unwrap()
-                })
+        .map(|(stage, entry, byte)| {
+            TargetVariant::new(
+                Target::Spirv,
+                stage,
+                entry,
+                "ez-gfx-v1",
+                compatibility(Target::Spirv),
+                vec![byte],
+            )
+            .unwrap()
         })
         .collect();
-    let graphics_artifact = Artifact::new(
-        metadata(&[Stage::Vertex, Stage::Fragment]),
-        Provenance::new("slangc", "2026.16", vec![], "host"),
-        variants,
-    )
-    .unwrap()
-    .encode()
-    .unwrap();
-    let graphics =
-        RuntimeShader::load(&graphics_artifact, Backend::Vulkan, SemanticProfile::V1).unwrap();
-    assert_eq!(graphics.graphics_pair().unwrap().0.1, Stage::Vertex);
-    assert!(graphics.compute_product().is_err());
-
-    let compute = RuntimeShader::load(
-        &artifact(Target::Metallib),
-        Backend::Vulkan,
-        SemanticProfile::V1,
-    )
-    .unwrap();
-    assert_eq!(compute.compute_product().unwrap().1, Stage::Compute);
-    assert!(compute.graphics_pair().is_err());
-}
-
-#[test]
-fn one_artifact_selects_graphics_and_compute_without_caller_entry_names() {
-    let variants = [Target::Spirv, Target::Dxil, Target::Metallib]
-        .into_iter()
-        .flat_map(|target| {
-            [Stage::Vertex, Stage::Fragment, Stage::Compute]
-                .into_iter()
-                .map(move |stage| {
-                    TargetVariant::new(
-                        target,
-                        stage,
-                        if stage == Stage::Compute {
-                            "main".into()
-                        } else {
-                            format!("{stage:?}")
-                        },
-                        "ez-gfx-v1",
-                        compatibility(target),
-                        vec![target as u8 + stage as u8 + 1],
-                    )
-                    .unwrap()
-                })
+    let reflections = entries.map(|(stage, entry, _)| {
+        serde_json::json!({
+            "target": "Spirv",
+            "entry": entry,
+            "stage": format!("{stage:?}"),
+            "reflection": {
+                "parameters": [],
+                "workgroup_size": (stage == Stage::Compute).then_some([1, 1, 1])
+            }
         })
-        .collect();
+    });
     let bytes = Artifact::new(
-        metadata(&[Stage::Vertex, Stage::Fragment, Stage::Compute]),
+        serde_json::to_vec(&serde_json::json!({
+            "semantic_abi": 1,
+            "reflections": reflections
+        }))
+        .unwrap(),
         Provenance::new("slangc", "2026.16", vec![], "host"),
         variants,
     )
     .unwrap()
     .encode()
     .unwrap();
-    let shader = RuntimeShader::load(&bytes, Backend::Vulkan, SemanticProfile::V1).unwrap();
 
-    assert!(shader.graphics_pair().is_ok());
-    assert_eq!(shader.compute_product().unwrap().1, Stage::Compute);
-    assert_eq!(shader.product(Stage::Vertex).unwrap().len(), 1);
+    for (entry, byte) in [("first", 1_u8), ("second", 2_u8)] {
+        let shader = RuntimeShader::load(
+            &bytes,
+            Backend::Vulkan,
+            SemanticProfile::V1,
+            Stage::Compute,
+            entry,
+        )
+        .unwrap();
+        assert_eq!(shader.product(Stage::Compute), Some([byte].as_slice()));
+        assert_eq!(shader.shader_product().2, entry);
+    }
+    assert_eq!(
+        RuntimeShader::load(
+            &bytes,
+            Backend::Vulkan,
+            SemanticProfile::V1,
+            Stage::Compute,
+            "missing",
+        ),
+        Err(ShaderLoadError::UnknownEntryPoint)
+    );
+    assert_eq!(
+        RuntimeShader::load(
+            &bytes,
+            Backend::Vulkan,
+            SemanticProfile::V1,
+            Stage::Fragment,
+            "vertexmain",
+        ),
+        Err(ShaderLoadError::WrongStage)
+    );
 }

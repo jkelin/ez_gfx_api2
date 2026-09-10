@@ -1,15 +1,6 @@
 //! C binding enums represented as bytes in the executable ABI.
 //! `tools/bindgen` parses these declarations; runtime ABI fields retain their byte representation.
 
-/// Shader stage family.
-#[repr(u8)]
-pub enum EzGfxShaderKind {
-    /// Vertex and fragment shader pair.
-    Graphics = 0,
-    /// Compute shader.
-    Compute = 1,
-}
-
 /// Selected native backend.
 #[repr(u8)]
 pub enum EzGfxBackend {

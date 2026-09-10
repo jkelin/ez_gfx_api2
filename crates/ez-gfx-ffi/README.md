@@ -2,11 +2,11 @@
 
 `ez-gfx-ffi` is the C ABI boundary for the `ez-gfx` runtime. C and other foreign-language clients include [`bindings/c/include/ez_gfx_api.h`](../../bindings/c/include/ez_gfx_api.h). Rust declarations and documentation are authoritative; `tools/bindgen` generates the XML contract and C header. Rust clients should depend on `ez-gfx`, not `ez-gfx-ffi`.
 
-The complete [C textured cube](../../examples/02_textured_cube_c/README.md) exercises ABI 37 portable GLFW window handles, typed heap/allocation handles, one-frame compute-to-graphics buffers, presentation, creator-thread callbacks, stable error printing, and snapshot readback.
+The complete [C textured cube](../../examples/02_textured_cube_c/README.md) exercises ABI 39 portable GLFW window handles, typed heap/allocation handles, one-frame compute-to-graphics buffers, presentation, creator-thread callbacks, resource diagnostics, stable error printing, and snapshot readback.
 
 ## Compatibility and ownership
 
-Before any other call, require `ez_gfx_abi_version() == EZ_GFX_ABI_VERSION` (ABI 37). Window and headless creation use separate descriptors. `EzGfxWindowSurfaceDesc` carries a validated native-window-system tag and handles but no extent; native code queries the drawable size. `EzGfxHeadlessSurfaceDesc` alone carries an explicit extent. Operations use canonical `ez_gfx_{object}_{operation}` names and context-first signatures.
+Before any other call, require `ez_gfx_abi_version() == EZ_GFX_ABI_VERSION` (ABI 39). Window and headless creation use separate descriptors. `EzGfxWindowSurfaceDesc` carries a validated native-window-system tag and handles but no extent; native code queries the drawable size. `EzGfxHeadlessSurfaceDesc` alone carries an explicit extent. Operations use canonical `ez_gfx_{object}_{operation}` names and context-first signatures.
 
 `ez_gfx_handle_inspect` decodes a packed handle into its context/child slot and generation fields; it does not validate that the handle is live in a context. `ez_gfx_semantic_id` accepts an exact 1-to-255-byte canonical semantic name and writes its fixed 16-byte identifier. Semantic names are ASCII dot-separated identifiers: every non-empty segment starts with an ASCII letter and continues with ASCII letters, digits, or underscores. Empty segments, non-ASCII bytes, embedded NUL, and terminators included in the supplied length are invalid.
 
@@ -14,7 +14,9 @@ Context and resource operations, including status-returning teardown, are creato
 
 ## Call order
 
-`ez_gfx_shader_load_artifact(data, size, out_shader, context)` loads every stage present for the context backend/profile. Entry-point names remain artifact metadata and are not caller inputs.
+`ez_gfx_compute_shader_load`, `ez_gfx_vertex_shader_load`, and `ez_gfx_fragment_shader_load` validate artifact bytes and select one exact UTF-8 entry-point name into a context-owned stage handle. `ez_gfx_frame_execute_compute` accepts only the compute handle; `ez_gfx_frame_execute_graphics` accepts the vertex and fragment handles separately.
+
+Frame execution retains each referenced shader record through `frame_end` or `frame_abort`; destroying the caller's stage handle invalidates it immediately but defers backend cleanup until that terminal operation.
 
 1. Create a context with `ez_gfx_context_create` or `ez_gfx_context_create_backend`.
 2. Create a presentation surface with `ez_gfx_surface_create_window`, or a windowless surface with `ez_gfx_surface_create_headless`, then initialize its device with `ez_gfx_context_init_device`.

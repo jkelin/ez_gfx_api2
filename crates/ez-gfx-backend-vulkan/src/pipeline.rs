@@ -196,7 +196,8 @@ impl NativeContext {
     )]
     pub fn create_graphics_pipeline(
         &self,
-        shader: &NativeShader,
+        vertex_shader: &NativeShader,
+        fragment_shader: &NativeShader,
         desc: NativeGraphicsPipelineDesc<'_>,
     ) -> Result<NativePipeline, HalError> {
         let NativeGraphicsPipelineDesc {
@@ -210,11 +211,11 @@ impl NativeContext {
         if self.swapchain_format == vk::Format::UNDEFINED {
             return Err(HalError::NotReady);
         }
-        let vertex = *shader
+        let vertex = *vertex_shader
             .modules
             .get(vertex_index)
             .ok_or(HalError::InvalidArgument)?;
-        let fragment = *shader
+        let fragment = *fragment_shader
             .modules
             .get(fragment_index)
             .ok_or(HalError::InvalidArgument)?;

@@ -27,7 +27,7 @@ Source evidence: `TODO.md` ("Add precompiled shader modules with reflection meta
 
 #### Architecture, integration, and applicability
 
-Emit one `.ezgfxshader` with a fixed little-endian frame around a bounded `rkyv` payload. The payload contains canonical reflection, stage-grouped target products, compiler/toolchain provenance, and one internal entry point per stage. Runtime verifies framing, digest, bytechecked archive structure, and semantic coverage before selecting a target without linking Slang.
+Emit one `.ezgfxshader` with a fixed little-endian frame around a bounded `rkyv` payload. The payload contains canonical reflection, compiler/toolchain provenance, and target products keyed by `(stage, entry-point name)`, allowing multiple names in one stage. Runtime verifies framing, digest, bytechecked archive structure, complete per-entry target coverage, and exact stage/name selection without linking Slang.
 
 #### Evidence, tradeoffs, and failure modes
 
@@ -85,9 +85,9 @@ No candidate has comparable load-time, RSS, file-open, or artifact-size measurem
 
 **Selected: `S-P-006-versioned-sectioned-bundle`.**
 
-Define a fixed 56-byte little-endian frame containing magic, format version, reserved flags, payload length, and BLAKE3 digest around one bounded `rkyv` payload. Format v4 bytechecks aligned bytes and validates archived collection, string, metadata, provenance, and variant ceilings before owned deserialization. Runtime then validates every required backend/stage reflection once, including mandatory fixed compute workgroup dimensions, carries typed binding and pipeline-layout products, and rejects missing, ambiguous, malformed, conflicting, or invalid texture-heap data before native shader creation. It never silently invokes Slang.
+Define a fixed 56-byte little-endian frame containing magic, format version, reserved flags, payload length, and BLAKE3 digest around one bounded `rkyv` payload. Format v5 bytechecks aligned bytes and validates archived collection, string, metadata, provenance, and variant ceilings before owned deserialization. It permits multiple entry-point names per stage while rejecting duplicate `(stage,name,target,profile,compatibility)` products, incomplete target coverage, malformed names, unknown exact-name selection, incompatible target data, and never compiles.
 
-Compiler production exposes `compile_shader(source, targets, development)`, which discovers stage entry points from the Slang source, compiles the requested SPIR-V, DXIL, and Metal target families, and returns owned validated bytes without writing an artifact. The CLI accepts a source path, repeated `--target` values, `--development`, and optional `--output`; CMake uses this source-path interface for build-time artifact generation. Each non-distributed Rust example is an explicit development compiler client: it passes its adjacent Slang source and all target families, compiles once at process startup, and immediately loads the returned bytes.
+Compiler production exposes `EasyGraphicsCompiler::compile_shader(source, targets, development) -> CompiledShader`; `CompiledShader::save_shader` serializes and `EasyGraphicsCompiler::load_compiled_shader` validates existing bytes. `CompiledShader::load_compute_shader`, `load_vertex_shader`, and `load_fragment_shader` select exact names through a runtime context and return stage-typed owning handles. The CLI accepts a source path, repeated `--target` values, `--development`, and optional `--output`; CMake uses this source-path interface for build-time artifact generation. Non-distributed Rust examples remain explicit development compiler clients.
 
 **Rejected:** sidecars remain rejected because partial deployment and synchronization undermine a shipping asset boundary. A custom section parser and generated schema pipeline add owned evolution machinery already covered by framed `rkyv`.
 

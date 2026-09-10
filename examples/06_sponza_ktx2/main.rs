@@ -105,9 +105,9 @@ fn main() -> anyhow::Result<()> {
         texture_decode_workers: 0,
         adapter_selection: None,
     })?;
-    let surface = context.create_surface_window(example.native_surface()?, true)?;
+    let surface = context.create_surface_window(example.native_surface()?, false)?;
     example.register_observations(&context)?;
-    let shader_bytes = ez_gfx_compiler::compile_shader(
+    let shader_bytes = ez_gfx_compiler::EasyGraphicsCompiler::compile_shader(
         std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/06_sponza_ktx2/06_sponza_ktx2.slang"
@@ -208,7 +208,9 @@ fn main() -> anyhow::Result<()> {
             transform: row_major(primitive.transform),
         })
         .collect::<Vec<_>>();
-    let shader = context.load_shader(&shader_bytes)?;
+    let compute_shader = shader_bytes.load_compute_shader(&context, "computemain")?;
+    let vertex_shader = shader_bytes.load_vertex_shader(&context, "vertexmain")?;
+    let fragment_shader = shader_bytes.load_fragment_shader(&context, "fragmentmain")?;
     let mut camera = OrbitCamera::new(90.0_f32.to_radians(), 8.0_f32.to_radians(), 0.45)
         .with_frustum(60.0_f32.to_radians(), 0.02, 100.0)
         .with_clip_y(shared::clip_y(backend.backend));
@@ -231,14 +233,16 @@ fn main() -> anyhow::Result<()> {
         frame.bind_buffer("params", &params_buffer)?;
         frame.bind_buffer("primitives", &primitives)?;
         frame.bind_buffer("draw_commands", &indirect)?;
-        frame.execute_compute(&shader, [primitive_count, 1, 1])?;
+        frame.execute_compute(&compute_shader, [primitive_count, 1, 1])?;
 
         frame.execute_graphics(
-            &shader,
+            &vertex_shader,
+            &fragment_shader,
             &indirect,
             DynamicPipelineState::from_abi(2, 0, 0, 0).unwrap(),
         )?;
         example.handle_frame(frame, swapchain_target)?;
+        example.update_title(&context);
     }
     Ok(())
 }

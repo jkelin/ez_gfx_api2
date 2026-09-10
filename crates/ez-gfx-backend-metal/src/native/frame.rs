@@ -876,12 +876,19 @@ impl NativeContext {
         surface: Option<&NativeSurface>,
         extent: (u32, u32),
         uses_surface: bool,
+        capture_presented: bool,
     ) -> Result<Option<MetalDrawable>, HalError> {
         if uses_surface {
             let surface = surface.ok_or(HalError::InvalidArgument)?;
             let layer = surface.metal_layer();
             layer.setDevice(Some(&self.device));
             layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm_sRGB);
+            // Core Animation defaults to framebuffer-only drawables. Disable that restriction
+            // before the first requested capture; leaving it disabled supports later one-frame
+            // captures without recreating the host layer.
+            if capture_presented {
+                layer.setFramebufferOnly(false);
+            }
             let drawable = layer.nextDrawable().ok_or(HalError::NotReady)?;
             let texture = drawable.texture();
             if texture.width()
@@ -948,7 +955,8 @@ impl NativeContext {
             capture_presented,
             presents,
         )?;
-        let drawable = self.prepare_drawable(surface.as_deref(), extent, uses_surface);
+        let drawable =
+            self.prepare_drawable(surface.as_deref(), extent, uses_surface, capture_presented);
         let drawable = match drawable {
             Ok(drawable) => drawable,
             Err(error) => {

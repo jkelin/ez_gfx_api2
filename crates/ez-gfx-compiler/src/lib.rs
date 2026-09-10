@@ -6,6 +6,7 @@ mod error;
 pub use error::CompilerError;
 
 use core::fmt;
+pub use ez_gfx_artifact::CompiledShader;
 use ez_gfx_artifact::{
     AppleArchitecture, ApplePlatform, Artifact, CompatibilityVersion, MetalCompatibility,
     Provenance, Stage, Target as ArtifactTarget, TargetCompatibility, TargetVariant,
@@ -90,7 +91,7 @@ pub enum Target {
     Spirv,
     /// DirectX IL Shader Model 6.5.
     Dxil,
-    /// Metal 3.0, emitted as MSL in development and metallib otherwise.
+    /// Metal 3.0, emitted as metallib on Apple hosts and as development MSL elsewhere.
     Metal,
 }
 
@@ -144,18 +145,37 @@ struct DiscoveredEntry {
     stage: Stage,
 }
 
-/// Compiles a Slang source file into owned, validated `.ezgfxshader` bytes.
-///
-/// Entry points and stages are discovered from Slang declarations. Profiles are
-/// fixed to SPIR-V 1.5, Shader Model 6.5, and Metal 3.0. Development builds
-/// emit portable MSL for `metal`; release builds emit a metallib.
-///
-/// # Errors
-///
-/// Returns an error if the source or target list is invalid, Slang reflection
-/// or compilation fails, a stage is declared more than once, Apple tooling is
-/// unavailable, or artifact encoding or validation fails.
-pub fn compile_shader(
+/// Stateless offline Slang compiler and validated artifact loader.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EasyGraphicsCompiler;
+
+impl EasyGraphicsCompiler {
+    /// Compiles every Slang entry point into one validated multi-target artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source or target list is invalid, Slang reflection or compilation
+    /// fails, Apple tooling is unavailable, or artifact encoding or validation fails.
+    pub fn compile_shader(
+        source: &Path,
+        targets: &[Target],
+        development: bool,
+    ) -> Result<CompiledShader, CompilerError> {
+        let bytes = compile_shader_bytes(source, targets, development)?;
+        CompiledShader::load(&bytes).map_err(CompilerError::ArtifactValidation)
+    }
+
+    /// Validates serialized `.ezgfxshader` bytes without invoking Slang.
+    ///
+    /// # Errors
+    ///
+    /// Returns an artifact validation error for malformed or incompatible bytes.
+    pub fn load_compiled_shader(bytes: &[u8]) -> Result<CompiledShader, CompilerError> {
+        CompiledShader::load(bytes).map_err(CompilerError::ArtifactValidation)
+    }
+}
+
+fn compile_shader_bytes(
     source: &Path,
     targets: &[Target],
     development: bool,
@@ -214,8 +234,7 @@ fn plan_target_requests(
         let (artifact_target, profile) = match target {
             Target::Spirv => (ArtifactTarget::Spirv, "spirv_1_5"),
             Target::Dxil => (ArtifactTarget::Dxil, "sm_6_5"),
-            Target::Metal if development => (ArtifactTarget::Msl, "metal_3_0"),
-            Target::Metal => (ArtifactTarget::Metallib, "metal_3_0"),
+            Target::Metal => (metal_artifact_target(development), "metal_3_0"),
         };
         requests.extend(entries.iter().map(|entry| TargetRequest {
             target: artifact_target,
@@ -280,12 +299,19 @@ fn compile_target(target: ArtifactTarget) -> shader_slang::CompileTarget {
     }
 }
 
+fn metal_artifact_target(development: bool) -> ArtifactTarget {
+    if development && !cfg!(target_os = "macos") {
+        ArtifactTarget::Msl
+    } else {
+        ArtifactTarget::Metallib
+    }
+}
+
 fn discovery_target(target: Target, development: bool) -> (ArtifactTarget, &'static str) {
     match target {
         Target::Spirv => (ArtifactTarget::Spirv, "spirv_1_5"),
         Target::Dxil => (ArtifactTarget::Dxil, "sm_6_5"),
-        Target::Metal if development => (ArtifactTarget::Msl, "metal_3_0"),
-        Target::Metal => (ArtifactTarget::Metallib, "metal_3_0"),
+        Target::Metal => (metal_artifact_target(development), "metal_3_0"),
     }
 }
 
@@ -345,13 +371,9 @@ fn discover_entries(
     let layout = linked
         .layout(0)
         .map_err(|error| CompilerError::Native(error.to_string()))?;
-    let mut stages = BTreeSet::new();
     let mut entries = Vec::with_capacity(module_entries.len());
     for entry in layout.entry_points() {
         let stage = artifact_stage(entry.stage())?;
-        if !stages.insert(stage) {
-            return Err(CompilerError::DuplicateStage(stage));
-        }
         entries.push(DiscoveredEntry {
             name: entry.name().to_owned(),
             stage,
@@ -967,6 +989,18 @@ mod compatibility_tests {
             ),
             Err(CompilerError::InvalidRequest("reflection"))
         ));
+    }
+
+    #[test]
+    fn apple_development_builds_runtime_loadable_metallib() {
+        let expected = if cfg!(target_os = "macos") {
+            ArtifactTarget::Metallib
+        } else {
+            ArtifactTarget::Msl
+        };
+
+        assert_eq!(metal_artifact_target(true), expected);
+        assert_eq!(metal_artifact_target(false), ArtifactTarget::Metallib);
     }
 
     #[test]

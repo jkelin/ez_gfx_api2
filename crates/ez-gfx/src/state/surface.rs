@@ -2,12 +2,14 @@ use crate::Result;
 
 #[cfg(windows)]
 use super::Dx12Surface;
+#[cfg(any(windows, target_vendor = "apple"))]
+use super::HalError;
 #[cfg(target_vendor = "apple")]
 use super::MetalSurface;
 #[cfg(test)]
 use super::SurfaceInsertTestFailure;
 use super::{
-    Backend, ContextHandle, ContextState, Error, HalError, HeadlessSurfaceOptions, NativeContext,
+    Backend, ContextHandle, ContextState, Error, HeadlessSurfaceOptions, NativeContext,
     NativeSurface, ResourceKind, SurfaceHandle, SurfaceRecord, SurfaceState, SurfaceWindow,
     map_hal, map_lifecycle, map_native_loss, result_status, with_context_mut, with_surface_mut,
 };

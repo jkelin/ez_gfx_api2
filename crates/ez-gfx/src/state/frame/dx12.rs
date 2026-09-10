@@ -6,7 +6,7 @@ use super::{
     MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext, NativePipeline, NativeShader,
     NativeSurface, NativeTexture, NativeTextureMap, PackedHandle, PipelineKey, RenderTargetHandle,
     RenderTargetRecord, ResourceId, SURFACE_DEFAULT_CLEAR, ShaderHandle, ShaderRecord,
-    dx12_bindings, map_hal, native_layouts, pipeline_layout_key,
+    dx12_bindings, map_hal, native_layouts, pipeline_layout_key, should_capture_presented,
 };
 
 struct DxActionState<'a> {
@@ -33,7 +33,6 @@ fn prepare_dx12_pipelines(
         let (key, pipeline) = match payload {
             ExecutableNode::Compute { shader, layout, .. } => {
                 let record = shaders.get(shader).ok_or(Error::InvalidContext)?;
-                let compute = record.compute.as_ref().ok_or(Error::InvalidArgument)?;
                 let NativeShader::Dx12(native_shader) = &record.native else {
                     return Err(Error::NativeFailure);
                 };
@@ -42,8 +41,7 @@ fn prepare_dx12_pipelines(
                     backend: Backend::Dx12,
                     shader: *shader,
                     shader_digest: record.digest,
-                    product: compute.0,
-                    entry: compute.1.clone(),
+                    entry: record.entry.clone(),
                     layouts: pipeline_layout_key(&layouts),
                 };
                 let pipeline = if pipelines.contains_key(&key) {
@@ -51,34 +49,38 @@ fn prepare_dx12_pipelines(
                 } else {
                     Some(NativePipeline::Dx12(
                         native
-                            .create_compute_pipeline(native_shader, compute.0, &layouts)
+                            .create_compute_pipeline(native_shader, record.product, &layouts)
                             .map_err(map_hal)?,
                     ))
                 };
                 (key, pipeline)
             }
             ExecutableNode::Graphics {
-                shader,
+                vertex_shader,
+                fragment_shader,
                 layout,
                 pipeline_layout,
                 state,
                 ..
             } => {
-                let record = shaders.get(shader).ok_or(Error::InvalidContext)?;
-                let graphics = record.graphics.as_ref().ok_or(Error::InvalidArgument)?;
-                let NativeShader::Dx12(native_shader) = &record.native else {
+                let vertex = shaders.get(vertex_shader).ok_or(Error::InvalidContext)?;
+                let fragment = shaders.get(fragment_shader).ok_or(Error::InvalidContext)?;
+                let NativeShader::Dx12(vertex_native) = &vertex.native else {
+                    return Err(Error::NativeFailure);
+                };
+                let NativeShader::Dx12(fragment_native) = &fragment.native else {
                     return Err(Error::NativeFailure);
                 };
                 let layouts = native_layouts(layout).map_err(map_hal)?;
                 let depth_required = pipeline_layout.depth_required();
                 let key = PipelineKey::Graphics {
                     backend: Backend::Dx12,
-                    shader: *shader,
-                    shader_digest: record.digest,
-                    vertex_product: graphics.0,
-                    vertex_entry: graphics.1.clone(),
-                    fragment_product: graphics.2,
-                    fragment_entry: graphics.3.clone(),
+                    vertex_shader: *vertex_shader,
+                    vertex_digest: vertex.digest,
+                    vertex_entry: vertex.entry.clone(),
+                    fragment_shader: *fragment_shader,
+                    fragment_digest: fragment.digest,
+                    fragment_entry: fragment.entry.clone(),
                     texture_heap: None,
                     layouts: pipeline_layout_key(&layouts),
                     state: *state,
@@ -93,9 +95,10 @@ fn prepare_dx12_pipelines(
                     Some(NativePipeline::Dx12(
                         native
                             .create_graphics_pipeline(
-                                native_shader,
-                                graphics.0,
-                                graphics.2,
+                                vertex_native,
+                                fragment_native,
+                                vertex.product,
+                                fragment.product,
                                 *state,
                                 depth_required,
                                 &layouts,
@@ -377,9 +380,12 @@ pub(super) fn execute_dx12_frame_plan(
                 .map(|record| (record.width, record.height))
         })
         .unwrap_or((0, 0));
-    let capture = surface
-        .as_ref()
-        .is_some_and(|surface| surface.state.snapshot_cache());
+    let capture = should_capture_presented(
+        surface
+            .as_ref()
+            .is_some_and(|surface| surface.state.snapshot_cache()),
+        context.frame_capture_surface.is_some(),
+    );
     let (index, index_size) = match context.index_heap.as_ref() {
         Some(heap) => match &heap.allocation {
             NativeAllocation::Dx12(index) => (Some(index), heap.size),

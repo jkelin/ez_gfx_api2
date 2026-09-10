@@ -12,15 +12,15 @@
 
 ## API and ownership
 
-Import public items from the crate root. `Context`, `Surface`, `Shader`, `Texture`, `RenderTarget`, `VertexHeap<T>`, `VertexAllocation<T>`, `IndexAllocation`, `Buffer<T>`, `CounterBuffer<T>`, and `Frame` are non-`Copy`, non-`Send`, and non-`Sync`. Raw handles and explicit lifecycle functions are doc-hidden for `ez-gfx-ffi`.
+Import public items from the crate root. `Context`, `Surface`, `ComputeShader`, `VertexShader`, `FragmentShader`, `Texture`, `RenderTarget`, `VertexHeap<T>`, `VertexAllocation<T>`, `IndexAllocation`, `Buffer<T>`, `CounterBuffer<T>`, and `Frame` are non-`Copy`, non-`Send`, and non-`Sync`. Raw handles and explicit lifecycle functions are doc-hidden for `ez-gfx-ffi`.
 
 The context-owned index heap is lazy behind `Context::upload_indices`. `Context::create_vertex_heap<T>(name)` derives stride and auto-grows storage; `VertexHeap::upload` derives checked count and byte size from `T: Pod`. `Context::acquire_buffer<T: Pod>` and `Context::acquire_counter_buffer<T: Pod>` allocate typed capacity. `Context::acquire_buffer_from` and `Context::acquire_counter_buffer_from` accept `BufferSource::one(&value)`, a slice, or a borrowed `Vec<T>` without an intermediate collection; arrays must use `.as_slice()` so they cannot be inferred as one array-valued element. Counter initialization publishes its input length. Writes validate element ranges; counter buffers publish their visible count explicitly.
 
-`Context::load_shader` accepts validated artifact bytes. `Context::load_texture` copies caller bytes before returning and schedules CPU work. `Context::register_callback` is the sole safe event channel for upload, runtime, diagnostic, dropped-record, and callback-scoped readback events. `RenderTarget::prepare_readback(&mut frame)` creates and attaches an opaque owner-and-generation request; the callback receives its identity, dimensions, and scoped bytes.
+Validated `CompiledShader` values load exact named compute, vertex, or fragment entry points through a `Context`, returning owning stage-typed handles. `Context::load_texture` copies caller bytes before returning and schedules CPU work. `Context::register_callback` is the sole safe event channel for upload, runtime, diagnostic, dropped-record, and callback-scoped readback events. `RenderTarget::prepare_readback(&mut frame)` creates and attaches an opaque owner-and-generation request; the callback receives its identity, dimensions, and scoped bytes.
 
 ## Shader artifacts
 
-`Context::load_shader` consumes caller-provided `.ezgfxshader` bytes and selects each stage's artifact-owned entry point. Applications compile artifacts offline or during their build; `ez-gfx` does not choose files, compile source, link Slang, or provide JIT/fallback behavior. The host owns artifact authenticity and storage; the registered callback receives asynchronous outcomes.
+`EasyGraphicsCompiler::load_compiled_shader` validates caller-provided `.ezgfxshader` bytes into host-owned `CompiledShader` data. Its stage loaders select exactly one UTF-8 entry-point name and ask the supplied `Context` to create an owning, context-bound shader handle. Applications compile artifacts offline or during development builds; `ez-gfx` does not choose files, compile source, link Slang, or provide JIT/fallback behavior. Compute and graphics pipelines are created and cached on demand from the selected shader identities and relevant state; dropping a shader evicts involving entries while backend destruction waits for retained frames. The host owns artifact authenticity and storage.
 
 ## Complete flows
 
@@ -32,4 +32,4 @@ The context-owned index heap is lazy behind `Context::upload_indices`. `Context:
 | [04 Dear ImGui](https://github.com/jkelin/ez_gfx_api2/blob/main/examples/04_imgui/README.md) | Dynamic UI buffers and per-command clipping |
 | [05 Helmet](https://github.com/jkelin/ez_gfx_api2/blob/main/examples/05_helmet/README.md) | GLB geometry and depth-tested rendering |
 | [06 Sponza KTX2](https://github.com/jkelin/ez_gfx_api2/blob/main/examples/06_sponza_ktx2/README.md) | KTX2 materials and compute-to-graphics flow |
-| [C textured cube](../../examples/02_textured_cube_c/README.md) | ABI 37 portable GLFW surface and one-frame compute-to-graphics cube |
+| [C textured cube](../../examples/02_textured_cube_c/README.md) | ABI 39 portable GLFW surface and one-frame compute-to-graphics cube |

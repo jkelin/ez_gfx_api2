@@ -6,6 +6,7 @@ use super::{
     NativeContext, NativePipeline, NativeShader, NativeSurface, NativeTexture, PipelineKey,
     RenderTargetHandle, RenderTargetRecord, ResourceId, SURFACE_DEFAULT_CLEAR, ShaderRecord,
     TextureHandle, TextureId, map_hal, metal_bindings, native_layouts, pipeline_layout_key,
+    should_capture_presented,
 };
 use ez_gfx_backend_metal::native::{
     NativeAllocation as MetalAllocation, NativeBufferBinding as MetalBufferBinding,
@@ -63,7 +64,6 @@ fn prepare_compute_pipeline(
     layout: &ReflectedBindings,
 ) -> Result<PreparedComputePipeline> {
     let record = shaders.get(&shader).ok_or(Error::InvalidContext)?;
-    let compute = record.compute.as_ref().ok_or(Error::InvalidArgument)?;
     let NativeShader::Metal(native_shader) = &record.native else {
         return Err(Error::NativeFailure);
     };
@@ -81,8 +81,7 @@ fn prepare_compute_pipeline(
         backend: Backend::Metal,
         shader,
         shader_digest: record.digest,
-        product: compute.0,
-        entry: compute.1.clone(),
+        entry: record.entry.clone(),
         layouts: pipeline_layout_key(&layouts),
     };
     let pipeline = if pipelines.contains_key(&key) {
@@ -90,7 +89,7 @@ fn prepare_compute_pipeline(
     } else {
         Some(NativePipeline::Metal(
             native
-                .create_compute_pipeline(native_shader, compute.0, &compute.1, texture_heap)
+                .create_compute_pipeline(native_shader, record.product, &record.entry, texture_heap)
                 .map_err(map_hal)?,
         ))
     };
@@ -102,24 +101,28 @@ fn prepare_graphics_pipeline(
     shaders: &HashMap<ShaderHandle, ShaderRecord>,
     pipelines: &HashMap<PipelineKey, NativePipeline>,
     native: &MetalContext,
-    shader: ShaderHandle,
+    vertex_shader: ShaderHandle,
+    fragment_shader: ShaderHandle,
     layout: &ReflectedBindings,
     pipeline_layout: &PipelineLayout,
     state: DynamicPipelineState,
 ) -> Result<PreparedGraphicsPipeline> {
-    let record = shaders.get(&shader).ok_or(Error::InvalidContext)?;
-    let graphics = record.graphics.as_ref().ok_or(Error::InvalidArgument)?;
-    let NativeShader::Metal(native_shader) = &record.native else {
+    let vertex = shaders.get(&vertex_shader).ok_or(Error::InvalidContext)?;
+    let fragment = shaders.get(&fragment_shader).ok_or(Error::InvalidContext)?;
+    let NativeShader::Metal(vertex_native) = &vertex.native else {
+        return Err(Error::NativeFailure);
+    };
+    let NativeShader::Metal(fragment_native) = &fragment.native else {
         return Err(Error::NativeFailure);
     };
     let layouts = native_layouts(layout).map_err(map_hal)?;
     let texture_heap = metal_texture_heap(pipeline_layout.texture_heap())?;
-    let vertex_layout = record
+    let vertex_layout = vertex
         .runtime
         .pipeline_layout(ez_gfx_artifact::Stage::Vertex)
         .map_err(|_| Error::InvalidArgument)?;
     let vertex_texture_heap = metal_texture_heap(vertex_layout.texture_heap())?;
-    let fragment_layout = record
+    let fragment_layout = fragment
         .runtime
         .pipeline_layout(ez_gfx_artifact::Stage::Fragment)
         .map_err(|_| Error::InvalidArgument)?;
@@ -127,12 +130,12 @@ fn prepare_graphics_pipeline(
     let depth_required = pipeline_layout.depth_required();
     let key = PipelineKey::Graphics {
         backend: Backend::Metal,
-        shader,
-        shader_digest: record.digest,
-        vertex_product: graphics.0,
-        vertex_entry: graphics.1.clone(),
-        fragment_product: graphics.2,
-        fragment_entry: graphics.3.clone(),
+        vertex_shader,
+        vertex_digest: vertex.digest,
+        vertex_entry: vertex.entry.clone(),
+        fragment_shader,
+        fragment_digest: fragment.digest,
+        fragment_entry: fragment.entry.clone(),
         layouts: pipeline_layout_key(&layouts),
         texture_heap,
         state,
@@ -147,8 +150,10 @@ fn prepare_graphics_pipeline(
         Some(NativePipeline::Metal(
             native
                 .create_graphics_pipeline(
-                    native_shader,
-                    graphics,
+                    vertex_native,
+                    fragment_native,
+                    &(vertex.product, vertex.entry.clone()),
+                    &(fragment.product, fragment.entry.clone()),
                     state,
                     depth_required,
                     vertex_texture_heap,
@@ -208,7 +213,8 @@ fn prepare_metal_pipelines(
                 (key, pipeline)
             }
             ExecutableNode::Graphics {
-                shader,
+                vertex_shader,
+                fragment_shader,
                 layout,
                 pipeline_layout,
                 state,
@@ -218,7 +224,8 @@ fn prepare_metal_pipelines(
                     shaders,
                     pipelines,
                     native,
-                    *shader,
+                    *vertex_shader,
+                    *fragment_shader,
                     layout,
                     pipeline_layout,
                     *state,
@@ -494,9 +501,12 @@ pub(super) fn execute_metal_frame_plan(
                 .map(|record| (record.width, record.height))
         })
         .unwrap_or((0, 0));
-    let capture = surface
-        .as_ref()
-        .is_some_and(|surface| surface.state.snapshot_cache());
+    let capture = should_capture_presented(
+        surface
+            .as_ref()
+            .is_some_and(|surface| surface.state.snapshot_cache()),
+        context.frame_capture_surface.is_some(),
+    );
 
     let mut binding_sets = Vec::with_capacity(payloads.len());
     for payload in payloads {

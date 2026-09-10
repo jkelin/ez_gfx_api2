@@ -84,11 +84,15 @@ C calls copy borrowed source bytes during the call, preserving asynchronous life
 
 Texture bindings are recorded only through `&mut Frame`; the context-owned texture heap requires no per-frame retain call. Surface recording uses `Surface::begin_frame()` and `Frame::configure_swapchain`; named targets use `Context::begin_frame()` and `Frame::configure_render_target`. `Frame::finish(self)` preserves exact errors, while dropping an unfinished frame aborts. `Buffer<T>`, `CounterBuffer<T>`, and single-value `ValueBuffer<T>` are one-frame values: their first execute use claims them, current bindings persist across same-frame execute calls, and terminal frame paths clear bindings and invalidate claimed public use while native backing remains completion-gated. `RenderTarget::prepare_readback(&mut frame)` creates and attaches an opaque owner-and-generation request, and completed metadata and bytes exist only during the registered callback.
 
-## C ABI 37
+## C ABI 39
 
 Install `ez_gfx_context_register_callback(context, callback, user_data)`. The callback receives `EzGfxEventKind_Upload`, runtime, diagnostic, dropped-count, and readback events on the context creator thread at graphics safe points. Compare upload resource handles, resolve bindings after `EzGfxUploadStatus_DeviceReady`, and copy readback bytes before the callback returns. Passing a null callback clears the registration. Convert result codes with `ez_gfx_error_print`.
 
-C retains explicit context-first texture load, cancellation, binding, residency, region-update, telemetry, and unload functions because RAII is available only through the safe Rust interface.
+C retains explicit context-first texture load, cancellation, binding, residency, region-update, telemetry, resource-diagnostics, and unload functions because RAII is available only through the safe Rust interface. `ez_gfx_context_get_resource_diagnostics` fills an `EzGfxResourceDiagnostics` struct with pending-upload counts, retained bytes, and cache sizes; it rejects null outputs and stale handles like every other context query.
+
+## Pending-upload and cache diagnostics
+
+`Context::resource_diagnostics` returns a point-in-time `ResourceDiagnostics` snapshot, distinct from the monotonic `texture_upload_telemetry` counters. `pending_textures` counts uploads awaiting decode or transfer completion; `pending_texture_bytes` holds admitted caller source bytes for decode-pending work plus decoded staging bytes recorded at native submission for transfer-pending work. Staging sizes aggregate retained bucket capacity across the shared, buffer, and counter pools; `pipeline_entries` counts retained compiled pipelines and `readback_bytes` aggregates retained readback frames. Counts and bytes saturate instead of wrapping. The query observes creator-thread state without requiring device health, so teardown titles keep reporting after loss until context destruction; stale handles and wrong-thread calls still fail fast.
 
 ## Synchronization
 
@@ -96,4 +100,4 @@ Frame recording imports only resources referenced by active work. Texture descri
 
 ## Verification and remaining evidence
 
-Pure queue and allocator transitions are covered by runtime tests. ABI layout tests cover callback event records, typed heap/allocation handles, one-frame buffer signatures, and the ABI 37 contract. Native backend behavior requires the Linux Vulkan, Windows DX12, and macOS Metal remote matrices.
+Pure queue and allocator transitions are covered by runtime tests. ABI layout tests cover callback event records, typed heap/allocation handles, one-frame buffer signatures, the resource-diagnostics struct and export, and the ABI 39 contract. Native backend behavior requires the Linux Vulkan, Windows DX12, and macOS Metal remote matrices.

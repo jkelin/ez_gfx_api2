@@ -1,6 +1,6 @@
 use super::*;
 use super::{AllocationError, NativeFrameAction, NativeFrameResource, PassAttachment};
-use ez_gfx_compiler::{Target, compile_shader};
+use ez_gfx_compiler::{EasyGraphicsCompiler, Target};
 use ez_gfx_runtime::shader::RuntimeShader;
 use std::{
     sync::{
@@ -143,10 +143,16 @@ void computemain(uint3 id : SV_DispatchThreadID) {
 "#,
     )
     .unwrap();
-    let artifact = compile_shader(&source, &[Target::Metal], false).unwrap();
-    let runtime =
-        RuntimeShader::load(&artifact, ez_gfx_core::Backend::Metal, SemanticProfile::V1).unwrap();
-    let (product, _, entry) = runtime.compute_product().unwrap();
+    let artifact = EasyGraphicsCompiler::compile_shader(&source, &[Target::Metal], false).unwrap();
+    let runtime = RuntimeShader::load(
+        &artifact,
+        ez_gfx_core::Backend::Metal,
+        SemanticProfile::V1,
+        ez_gfx_artifact::Stage::Compute,
+        "computemain",
+    )
+    .unwrap();
+    let (product, _, entry) = runtime.shader_product();
     let layout = runtime
         .pipeline_layout(ez_gfx_artifact::Stage::Compute)
         .unwrap();
@@ -940,26 +946,44 @@ float4 fragmentmain() : SV_Target {
 "#,
     )
     .unwrap();
-    let artifact = compile_shader(&source, &[Target::Metal], false).unwrap();
-    let runtime =
-        RuntimeShader::load(&artifact, ez_gfx_core::Backend::Metal, SemanticProfile::V1).unwrap();
-    let products = runtime
+    let artifact = EasyGraphicsCompiler::compile_shader(&source, &[Target::Metal], false).unwrap();
+    let vertex = RuntimeShader::load(
+        &artifact,
+        ez_gfx_core::Backend::Metal,
+        SemanticProfile::V1,
+        ez_gfx_artifact::Stage::Vertex,
+        "vertexmain",
+    )
+    .unwrap();
+    let fragment = RuntimeShader::load(
+        &artifact,
+        ez_gfx_core::Backend::Metal,
+        SemanticProfile::V1,
+        ez_gfx_artifact::Stage::Fragment,
+        "fragmentmain",
+    )
+    .unwrap();
+    let vertex_products = vertex
         .products()
         .map(|(_, bytes)| bytes)
         .collect::<Vec<_>>();
-    let (vertex, fragment) = runtime.graphics_pair().unwrap();
-    let graphics = (
-        vertex.0,
-        vertex.2.to_owned(),
-        fragment.0,
-        fragment.2.to_owned(),
-    );
+    let fragment_products = fragment
+        .products()
+        .map(|(_, bytes)| bytes)
+        .collect::<Vec<_>>();
+    let vertex_product = vertex.shader_product();
+    let fragment_product = fragment.shader_product();
+    let vertex_identity = (vertex_product.0, vertex_product.2.to_owned());
+    let fragment_identity = (fragment_product.0, fragment_product.2.to_owned());
     let mut context = NativeContext::create_default().unwrap();
-    let shader = context.create_shader(&products).unwrap();
+    let vertex_shader = context.create_shader(&vertex_products).unwrap();
+    let fragment_shader = context.create_shader(&fragment_products).unwrap();
     let pipeline = context
         .create_graphics_pipeline(
-            &shader,
-            &graphics,
+            &vertex_shader,
+            &fragment_shader,
+            &vertex_identity,
+            &fragment_identity,
             DynamicPipelineState::from_abi(0, 0, 0, 0).unwrap(),
             false,
             None,
@@ -1106,6 +1130,7 @@ float4 fragmentmain() : SV_Target {
     context.free(index).unwrap();
     context.destroy_texture(target).unwrap();
     context.destroy_pipeline(pipeline);
-    context.destroy_shader(shader);
+    context.destroy_shader(vertex_shader);
+    context.destroy_shader(fragment_shader);
     context.wait_idle().unwrap();
 }

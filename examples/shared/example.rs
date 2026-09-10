@@ -34,6 +34,13 @@ struct Observations {
     diagnostics: u32,
     dropped: u64,
 }
+#[derive(Clone, Copy)]
+struct FrameTiming {
+    frame: u32,
+    host_wait_ns: u128,
+    record_ns: u128,
+    submit_present_ns: u128,
+}
 
 struct HostState {
     title: &'static str,
@@ -156,8 +163,17 @@ pub struct Example {
     resize_after_first_frame: bool,
     observations: Rc<RefCell<Observations>>,
     benchmark: BenchmarkRunner,
+    frame_timings_enabled: bool,
+    frame_timings: Vec<FrameTiming>,
+    pending_frame_started: Option<Instant>,
+    pending_host_wait_ns: u128,
     frames: u32,
     last_frame: Instant,
+    last_present: Option<Instant>,
+    // Exponential moving average of presented frames per second for the title.
+    fps: f32,
+    // Reused title buffer so per-frame title updates never allocate.
+    title_text: String,
     report: Option<ProgramReport>,
 }
 
@@ -191,8 +207,15 @@ impl Example {
             resize_after_first_frame: options.resize_after_first_frame,
             observations: Rc::new(RefCell::new(Observations::default())),
             benchmark: BenchmarkRunner::new(options.benchmark),
+            frame_timings_enabled: options.frame_timings,
+            frame_timings: Vec::new(),
+            pending_frame_started: None,
+            pending_host_wait_ns: 0,
             frames: 0,
             last_frame: Instant::now(),
+            last_present: None,
+            fps: 0.0,
+            title_text: String::new(),
             report: None,
         };
         while example.state.window.is_none() && !example.state.closed {
@@ -207,6 +230,8 @@ impl Example {
             .window
             .as_ref()
             .ok_or_else(|| Error::message("native host was not resumed"))?;
+        // Startup-only hint; stderr keeps snapshot/benchmark stdout machine-parseable.
+        super::observability::print_frame_title_legend();
         Ok(example)
     }
 
@@ -281,6 +306,7 @@ impl Example {
 
     /// Pumps until host input is ready, or returns `None` after completion.
     pub fn wait_for_next_frame(&mut self, surface: &Surface) -> Result<Option<WindowFrame>> {
+        let host_wait_started = Instant::now();
         loop {
             if self.state.closed
                 || self
@@ -290,12 +316,6 @@ impl Example {
             {
                 return Ok(None);
             }
-            if self.state.visible
-                && let Some(window) = &self.state.window
-            {
-                window.request_redraw();
-            }
-
             self.state.redraw_ready = false;
             while !self.state.redraw_ready && !self.state.closed {
                 self.pump_once()?;
@@ -314,18 +334,44 @@ impl Example {
             }
 
             self.benchmark.begin_frame(self.frames);
+            let delta_seconds = self.last_frame.elapsed().as_secs_f32();
             let input = FrameInput {
                 width: self.state.width,
                 height: self.state.height,
-                delta_seconds: self.last_frame.elapsed().as_secs_f32(),
+                delta_seconds,
             };
             self.last_frame = Instant::now();
+            self.pending_host_wait_ns = host_wait_started.elapsed().as_nanos();
+            self.pending_frame_started = Some(Instant::now());
             return Ok(Some(WindowFrame {
                 size: [self.state.width, self.state.height],
                 input,
                 events: std::mem::take(&mut self.state.pending_input),
             }));
         }
+    }
+    /// Refreshes the window title with FPS plus compressed diagnostics.
+    ///
+    /// The title buffer reuses capacity after initial growth, so steady-state
+    /// updates perform no allocation. A failed diagnostics query renders as
+    /// `diag ?` instead of failing the frame; titles stay available after
+    /// device loss.
+    pub fn update_title(&mut self, context: &Context) {
+        // Query before clearing: a missing window still advances no state, and
+        // the previous title simply persists when the host is gone.
+        let diagnostics = context.resource_diagnostics().ok();
+        let Some(window) = self.state.window.as_ref() else {
+            return;
+        };
+        self.title_text.clear();
+        super::observability::push_frame_title(
+            &mut self.title_text,
+            self.identity,
+            self.backend_name,
+            self.fps,
+            diagnostics.as_ref(),
+        );
+        window.set_title(&self.title_text);
     }
 
     /// Consumes the pending frame and configures terminal swapchain readback.
@@ -334,6 +380,12 @@ impl Example {
         mut frame: Frame,
         swapchain_target: ez_gfx::RenderTarget,
     ) -> Result<()> {
+        let frame_started = self
+            .pending_frame_started
+            .take()
+            .ok_or_else(|| Error::message("frame timing began without a pending host frame"))?;
+        let record_ns = frame_started.elapsed().as_nanos();
+        let submit_present_started = Instant::now();
         if swapchain_target.extent()? != (self.state.width, self.state.height) {
             return Err(Error::message(
                 "swapchain target extent does not match host size",
@@ -348,7 +400,21 @@ impl Example {
             .transpose()?;
         drop(swapchain_target);
         frame.finish()?;
+        let submit_present_ns = submit_present_started.elapsed().as_nanos();
+        let presented_at = Instant::now();
+        if let Some(previous) = self.last_present {
+            self.fps = smoothed_fps(self.fps, presented_at.duration_since(previous));
+        }
+        self.last_present = Some(presented_at);
         self.frames = self.frames.saturating_add(1);
+        if self.frame_timings_enabled {
+            self.frame_timings.push(FrameTiming {
+                frame: self.frames,
+                host_wait_ns: self.pending_host_wait_ns,
+                record_ns,
+                submit_present_ns,
+            });
+        }
         self.benchmark.end_frame(self.frames);
         if self.resize_after_first_frame && self.frames == 1 {
             // Regression automation publishes a maximized-scale extent directly; the hidden host
@@ -413,7 +479,38 @@ impl Example {
             )
             .map_err(Error::ReportOutput)?;
         }
+        if self.frame_timings_enabled {
+            let mut stdout = std::io::stdout().lock();
+            for timing in &self.frame_timings {
+                writeln!(
+                    stdout,
+                    "ez-gfx-frame-timing {} {} {} {} {} {}",
+                    self.identity,
+                    self.backend_name,
+                    timing.frame,
+                    timing.host_wait_ns,
+                    timing.record_ns,
+                    timing.submit_present_ns
+                )
+                .map_err(Error::ReportOutput)?;
+            }
+        }
         Ok(())
+    }
+}
+
+fn smoothed_fps(previous: f32, elapsed: Duration) -> f32 {
+    // Timer granularity can produce a zero interval; retain the last valid sample.
+    let seconds = elapsed.as_secs_f32();
+    if seconds == 0.0 {
+        previous
+    } else {
+        let instant = 1.0 / seconds;
+        if previous == 0.0 {
+            instant
+        } else {
+            previous.mul_add(0.9, instant * 0.1)
+        }
     }
 }
 
@@ -443,15 +540,21 @@ impl ApplicationHandler for Example {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Hidden automation cannot depend on compositor redraw delivery, but a
-        // minimized window must still wait for a nonzero resize.
-        if !self.state.visible && self.state.width > 0 && self.state.height > 0 {
+        // The host owns continuous pacing under ControlFlow::Poll. Redraw delivery may be
+        // compositor-paced, so it is input/invalidating information rather than a frame clock.
+        // Minimized surfaces still wait for a nonzero resize.
+        if self.state.width > 0 && self.state.height > 0 {
             self.state.redraw_ready = true;
         }
     }
 
-    fn window_event(&mut self, _event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         self.state.window_event(id, event);
+        event_loop.set_control_flow(if self.state.width == 0 || self.state.height == 0 {
+            ControlFlow::Wait
+        } else {
+            ControlFlow::Poll
+        });
     }
 }
 
@@ -517,6 +620,13 @@ mod tests {
     }
 
     #[test]
+    fn fps_smoothing_uses_completed_presentation_intervals() {
+        assert_eq!(smoothed_fps(0.0, Duration::ZERO), 0.0);
+        assert_eq!(smoothed_fps(0.0, Duration::from_millis(10)), 100.0);
+        assert_eq!(smoothed_fps(60.0, Duration::from_millis(10)), 64.0);
+    }
+
+    #[test]
     #[should_panic(expected = "sentinel unwind")]
     fn publication_failure_does_not_double_panic_during_unwind() {
         let directory = tempfile::tempdir().unwrap();
@@ -536,8 +646,15 @@ mod tests {
             resize_after_first_frame: false,
             observations,
             benchmark: BenchmarkRunner::new(None),
+            frame_timings_enabled: false,
+            frame_timings: Vec::new(),
+            pending_frame_started: None,
+            pending_host_wait_ns: 0,
             frames: 1,
             last_frame: Instant::now(),
+            last_present: None,
+            fps: 0.0,
+            title_text: String::new(),
             report: Some(ProgramReport {
                 frame: PresentedFrame {
                     width: 1,

@@ -111,6 +111,9 @@ pub fn load_texture(
     }
     validate_texture_sampler(&config.sampler)?;
     let owned = bytes.to_vec().into_boxed_slice();
+    // `bytes` is copied into the decode closure below; retain only its length here so
+    // diagnostics can report decode-pending sizes without retaining a second copy.
+    let source_bytes = owned.len() as u64;
     let config = *config;
 
     with_context_mut(context, |context| {
@@ -138,6 +141,7 @@ pub fn load_texture(
                 id: texture,
                 cancelled: cancelled.clone(),
                 config,
+                source_bytes,
                 admitted_at: Instant::now(),
             },
         );
@@ -251,6 +255,9 @@ pub(super) fn note_device_lost(context: &mut ContextState) {
         });
     }
     let _ = context.identity.mark_lost();
+    // Terminal failure events retire every pending outcome, so no transfer keeps a
+    // pending size afterwards; `texture_ready` tokens linger for teardown ordering.
+    context.texture_transfer_bytes.clear();
     cancel_all_pending_textures(context);
 }
 
@@ -380,6 +387,11 @@ pub(super) fn pump_async_textures(context: &mut ContextState) -> Result<usize> {
             .insert(job.handle, decoded.mip_count);
         context.texture_last_transfer.insert(job.handle, last);
         context.texture_ready.insert(job.handle, first);
+        // Transfer-pending sizes mirror `texture_ready` so diagnostics can report them;
+        // publication, cancel, loss, and teardown each remove the entry alongside it.
+        context
+            .texture_transfer_bytes
+            .insert(job.handle, staging_bytes);
         context.texture_handoffs.insert(job.handle, submitted_at);
         let decode = runtime_record(context, job.handle.into_raw(), RuntimePhase::Decode, Ok(()));
         context.observability.push_event(decode);
@@ -625,6 +637,7 @@ pub(super) fn record_texture_ready(
     }
 
     context.texture_ready.remove(&texture);
+    context.texture_transfer_bytes.remove(&texture);
     if let Some(submitted_at) = context.texture_handoffs.remove(&texture) {
         context.texture_telemetry.record_handoff_latency(
             u64::try_from(submitted_at.elapsed().as_micros()).unwrap_or(u64::MAX),
@@ -954,6 +967,10 @@ pub fn update_texture_region(
         // Writes outside the published coarse view keep sampling available while finer work runs.
         if touches_view {
             context.texture_ready.insert(texture, completion);
+            // A region rewrite supersedes the initial upload size for pending diagnostics.
+            context
+                .texture_transfer_bytes
+                .insert(texture, region.bytes.len() as u64);
             context.texture_handoffs.insert(texture, Instant::now());
         }
         context
@@ -1005,6 +1022,7 @@ fn retire_live_texture(context: &mut ContextState, texture: TextureHandle) -> Re
         .ok_or(Error::InvalidContext)?;
     cancel_native_texture_transfers(&native);
     context.texture_ready.remove(&texture);
+    context.texture_transfer_bytes.remove(&texture);
     context.texture_handoffs.remove(&texture);
     context.texture_formats.remove(&texture);
     context.texture_published_mips.remove(&texture);

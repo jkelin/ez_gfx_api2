@@ -13,7 +13,7 @@ Migrate the original Odin/Vulkan `ez_gfx_api` to Rust/Cargo while roughly preser
 - Runtime packages must not depend on or bundle the Slang compiler.
 - Vulkan, DX12, and Metal are required; Vulkan-only abstractions are incomplete.
 - Explicit shader target attributes are authoritative for target intent.
-- Rust uses the clean context-owned interface; C/C# use the explicit ABI 37 lifecycle through the dedicated FFI seam.
+- Rust uses the clean context-owned interface; C/C# use the explicit ABI 39 lifecycle through the dedicated FFI seam.
 - External inputs and binary artifacts require validation; no panic crosses FFI.
 - OpenGL, DX11, software rasterizers, a custom shader DSL, and a custom window system are out of scope.
 - `gpu-allocator` 0.28 is the selected cross-backend Rust allocator.
@@ -29,7 +29,7 @@ A virtual workspace separates core types, runtime/artifact loading, offline in-p
 
 ### P-002: Public API and C ABI bindings â€” Owning Rust facade and raw FFI
 
-One owning `Context` controls native lifetime and invalidates every descendant on destruction or drop. Resource wrappers retain memory-safe access but not an independent native context lifetime; texture wrapper drop intentionally leaves its stable bindless heap entry resident until context teardown. `Surface::begin_frame` and `Context::begin_frame` return target-less owning `Frame` values; configure methods attach logical swapchain or cached named targets. Recording borrows frames mutably, `Frame::finish(self)` preserves exact errors, and `Drop` aborts. ABI 37 alone exposes explicit lifecycle calls and opaque generational `u64` handles, including `EzGfxFrame`.
+One owning `Context` controls native lifetime and invalidates every descendant on destruction or drop. Resource wrappers retain memory-safe access but not an independent native context lifetime; texture wrapper drop intentionally leaves its stable bindless heap entry resident until context teardown. `Surface::begin_frame` and `Context::begin_frame` return target-less owning `Frame` values; configure methods attach logical swapchain or cached named targets. Recording borrows frames mutably, `Frame::finish(self)` preserves exact errors, and `Drop` aborts. ABI 39 alone exposes explicit lifecycle calls and opaque generational `u64` handles, including `EzGfxFrame`.
 
 ### P-003: Multi-backend hardware abstraction â€” Custom static raw HAL
 
@@ -101,11 +101,11 @@ Backend-specific offscreen/readback fixtures provide PNG goldens and tolerances;
 
 ### P-020: Migration cutover â€” Clean ownership cutover
 
-The final cutover uses the shared `Example` host for winit inversion, native window hosting, resize, input, automation, and consuming frame dispatch. Each main creates platform-free `ContextOptions` and calls `Context::create_surface_window` with the host's `HasWindowHandle`; initial extent comes from the native window. Resources need no artificial scopes or ordered manual teardown: `Context::destroy` and owner drop invalidate and destroy all context-owned resources, including surfaces and retained texture-heap entries. Rust exposes no compatibility aliases or per-frame texture retention; ABI 37 preserves explicit C lifecycle and separate window/headless surface constructors.
+The final cutover uses the shared `Example` host for winit inversion, native window hosting, resize, input, automation, and consuming frame dispatch. Each main creates platform-free `ContextOptions` and calls `Context::create_surface_window` with the host's `HasWindowHandle`; initial extent comes from the native window. Resources need no artificial scopes or ordered manual teardown: `Context::destroy` and owner drop invalidate and destroy all context-owned resources, including surfaces and retained texture-heap entries. Rust exposes no compatibility aliases or per-frame texture retention; ABI 39 preserves explicit C lifecycle and separate window/headless surface constructors.
 
 ### P-021: Cross-backend shader execution semantics â€” Target-native layouts with canonical semantic ABI
 
-One root Slang module defines stable semantic resource declarations, while `.ezgfxshader` retains target-native products and reflection. Each stage owns exactly one internal entry point; callers load without naming it. Runtime never assumes identical physical slots or aggregate layouts. DXIL variants target Shader Model 6.5 and use explicit descriptor tables/root descriptors; no 6.6-only direct heap indexing is part of the semantic ABI.
+One root Slang module defines stable semantic resource declarations, while `.ezgfxshader` retains target-native products and reflection for every discovered `(stage, entry-point name)`. A source may contain multiple entry points of the same stage. Host-side `CompiledShader` data remains compiler/runtime-neutral; loading requires an exact name and stage, then creates a context-owned generational stage handle. Runtime never assumes identical physical slots or aggregate layouts. DXIL variants target Shader Model 6.5 and use explicit descriptor tables/root descriptors; no 6.6-only direct heap indexing is part of the semantic ABI.
 
 ### P-022: Backend, device, and capability admission â€” Single modern semantic floor
 
@@ -158,7 +158,7 @@ Target-native release CI builds pinned sources and publishes separate runtime/FF
 
 ### Offline shader to runtime draw
 
-The compiler receives a backend-agnostic Slang source importing the root shared module, assigns canonical semantic resource IDs, emits target-native SPIR-V and Shader Model 6.5 DXIL products, and invokes Apple tools for metallib on Apple hosts. It writes a bounded `.ezgfxshader` whose framed `rkyv` payload contains one entry point per stage, target products, reflection, provenance, and a BLAKE3 digest. Runtime bytechecks and semantically validates the payload before choosing backend/stage products without Slang or source compilation; the host/package boundary applies authenticity policy.
+The compiler receives a backend-agnostic Slang source importing the root shared module, assigns canonical semantic resource IDs, emits target-native SPIR-V and Shader Model 6.5 DXIL products, and invokes Apple tools for metallib on Apple hosts, including development clients. Non-Apple development compilers may retain MSL for cross-target validation, but Metal runtime accepts only metallib data. The compiler returns one bounded `CompiledShader` whose framed `rkyv` payload contains every discovered entry point, target products, reflection, provenance, and a BLAKE3 digest; `save_shader` serializes it. Runtime bytechecks and semantically validates loaded bytes before exact stage/name selection, then creates stage-typed context-owned shader identities. Compute pipeline keys include that shader identity, entry, layouts, and relevant state; graphics keys include both shader identities plus merged layout, attachment, and dynamic state. Dropping a stage handle evicts involving cache entries. Raw frames retain referenced shader identities through submit or abort. Pipeline eviction enters each backend's completion-tracked deferred queue; Vulkan shader modules and Metal libraries use the same queue, while DX12 shader bytecode is ordinary host memory copied synchronously during PSO creation. Runtime never links compiler libraries.
 
 ### Asynchronous texture load
 
@@ -336,7 +336,7 @@ Semantic-ID collision, cross-target type/access mismatch, specialization/packing
 
 ### Responsibility and boundary
 
-Own bounded `.ezgfxshader` framing, bytecheck/schema/digest/provenance validation, semantic-ID to target-layout resolution, PSO keys/native cache objects, stable bindless registry, frame descriptor arenas, and cache-envelope import/export. It owns no compiler execution, filesystem, authenticity keys, or graph scheduling.
+Own bounded `.ezgfxshader` framing, bytecheck/schema/digest/provenance validation, semantic-ID to target-layout resolution, on-demand process-local PSO creation and native cache objects, stable bindless registry, frame descriptor arenas, and cache-envelope import/export. Process-local cache keys include every participating shader identity and entry point plus relevant layout, attachment, and dynamic state. Shader drop evicts every involving entry into backend completion-tracked deferred retirement. The component owns no compiler execution, filesystem, authenticity keys, or graph scheduling.
 
 ### Problems and selected solutions
 
@@ -344,11 +344,11 @@ Realizes P-006/P-007/P-021/P-024/P-027 and runtime portions of P-025: versioned 
 
 ### Interfaces and connections
 
-Validated artifact loader; canonical semantic graph -> selected target layout/PSO; descriptor allocation/update; bounded cache-envelope import/export; provenance/verification status. Compiler output connects to HAL/graph/textures/draws without exposing physical bindings publicly.
+Validated artifact loader; canonical semantic graph -> selected target layout/on-demand PSO; descriptor allocation/update; bounded cache-envelope import/export; provenance/verification status. Compiler output connects to HAL/graph/textures/draws without exposing physical bindings publicly. Compute cache lookup uses one shader identity; graphics lookup uses both vertex and fragment identities.
 
 ### Data and persistence
 
-`.ezgfxshader` files and host cache blobs are externally durable, bounded inputs. Runtime owns validated artifact data, live PSOs/native cache objects, stable tables, and frame arenas. Hosts own authentication and cache storage/locking/quota/atomicity; no runtime cache filesystem exists.
+`.ezgfxshader` files and host cache blobs are externally durable, bounded inputs. Runtime owns validated artifact data, process-local live PSOs/native cache objects, stable tables, and frame arenas. Shader drop removes matching process-local keys; each backend retires evicted native objects only after its tracked in-flight frame slots complete. Hosts own authentication and persistent cache storage/locking/quota/atomicity; no runtime cache filesystem exists.
 
 ### Technology
 

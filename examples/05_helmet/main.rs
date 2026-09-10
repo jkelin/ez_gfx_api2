@@ -29,9 +29,9 @@ fn main() -> anyhow::Result<()> {
         texture_decode_workers: 0,
         adapter_selection: None,
     })?;
-    let surface = context.create_surface_window(example.native_surface()?, true)?;
+    let surface = context.create_surface_window(example.native_surface()?, false)?;
     example.register_observations(&context)?;
-    let shader_bytes = ez_gfx_compiler::compile_shader(
+    let shader_bytes = ez_gfx_compiler::EasyGraphicsCompiler::compile_shader(
         std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/05_helmet/05_helmet.slang"
@@ -58,7 +58,9 @@ fn main() -> anyhow::Result<()> {
     let _positions = positions_heap.upload(&mesh.positions)?;
     let normals_heap = context.create_vertex_heap("normals")?;
     let _normals = normals_heap.upload(&mesh.normals)?;
-    let shader = context.load_shader(&shader_bytes)?;
+    let compute_shader = shader_bytes.load_compute_shader(&context, "computemain")?;
+    let vertex_shader = shader_bytes.load_vertex_shader(&context, "vertexmain")?;
+    let fragment_shader = shader_bytes.load_fragment_shader(&context, "fragmentmain")?;
     let mut camera = OrbitCamera::new(35.0_f32.to_radians(), 22.0_f32.to_radians(), 5.0)
         .with_clip_y(shared::clip_y(backend.backend));
     let target = Vec3::ZERO;
@@ -80,14 +82,16 @@ fn main() -> anyhow::Result<()> {
         frame.bind_buffer("params", &params_buffer)?;
         frame.bind_buffer("primitives", &primitives)?;
         frame.bind_buffer("draw_commands", &indirect)?;
-        frame.execute_compute(&shader, [primitive_count, 1, 1])?;
+        frame.execute_compute(&compute_shader, [primitive_count, 1, 1])?;
 
         frame.execute_graphics(
-            &shader,
+            &vertex_shader,
+            &fragment_shader,
             &indirect,
             DynamicPipelineState::from_abi(0, 0, 0, 0).unwrap(),
         )?;
         example.handle_frame(frame, swapchain_target)?;
+        example.update_title(&context);
     }
     Ok(())
 }

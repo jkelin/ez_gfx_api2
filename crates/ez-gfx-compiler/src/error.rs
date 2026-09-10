@@ -1,5 +1,5 @@
 use core::fmt;
-use ez_gfx_artifact::{ArtifactError, Stage};
+use ez_gfx_artifact::ArtifactError;
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -20,8 +20,6 @@ pub enum CompilerError {
     ArtifactEncoding(ArtifactError),
     /// Encoded artifact bytes failed validation.
     ArtifactValidation(ArtifactError),
-    /// One stage declares more than one entry point.
-    DuplicateStage(Stage),
     /// The shader declares no entry points.
     NoEntryPoints,
     /// A declared Slang stage is unsupported by the artifact contract.
@@ -50,9 +48,6 @@ impl fmt::Display for CompilerError {
             Self::TemporaryOutputCreate(_) => f.write_str("create temporary compiler output"),
             Self::ArtifactEncoding(_) => f.write_str("encode shader artifact"),
             Self::ArtifactValidation(_) => f.write_str("validate encoded shader artifact"),
-            Self::DuplicateStage(stage) => {
-                write!(f, "multiple entry points declare stage {stage:?}")
-            }
             Self::NoEntryPoints => f.write_str("shader declares no entry points"),
             Self::UnsupportedStage(stage) => write!(f, "unsupported shader stage {stage}"),
             Self::NativeUnavailable => f.write_str("native Slang compiler is unavailable"),
@@ -76,7 +71,6 @@ impl std::error::Error for CompilerError {
             | Self::ArtifactValidation(source)
             | Self::Artifact(source) => Some(source),
             Self::InvalidRequest(_)
-            | Self::DuplicateStage(_)
             | Self::NoEntryPoints
             | Self::UnsupportedStage(_)
             | Self::NativeUnavailable

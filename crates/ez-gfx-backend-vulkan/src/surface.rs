@@ -58,6 +58,15 @@ pub(crate) const fn classify_surface_extent(extent: vk::Extent2D) -> NativeWindo
     }
 }
 
+pub(crate) fn preferred_present_mode(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
+    // Mailbox preserves tear-free display pacing without blocking each present. Immediate is the
+    // low-latency fallback; FIFO is required by Vulkan when neither optional mode is available.
+    [vk::PresentModeKHR::MAILBOX, vk::PresentModeKHR::IMMEDIATE]
+        .into_iter()
+        .find(|candidate| modes.contains(candidate))
+        .unwrap_or(vk::PresentModeKHR::FIFO)
+}
+
 pub(crate) fn instance_extensions(
     available: &[vk::ExtensionProperties],
     enable_debug: bool,
@@ -303,6 +312,14 @@ impl NativeContext {
                 .get_physical_device_surface_formats(physical, surface.handle)
         }
         .map_err(map_vk)?;
+        // SAFETY: `physical` and `surface.handle` belong to `surface_loader`'s instance, and ash
+        // owns the returned mode storage.
+        let present_modes = unsafe {
+            self.surface_loader
+                .get_physical_device_surface_present_modes(physical, surface.handle)
+        }
+        .map_err(map_vk)?;
+        let present_mode = preferred_present_mode(&present_modes);
         let chosen = formats
             .iter()
             .copied()
@@ -366,7 +383,7 @@ impl NativeContext {
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(capabilities.current_transform)
             .composite_alpha(composite_alpha)
-            .present_mode(vk::PresentModeKHR::FIFO)
+            .present_mode(present_mode)
             .clipped(true)
             .old_swapchain(old);
         let loader = self.swapchain_loader.as_ref().ok_or(HalError::NotReady)?;
