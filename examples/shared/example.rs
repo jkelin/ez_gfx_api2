@@ -153,6 +153,7 @@ pub struct Example {
     backend: Backend,
     debug_enabled: bool,
     validation_enabled: bool,
+    resize_after_first_frame: bool,
     observations: Rc<RefCell<Observations>>,
     benchmark: BenchmarkRunner,
     frames: u32,
@@ -187,6 +188,7 @@ impl Example {
             backend: options.backend,
             debug_enabled: options.debug,
             validation_enabled: options.validation,
+            resize_after_first_frame: options.resize_after_first_frame,
             observations: Rc::new(RefCell::new(Observations::default())),
             benchmark: BenchmarkRunner::new(options.benchmark),
             frames: 0,
@@ -348,6 +350,11 @@ impl Example {
         frame.finish()?;
         self.frames = self.frames.saturating_add(1);
         self.benchmark.end_frame(self.frames);
+        if self.resize_after_first_frame && self.frames == 1 {
+            // Regression automation publishes a maximized-scale extent directly; the hidden host
+            // window is never shown, activated, or asked to change state.
+            self.state.record_resize(PhysicalSize::new(1920, 1080));
+        }
         if self
             .state
             .frame_limit
@@ -526,6 +533,7 @@ mod tests {
             backend: Backend::Vulkan,
             debug_enabled: false,
             validation_enabled: false,
+            resize_after_first_frame: false,
             observations,
             benchmark: BenchmarkRunner::new(None),
             frames: 1,

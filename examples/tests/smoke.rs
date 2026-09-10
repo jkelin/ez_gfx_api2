@@ -226,3 +226,38 @@ fn hidden_windows_complete_multiple_frames_without_redraw_events() -> anyhow::Re
     }
     Ok(())
 }
+
+#[cfg(windows)]
+#[test]
+fn dx12_hidden_window_survives_large_swapchain_resize() -> anyhow::Result<()> {
+    let mut child = shared::snapshot_command(BINARIES[0].2, std::path::Path::new("unused"), "dx12")
+        .env_remove("EZ_GFX_EXAMPLE_SNAPSHOT")
+        .env("EZ_GFX_EXAMPLE_MAX_FRAMES", "3")
+        .env("EZ_GFX_EXAMPLE_RESIZE_AFTER_FIRST_FRAME", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while child.try_wait()?.is_none() {
+        if std::time::Instant::now() >= deadline {
+            child.kill()?;
+            let output = child.wait_with_output()?;
+            anyhow::bail!(
+                "DX12 hidden resize stalled: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let output = child.wait_with_output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "DX12 hidden resize failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout)?.split_whitespace().nth(3),
+        Some("3")
+    );
+    Ok(())
+}

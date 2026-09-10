@@ -2,7 +2,8 @@
 
 use super::{
     D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT, D3D12_VIEWPORT, DxFrameEncoder,
-    HalError, NativeFrameAction, RECT, copy_texture_to_readback, map_windows, transition_barrier,
+    HalError, NativeFrameAction, RECT, copy_texture_to_readback, map_windows,
+    record_resource_barriers, transition_barrier,
 };
 
 impl DxFrameEncoder<'_> {
@@ -79,28 +80,40 @@ impl DxFrameEncoder<'_> {
                                 D3D12_RESOURCE_STATE_RESOLVE_DEST,
                                 D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
                             };
-                            self.list.ResourceBarrier(&[transition_barrier(
-                                render.clone(),
-                                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
-                            )]);
-                            self.list.ResourceBarrier(&[transition_barrier(
-                                destination.clone(),
-                                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                D3D12_RESOURCE_STATE_RESOLVE_DEST,
-                            )]);
+                            record_resource_barriers(
+                                self.list,
+                                [transition_barrier(
+                                    render.clone(),
+                                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                    D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
+                                )],
+                            );
+                            record_resource_barriers(
+                                self.list,
+                                [transition_barrier(
+                                    destination.clone(),
+                                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                    D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                                )],
+                            );
                             self.list
                                 .ResolveSubresource(&destination, 0, &render, 0, format);
-                            self.list.ResourceBarrier(&[transition_barrier(
-                                render,
-                                D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
-                                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                            )]);
-                            self.list.ResourceBarrier(&[transition_barrier(
-                                destination,
-                                D3D12_RESOURCE_STATE_RESOLVE_DEST,
-                                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                            )]);
+                            record_resource_barriers(
+                                self.list,
+                                [transition_barrier(
+                                    render,
+                                    D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
+                                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                )],
+                            );
+                            record_resource_barriers(
+                                self.list,
+                                [transition_barrier(
+                                    destination,
+                                    D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                )],
+                            );
                         }
                     }
                     self.pass_target = None;
@@ -121,22 +134,28 @@ impl DxFrameEncoder<'_> {
                         // SAFETY: the encoder retains the command list, back buffer, and readback resource, and each temporary barrier array plus `footprint` remains readable through its recording call.
                         unsafe {
                             let back_buffer = self.back_buffer.ok_or(HalError::InvalidArgument)?;
-                            self.list.ResourceBarrier(&[transition_barrier(
-                                back_buffer.clone(),
-                                D3D12_RESOURCE_STATE_PRESENT,
-                                D3D12_RESOURCE_STATE_COPY_SOURCE,
-                            )]);
+                            record_resource_barriers(
+                                self.list,
+                                [transition_barrier(
+                                    back_buffer.clone(),
+                                    D3D12_RESOURCE_STATE_PRESENT,
+                                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                )],
+                            );
                             copy_texture_to_readback(
                                 self.list,
                                 back_buffer,
                                 &readback.resource,
                                 *footprint,
                             );
-                            self.list.ResourceBarrier(&[transition_barrier(
-                                back_buffer.clone(),
-                                D3D12_RESOURCE_STATE_COPY_SOURCE,
-                                D3D12_RESOURCE_STATE_PRESENT,
-                            )]);
+                            record_resource_barriers(
+                                self.list,
+                                [transition_barrier(
+                                    back_buffer.clone(),
+                                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                    D3D12_RESOURCE_STATE_PRESENT,
+                                )],
+                            );
                         }
                         self.readback_index += 1;
                     }

@@ -69,29 +69,52 @@ pub(super) fn uav_barrier(resource: ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
     }
 }
 
+pub(super) fn record_resource_barriers<const N: usize>(
+    list: &ID3D12GraphicsCommandList,
+    mut barriers: [D3D12_RESOURCE_BARRIER; N],
+) {
+    // SAFETY: ResourceBarrier copies the initialized array during the call. Each Type selects the
+    // initialized union arm whose cloned COM resource is released exactly once afterward.
+    unsafe {
+        list.ResourceBarrier(&barriers);
+        for barrier in &mut barriers {
+            if barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION {
+                core::mem::ManuallyDrop::drop(&mut (*barrier.Anonymous.Transition).pResource);
+            } else if barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV {
+                core::mem::ManuallyDrop::drop(&mut (*barrier.Anonymous.UAV).pResource);
+            } else {
+                unreachable!("resource barrier helper accepts only transition or UAV barriers");
+            }
+        }
+    }
+}
+
 pub(super) unsafe fn copy_texture_to_readback(
     list: &ID3D12GraphicsCommandList,
     source: &ID3D12Resource,
     destination: &ID3D12Resource,
     footprint: windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
 ) {
-    let source = D3D12_TEXTURE_COPY_LOCATION {
+    let mut source = D3D12_TEXTURE_COPY_LOCATION {
         pResource: core::mem::ManuallyDrop::new(Some(source.clone())),
         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
             SubresourceIndex: 0,
         },
     };
-    let destination = D3D12_TEXTURE_COPY_LOCATION {
+    let mut destination = D3D12_TEXTURE_COPY_LOCATION {
         pResource: core::mem::ManuallyDrop::new(Some(destination.clone())),
         Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
             PlacedFootprint: footprint,
         },
     };
-    // SAFETY: CopyTextureRegion receives pointers to initialized source and destination D3D12_TEXTURE_COPY_LOCATION locals whose storage and embedded resource references remain alive for the call.
+    // SAFETY: the locations retain both resources through recording; the bindings require their
+    // ManuallyDrop fields to be released explicitly after the native call has copied the values.
     unsafe {
         list.CopyTextureRegion(&raw const destination, 0, 0, 0, &raw const source, None);
+        core::mem::ManuallyDrop::drop(&mut source.pResource);
+        core::mem::ManuallyDrop::drop(&mut destination.pResource);
     }
 }
 

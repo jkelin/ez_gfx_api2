@@ -163,6 +163,7 @@ pub(crate) struct ProgramOptions {
     pub(crate) update_snapshots: bool,
     pub(crate) debug: bool,
     pub(crate) validation: bool,
+    pub(crate) resize_after_first_frame: bool,
 }
 
 pub(crate) fn exit_config(error: impl std::fmt::Display) -> ! {
@@ -283,6 +284,7 @@ fn program_options_from(
             || env_text("EZ_GFX_UPDATE_SNAPSHOTS", &env)?.as_deref() == Some("1"),
         debug: cli.debug || env_flag_value("EZ_GFX_EXAMPLE_DEBUG")?,
         validation: cli.validation || env_flag_value("EZ_GFX_EXAMPLE_VALIDATION")?,
+        resize_after_first_frame: env_flag_value("EZ_GFX_EXAMPLE_RESIZE_AFTER_FIRST_FRAME")?,
     })
 }
 

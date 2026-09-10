@@ -9,7 +9,7 @@ use super::{
     MemoryAllocator, MemoryClass, NativeAllocation, NativeContext, NativeFrameAction,
     NativeFrameResource, NativeSurface, QueueKind, RECT, WaitForSingleObject,
     bind_dx12_compute_buffers, bind_dx12_graphics_buffers, copy_texture_to_readback,
-    dx12_resource_state, map_windows, transition_barrier, uav_barrier,
+    dx12_resource_state, map_windows, record_resource_barriers, transition_barrier, uav_barrier,
 };
 use ez_gfx_hal::COUNTER_BUFFER_ELEMENT_OFFSET;
 
@@ -590,17 +590,16 @@ impl DxFrameEncoder<'_> {
             dx12_resource_state(state.access)
         });
         let after = dx12_resource_state(barrier.after.access);
-        // SAFETY: each barrier owns an `ID3D12Resource` clone, retaining its COM object until `ResourceBarrier` copies the barrier array during the call.
-        unsafe {
-            if before == after && after == D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
-                for native in natives.iter().take(native_count).flatten() {
-                    self.list.ResourceBarrier(&[uav_barrier(native.clone())]);
-                }
-            } else if before != after {
-                for native in natives.iter().take(native_count).flatten() {
-                    self.list
-                        .ResourceBarrier(&[transition_barrier(native.clone(), before, after)]);
-                }
+        if before == after && after == D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
+            for native in natives.iter().take(native_count).flatten() {
+                record_resource_barriers(self.list, [uav_barrier(native.clone())]);
+            }
+        } else if before != after {
+            for native in natives.iter().take(native_count).flatten() {
+                record_resource_barriers(
+                    self.list,
+                    [transition_barrier(native.clone(), before, after)],
+                );
             }
         }
 
@@ -763,18 +762,21 @@ impl DxFrameEncoder<'_> {
         };
         // SAFETY: no render pass is active; the draw and frame allocations retain both resources, and each barrier array remains readable until its recording call returns.
         unsafe {
-            self.list.ResourceBarrier(&[
-                transition_barrier(
-                    draw.indirect_buffer.resource.clone(),
-                    shader_state,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                ),
-                transition_barrier(
-                    copy.resource.clone(),
-                    D3D12_RESOURCE_STATE_COMMON,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
+            record_resource_barriers(
+                self.list,
+                [
+                    transition_barrier(
+                        draw.indirect_buffer.resource.clone(),
+                        shader_state,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    ),
+                    transition_barrier(
+                        copy.resource.clone(),
+                        D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ),
+                ],
+            );
             self.list.CopyBufferRegion(
                 &copy.resource,
                 0,
@@ -782,18 +784,21 @@ impl DxFrameEncoder<'_> {
                 0,
                 indirect_command_bytes(draw.draw_count) + COUNTER_BUFFER_ELEMENT_OFFSET,
             );
-            self.list.ResourceBarrier(&[
-                transition_barrier(
-                    draw.indirect_buffer.resource.clone(),
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    shader_state,
-                ),
-                transition_barrier(
-                    copy.resource.clone(),
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                ),
-            ]);
+            record_resource_barriers(
+                self.list,
+                [
+                    transition_barrier(
+                        draw.indirect_buffer.resource.clone(),
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        shader_state,
+                    ),
+                    transition_barrier(
+                        copy.resource.clone(),
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    ),
+                ],
+            );
         }
         Ok(())
     }
