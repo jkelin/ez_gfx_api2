@@ -43,7 +43,7 @@ This repository is a Rust/Cargo migration of `ez_gfx_api`. Preserve the recogniz
 
 - Test the changed contract within its blast radius, then run applicable source-line checks, Clippy, and formatting in that order at handoff. Use backend-matrix tests where behavior crosses HAL boundaries; include ABI and artifact validation tests for corresponding contract changes. Do not regenerate immutable snapshots without an explicit requirement.
 - Backend changes MUST be verified through the backend matrix, which runs each libtest case in its own `cargo test` process with a 60-second default timeout: Vulkan-facing changes use `remote-test-linux` and local Windows Vulkan suites; DX12 uses local Windows suites; Metal uses `remote-test-macos`; cross-backend texture or HAL changes use all three. When the development workstation itself hosts a backend (Windows for Vulkan/Direct3D 12), running the corresponding suites locally satisfies that backend's matrix requirement; Linux and macOS coverage remains remote. The remote tasks sync the current working tree first; Windows remotes additionally require POSIX-capable rsync locally and remotely plus a POSIX SSH shell.
-- All tests and agentic smoke/verification processes MUST run hidden/headless, without showing or activating windows or taking focus. If hidden automation stalls, fix the harness or report the blocker; NEVER fall back to visible windows.
+- All tests and agentic smoke/verification processes MUST run hidden/headless, without showing or activating windows or taking focus. NEVER open a user-visible window from a test or agent unless the user explicitly requests it. If hidden automation stalls, fix the harness or report the blocker; NEVER fall back to visible windows.
 
 ## UI exception
 

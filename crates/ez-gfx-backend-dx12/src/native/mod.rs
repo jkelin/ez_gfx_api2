@@ -431,7 +431,8 @@ unsafe impl Send for NativeContext {}
 mod commands;
 use commands::{
     bind_dx12_compute_buffers, bind_dx12_graphics_buffers, copy_texture_to_readback,
-    create_frame_slots, dx12_resource_state, transition_barrier, uav_barrier,
+    create_frame_slots, dx12_resource_state, record_resource_barriers, transition_barrier,
+    uav_barrier,
 };
 mod device;
 mod frame;

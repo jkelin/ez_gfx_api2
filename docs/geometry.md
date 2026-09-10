@@ -79,7 +79,7 @@ Evidence: FFI `counter_pixels` proves Vulkan/DX12 capacity-4 zero tails match ca
 
 ## Frame ownership
 
-`Surface::begin_frame()` creates an owning target-less `Frame`; `Frame::configure_swapchain(size, format)` attaches presentation. Named targets use `Context::begin_frame()` and `Frame::configure_render_target(name, size, format)`. `Frame::finish(self)` preserves exact errors. `Drop` aborts an unfinished frame, so safe Rust exposes no frame-end, frame-abort, or transient-release functions.
+`Surface::begin_frame()` creates an owning target-less `Frame`; `Frame::configure_swapchain(size, format)` attaches presentation. Named targets use `Context::begin_frame()` and `Frame::configure_render_target(name, size, format)`. `Frame::finish(self)` preserves exact errors. `Drop` aborts an unfinished frame, so safe Rust exposes no frame-end, frame-abort, or transient-release functions. DX12 releases temporary COM ownership created for command barriers immediately after recording, allowing a drained swapchain to resize without outstanding back-buffer references.
 
 ## Examples
 
