@@ -1,3 +1,3 @@
 # ez-gfx-backend-dx12
 
-Direct3D 12 HAL using `windows`. It owns devices/queues/fences, placed resources, shader-visible SRV descriptors, texture transitions, three-buffer flip-model swapchains, indirect-buffer uploads, and GPU readback. Presentation uses sync interval zero and enables tearing when DXGI reports support, so queued stale frames do not impose a vertical-blank cap. Hosts provide HWND handles; native handles remain backend-local.
+Direct3D 12 HAL using `windows`. It owns devices/queues/fences, placed resources, shader-visible SRV descriptors, texture transitions, three-buffer flip-model swapchains, indirect-buffer uploads, and GPU readback. Presentation supports FIFO, interval-zero tear-free pacing, and immediate mode when cached DXGI tearing support permits it. Hosts provide HWND handles; native handles remain backend-local.

@@ -75,6 +75,16 @@
         "EzGfxBackend_Metal": {}
       }
     },
+    "enum:EzGfxPresentationMode": {
+      "attrs": {},
+      "children": {
+        "EzGfxPresentationMode_Fifo": {},
+        "EzGfxPresentationMode_Mailbox": {},
+        "EzGfxPresentationMode_Immediate": {},
+        "EzGfxPresentationMode_Relaxed": {},
+        "EzGfxPresentationMode_Paced": {}
+      }
+    },
     "enum:EzGfxAdapterClass": {
       "attrs": {},
       "children": {
@@ -310,6 +320,12 @@
           "validation": "greater-than-zero"
         },
         "cache_presented_snapshots": {}
+      }
+    },
+    "struct:EzGfxPresentationModes": {
+      "attrs": {},
+      "children": {
+        "bits": {}
       }
     },
     "struct:EzGfxTextureDesc": {
@@ -1261,6 +1277,10 @@
           "nullable": "false",
           "doc": "Surface to acquire."
         },
+        "presentation_mode_code": {
+          "type": "EzGfxPresentationMode",
+          "doc": "Requested mode; deterministic fallback applies when unavailable."
+        },
         "out_frame": {
           "type": "EzGfxFrame *",
           "direction": "out",
@@ -1557,6 +1577,29 @@
         "user_data": {
           "nullable": "true",
           "doc": "Application state borrowed only during callback invocation."
+        }
+      }
+    },
+    "function:ez_gfx_surface_get_presentation_modes": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns query or handle status."
+      },
+      "children": {
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        },
+        "surface": {
+          "type": "EzGfxSurface",
+          "nullable": "false",
+          "doc": "Surface to query."
+        },
+        "out_modes": {
+          "type": "EzGfxPresentationModes *",
+          "direction": "out",
+          "doc": "Receives bits indexed by EzGfxPresentationMode."
         }
       }
     },

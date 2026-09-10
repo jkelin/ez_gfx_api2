@@ -374,7 +374,7 @@ fn exercises_async_texture_batches(backend: u8) {
         );
         assert_eq!(
             // SAFETY: frame output storage is live and aligned.
-            unsafe { ez_gfx_frame_begin(context, native.surface, &raw mut frame) },
+            unsafe { ez_gfx_frame_begin(context, native.surface, 0, &raw mut frame) },
             EzGfxResult::Ok
         );
         let mut request_id = 0;

@@ -52,24 +52,51 @@ fn native_extent_distinguishes_known_minimized_and_host_managed() {
 }
 
 #[test]
-fn present_mode_prefers_nonblocking_mailbox_then_immediate() {
+fn present_mode_mapping_is_exact() {
+    let modes = [
+        vk::PresentModeKHR::FIFO,
+        vk::PresentModeKHR::MAILBOX,
+        vk::PresentModeKHR::IMMEDIATE,
+        vk::PresentModeKHR::FIFO_RELAXED,
+        vk::PresentModeKHR::from_raw(1_000_361_000),
+    ];
+    for (requested, expected) in [
+        (PresentationMode::Fifo, vk::PresentModeKHR::FIFO),
+        (PresentationMode::Mailbox, vk::PresentModeKHR::MAILBOX),
+        (PresentationMode::Immediate, vk::PresentModeKHR::IMMEDIATE),
+        (PresentationMode::Relaxed, vk::PresentModeKHR::FIFO_RELAXED),
+        (
+            PresentationMode::Paced,
+            vk::PresentModeKHR::from_raw(1_000_361_000),
+        ),
+    ] {
+        assert_eq!(preferred_present_mode(&modes, requested), Some(expected));
+    }
     assert_eq!(
-        preferred_present_mode(&[
-            vk::PresentModeKHR::FIFO,
-            vk::PresentModeKHR::IMMEDIATE,
-            vk::PresentModeKHR::MAILBOX,
-        ]),
-        vk::PresentModeKHR::MAILBOX
+        preferred_present_mode(&[vk::PresentModeKHR::FIFO], PresentationMode::Mailbox),
+        None
+    );
+}
+
+#[test]
+fn normalized_modes_require_fifo_and_gate_paced() {
+    let latest = vk::PresentModeKHR::from_raw(1_000_361_000);
+    let native = [
+        vk::PresentModeKHR::FIFO,
+        vk::PresentModeKHR::MAILBOX,
+        latest,
+    ];
+    assert_eq!(
+        normalized_present_modes(&native, false).unwrap(),
+        PresentationModes::FIFO.union(PresentationModes::MAILBOX)
     );
     assert_eq!(
-        preferred_present_mode(&[vk::PresentModeKHR::FIFO, vk::PresentModeKHR::IMMEDIATE]),
-        vk::PresentModeKHR::IMMEDIATE
+        normalized_present_modes(&native, true).unwrap(),
+        PresentationModes::FIFO
+            .union(PresentationModes::MAILBOX)
+            .union(PresentationModes::PACED)
     );
-    assert_eq!(
-        preferred_present_mode(&[vk::PresentModeKHR::FIFO]),
-        vk::PresentModeKHR::FIFO
-    );
-    assert_eq!(preferred_present_mode(&[]), vk::PresentModeKHR::FIFO);
+    assert!(normalized_present_modes(&[vk::PresentModeKHR::IMMEDIATE], true).is_err());
 }
 
 #[test]

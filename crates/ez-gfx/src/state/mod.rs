@@ -15,7 +15,7 @@ use ez_gfx_backend_metal::native::{NativeContext as MetalContext, NativeSurface 
 use ez_gfx_backend_vulkan::{NativeContext as VulkanContext, NativeSurface as VulkanSurface};
 use ez_gfx_core::{
     Backend,
-    capability::AdapterInfo,
+    capability::{AdapterInfo, PresentationMode, PresentationModes},
     handle::{
         BufferHandle, ContextHandle, CounterBufferHandle, GenerationalArena, HandleParts,
         IndexAllocationHandle, LocalHandle, PackedHandle, RenderTargetHandle, ShaderHandle,
@@ -169,6 +169,7 @@ struct RetiredTexture {
 struct SurfaceRecord {
     native: NativeSurface,
     state: SurfaceState,
+    presentation_mode: PresentationMode,
     is_window: bool,
 }
 

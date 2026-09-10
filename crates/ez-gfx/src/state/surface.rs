@@ -10,8 +10,9 @@ use super::MetalSurface;
 use super::SurfaceInsertTestFailure;
 use super::{
     Backend, ContextHandle, ContextState, Error, HeadlessSurfaceOptions, NativeContext,
-    NativeSurface, ResourceKind, SurfaceHandle, SurfaceRecord, SurfaceState, SurfaceWindow,
-    map_hal, map_lifecycle, map_native_loss, result_status, with_context_mut, with_surface_mut,
+    NativeSurface, PresentationMode, PresentationModes, ResourceKind, SurfaceHandle, SurfaceRecord,
+    SurfaceState, SurfaceWindow, map_hal, map_lifecycle, map_native_loss, result_status,
+    with_context_mut, with_surface_mut,
 };
 
 /// Creates a headless surface with an explicit initial extent.
@@ -159,6 +160,7 @@ fn insert_surface(
         SurfaceRecord {
             native,
             state,
+            presentation_mode: PresentationMode::Fifo,
             is_window,
         },
     );
@@ -283,15 +285,15 @@ pub fn init_device(context: ContextHandle, surface: SurfaceHandle) -> Result<()>
             .map_err(map_lifecycle)?;
         let record = context
             .surfaces
-            .get(&surface)
+            .get_mut(&surface)
             .ok_or(Error::InvalidContext)?;
         let first_initialization = context.active_surface.is_none();
         // Explicit selection is enforced at device creation: Vulkan instances
         // are adapter-agnostic, so the stable identity resolves here.
         let selection = context.options.adapter_selection;
-        let adapter = match (&mut context.native, &record.native) {
+        let adapter = match (&mut context.native, &mut record.native) {
             (NativeContext::Vulkan(native), NativeSurface::Vulkan(surface)) => {
-                let presentation_surface = (!surface.is_headless()).then_some(surface);
+                let presentation_surface = (!surface.is_headless()).then_some(&*surface);
                 match selection {
                     Some(selected) => native.init_device_for_adapter(
                         presentation_surface,
@@ -327,6 +329,55 @@ pub fn init_device(context: ContextHandle, surface: SurfaceHandle) -> Result<()>
         }
         Ok(())
     }))
+}
+
+pub(super) fn presentation_modes_for_record(
+    context: &ContextState,
+    surface: SurfaceHandle,
+) -> Result<PresentationModes> {
+    let record = context
+        .surfaces
+        .get(&surface)
+        .ok_or(Error::InvalidContext)?;
+    match (&context.native, &record.native) {
+        (NativeContext::Vulkan(native), NativeSurface::Vulkan(surface)) => {
+            if surface.is_headless() {
+                Ok(PresentationModes::FIFO)
+            } else {
+                native.presentation_modes(surface).map_err(map_hal)
+            }
+        }
+        #[cfg(windows)]
+        (NativeContext::Dx12(_), NativeSurface::Dx12(surface)) => Ok(surface.presentation_modes()),
+        #[cfg(target_vendor = "apple")]
+        (NativeContext::Metal(_), NativeSurface::Metal(surface)) => {
+            Ok(surface.presentation_modes())
+        }
+        #[cfg(any(windows, target_vendor = "apple"))]
+        _ => Err(Error::InvalidArgument),
+    }
+}
+
+/// Returns the normalized presentation modes available for one initialized surface.
+///
+/// # Errors
+///
+/// Returns an error when either handle is invalid, the device is uninitialized, or the backend query fails.
+pub fn presentation_modes(
+    context: ContextHandle,
+    surface: SurfaceHandle,
+) -> Result<PresentationModes> {
+    with_context_mut(context, |context| {
+        context
+            .identity
+            .check_thread_and_health()
+            .map_err(map_lifecycle)?;
+        context
+            .identity
+            .resolve(surface.packed(), ResourceKind::Surface)
+            .map_err(map_lifecycle)?;
+        presentation_modes_for_record(context, surface)
+    })
 }
 
 /// Requests a surface resize.

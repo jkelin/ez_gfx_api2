@@ -9,9 +9,9 @@ use super::{
     CONTEXT_HANDLES, CONTEXTS, ContextHandle, ContextIdentity, ContextOptions, ContextState,
     DiagnosticLevel, Error, FrameRecorder, GeometryManager, HalError, HashMap,
     IndexAllocationHandle, LocalHandle, NativeContext, NativeSurface, Observability, Ordering,
-    RenderTargetHandle, ResourceKind, RuntimeError, RuntimePhase, RuntimeRecord, RuntimeStatus,
-    SurfaceHandle, TextureRegistry, TextureUploadTelemetry, UploadEvent, UploadResource,
-    UploadStatus, VertexAllocationHandle, VulkanContext, admission_report,
+    PresentationMode, RenderTargetHandle, ResourceKind, RuntimeError, RuntimePhase, RuntimeRecord,
+    RuntimeStatus, SurfaceHandle, TextureRegistry, TextureUploadTelemetry, UploadEvent,
+    UploadResource, UploadStatus, VertexAllocationHandle, VulkanContext, admission_report,
     completed_transfer_native, context_local, destroy_native_pipeline, destroy_native_shader,
     destroy_native_surface, destroy_native_texture, free_native_allocation, map_allocation,
     map_hal, map_lifecycle, map_native_loss, map_texture, progress_texture_upload_events,
@@ -709,10 +709,14 @@ fn destroy_buffer_state(owned: &mut ContextState, failure: &mut Option<Error>) {
     dead_code,
     reason = "the C raw seam begins an already-configured surface frame"
 )]
-pub fn begin_render(context: ContextHandle, surface: SurfaceHandle) -> Result<()> {
+pub fn begin_render(
+    context: ContextHandle,
+    surface: SurfaceHandle,
+    presentation_mode: PresentationMode,
+) -> Result<()> {
     result_status(with_context_mut(context, |context| {
         super::frame::start_recording(context)?;
-        if let Err(error) = configure_surface_recording(context, surface) {
+        if let Err(error) = configure_surface_recording(context, surface, presentation_mode) {
             context.frame.abort();
             return Err(error);
         }
@@ -725,13 +729,21 @@ pub fn begin_render(context: ContextHandle, surface: SurfaceHandle) -> Result<()
 /// # Errors
 ///
 /// Returns an error when no frame is recording or the surface is invalid or not ready.
-pub(crate) fn configure_surface(context: ContextHandle, surface: SurfaceHandle) -> Result<()> {
+pub(crate) fn configure_surface(
+    context: ContextHandle,
+    surface: SurfaceHandle,
+    requested: PresentationMode,
+) -> Result<()> {
     result_status(with_context_mut(context, |context| {
-        configure_surface_recording(context, surface)
+        configure_surface_recording(context, surface, requested)
     }))
 }
 
-fn configure_surface_recording(context: &mut ContextState, surface: SurfaceHandle) -> Result<()> {
+fn configure_surface_recording(
+    context: &mut ContextState,
+    surface: SurfaceHandle,
+    requested: PresentationMode,
+) -> Result<()> {
     context
         .identity
         .check_thread_and_health()
@@ -746,13 +758,16 @@ fn configure_surface_recording(context: &mut ContextState, surface: SurfaceHandl
         .identity
         .resolve(surface.packed(), ResourceKind::Surface)
         .map_err(map_lifecycle)?;
+    let available = super::surface::presentation_modes_for_record(context, surface)?;
+    let effective = available.resolve(requested).ok_or(Error::Unsupported)?;
     let record = context
         .surfaces
-        .get(&surface)
+        .get_mut(&surface)
         .ok_or(Error::InvalidContext)?;
     if record.state.extent().is_none() {
         return Err(Error::NotReady);
     }
+    record.presentation_mode = effective;
     context.active_surface = Some(surface);
     Ok(())
 }
@@ -846,15 +861,15 @@ pub fn present(context: ContextHandle) -> Result<()> {
                     Err(HalError::Unsupported)
                 }
                 (NativeContext::Vulkan(native), NativeSurface::Vulkan(surface)) => {
-                    native.acquire_present(surface, width, height)
+                    native.acquire_present(surface, width, height, record.presentation_mode)
                 }
                 #[cfg(windows)]
                 (NativeContext::Dx12(native), NativeSurface::Dx12(surface)) => {
-                    native.acquire_present(surface, width, height)
+                    native.acquire_present(surface, width, height, record.presentation_mode)
                 }
                 #[cfg(target_vendor = "apple")]
                 (NativeContext::Metal(native), NativeSurface::Metal(surface)) => {
-                    native.acquire_present(surface, width, height)
+                    native.acquire_present(surface, width, height, record.presentation_mode)
                 }
                 #[cfg(any(windows, target_vendor = "apple"))]
                 _ => Err(HalError::InvalidArgument),

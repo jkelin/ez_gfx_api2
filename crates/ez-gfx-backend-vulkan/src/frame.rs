@@ -1,12 +1,27 @@
 use super::{
     AllocationRequest, AttachmentLoadOp, AttachmentStoreOp, CompletionToken, FRAMES_IN_FLIGHT,
     HalError, MemoryAllocator, MemoryClass, NativeContext, NativeFrameAction, NativeFrameResource,
-    NativeSurface, NativeTexture, QueueKind, ResourceAccess, map_allocation_hal, map_vk, vk,
-    vulkan_state,
+    NativeSurface, NativeTexture, PresentationMode, QueueKind, ResourceAccess, map_allocation_hal,
+    map_vk, vk, vulkan_state,
 };
 #[path = "frame_record.rs"]
 mod record;
 use ez_gfx_hal::COUNTER_BUFFER_ELEMENT_OFFSET;
+
+type FrameSurface<'a> = (&'a mut NativeSurface, (u32, u32), PresentationMode);
+type ResolvedFrameSurface<'a> = (Option<&'a mut NativeSurface>, (u32, u32), PresentationMode);
+
+fn validate_surface_request(
+    surface: Option<FrameSurface<'_>>,
+) -> Result<ResolvedFrameSurface<'_>, HalError> {
+    match surface {
+        Some((surface, extent, mode)) if extent.0 != 0 && extent.1 != 0 => {
+            Ok((Some(surface), extent, mode))
+        }
+        Some(_) => Err(HalError::InvalidArgument),
+        None => Ok((None, (0, 0), PresentationMode::Fifo)),
+    }
+}
 
 struct VulkanEncoding<'a> {
     device: &'a ash::Device,
@@ -970,18 +985,14 @@ impl NativeContext {
     /// Returns an error for an invalid frame plan, unavailable required context resources, readback or descriptor setup failures, or failed Vulkan frame operations.
     pub fn execute_frame(
         &mut self,
-        surface: Option<(&mut NativeSurface, (u32, u32))>,
+        surface: Option<FrameSurface<'_>>,
         actions: &[NativeFrameAction<'_>],
         capture_presented: bool,
     ) -> Result<Vec<Vec<u8>>, HalError> {
         if actions.is_empty() {
             return Err(HalError::InvalidArgument);
         }
-        let (mut surface, extent) = match surface {
-            Some((surface, extent)) if extent.0 != 0 && extent.1 != 0 => (Some(surface), extent),
-            Some(_) => return Err(HalError::InvalidArgument),
-            None => (None, (0, 0)),
-        };
+        let (mut surface, extent, presentation_mode) = validate_surface_request(surface)?;
         let FramePlan {
             uses_surface,
             presents,
@@ -992,6 +1003,7 @@ impl NativeContext {
                 surface.as_deref_mut().ok_or(HalError::InvalidArgument)?,
                 extent.0,
                 extent.1,
+                presentation_mode,
             )?;
         }
         if actions.iter().any(|action| {
@@ -1071,7 +1083,7 @@ impl NativeContext {
             if acquired_image_index.is_some()
                 && let Some(surface) = surface.as_deref_mut()
             {
-                let _ = self.recreate_swapchain(surface, extent.0, extent.1);
+                let _ = self.recreate_swapchain(surface, extent.0, extent.1, presentation_mode);
             }
             for (_, _, _, _, allocation) in readbacks {
                 let _ = self.free(allocation);

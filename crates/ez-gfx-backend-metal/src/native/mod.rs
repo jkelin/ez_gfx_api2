@@ -5,7 +5,8 @@ use crate::{
     frame_slots::{FRAMES_IN_FLIGHT, FrameSlotTracker, complete_deferred_slot},
 };
 use ez_gfx_core::capability::{
-    AdapterCapabilities, AdapterClass, AdapterInfo, CompressionSupport, SemanticProfile,
+    AdapterCapabilities, AdapterClass, AdapterInfo, CompressionSupport, PresentationMode,
+    PresentationModes, SemanticProfile,
 };
 
 const MAX_ARGUMENT_BUFFERS_PER_SLOT: usize = 1024;
@@ -43,8 +44,9 @@ const fn detach_backend_layer(pre_existing: bool) -> bool {
     !pre_existing
 }
 
-/// Disable Core Animation's default display-refresh synchronization for throughput-oriented hosts.
-const DISPLAY_SYNC_ENABLED: bool = false;
+const fn metal_presentation_modes() -> PresentationModes {
+    PresentationModes::FIFO.union(PresentationModes::IMMEDIATE)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DrawableExtent {
@@ -409,6 +411,8 @@ pub struct NativeSurface {
     layer: ThreadBound<Layer>,
     presented_rgba8: Vec<u8>,
     detach_on_destroy: bool,
+    original_display_sync_enabled: bool,
+    presentation_mode: PresentationMode,
     depth: Option<SurfaceDepth>,
 }
 impl NativeSurface {
@@ -438,8 +442,8 @@ impl NativeSurface {
         let detach_on_destroy = detach_backend_layer(layer.pre_existing());
         // SAFETY: Layer retains a non-null CAMetalLayer.
         let metal_layer = unsafe { &*layer.as_ptr().cast::<CAMetalLayer>().as_ptr() };
+        let original_display_sync_enabled = metal_layer.displaySyncEnabled();
         metal_layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm_sRGB);
-        metal_layer.setDisplaySyncEnabled(DISPLAY_SYNC_ENABLED);
         if capture_presented {
             metal_layer.setFramebufferOnly(false);
         }
@@ -447,6 +451,12 @@ impl NativeSurface {
             layer: ThreadBound::new(layer),
             presented_rgba8: Vec::new(),
             detach_on_destroy,
+            original_display_sync_enabled,
+            presentation_mode: if original_display_sync_enabled {
+                PresentationMode::Fifo
+            } else {
+                PresentationMode::Immediate
+            },
             depth: None,
         })
     }
@@ -456,13 +466,31 @@ impl NativeSurface {
         unsafe { &*self.layer.as_ptr().cast::<CAMetalLayer>().as_ptr() }
     }
 
+    /// Returns the normalized modes exposed by `CAMetalLayer`.
+    pub const fn presentation_modes(&self) -> PresentationModes {
+        metal_presentation_modes()
+    }
+
+    /// Applies one supported mode before the next drawable is acquired.
+    fn set_presentation_mode(&mut self, mode: PresentationMode) -> Result<(), HalError> {
+        if !self.presentation_modes().contains(mode) {
+            return Err(HalError::Unsupported);
+        }
+        if self.presentation_mode != mode {
+            self.metal_layer()
+                .setDisplaySyncEnabled(mode == PresentationMode::Fifo);
+            self.presentation_mode = mode;
+        }
+        Ok(())
+    }
     fn detach_from_host(&mut self) {
+        self.metal_layer()
+            .setDisplaySyncEnabled(self.original_display_sync_enabled);
         if self.detach_on_destroy {
             self.metal_layer().removeFromSuperlayer();
             self.detach_on_destroy = false;
         }
     }
-
     /// Reads the current drawable extent, deriving an uninitialized size from native layer geometry.
     #[must_use]
     pub fn window_extent(&self) -> Option<(u32, u32)> {
@@ -549,14 +577,16 @@ mod texture;
 mod transfer;
 
 #[cfg(test)]
-mod texture_tests;
-
-#[cfg(test)]
 mod presentation_tests {
-    use super::DISPLAY_SYNC_ENABLED;
+    use super::{PresentationMode, metal_presentation_modes};
 
     #[test]
-    fn presentation_does_not_wait_for_display_refresh() {
-        assert!(!DISPLAY_SYNC_ENABLED);
+    fn presentation_modes_match_metal_layer_controls() {
+        let modes = metal_presentation_modes();
+        assert!(modes.contains(PresentationMode::Fifo));
+        assert!(modes.contains(PresentationMode::Immediate));
+        assert!(!modes.contains(PresentationMode::Mailbox));
+        assert!(!modes.contains(PresentationMode::Relaxed));
+        assert!(!modes.contains(PresentationMode::Paced));
     }
 }

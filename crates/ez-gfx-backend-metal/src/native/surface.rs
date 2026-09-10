@@ -1,8 +1,8 @@
 use super::{
     CAMetalDrawable, DeferredResource, HalError, MTLCommandBuffer, MTLCommandQueue,
     MTLCompareFunction, MTLDepthStencilDescriptor, MTLDevice, MTLPixelFormat, MTLStorageMode,
-    MTLTextureDescriptor, MTLTextureUsage, NativeContext, NativeSurface, ProtocolObject,
-    SurfaceDepth, ThreadBound, map_allocation_hal,
+    MTLTextureDescriptor, MTLTextureUsage, NativeContext, NativeSurface, PresentationMode,
+    ProtocolObject, SurfaceDepth, ThreadBound, map_allocation_hal,
 };
 
 impl NativeContext {
@@ -64,13 +64,15 @@ impl NativeContext {
     /// Returns an error when the surface is minimized or Metal cannot acquire or submit a drawable.
     pub fn acquire_present(
         &mut self,
-        surface: &NativeSurface,
+        surface: &mut NativeSurface,
         width: u32,
         height: u32,
+        presentation_mode: PresentationMode,
     ) -> Result<(), HalError> {
         if width == 0 || height == 0 {
             return Err(HalError::NotReady);
         }
+        surface.set_presentation_mode(presentation_mode)?;
         let (slot, must_wait) = self.frame_tracker.acquire();
         if must_wait {
             self.complete_frame_slot(slot)?;

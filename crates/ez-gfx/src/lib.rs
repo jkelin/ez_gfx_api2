@@ -5,7 +5,10 @@ mod state;
 
 pub use api::*;
 pub use ez_gfx_artifact::{CompiledShader, ShaderLoader, Stage};
-pub use ez_gfx_core::capability::{AdapterClass, AdapterInfo, CapabilityError};
+pub use ez_gfx_core::capability::{
+    AdapterClass, AdapterInfo, CapabilityError, PresentationMode, PresentationModes,
+    PresentationModesError,
+};
 pub use ez_gfx_core::{Backend, SemanticId};
 pub use ez_gfx_hal::{
     DynamicPipelineState, SamplerAddressMode, SamplerFilter, TextureFormat, TextureRegion,

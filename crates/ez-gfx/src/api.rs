@@ -8,7 +8,7 @@ use std::{
 };
 
 use ez_gfx_core::{
-    capability::CapabilityError,
+    capability::{CapabilityError, PresentationMode, PresentationModes},
     handle::{
         BufferHandle, ContextHandle, CounterBufferHandle, IndexAllocationHandle,
         RenderTargetHandle, ShaderHandle, SurfaceHandle, TextureHandle, VertexAllocationHandle,

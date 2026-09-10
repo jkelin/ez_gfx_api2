@@ -387,11 +387,15 @@ impl NativeContext {
     ///
     /// # Errors
     ///
-    /// Returns `HalError::InvalidArgument` if the surface window handle is zero.
-    pub fn init_device(&self, surface: &NativeSurface) -> Result<AdapterInfo, HalError> {
+    /// Returns an error when the surface window handle is zero or DXGI capability probing fails.
+    pub fn init_device(&self, surface: &mut NativeSurface) -> Result<AdapterInfo, HalError> {
         if surface.window == 0 {
             return Err(HalError::InvalidArgument);
         }
+        // Probe before the first present so the public surface capability snapshot is authoritative.
+        // SAFETY: factory creation takes no caller-provided pointers.
+        let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory1() }.map_err(map_windows)?;
+        surface.allow_tearing = super::surface::factory_allows_tearing(&factory);
         Ok(self.adapter_info.clone())
     }
 

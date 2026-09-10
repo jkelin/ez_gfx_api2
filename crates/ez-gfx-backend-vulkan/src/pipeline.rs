@@ -8,7 +8,7 @@ type NativePipelineLayout = (
 use super::{
     BlendMode, CString, CullMode, DeferredResource, FrontFace, HalError, NativeBufferBinding,
     NativeContext, NativeGraphicsPipelineDesc, NativePipeline, NativeShader, NativeSurface,
-    PrimitiveTopology, ShaderBufferLayout, map_vk, vk,
+    PresentationMode, PrimitiveTopology, ShaderBufferLayout, map_vk, vk,
 };
 
 impl NativeContext {
@@ -390,6 +390,7 @@ impl NativeContext {
         surface: &NativeSurface,
         width: u32,
         height: u32,
+        presentation_mode: PresentationMode,
     ) -> Result<(), HalError> {
         if width == 0 || height == 0 {
             return Err(HalError::NotReady);
@@ -397,8 +398,9 @@ impl NativeContext {
         if self.swapchain.is_none()
             || self.swapchain_extent.width != width
             || self.swapchain_extent.height != height
+            || self.swapchain_presentation_mode != presentation_mode
         {
-            self.recreate_swapchain(surface, width, height)?;
+            self.recreate_swapchain(surface, width, height, presentation_mode)?;
         }
         Ok(())
     }

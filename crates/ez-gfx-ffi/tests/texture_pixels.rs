@@ -1102,7 +1102,10 @@ impl Quad {
     fn readback_direct(&self, texture: TextureHandle) -> Vec<u8> {
         // A surfaceless capture exercises the native texture-copy path rather
         // than surface sampling.
-        assert_eq!(begin_render(self.context, self.surface), Ok(()));
+        assert_eq!(
+            begin_render(self.context, self.surface, ez_gfx::PresentationMode::Fifo,),
+            Ok(())
+        );
         assert_eq!(frame_enqueue_readback(self.context, texture), Ok(()));
         assert_eq!(finish_render(self.context), Ok(()));
         frame_readback(self.context).unwrap()
@@ -1118,7 +1121,10 @@ impl Quad {
             set_snapshot_cache(self.context, self.surface, capture),
             Ok(())
         );
-        assert_eq!(begin_render(self.context, self.surface), Ok(()));
+        assert_eq!(
+            begin_render(self.context, self.surface, ez_gfx::PresentationMode::Fifo,),
+            Ok(())
+        );
         let indirect = acquire_counter(self.context, 1).unwrap();
         write_counter_commands(
             self.context,

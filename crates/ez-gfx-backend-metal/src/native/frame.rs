@@ -8,7 +8,8 @@ use super::{
     MTLResource, MTLResourceOptions, MTLResourceUsage, MTLSize, MTLStoreAction, MTLTexture,
     MTLWinding, MemoryAllocator, MemoryClass, NativeAllocation, NativeContext, NativeFrameAction,
     NativeFrameResource, NativeGraphicsDraw, NativePipeline, NativeSurface, NativeTexture,
-    PrimitiveTopology, ProtocolObject, QueueKind, ThreadBound, map_allocation_hal,
+    PresentationMode, PrimitiveTopology, ProtocolObject, QueueKind, ThreadBound,
+    map_allocation_hal,
 };
 use ez_gfx_hal::COUNTER_BUFFER_ELEMENT_OFFSET;
 
@@ -16,6 +17,22 @@ type MetalDrawable = super::Retained<ProtocolObject<dyn CAMetalDrawable>>;
 
 type MetalFrameReadback = (NativeAllocation, u64, u64, u64, u32);
 type MetalArgumentEncoder = ThreadBound<super::Retained<ProtocolObject<dyn MTLArgumentEncoder>>>;
+
+type FrameSurface<'a> = (&'a mut NativeSurface, (u32, u32), PresentationMode);
+type ResolvedFrameSurface<'a> = (Option<&'a mut NativeSurface>, (u32, u32));
+
+fn validate_surface_request(
+    surface: Option<FrameSurface<'_>>,
+) -> Result<ResolvedFrameSurface<'_>, HalError> {
+    match surface {
+        Some((surface, extent, mode)) if extent.0 != 0 && extent.1 != 0 => {
+            surface.set_presentation_mode(mode)?;
+            Ok((Some(surface), extent))
+        }
+        Some(_) => Err(HalError::InvalidArgument),
+        None => Ok((None, (0, 0))),
+    }
+}
 
 fn buffer_range_fits(allocation_size: u64, range: ez_gfx_hal::BufferRange) -> bool {
     range
@@ -912,18 +929,14 @@ impl NativeContext {
     /// Returns an error for an invalid plan, allocation failure, or rejected Metal commands.
     pub fn execute_frame(
         &mut self,
-        surface: Option<(&mut NativeSurface, (u32, u32))>,
+        surface: Option<FrameSurface<'_>>,
         actions: &[NativeFrameAction<'_>],
         capture_presented: bool,
     ) -> Result<Vec<Vec<u8>>, HalError> {
         if actions.is_empty() {
             return Err(HalError::InvalidArgument);
         }
-        let (mut surface, extent) = match surface {
-            Some((surface, extent)) if extent.0 != 0 && extent.1 != 0 => (Some(surface), extent),
-            Some(_) => return Err(HalError::InvalidArgument),
-            None => (None, (0, 0)),
-        };
+        let (mut surface, extent) = validate_surface_request(surface)?;
         let (presents, uses_surface) =
             self.validate_frame_plan(&mut surface, extent, actions, capture_presented)?;
         // A failed producer must be rejected before allocating frame resources or queuing

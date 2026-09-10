@@ -11,7 +11,7 @@ use ez_gfx_core::{
     Backend,
     capability::{
         AdapterCapabilities, AdapterClass, AdapterInfo, CompressionSupport,
-        MAX_BINDLESS_SAMPLED_TEXTURES, SemanticProfile,
+        MAX_BINDLESS_SAMPLED_TEXTURES, PresentationMode, PresentationModes, SemanticProfile,
     },
 };
 use ez_gfx_hal::{
@@ -439,6 +439,11 @@ impl Drop for PendingDevice {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct PresentationSupport {
+    fifo_latest_ready: bool,
+}
+
 /// Vulkan instance, admitted device, queues, allocators, and frame state.
 pub struct NativeContext {
     // Retain ash's dynamically loaded Vulkan library until all instance/device function pointers are dropped.
@@ -477,11 +482,13 @@ pub struct NativeContext {
     texture_descriptor_set: Option<vk::DescriptorSet>,
     sampler_anisotropy: bool,
     swapchain_loader: Option<khr::swapchain::Device>,
+    presentation_support: PresentationSupport,
     swapchain: Option<vk::SwapchainKHR>,
     swapchain_views: Vec<vk::ImageView>,
     swapchain_finished: Vec<vk::Semaphore>,
     swapchain_initialized: Vec<bool>,
     swapchain_format: vk::Format,
+    swapchain_presentation_mode: PresentationMode,
     swapchain_extent: vk::Extent2D,
     frame_slots: Vec<FrameSlot>,
     frame_cursor: usize,

@@ -53,7 +53,11 @@ fn main() -> anyhow::Result<()> {
 
     while let Some(window_frame) = example.wait_for_next_frame(&surface)? {
         let mut frame = surface.begin_frame()?;
-        let swapchain_target = frame.configure_swapchain(window_frame.size, Format::Bgra8Srgb)?;
+        let swapchain_target = frame.configure_swapchain(
+            window_frame.size,
+            Format::Bgra8Srgb,
+            ez_gfx::PresentationMode::Immediate,
+        )?;
         // Counter buffers are one-frame values: the first bound frame consumes them.
         let commands = [DrawIndexedCommand {
             index_count: 3,

@@ -1,20 +1,36 @@
-use super::surface::dxgi_present_flags;
 use super::{
     AllocationRequest, AttachmentLoadOp, AttachmentStoreOp, CompletionToken,
     D3D12_CLEAR_FLAG_DEPTH, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_INDEX_BUFFER_VIEW,
     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
     D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT,
-    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_VIEWPORT, DXGI_FORMAT_R32_UINT, DXGI_PRESENT,
-    FRAMES_IN_FLIGHT, HalError, ID3D12CommandList, ID3D12PipelineState, INFINITE, Interface,
-    MemoryAllocator, MemoryClass, NativeAllocation, NativeContext, NativeFrameAction,
-    NativeFrameResource, NativeSurface, PRESENT_SYNC_INTERVAL, QueueKind, RECT,
-    WaitForSingleObject, bind_dx12_compute_buffers, bind_dx12_graphics_buffers,
-    copy_texture_to_readback, dx12_resource_state, map_windows, record_resource_barriers,
+    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_VIEWPORT, DXGI_FORMAT_R32_UINT, FRAMES_IN_FLIGHT,
+    HalError, ID3D12CommandList, ID3D12PipelineState, INFINITE, Interface, MemoryAllocator,
+    MemoryClass, NativeAllocation, NativeContext, NativeFrameAction, NativeFrameResource,
+    NativeSurface, PresentationMode, QueueKind, RECT, WaitForSingleObject,
+    bind_dx12_compute_buffers, bind_dx12_graphics_buffers, copy_texture_to_readback,
+    dx12_resource_state, map_windows, presentation_parameters, record_resource_barriers,
     transition_barrier, uav_barrier,
 };
 use ez_gfx_hal::COUNTER_BUFFER_ELEMENT_OFFSET;
 
+type FrameSurface<'a> = (&'a mut NativeSurface, (u32, u32), PresentationMode);
+type ResolvedFrameSurface<'a> = (Option<&'a mut NativeSurface>, (u32, u32), PresentationMode);
+
+fn validate_surface_request(
+    surface: Option<FrameSurface<'_>>,
+) -> Result<ResolvedFrameSurface<'_>, HalError> {
+    match surface {
+        Some((surface, extent, mode)) if extent.0 != 0 && extent.1 != 0 => {
+            if !surface.presentation_modes().contains(mode) {
+                return Err(HalError::Unsupported);
+            }
+            Ok((Some(surface), extent, mode))
+        }
+        Some(_) => Err(HalError::InvalidArgument),
+        None => Ok((None, (0, 0), PresentationMode::Fifo)),
+    }
+}
 const DRAW_INDEXED_ARGUMENT_BYTES: u64 = core::mem::size_of::<
     windows::Win32::Graphics::Direct3D12::D3D12_DRAW_INDEXED_ARGUMENTS,
 >() as u64;
@@ -886,26 +902,21 @@ impl NativeContext {
     /// Returns an error if the frame plan or extent is invalid, required surface or frame resources are unavailable, resource allocation or readback fails, or a Direct3D/DXGI operation fails.
     pub fn execute_frame(
         &mut self,
-        surface: Option<(&mut NativeSurface, (u32, u32))>,
+        surface: Option<FrameSurface<'_>>,
         actions: &[NativeFrameAction<'_>],
         capture_presented: bool,
     ) -> Result<Vec<Vec<u8>>, HalError> {
         if actions.is_empty() {
             return Err(HalError::InvalidArgument);
         }
-        let (mut surface, extent) = match surface {
-            Some((surface, extent)) if extent.0 != 0 && extent.1 != 0 => (Some(surface), extent),
-            Some(_) => return Err(HalError::InvalidArgument),
-            None => (None, (0, 0)),
-        };
+        let (mut surface, extent, presentation_mode) = validate_surface_request(surface)?;
         let DxFramePlan {
             uses_surface,
             presents,
             external_waits,
         } = validate_frame_plan(actions, extent, surface.is_some(), capture_presented)?;
-        let present_flags = surface.as_deref().map_or(DXGI_PRESENT(0), |surface| {
-            dxgi_present_flags(surface.allow_tearing)
-        });
+        let (present_interval, present_flags) =
+            presentation_parameters(presentation_mode).ok_or(HalError::Unsupported)?;
         let DxPreparedFrame {
             swapchain,
             back_buffer,
@@ -1011,7 +1022,7 @@ impl NativeContext {
                 swapchain
                     .as_ref()
                     .ok_or(HalError::InvalidArgument)?
-                    .Present(PRESENT_SYNC_INTERVAL, present_flags)
+                    .Present(present_interval, present_flags)
                     .ok()
                     .err()
             }

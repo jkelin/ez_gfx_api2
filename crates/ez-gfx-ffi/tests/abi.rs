@@ -24,8 +24,8 @@ use ez_gfx_ffi::{
     EzGfxAdapterClass, EzGfxAdapterDesc, EzGfxAdapterInfo, EzGfxBackendContextDesc, EzGfxBinding,
     EzGfxByteBuffer, EzGfxContextDesc, EzGfxDiagnostic, EzGfxDrawIndexedCommand, EzGfxDynamicState,
     EzGfxEvent, EzGfxEventCallback, EzGfxEventKind, EzGfxHandleParts, EzGfxHeadlessSurfaceDesc,
-    EzGfxRenderTargetDesc, EzGfxRenderTargetFormat, EzGfxRenderTargetUsage, EzGfxResult,
-    EzGfxRuntimeRecord, EzGfxTextureDesc, EzGfxUploadEvent, EzGfxWindowSurfaceDesc,
+    EzGfxPresentationModes, EzGfxRenderTargetDesc, EzGfxRenderTargetFormat, EzGfxRenderTargetUsage,
+    EzGfxResult, EzGfxRuntimeRecord, EzGfxTextureDesc, EzGfxUploadEvent, EzGfxWindowSurfaceDesc,
     ez_gfx_adapter_count, ez_gfx_adapter_query, ez_gfx_buffer_acquire, ez_gfx_buffer_release,
     ez_gfx_buffer_write, ez_gfx_compute_shader_load, ez_gfx_context_create,
     ez_gfx_context_create_backend, ez_gfx_context_destroy, ez_gfx_context_register_callback,
@@ -36,11 +36,26 @@ use ez_gfx_ffi::{
     ez_gfx_index_allocation_remove, ez_gfx_render_target_create, ez_gfx_render_target_destroy,
     ez_gfx_render_target_frame_begin, ez_gfx_render_target_get_clear,
     ez_gfx_render_target_get_extent, ez_gfx_render_target_get_format,
-    ez_gfx_render_target_probe_format, ez_gfx_semantic_id, ez_gfx_texture_get_binding,
-    ez_gfx_texture_get_residency, ez_gfx_texture_load, ez_gfx_texture_unload,
-    ez_gfx_vertex_allocation_get_range, ez_gfx_vertex_allocation_remove, ez_gfx_vertex_heap_create,
-    ez_gfx_vertex_heap_destroy, ez_gfx_vertex_heap_upload,
+    ez_gfx_render_target_probe_format, ez_gfx_semantic_id, ez_gfx_surface_get_presentation_modes,
+    ez_gfx_texture_get_binding, ez_gfx_texture_get_residency, ez_gfx_texture_load,
+    ez_gfx_texture_unload, ez_gfx_vertex_allocation_get_range, ez_gfx_vertex_allocation_remove,
+    ez_gfx_vertex_heap_create, ez_gfx_vertex_heap_destroy, ez_gfx_vertex_heap_upload,
 };
+#[test]
+fn presentation_mode_codes_are_stable() {
+    use ez_gfx_ffi::binding_enums::EzGfxPresentationMode;
+
+    assert_eq!(
+        [
+            EzGfxPresentationMode::Fifo as u8,
+            EzGfxPresentationMode::Mailbox as u8,
+            EzGfxPresentationMode::Immediate as u8,
+            EzGfxPresentationMode::Relaxed as u8,
+            EzGfxPresentationMode::Paced as u8,
+        ],
+        [0, 1, 2, 3, 4]
+    );
+}
 
 #[test]
 fn render_target_codes_are_stable() {
@@ -591,9 +606,24 @@ fn frame_handles_are_thread_local_terminal_and_context_owned() {
     let mut native = common::TestContext::create_with_validation(1, false);
     let context = native.context;
     let mut frame = 0;
+    let mut modes = EzGfxPresentationModes { bits: 0 };
+    assert_eq!(
+        // SAFETY: mode-set output storage is live and aligned.
+        unsafe {
+            ez_gfx_surface_get_presentation_modes(native.context, native.surface, &raw mut modes)
+        },
+        EzGfxResult::Ok
+    );
+    assert_ne!(modes.bits & 1, 0);
+    assert_eq!(
+        // SAFETY: frame output storage is live and aligned; mode 5 intentionally tests decoding.
+        unsafe { ez_gfx_frame_begin(native.context, native.surface, 5, &raw mut frame) },
+        EzGfxResult::InvalidArgument
+    );
+    assert_eq!(frame, 0);
     assert_eq!(
         // SAFETY: frame output storage is live and aligned.
-        unsafe { ez_gfx_frame_begin(native.context, native.surface, &raw mut frame) },
+        unsafe { ez_gfx_frame_begin(native.context, native.surface, 0, &raw mut frame) },
         EzGfxResult::Ok
     );
     assert_eq!(ez_gfx_frame_abort(0, frame), EzGfxResult::InvalidContext);
@@ -610,7 +640,7 @@ fn frame_handles_are_thread_local_terminal_and_context_owned() {
     let mut ended = 0;
     assert_eq!(
         // SAFETY: frame output storage is live and aligned.
-        unsafe { ez_gfx_frame_begin(native.context, native.surface, &raw mut ended) },
+        unsafe { ez_gfx_frame_begin(native.context, native.surface, 0, &raw mut ended) },
         EzGfxResult::Ok
     );
     assert_eq!(ez_gfx_frame_end(context, ended), EzGfxResult::NotReady);
@@ -622,7 +652,7 @@ fn frame_handles_are_thread_local_terminal_and_context_owned() {
     let mut descendant = 0;
     assert_eq!(
         // SAFETY: frame output storage is live and aligned.
-        unsafe { ez_gfx_frame_begin(native.context, native.surface, &raw mut descendant) },
+        unsafe { ez_gfx_frame_begin(native.context, native.surface, 0, &raw mut descendant) },
         EzGfxResult::Ok
     );
     assert_eq!(ez_gfx_context_destroy(native.context), EzGfxResult::Ok);
@@ -642,7 +672,7 @@ fn explicit_dx12_context_allocates_writes_and_releases_buffer_memory() {
     let mut frame = 0;
     assert_eq!(
         // SAFETY: frame output storage is live and aligned.
-        unsafe { ez_gfx_frame_begin(context, native.surface, &raw mut frame) },
+        unsafe { ez_gfx_frame_begin(context, native.surface, 0, &raw mut frame) },
         EzGfxResult::Ok
     );
     let name = b"vertices";
