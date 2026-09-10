@@ -31,6 +31,14 @@ pub type EzGfxTexture = EzGfxHandle;
 /// Opaque packed `u64` render-target handle; child bits index the context identity arena and resolve only as a render target.
 pub type EzGfxRenderTarget = EzGfxHandle;
 
+/// Compact set of presentation modes available for one surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct EzGfxPresentationModes {
+    /// Bits indexed by `EzGfxPresentationMode` values zero through four.
+    pub bits: u8,
+}
+
 /// Stable C ABI result code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]

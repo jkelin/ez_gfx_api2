@@ -12,7 +12,15 @@ use super::*;
     reason = "sequential layout assertions share one ABI contract; splitting would hide drift"
 )]
 fn layouts_are_stable() {
-    // ABI 39 splits window and headless creation while retaining portable tagged window handles.
+    // ABI 40 adds presentation-mode selection and surface capability querying.
+    assert_eq!(
+        (
+            size_of::<EzGfxPresentationModes>(),
+            align_of::<EzGfxPresentationModes>(),
+            offset_of!(EzGfxPresentationModes, bits),
+        ),
+        (1, 1, 0)
+    );
     assert_eq!(
         (
             size_of::<EzGfxContextDesc>(),
@@ -337,6 +345,8 @@ fn all_public_export_signatures_are_stable() {
     let _: extern "C" fn(Handle, Handle, u32, u32) -> Status = ffi::ez_gfx_surface_resize;
     let _: unsafe extern "C" fn(Handle, Handle, *mut u32, *mut u32) -> Status =
         ffi::ez_gfx_surface_get_extent;
+    let _: unsafe extern "C" fn(Handle, Handle, *mut EzGfxPresentationModes) -> Status =
+        ffi::ez_gfx_surface_get_presentation_modes;
     let _: unsafe extern "C" fn(Handle, Handle, *mut i32) -> Status =
         ffi::ez_gfx_surface_resize_pending;
     let _: extern "C" fn(Handle, Handle, i32) -> Status = ffi::ez_gfx_surface_set_snapshot_cache;
@@ -380,7 +390,8 @@ fn all_public_export_signatures_are_stable() {
     let _: extern "C" fn(Handle, u8, u8) -> Status = ffi::ez_gfx_render_target_probe_format;
     let _: unsafe extern "C" fn(Handle, Handle, *mut Handle) -> Status =
         ffi::ez_gfx_render_target_frame_begin;
-    let _: unsafe extern "C" fn(Handle, Handle, *mut Handle) -> Status = ffi::ez_gfx_frame_begin;
+    let _: unsafe extern "C" fn(Handle, Handle, u8, *mut Handle) -> Status =
+        ffi::ez_gfx_frame_begin;
     let _: unsafe extern "C" fn(Handle, u32, u32, *const u8, usize, *mut Handle) -> Status =
         ffi::ez_gfx_counter_buffer_acquire;
     let _: unsafe extern "C" fn(

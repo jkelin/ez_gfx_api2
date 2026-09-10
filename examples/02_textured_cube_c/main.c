@@ -440,7 +440,12 @@ int main(int argc, char **argv) {
             goto cleanup;
         }
         /* Compute writes both the draw command and its GPU-produced visible count. */
-        if (!checked(ez_gfx_frame_begin(context, surface, &active_frame), "begin frame")) goto cleanup;
+        if (!checked(ez_gfx_frame_begin(
+                context,
+                surface,
+                EzGfxPresentationMode_Immediate,
+                &active_frame),
+            "begin frame")) goto cleanup;
         bindings[0] = (EzGfxBinding){"primitives", sizeof("primitives") - 1, primitives, 0, 0};
         bindings[1] = (EzGfxBinding){"draw_commands", sizeof("draw_commands") - 1, 0, indirect, 0};
         if (!checked(ez_gfx_frame_bind(context, active_frame, &bindings[0]), "bind primitives") ||

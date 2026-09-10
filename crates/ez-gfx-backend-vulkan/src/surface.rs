@@ -1,8 +1,9 @@
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
+use super::device::available_extension;
 use super::{
     AllocationCreateDesc, AllocationError, AllocationScheme, CStr, DepthTarget, HalError,
-    MemoryLocation, NativeContext, NativeSurface, device::available_extension, khr,
+    MemoryLocation, NativeContext, NativeSurface, PresentationMode, PresentationModes, khr,
     map_allocation_hal, map_allocator, map_vk, vk,
 };
 
@@ -58,13 +59,48 @@ pub(crate) const fn classify_surface_extent(extent: vk::Extent2D) -> NativeWindo
     }
 }
 
-pub(crate) fn preferred_present_mode(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
-    // Mailbox preserves tear-free display pacing without blocking each present. Immediate is the
-    // low-latency fallback; FIFO is required by Vulkan when neither optional mode is available.
-    [vk::PresentModeKHR::MAILBOX, vk::PresentModeKHR::IMMEDIATE]
-        .into_iter()
-        .find(|candidate| modes.contains(candidate))
-        .unwrap_or(vk::PresentModeKHR::FIFO)
+const FIFO_LATEST_READY: vk::PresentModeKHR = vk::PresentModeKHR::from_raw(1_000_361_000);
+
+pub(crate) const fn native_present_mode(mode: PresentationMode) -> vk::PresentModeKHR {
+    match mode {
+        PresentationMode::Fifo => vk::PresentModeKHR::FIFO,
+        PresentationMode::Mailbox => vk::PresentModeKHR::MAILBOX,
+        PresentationMode::Immediate => vk::PresentModeKHR::IMMEDIATE,
+        PresentationMode::Relaxed => vk::PresentModeKHR::FIFO_RELAXED,
+        PresentationMode::Paced => FIFO_LATEST_READY,
+    }
+}
+
+pub(crate) fn preferred_present_mode(
+    modes: &[vk::PresentModeKHR],
+    requested: PresentationMode,
+) -> Option<vk::PresentModeKHR> {
+    let native = native_present_mode(requested);
+    modes.contains(&native).then_some(native)
+}
+
+fn normalized_present_modes(
+    native: &[vk::PresentModeKHR],
+    fifo_latest_ready_enabled: bool,
+) -> Result<PresentationModes, HalError> {
+    let mut modes = PresentationModes::NONE;
+    for (native_mode, flag) in [
+        (vk::PresentModeKHR::FIFO, PresentationModes::FIFO),
+        (vk::PresentModeKHR::MAILBOX, PresentationModes::MAILBOX),
+        (vk::PresentModeKHR::IMMEDIATE, PresentationModes::IMMEDIATE),
+        (vk::PresentModeKHR::FIFO_RELAXED, PresentationModes::RELAXED),
+    ] {
+        if native.contains(&native_mode) {
+            modes = modes.union(flag);
+        }
+    }
+    if fifo_latest_ready_enabled && native.contains(&FIFO_LATEST_READY) {
+        modes = modes.union(PresentationModes::PACED);
+    }
+    if !modes.contains(PresentationMode::Fifo) {
+        return Err(HalError::Unsupported);
+    }
+    Ok(modes)
 }
 
 pub(crate) fn instance_extensions(
@@ -211,6 +247,26 @@ impl NativeContext {
         .map_err(map_vk)?;
         Ok(classify_surface_extent(capabilities.current_extent))
     }
+
+    /// Returns presentation modes available for this initialized surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the device is uninitialized, Vulkan rejects the query, or FIFO is absent.
+    pub fn presentation_modes(
+        &self,
+        surface: &NativeSurface,
+    ) -> Result<PresentationModes, HalError> {
+        let physical = self.physical_device.ok_or(HalError::NotReady)?;
+        // SAFETY: both handles belong to this live instance and ash owns returned storage.
+        let native = unsafe {
+            self.surface_loader
+                .get_physical_device_surface_present_modes(physical, surface.handle)
+        }
+        .map_err(map_vk)?;
+        normalized_present_modes(&native, self.presentation_support.fifo_latest_ready)
+    }
+
     /// Acquires and presents one surface image; zero extents remain minimized.
     ///
     /// # Errors
@@ -221,6 +277,7 @@ impl NativeContext {
         surface: &NativeSurface,
         width: u32,
         height: u32,
+        mode: PresentationMode,
     ) -> Result<(), HalError> {
         if width == 0 || height == 0 {
             return Err(HalError::NotReady);
@@ -228,8 +285,9 @@ impl NativeContext {
         if self.swapchain.is_none()
             || self.swapchain_extent.width != width
             || self.swapchain_extent.height != height
+            || self.swapchain_presentation_mode != mode
         {
-            self.recreate_swapchain(surface, width, height)?;
+            self.recreate_swapchain(surface, width, height, mode)?;
         }
         let loader = self.swapchain_loader.as_ref().ok_or(HalError::NotReady)?;
         let semaphore = self.image_available.ok_or(HalError::NotReady)?;
@@ -240,7 +298,7 @@ impl NativeContext {
         } {
             Ok(value) => value,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                self.recreate_swapchain(surface, width, height)?;
+                self.recreate_swapchain(surface, width, height, mode)?;
                 let loader = self.swapchain_loader.as_ref().ok_or(HalError::NotReady)?;
                 // SAFETY: the failed acquire left `semaphore` unsignaled, and `recreate_swapchain` waited for device idle and installed the swapchain used by this loader; the fence is null.
                 unsafe {
@@ -275,12 +333,12 @@ impl NativeContext {
         match presented {
             Ok(present_suboptimal) => {
                 if suboptimal || present_suboptimal {
-                    self.recreate_swapchain(surface, width, height)?;
+                    self.recreate_swapchain(surface, width, height, mode)?;
                 }
                 Ok(())
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                self.recreate_swapchain(surface, width, height)
+                self.recreate_swapchain(surface, width, height, mode)
             }
             Err(error) => Err(map_vk(error)),
         }
@@ -295,6 +353,7 @@ impl NativeContext {
         surface: &NativeSurface,
         requested_width: u32,
         requested_height: u32,
+        presentation_mode: PresentationMode,
     ) -> Result<(), HalError> {
         self.wait_idle()?;
         self.destroy_depth_target().map_err(map_allocation_hal)?;
@@ -319,7 +378,8 @@ impl NativeContext {
                 .get_physical_device_surface_present_modes(physical, surface.handle)
         }
         .map_err(map_vk)?;
-        let present_mode = preferred_present_mode(&present_modes);
+        let present_mode = preferred_present_mode(&present_modes, presentation_mode)
+            .ok_or(HalError::Unsupported)?;
         let chosen = formats
             .iter()
             .copied()
@@ -447,6 +507,7 @@ impl NativeContext {
             unsafe { loader.destroy_swapchain(old, None) };
         }
         self.swapchain = Some(swapchain);
+        self.swapchain_presentation_mode = presentation_mode;
         self.swapchain_views = views;
         self.swapchain_finished = finished;
         self.swapchain_initialized = vec![false; self.swapchain_views.len()];

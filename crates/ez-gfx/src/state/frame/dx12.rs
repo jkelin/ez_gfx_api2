@@ -1,4 +1,5 @@
 use crate::Result;
+use ez_gfx_core::capability::PresentationMode;
 
 use super::{
     Backend, ContextState, Error, ExecutableNode, ExecutionAction, ExecutionBarrier, ExecutionPass,
@@ -369,6 +370,9 @@ pub(super) fn execute_dx12_frame_plan(
                 .ok_or(Error::InvalidContext)
         })
         .transpose()?;
+    let presentation_mode = surface
+        .as_ref()
+        .map_or(PresentationMode::Fifo, |surface| surface.presentation_mode);
     // Target-only frames size draws and validations from the target extents.
     let extent = surface
         .as_ref()
@@ -454,7 +458,7 @@ pub(super) fn execute_dx12_frame_plan(
             .execute_frame(
                 native_surface
                     .as_deref_mut()
-                    .map(|surface| (surface, extent)),
+                    .map(|surface| (surface, extent, presentation_mode)),
                 &actions,
                 capture,
             )

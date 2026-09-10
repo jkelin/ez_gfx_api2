@@ -295,7 +295,14 @@ mod apple {
         let mut frame = 0;
         assert_eq!(
             // SAFETY: frame output storage is live and aligned.
-            unsafe { ez_gfx_frame_begin(context, surface, &raw mut frame) },
+            unsafe {
+                ez_gfx_frame_begin(
+                    context,
+                    surface,
+                    ez_gfx_ffi::binding_enums::EzGfxPresentationMode::Immediate as u8,
+                    &raw mut frame,
+                )
+            },
             EzGfxResult::Ok
         );
         let mut indirect = 0;

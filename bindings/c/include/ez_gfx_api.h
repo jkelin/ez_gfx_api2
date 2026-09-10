@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EZ_GFX_ABI_VERSION 39u
+#define EZ_GFX_ABI_VERSION 40u
 
 #if defined(__clang__)
 #  if __has_attribute(access)
@@ -236,6 +236,25 @@ enum {
 };
 
 /**
+ * EzGfxPresentationMode:
+ * @EzGfxPresentationMode_Fifo: Ordered, tear-free presentation at vertical blank.
+ * @EzGfxPresentationMode_Mailbox: Newest-frame, tear-free presentation at vertical blank.
+ * @EzGfxPresentationMode_Immediate: Unsynchronized presentation that may tear.
+ * @EzGfxPresentationMode_Relaxed: Adaptive FIFO that may present immediately after a missed blank.
+ * @EzGfxPresentationMode_Paced: Latest-ready, tear-free presentation at vertical blank.
+ *
+ * Requested swapchain presentation behavior.
+ */
+typedef uint8_t EzGfxPresentationMode;
+enum {
+    EzGfxPresentationMode_Fifo = 0,
+    EzGfxPresentationMode_Mailbox = 1,
+    EzGfxPresentationMode_Immediate = 2,
+    EzGfxPresentationMode_Relaxed = 3,
+    EzGfxPresentationMode_Paced = 4,
+};
+
+/**
  * EzGfxRuntimePhase:
  * @EzGfxRuntimePhase_Admission: Adapter or device admission.
  * @EzGfxRuntimePhase_Decode: Asset decoding.
@@ -454,6 +473,16 @@ enum {
     EzGfxBlendMode_None = 0,
     EzGfxBlendMode_Alpha = 1,
 };
+
+/**
+ * EzGfxPresentationModes:
+ * @bits: Bits indexed by `EzGfxPresentationMode` values zero through four.
+ *
+ * Compact set of presentation modes available for one surface.
+ */
+typedef struct EzGfxPresentationModes {
+    uint8_t bits;
+} EzGfxPresentationModes;
 
 /**
  * EzGfxAdapterDesc:
@@ -1176,13 +1205,14 @@ EzGfxResult ez_gfx_context_register_callback(EzGfxContext context, EzGfxEventCal
  * ez_gfx_frame_begin:
  * @context: Owning context.
  * @surface: Surface to acquire.
+ * @presentation_mode_code: Requested mode; deterministic fallback applies when unavailable.
  * @out_frame: Receives the live frame handle.
  *
  * Begins one surface frame and returns its explicit owner handle.
  *
  * Returns: Returns readiness or handle status.
  */
-EzGfxResult ez_gfx_frame_begin(EzGfxContext context, EzGfxSurface surface, EzGfxFrame * out_frame) EZ_GFX_ACCESS(write_only, 3);
+EzGfxResult ez_gfx_frame_begin(EzGfxContext context, EzGfxSurface surface, EzGfxPresentationMode presentation_mode_code, EzGfxFrame * out_frame) EZ_GFX_ACCESS(write_only, 4);
 
 /**
  * ez_gfx_counter_buffer_acquire:
@@ -1373,6 +1403,18 @@ EzGfxResult ez_gfx_surface_resize(EzGfxContext context, EzGfxSurface surface, ui
  * Returns: Returns EzGfxResult_NotReady while minimized.
  */
 EzGfxResult ez_gfx_surface_get_extent(EzGfxContext context, EzGfxSurface surface, uint32_t * out_width, uint32_t * out_height) EZ_GFX_ACCESS(write_only, 3) EZ_GFX_ACCESS(write_only, 4);
+
+/**
+ * ez_gfx_surface_get_presentation_modes:
+ * @context: Owning context.
+ * @surface: Surface to query.
+ * @out_modes: Receives bits indexed by EzGfxPresentationMode.
+ *
+ * Queries the compact presentation-mode set available for a surface.
+ *
+ * Returns: Returns query or handle status.
+ */
+EzGfxResult ez_gfx_surface_get_presentation_modes(EzGfxContext context, EzGfxSurface surface, EzGfxPresentationModes * out_modes) EZ_GFX_ACCESS(write_only, 3);
 
 /**
  * ez_gfx_surface_resize_pending:

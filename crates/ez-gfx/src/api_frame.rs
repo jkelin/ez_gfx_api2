@@ -782,6 +782,8 @@ impl Frame {
     ///
     /// The returned target retains the surface and exposes the configured extent
     /// and format without exposing a backend swapchain image.
+    /// Unsupported valid presentation modes use the deterministic fallback exposed by
+    /// [`Surface::resolve_presentation_mode`].
     ///
     /// # Errors
     /// Returns [`Error`] when the frame is already configured, the extent is zero,
@@ -790,6 +792,7 @@ impl Frame {
         &mut self,
         size: [u32; 2],
         format: ez_gfx_runtime::target::Format,
+        presentation_mode: PresentationMode,
     ) -> Result<RenderTarget> {
         // A second attachment would make submission/presentation ownership ambiguous.
         if self.target != FrameTarget::Unconfigured {
@@ -813,7 +816,9 @@ impl Frame {
         {
             return self.fail(error);
         }
-        if let Err(error) = state::configure_surface(self.context.handle, surface.handle) {
+        if let Err(error) =
+            state::configure_surface(self.context.handle, surface.handle, presentation_mode)
+        {
             return self.fail(error);
         }
         self.target = FrameTarget::Surface;
@@ -1044,5 +1049,35 @@ impl Context {
             readbacks: Vec::new(),
             bindings: HashMap::new(),
         })
+    }
+}
+impl Surface {
+    /// Returns the presentation modes available for this initialized surface.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when the surface is stale or the backend query fails.
+    pub fn presentation_modes(&self) -> Result<PresentationModes> {
+        let context = Context {
+            inner: Rc::clone(&self.inner.context),
+            owner: false,
+        };
+        context.check_entry()?;
+        context.complete(state::presentation_modes(
+            self.inner.context.handle,
+            self.inner.handle,
+        ))
+    }
+
+    /// Resolves a requested presentation mode using the public deterministic fallback order.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when the surface query fails or FIFO is unavailable.
+    pub fn resolve_presentation_mode(
+        &self,
+        requested: PresentationMode,
+    ) -> Result<PresentationMode> {
+        self.presentation_modes()?
+            .resolve(requested)
+            .ok_or(Error::Unsupported)
     }
 }

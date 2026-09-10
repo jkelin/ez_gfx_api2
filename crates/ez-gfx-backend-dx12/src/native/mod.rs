@@ -3,7 +3,8 @@ use core::{ffi::c_void, ptr};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 use ez_gfx_core::capability::{
-    AdapterCapabilities, AdapterClass, AdapterInfo, CompressionSupport, SemanticProfile,
+    AdapterCapabilities, AdapterClass, AdapterInfo, CompressionSupport, PresentationMode,
+    PresentationModes, SemanticProfile,
 };
 use ez_gfx_hal::{
     AllocationError, AllocationRequest, AttachmentLoadOp, AttachmentStoreOp, BlendMode,
@@ -106,8 +107,24 @@ use windows::{
     core::Interface,
 };
 
-/// Flip-model interval zero replaces queued stale frames instead of blocking for vertical blank.
-const PRESENT_SYNC_INTERVAL: u32 = 0;
+/// Returns the DXGI presentation parameters for one supported normalized mode.
+const fn presentation_parameters(mode: PresentationMode) -> Option<(u32, DXGI_PRESENT)> {
+    match mode {
+        PresentationMode::Fifo => Some((1, DXGI_PRESENT(0))),
+        PresentationMode::Paced => Some((0, DXGI_PRESENT(0))),
+        PresentationMode::Immediate => Some((0, DXGI_PRESENT_ALLOW_TEARING)),
+        PresentationMode::Mailbox | PresentationMode::Relaxed => None,
+    }
+}
+
+const fn dx_presentation_modes(allow_tearing: bool) -> PresentationModes {
+    let modes = PresentationModes::FIFO.union(PresentationModes::PACED);
+    if allow_tearing {
+        modes.union(PresentationModes::IMMEDIATE)
+    } else {
+        modes
+    }
+}
 
 /// D3D12 buffer resource and its allocator ownership record.
 pub struct NativeAllocation {
@@ -365,6 +382,11 @@ impl NativeSurface {
             presented: Vec::new(),
             depth: None,
         })
+    }
+
+    /// Returns the normalized presentation modes available for this windowed flip-model surface.
+    pub const fn presentation_modes(&self) -> PresentationModes {
+        dx_presentation_modes(self.allow_tearing)
     }
 
     /// Returns the borrowed HWND value.

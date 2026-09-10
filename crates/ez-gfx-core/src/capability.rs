@@ -7,6 +7,123 @@ pub const CAPABILITY_PROFILE_SCHEMA_VERSION: u32 = 1;
 /// Maximum supported bindless sampled textures in the semantic profile.
 pub const MAX_BINDLESS_SAMPLED_TEXTURES: u32 = 1024;
 
+/// Presentation behavior requested for a surface swapchain.
+///
+/// [`PresentationMode::Paced`] is tear-free latest-ready presentation at vertical blank and is
+/// distinct from ordered [`PresentationMode::Fifo`] presentation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum PresentationMode {
+    /// Presents queued frames in order, one per vertical blank.
+    Fifo = 0,
+    /// Keeps only the newest pending frame and presents it at vertical blank.
+    Mailbox = 1,
+    /// Presents without waiting for vertical blank and may tear.
+    Immediate = 2,
+    /// Uses FIFO while on time but may present immediately after a missed vertical blank.
+    Relaxed = 3,
+    /// Presents the latest ready queued frame at vertical blank without tearing.
+    Paced = 4,
+}
+
+/// Invalid encoded presentation-mode set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PresentationModesError;
+
+/// Compact validated set of available presentation modes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct PresentationModes(u8);
+
+impl PresentationModes {
+    /// No presentation modes.
+    pub const NONE: Self = Self(0);
+    /// Required ordered vertical-blank presentation.
+    pub const FIFO: Self = Self(1 << PresentationMode::Fifo as u8);
+    /// Latest-frame vertical-blank presentation.
+    pub const MAILBOX: Self = Self(1 << PresentationMode::Mailbox as u8);
+    /// Unsynchronized presentation.
+    pub const IMMEDIATE: Self = Self(1 << PresentationMode::Immediate as u8);
+    /// Adaptive FIFO presentation.
+    pub const RELAXED: Self = Self(1 << PresentationMode::Relaxed as u8);
+    /// Latest-ready vertical-blank presentation.
+    pub const PACED: Self = Self(1 << PresentationMode::Paced as u8);
+    const ALL_BITS: u8 =
+        Self::FIFO.0 | Self::MAILBOX.0 | Self::IMMEDIATE.0 | Self::RELAXED.0 | Self::PACED.0;
+
+    /// Validates an encoded mode set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PresentationModesError`] when an unknown bit is set.
+    pub const fn from_bits(bits: u8) -> Result<Self, PresentationModesError> {
+        if bits & !Self::ALL_BITS == 0 {
+            Ok(Self(bits))
+        } else {
+            Err(PresentationModesError)
+        }
+    }
+
+    /// Returns the encoded mode bits.
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Returns whether `mode` is available.
+    pub const fn contains(self, mode: PresentationMode) -> bool {
+        self.0 & (1 << mode as u8) != 0
+    }
+
+    /// Returns the union of two available-mode sets.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Resolves `requested` through the stable presentation fallback order.
+    ///
+    /// Real presentation surfaces must include FIFO. An empty or malformed backend capability set
+    /// therefore has no resolution.
+    pub const fn resolve(self, requested: PresentationMode) -> Option<PresentationMode> {
+        let candidates: &[PresentationMode] = match requested {
+            PresentationMode::Fifo => &[PresentationMode::Fifo],
+            PresentationMode::Mailbox => &[
+                PresentationMode::Mailbox,
+                PresentationMode::Paced,
+                PresentationMode::Fifo,
+            ],
+            PresentationMode::Immediate => &[
+                PresentationMode::Immediate,
+                PresentationMode::Mailbox,
+                PresentationMode::Paced,
+                PresentationMode::Fifo,
+            ],
+            PresentationMode::Relaxed => &[PresentationMode::Relaxed, PresentationMode::Fifo],
+            PresentationMode::Paced => &[
+                PresentationMode::Paced,
+                PresentationMode::Mailbox,
+                PresentationMode::Fifo,
+            ],
+        };
+        let mut index = 0;
+        while index < candidates.len() {
+            if self.contains(candidates[index]) {
+                return Some(candidates[index]);
+            }
+            index += 1;
+        }
+        None
+    }
+}
+
+impl fmt::Display for PresentationModesError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("presentation mode set contains unknown bits")
+    }
+}
+
+impl std::error::Error for PresentationModesError {}
+
 /// Bit flags describing compressed texture support.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(transparent)]
@@ -334,5 +451,84 @@ fn require_limit(
 fn require_feature(errors: &mut Vec<CapabilityError>, name: &'static str, available: bool) {
     if !available {
         errors.push(CapabilityError::MissingFeature(name));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PresentationMode, PresentationModes};
+
+    #[test]
+    fn presentation_modes_reject_unknown_bits() {
+        assert!(PresentationModes::from_bits(1 << 5).is_err());
+    }
+
+    #[test]
+    fn presentation_fallbacks_are_stable() {
+        let all = PresentationModes::FIFO
+            .union(PresentationModes::MAILBOX)
+            .union(PresentationModes::IMMEDIATE)
+            .union(PresentationModes::RELAXED)
+            .union(PresentationModes::PACED);
+        for mode in [
+            PresentationMode::Fifo,
+            PresentationMode::Mailbox,
+            PresentationMode::Immediate,
+            PresentationMode::Relaxed,
+            PresentationMode::Paced,
+        ] {
+            assert_eq!(all.resolve(mode), Some(mode));
+        }
+
+        let fifo = PresentationModes::FIFO;
+        assert_eq!(
+            fifo.resolve(PresentationMode::Fifo),
+            Some(PresentationMode::Fifo)
+        );
+        assert_eq!(
+            fifo.resolve(PresentationMode::Mailbox),
+            Some(PresentationMode::Fifo)
+        );
+        assert_eq!(
+            fifo.resolve(PresentationMode::Immediate),
+            Some(PresentationMode::Fifo)
+        );
+        assert_eq!(
+            fifo.resolve(PresentationMode::Relaxed),
+            Some(PresentationMode::Fifo)
+        );
+        assert_eq!(
+            fifo.resolve(PresentationMode::Paced),
+            Some(PresentationMode::Fifo)
+        );
+
+        let paced = fifo.union(PresentationModes::PACED);
+        assert_eq!(
+            paced.resolve(PresentationMode::Mailbox),
+            Some(PresentationMode::Paced)
+        );
+        assert_eq!(
+            paced.resolve(PresentationMode::Immediate),
+            Some(PresentationMode::Paced)
+        );
+        assert_eq!(
+            paced.resolve(PresentationMode::Paced),
+            Some(PresentationMode::Paced)
+        );
+
+        let mailbox = fifo.union(PresentationModes::MAILBOX);
+        assert_eq!(
+            mailbox.resolve(PresentationMode::Immediate),
+            Some(PresentationMode::Mailbox)
+        );
+        assert_eq!(
+            mailbox.resolve(PresentationMode::Paced),
+            Some(PresentationMode::Mailbox)
+        );
+
+        assert_eq!(
+            PresentationModes::NONE.resolve(PresentationMode::Fifo),
+            None
+        );
     }
 }

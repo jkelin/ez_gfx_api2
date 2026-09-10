@@ -6,15 +6,14 @@ use super::{
     D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE,
     D3D12_RTV_DIMENSION_TEXTURE2D, D3D12_TEXTURE_LAYOUT_UNKNOWN, DXGI_ALPHA_MODE_IGNORE,
     DXGI_FEATURE_PRESENT_ALLOW_TEARING, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
-    DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_PRESENT, DXGI_PRESENT_ALLOW_TEARING, DXGI_SAMPLE_DESC,
-    DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
-    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, DXGI_SWAP_EFFECT_FLIP_DISCARD,
+    DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_SAMPLE_DESC, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
+    DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, DXGI_SWAP_EFFECT_FLIP_DISCARD,
     DXGI_USAGE_RENDER_TARGET_OUTPUT, HWND, HalError, ID3D12DescriptorHeap, ID3D12Resource,
     IDXGIFactory4, IDXGIFactory5, Interface, MemoryLocation, NativeContext, NativeSurface,
-    PRESENT_SYNC_INTERVAL, SurfaceDepth, map_allocator_hal, map_windows,
+    PresentationMode, SurfaceDepth, map_allocator_hal, map_windows, presentation_parameters,
 };
 
-fn factory_allows_tearing(factory: &IDXGIFactory4) -> bool {
+pub(super) fn factory_allows_tearing(factory: &IDXGIFactory4) -> bool {
     let Ok(factory) = factory.cast::<IDXGIFactory5>() else {
         return false;
     };
@@ -39,14 +38,6 @@ const fn swapchain_flags(allow_tearing: bool) -> DXGI_SWAP_CHAIN_FLAG {
     }
 }
 
-pub(super) const fn dxgi_present_flags(allow_tearing: bool) -> DXGI_PRESENT {
-    if allow_tearing {
-        DXGI_PRESENT_ALLOW_TEARING
-    } else {
-        DXGI_PRESENT(0)
-    }
-}
-
 impl NativeContext {
     /// Acquires and presents one surface image; zero extents remain minimized.
     ///
@@ -58,24 +49,24 @@ impl NativeContext {
         surface: &mut NativeSurface,
         width: u32,
         height: u32,
+        mode: PresentationMode,
     ) -> Result<(), HalError> {
         self.ensure_swapchain(surface, width, height)?;
-        // SAFETY: `surface.swapchain.as_ref()` retains the `IDXGISwapChain3` COM reference for `Present`, which receives only value arguments.
+        let (sync_interval, flags) = presentation_parameters(mode).ok_or(HalError::Unsupported)?;
+        // SAFETY: `surface.swapchain.as_ref()` retains the `IDXGISwapChain3` COM reference for
+        // `Present`, which receives only value arguments.
         unsafe {
             surface
                 .swapchain
                 .as_ref()
                 .ok_or(HalError::NotReady)?
-                .Present(
-                    PRESENT_SYNC_INTERVAL,
-                    dxgi_present_flags(surface.allow_tearing),
-                )
+                .Present(sync_interval, flags)
         }
         .ok()
-        .map_err(map_windows)?;
-        Ok(())
+        .map_err(map_windows)
     }
 
+    /// Creates or resizes the swap chain for the requested extent.
     ///
     /// # Errors
     ///
@@ -353,17 +344,42 @@ impl NativeContext {
 }
 #[cfg(test)]
 mod tests {
-    use super::{PRESENT_SYNC_INTERVAL, dxgi_present_flags, swapchain_flags};
+    use super::{PresentationMode, presentation_parameters, swapchain_flags};
+    use crate::native::{PresentationModes, dx_presentation_modes};
+    use windows::Win32::Graphics::Dxgi::{
+        DXGI_PRESENT, DXGI_PRESENT_ALLOW_TEARING, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
+    };
 
     #[test]
-    fn presentation_tearing_flags_follow_capability() {
-        assert_eq!(PRESENT_SYNC_INTERVAL, 0);
-        assert_eq!(swapchain_flags(false), super::DXGI_SWAP_CHAIN_FLAG(0));
-        assert_eq!(dxgi_present_flags(false), super::DXGI_PRESENT(0));
+    fn presentation_parameters_match_normalized_modes() {
         assert_eq!(
-            swapchain_flags(true),
-            super::DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+            presentation_parameters(PresentationMode::Fifo),
+            Some((1, DXGI_PRESENT(0)))
         );
-        assert_eq!(dxgi_present_flags(true), super::DXGI_PRESENT_ALLOW_TEARING);
+        assert_eq!(
+            presentation_parameters(PresentationMode::Paced),
+            Some((0, DXGI_PRESENT(0)))
+        );
+        assert_eq!(
+            presentation_parameters(PresentationMode::Immediate),
+            Some((0, DXGI_PRESENT_ALLOW_TEARING))
+        );
+        assert_eq!(presentation_parameters(PresentationMode::Mailbox), None);
+        assert_eq!(
+            dx_presentation_modes(false),
+            PresentationModes::FIFO.union(PresentationModes::PACED)
+        );
+        assert_eq!(
+            dx_presentation_modes(true),
+            PresentationModes::FIFO
+                .union(PresentationModes::PACED)
+                .union(PresentationModes::IMMEDIATE)
+        );
+        assert_eq!(presentation_parameters(PresentationMode::Relaxed), None);
+        assert_eq!(
+            swapchain_flags(false),
+            windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG(0)
+        );
+        assert_eq!(swapchain_flags(true), DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
     }
 }

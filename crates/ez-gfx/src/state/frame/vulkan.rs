@@ -1,4 +1,5 @@
-use crate::Result;
+use crate::{Result, state::SurfaceRecord};
+use ez_gfx_core::capability::PresentationMode;
 
 use super::{
     Backend, ContextState, Error, ExecutableNode, ExecutionAction, ExecutionBarrier, ExecutionPass,
@@ -119,10 +120,11 @@ fn prepare_vulkan_surface(
     graphics_format: &mut Option<u32>,
     surface: Option<&ez_gfx_backend_vulkan::NativeSurface>,
     extent: (u32, u32),
+    presentation_mode: PresentationMode,
 ) -> Result<()> {
     if let Some(surface) = surface {
         native
-            .prepare_surface(surface, extent.0, extent.1)
+            .prepare_surface(surface, extent.0, extent.1, presentation_mode)
             .map_err(map_hal)?;
         let format = native.graphics_format_key();
         if graphics_format.is_some_and(|cached| cached != format) {
@@ -446,6 +448,10 @@ fn vulkan_actions<'a>(
     Ok(actions)
 }
 
+fn presentation_mode(surface: Option<&SurfaceRecord>) -> PresentationMode {
+    surface.map_or(PresentationMode::Fifo, |surface| surface.presentation_mode)
+}
+
 pub(super) fn execute_vulkan_frame_plan(
     context: &mut ContextState,
     plan: &FrameExecutionPlan,
@@ -463,6 +469,7 @@ pub(super) fn execute_vulkan_frame_plan(
                 .ok_or(Error::InvalidContext)
         })
         .transpose()?;
+    let presentation_mode = presentation_mode(surface.as_ref());
     // Target-only frames size draws and validations from the target extents.
     let extent = surface
         .as_ref()
@@ -515,6 +522,7 @@ pub(super) fn execute_vulkan_frame_plan(
             &mut context.graphics_format,
             native_surface.as_deref(),
             extent,
+            presentation_mode,
         )?;
         prepare_vulkan_pipelines(native, &context.shaders, &mut context.pipelines, payloads)?
     };
@@ -555,7 +563,7 @@ pub(super) fn execute_vulkan_frame_plan(
             .execute_frame(
                 native_surface
                     .as_deref_mut()
-                    .map(|surface| (surface, extent)),
+                    .map(|surface| (surface, extent, presentation_mode)),
                 &actions,
                 capture,
             )

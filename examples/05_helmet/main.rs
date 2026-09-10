@@ -72,7 +72,11 @@ fn main() -> anyhow::Result<()> {
 
     while let Some(window_frame) = example.wait_for_next_frame(&surface)? {
         let mut frame = surface.begin_frame()?;
-        let swapchain_target = frame.configure_swapchain(window_frame.size, Format::Bgra8Srgb)?;
+        let swapchain_target = frame.configure_swapchain(
+            window_frame.size,
+            Format::Bgra8Srgb,
+            ez_gfx::PresentationMode::Immediate,
+        )?;
         camera.handle_window_events(&window_frame.events);
         params.mvp = row_major(camera.projection(window_frame.size)? * camera.view(target)?);
         let primitives = context.acquire_buffer_from(records.as_slice())?;

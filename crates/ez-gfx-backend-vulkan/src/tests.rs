@@ -28,16 +28,30 @@ fn device_policy_enables_advertised_swapchain_and_portability_subset() {
         extension(khr::portability_subset::NAME),
     ];
 
-    let (enabled, swapchain) = device_extensions(&available);
+    let (enabled, swapchain, fifo_latest_ready) = device_extensions(&available);
 
     assert!(enabled_has(&enabled, khr::swapchain::NAME));
     assert!(enabled_has(&enabled, khr::portability_subset::NAME));
     assert!(swapchain);
+    assert!(!fifo_latest_ready);
 
-    let (enabled, swapchain) = device_extensions(&[extension(khr::portability_subset::NAME)]);
+    let (enabled, swapchain, fifo_latest_ready) =
+        device_extensions(&[extension(khr::portability_subset::NAME)]);
     assert!(!enabled_has(&enabled, khr::swapchain::NAME));
     assert!(enabled_has(&enabled, khr::portability_subset::NAME));
     assert!(!swapchain);
+    assert!(!fifo_latest_ready);
+}
+
+#[test]
+fn device_policy_reports_fifo_latest_ready_extension() {
+    let name = c"VK_KHR_present_mode_fifo_latest_ready";
+    let (enabled, swapchain, fifo_latest_ready) =
+        device_extensions(&[extension(khr::swapchain::NAME), extension(name)]);
+
+    assert!(swapchain);
+    assert!(fifo_latest_ready);
+    assert!(enabled_has(&enabled, name));
 }
 
 #[test]

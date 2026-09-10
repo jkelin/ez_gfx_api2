@@ -203,7 +203,9 @@ impl Fixture {
         let mut frame = 0;
         assert_eq!(
             // SAFETY: frame output storage is writable and aligned.
-            unsafe { ez_gfx_frame_begin(self.native.context, self.native.surface, &raw mut frame) },
+            unsafe {
+                ez_gfx_frame_begin(self.native.context, self.native.surface, 0, &raw mut frame)
+            },
             EzGfxResult::Ok
         );
         let label = b"counter-pixels";

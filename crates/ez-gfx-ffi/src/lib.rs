@@ -57,15 +57,16 @@ use ez_gfx::raw::{
     SurfaceHandle, TextureHandle,
 };
 use ez_gfx::{
-    Backend, ContextOptions, DrawIndexedCommand, DynamicPipelineState, HeadlessSurfaceOptions, raw,
+    Backend, ContextOptions, DrawIndexedCommand, DynamicPipelineState, HeadlessSurfaceOptions,
+    PresentationMode, raw,
 };
 use raw_window_handle::{
     AppKitDisplayHandle, AppKitWindowHandle, RawDisplayHandle, RawWindowHandle,
     WaylandDisplayHandle, WaylandWindowHandle, Win32WindowHandle, WindowsDisplayHandle,
     XcbDisplayHandle, XcbWindowHandle, XlibDisplayHandle, XlibWindowHandle,
 };
-/// Identifies C ABI revision 39 for compatibility checks.
-pub const EZ_GFX_ABI_VERSION: u32 = 39;
+/// Identifies C ABI revision 40 for compatibility checks.
+pub const EZ_GFX_ABI_VERSION: u32 = 40;
 /// Caps any caller-provided byte range at 16 MiB.
 pub const EZ_GFX_MAX_BOUNDARY_BYTES: usize = 16 * 1024 * 1024;
 fn nonzero_native_ptr(bits: u64) -> Result<core::ptr::NonNull<core::ffi::c_void>, EzGfxResult> {
@@ -77,6 +78,17 @@ fn nonzero_win32_value(bits: u64) -> Result<core::num::NonZeroIsize, EzGfxResult
     let addr = usize::try_from(bits).map_err(|_| EzGfxResult::InvalidArgument)?;
     core::num::NonZeroIsize::new(isize::from_ne_bytes(addr.to_ne_bytes()))
         .ok_or(EzGfxResult::InvalidArgument)
+}
+
+fn presentation_mode(value: u8) -> Result<PresentationMode, EzGfxResult> {
+    match value {
+        0 => Ok(PresentationMode::Fifo),
+        1 => Ok(PresentationMode::Mailbox),
+        2 => Ok(PresentationMode::Immediate),
+        3 => Ok(PresentationMode::Relaxed),
+        4 => Ok(PresentationMode::Paced),
+        _ => Err(EzGfxResult::InvalidArgument),
+    }
 }
 
 fn nonzero_xid(bits: u64) -> Result<u32, EzGfxResult> {
@@ -298,6 +310,7 @@ pub unsafe extern "C" fn ez_gfx_context_register_callback(
 pub unsafe extern "C" fn ez_gfx_frame_begin(
     context: EzGfxContext,
     surface: EzGfxSurface,
+    presentation_mode_code: u8,
     out_frame: *mut EzGfxFrame,
 ) -> EzGfxResult {
     catch_status(|| {
@@ -306,6 +319,10 @@ pub unsafe extern "C" fn ez_gfx_frame_begin(
         }
         let context = try_handle!(ContextHandle, context);
         let surface = try_handle!(SurfaceHandle, surface);
+        let presentation_mode = match presentation_mode(presentation_mode_code) {
+            Ok(mode) => mode,
+            Err(status) => return status,
+        };
         if let Err(status) = callback::check_entry(context) {
             return status;
         }
@@ -313,7 +330,7 @@ pub unsafe extern "C" fn ez_gfx_frame_begin(
             EzGfxResult::Ok => {}
             status => return status,
         }
-        if let Err(status) = raw::begin_render(context, surface) {
+        if let Err(status) = raw::begin_render(context, surface, presentation_mode) {
             return status.into();
         }
         let serial = match raw::current_frame_serial(context) {
@@ -891,6 +908,34 @@ pub unsafe extern "C" fn ez_gfx_surface_get_extent(
                     out_width.write(width);
                     out_height.write(height);
                 }
+                EzGfxResult::Ok
+            }
+            Err(status) => status.into(),
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Queries the compact presentation-mode set available for a surface.
+///
+/// # Safety
+///
+/// `out_modes` must address one writable, aligned value for this call.
+pub unsafe extern "C" fn ez_gfx_surface_get_presentation_modes(
+    context: EzGfxContext,
+    surface: EzGfxSurface,
+    out_modes: *mut EzGfxPresentationModes,
+) -> EzGfxResult {
+    catch_status(|| {
+        if out_modes.is_null() || !out_modes.is_aligned() {
+            return EzGfxResult::InvalidArgument;
+        }
+        let context = try_handle!(ContextHandle, context);
+        let surface = try_handle!(SurfaceHandle, surface);
+        match raw::presentation_modes(context, surface) {
+            Ok(modes) => {
+                // SAFETY: the caller keeps validated writable storage live through this write.
+                unsafe { out_modes.write(EzGfxPresentationModes { bits: modes.bits() }) };
                 EzGfxResult::Ok
             }
             Err(status) => status.into(),

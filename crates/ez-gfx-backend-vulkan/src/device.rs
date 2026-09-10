@@ -1,13 +1,22 @@
 use super::surface::{WsiCapabilities, instance_extensions};
+#[path = "device_presentation.rs"]
+mod presentation;
+pub(super) use presentation::available_extension;
+pub(crate) use presentation::device_extensions;
+use presentation::{
+    FIFO_LATEST_READY_EXT, FIFO_LATEST_READY_KHR, PhysicalDevicePresentModeFifoLatestReadyFeatures,
+    supports_fifo_latest_ready,
+};
 
 use super::{
     AdapterCapabilities, AdapterClass, AdapterInfo, AllocationError, AllocationSizes, Allocator,
     AllocatorCreateDesc, Backend, CStr, CString, CompressionSupport,
     DEFAULT_ALLOCATION_BLOCK_POLICY, DeferredNativeResource, DeferredResource, DeviceProbe, Entry,
     FrameSlot, HalError, MemoryAllocator, NativeContext, NativeSurface, PendingDevice,
-    SemanticProfile, TEXTURE_DESCRIPTOR_CAPACITY, create_frame_slots, khr, map_allocation_hal,
-    map_allocation_vk, map_allocator, map_allocator_hal, map_vk, paired_texture_capacity,
-    texture_descriptor_layout_bindings, texture_heap_rejection, transfer, vk,
+    PresentationMode, PresentationSupport, SemanticProfile, TEXTURE_DESCRIPTOR_CAPACITY,
+    create_frame_slots, khr, map_allocation_hal, map_allocation_vk, map_allocator,
+    map_allocator_hal, map_vk, paired_texture_capacity, texture_descriptor_layout_bindings,
+    texture_heap_rejection, transfer, vk,
 };
 
 fn create_device_frame_state(
@@ -113,30 +122,6 @@ fn draw_feature_rejection(
         None
     }
 }
-pub(super) fn available_extension(
-    available: &[vk::ExtensionProperties],
-    name: &'static CStr,
-) -> Option<*const core::ffi::c_char> {
-    available
-        .iter()
-        .any(|extension| {
-            // SAFETY: Vulkan guarantees a NUL-terminated fixed-size extension name.
-            (unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) }) == name
-        })
-        .then_some(name.as_ptr())
-}
-pub(crate) fn device_extensions(
-    available: &[vk::ExtensionProperties],
-) -> (Vec<*const core::ffi::c_char>, bool) {
-    let swapchain = available_extension(available, khr::swapchain::NAME).is_some();
-    let mut enabled = Vec::with_capacity(2);
-    enabled.extend(swapchain.then_some(khr::swapchain::NAME.as_ptr()));
-    enabled.extend(
-        available_extension(available, khr::portability_subset::NAME)
-            .map(|_| khr::portability_subset::NAME.as_ptr()),
-    );
-    (enabled, swapchain)
-}
 
 pub(crate) const fn cached_device_supports_surface(
     wants_surface: bool,
@@ -230,12 +215,14 @@ impl NativeContext {
             texture_descriptor_set: None,
             sampler_anisotropy: false,
             swapchain_loader: None,
+            presentation_support: PresentationSupport::default(),
             swapchain: None,
             swapchain_views: Vec::new(),
             swapchain_finished: Vec::new(),
             swapchain_initialized: Vec::new(),
             swapchain_format: vk::Format::UNDEFINED,
             swapchain_extent: vk::Extent2D::default(),
+            swapchain_presentation_mode: PresentationMode::Fifo,
             frame_slots: Vec::new(),
             frame_cursor: 0,
             next_frame_value: 1,
@@ -478,18 +465,34 @@ impl NativeContext {
                     .enumerate_device_extension_properties(physical)
             }
             .map_err(map_vk)?;
-            let (enabled_extensions, swapchain_enabled) =
+            let (mut enabled_extensions, swapchain_enabled, fifo_latest_ready_extension) =
                 device_extensions(&available_device_extensions);
             if surface.is_some() && !swapchain_enabled {
                 continue;
             }
-            let create = vk::DeviceCreateInfo::default()
+            let fifo_latest_ready_enabled =
+                supports_fifo_latest_ready(&self.instance, physical, fifo_latest_ready_extension);
+            if !fifo_latest_ready_enabled {
+                enabled_extensions.pop_if(|extension| {
+                    *extension == FIFO_LATEST_READY_KHR.as_ptr()
+                        || *extension == FIFO_LATEST_READY_EXT.as_ptr()
+                });
+            }
+            let mut latest_ready = PhysicalDevicePresentModeFifoLatestReadyFeatures {
+                present_mode_fifo_latest_ready: vk::TRUE,
+                ..Default::default()
+            };
+            let mut create = vk::DeviceCreateInfo::default()
                 .enabled_features(&enabled_core)
                 .enabled_extension_names(&enabled_extensions)
                 .queue_create_infos(&queue_infos)
                 .push_next(&mut enabled11)
                 .push_next(&mut enabled12)
                 .push_next(&mut enabled13);
+            if fifo_latest_ready_enabled {
+                latest_ready.p_next = create.p_next.cast_mut();
+                create.p_next = (&raw const latest_ready).cast();
+            }
             // SAFETY: the physical device and queue family were queried from this live instance.
             let device =
                 unsafe { self.instance.create_device(physical, &create, None) }.map_err(map_vk)?;
@@ -715,7 +718,7 @@ impl NativeContext {
             self.texture_descriptor_pool = pending.descriptor_pool.take();
             self.texture_descriptor_layout = pending.descriptor_layout.take();
             self.texture_descriptor_set = Some(descriptor_set);
-            self.swapchain_loader = pending.swapchain_loader.take();
+            self.presentation_support.fifo_latest_ready = fifo_latest_ready_enabled;
             self.image_available = pending.image_available.take();
             self.frame_slots = frame_slots;
             return Ok(adapter);

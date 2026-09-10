@@ -256,7 +256,11 @@ fn main() -> anyhow::Result<()> {
         let indirect = context.acquire_counter_buffer_from(draws.as_slice())?;
         let params_buffer = context.acquire_value_buffer(params)?;
         let mut frame = surface.begin_frame()?;
-        let swapchain_target = frame.configure_swapchain(window_frame.size, Format::Bgra8Srgb)?;
+        let swapchain_target = frame.configure_swapchain(
+            window_frame.size,
+            Format::Bgra8Srgb,
+            ez_gfx::PresentationMode::Immediate,
+        )?;
         frame.bind_buffer("params", &params_buffer)?;
         frame.bind_buffer("imgui_commands", &commands)?;
         frame.execute_graphics(

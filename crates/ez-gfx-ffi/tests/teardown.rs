@@ -1,4 +1,4 @@
-//! Teardown completion contracts for the ABI 39 destroy exports.
+//! Teardown completion contracts for the ABI 40 destroy exports.
 //!
 //! Abandonment itself is not injectable here: it requires submitted native
 //! work that survives device loss, which no validation-level failure can

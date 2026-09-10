@@ -12,6 +12,21 @@ pub enum EzGfxBackend {
     Metal = 3,
 }
 
+/// Requested swapchain presentation behavior.
+#[repr(u8)]
+pub enum EzGfxPresentationMode {
+    /// Ordered, tear-free presentation at vertical blank.
+    Fifo = 0,
+    /// Newest-frame, tear-free presentation at vertical blank.
+    Mailbox = 1,
+    /// Unsynchronized presentation that may tear.
+    Immediate = 2,
+    /// Adaptive FIFO that may present immediately after a missed blank.
+    Relaxed = 3,
+    /// Latest-ready, tear-free presentation at vertical blank.
+    Paced = 4,
+}
+
 /// Runtime operation phase.
 #[repr(u8)]
 pub enum EzGfxRuntimePhase {

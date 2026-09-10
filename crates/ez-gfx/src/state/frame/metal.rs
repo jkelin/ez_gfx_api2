@@ -1,4 +1,5 @@
 use crate::Result;
+use ez_gfx_core::capability::PresentationMode;
 
 use super::{
     Backend, ContextState, Error, ExecutableNode, ExecutionAction, FrameExecutionPlan,
@@ -490,6 +491,9 @@ pub(super) fn execute_metal_frame_plan(
                 .ok_or(Error::InvalidContext)
         })
         .transpose()?;
+    let presentation_mode = surface
+        .as_ref()
+        .map_or(PresentationMode::Fifo, |surface| surface.presentation_mode);
     // Target-only frames size draws and validations from the target extents.
     let extent = surface
         .as_ref()
@@ -573,7 +577,11 @@ pub(super) fn execute_metal_frame_plan(
     let actions = build_metal_actions(plan, &inputs)?;
     let result = match surface.as_mut().map(|surface| &mut surface.native) {
         Some(NativeSurface::Metal(surface)) => native
-            .execute_frame(Some((surface, extent)), &actions, capture)
+            .execute_frame(
+                Some((surface, extent, presentation_mode)),
+                &actions,
+                capture,
+            )
             .map_err(map_hal),
         None => native.execute_frame(None, &actions, false).map_err(map_hal),
         Some(NativeSurface::Vulkan(_)) => Err(Error::NativeFailure),

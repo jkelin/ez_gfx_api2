@@ -1,6 +1,6 @@
 # ez-gfx-backend-metal
 
-Apple Metal HAL using `objc2-metal`. It owns admitted devices, command queues, synchronization, heaps, allocator-backed textures, blit upload/readback, compiler-produced metallib libraries, and CAMetalLayer drawable presentation while retaining its CAMetalLayer through the surface lifetime. Display synchronization is disabled so presentation throughput is not capped to vertical blank.
+Apple Metal HAL using `objc2-metal`. It owns admitted devices, command queues, synchronization, heaps, allocator-backed textures, blit upload/readback, compiler-produced metallib libraries, and CAMetalLayer drawable presentation while retaining its CAMetalLayer through the surface lifetime. FIFO and immediate modes set display synchronization before drawable acquisition; surface teardown restores the host layer's original setting.
 
 Surfaces and graphics pipelines use BGRA8 sRGB, matching the frame graph. Shader colors and clears are linear; captured RGBA bytes retain sRGB encoding and unchanged alpha. Runtime loading accepts offline metallib, not development MSL.
 
