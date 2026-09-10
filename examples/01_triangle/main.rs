@@ -73,8 +73,7 @@ fn main() -> anyhow::Result<()> {
             &indirect,
             DynamicPipelineState::from_abi(0, 0, 0, 0).unwrap(),
         )?;
-        example.handle_frame(frame, swapchain_target)?;
-        example.update_title(&context);
+        example.handle_frame(&context, frame, swapchain_target)?;
     }
     Ok(())
 }
