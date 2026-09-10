@@ -1055,7 +1055,7 @@ impl Surface {
     /// Returns the presentation modes available for this initialized surface.
     ///
     /// # Errors
-    /// Returns [`Error`] when the surface is stale or the backend query fails.
+    /// Returns [`Error`] when the surface is stale, its device is uninitialized, or the backend query fails.
     pub fn presentation_modes(&self) -> Result<PresentationModes> {
         let context = Context {
             inner: Rc::clone(&self.inner.context),
@@ -1071,7 +1071,7 @@ impl Surface {
     /// Resolves a requested presentation mode using the public deterministic fallback order.
     ///
     /// # Errors
-    /// Returns [`Error`] when the surface query fails or FIFO is unavailable.
+    /// Returns [`Error`] when the surface query fails or no supported fallback is available.
     pub fn resolve_presentation_mode(
         &self,
         requested: PresentationMode,
