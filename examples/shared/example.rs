@@ -356,7 +356,7 @@ impl Example {
     /// updates perform no allocation. A failed diagnostics query renders as
     /// `diag ?` instead of failing the frame; titles stay available after
     /// device loss.
-    pub fn update_title(&mut self, context: &Context) {
+    fn refresh_title(&mut self, context: &Context) {
         // Query before clearing: a missing window still advances no state, and
         // the previous title simply persists when the host is gone.
         let diagnostics = context.resource_diagnostics().ok();
@@ -374,9 +374,13 @@ impl Example {
         window.set_title(&self.title_text);
     }
 
-    /// Consumes the pending frame and configures terminal swapchain readback.
+    /// Consumes the pending frame, presents it, then refreshes the window title.
+    ///
+    /// The title reflects the FPS sample of this completed presentation, so it
+    /// runs only after `finish` succeeds; failed frames keep the previous title.
     pub fn handle_frame(
         &mut self,
+        context: &Context,
         mut frame: Frame,
         swapchain_target: ez_gfx::RenderTarget,
     ) -> Result<()> {
@@ -407,6 +411,10 @@ impl Example {
         }
         self.last_present = Some(presented_at);
         self.frames = self.frames.saturating_add(1);
+        // Successful presentation only: `finish` already returned, and `?`
+        // above skips this on failure, so a dropped frame never paints a
+        // title for a presentation that did not happen.
+        self.refresh_title(context);
         if self.frame_timings_enabled {
             self.frame_timings.push(FrameTiming {
                 frame: self.frames,
