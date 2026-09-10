@@ -160,6 +160,7 @@ fn insert_surface(
         SurfaceRecord {
             native,
             state,
+            initialized: false,
             presentation_mode: PresentationMode::Fifo,
             is_window,
         },
@@ -315,6 +316,7 @@ pub fn init_device(context: ContextHandle, surface: SurfaceHandle) -> Result<()>
             _ => Err(HalError::InvalidArgument),
         }
         .map_err(|error| map_native_loss(&context.identity, error))?;
+        record.initialized = true;
         context.active_surface = Some(surface);
         if first_initialization {
             let backend = match adapter.backend() {
@@ -339,10 +341,14 @@ pub(super) fn presentation_modes_for_record(
         .surfaces
         .get(&surface)
         .ok_or(Error::InvalidContext)?;
+    if !record.initialized {
+        return Err(Error::NotReady);
+    }
+
     match (&context.native, &record.native) {
         (NativeContext::Vulkan(native), NativeSurface::Vulkan(surface)) => {
             if surface.is_headless() {
-                Ok(PresentationModes::FIFO)
+                Ok(PresentationModes::NONE)
             } else {
                 native.presentation_modes(surface).map_err(map_hal)
             }

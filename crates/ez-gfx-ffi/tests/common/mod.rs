@@ -105,8 +105,17 @@ pub struct TestContext {
 }
 
 impl TestContext {
-    // Validation is opt-in so existing fixture callers retain their original device requirements.
     pub fn create_with_validation(backend: u8, validation: bool) -> Self {
+        let native = Self::create_uninitialized(backend, validation);
+        assert_eq!(
+            ez_gfx_context_init_device(native.context, native.surface),
+            EzGfxResult::Ok
+        );
+        native
+    }
+
+    // Validation is opt-in so existing fixture callers retain their original device requirements.
+    pub fn create_uninitialized(backend: u8, validation: bool) -> Self {
         let window = TestWindow::create_hidden();
         let mut native = Self {
             context: 0,
@@ -149,10 +158,6 @@ impl TestContext {
                     )
                 }
             },
-            EzGfxResult::Ok
-        );
-        assert_eq!(
-            ez_gfx_context_init_device(native.context, native.surface),
             EzGfxResult::Ok
         );
 

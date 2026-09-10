@@ -242,52 +242,37 @@ fn dropping_frame_aborts_and_allows_next_transaction() -> Result<()> {
 
 #[cfg(not(target_vendor = "apple"))]
 #[test]
-fn configured_swapchain_target_retains_surface_through_completion() -> Result<()> {
+fn headless_surface_rejects_presentation_configuration() -> Result<()> {
     let (_context, surface) = headless()?;
-    let surface_lease = Rc::downgrade(&surface.inner);
-    let mut frame = surface.begin_frame()?;
-    let target = frame.configure_swapchain(
-        [1, 1],
-        ez_gfx_runtime::target::Format::Bgra8Srgb,
-        PresentationMode::Fifo,
-    )?;
 
-    assert_eq!(target.extent(), Ok((1, 1)));
+    assert_eq!(surface.presentation_modes(), Ok(PresentationModes::NONE));
     assert_eq!(
-        target.format(),
-        Ok(ez_gfx_runtime::target::Format::Bgra8Srgb)
+        surface.resolve_presentation_mode(PresentationMode::Fifo),
+        Err(Error::Unsupported)
     );
 
-    assert_eq!(frame.finish(), Err(Error::NotReady));
-    let mut next = surface.begin_frame()?;
-    let next_target = next.configure_swapchain(
-        [1, 1],
-        ez_gfx_runtime::target::Format::Bgra8Srgb,
-        PresentationMode::Fifo,
-    )?;
-    assert!(Rc::ptr_eq(&target.inner, &next_target.inner));
-    drop(next);
-
-    drop(surface);
-    assert!(surface_lease.upgrade().is_some());
-    drop(target);
-    assert!(surface_lease.upgrade().is_some());
-    drop(next_target);
-    assert!(surface_lease.upgrade().is_none());
+    let mut frame = surface.begin_frame()?;
+    assert!(matches!(
+        frame.configure_swapchain(
+            [1, 1],
+            ez_gfx_runtime::target::Format::Bgra8Srgb,
+            PresentationMode::Fifo,
+        ),
+        Err(Error::Unsupported)
+    ));
+    assert_eq!(frame.finish(), Err(Error::Unsupported));
+    drop(surface.begin_frame()?);
     Ok(())
 }
 
 #[cfg(not(target_vendor = "apple"))]
 #[test]
 fn poisoned_frame_finish_returns_exact_record_error_without_submit() -> Result<()> {
-    let (_context, surface) = headless()?;
-    let mut frame = surface.begin_frame()?;
+    let (context, surface) = headless()?;
+    let mut frame = context.begin_frame()?;
     assert!(matches!(
-        frame.configure_swapchain(
-            [0, 1],
-            ez_gfx_runtime::target::Format::Bgra8Srgb,
-            PresentationMode::Fifo,
-        ),
+        frame
+            .configure_render_target("invalid", [0, 1], ez_gfx_runtime::target::Format::Bgra8Srgb,),
         Err(Error::InvalidArgument)
     ));
 

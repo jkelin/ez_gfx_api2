@@ -463,6 +463,33 @@ fn native_extent_sync_preserves_explicit_headless_extent() {
 
 #[cfg(not(target_vendor = "apple"))]
 #[test]
+fn presentation_modes_require_each_surface_to_be_initialized() {
+    let context = create_context(vulkan_options().unwrap()).unwrap();
+    let first =
+        create_surface_headless(context, HeadlessSurfaceOptions::new(1, 1, 0).unwrap()).unwrap();
+    let second =
+        create_surface_headless(context, HeadlessSurfaceOptions::new(1, 1, 0).unwrap()).unwrap();
+
+    assert_eq!(presentation_modes(context, first), Err(Error::NotReady));
+    assert_eq!(presentation_modes(context, second), Err(Error::NotReady));
+    assert_eq!(init_device(context, first), Ok(()));
+    assert_eq!(
+        presentation_modes(context, first),
+        Ok(PresentationModes::NONE)
+    );
+    assert_eq!(presentation_modes(context, second), Err(Error::NotReady));
+
+    assert_eq!(frame_begin(context), Ok(()));
+    assert_eq!(
+        configure_surface(context, first, PresentationMode::Fifo),
+        Err(Error::Unsupported)
+    );
+    assert_eq!(frame_abort(context), Ok(()));
+    assert_eq!(destroy_context(context), Ok(()));
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
 fn recursive_context_access_returns_native_failure_without_panicking() {
     let context = thread_exit_context();
 

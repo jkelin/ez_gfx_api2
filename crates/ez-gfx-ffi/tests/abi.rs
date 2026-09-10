@@ -600,6 +600,36 @@ fn context_lifecycle_rejects_cross_thread_destroy_and_invalidates_destroyed_hand
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn presentation_modes_are_not_ready_until_surface_device_initialization() {
+    use ez_gfx_ffi::ez_gfx_context_init_device;
+
+    let native = common::TestContext::create_uninitialized(2, false);
+    let mut modes = EzGfxPresentationModes { bits: u8::MAX };
+
+    assert_eq!(
+        // SAFETY: mode-set output storage is live and aligned.
+        unsafe {
+            ez_gfx_surface_get_presentation_modes(native.context, native.surface, &raw mut modes)
+        },
+        EzGfxResult::NotReady
+    );
+    assert_eq!(modes.bits, u8::MAX);
+    assert_eq!(
+        ez_gfx_context_init_device(native.context, native.surface),
+        EzGfxResult::Ok
+    );
+    assert_eq!(
+        // SAFETY: mode-set output storage is live and aligned.
+        unsafe {
+            ez_gfx_surface_get_presentation_modes(native.context, native.surface, &raw mut modes)
+        },
+        EzGfxResult::Ok
+    );
+    assert_ne!(modes.bits & 1, 0);
+}
+
 #[cfg(not(target_vendor = "apple"))]
 #[test]
 fn frame_handles_are_thread_local_terminal_and_context_owned() {

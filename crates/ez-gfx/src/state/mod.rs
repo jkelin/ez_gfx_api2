@@ -169,6 +169,7 @@ struct RetiredTexture {
 struct SurfaceRecord {
     native: NativeSurface,
     state: SurfaceState,
+    initialized: bool,
     presentation_mode: PresentationMode,
     is_window: bool,
 }

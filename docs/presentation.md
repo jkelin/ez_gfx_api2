@@ -1,6 +1,6 @@
 # Presentation
 
-`Frame::configure_swapchain(size, format, presentation_mode)` selects presentation behavior for that frame. `Surface::presentation_modes()` returns the modes available for the initialized surface; Vulkan support is surface-dependent and therefore cannot be inferred from context or adapter options. `Surface::resolve_presentation_mode(requested)` exposes the same deterministic resolution used during frame configuration.
+`Frame::configure_swapchain(size, format, presentation_mode)` selects presentation behavior for that frame. After successful device initialization, `Surface::presentation_modes()` returns the modes available for that surface; before initialization it returns `NotReady`. Vulkan support is surface-dependent and therefore cannot be inferred from context or adapter options. `Surface::resolve_presentation_mode(requested)` exposes the same deterministic resolution used during frame configuration.
 
 Modes:
 
@@ -10,7 +10,7 @@ Modes:
 - `Relaxed`: FIFO while on time, with an immediate late presentation after a missed blank.
 - `Paced`: latest-ready queued frame at vertical blank, tear-free. This is Vulkan FIFO-latest-ready behavior, not ordinary FIFO.
 
-Every real presentation surface must report `Fifo`. A Vulkan headless surface reports only logical `Fifo`; it has no presentable native swapchain, so finishing a surface frame remains `NotReady`. Unsupported requests resolve in this order:
+Every presentable surface must report `Fifo`. A Vulkan headless surface reports no presentation modes because it has no presentable native swapchain; resolving or configuring any presentation mode therefore returns `Unsupported`. Unsupported requests on presentable surfaces resolve in this order:
 
 - `Fifo` → `Fifo`
 - `Mailbox` → `Mailbox`, `Paced`, `Fifo`
