@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use ez_gfx_compiler::{Target, compile_shader};
+use ez_gfx_compiler::{EasyGraphicsCompiler, Target};
 use std::{fs, path::PathBuf};
 
 #[derive(Parser)]
@@ -44,9 +44,9 @@ fn run(cli: &Cli) -> Result<()> {
         .unwrap_or_else(|| std::path::Path::new("."));
     fs::create_dir_all(parent)
         .with_context(|| format!("create artifact directory {}", parent.display()))?;
-    let bytes = compile_shader(&cli.source, &cli.targets, cli.development)
+    let compiled = EasyGraphicsCompiler::compile_shader(&cli.source, &cli.targets, cli.development)
         .with_context(|| format!("compile shader source {}", cli.source.display()))?;
-    fs::write(&output, bytes)
+    fs::write(&output, compiled.save_shader())
         .with_context(|| format!("write shader artifact {}", output.display()))?;
     Ok(())
 }

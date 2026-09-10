@@ -55,11 +55,10 @@ fn round_trip_preserves_digest_and_variants() {
 }
 
 #[test]
-fn artifact_allows_only_one_entry_point_per_stage() {
+fn artifact_rejects_duplicate_entry_target_products() {
     let variants = vec![
         variant(Target::Spirv, Stage::Vertex, "vs_a", "spirv_1_5", 1),
-        variant(Target::Dxil, Stage::Vertex, "vs_b", "sm_6_5", 2),
-        variant(Target::Metallib, Stage::Vertex, "vs_a", "metallib_3_0", 3),
+        variant(Target::Spirv, Stage::Vertex, "vs_a", "spirv_1_5", 2),
     ];
 
     assert!(matches!(
@@ -68,7 +67,7 @@ fn artifact_allows_only_one_entry_point_per_stage() {
             Provenance::new("s", "v", vec![], "t"),
             variants
         ),
-        Err(ArtifactError::DuplicateStage(Stage::Vertex))
+        Err(ArtifactError::DuplicateVariant)
     ));
 }
 
@@ -195,18 +194,18 @@ fn rejects_duplicate_exact_variant_and_invalid_bounds() {
 }
 
 #[test]
-fn encoding_uses_format_v4_and_rejects_v3() {
-    assert_eq!(ARTIFACT_FORMAT_VERSION, 4);
+fn encoding_uses_format_v5_and_rejects_v4() {
+    assert_eq!(ARTIFACT_FORMAT_VERSION, 5);
 
     let bytes = sample().encode().unwrap();
-    assert_eq!(&bytes[..8], b"EZSHDR04");
-    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 4);
+    assert_eq!(&bytes[..8], b"EZSHDR05");
+    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 5);
 
-    let mut version_three = bytes;
-    version_three[..8].copy_from_slice(b"EZSHDR03");
-    version_three[8..12].copy_from_slice(&3_u32.to_le_bytes());
+    let mut version_four = bytes;
+    version_four[..8].copy_from_slice(b"EZSHDR04");
+    version_four[8..12].copy_from_slice(&4_u32.to_le_bytes());
     assert!(matches!(
-        Artifact::decode(&version_three),
+        Artifact::decode(&version_four),
         Err(ArtifactError::InvalidHeader)
     ));
 }

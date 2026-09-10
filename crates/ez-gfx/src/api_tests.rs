@@ -3,7 +3,9 @@ use static_assertions::assert_not_impl_any;
 
 assert_not_impl_any!(Context: Send, Sync);
 assert_not_impl_any!(Surface: Send, Sync);
-assert_not_impl_any!(Shader: Send, Sync);
+assert_not_impl_any!(ComputeShader: Send, Sync);
+assert_not_impl_any!(VertexShader: Send, Sync);
+assert_not_impl_any!(FragmentShader: Send, Sync);
 assert_not_impl_any!(Texture: Send, Sync);
 assert_not_impl_any!(RenderTarget: Send, Sync);
 assert_not_impl_any!(VertexHeap<u32>: Send, Sync);

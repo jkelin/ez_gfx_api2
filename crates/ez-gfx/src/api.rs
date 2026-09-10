@@ -114,6 +114,37 @@ pub enum Event<'a> {
     Snapshot(&'a [u8]),
 }
 
+/// Point-in-time pending-upload counts with retained bytes plus retained cache sizes.
+///
+/// Unlike [`Context::texture_upload_telemetry`], which reports monotonic pipeline
+/// counters, this snapshot describes what is outstanding right now. Counts are
+/// outstanding upload allocations and bytes accumulate with saturation, never
+/// wrapping. Vertex and index uploads each carry the byte size reserved by the
+/// original upload.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResourceDiagnostics {
+    /// Texture uploads awaiting decode or transfer completion.
+    pub pending_textures: u32,
+    /// Admitted source bytes (decode) plus decoded staging bytes (transfer).
+    pub pending_texture_bytes: u64,
+    /// Vertex uploads awaiting transfer completion.
+    pub pending_vertex_uploads: u32,
+    /// Vertex bytes awaiting transfer completion.
+    pub pending_vertex_bytes: u64,
+    /// Index uploads awaiting transfer completion.
+    pub pending_index_uploads: u32,
+    /// Index bytes awaiting transfer completion.
+    pub pending_index_bytes: u64,
+    /// Staging buckets retained across the shared, buffer, and counter pools.
+    pub staging_buckets: u32,
+    /// Staging bucket capacity retained across those pools.
+    pub staging_bytes: u64,
+    /// Compiled pipeline entries retained in the context cache.
+    pub pipeline_entries: u32,
+    /// Bytes retained across completed readback frames.
+    pub readback_bytes: u64,
+}
+
 type EventCallback = dyn for<'a> FnMut(Event<'a>);
 #[derive(Clone, Copy)]
 struct CachedRenderTarget {
@@ -387,6 +418,28 @@ impl Context {
         self.complete(state::texture_upload_telemetry(self.raw()))
     }
 
+    /// Returns pending-upload counts with retained bytes plus retained cache sizes.
+    ///
+    /// Decode-pending textures report admitted source bytes; transfer-pending
+    /// textures report decoded staging bytes. Vertex and index counts are
+    /// outstanding upload allocations. Device loss does not fail this
+    /// observation: teardown titles keep reporting until context destruction.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when the context is stale, called from the wrong thread,
+    /// reentered from a callback, or when callback dispatch itself fails.
+    pub fn resource_diagnostics(&self) -> Result<ResourceDiagnostics> {
+        self.check_entry()?;
+        let snapshot = state::resource_diagnostics(self.raw())?;
+        // The state query tolerates device loss, but the seam still delivers
+        // queued events; only a loss-driven dispatch failure keeps the snapshot,
+        // so callback panics and reentrancy keep failing fast.
+        match self.dispatch_events() {
+            Ok(()) | Err(Error::DeviceLost) => Ok(snapshot),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Deterministically destroys this context and every resource it owns.
     ///
     /// All outstanding resource wrappers become stale.
@@ -531,6 +584,8 @@ impl Surface {
     }
 
     /// Enables or disables presented snapshot caching.
+    /// Enabling this performs a GPU-to-CPU copy and completion wait for every presented frame.
+    /// Prefer one-frame [`RenderTarget::prepare_readback`] requests for occasional captures.
     ///
     /// # Errors
     /// Returns [`Error`] when the surface is stale.
@@ -555,6 +610,8 @@ impl Context {
     /// report a host-managed extent, notably Wayland, publish the surface unready until the
     /// toolkit-neutral caller forwards its configure-event dimensions through [`Surface::resize`].
     /// Callers never provide dimensions in the creation descriptor.
+    /// `cache_presented_snapshots` performs a GPU-to-CPU copy and completion wait on every
+    /// presented frame. Pass `false` unless continuous snapshots are required.
     ///
     /// # Errors
     /// Returns [`Error`] when the handle is unavailable or unsupported, native creation or device
@@ -639,23 +696,65 @@ impl Drop for ShaderInner {
     }
 }
 
-/// Owning shader artifact.
-pub struct Shader {
-    inner: Rc<ShaderInner>,
+macro_rules! define_shader {
+    ($name:ident, $doc:literal) => {
+        #[doc = $doc]
+        pub struct $name {
+            inner: Rc<ShaderInner>,
+        }
+    };
+}
+
+define_shader!(ComputeShader, "Owning compute-stage shader handle.");
+define_shader!(VertexShader, "Owning vertex-stage shader handle.");
+define_shader!(FragmentShader, "Owning fragment-stage shader handle.");
+
+impl ez_gfx_artifact::ShaderLoader for Context {
+    type ComputeShader = ComputeShader;
+    type VertexShader = VertexShader;
+    type FragmentShader = FragmentShader;
+    type Error = Error;
+
+    fn load_compute_shader(
+        &self,
+        artifact: &[u8],
+        entry_point: &str,
+    ) -> Result<Self::ComputeShader> {
+        self.load_stage_shader(artifact, ez_gfx_artifact::Stage::Compute, entry_point)
+            .map(|inner| ComputeShader { inner })
+    }
+
+    fn load_vertex_shader(&self, artifact: &[u8], entry_point: &str) -> Result<Self::VertexShader> {
+        self.load_stage_shader(artifact, ez_gfx_artifact::Stage::Vertex, entry_point)
+            .map(|inner| VertexShader { inner })
+    }
+
+    fn load_fragment_shader(
+        &self,
+        artifact: &[u8],
+        entry_point: &str,
+    ) -> Result<Self::FragmentShader> {
+        self.load_stage_shader(artifact, ez_gfx_artifact::Stage::Fragment, entry_point)
+            .map(|inner| FragmentShader { inner })
+    }
 }
 
 impl Context {
-    /// Loads a validated shader artifact.
-    ///
-    /// # Errors
-    /// Returns [`Error`] when the artifact or native shader is invalid.
-    pub fn load_shader(&self, artifact: &[u8]) -> Result<Shader> {
+    fn load_stage_shader(
+        &self,
+        artifact: &[u8],
+        stage: ez_gfx_artifact::Stage,
+        entry_point: &str,
+    ) -> Result<Rc<ShaderInner>> {
         self.check_entry()?;
-        let result = state::load_shader(self.raw(), artifact).map(|handle| Shader {
-            inner: Rc::new(ShaderInner {
+        if entry_point.is_empty() || entry_point.len() > 16 * 1024 || entry_point.contains('\0') {
+            return self.complete(Err(Error::InvalidArgument));
+        }
+        let result = state::load_shader(self.raw(), artifact, stage, entry_point).map(|handle| {
+            Rc::new(ShaderInner {
                 context: Rc::clone(&self.inner),
                 handle,
-            }),
+            })
         });
         self.complete(result)
     }

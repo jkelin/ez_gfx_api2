@@ -1,7 +1,7 @@
 //! Runtime in-memory shader compilation contract tests.
 
 use ez_gfx_artifact::{Artifact, Stage, Target};
-use ez_gfx_compiler::compile_shader;
+use ez_gfx_compiler::EasyGraphicsCompiler;
 use ez_gfx_core::{Backend, capability::SemanticProfile};
 use ez_gfx_runtime::shader::{RuntimeShader, ShaderLoadError};
 use std::sync::LazyLock;
@@ -49,7 +49,7 @@ fn compile_artifacts() -> anyhow::Result<Vec<ArtifactCase>> {
     shaders
         .into_iter()
         .map(|(name, source, has_compute)| {
-            let bytes = compile_shader(
+            let compiled = EasyGraphicsCompiler::compile_shader(
                 &workspace_root.join(source),
                 &[
                     ez_gfx_compiler::Target::Spirv,
@@ -60,7 +60,7 @@ fn compile_artifacts() -> anyhow::Result<Vec<ArtifactCase>> {
             )?;
             Ok(ArtifactCase {
                 name,
-                bytes,
+                bytes: compiled.save_shader(),
                 has_compute,
             })
         })
@@ -68,15 +68,26 @@ fn compile_artifacts() -> anyhow::Result<Vec<ArtifactCase>> {
 }
 
 #[test]
-fn runtime_compiled_artifacts_select_every_stage_without_entry_requests() -> anyhow::Result<()> {
+fn runtime_compiled_artifacts_select_each_exact_stage_entry() -> anyhow::Result<()> {
     for case in artifacts()? {
         let (name, bytes, has_compute) = (case.name, case.bytes.as_slice(), case.has_compute);
         for backend in [Backend::Vulkan, Backend::Dx12] {
-            let shader = RuntimeShader::load(bytes, backend, SemanticProfile::V1)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-            assert!(shader.graphics_pair().is_ok(), "{name} {backend:?}");
+            for (stage, entry) in [
+                (Stage::Vertex, "vertexmain"),
+                (Stage::Fragment, "fragmentmain"),
+            ] {
+                RuntimeShader::load(bytes, backend, SemanticProfile::V1, stage, entry)
+                    .map_err(|error| anyhow::anyhow!("{name} {backend:?}: {error:?}"))?;
+            }
             assert_eq!(
-                shader.compute_product().is_ok(),
+                RuntimeShader::load(
+                    bytes,
+                    backend,
+                    SemanticProfile::V1,
+                    Stage::Compute,
+                    "computemain",
+                )
+                .is_ok(),
                 has_compute,
                 "{name} {backend:?}"
             );
@@ -98,7 +109,16 @@ fn runtime_compiled_metal_product_matches_the_host() -> anyhow::Result<()> {
                     .iter()
                     .any(|variant| variant.target == Target::Metallib)
             );
-            assert!(RuntimeShader::load(bytes, Backend::Metal, SemanticProfile::V1).is_ok());
+            assert!(
+                RuntimeShader::load(
+                    bytes,
+                    Backend::Metal,
+                    SemanticProfile::V1,
+                    Stage::Vertex,
+                    "vertexmain",
+                )
+                .is_ok()
+            );
         }
         #[cfg(not(target_vendor = "apple"))]
         {
@@ -115,7 +135,13 @@ fn runtime_compiled_metal_product_matches_the_host() -> anyhow::Result<()> {
                     .any(|variant| variant.target == Target::Metallib)
             );
             assert!(matches!(
-                RuntimeShader::load(bytes, Backend::Metal, SemanticProfile::V1),
+                RuntimeShader::load(
+                    bytes,
+                    Backend::Metal,
+                    SemanticProfile::V1,
+                    Stage::Vertex,
+                    "vertexmain",
+                ),
                 Err(ShaderLoadError::MissingProduct {
                     stage: Stage::Vertex
                 })

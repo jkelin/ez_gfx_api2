@@ -195,20 +195,25 @@ impl NativeContext {
     /// # Errors
     ///
     /// Returns an error if either shader index is invalid, root-signature creation fails, triangle-fan topology is requested, the color-write mask does not fit in `u8`, or the device cannot create the graphics pipeline state or command signature.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the backend boundary receives two explicit shaders, their product indices, and pipeline state"
+    )]
     pub fn create_graphics_pipeline(
         &self,
-        shader: &NativeShader,
+        vertex_shader: &NativeShader,
+        fragment_shader: &NativeShader,
         vertex_index: usize,
         fragment_index: usize,
         state: DynamicPipelineState,
         depth_required: bool,
         layouts: &[ShaderBufferLayout],
     ) -> Result<NativePipeline, HalError> {
-        let vertex = shader
+        let vertex = vertex_shader
             .products
             .get(vertex_index)
             .ok_or(HalError::InvalidArgument)?;
-        let fragment = shader
+        let fragment = fragment_shader
             .products
             .get(fragment_index)
             .ok_or(HalError::InvalidArgument)?;

@@ -1,7 +1,7 @@
 //! Owned shader compilation tests.
 
 use ez_gfx_artifact::Artifact;
-use ez_gfx_compiler::{CompilerError, Target, compile_shader};
+use ez_gfx_compiler::{CompilerError, EasyGraphicsCompiler, Target};
 use std::fs;
 
 const ALL_TARGETS: &[Target] = &[Target::Spirv, Target::Dxil, Target::Metal];
@@ -11,7 +11,7 @@ fn missing_shader_reports_its_path_before_native_compiler_use() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("missing.slang");
 
-    let error = compile_shader(&source, ALL_TARGETS, true).unwrap_err();
+    let error = EasyGraphicsCompiler::compile_shader(&source, ALL_TARGETS, true).unwrap_err();
 
     assert!(matches!(error, CompilerError::SourceRead { path, .. } if path == source));
 }
@@ -23,7 +23,7 @@ fn directory_with_slang_extension_is_rejected_as_a_non_file() {
     fs::create_dir(&source).unwrap();
 
     assert!(matches!(
-        compile_shader(&source, ALL_TARGETS, true),
+        EasyGraphicsCompiler::compile_shader(&source, ALL_TARGETS, true),
         Err(CompilerError::InvalidRequest("source file"))
     ));
 }
@@ -39,11 +39,11 @@ fn empty_and_duplicate_target_lists_are_rejected() {
     .unwrap();
 
     assert!(matches!(
-        compile_shader(&source, &[], true),
+        EasyGraphicsCompiler::compile_shader(&source, &[], true),
         Err(CompilerError::InvalidRequest("targets"))
     ));
     assert!(matches!(
-        compile_shader(&source, &[Target::Spirv, Target::Spirv], true),
+        EasyGraphicsCompiler::compile_shader(&source, &[Target::Spirv, Target::Spirv], true),
         Err(CompilerError::InvalidRequest("duplicate target"))
     ));
 }
@@ -60,7 +60,7 @@ fn non_lowercase_slang_source_extensions_are_rejected_before_native_compiler_use
         .unwrap();
 
         assert!(matches!(
-            compile_shader(&source, &[Target::Spirv], true),
+            EasyGraphicsCompiler::compile_shader(&source, &[Target::Spirv], true),
             Err(CompilerError::InvalidRequest("source extension"))
         ));
     }
@@ -79,9 +79,13 @@ fn target_order_does_not_change_artifact_bytes_when_slang_is_available() {
     )
     .unwrap();
 
-    let canonical = compile_shader(&source, ALL_TARGETS, true).unwrap();
-    let reversed =
-        compile_shader(&source, &[Target::Metal, Target::Dxil, Target::Spirv], true).unwrap();
+    let canonical = EasyGraphicsCompiler::compile_shader(&source, ALL_TARGETS, true).unwrap();
+    let reversed = EasyGraphicsCompiler::compile_shader(
+        &source,
+        &[Target::Metal, Target::Dxil, Target::Spirv],
+        true,
+    )
+    .unwrap();
 
     assert_eq!(canonical, reversed);
 }
@@ -99,7 +103,7 @@ fn compute_workgroup_size_is_serialized_for_every_target_when_slang_is_available
     )
     .unwrap();
 
-    let bytes = compile_shader(&source, ALL_TARGETS, true).unwrap();
+    let bytes = EasyGraphicsCompiler::compile_shader(&source, ALL_TARGETS, true).unwrap();
     let artifact = Artifact::decode(&bytes).unwrap();
     let metadata: serde_json::Value = serde_json::from_slice(&artifact.metadata).unwrap();
 
@@ -127,14 +131,14 @@ fn discovered_entries_compile_for_every_requested_target_when_slang_is_available
     )
     .unwrap();
 
-    let bytes = compile_shader(&source, ALL_TARGETS, true).unwrap();
+    let bytes = EasyGraphicsCompiler::compile_shader(&source, ALL_TARGETS, true).unwrap();
     let artifact = Artifact::decode(&bytes).unwrap();
 
     assert_eq!(artifact.variants.len(), 6);
 }
 
 #[test]
-fn duplicate_declared_stage_is_rejected_when_slang_is_available() {
+fn same_stage_entry_points_compile_and_round_trip_when_slang_is_available() {
     if shader_slang::GlobalSession::new().is_none() {
         return;
     }
@@ -149,9 +153,48 @@ fn duplicate_declared_stage_is_rejected_when_slang_is_available() {
     )
     .unwrap();
 
-    let error = compile_shader(&source, ALL_TARGETS, true).unwrap_err();
+    let compiled = EasyGraphicsCompiler::compile_shader(&source, ALL_TARGETS, true).unwrap();
+    let saved = compiled.save_shader();
+    let loaded = EasyGraphicsCompiler::load_compiled_shader(&saved).unwrap();
+    let artifact = Artifact::decode(&loaded).unwrap();
 
-    assert!(matches!(error, CompilerError::DuplicateStage(_)));
+    assert_eq!(artifact.variants.len(), 6);
+    assert_eq!(
+        artifact
+            .variants
+            .iter()
+            .map(|variant| variant.entry_point.as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["first", "second"])
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn apple_development_metal_compilation_emits_runtime_loadable_metallib() {
+    if shader_slang::GlobalSession::new().is_none() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("shader.slang");
+    fs::write(
+        &source,
+        "[shader(\"compute\")] [numthreads(1,1,1)] void main() {}",
+    )
+    .unwrap();
+
+    let compiled = EasyGraphicsCompiler::compile_shader(&source, &[Target::Metal], true).unwrap();
+    let artifact = Artifact::decode(&compiled).unwrap();
+
+    assert_eq!(artifact.variants.len(), 1);
+    assert_eq!(
+        artifact.variants[0].target,
+        ez_gfx_artifact::Target::Metallib
+    );
+    assert!(matches!(
+        artifact.variants[0].compatibility,
+        ez_gfx_artifact::TargetCompatibility::MetalLibrary { .. }
+    ));
 }
 
 #[test]
@@ -183,13 +226,18 @@ fn shared_buffer_semantics_compile_for_every_target_when_slang_is_available() {
     )
     .unwrap();
 
-    let bytes = compile_shader(&source, ALL_TARGETS, true).unwrap();
+    let bytes = EasyGraphicsCompiler::compile_shader(&source, ALL_TARGETS, true).unwrap();
     let artifact = Artifact::decode(&bytes).unwrap();
     let metadata: serde_json::Value = serde_json::from_slice(&artifact.metadata).unwrap();
 
     let reflections = metadata["reflections"].as_array().unwrap();
     assert_eq!(reflections.len(), ALL_TARGETS.len());
-    for target in ["Spirv", "Dxil", "Msl"] {
+    let metal_target = if cfg!(target_os = "macos") {
+        "Metallib"
+    } else {
+        "Msl"
+    };
+    for target in ["Spirv", "Dxil", metal_target] {
         let matching: Vec<_> = reflections
             .iter()
             .filter(|reflection| reflection["target"] == target)

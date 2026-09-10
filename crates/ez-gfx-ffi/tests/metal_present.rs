@@ -9,11 +9,11 @@ use ez_gfx_artifact::{
 };
 use ez_gfx_ffi::{
     EzGfxBackendContextDesc, EzGfxEvent, EzGfxEventKind, EzGfxRenderTargetDesc, EzGfxResult,
-    EzGfxTextureDesc, ez_gfx_context_create_backend, ez_gfx_context_destroy,
-    ez_gfx_context_register_callback, ez_gfx_context_wait_idle, ez_gfx_frame_end,
-    ez_gfx_frame_enqueue_texture_readback, ez_gfx_frame_execute_compute,
-    ez_gfx_render_target_create, ez_gfx_render_target_destroy, ez_gfx_render_target_frame_begin,
-    ez_gfx_shader_destroy, ez_gfx_shader_load_artifact, ez_gfx_texture_load, ez_gfx_texture_unload,
+    EzGfxTextureDesc, ez_gfx_compute_shader_destroy, ez_gfx_compute_shader_load,
+    ez_gfx_context_create_backend, ez_gfx_context_destroy, ez_gfx_context_register_callback,
+    ez_gfx_context_wait_idle, ez_gfx_frame_end, ez_gfx_frame_enqueue_texture_readback,
+    ez_gfx_frame_execute_compute, ez_gfx_render_target_create, ez_gfx_render_target_destroy,
+    ez_gfx_render_target_frame_begin, ez_gfx_texture_load, ez_gfx_texture_unload,
 };
 
 const WIDTH: u32 = 64;
@@ -208,14 +208,17 @@ fn metal_compute_submits_without_a_surface() {
         },
         EzGfxResult::Ok
     );
+    let entry = b"computemain";
     assert_eq!(
         {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            // SAFETY: Artifact, exact entry name, and output storage remain live through the call.
             unsafe {
-                ez_gfx_shader_load_artifact(
+                ez_gfx_compute_shader_load(
                     context,
                     artifact.as_ptr(),
                     artifact.len(),
+                    entry.as_ptr(),
+                    entry.len(),
                     &raw mut shader,
                 )
             }
@@ -230,7 +233,7 @@ fn metal_compute_submits_without_a_surface() {
     assert_eq!(ez_gfx_frame_end(context, frame), EzGfxResult::Ok);
     ez_gfx_render_target_destroy(context, target);
 
-    ez_gfx_shader_destroy(context, shader);
+    ez_gfx_compute_shader_destroy(context, shader);
     assert_eq!(ez_gfx_context_destroy(context), EzGfxResult::Ok);
     let _ = std::fs::remove_dir_all(root);
 }

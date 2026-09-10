@@ -5,12 +5,47 @@ use super::{
     D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
     D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE,
     D3D12_RTV_DIMENSION_TEXTURE2D, D3D12_TEXTURE_LAYOUT_UNKNOWN, DXGI_ALPHA_MODE_IGNORE,
-    DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
-    DXGI_PRESENT, DXGI_SAMPLE_DESC, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
-    DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, HWND,
-    HalError, ID3D12DescriptorHeap, ID3D12Resource, IDXGIFactory4, Interface, MemoryLocation,
-    NativeContext, NativeSurface, SurfaceDepth, map_allocator_hal, map_windows,
+    DXGI_FEATURE_PRESENT_ALLOW_TEARING, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
+    DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_PRESENT, DXGI_PRESENT_ALLOW_TEARING, DXGI_SAMPLE_DESC,
+    DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
+    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, DXGI_SWAP_EFFECT_FLIP_DISCARD,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT, HWND, HalError, ID3D12DescriptorHeap, ID3D12Resource,
+    IDXGIFactory4, IDXGIFactory5, Interface, MemoryLocation, NativeContext, NativeSurface,
+    PRESENT_SYNC_INTERVAL, SurfaceDepth, map_allocator_hal, map_windows,
 };
+
+fn factory_allows_tearing(factory: &IDXGIFactory4) -> bool {
+    let Ok(factory) = factory.cast::<IDXGIFactory5>() else {
+        return false;
+    };
+    let mut supported = 0_i32;
+    // SAFETY: `supported` is writable BOOL-compatible storage of the exact size declared to DXGI.
+    unsafe {
+        factory.CheckFeatureSupport(
+            DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+            (&raw mut supported).cast(),
+            u32::try_from(core::mem::size_of_val(&supported)).unwrap_or(u32::MAX),
+        )
+    }
+    .is_ok()
+        && supported != 0
+}
+
+const fn swapchain_flags(allow_tearing: bool) -> DXGI_SWAP_CHAIN_FLAG {
+    if allow_tearing {
+        DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+    } else {
+        DXGI_SWAP_CHAIN_FLAG(0)
+    }
+}
+
+pub(super) const fn dxgi_present_flags(allow_tearing: bool) -> DXGI_PRESENT {
+    if allow_tearing {
+        DXGI_PRESENT_ALLOW_TEARING
+    } else {
+        DXGI_PRESENT(0)
+    }
+}
 
 impl NativeContext {
     /// Acquires and presents one surface image; zero extents remain minimized.
@@ -31,7 +66,10 @@ impl NativeContext {
                 .swapchain
                 .as_ref()
                 .ok_or(HalError::NotReady)?
-                .Present(1, DXGI_PRESENT(0))
+                .Present(
+                    PRESENT_SYNC_INTERVAL,
+                    dxgi_present_flags(surface.allow_tearing),
+                )
         }
         .ok()
         .map_err(map_windows)?;
@@ -52,9 +90,11 @@ impl NativeContext {
             return Err(HalError::NotReady);
         }
         if surface.swapchain.is_none() {
-            let factory: IDXGIFactory4 =
-                // SAFETY: `CreateDXGIFactory1::<IDXGIFactory4>` takes no caller-provided pointers or other unsafe arguments.
-                unsafe { CreateDXGIFactory1() }.map_err(map_windows)?;
+            // SAFETY: factory creation takes no caller-provided pointers.
+            let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory1() }.map_err(map_windows)?;
+            let allow_tearing = factory_allows_tearing(&factory);
+            let flags = swapchain_flags(allow_tearing);
+            let desc_flags = u32::try_from(flags.0).map_err(|_| HalError::NativeFailure)?;
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -69,7 +109,7 @@ impl NativeContext {
                 Scaling: DXGI_SCALING_STRETCH,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 AlphaMode: DXGI_ALPHA_MODE_IGNORE,
-                Flags: 0,
+                Flags: desc_flags,
             };
             // SAFETY: `desc` is fully initialized and lives through `CreateSwapChainForHwnd`; `self.queue` is retained for the call, and both optional descriptor pointers are null.
             let created = unsafe {
@@ -82,6 +122,7 @@ impl NativeContext {
                 )
             }
             .map_err(map_windows)?;
+            surface.allow_tearing = allow_tearing;
             surface.swapchain = Some(created.cast().map_err(map_windows)?);
             surface.width = width;
             surface.height = height;
@@ -101,7 +142,7 @@ impl NativeContext {
                         width,
                         height,
                         DXGI_FORMAT_R8G8B8A8_UNORM,
-                        DXGI_SWAP_CHAIN_FLAG(0),
+                        swapchain_flags(surface.allow_tearing),
                     )
             }
             .map_err(map_windows)?;
@@ -308,5 +349,21 @@ impl NativeContext {
         }
         let _ = self.destroy_surface_depth(&mut surface);
         true
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::{PRESENT_SYNC_INTERVAL, dxgi_present_flags, swapchain_flags};
+
+    #[test]
+    fn presentation_tearing_flags_follow_capability() {
+        assert_eq!(PRESENT_SYNC_INTERVAL, 0);
+        assert_eq!(swapchain_flags(false), super::DXGI_SWAP_CHAIN_FLAG(0));
+        assert_eq!(dxgi_present_flags(false), super::DXGI_PRESENT(0));
+        assert_eq!(
+            swapchain_flags(true),
+            super::DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+        );
+        assert_eq!(dxgi_present_flags(true), super::DXGI_PRESENT_ALLOW_TEARING);
     }
 }

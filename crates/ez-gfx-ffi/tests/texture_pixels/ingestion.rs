@@ -180,7 +180,7 @@ fn metal_minified_sampling_selects_published_mips() {
     // A 256px texture on the 64px hidden surface minifies 4:1, forcing mip
     // selection. mip0 is white and coarser levels are black: without a mip
     // filter every fragment would sample the white base level.
-    let artifact = compile_shader(
+    let artifact = EasyGraphicsCompiler::compile_shader(
         &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/02_textured_cube/02_textured_cube.slang"),
         &[Target::Metal],

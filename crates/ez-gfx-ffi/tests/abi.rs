@@ -25,9 +25,9 @@ use ez_gfx_ffi::{
     EzGfxByteBuffer, EzGfxContextDesc, EzGfxDiagnostic, EzGfxDrawIndexedCommand, EzGfxDynamicState,
     EzGfxEvent, EzGfxEventCallback, EzGfxEventKind, EzGfxHandleParts, EzGfxHeadlessSurfaceDesc,
     EzGfxRenderTargetDesc, EzGfxRenderTargetFormat, EzGfxRenderTargetUsage, EzGfxResult,
-    EzGfxRuntimeRecord, EzGfxShaderDesc, EzGfxTextureDesc, EzGfxUploadEvent,
-    EzGfxWindowSurfaceDesc, ez_gfx_adapter_count, ez_gfx_adapter_query, ez_gfx_buffer_acquire,
-    ez_gfx_buffer_release, ez_gfx_buffer_write, ez_gfx_context_create,
+    EzGfxRuntimeRecord, EzGfxTextureDesc, EzGfxUploadEvent, EzGfxWindowSurfaceDesc,
+    ez_gfx_adapter_count, ez_gfx_adapter_query, ez_gfx_buffer_acquire, ez_gfx_buffer_release,
+    ez_gfx_buffer_write, ez_gfx_compute_shader_load, ez_gfx_context_create,
     ez_gfx_context_create_backend, ez_gfx_context_destroy, ez_gfx_context_register_callback,
     ez_gfx_context_wait_idle, ez_gfx_counter_buffer_acquire, ez_gfx_counter_buffer_publish_count,
     ez_gfx_counter_buffer_release, ez_gfx_counter_buffer_write_draws, ez_gfx_frame_abort,
@@ -36,10 +36,10 @@ use ez_gfx_ffi::{
     ez_gfx_index_allocation_remove, ez_gfx_render_target_create, ez_gfx_render_target_destroy,
     ez_gfx_render_target_frame_begin, ez_gfx_render_target_get_clear,
     ez_gfx_render_target_get_extent, ez_gfx_render_target_get_format,
-    ez_gfx_render_target_probe_format, ez_gfx_semantic_id, ez_gfx_shader_load_artifact,
-    ez_gfx_texture_get_binding, ez_gfx_texture_get_residency, ez_gfx_texture_load,
-    ez_gfx_texture_unload, ez_gfx_vertex_allocation_get_range, ez_gfx_vertex_allocation_remove,
-    ez_gfx_vertex_heap_create, ez_gfx_vertex_heap_destroy, ez_gfx_vertex_heap_upload,
+    ez_gfx_render_target_probe_format, ez_gfx_semantic_id, ez_gfx_texture_get_binding,
+    ez_gfx_texture_get_residency, ez_gfx_texture_load, ez_gfx_texture_unload,
+    ez_gfx_vertex_allocation_get_range, ez_gfx_vertex_allocation_remove, ez_gfx_vertex_heap_create,
+    ez_gfx_vertex_heap_destroy, ez_gfx_vertex_heap_upload,
 };
 
 #[test]

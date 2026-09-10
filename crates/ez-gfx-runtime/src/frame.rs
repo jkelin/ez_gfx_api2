@@ -22,10 +22,12 @@ pub enum FrameState {
 #[derive(Clone, Debug, PartialEq)]
 /// Backend work associated with one compiled graph node.
 pub enum ExecutableNode {
-    /// A graphics draw node with shader, counter buffer, and dynamic state.
+    /// A graphics draw node with stage shaders, counter buffer, and dynamic state.
     Graphics {
-        /// Shader handle.
-        shader: ShaderHandle,
+        /// Vertex shader handle.
+        vertex_shader: ShaderHandle,
+        /// Fragment shader handle.
+        fragment_shader: ShaderHandle,
         /// Counter buffer handle.
         counter: CounterBufferHandle,
         /// Maximum number of indirect draws.

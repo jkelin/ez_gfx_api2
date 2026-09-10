@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -105,17 +105,16 @@ enum PipelineKey {
         backend: Backend,
         shader: ShaderHandle,
         shader_digest: [u8; 32],
-        product: usize,
         entry: String,
         layouts: Vec<ez_gfx_hal::ShaderBufferLayout>,
     },
     Graphics {
         backend: Backend,
-        shader: ShaderHandle,
-        shader_digest: [u8; 32],
-        vertex_product: usize,
+        vertex_shader: ShaderHandle,
+        vertex_digest: [u8; 32],
         vertex_entry: String,
-        fragment_product: usize,
+        fragment_shader: ShaderHandle,
+        fragment_digest: [u8; 32],
         fragment_entry: String,
         layouts: Vec<ez_gfx_hal::ShaderBufferLayout>,
         texture_heap: Option<ez_gfx_hal::ShaderTextureHeapLayout>,
@@ -128,10 +127,16 @@ enum PipelineKey {
 }
 
 impl PipelineKey {
-    fn shader(&self) -> ShaderHandle {
-        // Both variants always carry their owning generational shader handle.
+    fn involves_shader(&self, shader: ShaderHandle) -> bool {
         match self {
-            Self::Compute { shader, .. } | Self::Graphics { shader, .. } => *shader,
+            Self::Compute {
+                shader: candidate, ..
+            } => *candidate == shader,
+            Self::Graphics {
+                vertex_shader,
+                fragment_shader,
+                ..
+            } => *vertex_shader == shader || *fragment_shader == shader,
         }
     }
 }
@@ -141,10 +146,10 @@ const MAX_PIPELINE_CACHE_ENTRIES: usize = 1024;
 struct ShaderRecord {
     native: NativeShader,
     digest: [u8; 32],
-    graphics: Option<(usize, String, usize, String)>,
-    compute: Option<(usize, String)>,
+    product: usize,
+    entry: String,
+    stage: ez_gfx_artifact::Stage,
     runtime: ez_gfx_runtime::shader::RuntimeShader,
-    graphics_layout: Option<ez_gfx_runtime::binding::PipelineLayout>,
 }
 
 enum NativeTexture {
@@ -206,6 +211,9 @@ struct PendingTexture {
     id: TextureId,
     cancelled: Arc<AtomicBool>,
     config: TextureConfig,
+    // Admitted caller source bytes still awaiting decode; the owned copy lives on the
+    // decode closure, so this count is the only retained size until transfer takes over.
+    source_bytes: u64,
     admitted_at: Instant,
 }
 
@@ -309,6 +317,8 @@ struct ContextState {
     allocations: HashMap<PackedHandle, (u64, NativeAllocation)>,
     allocation_ready: HashMap<PackedHandle, CompletionToken>,
     shaders: HashMap<ShaderHandle, ShaderRecord>,
+    frame_shaders: HashSet<ShaderHandle>,
+    pending_shader_destroys: HashSet<ShaderHandle>,
     indirects: HashMap<CounterBufferHandle, IndexedIndirectBuffer>,
     textures: HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>,
     transient_buffers: HashMap<PackedHandle, TransientBuffer>,
@@ -325,6 +335,10 @@ struct ContextState {
     texture_registry: TextureRegistry,
     texture_ready: HashMap<TextureHandle, CompletionToken>,
     pending_textures: HashMap<TextureHandle, PendingTexture>,
+    // Decoded staging bytes per transfer-pending texture, kept in lockstep with
+    // `texture_ready`: inserted at native submission, removed at publication, cancel,
+    // loss, or teardown. Region updates overwrite with their latest transfer size.
+    texture_transfer_bytes: HashMap<TextureHandle, u64>,
     texture_handoffs: HashMap<TextureHandle, Instant>,
     texture_telemetry: Arc<TextureUploadTelemetry>,
     async_textures: AsyncTextureState,
@@ -351,6 +365,7 @@ struct ContextState {
     frame_depth: Option<ResourceId>,
     frame_has_graphics: bool,
     frame_presented: bool,
+    frame_capture_surface: Option<SurfaceHandle>,
     active_surface: Option<SurfaceHandle>,
     frame_render_target: Option<RenderTargetHandle>,
     last_readbacks: Vec<Vec<u8>>,
@@ -442,6 +457,7 @@ pub(crate) fn cleanup_context_for_thread_exit() -> Result<()> {
 
 mod buffers;
 mod context;
+mod diagnostics;
 mod frame;
 mod geometry;
 mod native;
@@ -465,6 +481,7 @@ mod texture;
 
 pub use buffers::*;
 pub use context::*;
+pub use diagnostics::*;
 pub use frame::*;
 pub use geometry::*;
 pub use render_target::*;

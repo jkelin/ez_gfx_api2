@@ -10,7 +10,7 @@ Define safe ownership for named vertex heaps, their allocations, the singleton c
 - A vertex allocation retains its parent heap; every owning wrapper retains `Rc<ContextInner>`.
 - The index heap is a singleton owned by `Context`; `IndexAllocation` retains the context.
 - `Buffer`, `CounterBuffer`, and `ValueBuffer` are context-acquired one-frame values: first use claims them, same-frame reuse is valid, and terminal frame paths invalidate them.
-- ABI 37 retains explicit opaque-handle lifecycle functions and rejects stale, foreign, wrong-kind, and duplicate handles.
+- ABI 39 retains explicit opaque-handle lifecycle functions and rejects stale, foreign, wrong-kind, and duplicate handles.
 
 ## Retired exploration
 
@@ -20,7 +20,7 @@ The selected ordered range free list and generation-indexed identity remain. All
 
 ## Selected solution
 
-Named auto-growing vertex heaps and one lazy context-owned index heap use ordered range free lists and generation-checked allocation identities. Allocation drop may retire its range before context teardown; a drop during recording waits for that frame's terminal completion, so no public per-frame retain method is needed. The context owner can invalidate and destroy the entire hierarchy regardless of live wrappers. ABI 37 retains explicit opaque-handle release and rejects stale, foreign, wrong-kind, and duplicate handles.
+Named auto-growing vertex heaps and one lazy context-owned index heap use ordered range free lists and generation-checked allocation identities. Allocation drop may retire its range before context teardown; a drop during recording waits for that frame's terminal completion, so no public per-frame retain method is needed. The context owner can invalidate and destroy the entire hierarchy regardless of live wrappers. ABI 39 retains explicit opaque-handle release and rejects stale, foreign, wrong-kind, and duplicate handles.
 
 Frame readiness conservatively covers imported named vertex heaps and the singleton index heap. `Buffer<T>`, `CounterBuffer<T>`, and single-value `ValueBuffer<T>` are materialized once for their claiming frame, support repeated compute/graphics use there, and are invalid afterward. `[Buffer]` and `[CounterBuffer]` shader names reflect as `buffer` and `counter_buffer` binding kinds; counters expose `set_count`/`add_count`/`set`/`get` over count at byte 0 plus elements at shared HAL offset 256 with bytes 4..255 zeroed (252 padding bytes); Vulkan/DX12 read the count at byte 0 and commands at offset 256 while Metal encodes capacity over zeroed tails. Native storage returns to completion-gated backend pools.
 

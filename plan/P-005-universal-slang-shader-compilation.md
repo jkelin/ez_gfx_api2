@@ -91,10 +91,10 @@ No comparable compile-time, artifact-size, startup, or shader-runtime measuremen
 
 **Selected: `S-P-005-slang-native-multi-target`.**
 
-Compile the same module and entry points offline with Slang's SPIR-V, DXIL, and Metal targets. Extract target declarations and common interface metadata before optimization can erase intent, then pass target blobs and canonical reflection to P-006. Use target-specific binding validation rather than a second semantic compiler pipeline.
+`EasyGraphicsCompiler::compile_shader` compiles every entry point discovered in one Slang module, including multiple names in the same stage, for each requested SPIR-V, DXIL, and Metal target and returns one validated `CompiledShader`. Extract target declarations and common interface metadata before optimization can erase intent, then pass target blobs and canonical `(stage, entry-point name)` reflection to P-006. Use target-specific binding validation rather than a second semantic compiler pipeline.
 
 **Rejected:** the incumbent fails backend and packaging constraints. The SPIR-V pivot is rejected because SPIRV-Cross/Naga add remapping and do not directly emit DXIL; it becomes a fallback only if a native Slang target proves unusable for a required shader feature.
 
 **Assumptions and risks:** the shared Slang subset covers all current shaders; DXC/signing and Xcode Metal tools are available in compiler environments; Metal legalization and explicit bindings can be reconciled. Compilation and artifact-size costs remain unknown.
 
-**Validation:** compile every shader/entry point for all targets in CI runners with required native tools; compare canonical reflection and explicit target attributes across outputs; create pipelines and render snapshot fixtures on each backend; record compiler version/options, wall time, peak RSS, and blob sizes.
+**Validation:** compile a fixture with two same-stage entry points for every requested target; save and reload it; prove both exact names survive independently. Compile every shader/entry point for all targets in CI runners with required native tools; compare canonical reflection and explicit target attributes across outputs; create pipelines and render snapshot fixtures on each backend; record compiler version/options, wall time, peak RSS, and blob sizes. Completion remains contingent on the recorded backend matrix.

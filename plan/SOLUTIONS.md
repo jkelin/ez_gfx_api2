@@ -13,14 +13,14 @@ Migrate the original Odin/Vulkan `ez_gfx_api` into a Rust/Cargo implementation t
 - Shipping runtime packages must not depend on or bundle the Slang compiler.
 - Vulkan, DX12, and Metal are required; Vulkan-only designs are incomplete.
 - Explicit shader target attributes remain the source of truth for render-target intent.
-- Rust exposes only the context-owned interface. C/C# use the explicit ABI 37 lifecycle through `ez-gfx-ffi`.
+- Rust exposes only the context-owned interface. C/C# use the explicit ABI 39 lifecycle through `ez-gfx-ffi`.
 - External inputs and binary artifacts require boundary validation.
 - Measurements from different or unspecified workloads are not averaged. Missing performance data remains unknown.
 - OpenGL, DX11, software rasterizers, a custom shader DSL, and a custom window system are out of scope.
 
 ### Assumptions
 
-- ABI 37 is the non-Rust compatibility seam; it does not dictate safe Rust ownership or retain safe compatibility aliases.
+- ABI 39 is the non-Rust compatibility seam; it does not dictate safe Rust ownership or retain safe compatibility aliases.
 - Supported hardware exposes sufficient modern bindless/indexing features. Devices below the declared capability floor receive an explicit unsupported error.
 - Slang, DXC/signing tools, and Apple Metal tools are available in compiler/build environments, not runtime deployments.
 - No repository-specific performance baseline exists for P-001 through P-020; every selected design carries explicit measurement actions.
@@ -68,7 +68,7 @@ One owning `Context` controls the graphics lifetime. Descendant wrappers retain 
 
 `Surface::begin_frame()` and `Context::begin_frame()` return target-less owners. `Frame::configure_swapchain` attaches presentation; `Frame::configure_render_target` caches a named image and implicitly recreates it for size or format changes. `Frame::bind_buffer` adds or replaces one named `Buffer`/`CounterBuffer`/`ValueBuffer` frame binding; execute calls read the current set without removing entries, and single POD constants bind as value buffers rather than push constants. `Frame::finish(self)` returns exact errors, while `Drop` aborts because it cannot report failure. `RenderTarget::prepare_readback` yields an opaque request delivered only through callback-scoped bytes.
 
-`ez-gfx-ffi` remains a validated adapter. ABI 37 uses opaque generation- and owner-checked `u64` handles, removes surface-platform fields, and separates window from headless creation. Surface and managed-target begin functions return explicit frame owners; `ez_gfx_frame_end` and `ez_gfx_frame_abort` invalidate on every result and clear frame-local bindings, while context destruction aborts descendants. C buffers are one-frame values: their first valid execution claims them, unchanged bindings persist across same-frame execute calls, and terminal paths invalidate claimed handles while completion gates native recycling. ABI 37 C parity covers value-buffer acquisition, frame binding with same-name replacement, and frame execute compute/graphics calls; push-constant arguments and legacy add exports are gone. Validate pointer ranges, exact errors, generated ABI parity, replacement without claim, persistent compute-to-graphics reuse, and terminal cleanup.
+`ez-gfx-ffi` remains a validated adapter. ABI 39 uses opaque generation- and owner-checked `u64` handles, removes surface-platform fields, and separates window from headless creation. Surface and managed-target begin functions return explicit frame owners; `ez_gfx_frame_end` and `ez_gfx_frame_abort` invalidate on every result and clear frame-local bindings, while context destruction aborts descendants. C buffers are one-frame values: their first valid execution claims them, unchanged bindings persist across same-frame execute calls, and terminal paths invalidate claimed handles while completion gates native recycling. ABI 39 C parity covers value-buffer acquisition, frame binding with same-name replacement, and frame execute compute/graphics calls; push-constant arguments and legacy add exports are gone. Validate pointer ranges, exact errors, generated ABI parity, replacement without claim, persistent compute-to-graphics reuse, and terminal cleanup.
 
 Window surface construction accepts a borrowed native window handle, derives the backend path from its `RawWindowHandle` variant, queries the initial drawable extent, and rolls back atomically on failure. Headless construction accepts a separate explicit extent.
 
@@ -78,7 +78,7 @@ The safe interface gains lifetime locality at the cost of `Rc` increments and in
 
 ### Risks and validation
 
-Validate context-owner destruction with live descendants, exact submit/present errors, implicit abort, one-frame buffer claim and terminal invalidation, atomic window/headless surface rollback, stale/foreign/generation rejection, ABI 37 generated-contract freshness, layout probes, invalid calls, and panic containment.
+Validate context-owner destruction with live descendants, exact submit/present errors, implicit abort, one-frame buffer claim and terminal invalidation, atomic window/headless surface rollback, stale/foreign/generation rejection, ABI 39 generated-contract freshness, layout probes, invalid calls, and panic containment.
 
 ## P-003: Multi-backend hardware abstraction — Custom static raw HAL
 
@@ -149,7 +149,7 @@ Compile one Slang source and entry-point set to SPIR-V, DXIL, and Metal output w
 
 ### Decision
 
-The offline compiler creates native `SLANG_SPIRV`, `SLANG_DXIL`, and `SLANG_METAL`/`SLANG_METAL_LIB` targets. DXIL variants target Shader Model 6.5: implemented binding uses explicit descriptor tables and root descriptors, so no Shader Model 6.6 direct-heap-indexing semantic is required. Extract target declarations and canonical interface metadata before optimization can erase intent; emit target blobs and metadata to P-006. Validate target-specific binding layouts instead of introducing another semantic compiler path.
+The offline `EasyGraphicsCompiler` creates native `SLANG_SPIRV`, `SLANG_DXIL`, and `SLANG_METAL`/`SLANG_METAL_LIB` targets for every discovered entry point, including multiple names in one stage, and returns one validated `CompiledShader`. DXIL variants target Shader Model 6.5: implemented binding uses explicit descriptor tables and root descriptors, so no Shader Model 6.6 direct-heap-indexing semantic is required. Extract target declarations and canonical interface metadata before optimization can erase intent; emit target blobs and metadata to P-006. Validate target-specific binding layouts instead of introducing another semantic compiler path.
 
 ### Performance and tradeoffs
 
@@ -180,7 +180,7 @@ Ship multi-backend shader code and complete reflection without Slang at runtime,
 
 ### Decision
 
-Use one `.ezgfxshader` file with a fixed 56-byte little-endian frame containing magic, format version, reserved flags, payload length, and BLAKE3 digest. Store stage-grouped target products, canonical reflection, compiler provenance, and one internal entry point per stage in a bounded `rkyv` payload. Verify exact framing and digest, copy into aligned storage, run `bytecheck`, deserialize, and validate semantic/target invariants before allocation or backend calls. Never invoke Slang at runtime.
+Use one `.ezgfxshader` file with a fixed 56-byte little-endian frame containing magic, format version, reserved flags, payload length, and BLAKE3 digest. Store target products and reflection keyed by `(stage, entry-point name)`, compiler provenance, and complete per-entry target coverage in a bounded `rkyv` payload. Permit multiple names in one stage while rejecting duplicate products, incomplete coverage, malformed names, unknown exact-name selection, wrong-stage selection, and ambiguous reflection. `CompiledShader::save_shader` serializes; loading verifies framing/digest, copies into aligned storage, runs `bytecheck`, deserializes, and validates semantics before backend allocation. Never invoke Slang at runtime.
 
 ### Performance and tradeoffs
 
@@ -336,7 +336,7 @@ Manage named bindless vertex heaps and one singleton context-owned index heap wi
 
 ### Decision
 
-GPU ranges use ordered free lists and generation-indexed identities. Safe heap and allocation wrappers retain memory-safe access to their context and parent-resource identities; dropping an allocation retires its range, and dropping a heap retires it after child and recorded uses. The context owner may invalidate and destroy the entire hierarchy regardless of live wrappers. ABI 37 retains explicit opaque-handle release for C.
+GPU ranges use ordered free lists and generation-indexed identities. Safe heap and allocation wrappers retain memory-safe access to their context and parent-resource identities; dropping an allocation retires its range, and dropping a heap retires it after child and recorded uses. The context owner may invalidate and destroy the entire hierarchy regardless of live wrappers. ABI 39 retains explicit opaque-handle release for C.
 
 `Buffer<T>`, `CounterBuffer<T>`, and single-value `ValueBuffer<T>` belong to `Context` for one frame. `[Buffer]` and `[CounterBuffer]` shader names reflect as `buffer` and `counter_buffer` binding kinds. The first execute call using a bound resource claims it; same-name replacement before execution leaves the prior resource unclaimed, and repeated compute/graphics use in that frame shares one native materialization while the binding remains current. Writes after claim and later-frame use fail. Counters expose `set_count`/`add_count`/`set`/`get` over count at byte 0 plus elements at shared HAL offset 256 with bytes 4..255 zeroed (252 padding bytes for Vulkan `minStorageBufferOffsetAlignment`); Vulkan and DX12 read the count at byte 0 and commands at offset 256 while Metal encodes capacity over zeroed tails. Native reuse remains completion-gated or quarantined after an indeterminate failure.
 
@@ -389,7 +389,7 @@ Presented and managed-target begin functions return owning `Frame` values; all r
 
 `Frame::finish(self)` aborts and returns any prior recording error unchanged, otherwise submits and presents surface frames only after successful submission. It preserves the exact error from each phase. Dropping an unfinished frame aborts. Claimed `Buffer<T>`, `CounterBuffer<T>`, and `ValueBuffer<T>` values support same-frame reuse, then become invalid on every terminal path; named entries persist in a replaceable frame binding set that `execute_compute`/`execute_graphics` materialize and read without consuming; native backing remains completion-gated or quarantined internally.
 
-ABI 37 exposes opaque generational `EzGfxFrame` handles from surface or managed-target begin. C terminates them with `ez_gfx_frame_end` or `ez_gfx_frame_abort`; every result invalidates the frame and its claimed buffer handles, and context destruction aborts descendants.
+ABI 39 exposes opaque generational `EzGfxFrame` handles from surface or managed-target begin. C terminates them with `ez_gfx_frame_end` or `ez_gfx_frame_abort`; every result invalidates the frame and its claimed buffer handles, and context destruction aborts descendants.
 
 ### Risks and validation
 
@@ -580,7 +580,7 @@ Sequence all P-001 through P-019 decisions into bounded milestones, obtain execu
 
 ### Decision
 
-Start with one end-to-end backend-neutral vertical slice, then require Vulkan, DX12, and Metal conformance, compressed assets/streaming/UI, and remaining selected work. Final cutover uses the shared `Example` host for winit inversion, native window hosting, resize, input, automation, and consuming frame dispatch; each main creates platform-free `ContextOptions` and passes the host window to `Context::create_surface_window` through `raw-window-handle`. Initial extent is queried from the native window. No artificial resource scopes or manual surface/context teardown remain: `Context::destroy` and owner drop invalidate and destroy every context-owned resource, while texture wrapper drop leaves stable heap entries retained until context teardown. Frames bind `Buffer`/`CounterBuffer`/`ValueBuffer` by shader-declared name in a replaceable frame-local set retained across execute calls, with single values as value buffers. It requires all six examples, ABI 37 gates, backend-required snapshots, every inherited TODO disposition, and no obsolete safe handle/free, per-frame texture-retain, or multi-begin compatibility path.
+Start with one end-to-end backend-neutral vertical slice, then require Vulkan, DX12, and Metal conformance, compressed assets/streaming/UI, and remaining selected work. Final cutover uses the shared `Example` host for winit inversion, native window hosting, resize, input, automation, and consuming frame dispatch; each main creates platform-free `ContextOptions` and passes the host window to `Context::create_surface_window` through `raw-window-handle`. Initial extent is queried from the native window. No artificial resource scopes or manual surface/context teardown remain: `Context::destroy` and owner drop invalidate and destroy every context-owned resource, while texture wrapper drop leaves stable heap entries retained until context teardown. Frames bind `Buffer`/`CounterBuffer`/`ValueBuffer` by shader-declared name in a replaceable frame-local set retained across execute calls, with single values as value buffers. It requires all six examples, ABI 39 gates, backend-required snapshots, every inherited TODO disposition, and no obsolete safe handle/free, per-frame texture-retain, or multi-begin compatibility path.
 
 ### Performance and tradeoffs
 
@@ -611,7 +611,7 @@ One Slang source must render equivalently on Vulkan, DX12, and Metal without Sla
 
 ### Decision
 
-Use the root `ez_gfx_api.slang` module and stable, collision-safe semantic resource IDs, but retain target-native products and reflection in `.ezgfxshader`. Every application shader imports the shared module and contains no Vulkan namespace/location/register syntax. Each stage has one artifact-owned entry point, so runtime callers select only the artifact and backend/profile. DXIL uses Shader Model 6.5 with explicit descriptor tables/root descriptors rather than Shader Model 6.6 direct heap indexing.
+Use the root `ez_gfx_api.slang` module and stable, collision-safe semantic resource IDs, but retain target-native products and reflection in `.ezgfxshader`. Every application shader imports the shared module and contains no Vulkan namespace/location/register syntax. A stage may own multiple named entry points. Runtime callers select one exact stage/name into a context-owned generational handle; stale and cross-owner handles fail. Raw frames retain every referenced shader identity until submit or abort, matching safe `Rc` ownership. Pipelines are created on demand and keyed by all participating shader identities plus relevant layout, attachment, and dynamic state. Handle drop evicts involving entries into backend completion-tracked deferred queues. Vulkan modules and Metal libraries also retire through those queues; DX12 bytecode drops after synchronous PSO creation because the PSO owns the compiled program. DXIL uses Shader Model 6.5 with explicit descriptor tables/root descriptors rather than Shader Model 6.6 direct heap indexing.
 
 ### Performance and tradeoffs
 

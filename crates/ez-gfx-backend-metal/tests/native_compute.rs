@@ -4,7 +4,7 @@
 use ez_gfx_backend_metal::native::{
     NativeBufferBinding, NativeComputeDispatch, NativeContext, NativeFrameAction,
 };
-use ez_gfx_compiler::{Target, compile_shader};
+use ez_gfx_compiler::{EasyGraphicsCompiler, Target};
 use ez_gfx_core::{Backend, capability::SemanticProfile};
 use ez_gfx_hal::{
     AllocationRequest, ImageMip, MemoryAllocator, MemoryClass, SamplerAddressMode, SamplerFilter,
@@ -33,9 +33,16 @@ void computemain(uint3 id : SV_DispatchThreadID) {
     )
     .unwrap();
 
-    let artifact = compile_shader(&source, &[Target::Metal], false).unwrap();
-    let runtime = RuntimeShader::load(&artifact, Backend::Metal, SemanticProfile::V1).unwrap();
-    let (product_index, _, entry) = runtime.compute_product().unwrap();
+    let artifact = EasyGraphicsCompiler::compile_shader(&source, &[Target::Metal], false).unwrap();
+    let runtime = RuntimeShader::load(
+        &artifact,
+        Backend::Metal,
+        SemanticProfile::V1,
+        ez_gfx_artifact::Stage::Compute,
+        "main",
+    )
+    .unwrap();
+    let (product_index, _, entry) = runtime.shader_product();
     let threads_per_group = runtime.compute_workgroup_size().unwrap();
     assert_eq!(threads_per_group, [8, 2, 1]);
 
@@ -116,9 +123,16 @@ void computemain(uint3 id : SV_DispatchThreadID) {
     )
     .unwrap();
 
-    let artifact = compile_shader(&source, &[Target::Metal], false).unwrap();
-    let runtime = RuntimeShader::load(&artifact, Backend::Metal, SemanticProfile::V1).unwrap();
-    let (product_index, _, entry) = runtime.compute_product().unwrap();
+    let artifact = EasyGraphicsCompiler::compile_shader(&source, &[Target::Metal], false).unwrap();
+    let runtime = RuntimeShader::load(
+        &artifact,
+        Backend::Metal,
+        SemanticProfile::V1,
+        ez_gfx_artifact::Stage::Compute,
+        "main",
+    )
+    .unwrap();
+    let (product_index, _, entry) = runtime.shader_product();
     let pipeline_layout = runtime
         .pipeline_layout(ez_gfx_artifact::Stage::Compute)
         .unwrap();

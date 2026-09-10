@@ -125,3 +125,7 @@ Bounded channel semantics and monotonic CPU/GPU timing primitives provide the tr
 1. Exercise fatal/recoverable/warning/profiling events across worker, transfer, graph, backend, and callback boundaries.
 2. Force queue overflow and verify bounded memory, loss reporting, and continued rendering.
 3. Compare diagnostics-disabled/enabled CPU cost, timestamp/readout latency, queue contention, and memory on named workloads.
+
+## Implementation status
+
+The lossless upload-event queue plus bounded runtime/diagnostic queues implement the selected event stream. `Context::resource_diagnostics` (safe Rust) and `ez_gfx_context_get_resource_diagnostics` (C ABI 39) add the anticipated derived pull snapshot for low-frequency consumers: pending texture/vertex/index upload counts with retained bytes plus staging, pipeline, and readback cache sizes. The snapshot never blocks rendering, saturates instead of wrapping, skips retired-but-unswept geometry keys, and stays available after device loss. Example window titles consume it once per presented frame. Correlation IDs, clocks, units, and per-event payloads remain future stream work.

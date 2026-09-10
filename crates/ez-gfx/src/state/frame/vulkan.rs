@@ -6,7 +6,7 @@ use super::{
     MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext, NativePipeline, NativeShader,
     NativeSurface, NativeTexture, NativeTextureMap, PackedHandle, PipelineKey, RenderTargetHandle,
     RenderTargetRecord, ResourceId, SURFACE_DEFAULT_CLEAR, ShaderHandle, ShaderRecord, map_hal,
-    native_layouts, pipeline_layout_key, vulkan_bindings,
+    native_layouts, pipeline_layout_key, should_capture_presented, vulkan_bindings,
 };
 
 struct VulkanActionState<'a> {
@@ -152,15 +152,13 @@ fn prepare_vulkan_pipelines(
         let (key, pipeline) = match payload {
             ExecutableNode::Compute { shader, layout, .. } => {
                 let record = shaders.get(shader).ok_or(Error::InvalidContext)?;
-                let compute = record.compute.as_ref().ok_or(Error::InvalidArgument)?;
                 let native_shader = record.native.vulkan()?;
                 let layouts = native_layouts(layout).map_err(map_hal)?;
                 let key = PipelineKey::Compute {
                     backend: Backend::Vulkan,
                     shader: *shader,
                     shader_digest: record.digest,
-                    product: compute.0,
-                    entry: compute.1.clone(),
+                    entry: record.entry.clone(),
                     layouts: pipeline_layout_key(&layouts),
                 };
                 let pipeline = if pipelines.contains_key(&key) {
@@ -168,32 +166,39 @@ fn prepare_vulkan_pipelines(
                 } else {
                     Some(NativePipeline::Vulkan(
                         native
-                            .create_compute_pipeline(native_shader, compute.0, &compute.1, &layouts)
+                            .create_compute_pipeline(
+                                native_shader,
+                                record.product,
+                                &record.entry,
+                                &layouts,
+                            )
                             .map_err(map_hal)?,
                     ))
                 };
                 (key, pipeline)
             }
             ExecutableNode::Graphics {
-                shader,
+                vertex_shader,
+                fragment_shader,
                 layout,
                 pipeline_layout,
                 state,
                 ..
             } => {
-                let record = shaders.get(shader).ok_or(Error::InvalidContext)?;
-                let graphics = record.graphics.as_ref().ok_or(Error::InvalidArgument)?;
-                let native_shader = record.native.vulkan()?;
+                let vertex = shaders.get(vertex_shader).ok_or(Error::InvalidContext)?;
+                let fragment = shaders.get(fragment_shader).ok_or(Error::InvalidContext)?;
+                let vertex_native = vertex.native.vulkan()?;
+                let fragment_native = fragment.native.vulkan()?;
                 let layouts = native_layouts(layout).map_err(map_hal)?;
                 let depth_required = pipeline_layout.depth_required();
                 let key = PipelineKey::Graphics {
                     backend: Backend::Vulkan,
-                    shader: *shader,
-                    shader_digest: record.digest,
-                    vertex_product: graphics.0,
-                    vertex_entry: graphics.1.clone(),
-                    fragment_product: graphics.2,
-                    fragment_entry: graphics.3.clone(),
+                    vertex_shader: *vertex_shader,
+                    vertex_digest: vertex.digest,
+                    vertex_entry: vertex.entry.clone(),
+                    fragment_shader: *fragment_shader,
+                    fragment_digest: fragment.digest,
+                    fragment_entry: fragment.entry.clone(),
                     texture_heap: None,
                     layouts: pipeline_layout_key(&layouts),
                     state: *state,
@@ -208,10 +213,11 @@ fn prepare_vulkan_pipelines(
                     Some(NativePipeline::Vulkan(
                         native
                             .create_graphics_pipeline(
-                                native_shader,
+                                vertex_native,
+                                fragment_native,
                                 ez_gfx_backend_vulkan::NativeGraphicsPipelineDesc {
-                                    vertex_index: graphics.0,
-                                    fragment_index: graphics.2,
+                                    vertex_index: vertex.product,
+                                    fragment_index: fragment.product,
                                     state: *state,
                                     depth_required,
                                     layouts: &layouts,
@@ -468,9 +474,12 @@ pub(super) fn execute_vulkan_frame_plan(
                 .map(|record| (record.width, record.height))
         })
         .unwrap_or((0, 0));
-    let capture = surface
-        .as_ref()
-        .is_some_and(|surface| surface.state.snapshot_cache());
+    let capture = should_capture_presented(
+        surface
+            .as_ref()
+            .is_some_and(|surface| surface.state.snapshot_cache()),
+        context.frame_capture_surface.is_some(),
+    );
 
     let index = context
         .index_heap

@@ -7,11 +7,11 @@ fn vulkan_options() -> std::result::Result<ContextOptions, ez_gfx_runtime::Publi
     ContextOptions::new_for_backend(0, 0, Backend::Vulkan)
 }
 
-fn shader() -> ShaderHandle {
+fn shader(slot: u32) -> ShaderHandle {
     ShaderHandle::from_packed(
         PackedHandle::child(
             LocalHandle::new(1, 1).unwrap(),
-            LocalHandle::new(7, 1).unwrap(),
+            LocalHandle::new(slot, 1).unwrap(),
         )
         .unwrap(),
     )
@@ -34,11 +34,11 @@ fn graphics_pipeline_keys_include_state_attachment_and_texture_interface() {
     let state = DynamicPipelineState::from_abi(2, 0, 0, 0).unwrap();
     let key = PipelineKey::Graphics {
         backend: Backend::Vulkan,
-        shader: shader(),
-        shader_digest: [1; 32],
-        vertex_product: 0,
+        vertex_shader: shader(7),
+        vertex_digest: [1; 32],
         vertex_entry: "vertexmain".to_owned(),
-        fragment_product: 1,
+        fragment_shader: shader(8),
+        fragment_digest: [2; 32],
         fragment_entry: "fragmentmain".to_owned(),
         texture_heap: None,
         layouts: Vec::new(),
@@ -68,6 +68,38 @@ fn graphics_pipeline_keys_include_state_attachment_and_texture_interface() {
         HashSet::from([key, changed_state, changed_format, changed_heap]).len(),
         4
     );
+}
+
+#[test]
+fn pipeline_keys_track_every_owning_shader_identity() {
+    let compute = PipelineKey::Compute {
+        backend: Backend::Vulkan,
+        shader: shader(6),
+        shader_digest: [3; 32],
+        entry: "computemain".to_owned(),
+        layouts: Vec::new(),
+    };
+    let graphics = PipelineKey::Graphics {
+        backend: Backend::Vulkan,
+        vertex_shader: shader(7),
+        vertex_digest: [1; 32],
+        vertex_entry: "vertexmain".to_owned(),
+        fragment_shader: shader(8),
+        fragment_digest: [2; 32],
+        fragment_entry: "fragmentmain".to_owned(),
+        texture_heap: None,
+        layouts: Vec::new(),
+        state: DynamicPipelineState::from_abi(2, 0, 0, 0).unwrap(),
+        depth_required: false,
+        color_format: 44,
+        depth_format: 0,
+        sample_count: 1,
+    };
+
+    assert!(compute.involves_shader(shader(6)));
+    assert!(graphics.involves_shader(shader(7)));
+    assert!(graphics.involves_shader(shader(8)));
+    assert!(!graphics.involves_shader(shader(9)));
 }
 
 #[cfg(not(target_vendor = "apple"))]
@@ -296,6 +328,73 @@ fn context_decode_worker_count_reaches_pool_construction() {
     .unwrap();
     assert_eq!(explicit_workers, 2);
     assert_eq!(destroy_context(explicit_context), Ok(()));
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn resource_diagnostics_reports_pending_uploads_then_rejects_stale_context() {
+    // Vulkan native allocation is unavailable on this Windows host while DX12
+    // is healthy; Linux CI runs the Vulkan path with real devices.
+    #[cfg(windows)]
+    let context = dx12_context();
+    #[cfg(not(any(windows, target_vendor = "apple")))]
+    let context = create_context(vulkan_options().unwrap()).unwrap();
+    // Vulkan allocators become available only after device initialization.
+    #[cfg(not(any(windows, target_vendor = "apple")))]
+    let _surface = {
+        let surface =
+            create_surface_headless(context, HeadlessSurfaceOptions::new(1, 1, 0).unwrap())
+                .unwrap();
+        assert_eq!(init_device(context, surface), Ok(()));
+        surface
+    };
+    // A fresh context retains nothing: no pending uploads and empty caches.
+    assert_eq!(
+        resource_diagnostics(context).unwrap(),
+        crate::ResourceDiagnostics::default()
+    );
+
+    // Hold the decode worker so the admitted texture stays decode-pending.
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    with_context_mut(context, |state| {
+        state.async_textures.decode_gate = Some(gate.clone());
+        Ok(())
+    })
+    .unwrap();
+    let _texture = load_texture(
+        context,
+        TextureSource::Rgba8 {
+            width: 1,
+            height: 1,
+        },
+        &[1, 2, 3, 4],
+        false,
+        &texture_config(),
+    )
+    .unwrap();
+    let heap = create_vertex_heap(context, "positions", 4).unwrap();
+    let _vertices = upload_vertices(context, heap, &[1u32, 2, 3, 4]).unwrap();
+    let _indices = upload_indices(context, &[0u32, 1, 2]).unwrap();
+
+    // Counts are outstanding upload allocations: one texture, one vertex range,
+    // one index range. Bytes are admitted source (4) and reserved ranges
+    // (4 vertices x 4 bytes, 3 indices x 4 bytes). No completion is polled, so
+    // native transfer progress cannot sweep these entries mid-assertion.
+    let diagnostics = resource_diagnostics(context).unwrap();
+    assert_eq!(diagnostics.pending_textures, 1);
+    assert_eq!(diagnostics.pending_texture_bytes, 4);
+    assert_eq!(diagnostics.pending_vertex_uploads, 1);
+    assert_eq!(diagnostics.pending_vertex_bytes, 16);
+    assert_eq!(diagnostics.pending_index_uploads, 1);
+    assert_eq!(diagnostics.pending_index_bytes, 12);
+    assert_eq!(diagnostics.pipeline_entries, 0);
+    assert_eq!(diagnostics.readback_bytes, 0);
+
+    // Releasing the gate must not revive swept state before teardown.
+    gate.wait();
+    assert_eq!(destroy_context(context), Ok(()));
+    // Stale handles fail fast instead of reporting zeroed diagnostics.
+    assert_eq!(resource_diagnostics(context), Err(Error::InvalidContext));
 }
 
 #[cfg(windows)]

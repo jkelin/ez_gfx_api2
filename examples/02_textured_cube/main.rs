@@ -29,9 +29,9 @@ fn main() -> anyhow::Result<()> {
         texture_decode_workers: 0,
         adapter_selection: None,
     })?;
-    let surface = context.create_surface_window(example.native_surface()?, true)?;
+    let surface = context.create_surface_window(example.native_surface()?, false)?;
     example.register_observations(&context)?;
-    let shader_bytes = ez_gfx_compiler::compile_shader(
+    let shader_bytes = ez_gfx_compiler::EasyGraphicsCompiler::compile_shader(
         std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/02_textured_cube/02_textured_cube.slang"
@@ -99,7 +99,8 @@ fn main() -> anyhow::Result<()> {
     )?;
     context.wait_idle()?;
     let texture_id = texture.binding()?;
-    let shader = context.load_shader(&shader_bytes)?;
+    let vertex_shader = shader_bytes.load_vertex_shader(&context, "vertexmain")?;
+    let fragment_shader = shader_bytes.load_fragment_shader(&context, "fragmentmain")?;
     let index_count = indices.len() as u32;
     let mut camera = OrbitCamera::new(35.0_f32.to_radians(), 22.0_f32.to_radians(), 5.0)
         .with_clip_y(shared::clip_y(backend.backend));
@@ -125,11 +126,13 @@ fn main() -> anyhow::Result<()> {
         let params_buffer = context.acquire_value_buffer(params)?;
         frame.bind_buffer("params", &params_buffer)?;
         frame.execute_graphics(
-            &shader,
+            &vertex_shader,
+            &fragment_shader,
             &indirect,
             DynamicPipelineState::from_abi(2, 0, 0, 0).unwrap(),
         )?;
         example.handle_frame(frame, swapchain_target)?;
+        example.update_title(&context);
     }
     Ok(())
 }

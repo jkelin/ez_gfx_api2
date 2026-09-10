@@ -1,6 +1,6 @@
 # C textured cube
 
-Minimal Vulkan ABI 37 example: GLFW owns a no-client-API window while ez-gfx creates its surface from tagged Win32, Xlib, or Wayland handles and queries the initial framebuffer extent. Typed geometry heaps persist; structured and counter buffers are reacquired per frame. A creator-thread callback copies borrowed snapshot bytes.
+Minimal Vulkan ABI 39 example: GLFW owns a no-client-API window while ez-gfx creates its surface from tagged Win32, Xlib, or Wayland handles and queries the initial framebuffer extent. Typed geometry heaps persist; structured and counter buffers are reacquired per frame. A creator-thread callback copies borrowed snapshot bytes from the terminal frame only.
 
 ## Build
 

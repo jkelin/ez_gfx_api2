@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EZ_GFX_ABI_VERSION 37u
+#define EZ_GFX_ABI_VERSION 39u
 
 #if defined(__clang__)
 #  if __has_attribute(access)
@@ -37,8 +37,14 @@ typedef uint64_t EzGfxFrame;
 /** Stable process-unique identity for one enqueued readback request. */
 typedef uint64_t EzGfxReadbackRequest;
 
-/** Opaque packed `u64` shader handle; child bits index the context identity arena and resolve only as a shader. */
-typedef uint64_t EzGfxShader;
+/** Opaque context-owned compute shader handle. */
+typedef uint64_t EzGfxComputeShader;
+
+/** Opaque context-owned vertex shader handle. */
+typedef uint64_t EzGfxVertexShader;
+
+/** Opaque context-owned fragment shader handle. */
+typedef uint64_t EzGfxFragmentShader;
 
 /** Opaque packed `u64` one-frame counter-buffer handle; child bits resolve only as indirect commands. */
 typedef uint64_t EzGfxCounterBuffer;
@@ -212,19 +218,6 @@ enum {
     EzGfxEventKind_ObservationsDropped = 4,
     EzGfxEventKind_Readback = 5,
     EzGfxEventKind_Snapshot = 6,
-};
-
-/**
- * EzGfxShaderKind:
- * @EzGfxShaderKind_Graphics: Vertex and fragment shader pair.
- * @EzGfxShaderKind_Compute: Compute shader.
- *
- * Shader stage family.
- */
-typedef uint8_t EzGfxShaderKind;
-enum {
-    EzGfxShaderKind_Graphics = 0,
-    EzGfxShaderKind_Compute = 1,
 };
 
 /**
@@ -547,32 +540,6 @@ typedef struct EzGfxHeadlessSurfaceDesc {
 } EzGfxHeadlessSurfaceDesc;
 
 /**
- * EzGfxShaderDesc:
- * @path: Points to exactly `path_length` UTF-8 bytes.
- * @path_length: Specifies the nonzero byte length available through `path`.
- * @vertex_entry: Points to exactly `vertex_entry_length` UTF-8 bytes when present.
- * @vertex_entry_length: Specifies the vertex-entry byte length, or zero when absent.
- * @fragment_entry: Points to exactly `fragment_entry_length` UTF-8 bytes when present.
- * @fragment_entry_length: Specifies the fragment-entry byte length, or zero when absent.
- * @compute_entry: Points to exactly `compute_entry_length` UTF-8 bytes when present.
- * @compute_entry_length: Specifies the compute-entry byte length, or zero when absent.
- * @kind: Identifies the shader kind by its C ABI numeric code.
- *
- * Describes shader source and stage entry points for resource creation.
- */
-typedef struct EzGfxShaderDesc {
-    const char * path;
-    size_t path_length;
-    const char * vertex_entry;
-    size_t vertex_entry_length;
-    const char * fragment_entry;
-    size_t fragment_entry_length;
-    const char * compute_entry;
-    size_t compute_entry_length;
-    EzGfxShaderKind kind;
-} EzGfxShaderDesc;
-
-/**
  * EzGfxTextureDesc:
  * @source_format: Identifies the source texel format by its C ABI numeric code.
  * @destination_format: Identifies the GPU destination format by its C ABI numeric code.
@@ -703,6 +670,34 @@ typedef struct EzGfxTextureUploadTelemetry {
     uint64_t queue_latency_microseconds;
     uint64_t handoff_latency_microseconds;
 } EzGfxTextureUploadTelemetry;
+
+/**
+ * EzGfxResourceDiagnostics:
+ * @pending_textures: Texture uploads awaiting decode or transfer completion.
+ * @pending_texture_bytes: Admitted source bytes (decode) plus decoded staging bytes (transfer).
+ * @pending_vertex_uploads: Vertex uploads awaiting transfer completion.
+ * @pending_vertex_bytes: Vertex bytes awaiting transfer completion.
+ * @pending_index_uploads: Index uploads awaiting transfer completion.
+ * @pending_index_bytes: Index bytes awaiting transfer completion.
+ * @staging_buckets: Staging buckets retained across the shared, buffer, and counter pools.
+ * @staging_bytes: Staging bucket capacity retained across those pools.
+ * @pipeline_entries: Compiled pipeline entries retained in the context cache.
+ * @readback_bytes: Bytes retained across completed readback frames.
+ *
+ * Point-in-time pending-upload counts with retained bytes plus retained cache sizes.
+ */
+typedef struct EzGfxResourceDiagnostics {
+    uint32_t pending_textures;
+    uint64_t pending_texture_bytes;
+    uint32_t pending_vertex_uploads;
+    uint64_t pending_vertex_bytes;
+    uint32_t pending_index_uploads;
+    uint64_t pending_index_bytes;
+    uint32_t staging_buckets;
+    uint64_t staging_bytes;
+    uint32_t pipeline_entries;
+    uint64_t readback_bytes;
+} EzGfxResourceDiagnostics;
 
 /**
  * EzGfxBinding:
@@ -1178,30 +1173,6 @@ EzGfxResult ez_gfx_context_destroy(EzGfxContext context);
 EzGfxResult ez_gfx_context_register_callback(EzGfxContext context, EzGfxEventCallback callback, void * user_data);
 
 /**
- * ez_gfx_shader_load_artifact:
- * @context: Owning context.
- * @data: Artifact bytes.
- * @data_size: Artifact byte count.
- * @out_shader: Receives opaque shader handle.
- *
- * Loads every stage from a compiler-produced shader artifact; no source compiler is linked into this runtime.
- *
- * Returns: Returns EzGfxResult_Ok or validation/native failure.
- */
-EzGfxResult ez_gfx_shader_load_artifact(EzGfxContext context, const uint8_t * data, size_t data_size, EzGfxShader * out_shader) EZ_GFX_ACCESS(read_only, 2, 3) EZ_GFX_ACCESS(write_only, 4);
-
-/**
- * ez_gfx_shader_destroy:
- * @context: Owning context; zero and stale values are ignored.
- * @shader: Shader to destroy.
- *
- * Destroys a shader previously loaded into the context.
- *
- * Returns: No return value; stale handles are ignored.
- */
-void ez_gfx_shader_destroy(EzGfxContext context, EzGfxShader shader);
-
-/**
  * ez_gfx_frame_begin:
  * @context: Owning context.
  * @surface: Surface to acquire.
@@ -1281,7 +1252,8 @@ EzGfxResult ez_gfx_frame_bind(EzGfxContext context, EzGfxFrame frame, const EzGf
  * ez_gfx_frame_execute_graphics:
  * @context: Owning context.
  * @frame: Live owning frame.
- * @shader: Graphics shader.
+ * @vertex_shader: Vertex shader.
+ * @fragment_shader: Fragment shader.
  * @buffer: Counter buffer containing indexed draw commands.
  * @dynamic_state: Optional dynamic pipeline state.
  *
@@ -1289,7 +1261,7 @@ EzGfxResult ez_gfx_frame_bind(EzGfxContext context, EzGfxFrame frame, const EzGf
  *
  * Returns: Returns validation or native status.
  */
-EzGfxResult ez_gfx_frame_execute_graphics(EzGfxContext context, EzGfxFrame frame, EzGfxShader shader, EzGfxCounterBuffer buffer, const EzGfxDynamicState * dynamic_state) EZ_GFX_ACCESS(read_only, 5);
+EzGfxResult ez_gfx_frame_execute_graphics(EzGfxContext context, EzGfxFrame frame, EzGfxVertexShader vertex_shader, EzGfxFragmentShader fragment_shader, EzGfxCounterBuffer buffer, const EzGfxDynamicState * dynamic_state) EZ_GFX_ACCESS(read_only, 6);
 
 /**
  * ez_gfx_frame_execute_compute:
@@ -1304,7 +1276,7 @@ EzGfxResult ez_gfx_frame_execute_graphics(EzGfxContext context, EzGfxFrame frame
  *
  * Returns: Returns validation or native status.
  */
-EzGfxResult ez_gfx_frame_execute_compute(EzGfxContext context, EzGfxFrame frame, EzGfxShader shader, uint32_t dispatch_x, uint32_t dispatch_y, uint32_t dispatch_z);
+EzGfxResult ez_gfx_frame_execute_compute(EzGfxContext context, EzGfxFrame frame, EzGfxComputeShader shader, uint32_t dispatch_x, uint32_t dispatch_y, uint32_t dispatch_z);
 
 /**
  * ez_gfx_frame_enqueue_texture_readback:
@@ -1525,6 +1497,84 @@ EzGfxResult ez_gfx_render_target_probe_format(EzGfxContext context, uint8_t form
 EzGfxResult ez_gfx_render_target_frame_begin(EzGfxContext context, EzGfxRenderTarget target, EzGfxFrame * out_frame) EZ_GFX_ACCESS(write_only, 3);
 
 /**
+ * ez_gfx_compute_shader_load:
+ * @context: Owning context.
+ * @data: Validated artifact bytes.
+ * @data_size: Artifact byte count.
+ * @entry_point: Exact UTF-8 entry-point name.
+ * @entry_point_size: Entry-point byte count.
+ * @out_shader: Receives the owning compute shader handle.
+ *
+ * Loads one exact compute entry point from a validated artifact.
+ *
+ * Returns: Returns EzGfxResult_Ok or validation/native failure.
+ */
+EzGfxResult ez_gfx_compute_shader_load(EzGfxContext context, const uint8_t * data, size_t data_size, const char * entry_point, size_t entry_point_size, EzGfxComputeShader * out_shader) EZ_GFX_ACCESS(read_only, 2, 3) EZ_GFX_ACCESS(read_only, 4, 5) EZ_GFX_ACCESS(write_only, 6);
+
+/**
+ * ez_gfx_vertex_shader_load:
+ * @context: Owning context.
+ * @data: Validated artifact bytes.
+ * @data_size: Artifact byte count.
+ * @entry_point: Exact UTF-8 entry-point name.
+ * @entry_point_size: Entry-point byte count.
+ * @out_shader: Receives the owning vertex shader handle.
+ *
+ * Loads one exact vertex entry point from a validated artifact.
+ *
+ * Returns: Returns EzGfxResult_Ok or validation/native failure.
+ */
+EzGfxResult ez_gfx_vertex_shader_load(EzGfxContext context, const uint8_t * data, size_t data_size, const char * entry_point, size_t entry_point_size, EzGfxVertexShader * out_shader) EZ_GFX_ACCESS(read_only, 2, 3) EZ_GFX_ACCESS(read_only, 4, 5) EZ_GFX_ACCESS(write_only, 6);
+
+/**
+ * ez_gfx_fragment_shader_load:
+ * @context: Owning context.
+ * @data: Validated artifact bytes.
+ * @data_size: Artifact byte count.
+ * @entry_point: Exact UTF-8 entry-point name.
+ * @entry_point_size: Entry-point byte count.
+ * @out_shader: Receives the owning fragment shader handle.
+ *
+ * Loads one exact fragment entry point from a validated artifact.
+ *
+ * Returns: Returns EzGfxResult_Ok or validation/native failure.
+ */
+EzGfxResult ez_gfx_fragment_shader_load(EzGfxContext context, const uint8_t * data, size_t data_size, const char * entry_point, size_t entry_point_size, EzGfxFragmentShader * out_shader) EZ_GFX_ACCESS(read_only, 2, 3) EZ_GFX_ACCESS(read_only, 4, 5) EZ_GFX_ACCESS(write_only, 6);
+
+/**
+ * ez_gfx_compute_shader_destroy:
+ * @context: Owning context; zero and stale values are ignored.
+ * @shader: Compute shader to destroy.
+ *
+ * Invalidates immediately. An active frame retains its record through its terminal operation.
+ *
+ * Returns: No return value; stale handles are ignored.
+ */
+void ez_gfx_compute_shader_destroy(EzGfxContext context, EzGfxComputeShader shader);
+
+/**
+ * ez_gfx_vertex_shader_destroy:
+ * @context: Owning context; zero and stale values are ignored.
+ * @shader: Vertex shader to destroy.
+ *
+ * Invalidates immediately. An active frame retains its record through its terminal operation.
+ *
+ * Returns: No return value; stale handles are ignored.
+ */
+void ez_gfx_vertex_shader_destroy(EzGfxContext context, EzGfxVertexShader shader);
+
+/**
+ * ez_gfx_fragment_shader_destroy:
+ * @context: Owning context; zero and stale values are ignored.
+ * @shader: Fragment shader to destroy.
+ *
+ * Invalidates immediately. An active frame retains its record through its terminal operation.
+ *
+ * Returns: No return value; stale handles are ignored.
+ */
+void ez_gfx_fragment_shader_destroy(EzGfxContext context, EzGfxFragmentShader shader);
+
+/**
  * ez_gfx_texture_decoder_register:
  * @source_format: Custom source code.
  * @callback: Concurrent decode callback.
@@ -1631,6 +1681,17 @@ EzGfxResult ez_gfx_texture_update_region(EzGfxContext context, EzGfxTexture text
  * Returns: Returns Ok or context/device status.
  */
 EzGfxResult ez_gfx_texture_get_upload_telemetry(EzGfxContext context, EzGfxTextureUploadTelemetry * out_telemetry) EZ_GFX_ACCESS(write_only, 2);
+
+/**
+ * ez_gfx_context_get_resource_diagnostics:
+ * @context: Owning context.
+ * @out_diagnostics: Receives pending counts with retained bytes plus retained cache sizes.
+ *
+ * Returns pending-upload counts with retained bytes plus retained cache sizes.
+ *
+ * Returns: Returns Ok or context status.
+ */
+EzGfxResult ez_gfx_context_get_resource_diagnostics(EzGfxContext context, EzGfxResourceDiagnostics * out_diagnostics) EZ_GFX_ACCESS(write_only, 2);
 
 /**
  * ez_gfx_texture_unload:

@@ -1,3 +1,4 @@
+use super::surface::dxgi_present_flags;
 use super::{
     AllocationRequest, AttachmentLoadOp, AttachmentStoreOp, CompletionToken,
     D3D12_CLEAR_FLAG_DEPTH, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_INDEX_BUFFER_VIEW,
@@ -7,9 +8,10 @@ use super::{
     D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_VIEWPORT, DXGI_FORMAT_R32_UINT, DXGI_PRESENT,
     FRAMES_IN_FLIGHT, HalError, ID3D12CommandList, ID3D12PipelineState, INFINITE, Interface,
     MemoryAllocator, MemoryClass, NativeAllocation, NativeContext, NativeFrameAction,
-    NativeFrameResource, NativeSurface, QueueKind, RECT, WaitForSingleObject,
-    bind_dx12_compute_buffers, bind_dx12_graphics_buffers, copy_texture_to_readback,
-    dx12_resource_state, map_windows, record_resource_barriers, transition_barrier, uav_barrier,
+    NativeFrameResource, NativeSurface, PRESENT_SYNC_INTERVAL, QueueKind, RECT,
+    WaitForSingleObject, bind_dx12_compute_buffers, bind_dx12_graphics_buffers,
+    copy_texture_to_readback, dx12_resource_state, map_windows, record_resource_barriers,
+    transition_barrier, uav_barrier,
 };
 use ez_gfx_hal::COUNTER_BUFFER_ELEMENT_OFFSET;
 
@@ -901,6 +903,9 @@ impl NativeContext {
             presents,
             external_waits,
         } = validate_frame_plan(actions, extent, surface.is_some(), capture_presented)?;
+        let present_flags = surface.as_deref().map_or(DXGI_PRESENT(0), |surface| {
+            dxgi_present_flags(surface.allow_tearing)
+        });
         let DxPreparedFrame {
             swapchain,
             back_buffer,
@@ -1006,7 +1011,7 @@ impl NativeContext {
                 swapchain
                     .as_ref()
                     .ok_or(HalError::InvalidArgument)?
-                    .Present(1, DXGI_PRESENT(0))
+                    .Present(PRESENT_SYNC_INTERVAL, present_flags)
                     .ok()
                     .err()
             }

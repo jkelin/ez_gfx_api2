@@ -227,6 +227,81 @@ fn hidden_windows_complete_multiple_frames_without_redraw_events() -> anyhow::Re
     Ok(())
 }
 
+#[test]
+fn triangle_ten_frame_timings_reject_system_timer_pacing() -> anyhow::Result<()> {
+    const FRAMES: usize = 10;
+    const TIMER_CAP_MIN_NS: u128 = 12_000_000;
+    const TIMER_CAP_MAX_NS: u128 = 20_000_000;
+
+    for backend in TARGET_BACKENDS {
+        let mut child = std::process::Command::new(BINARIES[0].2)
+            .args([
+                "--hidden",
+                "--backend",
+                backend,
+                "--max-frames",
+                "10",
+                "--frame-timings",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while child.try_wait()?.is_none() {
+            if std::time::Instant::now() >= deadline {
+                child.kill()?;
+                let output = child.wait_with_output()?;
+                anyhow::bail!(
+                    "{backend} ten-frame timing run stalled: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{backend}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout)?;
+        let timings = stdout
+            .lines()
+            .filter(|line| line.starts_with("ez-gfx-frame-timing "))
+            .map(|line| {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                anyhow::ensure!(fields.len() == 7, "{backend}: {line}");
+                anyhow::ensure!(fields[1] == "01_triangle", "{backend}: {line}");
+                Ok((
+                    fields[3].parse::<usize>()?,
+                    fields[4].parse::<u128>()?,
+                    fields[5].parse::<u128>()?,
+                    fields[6].parse::<u128>()?,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        assert_eq!(timings.len(), FRAMES, "{backend}: {stdout}");
+        for (index, &(frame, host_wait_ns, record_ns, submit_present_ns)) in
+            timings.iter().enumerate()
+        {
+            assert_eq!(frame, index + 1, "{backend}");
+            assert!(host_wait_ns > 0 && record_ns > 0 && submit_present_ns > 0);
+        }
+
+        // Ignore one startup frame and the terminal readback. A 15.625 ms wait bug clusters
+        // nearly every steady frame in this band; allowing two outliers keeps loaded CI stable.
+        let timer_capped_frames = timings[1..FRAMES - 1]
+            .iter()
+            .filter(|timing| (TIMER_CAP_MIN_NS..=TIMER_CAP_MAX_NS).contains(&timing.3))
+            .count();
+        assert!(
+            timer_capped_frames <= 2,
+            "{backend}: {timer_capped_frames} steady frames hit the system-timer pacing band: {timings:?}"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 #[test]
 fn dx12_hidden_window_survives_large_swapchain_resize() -> anyhow::Result<()> {

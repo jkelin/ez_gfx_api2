@@ -6,7 +6,7 @@ use ez_gfx::{SamplerAddressMode, SamplerFilter, TextureSamplerDesc, TextureSourc
 use super::{
     EZ_GFX_MAX_BOUNDARY_BYTES, EzGfxContext, EzGfxDecodedTexture, EzGfxResult, EzGfxTexture,
     EzGfxTextureDecoderCallback, EzGfxTextureDecoderReleaseCallback, EzGfxTextureDesc,
-    IntoFfiResult, catch_status, catch_void, validate_optional_bounded_string,
+    IntoFfiResult, callback, catch_status, catch_void, validate_optional_bounded_string,
 };
 
 // Zero/stale/wrong-kind packed handles fail before any context access.
@@ -474,6 +474,50 @@ pub unsafe extern "C" fn ez_gfx_texture_get_upload_telemetry(
                         staging_bytes: snapshot.staging_bytes,
                         queue_latency_microseconds: snapshot.queue_latency_microseconds,
                         handoff_latency_microseconds: snapshot.handoff_latency_microseconds,
+                    });
+                }
+                EzGfxResult::Ok
+            }
+            Err(error) => error.into(),
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Returns pending-upload counts with retained bytes plus retained cache sizes.
+///
+/// # Safety
+///
+/// `out_diagnostics` must address one writable aligned diagnostics structure.
+pub unsafe extern "C" fn ez_gfx_context_get_resource_diagnostics(
+    context: EzGfxContext,
+    out_diagnostics: *mut super::EzGfxResourceDiagnostics,
+) -> EzGfxResult {
+    catch_status(|| {
+        if out_diagnostics.is_null() {
+            return EzGfxResult::InvalidArgument;
+        }
+        let context = try_handle!(ContextHandle, context);
+        if let Err(status) = callback::check_entry(context) {
+            return status;
+        }
+        // A pure query mirrors the telemetry precedent: observe without dispatching
+        // pending events, so per-frame title polling never reenters the callback.
+        match raw::resource_diagnostics(context) {
+            Ok(snapshot) => {
+                // SAFETY: The output is non-null and writable for this call.
+                unsafe {
+                    out_diagnostics.write(super::EzGfxResourceDiagnostics {
+                        pending_textures: snapshot.pending_textures,
+                        pending_texture_bytes: snapshot.pending_texture_bytes,
+                        pending_vertex_uploads: snapshot.pending_vertex_uploads,
+                        pending_vertex_bytes: snapshot.pending_vertex_bytes,
+                        pending_index_uploads: snapshot.pending_index_uploads,
+                        pending_index_bytes: snapshot.pending_index_bytes,
+                        staging_buckets: snapshot.staging_buckets,
+                        staging_bytes: snapshot.staging_bytes,
+                        pipeline_entries: snapshot.pipeline_entries,
+                        readback_bytes: snapshot.readback_bytes,
                     });
                 }
                 EzGfxResult::Ok

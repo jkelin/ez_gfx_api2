@@ -21,8 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if EZ_GFX_ABI_VERSION != 37u
-#error "textured_cube requires ez-gfx ABI v37"
+#if EZ_GFX_ABI_VERSION != 39u
+#error "textured_cube requires ez-gfx ABI v39"
 #endif
 
 #define WIDTH 640u
@@ -48,6 +48,7 @@ typedef struct Observations {
     uint8_t *snapshot;
     size_t snapshot_capacity;
     size_t snapshot_size;
+    uint32_t snapshot_events;
     int failed;
 } Observations;
 
@@ -253,6 +254,7 @@ static void observe(const EzGfxEvent *event, void *user_data) {
         }
         memcpy(observations->snapshot, event->readback_bytes, event->readback_byte_count);
         observations->snapshot_size = event->readback_byte_count;
+        observations->snapshot_events += 1u;
         break;
     default:
         observations->failed = 1;
@@ -333,7 +335,9 @@ int main(int argc, char **argv) {
     size_t snapshot_size = 0;
     EzGfxContext context = 0;
     EzGfxSurface surface = 0;
-    EzGfxShader shader = 0;
+    EzGfxComputeShader compute_shader = 0;
+    EzGfxVertexShader vertex_shader = 0;
+    EzGfxFragmentShader fragment_shader = 0;
     EzGfxBuffer primitives = 0;
     EzGfxVertexHeap positions_heap = 0, normals_heap = 0;
     EzGfxVertexAllocation positions = 0, normals = 0;
@@ -380,7 +384,7 @@ int main(int argc, char **argv) {
     context_desc = (EzGfxBackendContextDesc){0, 0, options.backend, 0, 0, NULL};
     if (!checked(ez_gfx_context_create_backend(&context_desc, &context), "create context")) goto cleanup;
     if (!checked(ez_gfx_context_register_callback(context, observe, &observations), "register callback")) goto cleanup;
-    if (!native_surface_desc(window, options.snapshot_path != NULL, &surface_desc)) goto cleanup;
+    if (!native_surface_desc(window, 0, &surface_desc)) goto cleanup;
     if (!checked(ez_gfx_surface_create_window(context, &surface_desc, &surface), "create surface")) goto cleanup;
     if (!checked(ez_gfx_context_init_device(context, surface), "initialize surface device")) goto cleanup;
     /* Publishes the host extent for Vulkan window systems whose native extent is undefined. */
@@ -396,7 +400,12 @@ int main(int argc, char **argv) {
     if (!checked(ez_gfx_vertex_heap_upload(context, normals_heap, NORMALS, 24, sizeof(Vec4), &normals), "upload normals")) goto cleanup;
 
     primitive = (Primitive){first_index, index_count, 0, 0};
-    if (!checked(ez_gfx_shader_load_artifact(context, artifact, artifact_size, &shader), "load shader artifact")) goto cleanup;
+    if (!checked(ez_gfx_compute_shader_load(context, artifact, artifact_size,
+            "computemain", sizeof("computemain") - 1, &compute_shader), "load compute shader")) goto cleanup;
+    if (!checked(ez_gfx_vertex_shader_load(context, artifact, artifact_size,
+            "vertexmain", sizeof("vertexmain") - 1, &vertex_shader), "load vertex shader")) goto cleanup;
+    if (!checked(ez_gfx_fragment_shader_load(context, artifact, artifact_size,
+            "fragmentmain", sizeof("fragmentmain") - 1, &fragment_shader), "load fragment shader")) goto cleanup;
 
     dynamic_state = (EzGfxDynamicState){EzGfxCullMode_None, EzGfxFrontFace_CounterClockwise,
         EzGfxPrimitiveType_TriangleList, EzGfxBlendMode_None};
@@ -424,13 +433,19 @@ int main(int argc, char **argv) {
         /* Buffers are one-frame values: the first frame execution using each binding claims them. */
         if (!checked(ez_gfx_value_buffer_acquire(context, &primitive, sizeof(primitive), "primitives", sizeof("primitives") - 1, &primitives), "acquire primitives")) goto cleanup;
         if (!checked(ez_gfx_counter_buffer_acquire(context, sizeof(EzGfxDrawIndexedCommand), 1, "draw commands", sizeof("draw commands") - 1, &indirect), "acquire counter")) goto cleanup;
+        /* Capture only the terminal frame; persistent capture would copy the full surface every frame. */
+        if (options.snapshot_path != NULL && frame_index + 1u == options.max_frames &&
+            !checked(ez_gfx_surface_set_snapshot_cache(context, surface, 1),
+                "enable terminal snapshot")) {
+            goto cleanup;
+        }
         /* Compute writes both the draw command and its GPU-produced visible count. */
         if (!checked(ez_gfx_frame_begin(context, surface, &active_frame), "begin frame")) goto cleanup;
         bindings[0] = (EzGfxBinding){"primitives", sizeof("primitives") - 1, primitives, 0, 0};
         bindings[1] = (EzGfxBinding){"draw_commands", sizeof("draw_commands") - 1, 0, indirect, 0};
         if (!checked(ez_gfx_frame_bind(context, active_frame, &bindings[0]), "bind primitives") ||
             !checked(ez_gfx_frame_bind(context, active_frame, &bindings[1]), "bind draw commands") ||
-            !checked(ez_gfx_frame_execute_compute(context, active_frame, shader, 1, 1, 1), "execute compute")) {
+            !checked(ez_gfx_frame_execute_compute(context, active_frame, compute_shader, 1, 1, 1), "execute compute")) {
             (void)ez_gfx_frame_abort(context, active_frame);
             active_frame = 0;
             /* Abort consumes claimed handles; release covers any handle not claimed. */
@@ -440,7 +455,8 @@ int main(int argc, char **argv) {
             indirect = 0;
             goto cleanup;
         }
-        if (!checked(ez_gfx_frame_execute_graphics(context, active_frame, shader, indirect, &dynamic_state), "execute graphics")) {
+        if (!checked(ez_gfx_frame_execute_graphics(context, active_frame, vertex_shader,
+                fragment_shader, indirect, &dynamic_state), "execute graphics")) {
             (void)ez_gfx_frame_abort(context, active_frame);
             active_frame = 0;
             /* Abort consumes claimed handles; release covers any handle not claimed. */
@@ -464,6 +480,11 @@ int main(int argc, char **argv) {
             fprintf(stderr, "snapshot callback was not delivered\n");
             goto cleanup;
         }
+        if (observations.snapshot_events != 1u) {
+            fprintf(stderr, "expected one terminal snapshot, got %u\n",
+                observations.snapshot_events);
+            goto cleanup;
+        }
         if (!write_snapshot(
                 options.snapshot_path, snapshot, snapshot_size, surface_width, surface_height)) {
             goto cleanup;
@@ -480,6 +501,9 @@ cleanup:
         EzGfxResult surface_teardown = EzGfxResult_Ok;
         EzGfxResult context_teardown;
         (void)ez_gfx_context_register_callback(context, NULL, NULL);
+        if (compute_shader != 0) ez_gfx_compute_shader_destroy(context, compute_shader);
+        if (vertex_shader != 0) ez_gfx_vertex_shader_destroy(context, vertex_shader);
+        if (fragment_shader != 0) ez_gfx_fragment_shader_destroy(context, fragment_shader);
         if (surface != 0) {
             surface_teardown = ez_gfx_surface_destroy(context, surface);
             surface = 0;

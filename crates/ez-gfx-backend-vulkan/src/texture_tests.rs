@@ -3,7 +3,7 @@ use crate::{
     NativeBufferBinding, NativeComputeDispatch, NativeFrameAction, NativeFrameResource,
     NativePipeline, NativeShader, PassAttachment,
 };
-use ez_gfx_compiler::{Target, compile_shader};
+use ez_gfx_compiler::{EasyGraphicsCompiler, Target};
 use ez_gfx_core::{Backend, capability::SemanticProfile};
 use ez_gfx_runtime::shader::RuntimeShader;
 use std::{
@@ -331,9 +331,17 @@ void computemain(uint3 id : SV_DispatchThreadID) {
 }
 "#).unwrap();
     drop(file);
-    let artifact = compile_shader(&source.0, &[Target::Spirv], false).unwrap();
-    let runtime = RuntimeShader::load(&artifact, Backend::Vulkan, SemanticProfile::V1).unwrap();
-    let (index, _, entry) = runtime.compute_product().unwrap();
+    let artifact =
+        EasyGraphicsCompiler::compile_shader(&source.0, &[Target::Spirv], false).unwrap();
+    let runtime = RuntimeShader::load(
+        &artifact,
+        Backend::Vulkan,
+        SemanticProfile::V1,
+        ez_gfx_artifact::Stage::Compute,
+        "computemain",
+    )
+    .unwrap();
+    let (index, _, entry) = runtime.shader_product();
     let requirements = runtime.bindings(ez_gfx_artifact::Stage::Compute).unwrap();
     let layouts = requirements
         .requirements()

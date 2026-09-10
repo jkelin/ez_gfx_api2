@@ -12,7 +12,7 @@ use super::*;
     reason = "sequential layout assertions share one ABI contract; splitting would hide drift"
 )]
 fn layouts_are_stable() {
-    // ABI 37 splits window and headless creation while retaining portable tagged window handles.
+    // ABI 39 splits window and headless creation while retaining portable tagged window handles.
     assert_eq!(
         (
             size_of::<EzGfxContextDesc>(),
@@ -111,24 +111,6 @@ fn layouts_are_stable() {
             offset_of!(EzGfxHeadlessSurfaceDesc, cache_presented_snapshots),
         ],
         [0, 4, 8]
-    );
-    assert_eq!(
-        (size_of::<EzGfxShaderDesc>(), align_of::<EzGfxShaderDesc>()),
-        (72, 8)
-    );
-    assert_eq!(
-        [
-            offset_of!(EzGfxShaderDesc, path),
-            offset_of!(EzGfxShaderDesc, path_length),
-            offset_of!(EzGfxShaderDesc, vertex_entry),
-            offset_of!(EzGfxShaderDesc, vertex_entry_length),
-            offset_of!(EzGfxShaderDesc, fragment_entry),
-            offset_of!(EzGfxShaderDesc, fragment_entry_length),
-            offset_of!(EzGfxShaderDesc, compute_entry),
-            offset_of!(EzGfxShaderDesc, compute_entry_length),
-            offset_of!(EzGfxShaderDesc, kind)
-        ],
-        [0, 8, 16, 24, 32, 40, 48, 56, 64]
     );
     assert_eq!(
         (
@@ -358,9 +340,15 @@ fn all_public_export_signatures_are_stable() {
     let _: unsafe extern "C" fn(Handle, Handle, *mut i32) -> Status =
         ffi::ez_gfx_surface_resize_pending;
     let _: extern "C" fn(Handle, Handle, i32) -> Status = ffi::ez_gfx_surface_set_snapshot_cache;
-    let _: unsafe extern "C" fn(Handle, *const u8, usize, *mut Handle) -> Status =
-        ffi::ez_gfx_shader_load_artifact;
-    let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_shader_destroy;
+    let _: unsafe extern "C" fn(Handle, *const u8, usize, *const u8, usize, *mut Handle) -> Status =
+        ffi::ez_gfx_compute_shader_load;
+    let _: unsafe extern "C" fn(Handle, *const u8, usize, *const u8, usize, *mut Handle) -> Status =
+        ffi::ez_gfx_vertex_shader_load;
+    let _: unsafe extern "C" fn(Handle, *const u8, usize, *const u8, usize, *mut Handle) -> Status =
+        ffi::ez_gfx_fragment_shader_load;
+    let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_compute_shader_destroy;
+    let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_vertex_shader_destroy;
+    let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_fragment_shader_destroy;
     let _: unsafe extern "C" fn(
         Handle,
         *const u8,
@@ -411,6 +399,7 @@ fn all_public_export_signatures_are_stable() {
         Handle,
         Handle,
         Handle,
+        Handle,
         *const EzGfxDynamicState,
     ) -> Status = ffi::ez_gfx_frame_execute_graphics;
     let _: extern "C" fn(Handle, Handle, Handle, u32, u32, u32) -> Status =
@@ -453,13 +442,23 @@ fn all_public_export_signatures_are_stable() {
 }
 
 #[test]
-fn shader_load_v19_signature_and_boundary_validation_are_stable() {
-    let _: unsafe extern "C" fn(u64, *const u8, usize, *mut u64) -> EzGfxResult =
-        ez_gfx_shader_load_artifact;
+fn stage_shader_load_signature_and_boundary_validation_are_stable() {
+    let _: unsafe extern "C" fn(u64, *const u8, usize, *const u8, usize, *mut u64) -> EzGfxResult =
+        ez_gfx_compute_shader_load;
     let mut shader = 99;
+    let entry = b"main";
     assert_eq!(
-        // SAFETY: Null data intentionally exercises checked rejection; output storage is live and aligned.
-        unsafe { ez_gfx_shader_load_artifact(0, core::ptr::null(), 1, &raw mut shader) },
+        // SAFETY: Null data intentionally exercises checked rejection; other ranges are live.
+        unsafe {
+            ez_gfx_compute_shader_load(
+                0,
+                core::ptr::null(),
+                1,
+                entry.as_ptr(),
+                entry.len(),
+                &raw mut shader,
+            )
+        },
         EzGfxResult::InvalidArgument
     );
     assert_eq!(shader, 99);

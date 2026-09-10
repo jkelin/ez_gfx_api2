@@ -79,34 +79,36 @@ impl NativeContext {
     /// Returns an error for invalid entries, unsupported state, or rejected pipeline state.
     pub fn create_graphics_pipeline(
         &self,
-        shader: &NativeShader,
-        graphics: &(usize, String, usize, String),
+        vertex_shader: &NativeShader,
+        fragment_shader: &NativeShader,
+        vertex: &(usize, String),
+        fragment: &(usize, String),
         state: DynamicPipelineState,
         depth_required: bool,
         vertex_texture_heap: Option<ShaderTextureHeapLayout>,
         fragment_texture_heap: Option<ShaderTextureHeapLayout>,
     ) -> Result<NativePipeline, HalError> {
-        if graphics.1.is_empty()
-            || graphics.1.as_bytes().contains(&0)
-            || graphics.3.is_empty()
-            || graphics.3.as_bytes().contains(&0)
+        if vertex.1.is_empty()
+            || vertex.1.as_bytes().contains(&0)
+            || fragment.1.is_empty()
+            || fragment.1.as_bytes().contains(&0)
             || state.topology == PrimitiveTopology::TriangleFan
         {
             return Err(HalError::InvalidArgument);
         }
-        let vertex_library = shader
+        let vertex_library = vertex_shader
             .libraries
-            .get(graphics.0)
+            .get(vertex.0)
             .ok_or(HalError::InvalidArgument)?;
-        let fragment_library = shader
+        let fragment_library = fragment_shader
             .libraries
-            .get(graphics.2)
+            .get(fragment.0)
             .ok_or(HalError::InvalidArgument)?;
         let vertex = vertex_library
-            .newFunctionWithName(&NSString::from_str(&graphics.1))
+            .newFunctionWithName(&NSString::from_str(&vertex.1))
             .ok_or(HalError::InvalidArgument)?;
         let fragment = fragment_library
-            .newFunctionWithName(&NSString::from_str(&graphics.3))
+            .newFunctionWithName(&NSString::from_str(&fragment.1))
             .ok_or(HalError::InvalidArgument)?;
         let descriptor = MTLRenderPipelineDescriptor::new();
         descriptor.setVertexFunction(Some(&vertex));
@@ -152,7 +154,7 @@ impl NativeContext {
 mod tests {
     use super::{DynamicPipelineState, NativeContext, NativePipeline, ShaderTextureHeapLayout};
     use ez_gfx_artifact::Stage;
-    use ez_gfx_compiler::{Target, compile_shader};
+    use ez_gfx_compiler::{EasyGraphicsCompiler, Target};
     use ez_gfx_core::{Backend, capability::SemanticProfile};
     use ez_gfx_runtime::shader::RuntimeShader;
 
@@ -195,10 +197,26 @@ float4 fragmentmain() : SV_Target {
         )
         .unwrap();
 
-        let artifact = compile_shader(&source, &[Target::Metal], false).unwrap();
-        let runtime = RuntimeShader::load(&artifact, Backend::Metal, SemanticProfile::V1).unwrap();
-        let vertex_layout = runtime.pipeline_layout(Stage::Vertex).unwrap();
-        let fragment_layout = runtime.pipeline_layout(Stage::Fragment).unwrap();
+        let artifact =
+            EasyGraphicsCompiler::compile_shader(&source, &[Target::Metal], false).unwrap();
+        let vertex = RuntimeShader::load(
+            &artifact,
+            Backend::Metal,
+            SemanticProfile::V1,
+            Stage::Vertex,
+            "vertexmain",
+        )
+        .unwrap();
+        let fragment = RuntimeShader::load(
+            &artifact,
+            Backend::Metal,
+            SemanticProfile::V1,
+            Stage::Fragment,
+            "fragmentmain",
+        )
+        .unwrap();
+        let vertex_layout = vertex.pipeline_layout(Stage::Vertex).unwrap();
+        let fragment_layout = fragment.pipeline_layout(Stage::Fragment).unwrap();
         let vertex_heap = vertex_layout.texture_heap().unwrap();
         let fragment_heap = fragment_layout.texture_heap().unwrap();
         assert_eq!(vertex_heap, fragment_heap);
@@ -211,24 +229,28 @@ float4 fragmentmain() : SV_Target {
             vertex_heap.sampler_argument_offset,
         )
         .unwrap();
-        let products = runtime
+        let vertex_products = vertex
             .products()
             .map(|(_, bytes)| bytes)
             .collect::<Vec<_>>();
-        let (vertex, fragment) = runtime.graphics_pair().unwrap();
-        let graphics = (
-            vertex.0,
-            vertex.2.to_owned(),
-            fragment.0,
-            fragment.2.to_owned(),
-        );
+        let fragment_products = fragment
+            .products()
+            .map(|(_, bytes)| bytes)
+            .collect::<Vec<_>>();
+        let vertex_product = vertex.shader_product();
+        let fragment_product = fragment.shader_product();
+        let vertex_identity = (vertex_product.0, vertex_product.2.to_owned());
+        let fragment_identity = (fragment_product.0, fragment_product.2.to_owned());
 
         let mut context = NativeContext::create_default().unwrap();
-        let shader = context.create_shader(&products).unwrap();
+        let vertex_shader = context.create_shader(&vertex_products).unwrap();
+        let fragment_shader = context.create_shader(&fragment_products).unwrap();
         let pipeline = context
             .create_graphics_pipeline(
-                &shader,
-                &graphics,
+                &vertex_shader,
+                &fragment_shader,
+                &vertex_identity,
+                &fragment_identity,
                 DynamicPipelineState::from_abi(0, 0, 0, 0).unwrap(),
                 false,
                 Some(heap),
@@ -247,7 +269,8 @@ float4 fragmentmain() : SV_Target {
         assert!(fragment_argument_encoder.is_some());
 
         context.destroy_pipeline(pipeline);
-        context.destroy_shader(shader);
+        context.destroy_shader(vertex_shader);
+        context.destroy_shader(fragment_shader);
         context.wait_idle().unwrap();
     }
 }

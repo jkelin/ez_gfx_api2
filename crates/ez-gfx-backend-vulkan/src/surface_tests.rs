@@ -52,6 +52,27 @@ fn native_extent_distinguishes_known_minimized_and_host_managed() {
 }
 
 #[test]
+fn present_mode_prefers_nonblocking_mailbox_then_immediate() {
+    assert_eq!(
+        preferred_present_mode(&[
+            vk::PresentModeKHR::FIFO,
+            vk::PresentModeKHR::IMMEDIATE,
+            vk::PresentModeKHR::MAILBOX,
+        ]),
+        vk::PresentModeKHR::MAILBOX
+    );
+    assert_eq!(
+        preferred_present_mode(&[vk::PresentModeKHR::FIFO, vk::PresentModeKHR::IMMEDIATE]),
+        vk::PresentModeKHR::IMMEDIATE
+    );
+    assert_eq!(
+        preferred_present_mode(&[vk::PresentModeKHR::FIFO]),
+        vk::PresentModeKHR::FIFO
+    );
+    assert_eq!(preferred_present_mode(&[]), vk::PresentModeKHR::FIFO);
+}
+
+#[test]
 fn instance_policy_enables_only_available_native_wsi_extensions() {
     let available = [
         extension(khr::surface::NAME),

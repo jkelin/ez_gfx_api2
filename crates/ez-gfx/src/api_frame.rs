@@ -580,24 +580,28 @@ impl Frame {
         Ok(())
     }
 
-    /// Executes an indexed graphics operation from the current frame bindings.
+    /// Executes an indexed graphics operation with exact vertex and fragment entry points.
     ///
     /// # Errors
-    /// Returns [`Error`] when resources, bindings, or recording state are invalid.
+    /// Returns [`Error`] when resources, stage ownership, bindings, or recording state are invalid.
     pub fn execute_graphics(
         &mut self,
-        shader: &Shader,
+        vertex_shader: &VertexShader,
+        fragment_shader: &FragmentShader,
         counter: &CounterBuffer<ez_gfx_runtime::indirect::DrawIndexedCommand>,
         state_desc: ez_gfx_hal::DynamicPipelineState,
     ) -> Result<()> {
-        self.ensure_context(&shader.inner.context)?;
+        self.ensure_context(&vertex_shader.inner.context)?;
+        self.ensure_context(&fragment_shader.inner.context)?;
         let counter_handle = self.materialize_counter(&counter.inner)?;
         let raw_bindings = self.raw_bindings()?;
-        self.retain(&shader.inner);
+        self.retain(&vertex_shader.inner);
+        self.retain(&fragment_shader.inner);
         self.record(|context| {
             state::execute_graphics(
                 context,
-                shader.inner.handle,
+                vertex_shader.inner.handle,
+                fragment_shader.inner.handle,
                 counter_handle,
                 &raw_bindings,
                 state_desc,
@@ -605,11 +609,11 @@ impl Frame {
         })
     }
 
-    /// Executes a compute dispatch from the current frame bindings.
+    /// Executes a compute dispatch with one exact compute entry point.
     ///
     /// # Errors
-    /// Returns [`Error`] when resources, bindings, dispatch, or recording state are invalid.
-    pub fn execute_compute(&mut self, shader: &Shader, groups: [u32; 3]) -> Result<()> {
+    /// Returns [`Error`] when resources, bindings, dispatch, stage ownership, or recording state are invalid.
+    pub fn execute_compute(&mut self, shader: &ComputeShader, groups: [u32; 3]) -> Result<()> {
         self.ensure_context(&shader.inner.context)?;
         let raw_bindings = self.raw_bindings()?;
         self.retain(&shader.inner);
@@ -657,13 +661,14 @@ impl Frame {
                 })?;
                 false
             }
-            // Presented images have no stable raw target handle; surface capture is emitted last.
+            // Presented images have no stable raw target handle; request capture for this frame
+            // without enabling the surface's persistent snapshot cache.
             RenderTargetBacking::Surface { .. } => {
                 let Some(surface) = target.surface_lease.as_ref() else {
                     return self.fail(Error::InvalidContext);
                 };
                 self.record(|context| {
-                    state::set_snapshot_cache(context, surface.handle, true)
+                    state::frame_request_presented_readback(context, surface.handle)
                 })?;
                 true
             }

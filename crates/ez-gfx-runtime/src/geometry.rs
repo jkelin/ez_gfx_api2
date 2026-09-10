@@ -33,6 +33,15 @@ enum HeapIdentity {
     Index,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Identifies which heap backs one live geometry allocation.
+pub enum GeometryHeapKind {
+    /// Range within a named vertex heap.
+    Vertex,
+    /// Range within the global index heap.
+    Index,
+}
+
 #[derive(Clone, Debug)]
 struct Heap {
     capacity: u64,
@@ -290,6 +299,31 @@ impl GeometryManager {
     /// Returns the latest token for the index heap.
     pub fn index_ready(&self) -> Option<CompletionToken> {
         self.index.as_ref().and_then(|heap| heap.ready)
+    }
+
+    /// Returns one live allocation's heap kind and reserved byte size.
+    ///
+    /// Callers count one outstanding upload per allocation; element totals stay
+    /// behind the typed range queries, not this summary.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UnknownAllocation` for stale, freed, or foreign identities.
+    pub fn upload_summary(
+        &self,
+        handle: PackedHandle,
+    ) -> Result<(GeometryHeapKind, u64), GeometryError> {
+        // The live map is the only owner of per-allocation sizes; a missing entry
+        // means the caller holds a stale or foreign handle, never a zero-size upload.
+        let range = self
+            .live
+            .get(&handle)
+            .ok_or(GeometryError::UnknownAllocation)?;
+        let kind = match &range.heap {
+            HeapIdentity::Vertex(_) => GeometryHeapKind::Vertex,
+            HeapIdentity::Index => GeometryHeapKind::Index,
+        };
+        Ok((kind, range.upload.byte_size))
     }
 
     /// Extends a named vertex heap without moving existing logical ranges.

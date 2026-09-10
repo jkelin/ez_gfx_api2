@@ -10,8 +10,12 @@ pub type EzGfxSurface = EzGfxHandle;
 pub type EzGfxFrame = EzGfxHandle;
 /// Stable process-unique identity for one enqueued readback request.
 pub type EzGfxReadbackRequest = u64;
-/// Opaque packed `u64` shader handle; child bits index the context identity arena and resolve only as a shader.
-pub type EzGfxShader = EzGfxHandle;
+/// Opaque context-owned compute shader handle.
+pub type EzGfxComputeShader = EzGfxHandle;
+/// Opaque context-owned vertex shader handle.
+pub type EzGfxVertexShader = EzGfxHandle;
+/// Opaque context-owned fragment shader handle.
+pub type EzGfxFragmentShader = EzGfxHandle;
 /// Opaque packed `u64` one-frame counter-buffer handle; child bits resolve only as indirect commands.
 pub type EzGfxCounterBuffer = EzGfxHandle;
 /// Opaque packed `u64` one-frame buffer handle; child bits resolve only as structured data.
@@ -221,29 +225,6 @@ pub struct EzGfxHeadlessSurfaceDesc {
 }
 #[derive(Clone, Copy)]
 #[repr(C)]
-/// Describes shader source and stage entry points for resource creation.
-pub struct EzGfxShaderDesc {
-    /// Points to exactly `path_length` UTF-8 bytes.
-    pub path: *const u8,
-    /// Specifies the nonzero byte length available through `path`.
-    pub path_length: usize,
-    /// Points to exactly `vertex_entry_length` UTF-8 bytes when present.
-    pub vertex_entry: *const u8,
-    /// Specifies the vertex-entry byte length, or zero when absent.
-    pub vertex_entry_length: usize,
-    /// Points to exactly `fragment_entry_length` UTF-8 bytes when present.
-    pub fragment_entry: *const u8,
-    /// Specifies the fragment-entry byte length, or zero when absent.
-    pub fragment_entry_length: usize,
-    /// Points to exactly `compute_entry_length` UTF-8 bytes when present.
-    pub compute_entry: *const u8,
-    /// Specifies the compute-entry byte length, or zero when absent.
-    pub compute_entry_length: usize,
-    /// Identifies the shader kind by its C ABI numeric code.
-    pub kind: u8,
-}
-#[derive(Clone, Copy)]
-#[repr(C)]
 /// Describes texture dimensions, formats, mipmapping, sampling, and labeling.
 pub struct EzGfxTextureDesc {
     /// Identifies the source texel format by its C ABI numeric code.
@@ -391,6 +372,32 @@ pub struct EzGfxTextureUploadTelemetry {
     pub queue_latency_microseconds: u64,
     /// Aggregate transfer-to-graphics handoff latency.
     pub handoff_latency_microseconds: u64,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+/// Point-in-time pending-upload counts with retained bytes plus retained cache sizes.
+pub struct EzGfxResourceDiagnostics {
+    /// Texture uploads awaiting decode or transfer completion.
+    pub pending_textures: u32,
+    /// Admitted source bytes (decode) plus decoded staging bytes (transfer).
+    pub pending_texture_bytes: u64,
+    /// Vertex uploads awaiting transfer completion.
+    pub pending_vertex_uploads: u32,
+    /// Vertex bytes awaiting transfer completion.
+    pub pending_vertex_bytes: u64,
+    /// Index uploads awaiting transfer completion.
+    pub pending_index_uploads: u32,
+    /// Index bytes awaiting transfer completion.
+    pub pending_index_bytes: u64,
+    /// Staging buckets retained across the shared, buffer, and counter pools.
+    pub staging_buckets: u32,
+    /// Staging bucket capacity retained across those pools.
+    pub staging_bytes: u64,
+    /// Compiled pipeline entries retained in the context cache.
+    pub pipeline_entries: u32,
+    /// Bytes retained across completed readback frames.
+    pub readback_bytes: u64,
 }
 
 /// Custom image decoder invoked concurrently by texture workers.

@@ -46,7 +46,7 @@ StructuredBuffer<float4> positions;
 
 Reflection records `VertexHeap` separately from `StructuredBuffer`. Applications do not supply a `PublicBinding` for it. Frame recording imports the named heap automatically and each backend lowers it to its private descriptor layout. Vulkan, Direct3D 12, and Metal retain distinct physical layouts behind the same public contract.
 
-Buffer and counter resources bind by shader-declared name: `[Buffer("name")]` and `[CounterBuffer("name")]` reflect as `buffer` and `counter_buffer` binding kinds. `Frame::bind_buffer` adds or replaces one named entry in the frame binding set without materializing a never-executed replacement. `execute_compute` and `execute_graphics` materialize and read the current set without removing entries, so unchanged resources remain bound across same-frame compute and graphics work. Single POD constants bind the same way as `ValueBuffer`, not as push-constant bytes. ABI 37 exposes the same persistent frame-local set through `ez_gfx_frame_bind` and `ez_gfx_frame_execute_compute`/`graphics`; terminal end or abort clears it.
+Buffer and counter resources bind by shader-declared name: `[Buffer("name")]` and `[CounterBuffer("name")]` reflect as `buffer` and `counter_buffer` binding kinds. `Frame::bind_buffer` adds or replaces one named entry in the frame binding set without materializing a never-executed replacement. `execute_compute` and `execute_graphics` materialize and read the current set without removing entries, so unchanged resources remain bound across same-frame compute and graphics work. Single POD constants bind the same way as `ValueBuffer`, not as push-constant bytes. ABI 39 exposes the same persistent frame-local set through `ez_gfx_frame_bind` and `ez_gfx_frame_execute_compute`/`graphics`; terminal end or abort clears it.
 
 The global index heap remains a native index-buffer binding. `DrawIndexedCommand::first_index` is the queried index allocation start plus any mesh-local index offset. Because a vertex heap is bound at byte offset zero, `vertex_offset` must include the queried vertex allocation start.
 
@@ -62,6 +62,10 @@ The index heap is a context singleton, not a freely creatable family of named he
 `Context::register_callback` is the sole safe event channel. The facade dispatches queued events at creator-thread operation seams; applications do not poll internal runtime queues.
 
 A heap-level maximum readiness token is used when a frame imports a named heap. It may wait for a later allocation in the same heap, but never permits early use.
+
+## Pending-upload diagnostics
+
+`Context::resource_diagnostics` reports `pending_vertex_uploads` and `pending_index_uploads` as outstanding upload allocations with their reserved byte sizes in `pending_vertex_bytes` and `pending_index_bytes`. Vertex allocations count once each regardless of element width; index allocations count once each for packed `u32` ranges. A retired-but-unswept transfer keeps its pending key after its live range is reclaimed and contributes no size rather than failing the observation. The C ABI exposes the same snapshot through `ez_gfx_context_get_resource_diagnostics` at ABI 39.
 
 ## Admission and copies
 

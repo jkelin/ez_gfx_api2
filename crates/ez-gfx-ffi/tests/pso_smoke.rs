@@ -8,14 +8,14 @@ mod common;
 mod common;
 
 use common::TestContext;
-use ez_gfx_compiler::{CompilerError, Target, compile_shader};
+use ez_gfx_compiler::{CompilerError, EasyGraphicsCompiler, Target};
 use ez_gfx_ffi::{
     EzGfxBinding, EzGfxRenderTargetDesc, EzGfxResult, ez_gfx_buffer_acquire, ez_gfx_buffer_release,
-    ez_gfx_buffer_write, ez_gfx_context_wait_idle, ez_gfx_counter_buffer_acquire,
-    ez_gfx_counter_buffer_publish_count, ez_gfx_counter_buffer_release, ez_gfx_frame_bind,
-    ez_gfx_frame_end, ez_gfx_frame_execute_compute, ez_gfx_render_target_create,
-    ez_gfx_render_target_destroy, ez_gfx_render_target_frame_begin, ez_gfx_shader_destroy,
-    ez_gfx_shader_load_artifact, ez_gfx_value_buffer_acquire,
+    ez_gfx_buffer_write, ez_gfx_compute_shader_destroy, ez_gfx_compute_shader_load,
+    ez_gfx_context_wait_idle, ez_gfx_counter_buffer_acquire, ez_gfx_counter_buffer_publish_count,
+    ez_gfx_counter_buffer_release, ez_gfx_frame_bind, ez_gfx_frame_end,
+    ez_gfx_frame_execute_compute, ez_gfx_render_target_create, ez_gfx_render_target_destroy,
+    ez_gfx_render_target_frame_begin, ez_gfx_value_buffer_acquire,
 };
 
 const COMPUTE_SOURCE: &str = r#"import "ez_gfx_api";
@@ -106,7 +106,7 @@ fn reject_invalid_bindings_without_claiming(
     assert_eq!(
         // SAFETY: Null dynamic state selects the default; the zero counter is rejected.
         unsafe {
-            ez_gfx_ffi::ez_gfx_frame_execute_graphics(context, frame, 0, 0, core::ptr::null())
+            ez_gfx_ffi::ez_gfx_frame_execute_graphics(context, frame, 0, 0, 0, core::ptr::null())
         },
         EzGfxResult::InvalidContext
     );
@@ -161,7 +161,7 @@ fn run_compute_pipeline(backend: u8) {
     let targets = &[Target::Spirv, Target::Dxil, Target::Metal];
     #[cfg(not(windows))]
     let targets = &[Target::Spirv];
-    let artifact = match compile_shader(&source, targets, cfg!(windows)) {
+    let artifact = match EasyGraphicsCompiler::compile_shader(&source, targets, cfg!(windows)) {
         Ok(artifact) => artifact,
         Err(CompilerError::NativeUnavailable) => return,
         Err(error) => panic!("shader compilation failed: {error}"),
@@ -171,14 +171,17 @@ fn run_compute_pipeline(backend: u8) {
     let context = native.context;
 
     let mut shader = 0;
+    let entry = b"main";
     assert_eq!(
         {
-            // SAFETY: Non-null arguments use live test-owned storage with the export contract's required size, alignment, and access; nulls intentionally exercise checked rejection.
+            // SAFETY: Artifact, exact entry name, and output storage remain live through the call.
             unsafe {
-                ez_gfx_shader_load_artifact(
+                ez_gfx_compute_shader_load(
                     context,
                     artifact.as_ptr(),
                     artifact.len(),
+                    entry.as_ptr(),
+                    entry.len(),
                     &raw mut shader,
                 )
             }
@@ -288,6 +291,12 @@ fn run_compute_pipeline(backend: u8) {
         ez_gfx_frame_execute_compute(context, frame, shader, 1, 1, 1),
         EzGfxResult::Ok
     );
+    // The raw frame retains the selected shader after C relinquishes its only handle.
+    ez_gfx_compute_shader_destroy(context, shader);
+    assert_eq!(
+        ez_gfx_frame_execute_compute(context, frame, shader, 1, 1, 1),
+        EzGfxResult::InvalidContext
+    );
     assert_eq!(
         {
             // SAFETY: The source range remains valid; rejection occurs before any copy.
@@ -316,7 +325,7 @@ fn run_compute_pipeline(backend: u8) {
     ez_gfx_buffer_release(context, buffer);
     ez_gfx_counter_buffer_release(context, indirect);
 
-    ez_gfx_shader_destroy(context, shader);
+    // Shader destruction was requested before submission and completed with the frame.
     drop(native);
     let _ = std::fs::remove_dir_all(root);
 }

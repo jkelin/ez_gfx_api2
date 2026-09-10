@@ -104,6 +104,8 @@ The candidates have no comparable workload measurement. The target-native option
 
 One documented source convention fixes math, depth, winding, texture/sampler, and semantic resource identity. Offline compilation emits SPIR-V, DXIL, and Metal products plus a canonical semantic resource graph and complete per-target layouts. Runtime binds stable, collision-safe semantic IDs to the selected target layout; it never assumes identical binding numbers or aggregate byte layouts. Pipeline/viewport state handles coordinate differences where possible, and offline compilation rejects semantics without equivalent lowering.
 
+Runtime owns compiler-free `.ezgfxshader` loading. A host-side `CompiledShader` contains all discovered stage/name variants; loading one exact stage/name returns an owning, context-bound generational shader identity. Compute and graphics pipelines are created on demand, keyed by every shader identity and relevant state, and evicted on shader drop into backend completion-tracked deferred retirement.
+
 Reject the Vulkan-compatible physical ABI because identical backend slots/packing are not requested, target APIs differ materially, and generated remapping adds unmeasured code and correctness risk. Reconsider it only if incumbent C/C# compatibility proves callers persist raw Vulkan binding numbers or constant-buffer bytes that cannot migrate to semantic IDs.
 
 Evidence: Slang reflection explicitly separates declarations from layouts and exposes target-indexed layout data; its Metal backend documents entry legalization, binding, matrix, and function-constant differences. No source establishes a performance winner, so runtime lookup, artifact size, target instruction counts, compile/pipeline times, and scene GPU time remain unknown.
