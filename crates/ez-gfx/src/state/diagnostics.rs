@@ -128,16 +128,11 @@ pub fn memory_telemetry(context: ContextHandle) -> Result<MemoryTelemetryReport>
         report.swapchain_images = surface.images;
         report.swapchain_extent = surface.extent;
         report.swapchain_format = surface.format;
-        report.swapchain_bytes = ez_gfx_hal::rgba8_image_bytes(
-            surface.images,
-            surface.extent.0,
-            surface.extent.1,
-        );
-        report.depth_bytes = surface
-            .depth_extent
-            .map_or(0, |(width, height)| {
-                ez_gfx_hal::rgba8_image_bytes(1, width, height)
-            });
+        report.swapchain_bytes =
+            ez_gfx_hal::rgba8_image_bytes(surface.images, surface.extent.0, surface.extent.1);
+        report.depth_bytes = surface.depth_extent.map_or(0, |(width, height)| {
+            ez_gfx_hal::rgba8_image_bytes(1, width, height)
+        });
         Ok(MemoryTelemetryReport {
             backend: report,
             staging_buckets: u32::try_from(buckets).unwrap_or(u32::MAX),
@@ -184,12 +179,9 @@ fn aggregate_surface_telemetry(
     if preferred.is_none() {
         let mut largest = 0_u64;
         for (handle, record) in &context.surfaces {
-            let area = record
-                .state
-                .extent()
-                .map_or(0, |(width, height)| {
-                    u64::from(width).saturating_mul(u64::from(height))
-                });
+            let area = record.state.extent().map_or(0, |(width, height)| {
+                u64::from(width).saturating_mul(u64::from(height))
+            });
             if area > largest {
                 largest = area;
                 preferred = Some(*handle);

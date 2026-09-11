@@ -6,15 +6,13 @@ use super::{
     ExecutionBarrier, ExecutionPass, Format, FrameBindingSource, FrameBufferBindingRecord,
     FrameExecutionBackend, FrameExecutionPlan, FrameNativeResource, GeometryAllocation, HashMap,
     ImageRange, LoadOp, MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext,
-    NativePipeline, NativeShader,
-    NativeSurface, NativeTexture, NodeDesc, PackedHandle, PassInfo, PipelineKey, QueueKind,
-    RenderTargetHandle, RenderTargetRecord, ResourceAccess, ResourceDesc, ResourceId, ResourceKind,
-    ResourceLifetime, ResourceState, RuntimePhase, SURFACE_DEFAULT_CLEAR, ShaderHandle,
-    ShaderRecord, ShaderStage, StoreOp, SurfaceHandle, TextureFormat, TextureHandle, TextureId,
-    last_native_frame_completion, map_frame, map_hal, map_lifecycle, native_layouts,
+    NativePipeline, NativeShader, NativeSurface, NativeTexture, NodeDesc, PackedHandle, PassInfo,
+    PipelineKey, QueueKind, RenderTargetHandle, RenderTargetRecord, ResourceAccess, ResourceDesc,
+    ResourceId, ResourceKind, ResourceLifetime, ResourceState, RuntimePhase, SURFACE_DEFAULT_CLEAR,
+    ShaderHandle, ShaderRecord, ShaderStage, StoreOp, SurfaceHandle, TextureFormat, TextureHandle,
+    TextureId, last_native_frame_completion, map_frame, map_hal, map_lifecycle, native_layouts,
     pipeline_layout_key, prepare_frame_binding_scratch, result_status, runtime_record,
-    wait_native_idle,
-    with_context_mut,
+    wait_native_idle, with_context_mut,
 };
 
 mod binding;
@@ -27,77 +25,8 @@ use transients::{invalidate_unsafe_transients, recycle_consumed_transients};
 mod transient_tests;
 type NativeTextureMap = HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>;
 
+include!("lowering.rs");
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "each independently retained lowering vector is accounted and discarded together"
-)]
-fn account_frame_lowering_scratch(
-    frame: &mut ez_gfx_runtime::frame::FrameRecorder,
-    pipeline_keys: &mut Vec<Option<PipelineKey>>,
-    action_indices: &mut Vec<usize>,
-    bindings: &mut Vec<FrameBufferBindingRecord>,
-    ranges: &mut Vec<core::ops::Range<usize>>,
-    #[cfg(target_vendor = "apple")]
-    texture_heaps: &mut Vec<Option<ez_gfx_hal::ShaderTextureHeapLayout>>,
-    #[cfg(target_vendor = "apple")] workgroup_sizes: &mut Vec<Option<[u32; 3]>>,
-) -> Result<()> {
-    let bytes = pipeline_keys
-        .capacity()
-        .saturating_mul(core::mem::size_of::<Option<PipelineKey>>())
-        .saturating_add(
-            pipeline_keys.iter().flatten().fold(0_usize, |total, key| {
-                total.saturating_add(key.retained_bytes())
-            }),
-        )
-        .saturating_add(
-            action_indices
-                .capacity()
-                .saturating_mul(core::mem::size_of::<usize>()),
-        )
-        .saturating_add(
-            bindings
-                .capacity()
-                .saturating_mul(core::mem::size_of::<FrameBufferBindingRecord>()),
-        )
-        .saturating_add(
-            ranges
-                .capacity()
-                .saturating_mul(core::mem::size_of::<core::ops::Range<usize>>()),
-        );
-    #[cfg(target_vendor = "apple")]
-    let bytes = bytes
-        .saturating_add(
-            texture_heaps
-                .capacity()
-                .saturating_mul(core::mem::size_of::<
-                    Option<ez_gfx_hal::ShaderTextureHeapLayout>,
-                >()),
-        )
-        .saturating_add(
-            workgroup_sizes
-                .capacity()
-                .saturating_mul(core::mem::size_of::<Option<[u32; 3]>>()),
-        );
-    if let Err(error) = frame.set_lowering_scratch_bytes(bytes) {
-        // Drop the complete lowering workspace together: retaining only some
-        // vectors would make accounting dependent on the rejected frame.
-        *pipeline_keys = Vec::new();
-        *action_indices = Vec::new();
-        *bindings = Vec::new();
-        *ranges = Vec::new();
-        #[cfg(target_vendor = "apple")]
-        {
-            *texture_heaps = Vec::new();
-            *workgroup_sizes = Vec::new();
-        }
-        frame
-            .set_lowering_scratch_bytes(0)
-            .map_err(|reset| map_frame(&reset))?;
-        return Err(map_frame(&error));
-    }
-    Ok(())
-}
 /// Begins frame recording.
 ///
 /// # Errors
@@ -193,6 +122,35 @@ pub fn frame_request_presented_readback(
 
 const fn should_capture_presented(snapshot_cache: bool, frame_request: bool) -> bool {
     snapshot_cache || frame_request
+}
+
+fn frame_target_extent(
+    context: &ContextState,
+    surface: Option<&super::SurfaceRecord>,
+) -> (u32, u32) {
+    surface
+        .and_then(|surface| surface.state.extent())
+        .or_else(|| {
+            context
+                .frame_render_target
+                .and_then(|target| context.render_targets.get(&target))
+                .map(|record| (record.width, record.height))
+        })
+        .unwrap_or((0, 0))
+}
+
+fn expected_frame_output_count(payloads: &[ExecutableNode], capture: bool) -> usize {
+    payloads
+        .iter()
+        .filter(|payload| {
+            matches!(
+                payload,
+                ExecutableNode::TextureReadback { .. }
+                    | ExecutableNode::RenderTargetReadback { .. }
+            )
+        })
+        .count()
+        .saturating_add(usize::from(capture))
 }
 
 fn intern_buffer_resource(context: &mut ContextState, handle: PackedHandle) -> Result<ResourceId> {
@@ -856,9 +814,7 @@ pub fn execute_graphics(
             .map_err(|_| Error::InvalidArgument)?;
         let bindings = binding::BindingProjection::new(&layout, bindings);
         validate_binding_handles(context, bindings)?;
-        bindings
-            .validate()
-            .map_err(|_| Error::InvalidArgument)?;
+        bindings.validate().map_err(|_| Error::InvalidArgument)?;
         let draw_capacity = context
             .indirects
             .get(&counter)
@@ -930,9 +886,7 @@ pub fn execute_compute(
             .map_err(|_| Error::InvalidArgument)?;
         let bindings = binding::BindingProjection::new(&layout, bindings);
         validate_binding_handles(context, bindings)?;
-        bindings
-            .validate()
-            .map_err(|_| Error::InvalidArgument)?;
+        bindings.validate().map_err(|_| Error::InvalidArgument)?;
         let node = add_binding_accesses(
             context,
             NodeDesc::new("compute", QueueKind::Compute),
@@ -1190,30 +1144,15 @@ impl FrameExecutionBackend<ExecutableNode> for NativeFrameAdapter<'_> {
         payloads: &[ExecutableNode],
     ) -> std::result::Result<(), Self::Error> {
         if matches!(self.context.native, NativeContext::Vulkan(_)) {
-            return execute_vulkan_frame_plan(
-                self.context,
-                plan,
-                payloads,
-                self.binding_resources,
-            );
+            return execute_vulkan_frame_plan(self.context, plan, payloads, self.binding_resources);
         }
         #[cfg(windows)]
         if matches!(self.context.native, NativeContext::Dx12(_)) {
-            return execute_dx12_frame_plan(
-                self.context,
-                plan,
-                payloads,
-                self.binding_resources,
-            );
+            return execute_dx12_frame_plan(self.context, plan, payloads, self.binding_resources);
         }
         #[cfg(target_vendor = "apple")]
         if matches!(self.context.native, NativeContext::Metal(_)) {
-            return execute_metal_frame_plan(
-                self.context,
-                plan,
-                payloads,
-                self.binding_resources,
-            );
+            return execute_metal_frame_plan(self.context, plan, payloads, self.binding_resources);
         }
         Err(Error::NativeFailure)
     }

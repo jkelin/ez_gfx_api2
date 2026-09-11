@@ -291,7 +291,10 @@ impl NativeContext {
         let upload_request = AllocationRequest::new(bucket, 4, MemoryClass::Upload, true, None)
             .map_err(|_| AllocationError::ZeroSize)?;
         let completed = self.completed_texture_transfer_value()?;
-        for stale in self.texture_staging.trim(ez_gfx_hal::QueueKind::TextureTransfer, completed) {
+        for stale in self
+            .texture_staging
+            .trim(ez_gfx_hal::QueueKind::TextureTransfer, completed)
+        {
             self.free(stale)?;
         }
         if self.allocator.is_none() {
@@ -345,7 +348,10 @@ impl NativeContext {
                 return Err(map_allocation_vk(map_vk(error)));
             }
         };
-        let upload = if let Some((_, upload)) = self.texture_staging.take(total, ez_gfx_hal::QueueKind::TextureTransfer, completed) {
+        let upload = if let Some((_, upload)) =
+            self.texture_staging
+                .take(total, ez_gfx_hal::QueueKind::TextureTransfer, completed)
+        {
             upload
         } else {
             match self.allocate(upload_request) {
@@ -603,12 +609,18 @@ impl NativeContext {
         let bucket = ez_gfx_hal::staging_bucket_size(size, ez_gfx_hal::DEFAULT_STAGING_POLICY)
             .map_err(|_| AllocationError::OutOfMemory)?;
         let completed = self.completed_texture_transfer_value()?;
-        for stale in self.texture_staging.trim(ez_gfx_hal::QueueKind::TextureTransfer, completed) {
+        for stale in self
+            .texture_staging
+            .trim(ez_gfx_hal::QueueKind::TextureTransfer, completed)
+        {
             self.free(stale)?;
         }
         let request = AllocationRequest::new(bucket, 4, MemoryClass::Upload, true, None)
             .map_err(|_| AllocationError::ZeroSize)?;
-        let mut upload = if let Some((_, upload)) = self.texture_staging.take(size, ez_gfx_hal::QueueKind::TextureTransfer, completed) {
+        let mut upload = if let Some((_, upload)) =
+            self.texture_staging
+                .take(size, ez_gfx_hal::QueueKind::TextureTransfer, completed)
+        {
             upload
         } else {
             self.allocate(request)?

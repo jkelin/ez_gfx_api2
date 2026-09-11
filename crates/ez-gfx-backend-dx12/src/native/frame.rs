@@ -68,8 +68,7 @@ fn bindings_match_pipeline(
     let mut valid = true;
     bindings.visit(&mut |index, binding| {
         valid &= writable.get(index).is_some_and(|expected| {
-            binding.writable == *expected
-                && binding.offset < binding.allocation.allocation.size()
+            binding.writable == *expected && binding.offset < binding.allocation.allocation.size()
         });
         Ok(())
     })?;
@@ -189,10 +188,7 @@ fn validate_frame_plan(
                     .ok_or(HalError::InvalidArgument)?;
                 if !pass_active
                     || draw.draw_count == 0
-                    || !bindings_match_pipeline(
-                        draw.bindings,
-                        &draw.pipeline.buffer_writable,
-                    )?
+                    || !bindings_match_pipeline(draw.bindings, &draw.pipeline.buffer_writable)?
                     || draw.pipeline.topology.is_none()
                     || draw.pipeline.signature.is_none()
                     || draw.index_size == 0
@@ -401,7 +397,9 @@ impl NativeContext {
             }
             let request = AllocationRequest::new(total, 256, MemoryClass::Readback, true, None)
                 .map_err(|_| HalError::InvalidArgument)?;
-            let allocation = self.allocate(request).map_err(|_| HalError::NativeFailure)?;
+            let allocation = self
+                .allocate(request)
+                .map_err(|_| HalError::NativeFailure)?;
             let dimensions = match action {
                 NativeFrameAction::TextureReadback { width, height, .. } => (*width, *height),
                 NativeFrameAction::Present => extent,
@@ -442,7 +440,9 @@ impl NativeContext {
                 None,
             )
             .map_err(|_| HalError::InvalidArgument)?;
-            let allocation = self.allocate(request).map_err(|_| HalError::NativeFailure)?;
+            let allocation = self
+                .allocate(request)
+                .map_err(|_| HalError::NativeFailure)?;
             indirect_copies.push(IndirectCopyEntry {
                 action: action_index,
                 allocation,

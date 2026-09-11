@@ -234,7 +234,7 @@ pub(crate) fn materialize(
         .lock()
         .map_err(|_| EzGfxResult::NativeFailure)?
         .get(&(frame, handle))
-        .cloned()
+        .copied()
     {
         return Ok(resource);
     }
@@ -278,7 +278,7 @@ pub(crate) fn materialize(
     MATERIALIZED
         .lock()
         .map_err(|_| EzGfxResult::NativeFailure)?
-        .insert((frame, handle), resource.clone());
+        .insert((frame, handle), resource);
     Ok(resource)
 }
 

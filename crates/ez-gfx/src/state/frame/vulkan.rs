@@ -3,12 +3,12 @@ use ez_gfx_core::capability::PresentationMode;
 
 use super::{
     Backend, ContextState, Error, ExecutableNode, ExecutionAction, ExecutionBarrier, ExecutionPass,
-    FrameExecutionPlan, FrameNativeResource, GeometryAllocation, HashMap,
-    MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext, NativePipeline, NativeShader,
-    NativeSurface, NativeTexture, NativeTextureMap, PackedHandle, PipelineKey, RenderTargetHandle,
-    FrameBindingSource, FrameBufferBindingRecord, RenderTargetRecord, ResourceId,
-    SURFACE_DEFAULT_CLEAR, ShaderHandle, ShaderRecord, map_hal, native_layouts,
-    pipeline_layout_key, prepare_frame_binding_scratch, should_capture_presented,
+    FrameBindingSource, FrameBufferBindingRecord, FrameExecutionPlan, FrameNativeResource,
+    GeometryAllocation, HashMap, MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext,
+    NativePipeline, NativeShader, NativeSurface, NativeTexture, NativeTextureMap, PackedHandle,
+    PipelineKey, RenderTargetHandle, RenderTargetRecord, ResourceId, SURFACE_DEFAULT_CLEAR,
+    ShaderHandle, ShaderRecord, map_hal, native_layouts, pipeline_layout_key,
+    prepare_frame_binding_scratch, should_capture_presented,
 };
 
 use arrayvec::ArrayVec;
@@ -353,14 +353,35 @@ struct VulkanActionSource<'a, 'resources> {
     binding_ranges: &'a [core::ops::Range<usize>],
 }
 
+impl VulkanActionSource<'_, '_> {
+    fn binding_source(
+        &self,
+        node: usize,
+    ) -> std::result::Result<FrameBindingSource<'_>, ez_gfx_hal::HalError> {
+        let range = self
+            .binding_ranges
+            .get(node)
+            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+            .clone();
+        Ok(FrameBindingSource {
+            records: self
+                .binding_records
+                .get(range)
+                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?,
+            allocations: self.state.allocations,
+            vertex_heaps: self.state.vertex_heaps,
+        })
+    }
+}
+
 impl ez_gfx_backend_vulkan::NativeFrameActionSource for VulkanActionSource<'_, '_> {
     fn len(&self) -> usize {
         self.plan
             .actions
             .iter()
-            .filter(|action| {
-                !matches!(action, ExecutionAction::Wait(wait) if wait.external.is_none())
-            })
+            .filter(
+                |action| !matches!(action, ExecutionAction::Wait(wait) if wait.external.is_none()),
+            )
             .count()
     }
 
@@ -382,10 +403,8 @@ impl ez_gfx_backend_vulkan::NativeFrameActionSource for VulkanActionSource<'_, '
                     ez_gfx_backend_vulkan::NativeFrameAction::Wait(token)
                 }
                 ExecutionAction::Barrier(barrier) => {
-                    let resource =
-                        vulkan_barrier_resource(&self.state, barrier).map_err(|_| {
-                            ez_gfx_hal::HalError::InvalidArgument
-                        })?;
+                    let resource = vulkan_barrier_resource(&self.state, barrier)
+                        .map_err(|_| ez_gfx_hal::HalError::InvalidArgument)?;
                     ez_gfx_backend_vulkan::NativeFrameAction::Barrier {
                         barrier: *barrier,
                         resource,
@@ -404,19 +423,7 @@ impl ez_gfx_backend_vulkan::NativeFrameActionSource for VulkanActionSource<'_, '
                         .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
                     match payload {
                         ExecutableNode::Compute { groups, .. } => {
-                            let range = self
-                                .binding_ranges
-                                .get(node)
-                                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
-                                .clone();
-                            binding_source = FrameBindingSource {
-                                records: self
-                                    .binding_records
-                                    .get(range)
-                                    .ok_or(ez_gfx_hal::HalError::InvalidArgument)?,
-                                allocations: self.state.allocations,
-                                vertex_heaps: self.state.vertex_heaps,
-                            };
+                            binding_source = self.binding_source(node)?;
                             let key = self.pipeline_keys[node]
                                 .as_ref()
                                 .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
@@ -440,20 +447,9 @@ impl ez_gfx_backend_vulkan::NativeFrameActionSource for VulkanActionSource<'_, '
                             draw_capacity,
                             ..
                         } => {
-                            let range = self
-                                .binding_ranges
-                                .get(node)
-                                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
-                                .clone();
-                            binding_source = FrameBindingSource {
-                                records: self
-                                    .binding_records
-                                    .get(range)
-                                    .ok_or(ez_gfx_hal::HalError::InvalidArgument)?,
-                                allocations: self.state.allocations,
-                                vertex_heaps: self.state.vertex_heaps,
-                            };
-                            let indirect = self.state
+                            binding_source = self.binding_source(node)?;
+                            let indirect = self
+                                .state
                                 .allocations
                                 .get(&counter.packed())
                                 .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
@@ -486,11 +482,11 @@ impl ez_gfx_backend_vulkan::NativeFrameActionSource for VulkanActionSource<'_, '
                             )
                         }
                         ExecutableNode::TextureReadback { texture } => {
-                            let (_, texture, width, height, _) = self
-                                .state
-                                .textures
-                                .get(texture)
-                                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
+                            let (_, texture, width, height, _) =
+                                self.state
+                                    .textures
+                                    .get(texture)
+                                    .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
                             ez_gfx_backend_vulkan::NativeFrameAction::TextureReadback {
                                 texture: texture
                                     .vulkan()
@@ -551,17 +547,7 @@ pub(super) fn execute_vulkan_frame_plan(
         })
         .transpose()?;
     let presentation_mode = presentation_mode(surface.as_ref());
-    // Target-only frames size draws and validations from the target extents.
-    let extent = surface
-        .as_ref()
-        .and_then(|surface| surface.state.extent())
-        .or_else(|| {
-            context
-                .frame_render_target
-                .and_then(|target| context.render_targets.get(&target))
-                .map(|record| (record.width, record.height))
-        })
-        .unwrap_or((0, 0));
+    let extent = super::frame_target_extent(context, surface.as_ref());
     let capture = should_capture_presented(
         surface
             .as_ref()
@@ -664,17 +650,7 @@ pub(super) fn execute_vulkan_frame_plan(
     };
     let outcome = match execution {
         Ok(outputs) => {
-            let texture_readbacks = payloads
-                .iter()
-                .filter(|payload| {
-                    matches!(
-                        payload,
-                        ExecutableNode::TextureReadback { .. }
-                            | ExecutableNode::RenderTargetReadback { .. }
-                    )
-                })
-                .count();
-            let expected = texture_readbacks + usize::from(capture);
+            let expected = super::expected_frame_output_count(payloads, capture);
             if outputs.len() != expected {
                 if let (Some(handle), Some(surface)) = (surface_handle, surface) {
                     context.surfaces.insert(handle, surface);

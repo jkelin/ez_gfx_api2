@@ -500,12 +500,7 @@ impl FrameGraph {
                                     .checked_sub(growth.saturating_sub(reserved_bytes))
                                     .ok_or(GraphError::CapacityExhausted)?;
                             }
-                            result.push(HazardEdge::new(
-                                earlier,
-                                later,
-                                before.resource,
-                                kind,
-                            ));
+                            result.push(HazardEdge::new(earlier, later, before.resource, kind));
                         }
                     }
                 }

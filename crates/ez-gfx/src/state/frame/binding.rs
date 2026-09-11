@@ -69,7 +69,11 @@ impl<'a> BindingProjection<'a> {
 
     pub(in crate::state) fn validate(self) -> Result<(), BindingError> {
         for (index, binding) in self.iter().enumerate() {
-            if self.iter().take(index).any(|prior| prior.name == binding.name) {
+            if self
+                .iter()
+                .take(index)
+                .any(|prior| prior.name == binding.name)
+            {
                 return Err(BindingError::Duplicate(binding.name.clone()));
             }
         }
@@ -146,7 +150,10 @@ mod tests {
 
         let projection = BindingProjection::new(&current, &bindings);
 
-        assert_eq!(projection.iter().collect::<Vec<_>>(), bindings[1..].iter().collect::<Vec<_>>());
+        assert_eq!(
+            projection.iter().collect::<Vec<_>>(),
+            bindings[1..].iter().collect::<Vec<_>>()
+        );
         assert_eq!(projection.validate(), Ok(()));
     }
 
@@ -185,7 +192,10 @@ mod tests {
 
         let projection = BindingProjection::new(&current, &bindings);
 
-        assert_eq!(projection.iter().collect::<Vec<_>>(), bindings.iter().collect::<Vec<_>>());
+        assert_eq!(
+            projection.iter().collect::<Vec<_>>(),
+            bindings.iter().collect::<Vec<_>>()
+        );
         assert_eq!(
             projection.validate(),
             Err(BindingError::Duplicate("instances".into()))

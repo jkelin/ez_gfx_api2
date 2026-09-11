@@ -11,8 +11,7 @@ use super::{
     D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_RESOURCE_UAV_BARRIER, D3D12_TEXTURE_COPY_LOCATION,
     D3D12_TEXTURE_COPY_LOCATION_0, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
     D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, FRAMES_IN_FLIGHT, FrameSlot, HalError, ID3D12Device,
-    ID3D12GraphicsCommandList, ID3D12PipelineState, ID3D12Resource, NativePipeline,
-    ResourceAccess,
+    ID3D12GraphicsCommandList, ID3D12PipelineState, ID3D12Resource, NativePipeline, ResourceAccess,
 };
 
 pub(super) fn dx12_resource_state(access: ResourceAccess) -> D3D12_RESOURCE_STATES {

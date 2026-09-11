@@ -160,11 +160,7 @@ impl<T> ReusableStagingPool<T> {
     /// Idle age is ignored here; completion gating is not. Buckets still owned
     /// by in-flight GPU work stay even when retention exceeds the budget, so the
     /// returned removals may leave the pool over budget when everything is pending.
-    pub fn trim_to_budget(
-        &mut self,
-        completed_queue: QueueKind,
-        completed_value: u64,
-    ) -> Vec<T> {
+    pub fn trim_to_budget(&mut self, completed_queue: QueueKind, completed_value: u64) -> Vec<T> {
         let mut removed = Vec::new();
         while self.retained_bytes() > self.byte_budget {
             let index = self
@@ -281,9 +277,7 @@ fn retirement_completed(
     completed_queue: QueueKind,
     completed_value: u64,
 ) -> bool {
-    retirement.is_none_or(|token| {
-        token.queue == completed_queue && token.value <= completed_value
-    })
+    retirement.is_none_or(|token| token.queue == completed_queue && token.value <= completed_value)
 }
 
 #[cfg(test)]
@@ -312,15 +306,9 @@ mod tests {
         pool.put(64, "small", Some(pending));
         pool.put(128, "large", None);
 
-        assert_eq!(
-            pool.take(32, QueueKind::Transfer, 2),
-            Some((128, "large"))
-        );
+        assert_eq!(pool.take(32, QueueKind::Transfer, 2), Some((128, "large")));
         pool.put(128, "large", None);
-        assert_eq!(
-            pool.take(32, QueueKind::Transfer, 3),
-            Some((64, "small"))
-        );
+        assert_eq!(pool.take(32, QueueKind::Transfer, 3), Some((64, "small")));
         pool.put(64, "small", None);
 
         assert_eq!(pool.take(1024, QueueKind::Transfer, 3), None);
@@ -341,10 +329,7 @@ mod tests {
         assert_eq!(pool.retained_bytes(), 192);
         assert_eq!(pool.high_water_bytes(), 192);
         // Takes shrink retention but never the observed peak.
-        assert_eq!(
-            pool.take(32, QueueKind::Transfer, 0),
-            Some((64, "small"))
-        );
+        assert_eq!(pool.take(32, QueueKind::Transfer, 0), Some((64, "small")));
         assert_eq!(pool.retained_bytes(), 128);
         assert_eq!(pool.high_water_bytes(), 192);
         pool.put(64, "small", None);
@@ -379,10 +364,7 @@ mod tests {
         pool.put(64, "pending", Some(pending));
         pool.set_byte_budget(0);
         // Nothing is completed at value 2, so pressure trim keeps GPU-owned memory.
-        assert!(
-            pool.trim_to_budget(QueueKind::Transfer, 2)
-                .is_empty()
-        );
+        assert!(pool.trim_to_budget(QueueKind::Transfer, 2).is_empty());
         assert_eq!(pool.retained_bytes(), 64);
     }
 
@@ -394,21 +376,13 @@ mod tests {
         pool.set_byte_budget(0);
 
         assert_eq!(pool.take(1, QueueKind::Graphics, 30), None);
-        assert!(
-            pool.trim(QueueKind::Graphics, 30).is_empty()
-        );
-        assert!(
-            pool.trim_to_budget(QueueKind::Graphics, 30)
-                .is_empty()
-        );
+        assert!(pool.trim(QueueKind::Graphics, 30).is_empty());
+        assert!(pool.trim_to_budget(QueueKind::Graphics, 30).is_empty());
         assert_eq!(
             pool.largest_completed_capacity(QueueKind::Graphics, 30),
             None
         );
-        assert_eq!(
-            pool.pop_largest_completed(QueueKind::Graphics, 30),
-            None
-        );
+        assert_eq!(pool.pop_largest_completed(QueueKind::Graphics, 30), None);
         assert_eq!(pool.retained_bytes(), 64);
 
         assert_eq!(
@@ -439,18 +413,12 @@ mod tests {
         );
         assert_eq!(pool.retained_bytes(), 192);
         // Best-fit reuse is unaffected by eviction order.
-        assert_eq!(
-            pool.take(32, QueueKind::Transfer, 2),
-            Some((128, "medium"))
-        );
+        assert_eq!(pool.take(32, QueueKind::Transfer, 2), Some((128, "medium")));
         assert_eq!(
             pool.largest_completed_capacity(QueueKind::Transfer, 2),
             None
         );
-        assert_eq!(
-            pool.pop_largest_completed(QueueKind::Transfer, 2),
-            None
-        );
+        assert_eq!(pool.pop_largest_completed(QueueKind::Transfer, 2), None);
         // Only the in-flight bucket remains, still gated.
         assert_eq!(pool.retained_bytes(), 64);
     }

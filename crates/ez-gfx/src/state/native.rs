@@ -112,7 +112,10 @@ pub(super) struct FrameBufferBindingRecord {
     pub(super) offset: u64,
     pub(super) range: u64,
     pub(super) writable: bool,
-    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    #[cfg_attr(
+        not(target_vendor = "apple"),
+        allow(dead_code, reason = "Metal alone consumes the reflected binding index")
+    )]
     pub(super) index: usize,
 }
 
@@ -252,7 +255,10 @@ pub(super) struct FrameBindingSource<'a> {
 }
 
 impl FrameBindingSource<'_> {
-    fn allocation(&self, resource: FrameBindingResource) -> std::result::Result<&NativeAllocation, HalError> {
+    fn allocation(
+        &self,
+        resource: FrameBindingResource,
+    ) -> std::result::Result<&NativeAllocation, HalError> {
         match resource {
             FrameBindingResource::Allocation(handle) => self
                 .allocations
@@ -288,12 +294,15 @@ impl ez_gfx_backend_vulkan::NativeBufferBindingSource for FrameBindingSource<'_>
             let NativeAllocation::Vulkan(allocation) = self.allocation(record.resource)? else {
                 return Err(HalError::InvalidArgument);
             };
-            visitor(index, &ez_gfx_backend_vulkan::NativeBufferBinding {
-                allocation,
-                offset: record.offset,
-                range: record.range,
-                writable: record.writable,
-            })?;
+            visitor(
+                index,
+                &ez_gfx_backend_vulkan::NativeBufferBinding {
+                    allocation,
+                    offset: record.offset,
+                    range: record.range,
+                    writable: record.writable,
+                },
+            )?;
         }
         Ok(())
     }
@@ -316,11 +325,14 @@ impl ez_gfx_backend_dx12::native::NativeBufferBindingSource for FrameBindingSour
             let NativeAllocation::Dx12(allocation) = self.allocation(record.resource)? else {
                 return Err(HalError::InvalidArgument);
             };
-            visitor(index, &ez_gfx_backend_dx12::native::NativeBufferBinding {
-                allocation,
-                offset: record.offset,
-                writable: record.writable,
-            })?;
+            visitor(
+                index,
+                &ez_gfx_backend_dx12::native::NativeBufferBinding {
+                    allocation,
+                    offset: record.offset,
+                    writable: record.writable,
+                },
+            )?;
         }
         Ok(())
     }
@@ -343,11 +355,15 @@ impl ez_gfx_backend_metal::native::NativeBufferBindingSource for FrameBindingSou
             let NativeAllocation::Metal(allocation) = self.allocation(record.resource)? else {
                 return Err(HalError::InvalidArgument);
             };
-            visitor(index, &ez_gfx_backend_metal::native::NativeBufferBinding {
-                allocation,
-                offset: usize::try_from(record.offset).map_err(|_| HalError::InvalidArgument)?,
-                index: record.index,
-            })?;
+            visitor(
+                index,
+                &ez_gfx_backend_metal::native::NativeBufferBinding {
+                    allocation,
+                    offset: usize::try_from(record.offset)
+                        .map_err(|_| HalError::InvalidArgument)?,
+                    index: record.index,
+                },
+            )?;
         }
         Ok(())
     }
@@ -657,6 +673,8 @@ mod binding_scratch_tests {
     static ENABLED: AtomicBool = AtomicBool::new(false);
     static CALLS: AtomicUsize = AtomicUsize::new(0);
 
+    // SAFETY: every allocation operation preserves `GlobalAlloc`'s pointer and layout contracts by
+    // delegating unchanged requests to the system allocator.
     unsafe impl GlobalAlloc for CountingAllocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             // SAFETY: the unchanged request is delegated to the system allocator.
@@ -709,8 +727,7 @@ mod binding_scratch_tests {
             .resources()
             .collect::<Vec<_>>();
         let mut scratch = Vec::new();
-        append_frame_bindings(&layout, &bindings, |_| Some(1024), |_| None, &mut scratch)
-            .unwrap();
+        append_frame_bindings(&layout, &bindings, |_| Some(1024), |_| None, &mut scratch).unwrap();
         assert_eq!(scratch.len(), 65);
 
         CALLS.store(0, Ordering::Relaxed);

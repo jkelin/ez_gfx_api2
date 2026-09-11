@@ -2,13 +2,12 @@ use crate::Result;
 use ez_gfx_core::capability::PresentationMode;
 
 use super::{
-    Backend, ContextState, Error, ExecutableNode, ExecutionAction, FrameExecutionPlan,
-    FrameNativeResource, GeometryAllocation, HashMap, MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation,
-    NativeContext, NativePipeline, NativeShader, NativeSurface, NativeTexture, PipelineKey,
-    FrameBindingSource, FrameBufferBindingRecord, RenderTargetHandle, RenderTargetRecord,
-    ResourceId, SURFACE_DEFAULT_CLEAR, ShaderRecord, TextureHandle, TextureId, map_hal,
-    native_layouts, pipeline_layout_key, prepare_frame_binding_scratch,
-    should_capture_presented,
+    Backend, ContextState, Error, ExecutableNode, ExecutionAction, FrameBindingSource,
+    FrameBufferBindingRecord, FrameExecutionPlan, FrameNativeResource, GeometryAllocation, HashMap,
+    MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext, NativePipeline, NativeShader,
+    NativeSurface, NativeTexture, PipelineKey, RenderTargetHandle, RenderTargetRecord, ResourceId,
+    SURFACE_DEFAULT_CLEAR, ShaderRecord, TextureHandle, TextureId, map_hal, native_layouts,
+    pipeline_layout_key, prepare_frame_binding_scratch, should_capture_presented,
 };
 use arrayvec::ArrayVec;
 use ez_gfx_backend_metal::native::{
@@ -35,7 +34,6 @@ type PreparedGraphicsPipeline = (
     Option<ShaderTextureHeapLayout>,
 );
 type MetalTextureRecords = HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>;
-
 
 fn metal_texture_heap(
     layout: Option<&TextureHeapLayout>,
@@ -282,13 +280,18 @@ impl ez_gfx_backend_metal::native::NativeFrameActionSource for MetalActionSource
         let action = self
             .plan
             .actions
-            .get(*self.action_indices.get(index).ok_or(ez_gfx_hal::HalError::InvalidArgument)?)
+            .get(
+                *self
+                    .action_indices
+                    .get(index)
+                    .ok_or(ez_gfx_hal::HalError::InvalidArgument)?,
+            )
             .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
         let binding_source;
         let native = match action {
-            ExecutionAction::Wait(wait) => MetalFrameAction::Wait(
-                wait.external.ok_or(ez_gfx_hal::HalError::InvalidArgument)?,
-            ),
+            ExecutionAction::Wait(wait) => {
+                MetalFrameAction::Wait(wait.external.ok_or(ez_gfx_hal::HalError::InvalidArgument)?)
+            }
             ExecutionAction::Barrier(barrier) => {
                 let resource = self
                     .frame_resources
@@ -532,30 +535,24 @@ pub(super) fn execute_metal_frame_plan(
         _ => None,
     });
     let mut surface = surface_handle
-        .map(|handle| context.surfaces.remove(&handle).ok_or(Error::InvalidContext))
+        .map(|handle| {
+            context
+                .surfaces
+                .remove(&handle)
+                .ok_or(Error::InvalidContext)
+        })
         .transpose()?;
     let presentation_mode = surface
         .as_ref()
         .map_or(PresentationMode::Fifo, |surface| surface.presentation_mode);
-    // Target-only frames size draws and validations from the target extents.
-    let extent = surface
-        .as_ref()
-        .and_then(|surface| surface.state.extent())
-        .or_else(|| {
-            context
-                .frame_render_target
-                .and_then(|target| context.render_targets.get(&target))
-                .map(|record| (record.width, record.height))
-        })
-        .unwrap_or((0, 0));
+    let extent = super::frame_target_extent(context, surface.as_ref());
     let capture = should_capture_presented(
         surface
             .as_ref()
             .is_some_and(|surface| surface.state.snapshot_cache()),
         context.frame_capture_surface.is_some(),
     );
-    let mut native_textures =
-        ArrayVec::<_, { MAX_BINDLESS_SAMPLED_TEXTURES as usize }>::new();
+    let mut native_textures = ArrayVec::<_, { MAX_BINDLESS_SAMPLED_TEXTURES as usize }>::new();
     for (handle, (_, texture, _, _, _)) in &context.textures {
         if !context
             .texture_published_mips
@@ -591,15 +588,17 @@ pub(super) fn execute_metal_frame_plan(
         &mut context.frame_workgroup_sizes,
     )?;
     context.frame_action_indices.clear();
-    context.frame_action_indices.extend(
-        plan.actions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, action)| {
-                (!matches!(action, ExecutionAction::Wait(wait) if wait.external.is_none()))
-                    .then_some(index)
-            }),
-    );
+    context
+        .frame_action_indices
+        .extend(
+            plan.actions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, action)| {
+                    (!matches!(action, ExecutionAction::Wait(wait) if wait.external.is_none()))
+                        .then_some(index)
+                }),
+        );
     prepare_frame_binding_scratch(
         payloads,
         binding_resources,
@@ -648,17 +647,7 @@ pub(super) fn execute_metal_frame_plan(
         Some(NativeSurface::Vulkan(_)) => Err(Error::NativeFailure),
     };
     let output_count_valid = result.as_ref().map_or(true, |outputs| {
-        let texture_readbacks = payloads
-            .iter()
-            .filter(|payload| {
-                matches!(
-                    payload,
-                    ExecutableNode::TextureReadback { .. }
-                        | ExecutableNode::RenderTargetReadback { .. }
-                )
-            })
-            .count();
-        outputs.len() == texture_readbacks + usize::from(capture)
+        outputs.len() == super::expected_frame_output_count(payloads, capture)
     });
     if let Ok(outputs) = &result {
         context.last_readbacks.clone_from(outputs);

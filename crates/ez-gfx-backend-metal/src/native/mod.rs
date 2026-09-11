@@ -4,11 +4,11 @@ use crate::{
     BACKEND, TEXTURE_DESCRIPTOR_CAPACITY,
     frame_slots::{FRAMES_IN_FLIGHT, FrameSlotTracker, complete_deferred_slot},
 };
+use arrayvec::ArrayVec;
 use ez_gfx_core::capability::{
     AdapterCapabilities, AdapterClass, AdapterInfo, CompressionSupport, PresentationMode,
     PresentationModes, SemanticProfile,
 };
-use arrayvec::ArrayVec;
 
 const MAX_ARGUMENT_BUFFERS_PER_SLOT: usize = 1024;
 use ez_gfx_hal::{
@@ -230,7 +230,6 @@ impl NativeBufferBindingSource for [NativeBufferBinding<'_>] {
         Ok(())
     }
 }
-
 
 impl NativeBufferBindingSource for &[NativeBufferBinding<'_>] {
     fn len(&self) -> usize {

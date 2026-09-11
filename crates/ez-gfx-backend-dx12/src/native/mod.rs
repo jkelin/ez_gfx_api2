@@ -1,7 +1,7 @@
 use crate::{BACKEND, TEXTURE_DESCRIPTOR_CAPACITY};
+use arrayvec::ArrayVec;
 use core::{ffi::c_void, ptr};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
-use arrayvec::ArrayVec;
 
 use ez_gfx_core::capability::{
     AdapterCapabilities, AdapterClass, AdapterInfo, CompressionSupport, PresentationMode,
@@ -143,13 +143,25 @@ pub struct NativeBufferBinding<'a> {
     /// Whether the root descriptor permits unordered writes.
     pub writable: bool,
 }
-
 /// Synchronous provider for resolved root-buffer bindings.
 pub trait NativeBufferBindingSource {
     /// Number of bindings supplied to the pipeline.
     fn len(&self) -> usize;
 
+    /// Returns whether the source has no bindings.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Visits each binding; borrowed allocation views cannot escape the call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a binding cannot resolve its native allocation or the visitor fails.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the object-safe callback keeps borrowed native allocation views scoped to each visit"
+    )]
     fn visit(
         &self,
         visitor: &mut dyn FnMut(usize, &NativeBufferBinding<'_>) -> Result<(), HalError>,
@@ -171,7 +183,6 @@ impl NativeBufferBindingSource for [NativeBufferBinding<'_>] {
         Ok(())
     }
 }
-
 
 impl NativeBufferBindingSource for &[NativeBufferBinding<'_>] {
     fn len(&self) -> usize {
@@ -297,6 +308,11 @@ pub trait NativeFrameActionSource {
     fn len(&self) -> usize;
 
     /// Visits one action by stable index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the index is invalid, an action cannot resolve its native owner, or
+    /// the visitor rejects the action.
     fn with_action(
         &self,
         index: usize,
@@ -304,6 +320,14 @@ pub trait NativeFrameActionSource {
     ) -> Result<(), HalError>;
 
     /// Visits all actions in order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an action cannot resolve its native owner or the visitor rejects it.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the object-safe callback keeps borrowed native action views scoped to each visit"
+    )]
     fn visit(
         &self,
         visitor: &mut dyn FnMut(usize, &NativeFrameAction<'_>) -> Result<(), HalError>,

@@ -488,8 +488,7 @@ fn aggregate_staging_budget_bounds_many_distinct_strides() {
                 None,
             )
             .map_err(|_| Error::InvalidArgument)?;
-            let allocation =
-                allocate_native(&mut state.native, request).map_err(map_allocation)?;
+            let allocation = allocate_native(&mut state.native, request).map_err(map_allocation)?;
             let pool = state.buffer_pool.entry(stride).or_insert_with(|| {
                 let mut pool = ez_gfx_hal::ReusableStagingPool::new(256);
                 pool.set_byte_budget(ez_gfx_hal::DEFAULT_BUFFER_STAGING_BUDGET);
