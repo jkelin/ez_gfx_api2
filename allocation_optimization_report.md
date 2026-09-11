@@ -45,7 +45,7 @@ Static analysis covered:
 ### Limits
 
 - DHAT measures Rust global-allocator traffic. It does not fully observe driver, OS, COM, Vulkan implementation, or GPU memory allocation.
-- DX12 and Vulkan were measured locally. Metal was inspected statically but not dynamically profiled.
+- DX12 and Vulkan were measured locally; Metal is covered by the executed remote macOS matrix (3 packages, 69 tests at HEAD 5917787), not just static inspection.
 - The triangle is a small graph. Larger graphs amplify graph compiler and lowering costs.
 - Snapshot cost scales with pixel count.
 - Independent-process end-state differences include allocator and event-loop noise.
@@ -267,7 +267,7 @@ Vulkan additionally allocates short wait vectors, a descriptor-set result vector
 
 DX12 creates an action-index-sized `Vec<Option<NativeAllocation>>` for indirect copies. When the indirect argument buffer is also shader-bound, DX12 performs a logical device-memory allocation and copy each frame to avoid self-aliasing. The HAL allocator may satisfy this from retained blocks, but the operation and bookkeeping remain.
 
-Metal uses the same owned action/binding architecture and should receive equivalent scratch storage even though it was not dynamically measured.
+Metal uses the same owned action/binding architecture with equivalent scratch storage; the remote macOS matrix executes its backend suite rather than only compiling it.
 
 ### Transient upload and worker paths
 
@@ -699,12 +699,12 @@ Post-workload telemetry remained separately categorized:
 
 | Backend | GPU live / block / waste | Frame slots | Staging current / high-water | Counter scratch | Pipelines | Readback |
 |---|---:|---:|---:|---:|---:|---:|
-| Vulkan | 11,032,352 / 25,165,824 / 14,133,472 B | 3 | 217,880 B / remeasure | 2,316 B | 3 | 0 B |
-| DX12 | 11,665,408 / 25,165,824 / 13,500,416 B | 3 | 217,880 B / remeasure | 2,316 B | 3 | 0 B |
+| Vulkan | 11,032,352 / 25,165,824 / 14,133,472 B | 3 | 207,244 B / 207,244 B | 2,316 B | 3 | 0 B |
+| DX12 | 11,665,408 / 25,165,824 / 13,500,416 B | 3 | 217,880 B / 217,880 B | 2,316 B | 3 | 0 B |
 
-The staging current values remain valid point-in-time observations. The high-water column requires remeasurement because the prior query-time update did not prove the true peak.
+High-water now reports the true aggregate peak: the telemetry query stores the maximum summed current total across pools instead of summing disjoint per-pool peaks, and both runs held retention flat at the observed totals.
 
-Metal source parity is compile-only: `cargo check -p ez-gfx --no-default-features --target aarch64-apple-darwin` passes and Metal-compatible source/shader targets are present, but no Metal execution is claimed.
+Final backend evidence at HEAD 5917787: local Windows runs give ez-gfx-hal 20/20, ez-gfx-backend-vulkan 46/46, ez-gfx-backend-dx12 24/24, and ez-gfx lib 76/76 tests green, with hidden native probes holding in-scope zero phases and whole-window residuals inside the excluded ceilings above. Remote Linux Vulkan passes 4 packages and 152 tests; remote macOS Metal passes 3 packages (`ez-gfx-hal`, `ez-gfx-backend-metal`, `ez-gfx`) and 69 tests from a clean shallow clone, bypassing the stalled rsync sync. Metal execution is therefore claimed through the matrix, not compile-only.
 
 These columns must remain separate:
 | Category | Authoritative fields | Collection boundary |
