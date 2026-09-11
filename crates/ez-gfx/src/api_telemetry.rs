@@ -1,4 +1,5 @@
-use super::ReadbackId;
+use super::{Context, ReadbackId, state};
+use crate::Result;
 
 /// Creator-thread event delivered by `Context::register_callback`.
 #[derive(Clone, Copy, Debug)]
@@ -83,4 +84,34 @@ pub struct MemoryTelemetryReport {
     pub counter_scratch_bytes: u64,
     /// Async texture decode workers sized at creation.
     pub decode_workers: u32,
+}
+
+impl Context {
+    /// Returns on-demand allocator and memory telemetry without dispatching events.
+    ///
+    /// Backend allocators report through `generate_report` exactly once per
+    /// query, so query explicitly and never per frame. Unlike
+    /// [`Context::resource_diagnostics`], this never dispatches callbacks.
+    ///
+    /// # Errors
+    /// Returns [`crate::Error`] when the context is stale, called from the wrong
+    /// thread, or reentered from a callback.
+    pub fn memory_telemetry(&self) -> Result<MemoryTelemetryReport> {
+        self.check_entry()?;
+        state::memory_telemetry(self.raw())
+    }
+
+    /// Releases retained staging caches down to their finite budgets.
+    ///
+    /// Trims the shared, buffer, and counter staging pools plus excess counter
+    /// serialization capacity, freeing evicted buckets natively. Buckets owned
+    /// by in-flight GPU work stay retained. Call on memory pressure or after
+    /// large streaming bursts — never per frame.
+    /// # Errors
+    /// Returns [`crate::Error`] when the context is stale, called from the wrong
+    /// thread, or reentered from a callback.
+    pub fn release_staging_memory(&self) -> Result<()> {
+        self.check_entry()?;
+        state::release_staging_memory(self.raw())
+    }
 }
