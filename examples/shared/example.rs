@@ -308,17 +308,27 @@ impl Example {
     }
 
     /// Pumps until host input is ready, or returns `None` after completion.
-    pub fn wait_for_next_frame(&mut self, surface: &Surface) -> Result<Option<WindowFrame>> {
+    pub fn wait_for_next_frame(
+        &mut self,
+        context: &Context,
+        surface: &Surface,
+    ) -> Result<Option<WindowFrame>> {
+        if self.state.closed
+            || self
+                .state
+                .frame_limit
+                .is_some_and(|limit| self.frames >= limit)
+        {
+            return Ok(None);
+        }
+        // A zero-frame run exits above without waiting. Snapshot errors terminate the run, while
+        // a submitted first frame advances `frames`, so later frames and every ordinary run skip it.
+        if self.frames == 0 && self.snapshot.is_some() {
+            context.wait_idle()?;
+        }
+
         let host_wait_started = Instant::now();
         loop {
-            if self.state.closed
-                || self
-                    .state
-                    .frame_limit
-                    .is_some_and(|limit| self.frames >= limit)
-            {
-                return Ok(None);
-            }
             self.state.redraw_ready = false;
             while !self.state.redraw_ready && !self.state.closed {
                 self.pump_once()?;

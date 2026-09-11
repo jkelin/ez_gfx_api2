@@ -75,19 +75,35 @@ pub(super) fn decode_ktx2(
             compression,
             destination,
         ),
-        (None, Some(ktx2::SupercompressionScheme::BasisLZ)) => decode_ktx2_basis(
-            data,
-            header.pixel_width,
-            header.pixel_height,
-            header.level_count.max(1),
-            compression,
-            destination,
-        ),
+        (None, Some(ktx2::SupercompressionScheme::BasisLZ))
+            if reader.color_model() == Some(ktx2::ColorModel::ETC1S) =>
+        {
+            decode_ktx2_basis(
+                data,
+                header.pixel_width,
+                header.pixel_height,
+                header.level_count.max(1),
+                compression,
+                destination,
+            )
+        }
+        (None, Some(ktx2::SupercompressionScheme::Zstandard))
+            if reader.color_model() == Some(ktx2::ColorModel::UASTC) =>
+        {
+            decode_ktx2_basis(
+                data,
+                header.pixel_width,
+                header.pixel_height,
+                header.level_count.max(1),
+                compression,
+                destination,
+            )
+        }
         _ => Err(TextureError::Unsupported),
     }
 }
 
-/// The maintained Basis Universal C API validates UASTC/ETC1S payloads, codebooks, and slices; arrays and cubemaps are rejected by this 2D texture contract.
+/// The pure-Rust Basis Universal decoder validates UASTC/ETC1S payloads, codebooks, and slices; arrays and cubemaps are rejected by this 2D texture contract.
 ///
 /// # Errors
 ///
@@ -101,13 +117,7 @@ fn decode_ktx2_basis(
     compression: CompressionSupport,
     destination: TextureDestination,
 ) -> Result<DecodedTexture, TextureError> {
-    use basisu_c_sys::extra::{
-        BasisuTranscoder, ChannelType, SupportedTextureCompression, basisu_transcoder_init,
-    };
-
-    use basisu_c_sys::TranscodeTargetFormat;
-
-    // Bound native start/transcode allocations before entering the dependency.
+    // Bound transcoder preparation and output allocations before entering per-level decode.
     if width == 0
         || height == 0
         || mip_count == 0
@@ -116,6 +126,33 @@ fn decode_ktx2_basis(
         return Err(TextureError::InvalidData);
     }
     let reader = ktx2::Reader::new(data).map_err(|_| TextureError::InvalidData)?;
+    let scheme = reader.header().supercompression_scheme;
+    if scheme != Some(ktx2::SupercompressionScheme::BasisLZ) {
+        let mut source_total = 0_u64;
+        for (level, payload) in reader.levels().enumerate() {
+            let level = u32::try_from(level).map_err(|_| TextureError::TooLarge)?;
+            let mip_width = (width >> level).max(1);
+            let mip_height = (height >> level).max(1);
+            let expected = u64::from(mip_width.div_ceil(4))
+                .checked_mul(u64::from(mip_height.div_ceil(4)))
+                .and_then(|blocks| blocks.checked_mul(16))
+                .ok_or(TextureError::TooLarge)?;
+            let actual = if scheme == Some(ktx2::SupercompressionScheme::Zstandard) {
+                payload.uncompressed_byte_length
+            } else {
+                payload.data.len() as u64
+            };
+            if actual != expected {
+                return Err(TextureError::InvalidData);
+            }
+            source_total = source_total
+                .checked_add(actual)
+                .ok_or(TextureError::TooLarge)?;
+        }
+        if source_total > MAX_TEXTURE_BYTES as u64 {
+            return Err(TextureError::TooLarge);
+        }
+    }
     let dfd = reader.basic_dfd().ok_or(TextureError::InvalidData)?;
     let etc1s =
         reader.header().supercompression_scheme == Some(ktx2::SupercompressionScheme::BasisLZ);
@@ -164,89 +201,23 @@ fn decode_ktx2_basis(
     if total > MAX_TEXTURE_BYTES as u64 {
         return Err(TextureError::TooLarge);
     }
-    let target = match format {
-        TextureFormat::Rgba8Unorm | TextureFormat::Rgba8Srgb => TranscodeTargetFormat::RGBA32,
-        TextureFormat::Bc1Unorm | TextureFormat::Bc1Srgb => TranscodeTargetFormat::Bc1Rgb,
-        TextureFormat::Bc3Unorm | TextureFormat::Bc3Srgb => TranscodeTargetFormat::Bc3Rgba,
-        TextureFormat::Bc7Unorm | TextureFormat::Bc7Srgb => TranscodeTargetFormat::Bc7Rgba,
-        TextureFormat::Astc4x4Unorm | TextureFormat::Astc4x4Srgb => {
-            TranscodeTargetFormat::AstcLdr4x4Rgba
-        }
-    };
-    let srgb = matches!(
-        format,
-        TextureFormat::Rgba8Srgb
-            | TextureFormat::Bc1Srgb
-            | TextureFormat::Bc3Srgb
-            | TextureFormat::Bc7Srgb
-            | TextureFormat::Astc4x4Srgb
-    );
-    basisu_transcoder_init();
-    let transcoder = BasisuTranscoder::new(
-        data,
-        SupportedTextureCompression::empty(),
-        ChannelType::Auto,
-    )
-    .map_err(|_| TextureError::InvalidData)?;
-    let info = transcoder.get_info();
-    if info.width != width
-        || info.height != height
-        || info.levels != mip_count
-        || info.layers > 1
-        || info.faces != 1
-    {
-        return Err(TextureError::InvalidData);
-    }
-    let image = transcoder
-        .transcode(Some(target), Some(srgb))
-        .map_err(|_| TextureError::InvalidData)?;
-    if map_basis_format(image.format) != Some(format) {
-        return Err(TextureError::Unsupported);
-    }
-    if image.mip_level_count != mip_count {
-        return Err(TextureError::InvalidData);
-    }
 
-    let mut offset = 0_usize;
-    let mut mips = Vec::with_capacity(mip_count as usize);
-    for level in 0..mip_count {
-        let mip_width = width.checked_shr(level).unwrap_or(0).max(1);
-        let mip_height = height.checked_shr(level).unwrap_or(0).max(1);
-        let byte_count = usize::try_from(
-            format
-                .level_bytes(mip_width, mip_height)
-                .ok_or(TextureError::TooLarge)?,
-        )
-        .map_err(|_| TextureError::TooLarge)?;
-        let end = offset
-            .checked_add(byte_count)
-            .ok_or(TextureError::TooLarge)?;
-        let bytes = image
-            .data
-            .get(offset..end)
-            .ok_or(TextureError::InvalidData)?;
-        let mut bytes = bytes.to_vec();
-        if let Some(two_channels) = data_channels {
-            for pixel in bytes.chunks_exact_mut(4) {
+    let mut mips = basis::transcode(data, format, width, height, mip_count)?;
+    if let Some(two_channels) = data_channels {
+        for mip in &mut mips {
+            for pixel in mip.bytes.chunks_exact_mut(4) {
                 pixel[1] = if two_channels { pixel[3] } else { 0 };
                 pixel[2] = 0;
                 pixel[3] = 255;
             }
-        } else if native_rg {
-            for pixel in bytes.chunks_exact_mut(4) {
+        }
+    } else if native_rg {
+        for mip in &mut mips {
+            for pixel in mip.bytes.chunks_exact_mut(4) {
                 pixel[2] = 0;
                 pixel[3] = 255;
             }
         }
-        mips.push(DecodedMip {
-            width: mip_width,
-            height: mip_height,
-            bytes,
-        });
-        offset = end;
-    }
-    if offset != image.data.len() {
-        return Err(TextureError::InvalidData);
     }
     decoded(format, mips)
 }
@@ -273,32 +244,6 @@ fn map_ktx2_format(format: ktx2::Format) -> Option<TextureFormat> {
     }
 }
 
-#[cfg(all(feature = "ktx2", feature = "basis"))]
-fn map_basis_format(format: basisu_c_sys::extra::types::TextureFormat) -> Option<TextureFormat> {
-    use basisu_c_sys::extra::types::{AstcBlock, AstcChannel, TextureFormat as BasisTextureFormat};
-
-    match format {
-        BasisTextureFormat::Rgba8Unorm => Some(TextureFormat::Rgba8Unorm),
-        BasisTextureFormat::Rgba8UnormSrgb => Some(TextureFormat::Rgba8Srgb),
-        BasisTextureFormat::Bc1RgbaUnorm => Some(TextureFormat::Bc1Unorm),
-        BasisTextureFormat::Bc1RgbaUnormSrgb => Some(TextureFormat::Bc1Srgb),
-        BasisTextureFormat::Bc3RgbaUnorm => Some(TextureFormat::Bc3Unorm),
-        BasisTextureFormat::Bc3RgbaUnormSrgb => Some(TextureFormat::Bc3Srgb),
-        BasisTextureFormat::Bc7RgbaUnorm => Some(TextureFormat::Bc7Unorm),
-        BasisTextureFormat::Bc7RgbaUnormSrgb => Some(TextureFormat::Bc7Srgb),
-        BasisTextureFormat::Astc {
-            block: AstcBlock::B4x4,
-            channel: AstcChannel::Unorm,
-        } => Some(TextureFormat::Astc4x4Unorm),
-        BasisTextureFormat::Astc {
-            block: AstcBlock::B4x4,
-            channel: AstcChannel::UnormSrgb,
-        } => Some(TextureFormat::Astc4x4Srgb),
-        // HDR and non-4x4 ASTC outputs are intentionally rejected until every backend maps them.
-        _ => None,
-    }
-}
-
 #[cfg(not(feature = "ktx2"))]
 pub(super) fn decode_ktx2(
     _data: &[u8],
@@ -318,6 +263,6 @@ fn decode_ktx2_basis(
     _compression: CompressionSupport,
     _destination: TextureDestination,
 ) -> Result<DecodedTexture, TextureError> {
-    // Direct KTX2 loading does not pull in the native universal transcoder.
+    // Direct KTX2 loading does not pull in the optional universal transcoder.
     Err(TextureError::Unsupported)
 }

@@ -66,7 +66,7 @@ fn main() -> anyhow::Result<()> {
         .with_clip_y(shared::clip_y(backend.backend));
     let target = Vec3::new(0.0, 0.55, 0.0);
 
-    while let Some(window_frame) = example.wait_for_next_frame(&surface)? {
+    while let Some(window_frame) = example.wait_for_next_frame(&context, &surface)? {
         let mut frame = surface.begin_frame()?;
         let swapchain_target = frame.configure_swapchain(
             window_frame.size,

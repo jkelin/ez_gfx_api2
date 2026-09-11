@@ -2,8 +2,8 @@ use super::transients::{invalidate_unsafe_transients, recycle_consumed_transient
 use super::*;
 use crate::state::{
     Backend, ContextOptions, DrawIndexedCommand, Error, LifecycleError, acquire_buffer_sized,
-    acquire_counter, create_context, destroy_context, frame_begin, frame_submit, release_buffer,
-    release_counter, write_buffer_bytes, write_counter_commands,
+    acquire_counter, completed_native_frame_value, create_context, destroy_context, frame_begin,
+    frame_submit, release_buffer, release_counter, write_buffer_bytes, write_counter_commands,
 };
 
 fn test_context() -> Option<ContextHandle> {
@@ -97,7 +97,10 @@ fn successful_submission_retires_handles_and_same_frame_reuse_stays_interned() {
     // hidden renderer smokes cover the preceding backend execution.
     with_context_mut(context, |state| {
         state.frame.abort();
-        let completion = ez_gfx_hal::CompletionToken::new(QueueKind::Graphics, 1).unwrap();
+        let future = completed_native_frame_value(&mut state.native)?
+            .checked_add(1)
+            .ok_or(Error::NativeFailure)?;
+        let completion = ez_gfx_hal::CompletionToken::new(QueueKind::Graphics, future).unwrap();
         recycle_consumed_transients(state, completion)?;
         // Pending completion keeps both allocations pooled but unavailable.
         assert_eq!(

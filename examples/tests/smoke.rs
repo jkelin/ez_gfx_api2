@@ -4,7 +4,9 @@ mod shared;
 
 use std::{
     path::PathBuf,
+    process::Stdio,
     sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
 };
 
 const BINARIES: [(&str, &str, &str, u32); 6] = [
@@ -61,6 +63,25 @@ fn snapshot_reference_policy_is_vulkan_only() {
     }
 }
 
+#[test]
+fn snapshot_report_requires_exact_field_count() {
+    for (report, valid) in [
+        ("0 1 2 3 4 5 6", false),
+        ("0 1 2 3 4 5 6 7", true),
+        ("0 1 2 3 4 5 6 7 8", false),
+    ] {
+        assert_eq!(report_fields("test", report).is_ok(), valid);
+    }
+}
+
+fn report_fields<'a>(label: &str, report: &'a str) -> anyhow::Result<[&'a str; 8]> {
+    report
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{label}: malformed report {report:?}"))
+}
+
 fn snapshot(binary: &str, file: &str, backend: &str) -> anyhow::Result<(String, image::RgbaImage)> {
     let reference = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("snapshots")
@@ -89,8 +110,7 @@ fn snapshot(binary: &str, file: &str, backend: &str) -> anyhow::Result<(String, 
         String::from_utf8_lossy(&output.stderr)
     );
     let report = String::from_utf8(output.stdout)?;
-    let fields = report.split_whitespace().collect::<Vec<_>>();
-    assert_eq!(fields.len(), 8, "{binary}: {report:?}");
+    let fields = report_fields(binary, &report)?;
     assert_eq!(
         (fields[1], fields[2], fields[3]),
         ("640", "480", "1"),
@@ -118,8 +138,77 @@ fn snapshot(binary: &str, file: &str, backend: &str) -> anyhow::Result<(String, 
     Ok((report, image))
 }
 
+#[derive(Debug)]
+struct HiddenReport {
+    frames: u32,
+    hash: String,
+    runtime_events: u32,
+}
+
+fn hidden_report(
+    binary: &str,
+    backend: &str,
+    frames: u32,
+    deadline: Instant,
+) -> anyhow::Result<HiddenReport> {
+    // Removing both snapshot variables keeps this path asynchronous even when the parent process
+    // is running golden-update automation.
+    let mut child = shared::snapshot_command(binary, std::path::Path::new("unused"), backend)
+        .env_remove("EZ_GFX_EXAMPLE_SNAPSHOT")
+        .env_remove("EZ_GFX_UPDATE_SNAPSHOTS")
+        .env("EZ_GFX_EXAMPLE_MAX_FRAMES", frames.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    while child.try_wait()?.is_none() {
+        if Instant::now() >= deadline {
+            child.kill()?;
+            let output = child.wait_with_output()?;
+            anyhow::bail!(
+                "{backend} Sponza streaming timed out at {frames} frames: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{backend} Sponza streaming failed at {frames} frames: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8(output.stdout)?;
+    let fields = report_fields(backend, &report)?;
+    anyhow::ensure!(
+        fields[0] == "ez-gfx-snapshot",
+        "{backend}: malformed report {report:?}"
+    );
+    anyhow::ensure!(
+        (fields[1].parse::<u32>()?, fields[2].parse::<u32>()?) == (640, 480),
+        "{backend}: unexpected dimensions in {report:?}"
+    );
+    anyhow::ensure!(
+        fields[3].parse::<u32>()? == frames,
+        "{backend}: unexpected frame count in {report:?}"
+    );
+    let runtime_events = fields[5].parse::<u32>()?;
+    anyhow::ensure!(
+        runtime_events > 0,
+        "{backend}: no runtime events in {report:?}"
+    );
+    anyhow::ensure!(
+        fields[7].parse::<u64>()? == 0,
+        "{backend}: dropped observations in {report:?}"
+    );
+    Ok(HiddenReport {
+        frames,
+        hash: fields[4].to_owned(),
+        runtime_events,
+    })
+}
+
 fn assert_semantics(name: &str, report: &str, image: &image::RgbaImage, min_events: u32) {
-    let fields = report.split_whitespace().collect::<Vec<_>>();
+    let fields = report_fields(name, report).expect("snapshot already validated its report");
     assert!(
         fields[5].parse::<u32>().unwrap() >= min_events,
         "{name} missing expected observable structure"
@@ -174,6 +263,34 @@ independent_scene_test!(compute_structured_smoke, 2);
 independent_scene_test!(imgui_smoke, 3);
 independent_scene_test!(helmet_smoke, 4);
 independent_scene_test!(sponza_ktx2_smoke, 5);
+
+#[test]
+fn sponza_ktx2_streams_to_a_stable_terminal_hash() -> anyhow::Result<()> {
+    const FRAME_LIMITS: [u32; 6] = [1, 4, 16, 64, 256, 512];
+    let (_, file, binary, _) = BINARIES[5];
+    let deadline = Instant::now() + Duration::from_secs(55);
+    for backend in TARGET_BACKENDS {
+        let (_, waited_image) = snapshot(binary, file, backend)?;
+        let target_hash = blake3::hash(waited_image.as_raw()).to_string();
+        let mut converged = false;
+        let mut observed = Vec::with_capacity(FRAME_LIMITS.len());
+
+        for frames in FRAME_LIMITS {
+            let current = hidden_report(binary, backend, frames, deadline)?;
+            converged = current.hash == target_hash;
+            observed.push((current.frames, current.hash, current.runtime_events));
+            if converged {
+                break;
+            }
+        }
+
+        anyhow::ensure!(
+            converged,
+            "{backend} Sponza streaming did not reach target {target_hash} before the 55s/512-frame bound: {observed:?}"
+        );
+    }
+    Ok(())
+}
 
 #[test]
 fn triangle_snapshot_is_deterministic_across_processes() -> anyhow::Result<()> {

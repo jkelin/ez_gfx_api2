@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -25,8 +25,8 @@ use ez_gfx_core::{
 use ez_gfx_hal::{
     AllocationRequest, BufferRange, BufferTransfer, COUNTER_BUFFER_ELEMENT_OFFSET, CompletionToken,
     DEFAULT_STAGING_POLICY, DynamicPipelineState, ExecutionAction, ExecutionBarrier, ExecutionPass,
-    FrameExecutionBackend, FrameExecutionPlan, HalError, ImageMip, MemoryAllocator, MemoryClass,
-    QueueKind, ResourceAccess, ResourceState, SURFACE_DEFAULT_CLEAR, ShaderStage, TextureFormat,
+    FrameExecutionBackend, FrameExecutionPlan, HalError, MemoryAllocator, MemoryClass, QueueKind,
+    ResourceAccess, ResourceState, SURFACE_DEFAULT_CLEAR, ShaderStage, TextureFormat,
     TextureRegion, staging_bucket_size,
 };
 use ez_gfx_runtime::{
@@ -43,9 +43,9 @@ use ez_gfx_runtime::{
     observability::{DiagnosticLevel, Observability, RuntimePhase, RuntimeRecord, RuntimeStatus},
     target::Format,
     texture::{
-        DecodedTexture, TextureDecoder, TextureDestination, TextureError, TextureId,
-        TextureRegistry, TextureSource, TextureUploadTelemetry, TextureUploadTelemetrySnapshot,
-        generate_mips,
+        DecodedTexture, PreparedTextureDecode, TextureDecoder, TextureDestination, TextureError,
+        TextureId, TextureRegistry, TextureSource, TextureUploadTelemetry,
+        TextureUploadTelemetrySnapshot, generate_mips,
     },
     upload::{UploadEvent, UploadEventQueue, UploadResource, UploadStatus},
 };
@@ -183,8 +183,13 @@ enum NativeTexture {
 
 struct RetiredTexture {
     id: TextureId,
+    binding: u32,
     native: NativeTexture,
     completion: CompletionToken,
+}
+
+struct RetiredTextureBinding {
+    id: TextureId,
 }
 
 struct SurfaceRecord {
@@ -235,15 +240,31 @@ struct PendingTexture {
     id: TextureId,
     cancelled: Arc<AtomicBool>,
     config: TextureConfig,
-    // Admitted caller source bytes still awaiting decode; the owned copy lives on the
-    // decode closure, so this count is the only retained size until transfer takes over.
+    /// True after this reserved slot aliases the ready context fallback.
+    fallback_published: bool,
+    // Admitted source bytes remain owned by queued manager storage or an active decode closure;
+    // this count tracks either location until decoded/native transfer storage takes over.
     source_bytes: u64,
+    decoded_bytes: Option<u64>,
     admitted_at: Instant,
+}
+
+struct QueuedTextureDecode {
+    handle: TextureHandle,
+    prepared: PreparedTextureDecode,
+    bytes: Box<[u8]>,
+    generate: bool,
+    cancelled: Arc<AtomicBool>,
 }
 
 struct DecodedTextureJob {
     handle: TextureHandle,
     decoded: std::result::Result<DecodedTexture, TextureError>,
+}
+
+struct TextureTransferWork {
+    completion: CompletionToken,
+    bytes: u64,
 }
 
 struct AsyncTextureState {
@@ -254,6 +275,11 @@ struct AsyncTextureState {
     pool: Option<ez_gfx_assets::CpuPool>,
     ready_tx: crossbeam_channel::Sender<DecodedTextureJob>,
     ready_rx: crossbeam_channel::Receiver<DecodedTextureJob>,
+    queued: VecDeque<QueuedTextureDecode>,
+    order: VecDeque<TextureHandle>,
+    decoded: HashMap<TextureHandle, std::result::Result<DecodedTexture, TextureError>>,
+    active: usize,
+    working_bytes: u64,
     #[cfg(test)]
     decode_gate: Option<Arc<std::sync::Barrier>>,
 }
@@ -283,6 +309,11 @@ impl AsyncTextureState {
             pool: None,
             ready_tx,
             ready_rx,
+            queued: VecDeque::new(),
+            order: VecDeque::new(),
+            decoded: HashMap::new(),
+            active: 0,
+            working_bytes: 0,
             #[cfg(test)]
             decode_gate: None,
         })
@@ -398,14 +429,18 @@ struct ContextState {
     texture_last_transfer: HashMap<TextureHandle, CompletionToken>,
     retired_textures: Vec<RetiredTexture>,
     pipelines: HashMap<PipelineKey, NativePipeline>,
+    retired_texture_bindings: Vec<RetiredTextureBinding>,
     graphics_format: Option<u32>,
     texture_registry: TextureRegistry,
+    /// Explicit ownership and publication state for the shared opaque-magenta texture.
+    texture_fallback: TextureFallback,
     texture_ready: HashMap<TextureHandle, CompletionToken>,
     pending_textures: HashMap<TextureHandle, PendingTexture>,
     // Decoded staging bytes per transfer-pending texture, kept in lockstep with
     // `texture_ready`: inserted at native submission, removed at publication, cancel,
     // loss, or teardown. Region updates overwrite with their latest transfer size.
     texture_transfer_bytes: HashMap<TextureHandle, u64>,
+    texture_transfer_work: HashMap<TextureHandle, TextureTransferWork>,
     texture_handoffs: HashMap<TextureHandle, Instant>,
     texture_telemetry: Arc<TextureUploadTelemetry>,
     async_textures: AsyncTextureState,
@@ -462,6 +497,8 @@ struct ContextState {
     surface_insert_test_failure: Option<SurfaceInsertTestFailure>,
     #[cfg(test)]
     surface_rollback_test_abandoned: bool,
+    #[cfg(test)]
+    texture_fallback_alias_test_failure_after: Option<usize>,
 }
 
 type ContextHandleArena = GenerationalArena<()>;
@@ -561,6 +598,10 @@ mod shader;
 mod surface;
 use surface::destroy_native_surface;
 mod texture;
+mod texture_fallback;
+use texture_fallback::{TextureFallback, initialize_texture_fallback, publish_reserved_fallback};
+mod texture_manager;
+use texture_manager::pump_async_textures;
 
 pub use buffers::*;
 pub use context::*;

@@ -665,6 +665,46 @@ impl NativeContext {
         Ok(completion)
     }
 
+    /// Points one reserved descriptor slot at the context-owned fallback image.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid binding, unpublished fallback, or missing device state.
+    pub fn publish_texture_fallback(
+        &mut self,
+        fallback: &NativeTexture,
+        binding: u32,
+    ) -> Result<(), AllocationError> {
+        if binding >= TEXTURE_DESCRIPTOR_CAPACITY || fallback.resident_mips == 0 {
+            return Err(AllocationError::ZeroSize);
+        }
+        let index = usize::try_from(binding).map_err(|_| AllocationError::NativeFailure)?;
+        if self
+            .texture_fallback_bindings
+            .get(index)
+            .copied()
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let device = self.device.as_ref().ok_or(AllocationError::NativeFailure)?;
+        let descriptor_set = self
+            .texture_descriptor_set
+            .ok_or(AllocationError::NativeFailure)?;
+        write_texture_descriptor(
+            device,
+            descriptor_set,
+            binding,
+            fallback.view,
+            fallback.sampler,
+        );
+        if self.texture_fallback_bindings.len() <= index {
+            self.texture_fallback_bindings.resize(index + 1, false);
+        }
+        self.texture_fallback_bindings[index] = true;
+        Ok(())
+    }
+
     /// Publishes exactly the requested contiguous coarse mip range after transfer completion.
     ///
     /// # Errors
@@ -728,6 +768,12 @@ impl NativeContext {
             view,
             texture.sampler,
         );
+        if let Some(alias) = self
+            .texture_fallback_bindings
+            .get_mut(texture.binding as usize)
+        {
+            *alias = false;
+        }
         if view != texture.view {
             let old = core::mem::replace(&mut texture.view, view);
             self.defer_resource(DeferredResource::TextureView(old))?;

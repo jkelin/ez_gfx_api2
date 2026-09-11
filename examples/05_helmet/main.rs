@@ -70,7 +70,7 @@ fn main() -> anyhow::Result<()> {
         padding: [0; 3],
     };
 
-    while let Some(window_frame) = example.wait_for_next_frame(&surface)? {
+    while let Some(window_frame) = example.wait_for_next_frame(&context, &surface)? {
         let mut frame = surface.begin_frame()?;
         let swapchain_target = frame.configure_swapchain(
             window_frame.size,

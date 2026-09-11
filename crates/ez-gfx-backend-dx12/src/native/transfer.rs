@@ -272,6 +272,26 @@ fn require_wait_succeeded(
     }
 }
 
+/// Waits through stale reusable-event wakes until the fence itself proves completion.
+fn wait_for_completion(
+    fence: &ID3D12Fence,
+    event: HANDLE,
+    value: u64,
+) -> windows::core::Result<()> {
+    loop {
+        // SAFETY: the caller retains the fence throughout the query and wait registration.
+        if checked_completed_value(unsafe { fence.GetCompletedValue() })? >= value {
+            return Ok(());
+        }
+        // SAFETY: the event remains live until the fence reaches `value`.
+        unsafe { fence.SetEventOnCompletion(value, event)? };
+        // A reused auto-reset event may still carry an earlier fence signal; loop until this fence
+        // confirms completion rather than treating the stale wake as a native failure.
+        // SAFETY: the worker owns the event handle for the full wait.
+        require_wait_succeeded(unsafe { WaitForSingleObject(event, INFINITE) })?;
+    }
+}
+
 fn snapshot_live_indices<T>(jobs: &[T], scratch: &mut Vec<usize>, cancelled: impl Fn(&T) -> bool) {
     scratch.clear();
     scratch.reserve(jobs.len());
@@ -303,20 +323,7 @@ fn submit_batch(
     live_scratch: &mut Vec<usize>,
     texture_scratch: &mut Vec<(usize, u32, bool)>,
 ) -> windows::core::Result<()> {
-    // SAFETY: the completion fence remains live while retained by the worker.
-    let completed = checked_completed_value(unsafe { completion_fence.GetCompletedValue() })?;
-    if *last_completion != 0 && completed < *last_completion {
-        // SAFETY: `event` is a live waitable handle retained by the batch resource.
-        unsafe { completion_fence.SetEventOnCompletion(*last_completion, event)? };
-        // SAFETY: `event` remains live until this blocking wait returns.
-        require_wait_succeeded(unsafe { WaitForSingleObject(event, INFINITE) })?;
-        // An event wake is not completion proof until the owning fence confirms it.
-        // SAFETY: the completion fence remains live through the post-wake query.
-        let completed = checked_completed_value(unsafe { completion_fence.GetCompletedValue() })?;
-        if completed < *last_completion {
-            return Err(windows::core::Error::from_thread());
-        }
-    }
+    wait_for_completion(completion_fence, event, *last_completion)?;
     // SAFETY: the slot is idle after the preceding completion wait, so its allocator and list may reset.
     unsafe {
         copy_allocator.Reset()?;
@@ -590,9 +597,10 @@ pub(super) fn submit_test_batch(
 
 #[cfg(test)]
 mod cancellation_snapshot_tests {
+    use super::super::{D3D12_FENCE_FLAG_NONE, NativeContext};
     use super::{
-        checked_completed_value, map_transfer_worker_error, require_wait_succeeded,
-        snapshot_live_indices,
+        CreateEventW, ID3D12Fence, WorkerEvent, checked_completed_value, map_transfer_worker_error,
+        require_wait_succeeded, snapshot_live_indices, wait_for_completion,
     };
     use std::sync::{
         Arc, Barrier,
@@ -600,6 +608,27 @@ mod cancellation_snapshot_tests {
         mpsc,
     };
 
+    #[test]
+    fn stale_event_wake_waits_for_the_requested_fence() {
+        let context = NativeContext::create_default(false).unwrap();
+        // SAFETY: the test device owns the new fence.
+        let fence: ID3D12Fence =
+            unsafe { context.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+        // SAFETY: an unnamed auto-reset event needs no security attributes.
+        let event = WorkerEvent(unsafe { CreateEventW(None, false, false, None) }.unwrap());
+        // Seed the reusable event with an unrelated earlier wake.
+        // SAFETY: the worker event remains live and accepts a test-local signal.
+        unsafe { windows::Win32::System::Threading::SetEvent(event.handle()) }.unwrap();
+
+        let signal = fence.clone();
+        let signaler = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            // SAFETY: the retained fence supports CPU signaling.
+            unsafe { signal.Signal(1) }.unwrap();
+        });
+        wait_for_completion(&fence, event.handle(), 1).unwrap();
+        signaler.join().unwrap();
+    }
     #[test]
     fn cancellation_after_snapshot_keeps_the_gated_job_live() {
         let cancelled = Arc::new([AtomicBool::new(false)]);

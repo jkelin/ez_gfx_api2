@@ -235,6 +235,7 @@ impl NativeContext {
             resource,
             allocation,
             format: hal_format,
+            sampler_desc: None,
             width,
             height,
             mip_count: 1,

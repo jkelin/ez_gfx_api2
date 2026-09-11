@@ -145,17 +145,18 @@ fn main() -> anyhow::Result<()> {
             address_w: SamplerAddressMode::Clamp,
         },
     };
-    let texture = context.load_texture(
-        TextureSource::Rgba8 {
-            width: atlas.width,
-            height: atlas.height,
-        },
-        atlas.data,
-        false,
-        &config,
-    )?;
-    context.wait_idle()?;
-    let texture_id = texture.binding()?;
+    // The atlas slot is immediately stable; it samples fallback until the upload publishes.
+    let texture_id = context
+        .load_texture(
+            TextureSource::Rgba8 {
+                width: atlas.width,
+                height: atlas.height,
+            },
+            atlas.data,
+            false,
+            &config,
+        )?
+        .binding()?;
     imgui.fonts().tex_id = TextureId::new(texture_id as usize);
     let identity_indices = context.upload_indices(&identity)?;
     let identity_start = identity_indices.range()?.0;
@@ -181,7 +182,7 @@ fn main() -> anyhow::Result<()> {
         padding: 0.0,
     };
 
-    while let Some(window_frame) = example.wait_for_next_frame(&surface)? {
+    while let Some(window_frame) = example.wait_for_next_frame(&context, &surface)? {
         let input = window_frame.input;
         let events = &window_frame.events;
         for &event in events {

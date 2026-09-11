@@ -77,7 +77,7 @@ impl MetalFrameEncoder<'_> {
                 for texture in draw.textures {
                     let resource = <ProtocolObject<dyn MTLTexture> as AsRef<
                         ProtocolObject<dyn MTLResource>,
-                    >>::as_ref(&*texture.texture);
+                    >>::as_ref(texture.texture);
                     if vertex_argument_encoder.is_some() {
                         encoder.useResource_usage_stages(
                             resource,

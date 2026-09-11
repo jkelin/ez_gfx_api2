@@ -635,6 +635,9 @@ pub struct NativeContext {
     texture_descriptor_pool: Option<vk::DescriptorPool>,
     texture_descriptor_layout: Option<vk::DescriptorSetLayout>,
     texture_descriptor_set: Option<vk::DescriptorSet>,
+    /// Slots whose descriptor currently aliases the shared fallback texture and sampler.
+    /// Every sampled-heap writer must set `true` for aliases and `false` for real descriptors.
+    texture_fallback_bindings: Vec<bool>,
     sampler_anisotropy: bool,
     swapchain_loader: Option<khr::swapchain::Device>,
     presentation_support: PresentationSupport,

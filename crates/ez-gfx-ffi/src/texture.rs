@@ -309,7 +309,7 @@ pub extern "C" fn ez_gfx_texture_cancel(
 }
 
 #[unsafe(no_mangle)]
-/// Queries the binding index assigned to a loaded texture.
+/// Queries the stable binding assigned at load; it samples fallback until `DeviceReady`.
 ///
 /// # Safety
 ///

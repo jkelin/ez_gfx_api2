@@ -23,6 +23,23 @@ fn block_payload_rejects_zero_dimensions() {
     );
 }
 
+#[cfg(feature = "basis")]
+#[test]
+fn standalone_basis_transcodes_base_level_to_exact_blocks() {
+    let data = include_bytes!("../../ez-gfx-runtime/tests/fixtures/rust-logo-etc.basis");
+    for (format, bytes) in [
+        (BlockFormat::Bc1, 64 * 64 / 2),
+        (BlockFormat::Bc3, 64 * 64),
+        (BlockFormat::Bc7, 64 * 64),
+        (BlockFormat::Astc4x4, 64 * 64),
+    ] {
+        assert_eq!(
+            ez_gfx_assets::transcode_basis(data, format).unwrap().len(),
+            bytes
+        );
+    }
+}
+
 #[test]
 fn mip_progression_starts_coarsest() {
     let mut c = MipChain::new(TextureId::try_new(7).unwrap(), 16, 8, 3, BlockFormat::Bc7).unwrap();

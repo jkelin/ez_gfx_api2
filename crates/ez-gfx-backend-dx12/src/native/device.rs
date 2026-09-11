@@ -139,6 +139,7 @@ fn initialize_context(
         descriptor_stride,
         samplers,
         sampler_stride: u32::try_from(sampler_stride).unwrap_or(u32::MAX),
+        texture_fallback_bindings: Vec::new(),
     })
 }
 

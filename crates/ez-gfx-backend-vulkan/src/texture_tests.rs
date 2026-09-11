@@ -416,6 +416,83 @@ fn frame_pixels(
 }
 
 #[test]
+fn fallback_binding_stays_magenta_until_real_publication() {
+    let mut context = context();
+    let (shader, pipeline) = sampler_pipeline(&context, "fallback");
+    let sampler = TextureSamplerDesc {
+        min_filter: SamplerFilter::Nearest,
+        mag_filter: SamplerFilter::Nearest,
+        max_anisotropy: 1.0,
+        address_u: SamplerAddressMode::Clamp,
+        address_v: SamplerAddressMode::Clamp,
+        address_w: SamplerAddressMode::Clamp,
+    };
+    let magenta = [255, 0, 255, 255];
+    let green = [0, 255, 0, 255];
+    let (mut fallback, completion) = context
+        .create_texture(
+            TextureFormat::Rgba8Unorm,
+            &[ImageMip {
+                width: 1,
+                height: 1,
+                bytes: &magenta,
+            }],
+            0,
+            sampler,
+        )
+        .unwrap();
+    wait_texture(&context, completion[0].value);
+    context.publish_texture_mips(&mut fallback, 1).unwrap();
+    context.publish_texture_fallback(&fallback, 0).unwrap();
+    let mut output = context
+        .allocate(AllocationRequest::new(4, 4, MemoryClass::Readback, true, None).unwrap())
+        .unwrap();
+    let slot = dispatch(&mut context, &pipeline, &output, 1);
+    frame_pixels(&mut context, slot, &mut output, &[magenta]);
+    let mut gate = QueueGate::new(
+        context.device.as_ref().unwrap(),
+        context.graphics_queue.unwrap(),
+    );
+    let slot = dispatch(&mut context, &pipeline, &output, 1);
+    context.publish_texture_fallback(&fallback, 1).unwrap();
+    context.publish_texture_fallback(&fallback, 0).unwrap();
+    assert_eq!(&context.texture_fallback_bindings[..2], &[true, true]);
+    gate.release();
+    frame_pixels(&mut context, slot, &mut output, &[magenta]);
+    drop(gate);
+
+    let (mut real, completion) = context
+        .create_texture(
+            TextureFormat::Rgba8Unorm,
+            &[ImageMip {
+                width: 1,
+                height: 1,
+                bytes: &green,
+            }],
+            0,
+            sampler,
+        )
+        .unwrap();
+    let slot = dispatch(&mut context, &pipeline, &output, 1);
+    frame_pixels(&mut context, slot, &mut output, &[magenta]);
+    wait_texture(&context, completion[0].value);
+    context.publish_texture_mips(&mut real, 1).unwrap();
+    let slot = dispatch(&mut context, &pipeline, &output, 1);
+    frame_pixels(&mut context, slot, &mut output, &[green]);
+
+    context.wait_idle().unwrap();
+    context.publish_texture_fallback(&fallback, 0).unwrap();
+    context.destroy_texture(real).unwrap();
+    let slot = dispatch(&mut context, &pipeline, &output, 1);
+    frame_pixels(&mut context, slot, &mut output, &[magenta]);
+    context.destroy_texture(fallback).unwrap();
+    context.destroy_pipeline(pipeline);
+    context.destroy_shader(shader);
+    context.free(output).unwrap();
+    context.wait_idle().unwrap();
+}
+
+#[test]
 fn coarse_sampling_frame_completes_while_fine_copy_is_gpu_blocked() {
     let mut context = context();
     let queue = texture_queue(&context);

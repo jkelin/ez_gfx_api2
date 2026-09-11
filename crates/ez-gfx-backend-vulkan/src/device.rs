@@ -213,6 +213,7 @@ impl NativeContext {
             texture_descriptor_pool: None,
             texture_descriptor_layout: None,
             texture_descriptor_set: None,
+            texture_fallback_bindings: Vec::new(),
             sampler_anisotropy: false,
             swapchain_loader: None,
             presentation_support: PresentationSupport::default(),

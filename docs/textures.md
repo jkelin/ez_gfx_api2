@@ -1,10 +1,12 @@
 # Textures
 
-Texture loading is asynchronous. Each safe `Texture` is a typed view into the context-owned bindless heap; dropping the wrapper does not unload or recycle its texture. A Rayon pool performs decode/mip work and backend transfer owners submit device copies.
+Texture loading is asynchronous. Each context/device owns one 1×1 opaque-magenta sampled texture. Every safe `Texture` is a typed view into the context-owned bindless heap; dropping the wrapper does not unload or recycle its texture. A Rayon pool performs decode/mip work and backend transfer owners submit device copies.
 
 ## Public path
 
-`Context::load_texture` validates the request, copies caller source before returning, reserves a generational lease, and schedules CPU work. Register one creator-thread callback with `Context::register_callback`; graphics safe points drain the lossless upload queue, advance decoded work and native transfers, publish completed views, and report failures.
+`Context::load_texture` validates the request, copies caller source, reserves a generational lease, and publishes that stable slot as an alias of the shared fallback before returning. Device initialization backfills loads queued before a frame-capable device existed. Every alias uses the fallback's one context-owned sampler; a uniform 1x1 texel is invariant under filtering, addressing, and anisotropy. Real publication installs the request's sampler with its texture. The manager then admits decode and native transfer waves under its working-set budget. Register one creator-thread callback with `Context::register_callback`; graphics safe points drain the lossless upload queue, advance queued and decoded work, publish completed views, and report failures.
+
+Binding queries preserve terminal status precedence: failed textures return their typed failure and lost contexts return `DeviceLost`; the fallback never converts either condition into success. The Sponza example keeps normal interactive and hidden runs streaming, while snapshot/golden runs use one startup synchronization point so reference pixels are deterministic.
 
 Events identify a typed texture, vertex allocation, or index allocation and report:
 
@@ -23,15 +25,16 @@ sequenceDiagram
     participant GPU as Backend transfer
     participant Queue as Upload queue
     App->>Gfx: load_texture(source bytes)
-    Gfx->>CPU: copy source and create decode job
+    Gfx->>Gfx: copy source, reserve binding, publish magenta fallback
     Gfx->>Queue: SourceStaged
     App->>Queue: drain once per frame
+    Gfx->>CPU: admit bounded decode wave
     CPU-->>Gfx: decoded mip chain
-    Gfx->>GPU: upload staged mips
+    Gfx->>GPU: admit bounded staged upload
     alt upload and publication succeed
         GPU-->>Gfx: completion
         Gfx->>Queue: DeviceReady
-        App->>Gfx: Texture::binding and use
+        Gfx->>Gfx: atomically replace fallback with real view
         App->>Gfx: continue using stable binding
         App->>Gfx: destroy or drop Context
         Gfx->>GPU: destroy retained textures after completion
@@ -45,11 +48,11 @@ sequenceDiagram
 
 ## Texture lifecycle
 
-After a texture `DeviceReady` event, obtain its stable bindless index from the owning `Texture`. Use a resident fallback until then. Binding, residency, and residency updates each perform a nonblocking owner-thread progress pass that drains completed decode work, admits transfers, and publishes completed residency. `Context::wait_idle` drains native work, then performs the same publication pass. None dequeues upload events or replaces event consumption.
+Obtain the stable bindless index immediately after `load_texture` succeeds. Until `DeviceReady`, that index safely samples opaque magenta. CPU decode and native upload remain asynchronous. At a graphics-safe descriptor-update gate, the same slot changes from the fallback alias to the completed real coarse view. Binding lookup does not poll or wait for real uploads; residency operations retain their existing nonblocking progress behavior. `Context::wait_idle` still drains all manager work when explicitly requested.
 
-Cancellation wins only before initial readiness and emits `Cancelled`. Dropping `Texture` releases only the Rust wrapper; the context retains its heap entry and native storage so stable bindless IDs remain valid until `Context::destroy` or context drop. Context teardown cancels queued decode work, drains native work where possible, then destroys retained textures, events, surfaces, and other resources.
+Cancellation wins only before initial real readiness and emits `Cancelled`. Decode, upload, cancellation, and failure paths leave the slot pointing at fallback until safe reuse; reuse republishes fallback before returning the new texture. Dropping `Texture` releases only the Rust wrapper; the context retains its heap entry and native storage so stable bindless IDs remain valid until `Context::destroy` or context drop. Context teardown drains native work where possible, then destroys real textures and the shared fallback.
 
-Device loss is terminal. Textures still in decode or awaiting transfer completion receive a terminal `Failed(DeviceLost)` event. Textures whose readiness was already published are not in that pending set and do not receive a retroactive upload failure.
+Device loss is terminal. Textures still in decode or awaiting transfer completion receive a terminal `Failed(DeviceLost)` event. Textures whose real readiness was already published are not in that pending set and do not receive a retroactive upload failure.
 
 ## Residency and updates
 
@@ -59,7 +62,9 @@ Initial readiness requires a completed coarse mip range and a frame-safe publish
 
 ## Admission and memory
 
-CPU jobs, the decoded-result channel, and backend transfer request channels have no fixed job-count or aggregate-byte backpressure. Scheduling is limited by actual allocation, counter, thread, or OS failure. `QueueFull` remains a representable ABI status for genuine counter/channel failure, not routine texture admission control.
+Texture admission is nonblocking and FIFO. Accepted sources remain manager-owned while queued; callers submit textures naturally and never choose a batch size or retry routine `QueueFull`. The manager reserves the 64 MiB per-request maximum for each active decode and limits decoded plus in-flight native-transfer work to a 256 MiB window. Completed small uploads release reservations before later waves, while an otherwise-valid request that exceeds an empty window is admitted alone so progress cannot deadlock. The synchronous decoded-to-staging copy may transiently duplicate one admitted chain, but queued decoded results and in-flight staging cannot grow with the full submission set.
+
+The result channel remains mechanically lossless and unbounded, but only manager-permitted jobs can publish into it, so payload occupancy is bounded by the same reservations. Backend transfer queues retain their existing all-or-none chain submission and adaptive coalescing. Vulkan, Direct3D 12, and Metal staging buckets are each capped at the shared 64 MiB request maximum; holding a manager reservation through the final mip completion token therefore bounds active native staging without a backend interface change.
 
 Real request boundaries remain:
 
@@ -68,7 +73,11 @@ Real request boundaries remain:
 - decoder worker threads: `1..=256`, with zero selecting the default count;
 - texture handle and bindless descriptor capacity: finite and validated.
 
-Transfer workers coalesce adjacent compatible requests according to staging policy byte/copy/deadline thresholds. Those are batch-flush thresholds, not admission limits. Reusable mapped staging buckets are reclaimed only after their completion token retires and trimmed after idle epochs.
+Transfer workers coalesce adjacent compatible requests according to staging policy byte/copy/deadline thresholds. Those are batch-flush thresholds, not caller admission limits. Reusable mapped staging buckets remain completion-gated and are reused or trimmed by the backend; the manager separately bounds active decoded and transfer payloads.
+
+### Sponza fixture encoding
+
+`examples/shared/assets/sponza.glb` retains the immutable-reference fixture encoding recorded in the asset itself. Its GLB metadata names `glTF-Transform v4.4.1`; `KHR_texture_basisu` references 69 KTX2 images. Every image has undefined `vkFormat`, DFD color model 163 (ETC1S), and supercompression scheme 1 (BasisLZ). Every KTX2 payload names `ktx create v4.4.2 / libktx v4.4.2` as its writer. Embedded `KTXwriterScParams` are `--threads 2` for 45 images and `--no-endpoint-rdo --no-selector-rdo --threads 2` for 24 images. Only metadata embedded in the checked-in bytes is treated as provenance.
 
 ## Texture heap capacity
 
@@ -84,15 +93,15 @@ C calls copy borrowed source bytes during the call, preserving asynchronous life
 
 Texture bindings are recorded only through `&mut Frame`; the context-owned texture heap requires no per-frame retain call. Surface recording uses `Surface::begin_frame()` and `Frame::configure_swapchain`; named targets use `Context::begin_frame()` and `Frame::configure_render_target`. `Frame::finish(self)` preserves exact errors, while dropping an unfinished frame aborts. `Buffer<T>`, `CounterBuffer<T>`, and single-value `ValueBuffer<T>` are one-frame values: their first execute use claims them, current bindings persist across same-frame execute calls, and terminal frame paths clear bindings and invalidate claimed public use while native backing remains completion-gated. `RenderTarget::prepare_readback(&mut frame)` creates and attaches an opaque owner-and-generation request, and completed metadata and bytes exist only during the registered callback.
 
-## C ABI 40
+## C ABI 41
 
-Install `ez_gfx_context_register_callback(context, callback, user_data)`. The callback receives `EzGfxEventKind_Upload`, runtime, diagnostic, dropped-count, and readback events on the context creator thread at graphics safe points. Compare upload resource handles, resolve bindings after `EzGfxUploadStatus_DeviceReady`, and copy readback bytes before the callback returns. Passing a null callback clears the registration. Convert result codes with `ez_gfx_error_print`.
+Install `ez_gfx_context_register_callback(context, callback, user_data)`. The callback receives `EzGfxEventKind_Upload`, runtime, diagnostic, dropped-count, and readback events on the context creator thread at graphics safe points. `ez_gfx_texture_get_binding` succeeds immediately after a successful load; the returned slot samples fallback until `EzGfxUploadStatus_DeviceReady` identifies real publication. Copy readback bytes before the callback returns. Passing a null callback clears the registration. Convert result codes with `ez_gfx_error_print`.
 
 C retains explicit context-first texture load, cancellation, binding, residency, region-update, telemetry, resource-diagnostics, and unload functions because RAII is available only through the safe Rust interface. `ez_gfx_context_get_resource_diagnostics` fills an `EzGfxResourceDiagnostics` struct with pending-upload counts, retained bytes, and cache sizes; it rejects null outputs and stale handles like every other context query.
 
 ## Pending-upload and cache diagnostics
 
-`Context::resource_diagnostics` returns a point-in-time `ResourceDiagnostics` snapshot, distinct from the monotonic `texture_upload_telemetry` counters. `pending_textures` counts uploads awaiting decode or transfer completion; `pending_texture_bytes` holds admitted caller source bytes for decode-pending work plus decoded staging bytes recorded at native submission for transfer-pending work. Staging sizes aggregate retained bucket capacity across the shared, buffer, and counter pools; `pipeline_entries` counts retained compiled pipelines and `readback_bytes` aggregates retained readback frames. Counts and bytes saturate instead of wrapping. The query observes creator-thread state without requiring device health, so teardown titles keep reporting after loss until context destruction; stale handles and wrong-thread calls still fail fast.
+`Context::resource_diagnostics` returns a point-in-time `ResourceDiagnostics` snapshot, distinct from the monotonic `texture_upload_telemetry` counters. `pending_textures` counts uploads queued for decode, holding decoded output, or awaiting their final transfer completion. `pending_texture_bytes` reports owned source bytes before decode completion, decoded bytes awaiting native admission, and decoded payload bytes after native submission. Staging sizes aggregate retained bucket capacity across the shared, buffer, and counter pools; `pipeline_entries` counts retained compiled pipelines and `readback_bytes` aggregates retained readback frames. Counts and bytes saturate instead of wrapping. The query observes creator-thread state without requiring device health, so teardown titles keep reporting after loss until destruction.
 
 ## Staging retention budgets and memory telemetry
 
@@ -102,8 +111,8 @@ Upload staging reuses best-fit buckets across the shared, per-stride buffer, and
 
 ## Synchronization
 
-Frame recording imports only resources referenced by active work. Texture descriptor publication is guarded by transfer and graphics completion. Vulkan and Direct3D 12 still use conservative host waits in parts of the transfer handoff; Metal has nonblocking submission coverage. Removing those remaining waits is tracked separately and is not claimed complete here.
+Device initialization waits only for creation/publication of the shared fallback before any frame can sample. Later frames never globally wait for pending real texture uploads. Real descriptor/view replacement reuses each backend's graphics-completion publication gate; Vulkan, Direct3D 12, and Metal therefore expose the same fallback-to-real contract while preserving existing streaming and residency completion rules.
 
 ## Verification and remaining evidence
 
-Pure queue and allocator transitions are covered by runtime tests. ABI layout tests cover callback event records, typed heap/allocation handles, one-frame buffer signatures, presentation modes, the resource-diagnostics struct and export, and the ABI 40 contract. Native backend behavior requires the Linux Vulkan, Windows DX12, and macOS Metal remote matrices.
+Pure queue and allocator transitions are covered by runtime tests. ABI layout tests cover callback event records, typed heap/allocation handles, one-frame buffer signatures, presentation modes, the resource-diagnostics struct and export, and the ABI 41 contract. Native backend behavior requires the Linux Vulkan, Windows DX12, and macOS Metal remote matrices.

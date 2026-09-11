@@ -526,22 +526,42 @@ impl CpuPool {
 /// [`AssetError::BasisTranscode`] when transcoding fails.
 #[cfg(feature = "basis")]
 pub fn transcode_basis(data: &[u8], target: BlockFormat) -> Result<Vec<u8>, AssetError> {
+    use basisu::{DecodeFlags, Error, TargetFormat, Transcoder};
+
+    const MAX_BASIS_BYTES: usize = 64 * 1024 * 1024;
+    if data.is_empty() || data.len() > MAX_BASIS_BYTES || data.get(..2) != Some(&[0x73, 0x42]) {
+        return Err(AssetError::InvalidBasis);
+    }
     let target = match target {
-        BlockFormat::Bc1 | BlockFormat::Bc1Srgb => ez_gfx_basis::BasisTarget::Bc1,
-        BlockFormat::Bc3 | BlockFormat::Bc3Srgb => ez_gfx_basis::BasisTarget::Bc3,
-        BlockFormat::Bc7 | BlockFormat::Bc7Srgb => ez_gfx_basis::BasisTarget::Bc7,
-        BlockFormat::Astc4x4 | BlockFormat::Astc4x4Srgb => ez_gfx_basis::BasisTarget::Astc4x4,
+        BlockFormat::Bc1 | BlockFormat::Bc1Srgb => TargetFormat::Bc1Rgb,
+        BlockFormat::Bc3 | BlockFormat::Bc3Srgb => TargetFormat::Bc3Rgba,
+        BlockFormat::Bc7 | BlockFormat::Bc7Srgb => TargetFormat::Bc7Rgba,
+        BlockFormat::Astc4x4 | BlockFormat::Astc4x4Srgb => TargetFormat::Astc4x4Rgba,
     };
-    // The legacy asset helper returns the base image; runtime streaming consumes every mip.
-    ez_gfx_basis::transcode(data, target)
+    let transcoder = Transcoder::new(data).map_err(|_| AssetError::InvalidBasis)?;
+    if transcoder.layer_count() > 1 || transcoder.face_count() != 1 || transcoder.is_video() {
+        return Err(AssetError::InvalidBasis);
+    }
+    if !transcoder.supports(target) {
+        return Err(AssetError::BasisTranscode);
+    }
+    let byte_count = transcoder
+        .output_size(0, target)
+        .map_err(|_| AssetError::InvalidBasis)?;
+    if byte_count > MAX_BASIS_BYTES {
+        return Err(AssetError::InvalidBasis);
+    }
+    let mut bytes = vec![0; byte_count];
+    transcoder
+        .transcode_into(0, target, DecodeFlags::NONE, &mut bytes)
         .map_err(|error| match error {
-            ez_gfx_basis::BasisError::InvalidData => AssetError::InvalidBasis,
-            ez_gfx_basis::BasisError::Transcode => AssetError::BasisTranscode,
-        })?
-        .into_iter()
-        .next()
-        .map(|mip| mip.bytes)
-        .ok_or(AssetError::InvalidBasis)
+            Error::InvalidData
+            | Error::Truncated
+            | Error::InvalidImageOrLevel
+            | Error::OutputTooSmall { .. } => AssetError::InvalidBasis,
+            _ => AssetError::BasisTranscode,
+        })?;
+    Ok(bytes)
 }
 
 #[cfg(not(feature = "basis"))]

@@ -28,17 +28,17 @@ pub fn resource_diagnostics(context: ContextHandle) -> Result<ResourceDiagnostic
         context.identity.check_thread().map_err(map_lifecycle)?;
         let mut diagnostics = ResourceDiagnostics::default();
         for pending in context.pending_textures.values() {
-            // Decode-pending entries always carry their admitted size; the owned
-            // bytes live on the decode closure, so this count is the only record.
             diagnostics.pending_textures = diagnostics.pending_textures.saturating_add(1);
             diagnostics.pending_texture_bytes = diagnostics
                 .pending_texture_bytes
-                .saturating_add(pending.source_bytes);
+                .saturating_add(pending.decoded_bytes.unwrap_or(pending.source_bytes));
         }
         for (handle, bytes) in &context.texture_transfer_bytes {
-            // Sizes stay in lockstep with `texture_ready`; publication, cancel,
-            // loss, and teardown remove both, so every entry here is outstanding.
-            if context.texture_ready.contains_key(handle) {
+            // Manager uploads hold a transfer reservation; region rewrites only
+            // re-arm texture_ready, so both gates report outstanding transfers.
+            if context.texture_transfer_work.contains_key(handle)
+                || context.texture_ready.contains_key(handle)
+            {
                 diagnostics.pending_textures = diagnostics.pending_textures.saturating_add(1);
                 diagnostics.pending_texture_bytes =
                     diagnostics.pending_texture_bytes.saturating_add(*bytes);

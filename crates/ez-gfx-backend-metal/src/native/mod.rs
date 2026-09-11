@@ -278,8 +278,8 @@ pub struct NativeGraphicsDraw<'a> {
     pub draw_count: u32,
     /// Reflected public buffer bindings.
     pub bindings: &'a dyn NativeBufferBindingSource,
-    /// Textures referenced by the argument buffer.
-    pub textures: &'a [&'a NativeTexture],
+    /// Textures and fallback aliases referenced by the argument buffer.
+    pub textures: &'a [NativeSampledTexture<'a>],
 }
 
 /// Fully resolved compute dispatch consumed by Metal encoding.
@@ -294,8 +294,8 @@ pub struct NativeComputeDispatch<'a> {
     pub bindings: &'a dyn NativeBufferBindingSource,
     /// Reflected compute texture argument-buffer layout, when present.
     pub texture_heap: Option<ShaderTextureHeapLayout>,
-    /// Textures referenced by the compute argument buffer.
-    pub textures: &'a [&'a NativeTexture],
+    /// Textures and fallback aliases referenced by the compute argument buffer.
+    pub textures: &'a [NativeSampledTexture<'a>],
 }
 
 /// Metal resource referenced by a compiled frame barrier.
@@ -462,6 +462,13 @@ pub struct MsaaStorage {
     samples: u8,
 }
 
+/// One texture/sampler pair written at an explicit bindless slot.
+pub struct NativeSampledTexture<'a> {
+    texture: &'a ProtocolObject<dyn MTLTexture>,
+    sampler: &'a ProtocolObject<dyn MTLSamplerState>,
+    binding: u32,
+}
+
 impl NativeTexture {
     /// Returns the last transfer value that may reference this texture.
     pub fn last_transfer_value(&self) -> u64 {
@@ -471,6 +478,23 @@ impl NativeTexture {
     /// Latest copy values ordered from finest to coarsest mip; zero means never submitted.
     pub fn mip_transfer_values(&self) -> &[u64] {
         &self.mip_completions
+    }
+
+    /// Borrows this texture at its stable binding.
+    pub fn sampled(&self) -> NativeSampledTexture<'_> {
+        NativeSampledTexture {
+            texture: &*self.texture,
+            sampler: &*self.sampler,
+            binding: self.binding,
+        }
+    }
+    /// Borrows the shared fallback and its context-owned sampler at `binding`.
+    pub fn fallback_sampled(&self, binding: u32) -> NativeSampledTexture<'_> {
+        NativeSampledTexture {
+            texture: &*self.texture,
+            sampler: &*self.sampler,
+            binding,
+        }
     }
 }
 

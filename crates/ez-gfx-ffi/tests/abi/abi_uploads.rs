@@ -267,20 +267,14 @@ fn dx12_texture_upload_becomes_resident_and_unload_invalidates_handle() {
         },
         EzGfxResult::Ok
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let completion = loop {
-        let mut binding = u32::MAX;
-        let status =
-            // SAFETY: binding remains writable and both handles are live.
-            unsafe { ez_gfx_texture_get_binding(context, texture, &raw mut binding) };
-        if status != EzGfxResult::NotReady || std::time::Instant::now() >= deadline {
-            break status;
-        }
-        // Owner-thread idle admits transfers and dispatches their events.
-        assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
-        std::thread::yield_now();
-    };
-    assert_eq!(completion, EzGfxResult::Ok);
+    let mut binding = u32::MAX;
+    assert_eq!(
+        // SAFETY: binding remains writable and both handles are live.
+        unsafe { ez_gfx_texture_get_binding(context, texture, &raw mut binding) },
+        EzGfxResult::Ok
+    );
+    assert_eq!(binding, 0);
+    assert_eq!(ez_gfx_context_wait_idle(context), EzGfxResult::Ok);
     assert!(
         collected
             .uploads

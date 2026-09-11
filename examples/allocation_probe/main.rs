@@ -565,9 +565,13 @@ impl Multipass {
     }
 }
 
-fn next_size(example: &mut Example, surface: &Surface) -> anyhow::Result<[u32; 2]> {
+fn next_size(
+    example: &mut Example,
+    context: &Context,
+    surface: &Surface,
+) -> anyhow::Result<[u32; 2]> {
     example
-        .wait_for_next_frame(surface)?
+        .wait_for_next_frame(context, surface)?
         .map(|frame| frame.size)
         .ok_or_else(|| anyhow::anyhow!("native host stopped before allocation workload completed"))
 }
@@ -575,16 +579,17 @@ fn next_size(example: &mut Example, surface: &Surface) -> anyhow::Result<[u32; 2
 fn run_workload(
     name: &str,
     example: &mut Example,
+    context: &Context,
     surface: &Surface,
     mut render: impl FnMut(&mut Example, [u32; 2]) -> anyhow::Result<()>,
 ) -> anyhow::Result<AllocationStats> {
     for _ in 0..WARM_FRAMES {
-        let size = next_size(example, surface)?;
+        let size = next_size(example, context, surface)?;
         render(example, size)?;
     }
     let mut total = AllocationStats::default();
     for _ in 0..MEASURED_FRAMES {
-        let size = next_size(example, surface)?;
+        let size = next_size(example, context, surface)?;
         total.add(measure_frame(|| render(example, size))?);
     }
     println!(
@@ -612,15 +617,23 @@ fn main() -> anyhow::Result<()> {
     let triangle = Triangle::new(&context, &positions_heap)?;
     let multipass = Multipass::new(&context, &positions_heap)?;
 
-    let triangle_stats = run_workload("triangle", &mut example, &surface, |example, size| {
-        triangle.render(&context, &surface, example, size)
-    })?;
-    let trace_size = next_size(&mut example, &surface)?;
+    let triangle_stats = run_workload(
+        "triangle",
+        &mut example,
+        &context,
+        &surface,
+        |example, size| triangle.render(&context, &surface, example, size),
+    )?;
+    let trace_size = next_size(&mut example, &context, &surface)?;
     triangle.trace(&context, &surface, &mut example, trace_size)?;
-    let multipass_stats = run_workload("multipass", &mut example, &surface, |example, size| {
-        multipass.render(&context, &surface, example, size)
-    })?;
-    let trace_size = next_size(&mut example, &surface)?;
+    let multipass_stats = run_workload(
+        "multipass",
+        &mut example,
+        &context,
+        &surface,
+        |example, size| multipass.render(&context, &surface, example, size),
+    )?;
+    let trace_size = next_size(&mut example, &context, &surface)?;
     multipass.trace(&context, &surface, &mut example, trace_size)?;
 
     let memory = context.memory_telemetry()?;

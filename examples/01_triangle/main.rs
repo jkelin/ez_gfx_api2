@@ -51,7 +51,7 @@ fn main() -> anyhow::Result<()> {
     let vertex_shader = compiled_shader.load_vertex_shader(&context, "vertexmain")?;
     let fragment_shader = compiled_shader.load_fragment_shader(&context, "fragmentmain")?;
 
-    while let Some(window_frame) = example.wait_for_next_frame(&surface)? {
+    while let Some(window_frame) = example.wait_for_next_frame(&context, &surface)? {
         let mut frame = surface.begin_frame()?;
         let swapchain_target = frame.configure_swapchain(
             window_frame.size,

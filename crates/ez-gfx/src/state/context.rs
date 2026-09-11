@@ -10,13 +10,13 @@ use super::{
     DiagnosticLevel, Error, FrameRecorder, GeometryManager, HalError, HashMap,
     IndexAllocationHandle, LocalHandle, NativeContext, NativeSurface, Observability, Ordering,
     PresentationMode, RenderTargetHandle, ResourceKind, RuntimeError, RuntimePhase, RuntimeRecord,
-    RuntimeStatus, SurfaceHandle, TextureRegistry, TextureUploadTelemetry, UploadEvent,
-    UploadResource, UploadStatus, VertexAllocationHandle, VulkanContext, admission_report,
-    completed_transfer_native, context_local, destroy_native_pipeline, destroy_native_shader,
-    destroy_native_surface, destroy_native_texture, free_native_allocation, map_allocation,
-    map_hal, map_lifecycle, map_native_loss, map_texture, progress_texture_upload_events,
-    pump_async_textures, render_target::destroy_all_render_targets, result_status,
-    wait_native_idle, with_context_mut,
+    RuntimeStatus, SurfaceHandle, TextureFallback, TextureRegistry, TextureUploadTelemetry,
+    UploadEvent, UploadResource, UploadStatus, VertexAllocationHandle, VulkanContext,
+    admission_report, completed_transfer_native, context_local, destroy_native_pipeline,
+    destroy_native_shader, destroy_native_surface, destroy_native_texture, free_native_allocation,
+    initialize_texture_fallback, map_allocation, map_hal, map_lifecycle, map_native_loss,
+    map_texture, native_device_initialized, progress_texture_upload_events, pump_async_textures,
+    render_target::destroy_all_render_targets, result_status, wait_native_idle, with_context_mut,
 };
 #[cfg(test)]
 use super::{CleanupTestOutcome, SurfaceInsertTestFailure};
@@ -57,7 +57,7 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
     staging.set_byte_budget(ez_gfx_hal::DEFAULT_SHARED_STAGING_BUDGET);
     let mut counter_pool = ez_gfx_hal::ReusableStagingPool::new(256);
     counter_pool.set_byte_budget(ez_gfx_hal::DEFAULT_COUNTER_STAGING_BUDGET);
-    let state = ContextState {
+    let mut state = ContextState {
         identity,
         options,
         native,
@@ -74,6 +74,7 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         texture_residency_targets: HashMap::new(),
         texture_last_transfer: HashMap::new(),
         retired_textures: Vec::new(),
+        retired_texture_bindings: Vec::new(),
         pipelines: HashMap::new(),
         graphics_format: None,
         indirects: HashMap::new(),
@@ -82,9 +83,11 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         counter_pool,
         counter_scratch: Vec::new(),
         texture_registry,
+        texture_fallback: TextureFallback::Uninitialized,
         texture_ready: HashMap::new(),
         pending_textures: HashMap::new(),
         texture_transfer_bytes: HashMap::new(),
+        texture_transfer_work: HashMap::new(),
         texture_handoffs: HashMap::new(),
         texture_telemetry: Arc::new(TextureUploadTelemetry::default()),
         async_textures,
@@ -131,7 +134,17 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         surface_insert_test_failure: None,
         #[cfg(test)]
         surface_rollback_test_abandoned: false,
+        #[cfg(test)]
+        texture_fallback_alias_test_failure_after: None,
     };
+    if native_device_initialized(&state.native)
+        && let Err(error) = initialize_texture_fallback(&mut state)
+    {
+        if let Ok(mut handles) = CONTEXT_HANDLES.lock() {
+            let _ = handles.remove(local);
+        }
+        return Err(error);
+    }
     let inserted = CONTEXTS.with(|contexts| {
         let mut contexts = contexts
             .try_borrow_mut()
@@ -451,6 +464,11 @@ pub fn wait_idle(context: ContextHandle) -> Result<()> {
             .identity
             .check_thread_and_health()
             .map_err(map_lifecycle)?;
+        if !context.texture_fallback.is_ready() && !context.pending_textures.is_empty() {
+            // A pre-device or failed-initialization Vulkan context cannot make native upload
+            // progress; returning keeps `wait_idle` finite while preserving queued decode data.
+            return Err(Error::NotReady);
+        }
         while !context.pending_textures.is_empty() {
             pump_async_textures(context)?;
             if !context.pending_textures.is_empty() {
@@ -635,6 +653,11 @@ pub(super) fn cleanup_context_state(
         if let Err(error) = destroy_native_texture(&mut owned.native, retired.native) {
             failure.get_or_insert_with(|| map_allocation(error));
         }
+    }
+    if let Some(fallback) = owned.texture_fallback.take()
+        && let Err(error) = destroy_native_texture(&mut owned.native, fallback)
+    {
+        failure.get_or_insert_with(|| map_allocation(error));
     }
     destroy_all_render_targets(&mut owned);
     owned.texture_formats.clear();

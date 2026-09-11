@@ -48,6 +48,40 @@ fn texture_view(
     .ok_or(AllocationError::NativeFailure)
 }
 
+fn create_sampler(
+    device: &ProtocolObject<dyn MTLDevice>,
+    sampler_desc: TextureSamplerDesc,
+) -> Result<Retained<ProtocolObject<dyn MTLSamplerState>>, AllocationError> {
+    let descriptor = MTLSamplerDescriptor::new();
+    descriptor.setMinFilter(match sampler_desc.min_filter {
+        SamplerFilter::Nearest => MTLSamplerMinMagFilter::Nearest,
+        SamplerFilter::Linear => MTLSamplerMinMagFilter::Linear,
+    });
+    descriptor.setMagFilter(match sampler_desc.mag_filter {
+        SamplerFilter::Nearest => MTLSamplerMinMagFilter::Nearest,
+        SamplerFilter::Linear => MTLSamplerMinMagFilter::Linear,
+    });
+    descriptor.setMipFilter(match sampler_desc.min_filter {
+        SamplerFilter::Nearest => MTLSamplerMipFilter::Nearest,
+        SamplerFilter::Linear => MTLSamplerMipFilter::Linear,
+    });
+    let address = |mode| match mode {
+        SamplerAddressMode::Clamp => MTLSamplerAddressMode::ClampToEdge,
+        SamplerAddressMode::Repeat => MTLSamplerAddressMode::Repeat,
+    };
+    descriptor.setSAddressMode(address(sampler_desc.address_u));
+    descriptor.setTAddressMode(address(sampler_desc.address_v));
+    descriptor.setRAddressMode(address(sampler_desc.address_w));
+    let anisotropy = (1_u16..16)
+        .find(|level| sampler_desc.max_anisotropy < f32::from(*level + 1))
+        .map_or(16, usize::from);
+    descriptor.setMaxAnisotropy(anisotropy);
+    descriptor.setSupportArgumentBuffers(true);
+    device
+        .newSamplerStateWithDescriptor(&descriptor)
+        .ok_or(AllocationError::NativeFailure)
+}
+
 /// Releases the published resolve-texture parts when multisampled setup fails.
 ///
 /// The resolve storage, view, and sampler never published, so they drop
@@ -174,37 +208,7 @@ impl NativeContext {
             }
             self.flush(&mut upload, 0, total)?;
 
-            let sampler_descriptor = MTLSamplerDescriptor::new();
-            sampler_descriptor.setMinFilter(match sampler_desc.min_filter {
-                SamplerFilter::Nearest => MTLSamplerMinMagFilter::Nearest,
-                SamplerFilter::Linear => MTLSamplerMinMagFilter::Linear,
-            });
-            sampler_descriptor.setMagFilter(match sampler_desc.mag_filter {
-                SamplerFilter::Nearest => MTLSamplerMinMagFilter::Nearest,
-                SamplerFilter::Linear => MTLSamplerMinMagFilter::Linear,
-            });
-            // `mipFilter` defaults to `notMipmapped`: without this mapping every
-            // minified fragment would sample view level zero regardless of the chain.
-            sampler_descriptor.setMipFilter(match sampler_desc.min_filter {
-                SamplerFilter::Nearest => MTLSamplerMipFilter::Nearest,
-                SamplerFilter::Linear => MTLSamplerMipFilter::Linear,
-            });
-            let address = |mode| match mode {
-                SamplerAddressMode::Clamp => MTLSamplerAddressMode::ClampToEdge,
-                SamplerAddressMode::Repeat => MTLSamplerAddressMode::Repeat,
-            };
-            sampler_descriptor.setSAddressMode(address(sampler_desc.address_u));
-            sampler_descriptor.setTAddressMode(address(sampler_desc.address_v));
-            sampler_descriptor.setRAddressMode(address(sampler_desc.address_w));
-            let anisotropy = (1_u16..16)
-                .find(|level| sampler_desc.max_anisotropy < f32::from(*level + 1))
-                .map_or(16, usize::from);
-            sampler_descriptor.setMaxAnisotropy(anisotropy);
-            sampler_descriptor.setSupportArgumentBuffers(true);
-            let sampler = self
-                .device
-                .newSamplerStateWithDescriptor(&sampler_descriptor)
-                .ok_or(AllocationError::NativeFailure)?;
+            let sampler = create_sampler(&self.device, sampler_desc)?;
             let view = texture_view(&storage, format, mip_count, 1)?;
 
             let cancellation = std::sync::Arc::new(super::transfer::TransferCancellation::new());
@@ -665,6 +669,24 @@ impl NativeContext {
                 Err(error)
             }
         }
+    }
+
+    /// Validates one alias of the context-owned fallback texture and shared sampler.
+    ///
+    /// Metal argument buffers are rebuilt per frame, so publication retains no per-slot object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid binding or unpublished fallback.
+    pub fn publish_texture_fallback(
+        &self,
+        fallback: &NativeTexture,
+        binding: u32,
+    ) -> Result<(), AllocationError> {
+        if binding >= TEXTURE_DESCRIPTOR_CAPACITY || fallback.resident_mips == 0 {
+            return Err(AllocationError::ZeroSize);
+        }
+        Ok(())
     }
 
     /// Reports whether bindless argument-buffer rewrites can avoid every submitted frame.

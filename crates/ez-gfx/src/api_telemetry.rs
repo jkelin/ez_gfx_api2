@@ -42,9 +42,9 @@ pub enum Event<'a> {
 /// original upload.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ResourceDiagnostics {
-    /// Texture uploads awaiting decode or transfer completion.
+    /// Texture uploads queued for decode, holding decoded output, or awaiting final transfer.
     pub pending_textures: u32,
-    /// Admitted source bytes (decode) plus decoded staging bytes (transfer).
+    /// Owned source bytes before decode plus decoded bytes after decode.
     pub pending_texture_bytes: u64,
     /// Vertex uploads awaiting transfer completion.
     pub pending_vertex_uploads: u32,

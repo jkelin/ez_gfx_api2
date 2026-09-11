@@ -65,8 +65,8 @@ use raw_window_handle::{
     WaylandDisplayHandle, WaylandWindowHandle, Win32WindowHandle, WindowsDisplayHandle,
     XcbDisplayHandle, XcbWindowHandle, XlibDisplayHandle, XlibWindowHandle,
 };
-/// Identifies C ABI revision 40 for compatibility checks.
-pub const EZ_GFX_ABI_VERSION: u32 = 40;
+/// Identifies C ABI revision 41 for compatibility checks.
+pub const EZ_GFX_ABI_VERSION: u32 = 41;
 /// Caps any caller-provided byte range at 16 MiB.
 pub const EZ_GFX_MAX_BOUNDARY_BYTES: usize = 16 * 1024 * 1024;
 fn nonzero_native_ptr(bits: u64) -> Result<core::ptr::NonNull<core::ffi::c_void>, EzGfxResult> {

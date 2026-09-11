@@ -63,15 +63,16 @@ unsafe extern "C" fn collect_event(event: *const EzGfxEvent, user_data: *mut cor
     }
 }
 fn poll_texture_ready(context: u64, texture: u64) -> EzGfxResult {
-    // Owner-thread idle admits transfers; a registration observes their events.
-    // Binding readiness stays authoritative: this only advances progress.
+    // Owner-thread idle admits transfers and dispatches events; residency identifies real
+    // publication because binding itself is valid from admission.
     assert_eq!(
         ez_gfx_ffi::ez_gfx_context_wait_idle(context),
         EzGfxResult::Ok
     );
-    let mut binding = 0;
-    // SAFETY: binding remains writable and both handles are supplied by this test.
-    unsafe { ez_gfx_texture_get_binding(context, texture, &raw mut binding) }
+    let mut resident = 0;
+    let mut total = 0;
+    // SAFETY: both outputs remain writable and both handles are supplied by this test.
+    unsafe { ez_gfx_texture_get_residency(context, texture, &raw mut resident, &raw mut total) }
 }
 
 fn cancel_after_native_admission(context: u64, bytes: &[u8], desc: &EzGfxTextureDesc) {
