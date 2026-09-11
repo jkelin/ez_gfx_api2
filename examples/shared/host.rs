@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use raw_window_handle::{
-    DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, WindowHandle,
+    DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
+    RawWindowHandle, WindowHandle,
 };
 use winit::window::Window;
 
@@ -70,24 +71,44 @@ pub const fn clip_y(backend: Backend) -> crate::shared::math::ClipY {
 /// Cloneable owner passed into the graphics surface.
 #[derive(Clone)]
 pub struct HostSurface {
-    window: Arc<Window>,
+    _window: Arc<Window>,
+    display: RawDisplayHandle,
+    window_handle: RawWindowHandle,
 }
 
+// SAFETY: `attach` captures display/window-handle snapshots on the event-loop
+// thread, and no `Window` methods are called off-thread; graphics code only
+// borrows those raw handles. `Example` keeps the main-thread `Arc<Window>`
+// owner alive until graphics join completes. `Send` without `Sync` is
+// intentional because `HostSurface` is moved to, not shared with, that thread.
+#[cfg(windows)]
+unsafe impl Send for HostSurface {}
+
 impl HostSurface {
-    pub fn attach(window: Arc<Window>) -> Self {
-        Self { window }
+    pub fn attach(window: Arc<Window>) -> Result<Self, HandleError> {
+        // Capture on the event-loop thread. Some window adapters reject handle
+        // queries from workers even though the native handles remain process-valid.
+        let display = window.display_handle()?.as_raw();
+        let window_handle = window.window_handle()?.as_raw();
+        Ok(Self {
+            _window: window,
+            display,
+            window_handle,
+        })
     }
 }
 
 impl HasWindowHandle for HostSurface {
     fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
-        self.window.window_handle()
+        // SAFETY: `_window` retains the native window for this borrow.
+        Ok(unsafe { WindowHandle::borrow_raw(self.window_handle) })
     }
 }
 
 impl HasDisplayHandle for HostSurface {
     fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
-        self.window.display_handle()
+        // SAFETY: `_window` retains the display associated with this borrow.
+        Ok(unsafe { DisplayHandle::borrow_raw(self.display) })
     }
 }
 

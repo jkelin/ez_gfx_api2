@@ -1,6 +1,5 @@
 include!("api_frame/buffers.rs");
 
-
 #[derive(Clone)]
 enum DraftBinding {
     Buffer(Rc<BufferInner>),
@@ -51,6 +50,10 @@ enum PendingReadback {
     RequestedPresentation(Rc<ReadbackInner>),
 }
 
+const fn should_fetch_frame_readbacks(pending: usize, implicit: bool) -> bool {
+    pending != 0 || implicit
+}
+
 type FrameTransients = SmallVec<[TransientInner; 4]>;
 type FrameRetained = SmallVec<[Rc<dyn Any>; 4]>;
 type FrameBindings = SmallVec<[(CompactString, DraftBinding); 4]>;
@@ -93,11 +96,9 @@ impl FacadeFrameScratch {
                     .capacity()
                     .saturating_mul(core::mem::size_of::<RawBinding>()),
             )
-            .saturating_add(
-                self.raw_bindings.iter().fold(0_usize, |bytes, binding| {
-                    bytes.saturating_add(binding.name.capacity())
-                }),
-            )
+            .saturating_add(self.raw_bindings.iter().fold(0_usize, |bytes, binding| {
+                bytes.saturating_add(binding.name.capacity())
+            }))
     }
 
     fn clear_owned_values(&mut self) {
@@ -140,7 +141,6 @@ impl Frame {
             self.fail(Error::InvalidContext)
         }
     }
-
 
     fn fail<T>(&mut self, error: Error) -> Result<T> {
         self.poison.get_or_insert(error);
@@ -196,9 +196,10 @@ impl Frame {
         if !Rc::ptr_eq(context, &owner) {
             return Err(Error::InvalidContext);
         }
-        if let Some(handle) = transients.iter().find_map(|transient| {
-            Rc::ptr_eq(&transient.buffer, inner).then_some(&transient.handle)
-        }) {
+        if let Some(handle) = transients
+            .iter()
+            .find_map(|transient| Rc::ptr_eq(&transient.buffer, inner).then_some(&transient.handle))
+        {
             return match handle {
                 TransientHandle::Buffer(handle) => Ok(*handle),
                 TransientHandle::Counter(_) => Err(Error::InvalidContext),
@@ -228,7 +229,6 @@ impl Frame {
         Ok(handle)
     }
 
-
     fn materialize_counter_state(
         context: &Rc<ContextInner>,
         transients: &mut FrameTransients,
@@ -245,9 +245,10 @@ impl Frame {
         {
             return Err(Error::InvalidArgument);
         }
-        if let Some(handle) = transients.iter().find_map(|transient| {
-            Rc::ptr_eq(&transient.buffer, inner).then_some(&transient.handle)
-        }) {
+        if let Some(handle) = transients
+            .iter()
+            .find_map(|transient| Rc::ptr_eq(&transient.buffer, inner).then_some(&transient.handle))
+        {
             return match handle {
                 TransientHandle::Counter(handle) => Ok(*handle),
                 TransientHandle::Buffer(_) => Err(Error::InvalidContext),
@@ -277,11 +278,7 @@ impl Frame {
     }
 
     fn materialize_counter(&mut self, inner: &Rc<BufferInner>) -> Result<CounterBufferHandle> {
-        match Self::materialize_counter_state(
-            &self.context,
-            &mut self.transients,
-            inner,
-        ) {
+        match Self::materialize_counter_state(&self.context, &mut self.transients, inner) {
             Ok(handle) => Ok(handle),
             Err(error) => self.fail(error),
         }
@@ -362,7 +359,11 @@ impl Frame {
         if !valid_state {
             return self.fail(Error::NotReady);
         }
-        if let Some((_, current)) = self.bindings.iter_mut().find(|(key, _)| key.as_str() == name.as_str()) {
+        if let Some((_, current)) = self
+            .bindings
+            .iter_mut()
+            .find(|(key, _)| key.as_str() == name.as_str())
+        {
             *current = binding;
         } else {
             self.bindings.push((name, binding));
@@ -496,7 +497,6 @@ impl Frame {
         Ok(Readback { inner: request })
     }
 
-
     /// Configures a cached named render target for this frame.
     ///
     /// A format or extent change atomically replaces the cached native image;
@@ -542,15 +542,12 @@ impl Frame {
             ) else {
                 return self.fail(Error::InvalidArgument);
             };
-            let handle = match state::create_render_target(
-                self.context.handle,
-                &declaration,
-                width,
-                height,
-            ) {
-                Ok(handle) => handle,
-                Err(error) => return self.fail(error),
-            };
+            let handle =
+                match state::create_render_target(self.context.handle, &declaration, width, height)
+                {
+                    Ok(handle) => handle,
+                    Err(error) => return self.fail(error),
+                };
             // Publish the replacement before retiring the old native image.
             let previous = self.context.render_targets.borrow_mut().insert(
                 name.clone(),
@@ -579,7 +576,6 @@ impl Frame {
             surface_lease: None,
         })
     }
-
 
     /// Attaches the frame's surface swapchain and returns its logical render target.
     ///
@@ -665,7 +661,10 @@ impl Frame {
     /// # Errors
     /// Returns the exact first recording, submission, presentation, readback, or callback error.
     pub fn finish(mut self) -> Result<()> {
-        let context = Context { inner: Rc::clone(&self.context), owner: false, };
+        let context = Context {
+            inner: Rc::clone(&self.context),
+            owner: false,
+        };
         let result = if let Some(error) = self.poison {
             let _ = state::frame_abort(self.context.handle);
             self.release_aborted_transients();
@@ -690,11 +689,19 @@ impl Frame {
                 }
             }
         };
-        let outputs = if result.is_ok() {
+        let implicit_readback = self
+            .surface
+            .as_ref()
+            .is_some_and(|surface| surface.snapshot_cache.get());
+        let outputs = if result.is_ok()
+            && should_fetch_frame_readbacks(self.readbacks.len(), implicit_readback)
+        {
             match state::frame_readbacks(self.context.handle) {
                 Ok(outputs) => Some(Ok(outputs)),
-                Err(Error::NotReady) if self.readbacks.is_empty() => None,
-                Err(Error::NotReady) => Some(Err(Error::NativeFailure)),
+                Err(Error::NotReady) if !self.readbacks.is_empty() => {
+                    Some(Err(Error::NativeFailure))
+                }
+                Err(Error::NotReady) => None,
                 Err(error) => Some(Err(error)),
             }
         } else {
@@ -729,9 +736,9 @@ impl Frame {
                 )
             })
             .count();
-        let has_presented = readbacks.iter().any(|readback| {
-            matches!(readback, PendingReadback::RequestedPresentation(_))
-        });
+        let has_presented = readbacks
+            .iter()
+            .any(|readback| matches!(readback, PendingReadback::RequestedPresentation(_)));
         let minimum_outputs = graph_count + usize::from(has_presented);
         if outputs.len() < minimum_outputs {
             for request in readbacks.iter().filter_map(|readback| match readback {
@@ -816,7 +823,7 @@ impl Drop for Frame {
             recycled = FacadeFrameScratch::default();
         }
         *self.context.frame_scratch.borrow_mut() = recycled;
-}
+    }
 }
 
 impl Surface {
@@ -825,7 +832,10 @@ impl Surface {
     /// # Errors
     /// Returns [`Error`] when readiness or concurrent recording validation fails.
     pub fn begin_frame(&self) -> Result<Frame> {
-        let context = Context { inner: Rc::clone(&self.inner.context), owner: false, };
+        let context = Context {
+            inner: Rc::clone(&self.inner.context),
+            owner: false,
+        };
         context.check_entry()?;
         context.dispatch_events()?;
         state::frame_begin(context.raw())?;
@@ -907,6 +917,7 @@ mod inline_storage_tests {
     use super::{
         FacadeFrameScratch, FrameTransients, MAX_FACADE_BUFFER_POOL_BYTES,
         MAX_FACADE_BUFFER_POOL_ENTRIES, MAX_FACADE_FRAME_SCRATCH_BYTES, facade_pool_can_retain,
+        should_fetch_frame_readbacks,
     };
     use std::{any::Any, rc::Rc};
 
@@ -919,15 +930,18 @@ mod inline_storage_tests {
     }
 
     #[test]
+    fn readback_fetch_is_skipped_only_for_uncached_frames_without_requests() {
+        assert!(!should_fetch_frame_readbacks(0, false));
+        assert!(should_fetch_frame_readbacks(1, false));
+        assert!(should_fetch_frame_readbacks(0, true));
+        assert!(should_fetch_frame_readbacks(1, true));
+    }
+
+    #[test]
     fn facade_pool_rejects_entry_and_byte_overflow() {
         for (entries, retained, candidate, expected) in [
             (0, 0, 1, true),
-            (
-                MAX_FACADE_BUFFER_POOL_ENTRIES,
-                0,
-                1,
-                false,
-            ),
+            (MAX_FACADE_BUFFER_POOL_ENTRIES, 0, 1, false),
             (0, MAX_FACADE_BUFFER_POOL_BYTES, 1, false),
             (0, usize::MAX, usize::MAX, false),
         ] {

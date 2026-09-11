@@ -42,6 +42,184 @@ struct FrameTiming {
     submit_present_ns: u128,
 }
 
+const TITLE_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
+
+fn title_refresh_due(last: Option<Instant>, now: Instant, force: bool) -> bool {
+    force || last.is_none_or(|last| now.saturating_duration_since(last) >= TITLE_REFRESH_INTERVAL)
+}
+
+/// Render-thread result consumed by the window-thread host after joining.
+pub(crate) struct ThreadedRenderOutput {
+    report: Option<ProgramReport>,
+    frame_timings: Vec<FrameTiming>,
+}
+
+/// One lock-free telemetry publication after a completed threaded frame.
+pub(crate) struct ThreadedFrameUpdate {
+    pub(crate) frames: u32,
+    pub(crate) fps: f32,
+    pub(crate) diagnostics: Option<Option<ez_gfx::ResourceDiagnostics>>,
+}
+
+/// Sendable automation configuration moved into the graphics thread.
+pub(crate) struct ThreadedRenderConfig {
+    frame_limit: Option<u32>,
+    benchmark: BenchmarkRunner,
+    frame_timings_enabled: bool,
+}
+
+/// Render-side automation state. No window-thread acknowledgement is required.
+pub(crate) struct ThreadedRenderHost {
+    frame_limit: Option<u32>,
+    observations: Rc<RefCell<Observations>>,
+    benchmark: BenchmarkRunner,
+    frame_timings_enabled: bool,
+    frame_timings: Vec<FrameTiming>,
+    pending_frame_started: Option<Instant>,
+    frames: u32,
+    last_present: Option<Instant>,
+    last_diagnostics: Option<Instant>,
+    fps: f32,
+    report: Option<ProgramReport>,
+}
+
+fn register_observations(context: &Context, observations: Rc<RefCell<Observations>>) -> Result<()> {
+    context.register_callback(move |event| {
+        let mut observations = observations.borrow_mut();
+        match event {
+            Event::Upload(_) => {}
+            Event::Runtime(_) => {
+                observations.runtime_events = observations.runtime_events.saturating_add(1);
+            }
+            Event::Diagnostic { .. } => {
+                observations.diagnostics = observations.diagnostics.saturating_add(1);
+            }
+            Event::ObservationsDropped(count) => {
+                observations.dropped = observations.dropped.saturating_add(count);
+            }
+            Event::Readback { bytes, .. } | Event::Snapshot(bytes) => {
+                observations.rgba8.clear_from_slice(bytes);
+            }
+            _ => {}
+        }
+    })?;
+    Ok(())
+}
+
+impl ThreadedRenderConfig {
+    /// Creates render-side state and registers its thread-local observations.
+    pub(crate) fn start(self, context: &Context) -> Result<ThreadedRenderHost> {
+        let observations = Rc::new(RefCell::new(Observations::default()));
+        register_observations(context, Rc::clone(&observations))?;
+        Ok(ThreadedRenderHost {
+            frame_limit: self.frame_limit,
+            observations,
+            benchmark: self.benchmark,
+            frame_timings_enabled: self.frame_timings_enabled,
+            frame_timings: Vec::new(),
+            pending_frame_started: None,
+            frames: 0,
+            last_present: None,
+            last_diagnostics: None,
+            fps: 0.0,
+            report: None,
+        })
+    }
+}
+
+impl ThreadedRenderHost {
+    /// Returns false after the exact configured terminal frame.
+    pub(crate) fn should_render(&self) -> bool {
+        self.frame_limit.is_none_or(|limit| self.frames < limit)
+    }
+
+    /// Starts render-loop timing after startup compilation and resource creation.
+    pub(crate) fn begin_frame(&mut self) {
+        self.benchmark.begin_frame(self.frames);
+        self.pending_frame_started = Some(Instant::now());
+    }
+
+    /// Finishes, optionally captures, and publishes one render-thread frame.
+    pub(crate) fn finish_frame(
+        &mut self,
+        context: &Context,
+        mut frame: Frame,
+        swapchain_target: ez_gfx::RenderTarget,
+        size: [u32; 2],
+    ) -> Result<ThreadedFrameUpdate> {
+        let frame_started = self
+            .pending_frame_started
+            .take()
+            .ok_or_else(|| Error::message("threaded frame timing began without a pending frame"))?;
+        let record_ns = frame_started.elapsed().as_nanos();
+        let submit_present_started = Instant::now();
+        if swapchain_target.extent()? != (size[0], size[1]) {
+            return Err(Error::message(
+                "swapchain target extent does not match render-thread size",
+            ));
+        }
+        let terminal = self
+            .frame_limit
+            .is_some_and(|limit| self.frames.saturating_add(1) >= limit);
+        let _readback = terminal
+            .then(|| swapchain_target.prepare_readback(&mut frame))
+            .transpose()?;
+        drop(swapchain_target);
+        frame.finish()?;
+        let submit_present_ns = submit_present_started.elapsed().as_nanos();
+        self.frames = self.frames.saturating_add(1);
+        self.benchmark.end_frame(self.frames);
+
+        let presented_at = Instant::now();
+        if let Some(previous) = self.last_present {
+            self.fps = smoothed_fps(self.fps, presented_at.duration_since(previous));
+        }
+        self.last_present = Some(presented_at);
+        if self.frame_timings_enabled {
+            self.frame_timings.push(FrameTiming {
+                frame: self.frames,
+                host_wait_ns: 0,
+                record_ns,
+                submit_present_ns,
+            });
+        }
+
+        let refresh = title_refresh_due(self.last_diagnostics, presented_at, terminal);
+        let diagnostics = refresh.then(|| context.resource_diagnostics().ok());
+        if refresh {
+            self.last_diagnostics = Some(presented_at);
+        }
+        if terminal {
+            let observations = self.observations.borrow();
+            self.report = Some(ProgramReport {
+                frame: PresentedFrame {
+                    width: size[0],
+                    height: size[1],
+                    frames: self.frames,
+                    rgba8: observations.rgba8.clone(),
+                    runtime_events: observations.runtime_events,
+                    diagnostics: observations.diagnostics,
+                    dropped_observations: observations.dropped,
+                },
+                benchmark: self.benchmark.report(),
+            });
+        }
+        Ok(ThreadedFrameUpdate {
+            frames: self.frames,
+            fps: self.fps,
+            diagnostics,
+        })
+    }
+
+    /// Returns completed report data after the graphics thread stops.
+    pub(crate) fn finish(self) -> ThreadedRenderOutput {
+        ThreadedRenderOutput {
+            report: self.report,
+            frame_timings: self.frame_timings,
+        }
+    }
+}
+
 struct HostState {
     title: &'static str,
     frame_limit: Option<u32>,
@@ -176,6 +354,7 @@ pub struct Example {
     fps: f32,
     // Reused title buffer so per-frame title updates never allocate.
     title_text: String,
+    last_title_refresh: Option<Instant>,
     report: Option<ProgramReport>,
 }
 
@@ -219,6 +398,7 @@ impl Example {
             last_present: None,
             fps: 0.0,
             title_text: String::new(),
+            last_title_refresh: None,
             report: None,
         };
         while example.state.window.is_none() && !example.state.closed {
@@ -247,11 +427,12 @@ impl Example {
     }
     /// Returns an owned clone of the live host used for surface creation.
     pub fn native_surface(&self) -> Result<HostSurface> {
-        self.state
+        let window = self
+            .state
             .window
             .as_ref()
-            .map(|window| HostSurface::attach(Arc::clone(window)))
-            .ok_or_else(|| Error::message("native host was not resumed"))
+            .ok_or_else(|| Error::message("native host was not resumed"))?;
+        Ok(HostSurface::attach(Arc::clone(window))?)
     }
 
     /// Returns whether graphics debug behavior was requested.
@@ -265,33 +446,41 @@ impl Example {
     }
 
     /// Returns the current native drawable size, or `[0, 0]` while minimized.
-    pub const fn surface_size(&self) -> [u32; 2] {
+    pub(crate) const fn surface_size(&self) -> [u32; 2] {
         [self.state.width, self.state.height]
+    }
+
+    /// Pumps one window-event batch without using frame completion as pacing.
+    pub(crate) fn pump_window_events(&mut self) -> Result<bool> {
+        if self.state.closed {
+            return Ok(false);
+        }
+        self.pump_once()?;
+        if let Some(error) = self.state.error.take() {
+            return Err(error);
+        }
+        Ok(!self.state.closed)
+    }
+
+    /// Transfers benchmark and frame-timing ownership to a graphics thread.
+    pub(crate) fn take_threaded_render_config(&mut self) -> ThreadedRenderConfig {
+        ThreadedRenderConfig {
+            frame_limit: self.state.frame_limit,
+            benchmark: std::mem::replace(&mut self.benchmark, BenchmarkRunner::new(None)),
+            frame_timings_enabled: std::mem::replace(&mut self.frame_timings_enabled, false),
+        }
+    }
+
+    /// Installs joined render-thread results for ordinary drop-time publication.
+    pub(crate) fn accept_threaded_render_output(&mut self, output: ThreadedRenderOutput) {
+        self.report = output.report;
+        self.frame_timings = output.frame_timings;
+        self.frame_timings_enabled = !self.frame_timings.is_empty();
     }
 
     /// Registers the observations used by snapshot, report, and benchmark automation.
     pub fn register_observations(&self, context: &Context) -> Result<()> {
-        let callback_observations = Rc::clone(&self.observations);
-        context.register_callback(move |event| {
-            let mut observations = callback_observations.borrow_mut();
-            match event {
-                Event::Upload(_) => {}
-                Event::Runtime(_) => {
-                    observations.runtime_events = observations.runtime_events.saturating_add(1);
-                }
-                Event::Diagnostic { .. } => {
-                    observations.diagnostics = observations.diagnostics.saturating_add(1);
-                }
-                Event::ObservationsDropped(count) => {
-                    observations.dropped = observations.dropped.saturating_add(count);
-                }
-                Event::Readback { bytes, .. } | Event::Snapshot(bytes) => {
-                    observations.rgba8.clear_from_slice(bytes);
-                }
-                _ => {}
-            }
-        })?;
-        Ok(())
+        register_observations(context, Rc::clone(&self.observations))
     }
 
     fn pump_once(&mut self) -> Result<()> {
@@ -353,16 +542,17 @@ impl Example {
             }));
         }
     }
-    /// Refreshes the window title with FPS plus compressed diagnostics.
+    /// Refreshes the window title with externally sampled FPS and diagnostics.
     ///
-    /// The title buffer reuses capacity after initial growth, so steady-state
-    /// updates perform no allocation. A failed diagnostics query renders as
-    /// `diag ?` instead of failing the frame; titles stay available after
-    /// device loss.
-    fn refresh_title(&mut self, context: &Context) {
-        // Query before clearing: a missing window still advances no state, and
-        // the previous title simply persists when the host is gone.
-        let diagnostics = context.resource_diagnostics().ok();
+    /// This is safe to call from the window thread while rendering proceeds on
+    /// another thread. The title buffer reuses capacity after initial growth.
+    pub(crate) fn update_title(
+        &mut self,
+        fps: f32,
+        diagnostics: Option<&ez_gfx::ResourceDiagnostics>,
+    ) {
+        // A missing window can only occur during host teardown; retain the
+        // previous title instead of turning telemetry into a shutdown error.
         let Some(window) = self.state.window.as_ref() else {
             return;
         };
@@ -371,10 +561,21 @@ impl Example {
             &mut self.title_text,
             self.identity,
             self.backend_name,
-            self.fps,
-            diagnostics.as_ref(),
+            fps,
+            diagnostics,
         );
         window.set_title(&self.title_text);
+    }
+
+    fn refresh_title(&mut self, context: &Context, force: bool) {
+        let now = Instant::now();
+        if !title_refresh_due(self.last_title_refresh, now, force) {
+            return;
+        }
+        // Query and native title mutation share one 5 Hz gate; the terminal frame is forced.
+        let diagnostics = context.resource_diagnostics().ok();
+        self.update_title(self.fps, diagnostics.as_ref());
+        self.last_title_refresh = Some(now);
     }
 
     /// Consumes the pending frame, presents it, then refreshes the window title.
@@ -417,7 +618,7 @@ impl Example {
         // Successful presentation only: `finish` already returned, and `?`
         // above skips this on failure, so a dropped frame never paints a
         // title for a presentation that did not happen.
-        self.refresh_title(context);
+        self.refresh_title(context, terminal);
         if self.frame_timings_enabled {
             self.frame_timings.push(FrameTiming {
                 frame: self.frames,
@@ -695,6 +896,23 @@ mod tests {
     }
 
     #[test]
+    fn title_refresh_runs_first_then_at_five_hertz_and_when_forced() {
+        let started = Instant::now();
+        assert!(title_refresh_due(None, started, false));
+        assert!(!title_refresh_due(
+            Some(started),
+            started + Duration::from_millis(199),
+            false
+        ));
+        assert!(title_refresh_due(
+            Some(started),
+            started + Duration::from_millis(200),
+            false
+        ));
+        assert!(title_refresh_due(Some(started), started, true));
+    }
+
+    #[test]
     #[should_panic(expected = "sentinel unwind")]
     fn publication_failure_does_not_double_panic_during_unwind() {
         let directory = tempfile::tempdir().unwrap();
@@ -724,6 +942,7 @@ mod tests {
             last_present: None,
             fps: 0.0,
             title_text: String::new(),
+            last_title_refresh: None,
             report: Some(ProgramReport {
                 frame: PresentedFrame {
                     width: 1,

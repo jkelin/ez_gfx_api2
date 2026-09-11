@@ -14,6 +14,9 @@ autotests = false
 name = "01_triangle"
 path = "01_triangle/main.rs"
 [[bin]]
+name = "01_triangle_second_thread"
+path = "01_triangle_second_thread/main.rs"
+[[bin]]
 name = "02_textured_cube"
 path = "02_textured_cube/main.rs"
 [[bin]]

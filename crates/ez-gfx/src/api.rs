@@ -469,6 +469,7 @@ struct SurfaceInner {
     context: Rc<ContextInner>,
     handle: SurfaceHandle,
     target: RefCell<Option<Rc<RenderTargetInner>>>,
+    snapshot_cache: Cell<bool>,
     // Keep the host alive until backend surface destruction releases every borrowed handle.
     host: Option<Box<dyn SurfaceHost>>,
 }
@@ -587,11 +588,13 @@ impl Surface {
             owner: false,
         };
         context.check_entry()?;
-        context.complete(state::set_snapshot_cache(
-            self.inner.context.handle,
-            self.inner.handle,
-            enabled,
-        ))
+        let result =
+            state::set_snapshot_cache(self.inner.context.handle, self.inner.handle, enabled);
+        if result.is_ok() {
+            // Keep facade readback routing aligned even when callback dispatch later fails.
+            self.inner.snapshot_cache.set(enabled);
+        }
+        context.complete(result)
     }
 }
 
@@ -637,7 +640,12 @@ impl Context {
         };
         let initialized = state::init_device(self.raw(), handle)
             .and_then(|()| state::sync_window_surface_extent(self.raw(), handle));
-        self.publish_surface(handle, initialized, Some(Box::new(host)))
+        self.publish_surface(
+            handle,
+            initialized,
+            Some(Box::new(host)),
+            cache_presented_snapshots,
+        )
     }
 
     /// Creates, initializes, and sizes a headless surface atomically.
@@ -651,7 +659,7 @@ impl Context {
         self.check_entry()?;
         let handle = state::create_surface_headless(self.raw(), options)?;
         let initialized = state::init_device(self.raw(), handle);
-        self.publish_surface(handle, initialized, None)
+        self.publish_surface(handle, initialized, None, options.cache_presented_snapshots)
     }
 
     fn publish_surface(
@@ -659,6 +667,7 @@ impl Context {
         handle: SurfaceHandle,
         initialized: Result<()>,
         mut host: Option<Box<dyn SurfaceHost>>,
+        snapshot_cache: bool,
     ) -> Result<Surface> {
         if let Err(error) = initialized {
             // Preserve the initialization failure while disposing of the host according to the
@@ -671,6 +680,7 @@ impl Context {
                 context: Rc::clone(&self.inner),
                 handle,
                 target: RefCell::new(None),
+                snapshot_cache: Cell::new(snapshot_cache),
                 host,
             }),
         }))

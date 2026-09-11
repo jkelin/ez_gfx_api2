@@ -304,6 +304,79 @@ fn triangle_ten_frame_timings_reject_system_timer_pacing() -> anyhow::Result<()>
 
 #[cfg(windows)]
 #[test]
+fn threaded_triangle_matches_benchmark_timing_and_terminal_report_contract() -> anyhow::Result<()> {
+    for backend in TARGET_BACKENDS {
+        let expected_backend =
+            shared::backend_config(shared::host::parse_backend(Some(backend))?).name;
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_01_triangle_second_thread"))
+            .args([
+                "--hidden",
+                "--backend",
+                backend,
+                "--report",
+                "--benchmark",
+                "--benchmark-warmup",
+                "2",
+                "--benchmark-frames",
+                "4",
+                "--frame-timings",
+            ])
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{backend}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout)?;
+        let lines = stdout.lines().collect::<Vec<_>>();
+        let snapshot = lines
+            .iter()
+            .find(|line| line.starts_with("ez-gfx-snapshot "))
+            .ok_or_else(|| anyhow::anyhow!("{backend}: missing terminal report: {stdout}"))?;
+        let snapshot_fields = snapshot.split_whitespace().collect::<Vec<_>>();
+        assert_eq!(snapshot_fields.len(), 8, "{backend}: {snapshot}");
+        assert_eq!(snapshot_fields[3], "7", "{backend}: {snapshot}");
+        assert_ne!(
+            snapshot_fields[4],
+            blake3::hash(&[]).to_string(),
+            "{backend}: {snapshot}"
+        );
+        let benchmark_line = lines
+            .iter()
+            .find(|line| line.starts_with("{\"benchmark\":"))
+            .ok_or_else(|| anyhow::anyhow!("{backend}: missing benchmark report: {stdout}"))?;
+        let benchmark: serde_json::Value = serde_json::from_str(benchmark_line)?;
+        assert_eq!(benchmark["benchmark"], "01_triangle_second_thread");
+        assert_eq!(benchmark["backend"], expected_backend);
+        assert_eq!(benchmark["warmup_frames"], 2);
+        assert_eq!(benchmark["measured_frames"], 4);
+        assert!(
+            benchmark["elapsed_ns"]
+                .as_u64()
+                .is_some_and(|value| value > 0),
+            "{backend}: {benchmark_line}"
+        );
+        for field in ["frame_time_ns", "fps"] {
+            assert!(
+                benchmark[field].as_f64().is_some_and(|value| value > 0.0),
+                "{backend} {field}: {benchmark_line}"
+            );
+        }
+        let timings = lines
+            .iter()
+            .filter(|line| line.starts_with("ez-gfx-frame-timing "))
+            .collect::<Vec<_>>();
+        assert_eq!(timings.len(), 7, "{backend}: {stdout}");
+        assert!(timings.iter().all(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            fields.len() == 7 && fields[1] == "01_triangle_second_thread" && fields[4] == "0"
+        }));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
 fn dx12_hidden_window_survives_large_swapchain_resize() -> anyhow::Result<()> {
     let mut child = shared::snapshot_command(BINARIES[0].2, std::path::Path::new("unused"), "dx12")
         .env_remove("EZ_GFX_EXAMPLE_SNAPSHOT")
