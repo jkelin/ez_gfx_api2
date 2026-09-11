@@ -418,7 +418,8 @@ impl NativeContext {
     /// pool cannot race GPU use. Capacities and high-water marks update only on
     /// successful recreation; a failed recreation leaves the old pool destroyed
     /// and reports the error, and the next frame retries from current capacity.
-    fn ensure_descriptor_capacity(
+    /// Crate-visible for the descriptor-count test alongside production use.
+    pub(super) fn ensure_descriptor_capacity(
         &mut self,
         slot_index: usize,
         needed_sets: u32,
@@ -1142,75 +1143,5 @@ mod public_set_tests {
         assert_eq!(public_set(&sets, 2), None);
         assert_eq!(public_set(&sets, 9), None);
         assert_eq!(public_set(&[], 1), None);
-    }
-}
-
-#[cfg(test)]
-mod descriptor_count_tests {
-    use super::{NativeContext, vk};
-
-    fn headless() -> NativeContext {
-        // No surface is created, shown, or activated by this test.
-        let mut context = NativeContext::create(false, false).unwrap();
-        context.init_device(None).unwrap();
-        context
-    }
-
-    fn storage_layout(device: &ash::Device, count: u32) -> vk::DescriptorSetLayout {
-        let binding = vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(count)
-            .stage_flags(vk::ShaderStageFlags::COMPUTE);
-        // SAFETY: the binding storage spans the create call on this live device.
-        unsafe {
-            device
-                .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default()
-                        .bindings(core::slice::from_ref(&binding)),
-                    None,
-                )
-                .unwrap()
-        }
-    }
-
-    #[test]
-    fn ensure_path_covers_real_allocated_set_counts() {
-        let mut context = headless();
-        // Preflight need: two pipeline actions holding three plus five descriptors.
-        let pool = context.ensure_descriptor_capacity(0, 2, 8).unwrap();
-        assert_eq!(context.frame_slots[0].descriptor_sets_capacity, 2);
-        assert_eq!(context.frame_slots[0].descriptor_count_capacity, 8);
-        let device = context.device.as_ref().unwrap().clone();
-        let first = storage_layout(&device, 3);
-        let second = storage_layout(&device, 5);
-        // SAFETY: both layouts are live, their counts fit the pool, and nothing
-        // else allocates from this pool during the test.
-        let sets = unsafe {
-            device
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(pool)
-                        .set_layouts(&[first, second]),
-                )
-                .unwrap()
-        };
-        // The real path backs exactly the preflighted counts: two sets, eight
-        // descriptors across layouts that sum to the pool capacity.
-        assert_eq!(sets.len(), 2);
-        // The same need reuses the pool instead of recreating it.
-        let reused = context.ensure_descriptor_capacity(0, 2, 8).unwrap();
-        assert_eq!(reused, pool);
-        // Growth doubles sets toward the need while descriptors already cover.
-        context.ensure_descriptor_capacity(0, 3, 8).unwrap();
-        assert_eq!(context.frame_slots[0].descriptor_sets_capacity, 4);
-        assert_eq!(context.frame_slots[0].descriptor_count_capacity, 8);
-        // SAFETY: the sets came from pools owned by this device and both
-        // layouts are still live; the context drop destroys the pools.
-        unsafe {
-            device.free_descriptor_sets(pool, &sets).unwrap();
-            device.destroy_descriptor_set_layout(first, None);
-            device.destroy_descriptor_set_layout(second, None);
-        }
     }
 }
