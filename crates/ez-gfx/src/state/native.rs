@@ -666,12 +666,15 @@ mod binding_scratch_tests {
     };
     use std::{
         alloc::{GlobalAlloc, Layout, System},
-        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        cell::Cell,
     };
 
     struct CountingAllocator;
-    static ENABLED: AtomicBool = AtomicBool::new(false);
-    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        // Thread-local gates exclude libtest/nextest allocator traffic from other threads.
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
 
     // SAFETY: every allocation operation preserves `GlobalAlloc`'s pointer and layout contracts by
     // delegating unchanged requests to the system allocator.
@@ -679,8 +682,8 @@ mod binding_scratch_tests {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             // SAFETY: the unchanged request is delegated to the system allocator.
             let pointer = unsafe { System.alloc(layout) };
-            if ENABLED.load(Ordering::Relaxed) && !pointer.is_null() {
-                CALLS.fetch_add(1, Ordering::Relaxed);
+            if ENABLED.get() && !pointer.is_null() {
+                CALLS.set(CALLS.get().saturating_add(1));
             }
             pointer
         }
@@ -693,6 +696,23 @@ mod binding_scratch_tests {
 
     #[global_allocator]
     static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    struct MeasurementGuard;
+
+    impl Drop for MeasurementGuard {
+        fn drop(&mut self) {
+            ENABLED.set(false);
+        }
+    }
+
+    fn allocation_calls(operation: impl FnOnce()) -> usize {
+        CALLS.set(0);
+        ENABLED.set(true);
+        let guard = MeasurementGuard;
+        operation();
+        drop(guard);
+        CALLS.get()
+    }
 
     #[test]
     fn more_than_64_bindings_are_accepted_without_warmed_allocations() {
@@ -730,15 +750,14 @@ mod binding_scratch_tests {
         append_frame_bindings(&layout, &bindings, |_| Some(1024), |_| None, &mut scratch).unwrap();
         assert_eq!(scratch.len(), 65);
 
-        CALLS.store(0, Ordering::Relaxed);
-        ENABLED.store(true, Ordering::Relaxed);
-        for _ in 0..500 {
-            scratch.clear();
-            append_frame_bindings(&layout, &bindings, |_| Some(1024), |_| None, &mut scratch)
-                .unwrap();
-        }
-        ENABLED.store(false, Ordering::Relaxed);
-        assert_eq!(CALLS.load(Ordering::Relaxed), 0);
+        let calls = allocation_calls(|| {
+            for _ in 0..500 {
+                scratch.clear();
+                append_frame_bindings(&layout, &bindings, |_| Some(1024), |_| None, &mut scratch)
+                    .unwrap();
+            }
+        });
+        assert_eq!(calls, 0);
     }
 
     #[test]
@@ -802,29 +821,28 @@ mod binding_scratch_tests {
             recorder.abort();
         }
 
-        CALLS.store(0, Ordering::Relaxed);
-        ENABLED.store(true, Ordering::Relaxed);
-        for _ in 0..500 {
-            recorder.begin().unwrap();
-            let projection = BindingProjection::new(&layout, &bindings);
-            projection.validate().unwrap();
-            let payload_layout = layout.clone();
-            recorder
-                .record_bound_node(
-                    NodeDesc::new("compute", QueueKind::Compute),
-                    projection.resources(),
-                    move |bindings| ExecutableNode::Compute {
-                        shader,
-                        groups: [1, 1, 1],
-                        bindings,
-                        layout: payload_layout,
-                    },
-                )
-                .unwrap();
-            recorder.abort();
-        }
-        ENABLED.store(false, Ordering::Relaxed);
-        assert_eq!(CALLS.load(Ordering::Relaxed), 0);
+        let calls = allocation_calls(|| {
+            for _ in 0..500 {
+                recorder.begin().unwrap();
+                let projection = BindingProjection::new(&layout, &bindings);
+                projection.validate().unwrap();
+                let payload_layout = layout.clone();
+                recorder
+                    .record_bound_node(
+                        NodeDesc::new("compute", QueueKind::Compute),
+                        projection.resources(),
+                        move |bindings| ExecutableNode::Compute {
+                            shader,
+                            groups: [1, 1, 1],
+                            bindings,
+                            layout: payload_layout,
+                        },
+                    )
+                    .unwrap();
+                recorder.abort();
+            }
+        });
+        assert_eq!(calls, 0);
 
         let original = bindings[0].resource;
         recorder.begin().unwrap();

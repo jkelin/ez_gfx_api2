@@ -350,10 +350,11 @@ pub(super) fn presentation_modes_for_record(
 
     match (&context.native, &record.native) {
         (NativeContext::Vulkan(native), NativeSurface::Vulkan(surface)) => {
-            if surface.is_headless() {
-                Ok(PresentationModes::NONE)
-            } else {
+            // VK_EXT_headless_surface owns a non-null handle, so logical surface kind is authoritative.
+            if record.is_window {
                 native.presentation_modes(surface).map_err(map_hal)
+            } else {
+                Ok(PresentationModes::NONE)
             }
         }
         #[cfg(windows)]
