@@ -4,22 +4,26 @@ use super::{
     CreateEventW, D3D_FEATURE_LEVEL_12_1, D3D_SHADER_MODEL_6_5, D3D12_COMMAND_LIST_TYPE_COPY,
     D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC, D3D12_DESCRIPTOR_HEAP_DESC,
     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-    D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, D3D12_FEATURE_D3D12_OPTIONS,
-    D3D12_FEATURE_DATA_D3D12_OPTIONS, D3D12_FEATURE_DATA_SHADER_MODEL, D3D12_FEATURE_SHADER_MODEL,
-    D3D12_FENCE_FLAG_NONE, D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_RANGE, D3D12_SAMPLER_DESC,
+    D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, D3D12_FEATURE_D3D12_OPTIONS, D3D12_FEATURE_D3D12_OPTIONS7,
+    D3D12_FEATURE_DATA_D3D12_OPTIONS, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
+    D3D12_FEATURE_DATA_SHADER_MODEL, D3D12_FEATURE_SHADER_MODEL, D3D12_FENCE_FLAG_NONE,
+    D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_MESH_SHADER_TIER, D3D12_MESH_SHADER_TIER_1,
+    D3D12_MESH_SHADER_TIER_NOT_SUPPORTED, D3D12_RANGE, D3D12_SAMPLER_DESC,
     D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12CreateDevice, DEFAULT_ALLOCATION_BLOCK_POLICY,
     DXGI_ADAPTER_FLAG3_SOFTWARE, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_UNSUPPORTED,
-    DeferredNativeResource, DeferredResource, HalError, ID3D12CommandQueue, ID3D12DescriptorHeap,
-    ID3D12Device, ID3D12DeviceVersion, ID3D12Fence, IDXGIAdapter4, IDXGIFactory4, INFINITE,
+    DeferredNativeResource, DeferredResource, E_INVALIDARG, HalError, ID3D12CommandQueue,
+    ID3D12DescriptorHeap, ID3D12Device, ID3D12DeviceVersion, ID3D12Fence,
+    ID3D12GraphicsCommandList, ID3D12GraphicsCommandList6, IDXGIAdapter4, IDXGIFactory4, INFINITE,
     Interface, MemoryAllocator, NativeContext, NativeSurface, QueueKind, SemanticProfile,
-    TEXTURE_DESCRIPTOR_CAPACITY, WAIT_FAILED, WAIT_OBJECT_0, WaitForSingleObject, adapter_id,
-    create_frame_slots, map_allocator, map_windows, transfer,
+    ShaderCapabilities, TEXTURE_DESCRIPTOR_CAPACITY, WAIT_FAILED, WAIT_OBJECT_0,
+    WaitForSingleObject, adapter_id, create_frame_slots, map_allocator, map_windows, transfer,
 };
 
 fn initialize_context(
     adapter: IDXGIAdapter4,
     device: ID3D12Device,
     adapter_info: AdapterInfo,
+    mesh_shader_tier: D3D12_MESH_SHADER_TIER,
 ) -> windows::core::Result<NativeContext> {
     // SAFETY: CreateCommandQueue reads the initialized D3D12_COMMAND_QUEUE_DESC only during the call, while device retains the ID3D12Device COM receiver.
     let queue: ID3D12CommandQueue = unsafe {
@@ -112,9 +116,10 @@ fn initialize_context(
     let texture_worker =
         transfer::start_worker(&device, texture_queue, queue.clone(), texture_fence.clone())
             .map_err(|_| windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL))?;
-    Ok(NativeContext {
+    let context = NativeContext {
         adapter,
         device,
+        mesh_shader_tier,
         queue,
         fence,
         fence_event,
@@ -139,7 +144,44 @@ fn initialize_context(
         descriptor_stride,
         samplers,
         sampler_stride: u32::try_from(sampler_stride).unwrap_or(u32::MAX),
-    })
+    };
+    // The cached tier and the normalized stages derive from the same probe;
+    // a mismatch would admit an adapter whose execution gate disagrees.
+    debug_assert_eq!(
+        context.mesh_shader_tier.0 >= D3D12_MESH_SHADER_TIER_1.0,
+        context.adapter_info.capabilities().shader_stages.mesh,
+        "cached mesh tier agrees with normalized shader stages"
+    );
+    Ok(context)
+}
+
+/// Maps the optional OPTIONS7 query result to a mesh-shader tier.
+///
+/// `E_INVALIDARG` means the runtime predates the OPTIONS7 revision, so
+/// neither the tier query nor the mesh-dispatch command-list interface
+/// exists, and maps to unsupported. Any other failure is a genuine device
+/// problem and propagates to the caller.
+///
+/// # Errors
+///
+/// Returns the query failure unless it is `E_INVALIDARG`.
+fn mesh_tier_from_options7(
+    result: windows::core::Result<D3D12_FEATURE_DATA_D3D12_OPTIONS7>,
+) -> windows::core::Result<D3D12_MESH_SHADER_TIER> {
+    match result {
+        Ok(options) => Ok(options.MeshShaderTier),
+        Err(error) if error.code() == E_INVALIDARG => Ok(D3D12_MESH_SHADER_TIER_NOT_SUPPORTED),
+        Err(error) => Err(error),
+    }
+}
+
+/// Mesh execution records `DispatchMesh` through this interface; the OPTIONS7
+/// probe below already gates its availability on the same runtime floor, so a
+/// cast failure here reports a genuine device problem.
+pub(super) fn mesh_dispatch_list(
+    list: &ID3D12GraphicsCommandList,
+) -> windows::core::Result<ID3D12GraphicsCommandList6> {
+    list.cast()
 }
 
 /// Probes one DXGI adapter for identity and capabilities, creating a temporary
@@ -147,20 +189,36 @@ fn initialize_context(
 /// enumeration drops it. Software adapters classify as `Software` (not by
 /// video memory) so catalog policy can gate them.
 ///
+/// Returns `Ok(None)` for adapters that cannot host D3D12 at all (undescribed
+/// or device-less); callers skip those without failing the walk. Every other
+/// failure is a genuine device problem and propagates through `Err`.
+///
+/// The mesh-shader tier comes from the optional `D3D12_FEATURE_D3D12_OPTIONS7`
+/// query: tier 1 enables both task (amplification) and mesh stages. The tier
+/// is returned alongside the device so context creation caches the native
+/// probe result.
+///
 /// # Errors
 ///
-/// Returns an error if adapter description, device creation, feature queries,
-/// or adapter metadata construction fails.
-fn describe_adapter(adapter: &IDXGIAdapter4) -> windows::core::Result<(AdapterInfo, ID3D12Device)> {
+/// Returns an error if required feature queries or adapter metadata
+/// construction fails.
+fn describe_adapter(
+    adapter: &IDXGIAdapter4,
+) -> windows::core::Result<Option<(AdapterInfo, ID3D12Device, D3D12_MESH_SHADER_TIER)>> {
     // SAFETY: GetDesc3 uses adapter's retained IDXGIAdapter4 receiver, and windows-rs provides correctly sized DXGI_ADAPTER_DESC3 out storage for the call.
-    let description = unsafe { adapter.GetDesc3() }?;
+    let Ok(description) = (unsafe { adapter.GetDesc3() }) else {
+        // Undescribable adapters (removed, non-DXGI) skip the walk, never fail it.
+        return Ok(None);
+    };
     let mut device: Option<ID3D12Device> = None;
     // SAFETY: D3D12CreateDevice receives adapter through its IDXGIAdapter4 wrapper and a writable, aligned Option<ID3D12Device> out slot that lives through the call.
-    unsafe { D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_1, &raw mut device) }?;
+    if (unsafe { D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_1, &raw mut device) }).is_err() {
+        // Adapters without a D3D12 device (basic display, pre-12.1) skip the
+        // walk; only created devices face the required queries below.
+        return Ok(None);
+    }
     let Some(device) = device else {
-        return Err(windows::core::Error::from_hresult(
-            windows::Win32::Foundation::E_FAIL,
-        ));
+        return Ok(None);
     };
     let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
     // SAFETY: CheckFeatureSupport(D3D12_OPTIONS) receives a writable, aligned options pointer with the exact D3D12_FEATURE_DATA_D3D12_OPTIONS size, and options lives through the call.
@@ -182,6 +240,22 @@ fn describe_adapter(adapter: &IDXGIAdapter4) -> windows::core::Result<(AdapterIn
             u32::try_from(core::mem::size_of_val(&shader_model)).unwrap_or(u32::MAX),
         )
     }?;
+    let mut mesh_options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+    // SAFETY: CheckFeatureSupport(D3D12_OPTIONS7) receives a writable, aligned mesh_options pointer with the exact D3D12_FEATURE_DATA_D3D12_OPTIONS7 size, and mesh_options lives through the call.
+    let options7 = unsafe {
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS7,
+                (&raw mut mesh_options).cast(),
+                u32::try_from(core::mem::size_of_val(&mesh_options)).unwrap_or(u32::MAX),
+            )
+            .map(|()| mesh_options)
+    };
+    let mesh_tier = mesh_tier_from_options7(options7)?;
+    // Tier 1 is the only supported tier in this SDK revision; compare by
+    // value floor so a future higher tier still implies both stages.
+    let mesh_supported = mesh_tier.0 >= D3D12_MESH_SHADER_TIER_1.0;
+    let shader_stages = ShaderCapabilities::normalized(mesh_supported, mesh_supported);
     let capabilities = AdapterCapabilities {
         bindless_sampled_textures: if options.ResourceBindingTier.0 >= 3 {
             TEXTURE_DESCRIPTOR_CAPACITY
@@ -202,6 +276,7 @@ fn describe_adapter(adapter: &IDXGIAdapter4) -> windows::core::Result<(AdapterIn
         shader_model: u32::try_from(shader_model.HighestShaderModel.0)
             .map(|value| ((value >> 4) << 8) | (value & 0x0f))
             .unwrap_or(0),
+        shader_stages,
         timeline_synchronization: true,
         resource_aliasing: true,
         dynamic_rendering: true,
@@ -227,7 +302,7 @@ fn describe_adapter(adapter: &IDXGIAdapter4) -> windows::core::Result<(AdapterIn
     };
     let adapter_info = AdapterInfo::new(BACKEND, stable_id, name, driver, class, capabilities)
         .map_err(|_| windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL))?;
-    Ok((adapter_info, device))
+    Ok(Some((adapter_info, device, mesh_tier)))
 }
 
 impl NativeContext {
@@ -284,8 +359,9 @@ impl NativeContext {
                 Err(error) => return Err(error),
             };
             index += 1;
-            // One undescribable adapter skips itself, never the selection.
-            let Ok((adapter_info, device)) = describe_adapter(&adapter) else {
+            // Adapter-local inability to describe or create a D3D12 device remains skippable;
+            // every failure from a created device's required queries propagates.
+            let Some((adapter_info, device, mesh_shader_tier)) = describe_adapter(&adapter)? else {
                 continue;
             };
             if !allow_software && adapter_info.class() == AdapterClass::Software {
@@ -297,7 +373,7 @@ impl NativeContext {
             {
                 continue;
             }
-            return initialize_context(adapter, device, adapter_info);
+            return initialize_context(adapter, device, adapter_info, mesh_shader_tier);
         }
     }
 
@@ -308,7 +384,8 @@ impl NativeContext {
     ///
     /// # Errors
     ///
-    /// Returns an error if DXGI factory creation fails.
+    /// Returns an error if DXGI factory creation, adapter enumeration, or a created device's
+    /// required capability query fails.
     pub fn enumerate_adapters() -> windows::core::Result<Vec<AdapterInfo>> {
         // SAFETY: CreateDXGIFactory1 takes no input pointers, and windows-rs provides correctly typed IDXGIFactory4 out storage and adopts the returned COM reference.
         let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory1() }?;
@@ -326,7 +403,7 @@ impl NativeContext {
                 continue;
             };
             index += 1;
-            if let Ok((adapter_info, _)) = describe_adapter(&adapter) {
+            if let Some((adapter_info, _, _)) = describe_adapter(&adapter)? {
                 adapters.push(adapter_info);
             }
         }
@@ -357,8 +434,11 @@ impl NativeContext {
                 Err(error) => return Err(map_windows(error)),
             };
             index += 1;
-            // One undescribable adapter skips itself, never the selection.
-            let Ok((adapter_info, device)) = describe_adapter(&adapter) else {
+            // Preserve adapter-local skips, but never turn a created device's query failure into
+            // a misleading unknown-adapter result.
+            let Some((adapter_info, device, mesh_shader_tier)) =
+                describe_adapter(&adapter).map_err(map_windows)?
+            else {
                 continue;
             };
             if adapter_info.stable_id() != stable_id {
@@ -374,7 +454,8 @@ impl NativeContext {
             {
                 return Err(HalError::Unsupported);
             }
-            return initialize_context(adapter, device, adapter_info).map_err(map_windows);
+            return initialize_context(adapter, device, adapter_info, mesh_shader_tier)
+                .map_err(map_windows);
         }
     }
 
@@ -660,7 +741,9 @@ impl NativeContext {
 
 #[cfg(test)]
 mod adapter_tests {
+    use super::super::{NativeMeshPipelineDesc, NativeShader};
     use super::*;
+    use ez_gfx_hal::{BlendMode, CullMode, FrontFace, MeshPipelineState};
     use std::collections::BTreeSet;
 
     #[test]
@@ -693,5 +776,224 @@ mod adapter_tests {
         let context = NativeContext::create_for_adapter(wanted, false)
             .expect("enumerated adapter initializes");
         assert_eq!(context.adapter_info().stable_id(), wanted);
+    }
+
+    #[test]
+    fn options7_invalid_argument_means_mesh_is_unsupported() {
+        let error = windows::core::Error::from_hresult(E_INVALIDARG);
+
+        assert_eq!(
+            mesh_tier_from_options7(Err(error)).unwrap(),
+            D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
+        );
+    }
+
+    #[test]
+    fn options7_non_invalid_argument_failure_propagates() {
+        let error = windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL);
+
+        assert_eq!(
+            mesh_tier_from_options7(Err(error.clone()))
+                .unwrap_err()
+                .code(),
+            error.code()
+        );
+    }
+
+    #[test]
+    fn mesh_dispatch_accepts_valid_task_and_taskless_grids() {
+        use super::super::check_mesh_dispatch;
+
+        assert_eq!(
+            check_mesh_dispatch(true, [4, 2, 1], [128, 1, 1], Some([32, 1, 1])),
+            Ok(())
+        );
+        assert_eq!(
+            check_mesh_dispatch(false, [4, 2, 1], [128, 1, 1], None),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn mesh_dispatch_rejects_misshapen_grids_and_inconsistent_stages() {
+        use super::super::check_mesh_dispatch;
+
+        // Zero dimensions and over-ceiling grids fail.
+        assert_eq!(
+            check_mesh_dispatch(false, [0, 1, 1], [8, 1, 1], None),
+            Err(HalError::InvalidArgument)
+        );
+        assert_eq!(
+            check_mesh_dispatch(
+                false,
+                [
+                    super::super::D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION + 1,
+                    1,
+                    1,
+                ],
+                [8, 1, 1],
+                None,
+            ),
+            Err(HalError::InvalidArgument)
+        );
+        // A task size without a task stage, or a missing one with it, describes
+        // no executable dispatch.
+        assert_eq!(
+            check_mesh_dispatch(false, [1, 1, 1], [8, 1, 1], Some([8, 1, 1])),
+            Err(HalError::InvalidArgument)
+        );
+        assert_eq!(
+            check_mesh_dispatch(true, [1, 1, 1], [8, 1, 1], None),
+            Err(HalError::InvalidArgument)
+        );
+        // Zero thread dimensions fail before any ceiling comparison.
+        assert_eq!(
+            check_mesh_dispatch(true, [1, 1, 1], [8, 1, 1], Some([0, 1, 1])),
+            Err(HalError::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn mesh_dispatch_enforces_spec_total_grid_and_thread_caps() {
+        use super::super::check_mesh_dispatch;
+
+        // The mesh-shader specification caps the DispatchMesh workgroup-count
+        // product at 2^22: the boundary product dispatches, one step over fails.
+        assert_eq!(
+            check_mesh_dispatch(false, [4096, 1024, 1], [8, 1, 1], None),
+            Ok(())
+        );
+        assert_eq!(
+            check_mesh_dispatch(false, [4096, 4096, 1], [8, 1, 1], None),
+            Err(HalError::InvalidArgument)
+        );
+        // Amplification and mesh threadgroup sizes cap at 128 threads each.
+        assert_eq!(
+            check_mesh_dispatch(false, [1, 1, 1], [128, 1, 1], None),
+            Ok(())
+        );
+        assert_eq!(
+            check_mesh_dispatch(false, [1, 1, 1], [256, 1, 1], None),
+            Err(HalError::InvalidArgument)
+        );
+        assert_eq!(
+            check_mesh_dispatch(true, [1, 1, 1], [8, 1, 1], Some([128, 1, 1])),
+            Ok(())
+        );
+        assert_eq!(
+            check_mesh_dispatch(true, [1, 1, 1], [8, 1, 1], Some([256, 1, 1])),
+            Err(HalError::InvalidArgument)
+        );
+    }
+
+    fn mesh_raster() -> MeshPipelineState {
+        MeshPipelineState {
+            cull: CullMode::None,
+            front_face: FrontFace::CounterClockwise,
+            blend: BlendMode::None,
+        }
+    }
+
+    fn mesh_describe<'a>(
+        empty: &'a NativeShader,
+        task: Option<(&'a NativeShader, usize)>,
+    ) -> NativeMeshPipelineDesc<'a> {
+        NativeMeshPipelineDesc {
+            task,
+            mesh: (empty, 0),
+            fragment: (empty, 0),
+            state: mesh_raster(),
+            color_format: None,
+            layouts: &[],
+            depth_required: false,
+            task_workgroup_size: task.map(|_| [1, 1, 1]),
+            mesh_workgroup_size: [32, 1, 1],
+        }
+    }
+
+    #[test]
+    fn mesh_pipeline_rejects_unsupported_before_state_creation() {
+        // No surface is created, shown, or activated by this test.
+        let adapters = NativeContext::enumerate_adapters().expect("DXGI enumerates adapters");
+        let wanted = adapters.first().expect("at least one adapter").stable_id();
+        let context = NativeContext::create_for_adapter(wanted, false)
+            .expect("enumerated adapter initializes");
+        let stages = context.adapter_info().capabilities().shader_stages;
+        // The public limits getter follows the same tier gate without allocation.
+        assert_eq!(context.mesh_dispatch_limits(false).is_ok(), stages.mesh);
+        assert_eq!(context.mesh_dispatch_limits(true).is_ok(), stages.task);
+        // Tier-1 limits are the specified mesh-shader constants.
+        if stages.mesh {
+            let limits = context.mesh_dispatch_limits(false).expect("tier-1 limits");
+            assert_eq!(limits.max_groups, [65_535; 3]);
+            assert_eq!(limits.max_total_groups, 1 << 22);
+            assert_eq!(limits.max_mesh_threads, 128);
+            assert_eq!(limits.max_task_threads, 128);
+        }
+        // Empty shaders carry no products, so a tier-1 device fails on the
+        // product index while an older one fails on the earlier tier gate.
+        let empty = NativeShader {
+            products: Vec::new(),
+        };
+        assert_eq!(
+            context
+                .create_mesh_pipeline(mesh_describe(&empty, None))
+                .map(|_| ()),
+            if stages.mesh {
+                Err(HalError::InvalidArgument)
+            } else {
+                Err(HalError::Unsupported)
+            }
+        );
+        // Tier 1 always implies the task stage, so the task case follows the
+        // same gate: unsupported below tier 1, product index above it.
+        assert_eq!(
+            context
+                .create_mesh_pipeline(mesh_describe(&empty, Some((&empty, 0))))
+                .map(|_| ()),
+            if stages.task {
+                Err(HalError::InvalidArgument)
+            } else {
+                Err(HalError::Unsupported)
+            }
+        );
+        // An inconsistent stage/size selection is invalid on any device.
+        let mismatched = NativeMeshPipelineDesc {
+            task: None,
+            task_workgroup_size: Some([1, 1, 1]),
+            ..mesh_describe(&empty, None)
+        };
+        assert_eq!(
+            context.create_mesh_pipeline(mismatched).map(|_| ()),
+            Err(HalError::InvalidArgument)
+        );
+        // Garbage bytes pass index checks without reaching native creation, so a
+        // well-formed but oversized workgroup is unsupported on any device,
+        // while a zero workgroup is malformed only where tier 1 is supported.
+        let present = NativeShader {
+            products: vec![vec![0xAA]],
+        };
+        let oversized = NativeMeshPipelineDesc {
+            mesh: (&present, 0),
+            fragment: (&present, 0),
+            mesh_workgroup_size: [1024, 1, 1],
+            ..mesh_describe(&present, None)
+        };
+        assert_eq!(
+            context.create_mesh_pipeline(oversized).map(|_| ()),
+            Err(HalError::Unsupported)
+        );
+        let empty_workgroup = NativeMeshPipelineDesc {
+            mesh_workgroup_size: [0, 1, 1],
+            ..mesh_describe(&present, None)
+        };
+        assert_eq!(
+            context.create_mesh_pipeline(empty_workgroup).map(|_| ()),
+            if stages.mesh {
+                Err(HalError::InvalidArgument)
+            } else {
+                Err(HalError::Unsupported)
+            }
+        );
     }
 }

@@ -650,6 +650,105 @@ pub enum BlendMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// Shader stages selected for a mesh graphics pipeline.
+pub struct MeshStages<T> {
+    /// Optional task shader.
+    pub task: Option<T>,
+    /// Required mesh shader.
+    pub mesh: T,
+    /// Required fragment shader.
+    pub fragment: T,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// Rasterization and blending choices supplied for a mesh graphics pipeline.
+pub struct MeshPipelineState {
+    /// Face-culling mode for rasterization.
+    pub cull: CullMode,
+    /// Vertex winding interpreted as front-facing.
+    pub front_face: FrontFace,
+    /// Color blending mode.
+    pub blend: BlendMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Failure class for direct mesh dispatch validation.
+pub enum MeshDispatchError {
+    /// Caller-supplied dispatch counts are zero, overflow, or exceed a grid limit.
+    InvalidGroups,
+    /// A reflected task or mesh workgroup shape is zero or overflows.
+    InvalidWorkgroup,
+    /// A valid reflected workgroup shape exceeds the selected device limit.
+    UnsupportedWorkgroup,
+}
+
+impl fmt::Display for MeshDispatchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for MeshDispatchError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Native limits used to validate a direct mesh dispatch.
+pub struct MeshDispatchLimits {
+    /// Maximum grid count in each dimension.
+    pub max_groups: [u32; 3],
+    /// Maximum total grid count across all dimensions.
+    pub max_total_groups: u64,
+    /// Maximum threads in one mesh threadgroup.
+    pub max_mesh_threads: u32,
+    /// Maximum threads in one task/object threadgroup.
+    pub max_task_threads: u32,
+}
+
+/// Validates direct mesh grid and reflected threadgroup dimensions without allocation.
+///
+/// # Errors
+///
+/// Returns [`MeshDispatchError::InvalidGroups`] for invalid caller dispatch counts,
+/// [`MeshDispatchError::InvalidWorkgroup`] for malformed reflected dimensions, or
+/// [`MeshDispatchError::UnsupportedWorkgroup`] when valid reflection exceeds native limits.
+pub fn validate_mesh_dispatch(
+    groups: [u32; 3],
+    mesh_threads: [u32; 3],
+    task_threads: Option<[u32; 3]>,
+    limits: MeshDispatchLimits,
+) -> Result<(), MeshDispatchError> {
+    fn product(dimensions: [u32; 3], invalid: MeshDispatchError) -> Result<u64, MeshDispatchError> {
+        if dimensions.contains(&0) {
+            return Err(invalid);
+        }
+        dimensions.into_iter().try_fold(1_u64, |total, value| {
+            total.checked_mul(u64::from(value)).ok_or(invalid)
+        })
+    }
+
+    let group_count = product(groups, MeshDispatchError::InvalidGroups)?;
+    if groups
+        .into_iter()
+        .zip(limits.max_groups)
+        .any(|(count, limit)| count > limit)
+        || group_count > limits.max_total_groups
+    {
+        return Err(MeshDispatchError::InvalidGroups);
+    }
+    if product(mesh_threads, MeshDispatchError::InvalidWorkgroup)?
+        > u64::from(limits.max_mesh_threads)
+    {
+        return Err(MeshDispatchError::UnsupportedWorkgroup);
+    }
+    if let Some(threads) = task_threads
+        && product(threads, MeshDispatchError::InvalidWorkgroup)?
+            > u64::from(limits.max_task_threads)
+    {
+        return Err(MeshDispatchError::UnsupportedWorkgroup);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 /// Rasterization, topology, and blending choices supplied at pipeline creation.
 pub struct DynamicPipelineState {
     /// Face-culling mode for rasterization.
@@ -712,19 +811,24 @@ pub enum RenderStateError {
     InvalidDiscriminant,
 }
 
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Programmable pipeline stage associated with a resource access.
 pub enum ShaderStage {
     /// No programmable shader stage participates.
-    None,
+    None = 0,
     /// Vertex shader stage.
-    Vertex,
+    Vertex = 1,
     /// Fragment shader stage.
-    Fragment,
+    Fragment = 2,
     /// Compute shader stage.
-    Compute,
+    Compute = 3,
     /// All programmable graphics stages.
-    AllGraphics,
+    AllGraphics = 4,
+    /// Task/object shader stage.
+    Task = 5,
+    /// Mesh shader stage.
+    Mesh = 6,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -805,7 +909,11 @@ impl ResourceState {
         if queue == QueueKind::Compute
             && matches!(
                 stage,
-                ShaderStage::Vertex | ShaderStage::Fragment | ShaderStage::AllGraphics
+                ShaderStage::Vertex
+                    | ShaderStage::Fragment
+                    | ShaderStage::AllGraphics
+                    | ShaderStage::Task
+                    | ShaderStage::Mesh
             )
         {
             return Err(ContractError::InvalidState);

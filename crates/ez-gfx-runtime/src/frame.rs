@@ -48,6 +48,23 @@ pub enum ExecutableNode {
         /// Dynamic pipeline state.
         state: DynamicPipelineState,
     },
+    /// A direct mesh graphics node with optional task stage.
+    Mesh {
+        /// Optional task, required mesh, and required fragment handles.
+        stages: ez_gfx_hal::MeshStages<ShaderHandle>,
+        /// Direct object or mesh threadgroup grid.
+        groups: [u32; 3],
+        /// Range of snapshotted resources in the submission binding arena.
+        bindings: core::ops::Range<usize>,
+        /// Merged reflected shader requirements.
+        layout: ReflectedBindings,
+        /// Per-stage physical identities in task, mesh, fragment execution order.
+        stage_layouts: ez_gfx_hal::MeshStages<crate::binding::StageLayoutIdentity>,
+        /// Merged backend pipeline layout.
+        pipeline_layout: PipelineLayout,
+        /// Mesh rasterization and blend state.
+        state: ez_gfx_hal::MeshPipelineState,
+    },
     /// A compute dispatch node.
     Compute {
         /// Shader handle.

@@ -12,13 +12,14 @@ use std::sync::LazyLock;
 use common::TestContext;
 use ez_gfx_compiler::{EasyGraphicsCompiler, Target};
 use ez_gfx_ffi::{
-    EzGfxDrawIndexedCommand, EzGfxDynamicState, EzGfxEvent, EzGfxEventKind, EzGfxResult,
-    ez_gfx_context_register_callback, ez_gfx_counter_buffer_acquire,
-    ez_gfx_counter_buffer_publish_count, ez_gfx_counter_buffer_write_draws,
-    ez_gfx_fragment_shader_destroy, ez_gfx_fragment_shader_load, ez_gfx_frame_begin,
-    ez_gfx_frame_end, ez_gfx_frame_execute_graphics, ez_gfx_index_allocation_create,
-    ez_gfx_index_allocation_get_range, ez_gfx_index_allocation_remove,
-    ez_gfx_surface_set_snapshot_cache, ez_gfx_vertex_shader_destroy, ez_gfx_vertex_shader_load,
+    EzGfxDrawIndexedCommand, EzGfxDynamicState, EzGfxEvent, EzGfxEventKind,
+    EzGfxReadbackSourceKind, EzGfxResult, ez_gfx_context_register_callback,
+    ez_gfx_counter_buffer_acquire, ez_gfx_counter_buffer_publish_count,
+    ez_gfx_counter_buffer_write_draws, ez_gfx_fragment_shader_destroy, ez_gfx_fragment_shader_load,
+    ez_gfx_frame_begin, ez_gfx_frame_end, ez_gfx_frame_execute_graphics,
+    ez_gfx_index_allocation_create, ez_gfx_index_allocation_get_range,
+    ez_gfx_index_allocation_remove, ez_gfx_surface_set_snapshot_cache,
+    ez_gfx_vertex_shader_destroy, ez_gfx_vertex_shader_load,
 };
 
 const WIDTH: u32 = 64;
@@ -31,6 +32,8 @@ unsafe extern "C" fn collect_snapshot(event: *const EzGfxEvent, user_data: *mut 
     // SAFETY: registration retains live test-owned pointers for every callback invocation.
     let (event, captures) = unsafe { (&*event, &mut *user_data.cast::<Captures>()) };
     if event.kind == EzGfxEventKind::Snapshot {
+        assert_eq!(event.readback_source_kind, EzGfxReadbackSourceKind::None);
+        assert_eq!(event.readback_source, 0);
         // SAFETY: snapshot bytes remain readable for this callback and are copied before return.
         captures.0.push(unsafe {
             core::slice::from_raw_parts(event.readback_bytes, event.readback_byte_count).to_vec()

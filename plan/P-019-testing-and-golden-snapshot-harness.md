@@ -120,7 +120,7 @@ Run interactive windowed examples and save screenshots to disk for manual inspec
 
 ### Evidence summary
 
-Headless offscreen rendering tests actual GPU command execution and memory readback without desktop environment dependencies (`[INFERENCE]` from Vulkan headless surface and offscreen rendering specifications).
+Headless offscreen rendering tests actual GPU command execution and memory readback without desktop environment dependencies (`[INFERENCE]` from Vulkan headless surface and offscreen rendering specifications). Measured: Windows `vulkan_mesh_pixels`, `vulkan_task_mesh_pixels`, `dx12_mesh_pixels`, `dx12_task_mesh_pixels` passed; Apple M2 Pro `metal_mesh_pixels` and `metal_task_mesh_pixels` passed. Final matrices at 60 s per-process isolation with 0 failures/timeouts: Windows 213 (HAL 21, Vulkan 58, DX12 35, ez-gfx 99) on RTX 3080 plus FFI ABI 39, runtime 27 (bindings 11/render 8/shader_loading 8), artifact 11, compiler 12, and one hidden C Vulkan frame of 1,228,800 bytes (640×480×4); Linux 176 (HAL 21, Vulkan 60, ez-gfx 88, FFI 7) plus 2 Vulkan passes on RTX 3090; macOS 84 (HAL 21, Metal 27, ez-gfx 36) plus compiler 13 with real xcrun metallib on M2 Pro.
 
 ### Key assumptions
 

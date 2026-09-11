@@ -2,7 +2,9 @@
 
 use ez_gfx_core::{
     Backend,
-    capability::{AdapterCapabilities, AdapterClass, AdapterInfo, CompressionSupport},
+    capability::{
+        AdapterCapabilities, AdapterClass, AdapterInfo, CompressionSupport, ShaderCapabilities,
+    },
 };
 use ez_gfx_runtime::{AdapterCatalog, RuntimeError};
 
@@ -19,6 +21,7 @@ fn adapter(id: u8, class: AdapterClass, sampled: u32) -> AdapterInfo {
             bindless_samplers: 1024,
             max_indirect_draw_count: 65_535,
             shader_model: 0x0605,
+            shader_stages: ShaderCapabilities::default(),
             timeline_synchronization: true,
             resource_aliasing: true,
             dynamic_rendering: true,

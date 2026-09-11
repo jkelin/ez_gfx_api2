@@ -12,6 +12,10 @@ pub type EzGfxFrame = EzGfxHandle;
 pub type EzGfxReadbackRequest = u64;
 /// Opaque context-owned compute shader handle.
 pub type EzGfxComputeShader = EzGfxHandle;
+/// Opaque context-owned task shader handle.
+pub type EzGfxTaskShader = EzGfxHandle;
+/// Opaque context-owned mesh shader handle.
+pub type EzGfxMeshShader = EzGfxHandle;
 /// Opaque context-owned vertex shader handle.
 pub type EzGfxVertexShader = EzGfxHandle;
 /// Opaque context-owned fragment shader handle.
@@ -186,6 +190,8 @@ pub struct EzGfxAdapterInfo {
     pub software_rejected: u8,
     /// Count of unmet profile requirements; zero when admitted.
     pub error_count: u32,
+    /// Optional task and mesh stages supported by this adapter.
+    pub shader_stages: EzGfxShaderCapabilities,
 }
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -439,6 +445,42 @@ pub struct EzGfxBinding {
 }
 #[derive(Clone, Copy)]
 #[repr(C)]
+/// Selects the shader stages for one mesh graphics dispatch.
+pub struct EzGfxMeshShaders {
+    /// Optional task shader; zero means absent.
+    pub task_shader: EzGfxTaskShader,
+    /// Required mesh shader.
+    pub mesh_shader: EzGfxMeshShader,
+    /// Required fragment shader.
+    pub fragment_shader: EzGfxFragmentShader,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+/// Encodes rasterization and blending state for a mesh graphics pipeline.
+pub struct EzGfxMeshState {
+    /// Selects the polygon culling mode by its C ABI numeric code.
+    pub cull_mode: u8,
+    /// Selects which winding is considered front-facing.
+    pub front_face: u8,
+    /// Selects the color blending mode by its C ABI numeric code.
+    pub blend_mode: u8,
+    /// Must be zero.
+    pub reserved: u8,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+/// Reports optional programmable shader stages.
+pub struct EzGfxShaderCapabilities {
+    /// Whether task shaders are enabled; zero or one.
+    pub task: u8,
+    /// Whether mesh shaders are enabled; zero or one.
+    pub mesh: u8,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
 /// Encodes dynamic rasterization, topology, and blending state.
 pub struct EzGfxDynamicState {
     /// Selects the polygon culling mode by its C ABI numeric code.
@@ -574,6 +616,18 @@ pub enum EzGfxEventKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+/// Identifies the resource type stored in [`EzGfxEvent::readback_source`].
+pub enum EzGfxReadbackSourceKind {
+    /// No resource handle; used by unrequested presentation snapshots.
+    None = 0,
+    /// `readback_source` is an [`EzGfxTexture`].
+    Texture = 1,
+    /// `readback_source` is an [`EzGfxRenderTarget`].
+    RenderTarget = 2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
 #[allow(
     clippy::pub_underscore_fields,
@@ -600,8 +654,12 @@ pub struct EzGfxEvent {
     pub dropped: u64,
     /// Stable request correlator, or zero for an unrequested snapshot.
     pub readback_request_id: EzGfxReadbackRequest,
-    /// Readback source texture, or zero for a surface-presented snapshot.
-    pub readback_texture: EzGfxTexture,
+    /// Opaque source handle, or zero when `readback_source_kind` is `None`.
+    pub readback_source: EzGfxHandle,
+    /// Identifies how to interpret `readback_source`.
+    pub readback_source_kind: EzGfxReadbackSourceKind,
+    /// Reserves bytes that keep the C ABI layout stable.
+    pub _pad_readback_source_kind: [u8; 7],
     /// Readback image width in pixels; valid for `Readback` or `Snapshot`.
     pub readback_width: u32,
     /// Readback image height in pixels; valid for `Readback` or `Snapshot`.

@@ -13,15 +13,17 @@ use ez_gfx_core::{
     capability::{
         AdapterCapabilities, AdapterClass, AdapterInfo, CompressionSupport,
         MAX_BINDLESS_SAMPLED_TEXTURES, PresentationMode, PresentationModes, SemanticProfile,
+        ShaderCapabilities,
     },
 };
 use ez_gfx_hal::{
     AllocationError, AllocationRequest, AttachmentLoadOp, AttachmentStoreOp, BlendMode,
     BufferTransfer, CompletionToken, CullMode, DEFAULT_ALLOCATION_BLOCK_POLICY,
     DynamicPipelineState, ExecutionBarrier, ExecutionPass, FrontFace, HalError, ImageMip,
-    MemoryAllocator, MemoryClass, PrimitiveTopology, QueueKind, ResourceAccess, ResourceState,
-    SamplerAddressMode, SamplerFilter, ShaderBufferLayout, ShaderStage, TextureFormat,
-    TextureRegion, TextureSamplerDesc, validate_texture_mips, validate_texture_region,
+    MemoryAllocator, MemoryClass, MeshDispatchLimits, MeshPipelineState, PrimitiveTopology,
+    QueueKind, ResourceAccess, ResourceState, SamplerAddressMode, SamplerFilter,
+    ShaderBufferLayout, ShaderStage, TextureFormat, TextureRegion, TextureSamplerDesc,
+    validate_mesh_dispatch, validate_texture_mips, validate_texture_region,
 };
 use gpu_allocator::{
     AllocationSizes, MemoryLocation,
@@ -210,6 +212,35 @@ impl<const N: usize> NativeBufferBindingSource for [NativeBufferBinding<'_>; N] 
     }
 }
 
+/// Immutable inputs used to create a mesh pipeline.
+///
+/// Backend-local shape of the shared mesh seam: exact task/mesh/fragment
+/// products, one entry per stage, and merged stage layouts. Rasterization comes
+/// from the shared [`MeshPipelineState`], which carries no topology because mesh
+/// pipelines hold no vertex-input or input-assembly state. Workgroup sizes come
+/// from stage reflection and are checked against the retained native mesh limits
+/// before any Vulkan allocation.
+pub struct NativeMeshPipelineDesc<'a> {
+    /// Optional task stage as owning shader plus product index.
+    pub task: Option<(&'a NativeShader, usize)>,
+    /// Required mesh stage as owning shader plus product index.
+    pub mesh: (&'a NativeShader, usize),
+    /// Required fragment stage as owning shader plus product index.
+    pub fragment: (&'a NativeShader, usize),
+    /// Rasterization and blend state fixed by the pipeline.
+    pub state: MeshPipelineState,
+    /// Offscreen color format, or the active swapchain format.
+    pub color_format: Option<ez_gfx_runtime::target::Format>,
+    /// Reflected public buffer layout merged across the selected stages.
+    pub layouts: &'a [ShaderBufferLayout],
+    /// Whether the pipeline requires a depth attachment.
+    pub depth_required: bool,
+    /// Optional task workgroup size from reflection.
+    pub task_workgroup_size: Option<[u32; 3]>,
+    /// Mesh workgroup size from reflection.
+    pub mesh_workgroup_size: [u32; 3],
+}
+
 /// Immutable inputs used to create a graphics pipeline.
 pub struct NativeGraphicsPipelineDesc<'a> {
     /// Index of the vertex module in the owning shader.
@@ -218,6 +249,8 @@ pub struct NativeGraphicsPipelineDesc<'a> {
     pub fragment_index: usize,
     /// Rasterization and blend state fixed by the pipeline.
     pub state: DynamicPipelineState,
+    /// Offscreen color format, or the active swapchain format.
+    pub color_format: Option<ez_gfx_runtime::target::Format>,
     /// Reflected public buffer layout.
     pub layouts: &'a [ShaderBufferLayout],
     /// Whether the pipeline requires a depth attachment.
@@ -238,6 +271,26 @@ pub struct NativeDrawIndexed<'a> {
     pub indirect_buffer: &'a NativeAllocation,
     /// Number of indirect commands to execute.
     pub draw_count: u32,
+    /// Reflected public buffer bindings.
+    pub bindings: &'a dyn NativeBufferBindingSource,
+}
+
+/// Fully resolved mesh dispatch consumed by frame recording.
+pub struct NativeMeshDraw<'a> {
+    /// Render width in pixels.
+    pub width: u32,
+    /// Render height in pixels.
+    pub height: u32,
+    /// Mesh pipeline used by the dispatch.
+    pub pipeline: &'a NativePipeline,
+    /// Task workgroup count for each dispatch dimension.
+    pub groups: [u32; 3],
+    /// Whether the pipeline holds a task stage; selects the task grid limits.
+    pub has_task: bool,
+    /// Mesh workgroup size from reflection, rechecked at record time.
+    pub mesh_workgroup_size: [u32; 3],
+    /// Optional task workgroup size from reflection; required with a task stage.
+    pub task_workgroup_size: Option<[u32; 3]>,
     /// Reflected public buffer bindings.
     pub bindings: &'a dyn NativeBufferBindingSource,
 }
@@ -298,6 +351,8 @@ pub enum NativeFrameAction<'a> {
     Compute(NativeComputeDispatch<'a>),
     /// Encode indexed indirect graphics work.
     Graphics(NativeDrawIndexed<'a>),
+    /// Encode a mesh workgroup dispatch inside the active render pass.
+    Mesh(NativeMeshDraw<'a>),
     /// Copy a texture into host-readable memory.
     TextureReadback {
         /// Texture to copy.
@@ -432,6 +487,13 @@ impl NativeTexture {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativePipelineKind {
+    Compute,
+    Graphics,
+    Mesh { task_stage: bool },
+}
+
 /// Vulkan pipeline and descriptor layout required to bind it.
 pub struct NativePipeline {
     pipeline: vk::Pipeline,
@@ -439,6 +501,8 @@ pub struct NativePipeline {
     public_descriptor_layout: vk::DescriptorSetLayout,
     buffer_writable: Vec<bool>,
     buffer_bindings: Vec<u32>,
+    /// Exact bind-point and shader-family identity validated before recording.
+    kind: NativePipelineKind,
 }
 
 struct DepthTarget {
@@ -499,6 +563,84 @@ struct FrameSlot {
     submission_value: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct MeshShaderLimits {
+    /// Whether the task stage was enabled alongside mesh at device creation.
+    task_supported: bool,
+    task_work_group_invocations: u32,
+    mesh_work_group_invocations: u32,
+    // Retained native output ceilings; the shared seam carries no reflected
+    // output counts yet, so pipeline creation cannot check them.
+    #[allow(
+        dead_code,
+        reason = "checked once the shared seam supplies reflected mesh output counts"
+    )]
+    mesh_output_vertices: u32,
+    #[allow(
+        dead_code,
+        reason = "checked once the shared seam supplies reflected mesh output counts"
+    )]
+    mesh_output_primitives: u32,
+    task_group_count: [u32; 3],
+    task_group_total_count: u32,
+    mesh_group_count: [u32; 3],
+    mesh_group_total_count: u32,
+}
+
+/// Maps retained native mesh properties to the shared dispatch limits.
+///
+/// Selects the task grid ceilings when the pipeline holds a task stage and the
+/// mesh grid ceilings otherwise, including the native total grid count. Thread
+/// ceilings cover both dispatch stages, so pipeline creation validates task and
+/// mesh workgroup sizes together.
+fn retained_mesh_dispatch_limits(limits: &MeshShaderLimits, has_task: bool) -> MeshDispatchLimits {
+    if has_task {
+        MeshDispatchLimits {
+            max_groups: limits.task_group_count,
+            max_total_groups: u64::from(limits.task_group_total_count),
+            max_mesh_threads: limits.mesh_work_group_invocations,
+            max_task_threads: limits.task_work_group_invocations,
+        }
+    } else {
+        MeshDispatchLimits {
+            max_groups: limits.mesh_group_count,
+            max_total_groups: u64::from(limits.mesh_group_total_count),
+            max_mesh_threads: limits.mesh_work_group_invocations,
+            max_task_threads: limits.task_work_group_invocations,
+        }
+    }
+}
+
+/// Checks a mesh workgroup dispatch against the retained native limits.
+///
+/// Grid dimensions, total grid count, and reflected threadgroup sizes run
+/// through the shared [`validate_mesh_dispatch`]. A task threadgroup size
+/// without a task stage, or a missing one with it, fails as an inconsistent
+/// dispatch description before the shared validation.
+///
+/// # Errors
+///
+/// Returns [`HalError::InvalidArgument`] for an inconsistent stage selection, a
+/// zero dimension, an overflowing product, or any exceeded native ceiling.
+fn check_mesh_groups(
+    limits: &MeshShaderLimits,
+    has_task: bool,
+    groups: [u32; 3],
+    mesh_threads: [u32; 3],
+    task_threads: Option<[u32; 3]>,
+) -> Result<(), HalError> {
+    if task_threads.is_some() != has_task {
+        return Err(HalError::InvalidArgument);
+    }
+    validate_mesh_dispatch(
+        groups,
+        mesh_threads,
+        task_threads,
+        retained_mesh_dispatch_limits(limits, has_task),
+    )
+    .map_err(|_| HalError::InvalidArgument)
+}
+
 struct DeviceProbe {
     adapter: AdapterInfo,
     queue_family: u32,
@@ -506,6 +648,9 @@ struct DeviceProbe {
     features13: vk::PhysicalDeviceVulkan13Features<'static>,
     vertex_storage: bool,
     multi_draw: bool,
+    mesh_features: vk::PhysicalDeviceMeshShaderFeaturesEXT<'static>,
+    mesh_limits: Option<MeshShaderLimits>,
+    mesh_extension_available: bool,
 }
 
 struct PendingDevice {
@@ -610,6 +755,8 @@ pub struct NativeContext {
     physical_device: Option<vk::PhysicalDevice>,
     adapter_info: Option<AdapterInfo>,
     device: Option<ash::Device>,
+    mesh_shader_loader: Option<ash::ext::mesh_shader::Device>,
+    mesh_shader_limits: Option<MeshShaderLimits>,
     idle_drained: bool,
     allocator: Option<Allocator>,
     retired: Vec<RetiredAllocation>,

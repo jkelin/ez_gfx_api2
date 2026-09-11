@@ -253,12 +253,18 @@ impl BufferTransfer for NativeContext {
 }
 pub(super) fn vulkan_state(
     state: ResourceState,
-) -> (vk::PipelineStageFlags, vk::AccessFlags, vk::ImageLayout) {
+    capabilities: ez_gfx_core::capability::ShaderCapabilities,
+) -> Result<(vk::PipelineStageFlags, vk::AccessFlags, vk::ImageLayout), HalError> {
+    ResourceState::new(state.queue, state.stage, state.access)
+        .map_err(|_| HalError::InvalidArgument)?;
     let shader_stage = match state.stage {
         ShaderStage::None => vk::PipelineStageFlags::ALL_COMMANDS,
         ShaderStage::Vertex => vk::PipelineStageFlags::VERTEX_SHADER,
         ShaderStage::Fragment => vk::PipelineStageFlags::FRAGMENT_SHADER,
         ShaderStage::Compute => vk::PipelineStageFlags::COMPUTE_SHADER,
+        ShaderStage::Task if capabilities.task => vk::PipelineStageFlags::TASK_SHADER_EXT,
+        ShaderStage::Mesh if capabilities.mesh => vk::PipelineStageFlags::MESH_SHADER_EXT,
+        ShaderStage::Task | ShaderStage::Mesh => return Err(HalError::Unsupported),
         ShaderStage::AllGraphics => vk::PipelineStageFlags::ALL_GRAPHICS,
     };
     let pipeline_stage = match state.access {
@@ -329,7 +335,7 @@ pub(super) fn vulkan_state(
         ),
         ResourceAccess::Present => (vk::AccessFlags::empty(), vk::ImageLayout::PRESENT_SRC_KHR),
     };
-    (pipeline_stage, access, layout)
+    Ok((pipeline_stage, access, layout))
 }
 ///
 /// # Errors

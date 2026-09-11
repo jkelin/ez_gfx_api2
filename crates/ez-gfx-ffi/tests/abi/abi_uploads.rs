@@ -5,7 +5,8 @@ use super::*;
 #[derive(Debug, Eq, PartialEq)]
 struct ObservedReadback {
     request_id: u64,
-    texture: u64,
+    source: u64,
+    source_kind: EzGfxReadbackSourceKind,
     width: u32,
     height: u32,
     bytes: Vec<u8>,
@@ -44,7 +45,8 @@ unsafe extern "C" fn collect_event(event: *const EzGfxEvent, user_data: *mut cor
             };
             out.readbacks.push(ObservedReadback {
                 request_id: event.readback_request_id,
-                texture: event.readback_texture,
+                source: event.readback_source,
+                source_kind: event.readback_source_kind,
                 width: event.readback_width,
                 height: event.readback_height,
                 bytes,
@@ -53,7 +55,7 @@ unsafe extern "C" fn collect_event(event: *const EzGfxEvent, user_data: *mut cor
         _ => {}
     }
 }
-fn begin_offscreen_frame(context: u64) -> (u64, u64) {
+fn create_offscreen_target(context: u64, width: u32, height: u32) -> u64 {
     let name = b"readback-target";
     let format = 1_u8;
     let desc = EzGfxRenderTargetDesc {
@@ -71,9 +73,16 @@ fn begin_offscreen_frame(context: u64) -> (u64, u64) {
     let mut target = 0;
     assert_eq!(
         // SAFETY: descriptor, format, and output storage remain live through the call.
-        unsafe { ez_gfx_render_target_create(context, &raw const desc, 1, 1, &raw mut target) },
+        unsafe {
+            ez_gfx_render_target_create(context, &raw const desc, width, height, &raw mut target)
+        },
         EzGfxResult::Ok
     );
+    target
+}
+
+fn begin_offscreen_frame(context: u64) -> (u64, u64) {
+    let target = create_offscreen_target(context, 1, 1);
     let mut frame = 0;
     assert_eq!(
         // SAFETY: frame output storage is live and aligned.
@@ -415,7 +424,8 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
     assert_eq!(collected.readbacks[0].request_id, first_request);
     assert_eq!(collected.readbacks[1].request_id, second_request);
     assert!(collected.readbacks.iter().all(|readback| {
-        readback.texture == texture
+        readback.source == texture
+            && readback.source_kind == EzGfxReadbackSourceKind::Texture
             && readback.width == texture_desc.width
             && readback.height == texture_desc.height
             && readback.bytes == pixels
@@ -428,6 +438,97 @@ fn frame_uploads_indirect_compiles_graph_and_reads_back_texture(backend: u8) {
     ez_gfx_render_target_destroy(context, target);
     ez_gfx_texture_unload(context, texture);
     drop(native);
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn render_target_readback_validates_handles_and_reports_dimensions(backend: u8) {
+    let native = common::TestContext::create_with_validation(backend, false);
+    let foreign = common::TestContext::create_with_validation(backend, false);
+    let context = native.context;
+    let target = create_offscreen_target(context, 3, 2);
+    let stale = create_offscreen_target(context, 1, 1);
+    let foreign_target = create_offscreen_target(foreign.context, 1, 1);
+    ez_gfx_render_target_destroy(context, stale);
+
+    let mut collected = Collected::default();
+    assert_eq!(
+        // SAFETY: the boxed callback state remains live until registration is cleared.
+        unsafe {
+            ez_gfx_context_register_callback(
+                context,
+                Some(collect_event),
+                (&raw mut collected).cast(),
+            )
+        },
+        EzGfxResult::Ok
+    );
+    let mut frame = 0;
+    assert_eq!(
+        // SAFETY: frame output storage is live and aligned.
+        unsafe { ez_gfx_render_target_frame_begin(context, target, &raw mut frame) },
+        EzGfxResult::Ok
+    );
+
+    let mut request_id = 0xA5_A5_u64;
+    for invalid_target in [stale, foreign_target] {
+        assert_eq!(
+            // SAFETY: output storage is live and aligned; the target handle is intentionally invalid for this context.
+            unsafe {
+                ffi::ez_gfx_frame_enqueue_render_target_readback(
+                    context,
+                    frame,
+                    invalid_target,
+                    &raw mut request_id,
+                )
+            },
+            EzGfxResult::InvalidContext
+        );
+        assert_eq!(request_id, 0xA5_A5);
+    }
+
+    assert_eq!(
+        // SAFETY: frame, target, and output storage remain live through the call.
+        unsafe {
+            ffi::ez_gfx_frame_enqueue_render_target_readback(
+                context,
+                frame,
+                target,
+                &raw mut request_id,
+            )
+        },
+        EzGfxResult::Ok
+    );
+    assert_ne!(request_id, 0xA5_A5);
+    assert_eq!(ez_gfx_frame_end(context, frame), EzGfxResult::Ok);
+    assert_eq!(collected.readbacks.len(), 1);
+    let readback = &collected.readbacks[0];
+    assert_eq!(readback.request_id, request_id);
+    assert_eq!(readback.source, target);
+    assert_eq!(readback.source_kind, EzGfxReadbackSourceKind::RenderTarget);
+    assert_eq!((readback.width, readback.height), (3, 2));
+    assert_eq!(readback.bytes.len(), 3 * 2 * 4);
+
+    assert_eq!(
+        // SAFETY: clearing a live registration needs no user data.
+        unsafe { ez_gfx_context_register_callback(context, None, core::ptr::null_mut()) },
+        EzGfxResult::Ok
+    );
+    ez_gfx_render_target_destroy(context, target);
+    ez_gfx_render_target_destroy(foreign.context, foreign_target);
+    drop(foreign);
+    drop(native);
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn vulkan_render_target_readback_validates_handles_and_reports_dimensions() {
+    render_target_readback_validates_handles_and_reports_dimensions(1);
+}
+
+#[cfg(windows)]
+#[test]
+fn dx12_render_target_readback_validates_handles_and_reports_dimensions() {
+    render_target_readback_validates_handles_and_reports_dimensions(2);
 }
 
 #[cfg(not(target_vendor = "apple"))]

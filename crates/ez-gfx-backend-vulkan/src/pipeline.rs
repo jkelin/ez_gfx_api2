@@ -6,10 +6,58 @@ type NativePipelineLayout = (
 );
 
 use super::{
-    BlendMode, CString, CullMode, DeferredResource, FrontFace, HalError, NativeContext,
-    NativeGraphicsPipelineDesc, NativePipeline, NativeShader, NativeSurface, PresentationMode,
-    PrimitiveTopology, ShaderBufferLayout, map_vk, vk,
+    BlendMode, CString, CullMode, DeferredResource, FrontFace, HalError, MeshDispatchLimits,
+    NativeContext, NativeGraphicsPipelineDesc, NativeMeshPipelineDesc, NativePipeline,
+    NativePipelineKind, NativeShader, NativeSurface, PresentationMode, PrimitiveTopology,
+    ShaderBufferLayout, map_vk, retained_mesh_dispatch_limits, texture::render_target_format_vk,
+    validate_mesh_dispatch, vk,
 };
+
+use ez_gfx_hal::MeshDispatchError;
+
+/// Resolves the exact task/mesh/fragment modules named by a mesh pipeline request.
+///
+/// # Errors
+///
+/// Returns [`HalError::InvalidArgument`] when any product index is out of range.
+fn mesh_shader_modules(
+    desc: &NativeMeshPipelineDesc<'_>,
+) -> Result<(Option<vk::ShaderModule>, vk::ShaderModule, vk::ShaderModule), HalError> {
+    let task = desc
+        .task
+        .map(|(shader, index)| {
+            shader
+                .modules
+                .get(index)
+                .copied()
+                .ok_or(HalError::InvalidArgument)
+        })
+        .transpose()?;
+    let mesh = *desc
+        .mesh
+        .0
+        .modules
+        .get(desc.mesh.1)
+        .ok_or(HalError::InvalidArgument)?;
+    let fragment = *desc
+        .fragment
+        .0
+        .modules
+        .get(desc.fragment.1)
+        .ok_or(HalError::InvalidArgument)?;
+    Ok((task, mesh, fragment))
+}
+
+fn pipeline_color_format(
+    swapchain_format: vk::Format,
+    format: Option<ez_gfx_runtime::target::Format>,
+) -> Result<vk::Format, HalError> {
+    match format {
+        Some(format) => render_target_format_vk(format).ok_or(HalError::Unsupported),
+        None if swapchain_format == vk::Format::UNDEFINED => Err(HalError::NotReady),
+        None => Ok(swapchain_format),
+    }
+}
 
 impl NativeContext {
     /// Creates native shader products from validated compiler output.
@@ -71,6 +119,22 @@ impl NativeContext {
         &self,
         layouts: &[ShaderBufferLayout],
     ) -> Result<NativePipelineLayout, HalError> {
+        self.create_pipeline_layout_with_stages(layouts, vk::ShaderStageFlags::ALL)
+    }
+
+    /// Reflected public buffers occupy descriptor set zero with explicit stage visibility.
+    ///
+    /// Mesh pipelines bind only their dispatch stages instead of every stage, so a
+    /// task/mesh/fragment pipeline never claims compute or vertex visibility it cannot use.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotReady` if the device or texture descriptor layout is unavailable, `Unsupported` for an unsupported buffer layout, `InvalidArgument` if a binding overflows, or a mapped Vulkan error if descriptor-set or pipeline-layout creation fails.
+    fn create_pipeline_layout_with_stages(
+        &self,
+        layouts: &[ShaderBufferLayout],
+        stages: vk::ShaderStageFlags,
+    ) -> Result<NativePipelineLayout, HalError> {
         let device = self.device.as_ref().ok_or(HalError::NotReady)?;
         let texture = self.texture_descriptor_layout.ok_or(HalError::NotReady)?;
         let mut bindings = Vec::new();
@@ -90,7 +154,7 @@ impl NativeContext {
                         .binding(binding)
                         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                         .descriptor_count(1)
-                        .stage_flags(vk::ShaderStageFlags::ALL),
+                        .stage_flags(stages),
                 );
                 writable.push(layout.writable);
                 physical_bindings.push(binding);
@@ -165,6 +229,7 @@ impl NativeContext {
                 public_descriptor_layout,
                 buffer_writable,
                 buffer_bindings,
+                kind: NativePipelineKind::Compute,
             }),
             Err((_, error)) => {
                 // SAFETY: `layout` and `public_descriptor_layout` were created above by `device`, have not escaped on this error path, and are each passed once to their matching destroy operation.
@@ -206,11 +271,10 @@ impl NativeContext {
             state,
             layouts,
             depth_required,
+            color_format,
         } = desc;
         let device = self.device.as_ref().ok_or(HalError::NotReady)?;
-        if self.swapchain_format == vk::Format::UNDEFINED {
-            return Err(HalError::NotReady);
-        }
+        let color_format = pipeline_color_format(self.swapchain_format, color_format)?;
         let vertex = *vertex_shader
             .modules
             .get(vertex_index)
@@ -283,7 +347,7 @@ impl NativeContext {
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         let mut rendering = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(core::slice::from_ref(&self.swapchain_format))
+            .color_attachment_formats(core::slice::from_ref(&color_format))
             .depth_attachment_format(if depth_required {
                 vk::Format::D32_SFLOAT
             } else {
@@ -311,6 +375,190 @@ impl NativeContext {
                 public_descriptor_layout,
                 buffer_writable,
                 buffer_bindings,
+                kind: NativePipelineKind::Graphics,
+            }),
+            Err((_, error)) => {
+                // SAFETY: `layout` and `public_descriptor_layout` were created above by `device`, have not escaped on this error path, and are each passed once to their matching destroy operation.
+                unsafe {
+                    device.destroy_pipeline_layout(layout, None);
+                    device.destroy_descriptor_set_layout(public_descriptor_layout, None);
+                };
+                Err(map_vk(error))
+            }
+        }
+    }
+
+    /// Returns the shared mesh dispatch limits for a task or taskless pipeline.
+    ///
+    /// Selects the retained task grid ceilings when the pipeline holds a task
+    /// stage and the mesh ceilings otherwise; both dispatch-stage thread
+    /// ceilings and the native total grid count travel in the shared value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HalError::Unsupported`] when the device lacks mesh support, or
+    /// task support when a task stage is requested.
+    pub fn mesh_dispatch_limits(&self, has_task: bool) -> Result<MeshDispatchLimits, HalError> {
+        let limits = self
+            .mesh_shader_limits
+            .as_ref()
+            .ok_or(HalError::Unsupported)?;
+        if has_task && !limits.task_supported {
+            return Err(HalError::Unsupported);
+        }
+        Ok(retained_mesh_dispatch_limits(limits, has_task))
+    }
+
+    /// Creates a dynamic-rendering mesh pipeline from exact task/mesh/fragment products.
+    ///
+    /// Support is rejected before any Vulkan allocation: without the retained EXT
+    /// loader and limits the device cannot execute mesh work, and a task stage
+    /// without task support fails the same way. Reflected workgroup sizes run through
+    /// the shared dispatch validation against the retained native ceilings. The
+    /// pipeline holds explicit task/mesh/fragment stages, stage-visible resource
+    /// bindings, and the shared rasterization state, but no vertex-input or
+    /// input-assembly state, which mesh pipelines must omit.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotReady` if required context state or the swapchain format is unavailable, `Unsupported` when the device lacks mesh or requested task support, or when a well-formed reflected workgroup size exceeds the native ceilings; `InvalidArgument` for an inconsistent stage selection, an invalid shader index, or a malformed (zero or overflowing) workgroup size; or a mapped Vulkan error if layout or graphics-pipeline creation fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if Vulkan reports successful graphics-pipeline creation without returning a pipeline.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the public backend request is consumed by value across all adapters"
+    )]
+    pub fn create_mesh_pipeline(
+        &self,
+        desc: NativeMeshPipelineDesc<'_>,
+    ) -> Result<NativePipeline, HalError> {
+        let device = self.device.as_ref().ok_or(HalError::NotReady)?;
+        let has_task = desc.task.is_some();
+        // Malformed stage/size selection fails before any capability probe.
+        if desc.task_workgroup_size.is_some() != has_task {
+            return Err(HalError::InvalidArgument);
+        }
+        let (task, mesh, fragment) = mesh_shader_modules(&desc)?;
+        let shared = self.mesh_dispatch_limits(has_task)?;
+        // A well-formed shader the device cannot execute is unsupported; only
+        // malformed shapes stay invalid arguments.
+        validate_mesh_dispatch(
+            [1, 1, 1],
+            desc.mesh_workgroup_size,
+            desc.task_workgroup_size,
+            shared,
+        )
+        .map_err(|error| match error {
+            MeshDispatchError::InvalidGroups | MeshDispatchError::InvalidWorkgroup => {
+                HalError::InvalidArgument
+            }
+            MeshDispatchError::UnsupportedWorkgroup => HalError::Unsupported,
+        })?;
+        let color_format = pipeline_color_format(self.swapchain_format, desc.color_format)?;
+        let entry = CString::new("main").unwrap();
+        let task_stage = task.map(|module| {
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::TASK_EXT)
+                .module(module)
+                .name(&entry)
+        });
+        let mesh_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::MESH_EXT)
+            .module(mesh)
+            .name(&entry);
+        let fragment_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(fragment)
+            .name(&entry);
+        let mut stages = [mesh_stage, fragment_stage, fragment_stage];
+        let stage_count = if task_stage.is_some() { 3 } else { 2 };
+        if let Some(task_stage) = task_stage {
+            stages[2] = stages[1];
+            stages[1] = stages[0];
+            stages[0] = task_stage;
+        }
+        let state = desc.state;
+        let cull = match state.cull {
+            CullMode::None => vk::CullModeFlags::NONE,
+            CullMode::Front => vk::CullModeFlags::FRONT,
+            CullMode::Back => vk::CullModeFlags::BACK,
+        };
+        let front = match state.front_face {
+            FrontFace::CounterClockwise => vk::FrontFace::COUNTER_CLOCKWISE,
+            FrontFace::Clockwise => vk::FrontFace::CLOCKWISE,
+        };
+        let blend = match state.blend {
+            BlendMode::None => vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA),
+            BlendMode::Alpha => vk::PipelineColorBlendAttachmentState::default()
+                .blend_enable(true)
+                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .color_blend_op(vk::BlendOp::ADD)
+                .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .alpha_blend_op(vk::BlendOp::ADD)
+                .color_write_mask(vk::ColorComponentFlags::RGBA),
+        };
+        let visible = if has_task {
+            vk::ShaderStageFlags::TASK_EXT
+                | vk::ShaderStageFlags::MESH_EXT
+                | vk::ShaderStageFlags::FRAGMENT
+        } else {
+            vk::ShaderStageFlags::MESH_EXT | vk::ShaderStageFlags::FRAGMENT
+        };
+        let (layout, public_descriptor_layout, buffer_writable, buffer_bindings) =
+            self.create_pipeline_layout_with_stages(desc.layouts, visible)?;
+        let viewport = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(cull)
+            .front_face(front)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let color = vk::PipelineColorBlendStateCreateInfo::default()
+            .attachments(core::slice::from_ref(&blend));
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(desc.depth_required)
+            .depth_write_enable(desc.depth_required)
+            .depth_compare_op(vk::CompareOp::LESS);
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        let mut rendering = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(core::slice::from_ref(&color_format))
+            .depth_attachment_format(if desc.depth_required {
+                vk::Format::D32_SFLOAT
+            } else {
+                vk::Format::UNDEFINED
+            });
+        let create = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages[..stage_count])
+            .viewport_state(&viewport)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .depth_stencil_state(&depth_stencil)
+            .color_blend_state(&color)
+            .dynamic_state(&dynamic)
+            .layout(layout)
+            .push_next(&mut rendering);
+        // SAFETY: `device.create_graphics_pipelines` receives `layout` created above and stages selected from the callers' shader modules; all create-info, pNext, entry-string, array, and state storage remains allocated and unmodified for the call. No vertex-input or input-assembly state is chained, which mesh pipelines must omit.
+        match unsafe {
+            device.create_graphics_pipelines(vk::PipelineCache::null(), &[create], None)
+        } {
+            Ok(pipelines) => Ok(NativePipeline {
+                pipeline: pipelines[0],
+                layout,
+                public_descriptor_layout,
+                buffer_writable,
+                buffer_bindings,
+                kind: NativePipelineKind::Mesh {
+                    task_stage: has_task,
+                },
             }),
             Err((_, error)) => {
                 // SAFETY: `layout` and `public_descriptor_layout` were created above by `device`, have not escaped on this error path, and are each passed once to their matching destroy operation.
@@ -437,9 +685,18 @@ impl NativeContext {
         Ok(())
     }
 
-    /// Returns the native color-format key used by graphics pipeline caching.
-    pub fn graphics_format_key(&self) -> u32 {
-        u32::try_from(self.swapchain_format.as_raw()).unwrap_or_default()
+    /// Returns the exact native color-format key used by graphics pipeline caching.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotReady` when a surface format is requested before swapchain preparation, or
+    /// `Unsupported` for a non-color render-target format.
+    pub fn graphics_format_key(
+        &self,
+        format: Option<ez_gfx_runtime::target::Format>,
+    ) -> Result<u32, HalError> {
+        u32::try_from(pipeline_color_format(self.swapchain_format, format)?.as_raw())
+            .map_err(|_| HalError::NativeFailure)
     }
 }
 /// Clears borrowed write entries and reserves both descriptor shells.
@@ -465,8 +722,28 @@ fn reserve_descriptor_shells(
 
 #[cfg(test)]
 mod descriptor_shell_tests {
-    use super::reserve_descriptor_shells;
+    use super::{pipeline_color_format, reserve_descriptor_shells};
     use ash::vk;
+    use ez_gfx_runtime::target::Format;
+
+    #[test]
+    fn target_format_resolution_preserves_surface_format() {
+        let surface = vk::Format::B8G8R8A8_SRGB;
+
+        assert_eq!(
+            pipeline_color_format(surface, Some(Format::Rgba8Unorm)).unwrap(),
+            vk::Format::R8G8B8A8_UNORM
+        );
+        assert_eq!(
+            pipeline_color_format(surface, Some(Format::Bgra8Srgb)).unwrap(),
+            vk::Format::B8G8R8A8_SRGB
+        );
+        assert_eq!(
+            pipeline_color_format(surface, Some(Format::Rgba16Float)).unwrap(),
+            vk::Format::R16G16B16A16_SFLOAT
+        );
+        assert_eq!(pipeline_color_format(surface, None).unwrap(), surface);
+    }
 
     fn rebuild_test_writes(
         writes: &mut Vec<vk::WriteDescriptorSet<'static>>,

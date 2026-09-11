@@ -11,7 +11,7 @@ The six numbered directories are linear procedural renderers hosted by one share
 
 The Rust examples enable `ktx2` and `basis`; the Sponza example therefore retains universal decoding. Library/FFI default builds omit those decoders. Enable both for universal KTX2, `ktx2` for native blocks, or `basis` for standalone Basis; see [texture admission](../docs/textures.md#admission-and-memory).
 
-The portable GLFW [`C textured cube`](02_textured_cube_c/README.md) is a separate Vulkan ABI 40 flow using tagged native window handles and immediate presentation with deterministic fallback. C owns its opaque generational frames and explicitly ends or aborts them.
+The portable GLFW [`C textured cube`](02_textured_cube_c/README.md) is a separate Vulkan flow using tagged native window handles and immediate presentation with deterministic fallback. C owns its opaque generational frames and explicitly ends or aborts them.
 
 | Binary | Complete renderer | Owned inputs |
 | --- | --- | --- |

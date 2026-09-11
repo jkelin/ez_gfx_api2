@@ -15,7 +15,7 @@ use ez_gfx_backend_metal::native::{NativeContext as MetalContext, NativeSurface 
 use ez_gfx_backend_vulkan::{NativeContext as VulkanContext, NativeSurface as VulkanSurface};
 use ez_gfx_core::{
     Backend,
-    capability::{AdapterInfo, PresentationMode, PresentationModes},
+    capability::{AdapterInfo, PresentationMode, PresentationModes, ShaderCapabilities},
     handle::{
         BufferHandle, ContextHandle, CounterBufferHandle, GenerationalArena, HandleParts,
         IndexAllocationHandle, LocalHandle, PackedHandle, RenderTargetHandle, ShaderHandle,
@@ -123,9 +123,127 @@ enum PipelineKey {
         depth_format: u32,
         sample_count: u8,
     },
+    Mesh {
+        backend: Backend,
+        task_shader: Option<ShaderHandle>,
+        task_digest: Option<[u8; 32]>,
+        task_entry: String,
+        has_task_entry: bool,
+        mesh_shader: ShaderHandle,
+        mesh_digest: [u8; 32],
+        mesh_entry: String,
+        fragment_shader: ShaderHandle,
+        fragment_digest: [u8; 32],
+        fragment_entry: String,
+        stage_layouts: [Option<ez_gfx_runtime::binding::StageLayoutIdentity>; 3],
+        state: ez_gfx_hal::MeshPipelineState,
+        depth_required: bool,
+        color_format: u32,
+        depth_format: u32,
+        sample_count: u8,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct MeshPipelineKeyDesc<'a> {
+    backend: Backend,
+    task_shader: Option<ShaderHandle>,
+    task_digest: Option<[u8; 32]>,
+    task_entry: Option<&'a str>,
+    mesh_shader: ShaderHandle,
+    mesh_digest: [u8; 32],
+    mesh_entry: &'a str,
+    fragment_shader: ShaderHandle,
+    fragment_digest: [u8; 32],
+    fragment_entry: &'a str,
+    stage_layouts: &'a ez_gfx_hal::MeshStages<ez_gfx_runtime::binding::StageLayoutIdentity>,
+    state: ez_gfx_hal::MeshPipelineState,
+    depth_required: bool,
+    color_format: u32,
+    depth_format: u32,
+    sample_count: u8,
 }
 
 impl PipelineKey {
+    fn prepare_mesh_slot<'a>(
+        slot: &'a mut Option<Self>,
+        desc: MeshPipelineKeyDesc<'_>,
+    ) -> &'a Self {
+        if !matches!(slot, Some(Self::Mesh { .. })) {
+            *slot = Some(Self::Mesh {
+                backend: desc.backend,
+                task_shader: None,
+                task_digest: None,
+                task_entry: String::new(),
+                has_task_entry: false,
+                mesh_shader: desc.mesh_shader,
+                mesh_digest: desc.mesh_digest,
+                mesh_entry: String::new(),
+                fragment_shader: desc.fragment_shader,
+                fragment_digest: desc.fragment_digest,
+                fragment_entry: String::new(),
+                stage_layouts: [None; 3],
+                state: desc.state,
+                depth_required: desc.depth_required,
+                color_format: desc.color_format,
+                depth_format: desc.depth_format,
+                sample_count: desc.sample_count,
+            });
+        }
+        let Some(Self::Mesh {
+            backend,
+            task_shader,
+            task_digest,
+            task_entry,
+            has_task_entry,
+            mesh_shader,
+            mesh_digest,
+            mesh_entry,
+            fragment_shader,
+            fragment_digest,
+            fragment_entry,
+            stage_layouts,
+            state,
+            depth_required,
+            color_format,
+            depth_format,
+            sample_count,
+        }) = slot
+        else {
+            unreachable!("mesh slot initialized above")
+        };
+
+        *backend = desc.backend;
+        *task_shader = desc.task_shader;
+        *task_digest = desc.task_digest;
+        *has_task_entry = desc.task_entry.is_some();
+        // A mesh-only use clears the logical task identity but retains the
+        // allocation for a later task-and-mesh use of this bounded scratch slot.
+        task_entry.clear();
+        if let Some(entry) = desc.task_entry {
+            task_entry.push_str(entry);
+        }
+        *mesh_shader = desc.mesh_shader;
+        *mesh_digest = desc.mesh_digest;
+        mesh_entry.clear();
+        mesh_entry.push_str(desc.mesh_entry);
+        *fragment_shader = desc.fragment_shader;
+        *fragment_digest = desc.fragment_digest;
+        fragment_entry.clear();
+        fragment_entry.push_str(desc.fragment_entry);
+        *stage_layouts = [
+            desc.stage_layouts.task,
+            Some(desc.stage_layouts.mesh),
+            Some(desc.stage_layouts.fragment),
+        ];
+        *state = desc.state;
+        *depth_required = desc.depth_required;
+        *color_format = desc.color_format;
+        *depth_format = desc.depth_format;
+        *sample_count = desc.sample_count;
+        slot.as_ref().expect("mesh slot initialized above")
+    }
+
     fn involves_shader(&self, shader: ShaderHandle) -> bool {
         match self {
             Self::Compute {
@@ -136,7 +254,21 @@ impl PipelineKey {
                 fragment_shader,
                 ..
             } => *vertex_shader == shader || *fragment_shader == shader,
+            Self::Mesh {
+                task_shader,
+                mesh_shader,
+                fragment_shader,
+                ..
+            } => {
+                task_shader.is_some_and(|candidate| candidate == shader)
+                    || *mesh_shader == shader
+                    || *fragment_shader == shader
+            }
         }
+    }
+
+    const fn is_render(&self) -> bool {
+        matches!(self, Self::Graphics { .. } | Self::Mesh { .. })
     }
     fn retained_bytes(&self) -> usize {
         match self {
@@ -158,6 +290,15 @@ impl PipelineKey {
                         .capacity()
                         .saturating_mul(core::mem::size_of::<ez_gfx_hal::ShaderBufferLayout>()),
                 ),
+            Self::Mesh {
+                task_entry,
+                mesh_entry,
+                fragment_entry,
+                ..
+            } => task_entry
+                .capacity()
+                .saturating_add(mesh_entry.capacity())
+                .saturating_add(fragment_entry.capacity()),
         }
     }
 }
@@ -328,6 +469,15 @@ impl AsyncTextureState {
             .map_or(self.threads, ez_gfx_assets::CpuPool::thread_count)
     }
 }
+#[cfg(target_vendor = "apple")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetalWorkgroupSizes {
+    Compute([u32; 3]),
+    Mesh {
+        task: Option<[u32; 3]>,
+        mesh: [u32; 3],
+    },
+}
 
 impl Drop for AsyncTextureState {
     fn drop(&mut self) {
@@ -362,6 +512,7 @@ struct TransientBuffer {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CleanupTestOutcome {
+    #[cfg(not(target_vendor = "apple"))]
     DrainedFailure(Error),
     Undrained,
 }
@@ -371,6 +522,15 @@ pub(super) enum CleanupTestOutcome {
 pub(super) enum SurfaceInsertTestFailure {
     IdentityInsertion,
     InvalidPackedHandle,
+}
+
+#[cfg(all(test, windows))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RawNativeFrameTestProbe {
+    enabled: bool,
+    submits: usize,
+    mesh_executions: usize,
+    graphics_executions: usize,
 }
 
 struct ContextState {
@@ -436,12 +596,14 @@ struct ContextState {
     frame_binding_scratch: Vec<native::FrameBufferBindingRecord>,
     /// Binding ranges aligned with frame payloads.
     frame_binding_ranges: Vec<core::ops::Range<usize>>,
+    /// Reusable texture-handle snapshot used while recording sampled heap hazards.
+    frame_texture_handles: Vec<TextureHandle>,
     #[cfg(target_vendor = "apple")]
     /// Reusable Metal texture-heap metadata aligned with frame nodes.
     frame_texture_heaps: Vec<Option<ez_gfx_hal::ShaderTextureHeapLayout>>,
     #[cfg(target_vendor = "apple")]
     /// Reusable Metal workgroup metadata aligned with frame nodes.
-    frame_workgroup_sizes: Vec<Option<[u32; 3]>>,
+    frame_workgroup_sizes: Vec<Option<MetalWorkgroupSizes>>,
     frame_resources: HashMap<PackedHandle, ResourceId>,
     frame_vertex_heaps: HashMap<u32, ResourceId>,
     frame_serial: u64,
@@ -462,6 +624,16 @@ struct ContextState {
     surface_insert_test_failure: Option<SurfaceInsertTestFailure>,
     #[cfg(test)]
     surface_rollback_test_abandoned: bool,
+    #[cfg(test)]
+    shader_capabilities_override: Option<ez_gfx_core::capability::ShaderCapabilities>,
+    #[cfg(test)]
+    native_shader_allocation_attempts: usize,
+    #[cfg(all(test, not(target_vendor = "apple")))]
+    shader_destroy_requests: usize,
+    #[cfg(test)]
+    native_shader_destroys: usize,
+    #[cfg(all(test, windows))]
+    raw_native_frame_test_probe: RawNativeFrameTestProbe,
 }
 
 type ContextHandleArena = GenerationalArena<()>;
@@ -536,7 +708,7 @@ thread_local! {
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_vendor = "apple")))]
 pub(crate) fn cleanup_context_for_thread_exit() -> Result<()> {
     CONTEXTS.with(|contexts| contexts.borrow_mut().cleanup_for_thread_exit())
 }
@@ -552,8 +724,9 @@ use native::{
     completed_texture_transfer_native, completed_transfer_native, copy_native,
     destroy_native_texture, free_native_allocation, last_native_frame_completion, map_allocation,
     map_frame, map_geometry, map_hal, map_lifecycle, map_native_loss, map_texture,
-    native_device_initialized, native_layouts, native_texture_compression, pipeline_layout_key,
-    poll_native_frame_completion, prepare_frame_binding_scratch, result_status,
+    native_device_initialized, native_layouts, native_mesh_dispatch_limits,
+    native_texture_compression, pipeline_layout_key, poll_native_frame_completion,
+    prepare_frame_binding_scratch, published_texture_handles_into, result_status,
     retire_native_allocation, wait_native_idle, write_native,
 };
 mod render_target;

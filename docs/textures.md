@@ -84,7 +84,11 @@ C calls copy borrowed source bytes during the call, preserving asynchronous life
 
 Texture bindings are recorded only through `&mut Frame`; the context-owned texture heap requires no per-frame retain call. Surface recording uses `Surface::begin_frame()` and `Frame::configure_swapchain`; named targets use `Context::begin_frame()` and `Frame::configure_render_target`. `Frame::finish(self)` preserves exact errors, while dropping an unfinished frame aborts. `Buffer<T>`, `CounterBuffer<T>`, and single-value `ValueBuffer<T>` are one-frame values: their first execute use claims them, current bindings persist across same-frame execute calls, and terminal frame paths clear bindings and invalidate claimed public use while native backing remains completion-gated. `RenderTarget::prepare_readback(&mut frame)` creates and attaches an opaque owner-and-generation request, and completed metadata and bytes exist only during the registered callback.
 
-## C ABI 40
+## Render-target readback
+
+Managed render-target readback supports only full-image `Rgba8Unorm`; `Bgra8Srgb`, `Rgba16Float`, compressed, and depth targets fail before graph recording because backend copies do not convert texels. Safe `RenderTarget::prepare_readback(&mut frame)` returns an opaque owner-and-generation `Readback`; ABI 41 `ez_gfx_frame_enqueue_render_target_readback(context, frame, render_target, out_request_id)` returns a stable request correlator instead. Presented images use the presented-capture path and report no source handle. The correlator is reserved in graph insertion order and written only on success; a failed insertion cancels the reservation. Callback events pair opaque `readback_source` with `readback_source_kind`: texture requests report `Texture`, render-target requests report `RenderTarget`, and unrequested snapshots report `None` with a zero handle. The extent and RGBA bytes remain valid only for the callback invocation.
+
+## C ABI 41
 
 Install `ez_gfx_context_register_callback(context, callback, user_data)`. The callback receives `EzGfxEventKind_Upload`, runtime, diagnostic, dropped-count, and readback events on the context creator thread at graphics safe points. Compare upload resource handles, resolve bindings after `EzGfxUploadStatus_DeviceReady`, and copy readback bytes before the callback returns. Passing a null callback clears the registration. Convert result codes with `ez_gfx_error_print`.
 
@@ -106,4 +110,4 @@ Frame recording imports only resources referenced by active work. Texture descri
 
 ## Verification and remaining evidence
 
-Pure queue and allocator transitions are covered by runtime tests. ABI layout tests cover callback event records, typed heap/allocation handles, one-frame buffer signatures, presentation modes, the resource-diagnostics struct and export, and the ABI 40 contract. Native backend behavior requires the Linux Vulkan, Windows DX12, and macOS Metal remote matrices.
+Pure queue and allocator transitions are covered by runtime tests. ABI layout tests cover callback event records, typed heap/allocation handles, one-frame buffer signatures, presentation modes, the resource-diagnostics struct and export, and the ABI 41 contract. Native backend behavior requires the Linux Vulkan, Windows DX12, and macOS Metal remote matrices.

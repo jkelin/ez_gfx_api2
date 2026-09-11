@@ -3,8 +3,9 @@ use ez_gfx_core::{
     Backend, ResourceAccess, ResourceKind, SemanticError, SemanticGraph, SemanticId,
     SemanticResource, TargetBinding, TargetLayout,
     capability::{
-        AdapterCapabilities, AdapterClass, AdapterInfo, CapabilityError, CompressionSupport,
-        SemanticProfile, select_default_adapter,
+        AdapterCapabilities, AdapterClass, AdapterError, AdapterInfo,
+        CAPABILITY_PROFILE_SCHEMA_VERSION, CapabilityError, CompressionSupport, SemanticProfile,
+        ShaderCapabilities, select_default_adapter,
     },
 };
 
@@ -66,12 +67,86 @@ fn capabilities(compression: CompressionSupport) -> AdapterCapabilities {
         bindless_samplers: 1024,
         max_indirect_draw_count: 65_535,
         shader_model: 0x0605,
+        shader_stages: ShaderCapabilities::default(),
         timeline_synchronization: true,
         resource_aliasing: true,
         dynamic_rendering: true,
         presentation: true,
         compression,
     }
+}
+
+#[test]
+fn capability_schema_version_tracks_shader_stage_addition() {
+    assert_eq!(CAPABILITY_PROFILE_SCHEMA_VERSION, 2);
+    assert_eq!(SemanticProfile::V1.schema_version(), 2);
+}
+
+#[test]
+fn shader_capabilities_normalize_task_dependency() {
+    for (task, mesh, expected) in [
+        (false, false, ShaderCapabilities::default()),
+        (
+            true,
+            false,
+            ShaderCapabilities {
+                task: false,
+                mesh: false,
+            },
+        ),
+        (
+            false,
+            true,
+            ShaderCapabilities {
+                task: false,
+                mesh: true,
+            },
+        ),
+        (
+            true,
+            true,
+            ShaderCapabilities {
+                task: true,
+                mesh: true,
+            },
+        ),
+    ] {
+        assert_eq!(ShaderCapabilities::normalized(task, mesh), expected);
+    }
+}
+
+#[test]
+fn adapter_identity_rejects_task_shaders_without_mesh_shaders() {
+    let mut caps = capabilities(CompressionSupport::BC);
+    caps.shader_stages = ShaderCapabilities {
+        task: true,
+        mesh: false,
+    };
+
+    assert_eq!(
+        AdapterInfo::new(
+            Backend::Vulkan,
+            [1; 16],
+            "adapter",
+            "driver",
+            AdapterClass::Discrete,
+            caps,
+        ),
+        Err(AdapterError::InvalidCapabilities)
+    );
+}
+
+#[test]
+fn optional_shader_stages_do_not_change_v1_admission() {
+    let baseline = capabilities(CompressionSupport::BC);
+    let mut optional = baseline.clone();
+    optional.shader_stages = ShaderCapabilities {
+        task: true,
+        mesh: true,
+    };
+
+    assert!(SemanticProfile::V1.admit(&baseline).is_ok());
+    assert!(SemanticProfile::V1.admit(&optional).is_ok());
 }
 
 #[test]

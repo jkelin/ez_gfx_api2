@@ -90,6 +90,7 @@ No comparable ez-gfx CPU/GPU benchmark exists. Hard feature reach and long-term 
 **Selected: `S-P-003-custom-static-raw-hal`.**
 
 Define the smallest backend-neutral contract needed by the public API and graph, then implement it directly over `ash`, Windows D3D12 bindings, and `objc2-metal`. Keep capability discovery and state/barrier lowering backend-local; compile a concrete backend rather than placing dynamic dispatch in hot recording paths.
+The HAL adds `MeshStages`/`MeshPipelineState` plus allocation-free `validate_mesh_dispatch` (`MeshDispatchLimits`), `ShaderStage::Task = 5`/`Mesh = 6`, and one per-backend mesh pipeline create path; task stages without mesh support fail before allocation.
 
 **Rejected:** the Vulkan incumbent fails the three-API requirement. `wgpu-hal` is rejected because the plan requires exact bindless, indirect, synchronization, and transient-aliasing controls that remain unverified through its evolving unsafe interface; it becomes viable if a capability spike proves every required path without private forks or leaky escape hatches.
 

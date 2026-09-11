@@ -5,15 +5,16 @@ use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 use ez_gfx_core::capability::{
     AdapterCapabilities, AdapterClass, AdapterInfo, CompressionSupport, PresentationMode,
-    PresentationModes, SemanticProfile,
+    PresentationModes, SemanticProfile, ShaderCapabilities,
 };
 use ez_gfx_hal::{
     AllocationError, AllocationRequest, AttachmentLoadOp, AttachmentStoreOp, BlendMode,
     BufferTransfer, CompletionToken, CullMode, DEFAULT_ALLOCATION_BLOCK_POLICY,
     DynamicPipelineState, ExecutionBarrier, ExecutionPass, FrontFace, HalError, ImageMip,
-    MemoryAllocator, MemoryClass, PrimitiveTopology, QueueKind, ResourceAccess, SamplerAddressMode,
-    SamplerFilter, ShaderBufferLayout, TextureFormat, TextureRegion, TextureSamplerDesc,
-    TransferWorker, validate_texture_mips, validate_texture_region,
+    MemoryAllocator, MemoryClass, MeshDispatchLimits, MeshPipelineState, PrimitiveTopology,
+    QueueKind, ResourceAccess, SamplerAddressMode, SamplerFilter, ShaderBufferLayout,
+    TextureFormat, TextureRegion, TextureSamplerDesc, TransferWorker, validate_mesh_dispatch,
+    validate_texture_mips, validate_texture_region,
 };
 use gpu_allocator::{
     AllocationSizes, MemoryLocation,
@@ -32,23 +33,35 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_BLEND_ZERO, D3D12_CLEAR_FLAG_DEPTH, D3D12_CLEAR_VALUE, D3D12_CLEAR_VALUE_0,
     D3D12_COLOR_WRITE_ENABLE_ALL, D3D12_COMMAND_SIGNATURE_DESC, D3D12_COMPARISON_FUNC_ALWAYS,
     D3D12_COMPARISON_FUNC_LESS, D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_CPU_DESCRIPTOR_HANDLE,
-    D3D12_CULL_MODE_BACK, D3D12_CULL_MODE_FRONT, D3D12_CULL_MODE_NONE,
-    D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, D3D12_DEPTH_STENCIL_DESC, D3D12_DEPTH_STENCIL_VALUE,
-    D3D12_DEPTH_STENCILOP_DESC, D3D12_DEPTH_WRITE_MASK_ALL, D3D12_DESCRIPTOR_HEAP_DESC,
-    D3D12_DESCRIPTOR_HEAP_FLAG_NONE, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
-    D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, D3D12_DESCRIPTOR_RANGE,
+    D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION, D3D12_CULL_MODE_BACK, D3D12_CULL_MODE_FRONT,
+    D3D12_CULL_MODE_NONE, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, D3D12_DEPTH_STENCIL_DESC,
+    D3D12_DEPTH_STENCIL_VALUE, D3D12_DEPTH_STENCILOP_DESC, D3D12_DEPTH_WRITE_MASK_ALL,
+    D3D12_DESCRIPTOR_HEAP_DESC, D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+    D3D12_DESCRIPTOR_HEAP_TYPE_DSV, D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+    D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, D3D12_DESCRIPTOR_RANGE,
     D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,
-    D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_FEATURE_DATA_SHADER_MODEL, D3D12_FEATURE_SHADER_MODEL,
+    D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_FEATURE_D3D12_OPTIONS7,
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7, D3D12_FEATURE_DATA_SHADER_MODEL, D3D12_FEATURE_SHADER_MODEL,
     D3D12_FILL_MODE_SOLID, D3D12_FILTER_ANISOTROPIC, D3D12_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR,
     D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_FILTER_MIN_MAG_MIP_POINT,
     D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT, D3D12_GRAPHICS_PIPELINE_STATE_DESC,
     D3D12_INDEX_BUFFER_VIEW, D3D12_INDIRECT_ARGUMENT_DESC, D3D12_INDIRECT_ARGUMENT_DESC_0,
-    D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, D3D12_LOGIC_OP_NOOP,
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE,
-    D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-    D3D12_RASTERIZER_DESC, D3D12_RENDER_TARGET_BLEND_DESC, D3D12_RESOURCE_BARRIER,
-    D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+    D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, D3D12_LOGIC_OP_NOOP, D3D12_MESH_SHADER_TIER,
+    D3D12_MESH_SHADER_TIER_1, D3D12_MESH_SHADER_TIER_NOT_SUPPORTED,
+    D3D12_PIPELINE_STATE_STREAM_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE, D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT,
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_RASTERIZER_DESC, D3D12_RENDER_TARGET_BLEND_DESC,
+    D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
     D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
     D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
     D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_READ,
@@ -61,17 +74,18 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
     D3D12_ROOT_PARAMETER_TYPE_SRV, D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_ROOT_SIGNATURE_DESC,
     D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, D3D12_ROOT_SIGNATURE_FLAG_NONE,
-    D3D12_SAMPLER_DESC, D3D12_SHADER_BYTECODE, D3D12_SHADER_RESOURCE_VIEW_DESC,
-    D3D12_SHADER_RESOURCE_VIEW_DESC_0, D3D12_SHADER_VISIBILITY_ALL, D3D12_SRV_DIMENSION_TEXTURE2D,
-    D3D12_STENCIL_OP_KEEP, D3D12_TEX2D_SRV, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-    D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
+    D3D12_RT_FORMAT_ARRAY, D3D12_SAMPLER_DESC, D3D12_SHADER_BYTECODE,
+    D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC_0,
+    D3D12_SHADER_VISIBILITY_ALL, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_STENCIL_OP_KEEP,
+    D3D12_TEX2D_SRV, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+    D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
     D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
     D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_VIEWPORT, D3D12SerializeRootSignature,
     ID3D12CommandSignature, ID3D12DescriptorHeap, ID3D12PipelineState, ID3D12RootSignature,
 };
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE, HWND, RECT, WAIT_FAILED, WAIT_OBJECT_0},
+        Foundation::{CloseHandle, E_INVALIDARG, HANDLE, HWND, RECT, WAIT_FAILED, WAIT_OBJECT_0},
         Graphics::{
             Direct3D::{D3D_FEATURE_LEVEL_12_1, ID3DBlob},
             Direct3D12::{
@@ -85,14 +99,14 @@ use windows::{
                 D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
                 D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RTV_DIMENSION_TEXTURE2D,
                 D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12CreateDevice, ID3D12CommandAllocator,
-                ID3D12CommandList, ID3D12CommandQueue, ID3D12Device, ID3D12Fence,
-                ID3D12GraphicsCommandList, ID3D12Resource,
+                ID3D12CommandList, ID3D12CommandQueue, ID3D12Device, ID3D12Device2, ID3D12Fence,
+                ID3D12GraphicsCommandList, ID3D12GraphicsCommandList6, ID3D12Resource,
             },
             Dxgi::{
                 Common::{
-                    DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
-                    DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_UNKNOWN,
-                    DXGI_SAMPLE_DESC,
+                    DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT, DXGI_FORMAT_D32_FLOAT,
+                    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                    DXGI_FORMAT_R32_UINT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
                 },
                 CreateDXGIFactory1, DXGI_ADAPTER_FLAG3_SOFTWARE, DXGI_ERROR_NOT_FOUND,
                 DXGI_ERROR_UNSUPPORTED, DXGI_FEATURE_PRESENT_ALLOW_TEARING, DXGI_PRESENT,
@@ -241,6 +255,95 @@ pub struct NativeComputeDispatch<'a> {
     pub bindings: &'a dyn NativeBufferBindingSource,
 }
 
+/// Immutable inputs used to create a mesh pipeline.
+///
+/// Backend-local shape of the shared mesh seam: exact task/mesh/fragment DXIL
+/// products, one entry per stage, and merged stage layouts. Rasterization comes
+/// from the shared [`MeshPipelineState`], which carries no topology because mesh
+/// pipelines hold no input-assembler state. Workgroup sizes come from stage
+/// reflection and are checked before any D3D12 state creation.
+pub struct NativeMeshPipelineDesc<'a> {
+    /// Optional task stage as owning shader plus product index.
+    pub task: Option<(&'a NativeShader, usize)>,
+    /// Required mesh stage as owning shader plus product index.
+    pub mesh: (&'a NativeShader, usize),
+    /// Required fragment stage as owning shader plus product index.
+    pub fragment: (&'a NativeShader, usize),
+    /// Rasterization and blend state fixed by the pipeline.
+    pub state: MeshPipelineState,
+    /// Offscreen color format, or the default surface format.
+    pub color_format: Option<ez_gfx_runtime::target::Format>,
+    /// Reflected root buffer layout merged across the selected stages.
+    pub layouts: &'a [ShaderBufferLayout],
+    /// Whether the pipeline requires a depth attachment.
+    pub depth_required: bool,
+    /// Optional task workgroup size from reflection.
+    pub task_workgroup_size: Option<[u32; 3]>,
+    /// Mesh workgroup size from reflection.
+    pub mesh_workgroup_size: [u32; 3],
+}
+
+/// Fully resolved mesh dispatch consumed by command-list recording.
+pub struct NativeMeshDispatch<'a> {
+    /// Mesh pipeline used by the dispatch.
+    pub pipeline: &'a NativePipeline,
+    /// Task workgroup count for each dispatch dimension.
+    pub groups: [u32; 3],
+    /// Whether the pipeline holds a task stage.
+    pub has_task: bool,
+    /// Mesh workgroup size from reflection, rechecked at record time.
+    pub mesh_workgroup_size: [u32; 3],
+    /// Optional task workgroup size from reflection; required with a task stage.
+    pub task_workgroup_size: Option<[u32; 3]>,
+    /// Reflected root buffer bindings.
+    pub bindings: &'a dyn NativeBufferBindingSource,
+}
+
+/// Native limits used to validate a direct mesh dispatch.
+///
+/// The per-dimension grid ceiling is the documented D3D12 dispatch ceiling, and
+/// the total grid ceiling is the mesh-shader specification's `DispatchMesh`
+/// requirement that the workgroup-count product not exceed 2^22. The
+/// specification caps amplification and mesh threadgroup sizes at 128 threads
+/// each; D3D12 exposes no limit query, so the backend enforces the specified
+/// constants through the shared value.
+pub(super) fn retained_mesh_dispatch_limits() -> MeshDispatchLimits {
+    MeshDispatchLimits {
+        max_groups: [D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION; 3],
+        max_total_groups: 1 << 22,
+        max_mesh_threads: 128,
+        max_task_threads: 128,
+    }
+}
+
+/// Checks a mesh workgroup dispatch without allocation.
+///
+/// A task threadgroup size without a task stage, or a missing one with it, fails
+/// as an inconsistent dispatch description before the shared grid validation,
+/// which covers per-dimension, total, and threadgroup ceilings.
+///
+/// # Errors
+///
+/// Returns [`HalError::InvalidArgument`] for an inconsistent stage selection, a
+/// zero dimension, an overflowing product, or an exceeded grid ceiling.
+pub(super) fn check_mesh_dispatch(
+    has_task: bool,
+    groups: [u32; 3],
+    mesh_threads: [u32; 3],
+    task_threads: Option<[u32; 3]>,
+) -> Result<(), HalError> {
+    if task_threads.is_some() != has_task {
+        return Err(HalError::InvalidArgument);
+    }
+    validate_mesh_dispatch(
+        groups,
+        mesh_threads,
+        task_threads,
+        retained_mesh_dispatch_limits(),
+    )
+    .map_err(|_| HalError::InvalidArgument)
+}
+
 /// D3D12 resource referenced by a compiled frame barrier.
 pub enum NativeFrameResource<'a> {
     /// Buffer resource.
@@ -287,6 +390,8 @@ pub enum NativeFrameAction<'a> {
     Compute(NativeComputeDispatch<'a>),
     /// Encode indexed indirect graphics work.
     Graphics(NativeDrawIndexed<'a>),
+    /// Encode a mesh workgroup dispatch inside the active render pass.
+    Mesh(NativeMeshDispatch<'a>),
     /// Copy a texture into a readback allocation.
     TextureReadback {
         /// Texture to copy.
@@ -405,6 +510,12 @@ pub struct NativePipeline {
     topology: Option<D3D_PRIMITIVE_TOPOLOGY>,
     signature: Option<ID3D12CommandSignature>,
     buffer_writable: Vec<bool>,
+    /// Whether this state object is a mesh pipeline; mesh dispatches reject any
+    /// other pipeline instead of misrecording through it.
+    mesh: bool,
+    /// Whether the pipeline was created with a task stage; mesh dispatches
+    /// must match it instead of trusting the caller's stage flag.
+    task_stage: bool,
 }
 
 /// Multisampled render storage owned by a managed render target.
@@ -610,6 +721,8 @@ pub struct NativeContext {
     pub adapter: IDXGIAdapter4,
     /// Feature-level 12.1 device created from the selected adapter.
     pub device: ID3D12Device,
+    /// Mesh-shader tier probed at admission; gates later `DispatchMesh` recording.
+    mesh_shader_tier: D3D12_MESH_SHADER_TIER,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     transfer_fence: ID3D12Fence,

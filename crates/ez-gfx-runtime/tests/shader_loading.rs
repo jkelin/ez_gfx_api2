@@ -48,7 +48,8 @@ fn metadata(stages: &[Stage]) -> Vec<u8> {
         .into_iter()
         .flat_map(|target| {
             stages.iter().map(move |stage| {
-                let workgroup_size = (*stage == Stage::Compute).then_some([1, 1, 1]);
+                let workgroup_size = matches!(stage, Stage::Compute | Stage::Task | Stage::Mesh)
+                    .then_some([1, 1, 1]);
                 serde_json::json!({
                     "target": format!("{target:?}"),
                     "entry": format!("{stage:?}").replace("Compute", "main"),
@@ -462,5 +463,77 @@ fn named_entry_selection_is_exact_and_stage_typed() {
             "vertexmain",
         ),
         Err(ShaderLoadError::WrongStage)
+    );
+}
+
+#[test]
+fn task_and_mesh_products_expose_validated_workgroup_sizes() {
+    let stages = [
+        (Stage::Task, "taskmain", 1_u8),
+        (Stage::Mesh, "meshmain", 2),
+    ];
+    let variants = stages
+        .into_iter()
+        .map(|(stage, entry, byte)| {
+            TargetVariant::new(
+                Target::Spirv,
+                stage,
+                entry,
+                "ez-gfx-v1",
+                compatibility(Target::Spirv),
+                vec![byte],
+            )
+            .unwrap()
+        })
+        .collect();
+    let reflections = stages.map(|(stage, entry, _)| {
+        serde_json::json!({
+            "target": "Spirv",
+            "entry": entry,
+            "stage": format!("{stage:?}"),
+            "reflection": {"parameters": [], "workgroup_size": [4, 2, 1]}
+        })
+    });
+    let bytes = Artifact::new(
+        serde_json::to_vec(&serde_json::json!({"reflections": reflections})).unwrap(),
+        Provenance::new("slangc", "2026.16", vec![], "host"),
+        variants,
+    )
+    .unwrap()
+    .encode()
+    .unwrap();
+
+    for (stage, entry, byte) in stages {
+        let shader =
+            RuntimeShader::load(&bytes, Backend::Vulkan, SemanticProfile::V1, stage, entry)
+                .unwrap();
+        assert_eq!(shader.product(stage), Some([byte].as_slice()));
+        assert_eq!(shader.workgroup_size().unwrap(), [4, 2, 1]);
+    }
+    for (requested, entry) in [
+        (Stage::Mesh, "taskmain"),
+        (Stage::Task, "meshmain"),
+        (Stage::Fragment, "meshmain"),
+    ] {
+        assert_eq!(
+            RuntimeShader::load(
+                &bytes,
+                Backend::Vulkan,
+                SemanticProfile::V1,
+                requested,
+                entry,
+            ),
+            Err(ShaderLoadError::WrongStage)
+        );
+    }
+    assert_eq!(
+        RuntimeShader::load(
+            &bytes,
+            Backend::Vulkan,
+            SemanticProfile::V1,
+            Stage::Mesh,
+            "mesh",
+        ),
+        Err(ShaderLoadError::UnknownEntryPoint)
     );
 }

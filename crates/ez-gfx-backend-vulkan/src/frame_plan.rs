@@ -23,6 +23,47 @@ fn samples_agree(resource: &NativeFrameResource<'_>, samples: u8) -> bool {
     }
 }
 
+/// Rejects misshapen or passless mesh dispatches without allocation.
+///
+/// Mesh work shades the active pass directly: no index or indirect buffers
+/// participate. Grid ceilings and reflected threadgroup sizes need the retained
+/// native limits, so recording rechecks them fully.
+///
+/// # Errors
+///
+/// Returns [`HalError::InvalidArgument`] for a passless, empty, overflowing,
+/// stage-inconsistent, or pipeline-mismatched dispatch.
+pub(super) fn validate_mesh_plan(
+    draw: &super::super::NativeMeshDraw<'_>,
+    extent: (u32, u32),
+    pass_active: bool,
+) -> Result<(), HalError> {
+    if !pass_active
+        || draw.width == 0
+        || draw.height == 0
+        || draw.width > extent.0
+        || draw.height > extent.1
+        || draw.groups.contains(&0)
+        || draw.task_workgroup_size.is_some() != draw.has_task
+        || !matches!(
+            draw.pipeline.kind,
+            super::super::NativePipelineKind::Mesh { task_stage }
+                if task_stage == draw.has_task
+        )
+    {
+        return Err(HalError::InvalidArgument);
+    }
+    Ok(())
+}
+
+// Overflow and any edge beyond the attachment both reject the pass.
+const fn pass_area_fits(area: [u32; 4], extent: (u32, u32)) -> bool {
+    match (area[0].checked_add(area[2]), area[1].checked_add(area[3])) {
+        (Some(right), Some(bottom)) => right <= extent.0 && bottom <= extent.1,
+        _ => false,
+    }
+}
+
 pub(super) fn validate_frame_plan(
     actions: &(impl NativeFrameActionSource + ?Sized),
     extent: (u32, u32),
@@ -34,6 +75,7 @@ pub(super) fn validate_frame_plan(
     let mut external_wait = ArrayVec::<CompletionToken, 2>::new();
     let mut pass_active = false;
     let mut saw_present = false;
+    let mut pass_extent = None;
     actions.visit(&mut |_, action| {
         if saw_present {
             return Err(HalError::InvalidArgument);
@@ -105,20 +147,17 @@ pub(super) fn validate_frame_plan(
                 let Some((target_width, target_height)) = target_extent else {
                     return Err(HalError::InvalidArgument);
                 };
-                if !valid
-                    || pass.area[0]
-                        .checked_add(pass.area[2])
-                        .is_none_or(|end| end > target_width)
-                    || pass.area[1]
-                        .checked_add(pass.area[3])
-                        .is_none_or(|end| end > target_height)
-                {
+                if !valid || !pass_area_fits(pass.area, (target_width, target_height)) {
                     return Err(HalError::InvalidArgument);
                 }
                 pass_active = true;
+                pass_extent = target_extent;
             }
             NativeFrameAction::Compute(dispatch) => {
-                if pass_active || dispatch.groups.contains(&0) {
+                if pass_active
+                    || dispatch.groups.contains(&0)
+                    || dispatch.pipeline.kind != super::super::NativePipelineKind::Compute
+                {
                     return Err(HalError::InvalidArgument);
                 }
             }
@@ -128,15 +167,20 @@ pub(super) fn validate_frame_plan(
                     .and_then(|size| size.checked_add(COUNTER_BUFFER_ELEMENT_OFFSET))
                     .ok_or(HalError::InvalidArgument)?;
                 if !pass_active
+                    || draw.pipeline.kind != super::super::NativePipelineKind::Graphics
                     || draw.width == 0
                     || draw.height == 0
-                    || draw.width > extent.0
-                    || draw.height > extent.1
+                    || pass_extent.is_none_or(|pass_extent| {
+                        draw.width > pass_extent.0 || draw.height > pass_extent.1
+                    })
                     || draw.draw_count == 0
                     || draw.indirect_buffer.allocation.size() < indirect_size
                 {
                     return Err(HalError::InvalidArgument);
                 }
+            }
+            NativeFrameAction::Mesh(draw) => {
+                validate_mesh_plan(draw, pass_extent.unwrap_or_default(), pass_active)?;
             }
             NativeFrameAction::TextureReadback { width, height, .. } => {
                 if pass_active || *width == 0 || *height == 0 {
@@ -148,6 +192,7 @@ pub(super) fn validate_frame_plan(
                     return Err(HalError::InvalidArgument);
                 }
                 pass_active = false;
+                pass_extent = None;
             }
             NativeFrameAction::Present => {
                 if pass_active {

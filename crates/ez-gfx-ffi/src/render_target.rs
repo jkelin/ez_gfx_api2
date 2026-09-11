@@ -72,7 +72,13 @@ pub unsafe extern "C" fn ez_gfx_render_target_create(
     out_target: *mut EzGfxRenderTarget,
 ) -> EzGfxResult {
     catch_status(|| {
-        if desc.is_null() || out_target.is_null() || width == 0 || height == 0 {
+        if desc.is_null()
+            || !desc.is_aligned()
+            || out_target.is_null()
+            || !out_target.is_aligned()
+            || width == 0
+            || height == 0
+        {
             return EzGfxResult::InvalidArgument;
         }
         // SAFETY: `desc` is non-null and readable for this call.
@@ -196,7 +202,11 @@ pub unsafe extern "C" fn ez_gfx_render_target_get_extent(
     out_height: *mut u32,
 ) -> EzGfxResult {
     catch_status(|| {
-        if out_width.is_null() || out_height.is_null() {
+        if out_width.is_null()
+            || !out_width.is_aligned()
+            || out_height.is_null()
+            || !out_height.is_aligned()
+        {
             return EzGfxResult::InvalidArgument;
         }
         let target = match render_target_handle(target) {
@@ -238,7 +248,7 @@ pub unsafe extern "C" fn ez_gfx_render_target_get_clear(
     out_color: *mut f32,
 ) -> EzGfxResult {
     catch_status(|| {
-        if out_use_clear.is_null() || out_color.is_null() {
+        if out_use_clear.is_null() || out_color.is_null() || !out_color.is_aligned() {
             return EzGfxResult::InvalidArgument;
         }
         let target = match render_target_handle(target) {

@@ -62,7 +62,7 @@ Shader compilation/loading and readback are scheduled for separate redesigns. Th
 | Vulkan, snapshot cache disabled | 11.1 | 1,111 | 668 allocations/s; 0.064 MiB/s |
 | DX12, snapshot cache enabled | about 106 | about 2,470,750 | about 141 MiB/s |
 
-Fresh hidden probes (500 frames, triangle workload): DX12 reports 5,539 calls and 537,846 bytes; Vulkan reports 5,564 calls and 555,422 bytes. Safe-facade phases (begin/configure/acquire/bind) and independent shader-free frame-plan/wait validation assert zero; the residual is excluded shader metadata and pipeline-key storage under fixed ceilings. The snapshot-enabled row predates the scratch-retention work and was not re-measured here.
+Fresh hidden probes (500 frames, triangle workload): DX12 reports 5,539 calls and 537,846 bytes; Vulkan reports 5,559 calls and 554,622 bytes. Safe-facade phases (begin/configure/acquire/bind) and independent shader-free frame-plan/wait validation assert zero; the residual is excluded shader metadata and pipeline-key storage under fixed ceilings. The snapshot-enabled row predates the scratch-retention work and was not re-measured here.
 
 Live Rust heap usage stayed near 4 KiB for the triangle workload (DX12 peak-live increase 3,925 bytes with a -698-byte ending delta; Vulkan 4,181 bytes with a 364-byte ending delta). The captures do not show linear retained growth.
 
@@ -686,10 +686,10 @@ The native probe defaults to scoped success and keeps whole-window totals visibl
 
 | Backend | Workload | Measured frames | Rust calls | Rust requested bytes | Residual ceiling (calls / bytes) | Scoped result |
 |---|---|---:|---:|---:|---:|---|
-| Vulkan (Windows, RTX 3080) | Triangle | 500 | 5,564 | 555,422 B | 7,300 / 600,000 B | pass |
-| Vulkan (Windows, RTX 3080) | Compute + graphics | 500 | 11,133 | 2,324,962 B | 32,000 / 5,000,000 B | pass |
+| Vulkan (Windows, RTX 3080) | Triangle | 500 | 5,559 | 554,622 B | 7,300 / 600,000 B | pass |
+| Vulkan (Windows, RTX 3080) | Compute + graphics | 500 | 11,199 | 2,333,504 B | 32,000 / 5,000,000 B | pass |
 | DX12 (Windows, RTX 3080) | Triangle | 500 | 5,539 | 537,846 B | 7,300 / 585,000 B | pass |
-| DX12 (Windows, RTX 3080) | Compute + graphics | 500 | 13,681 | 2,567,850 B | 34,500 / 5,200,000 B | pass |
+| DX12 (Windows, RTX 3080) | Compute + graphics | 500 | 13,683 | 2,563,534 B | 34,500 / 5,200,000 B | pass |
 
 In-scope safe phases hard-assert zero after warm-up on both backends: begin, swapchain configure, transient/counter acquisition, and frame binding each record zero calls, bytes, peak-live increase, and live delta. Independent shader-free unit tests (`spill_cardinality_plan_validation_performs_no_allocations` in the Vulkan and DX12 backends) assert frame-plan and wait validation at 65 actions. They do not execute pipeline actions, descriptor accounting, descriptor allocation, or descriptor lowering. Residual traffic is confined to execute/finish phases and classified as excluded shader metadata/pipeline-key ownership: triangle execute observes 4 calls and 125 B; triangle finish observes 7 calls and 742–750 B; compute observes 3 calls and 2,540–2,580 B; graphics observes 8 calls and 465 B; multipass finish observes 12 calls and 4,601 B on Vulkan and 16 calls and 1,595 B on DX12.
 

@@ -18,9 +18,21 @@ fn texture_format_vk(format: TextureFormat) -> vk::Format {
         TextureFormat::Bc3Unorm => vk::Format::BC3_UNORM_BLOCK,
         TextureFormat::Bc3Srgb => vk::Format::BC3_SRGB_BLOCK,
         TextureFormat::Bc7Unorm => vk::Format::BC7_UNORM_BLOCK,
+
         TextureFormat::Bc7Srgb => vk::Format::BC7_SRGB_BLOCK,
         TextureFormat::Astc4x4Unorm => vk::Format::ASTC_4X4_UNORM_BLOCK,
         TextureFormat::Astc4x4Srgb => vk::Format::ASTC_4X4_SRGB_BLOCK,
+    }
+}
+pub(super) const fn render_target_format_vk(
+    format: ez_gfx_runtime::target::Format,
+) -> Option<vk::Format> {
+    use ez_gfx_runtime::target::Format;
+    match format {
+        Format::Rgba8Unorm => Some(vk::Format::R8G8B8A8_UNORM),
+        Format::Bgra8Srgb => Some(vk::Format::B8G8R8A8_SRGB),
+        Format::Rgba16Float => Some(vk::Format::R16G16B16A16_SFLOAT),
+        _ => None,
     }
 }
 
@@ -438,14 +450,11 @@ impl NativeContext {
         samples: u8,
     ) -> Result<NativeTexture, AllocationError> {
         use ez_gfx_runtime::target::Format;
-        let (vk_format, hal_format, bytes_per_texel) = match format {
-            Format::Rgba8Unorm => (vk::Format::R8G8B8A8_UNORM, TextureFormat::Rgba8Unorm, 4),
-            Format::Bgra8Srgb => (vk::Format::B8G8R8A8_SRGB, TextureFormat::Rgba8Srgb, 4),
-            Format::Rgba16Float => (
-                vk::Format::R16G16B16A16_SFLOAT,
-                TextureFormat::Rgba8Unorm,
-                8,
-            ),
+        let vk_format = render_target_format_vk(format).ok_or(AllocationError::Unsupported)?;
+        let (hal_format, bytes_per_texel) = match format {
+            Format::Rgba8Unorm => (TextureFormat::Rgba8Unorm, 4),
+            Format::Bgra8Srgb => (TextureFormat::Rgba8Srgb, 4),
+            Format::Rgba16Float => (TextureFormat::Rgba8Unorm, 8),
             _ => return Err(AllocationError::Unsupported),
         };
         let Some(sample_flags) = msaa::sample_count_flags(samples) else {

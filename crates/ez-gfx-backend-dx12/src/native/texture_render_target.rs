@@ -110,11 +110,12 @@ impl NativeContext {
         use ez_gfx_runtime::target::Format;
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         use windows::Win32::Graphics::Dxgi::Common::{
-            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
         };
         let (dxgi, hal_format, bytes_per_texel): (_, TextureFormat, u64) = match format {
             Format::Rgba8Unorm => (DXGI_FORMAT_R8G8B8A8_UNORM, TextureFormat::Rgba8Unorm, 4),
-            Format::Bgra8Srgb => (DXGI_FORMAT_B8G8R8A8_UNORM, TextureFormat::Rgba8Srgb, 4),
+            Format::Bgra8Srgb => (DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, TextureFormat::Rgba8Srgb, 4),
             Format::Rgba16Float => (DXGI_FORMAT_R16G16B16A16_FLOAT, TextureFormat::Rgba8Unorm, 8),
             _ => return Err(AllocationError::Unsupported),
         };

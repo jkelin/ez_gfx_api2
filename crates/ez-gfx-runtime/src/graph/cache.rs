@@ -1,5 +1,5 @@
 use super::{AliasAssignment, CompiledGraph, HazardEdge, NodeId, size_of, vec_bytes};
-pub(super) const GRAPH_TEMPLATE_SCHEMA: u32 = 1;
+pub(super) const GRAPH_TEMPLATE_SCHEMA: u32 = 2;
 const GRAPH_TEMPLATE_CACHE_ENTRY_LIMIT: usize = 8;
 const GRAPH_TEMPLATE_CACHE_BYTE_LIMIT: usize = 8 * 1024 * 1024;
 

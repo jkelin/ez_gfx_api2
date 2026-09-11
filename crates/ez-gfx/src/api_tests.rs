@@ -4,6 +4,8 @@ use static_assertions::assert_not_impl_any;
 assert_not_impl_any!(Context: Send, Sync);
 assert_not_impl_any!(Surface: Send, Sync);
 assert_not_impl_any!(ComputeShader: Send, Sync);
+assert_not_impl_any!(TaskShader: Send, Sync);
+assert_not_impl_any!(MeshShader: Send, Sync);
 assert_not_impl_any!(VertexShader: Send, Sync);
 assert_not_impl_any!(FragmentShader: Send, Sync);
 assert_not_impl_any!(Texture: Send, Sync);
@@ -15,6 +17,207 @@ assert_not_impl_any!(Buffer<u32>: Send, Sync);
 assert_not_impl_any!(CounterBuffer<ez_gfx_runtime::indirect::DrawIndexedCommand>: Send, Sync);
 assert_not_impl_any!(ValueBuffer<u32>: Send, Sync);
 assert_not_impl_any!(Frame: Send, Sync);
+
+#[cfg(not(target_vendor = "apple"))]
+fn mesh_shader_owners(
+    shaders: MeshShaders<'_>,
+) -> (Option<&TaskShader>, &MeshShader, &FragmentShader) {
+    (shaders.task, shaders.mesh, shaders.fragment)
+}
+#[cfg(windows)]
+fn safe_mesh_stage_test_artifact() -> Vec<u8> {
+    use ez_gfx_artifact::{
+        Artifact, Provenance, Stage, Target, TargetCompatibility, TargetVariant,
+    };
+
+    let stages = [
+        (Stage::Task, "taskmain"),
+        (Stage::Mesh, "meshmain"),
+        (Stage::Fragment, "fragmentmain"),
+    ];
+    let variants = stages
+        .into_iter()
+        .map(|(stage, entry)| {
+            TargetVariant::new(
+                Target::Dxil,
+                stage,
+                entry,
+                "ez-gfx-v1",
+                TargetCompatibility::portable(Target::Dxil).unwrap(),
+                vec![stage as u8 + 1],
+            )
+            .unwrap()
+        })
+        .collect();
+    let metadata = br#"{"semantic_abi":1,"reflections":[
+        {"target":"Dxil","entry":"taskmain","stage":"Task","reflection":{"parameters":[],"workgroup_size":[1,1,1]}},
+        {"target":"Dxil","entry":"meshmain","stage":"Mesh","reflection":{"parameters":[],"workgroup_size":[1,1,1]}},
+        {"target":"Dxil","entry":"fragmentmain","stage":"Fragment","reflection":{"parameters":[]}}
+    ]}"#;
+    Artifact::new(
+        metadata.to_vec(),
+        Provenance::new("test", "1", vec![], "host"),
+        variants,
+    )
+    .unwrap()
+    .encode()
+    .unwrap()
+}
+
+#[cfg(windows)]
+fn safe_mesh_test_context() -> Result<Context> {
+    let options = ez_gfx_runtime::ContextOptions::new_for_backend(0, 0, ez_gfx_core::Backend::Dx12)
+        .map_err(|_| Error::InvalidArgument)?;
+    Context::new(options)
+}
+
+#[cfg(windows)]
+#[test]
+fn safe_mesh_loading_and_retention_use_capability_and_owner_boundaries() -> Result<()> {
+    use ez_gfx_artifact::ShaderLoader;
+
+    let context = safe_mesh_test_context()?;
+    let artifact = safe_mesh_stage_test_artifact();
+    state::inject_shader_capabilities(
+        context.raw(),
+        ShaderCapabilities {
+            task: false,
+            mesh: true,
+        },
+    )?;
+    assert!(matches!(
+        context.load_task_shader(&artifact, "taskmain"),
+        Err(Error::Unsupported)
+    ));
+    assert_eq!(state::native_shader_allocation_attempts(context.raw())?, 0);
+    let mesh = context.load_mesh_shader(&artifact, "meshmain")?;
+
+    state::inject_shader_capabilities(
+        context.raw(),
+        ShaderCapabilities {
+            task: true,
+            mesh: true,
+        },
+    )?;
+    let task = context.load_task_shader(&artifact, "taskmain")?;
+    let fragment = context.load_fragment_shader(&artifact, "fragmentmain")?;
+    let mut frame = context.begin_frame()?;
+    let handles = frame.retain_mesh_shaders(MeshShaders {
+        task: Some(&task),
+        mesh: &mesh,
+        fragment: &fragment,
+    })?;
+    assert_eq!(handles.task, Some(task.inner.handle));
+    assert_eq!(handles.mesh, mesh.inner.handle);
+    assert_eq!(handles.fragment, fragment.inner.handle);
+    assert_eq!(frame.retained.len(), 3);
+    drop(frame);
+
+    let foreign = safe_mesh_test_context()?;
+    let foreign_fragment = foreign.load_fragment_shader(&artifact, "fragmentmain")?;
+    let mut frame = context.begin_frame()?;
+    assert_eq!(
+        frame.retain_mesh_shaders(MeshShaders {
+            task: Some(&task),
+            mesh: &mesh,
+            fragment: &foreign_fragment,
+        }),
+        Err(Error::InvalidContext)
+    );
+    assert!(frame.retained.is_empty());
+    Ok(())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn mesh_shader_bundle_keeps_typed_owner_lifetimes() -> Result<()> {
+    let (context, _surface) = headless()?;
+    let mesh = MeshShader {
+        inner: Rc::new(ShaderInner {
+            context: Rc::clone(&context.inner),
+            handle: state::insert_shader_drop_probe(context.raw())?,
+        }),
+    };
+    let fragment = FragmentShader {
+        inner: Rc::new(ShaderInner {
+            context: Rc::clone(&context.inner),
+            handle: state::insert_shader_drop_probe(context.raw())?,
+        }),
+    };
+
+    let (task, selected_mesh, selected_fragment) = mesh_shader_owners(MeshShaders {
+        task: None,
+        mesh: &mesh,
+        fragment: &fragment,
+    });
+
+    assert!(task.is_none());
+    assert!(std::ptr::eq(selected_mesh, &raw const mesh));
+    assert!(std::ptr::eq(selected_fragment, &raw const fragment));
+    Ok(())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn safe_mesh_failure_poison_aborts_the_transaction() -> Result<()> {
+    let (context, surface) = headless()?;
+    let mesh = MeshShader {
+        inner: Rc::new(ShaderInner {
+            context: Rc::clone(&context.inner),
+            handle: state::insert_shader_drop_probe(context.raw())?,
+        }),
+    };
+    let fragment = FragmentShader {
+        inner: Rc::new(ShaderInner {
+            context: Rc::clone(&context.inner),
+            handle: state::insert_shader_drop_probe(context.raw())?,
+        }),
+    };
+    let mut frame = surface.begin_frame()?;
+    let shaders = MeshShaders {
+        task: None,
+        mesh: &mesh,
+        fragment: &fragment,
+    };
+    let pipeline = ez_gfx_hal::MeshPipelineState {
+        cull: ez_gfx_hal::CullMode::None,
+        front_face: ez_gfx_hal::FrontFace::CounterClockwise,
+        blend: ez_gfx_hal::BlendMode::None,
+    };
+
+    assert_eq!(
+        frame.execute_mesh(shaders, [1, 1, 1], pipeline),
+        Err(Error::InvalidContext)
+    );
+    assert_eq!(
+        frame.execute_mesh(shaders, [1, 1, 1], pipeline),
+        Err(Error::InvalidContext)
+    );
+    assert_eq!(frame.finish(), Err(Error::InvalidContext));
+    drop(surface.begin_frame()?);
+    Ok(())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn shared_shader_owner_requests_destruction_once() -> Result<()> {
+    let (context, _surface) = headless()?;
+    let handle = state::insert_shader_drop_probe(context.raw())?;
+    let inner = Rc::new(ShaderInner {
+        context: Rc::clone(&context.inner),
+        handle,
+    });
+    let first = MeshShader {
+        inner: Rc::clone(&inner),
+    };
+    let second = MeshShader { inner };
+
+    drop(first);
+    assert_eq!(state::shader_destroy_requests(context.raw())?, 0);
+    drop(second);
+    assert_eq!(state::shader_destroy_requests(context.raw())?, 1);
+    Ok(())
+}
 
 #[cfg(not(target_vendor = "apple"))]
 struct HostProbe(Rc<Cell<u32>>);
@@ -228,6 +431,23 @@ thread_local! {
 }
 
 #[cfg(not(target_vendor = "apple"))]
+#[test]
+fn safe_shader_capabilities_follow_device_initialization() -> Result<()> {
+    let options =
+        ez_gfx_runtime::ContextOptions::new_for_backend(0, 0, ez_gfx_core::Backend::Vulkan)
+            .map_err(|_| Error::InvalidArgument)?;
+    let context = Context::new(options)?;
+    assert_eq!(context.shader_capabilities(), Err(Error::NotReady));
+
+    let _surface = context.create_surface_headless(
+        ez_gfx_runtime::HeadlessSurfaceOptions::new(1, 1, 0).map_err(|_| Error::InvalidArgument)?,
+    )?;
+    let capabilities = context.shader_capabilities()?;
+    assert!(!capabilities.task || capabilities.mesh);
+    Ok(())
+}
+
+#[cfg(not(target_vendor = "apple"))]
 fn headless() -> Result<(Context, Surface)> {
     let options =
         ez_gfx_runtime::ContextOptions::new_for_backend(0, 0, ez_gfx_core::Backend::Vulkan)
@@ -387,6 +607,28 @@ fn repeated_render_target_readbacks_keep_distinct_callback_identities() -> Resul
         observed.borrow().as_slice(),
         &[(first.id(), 16), (second.id(), 16)]
     );
+    Ok(())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn managed_render_target_readback_rejects_non_rgba8_formats() -> Result<()> {
+    for (name, format) in [
+        ("bgra-capture", ez_gfx_runtime::target::Format::Bgra8Srgb),
+        (
+            "rgba16-capture",
+            ez_gfx_runtime::target::Format::Rgba16Float,
+        ),
+    ] {
+        let (context, _surface) = headless()?;
+        let mut frame = context.begin_frame()?;
+        let target = frame.configure_render_target(name, [2, 2], format)?;
+
+        assert_eq!(
+            target.prepare_readback(&mut frame).map(|_| ()),
+            Err(Error::InvalidArgument)
+        );
+    }
     Ok(())
 }
 

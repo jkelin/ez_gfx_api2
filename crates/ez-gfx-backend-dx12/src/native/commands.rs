@@ -13,28 +13,42 @@ use super::{
     D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, FRAMES_IN_FLIGHT, FrameSlot, HalError, ID3D12Device,
     ID3D12GraphicsCommandList, ID3D12PipelineState, ID3D12Resource, NativePipeline, ResourceAccess,
 };
+use ez_gfx_hal::{ResourceState, ShaderStage};
 
-pub(super) fn dx12_resource_state(access: ResourceAccess) -> D3D12_RESOURCE_STATES {
-    match access {
-        ResourceAccess::SampledRead
-        | ResourceAccess::StorageRead
-        | ResourceAccess::IndirectStorageRead => {
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-                | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+fn shader_read_state(stage: ShaderStage) -> Result<D3D12_RESOURCE_STATES, HalError> {
+    match stage {
+        ShaderStage::Vertex | ShaderStage::Compute | ShaderStage::Task | ShaderStage::Mesh => {
+            Ok(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
         }
-        ResourceAccess::StorageWrite | ResourceAccess::StorageReadWrite => {
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        ShaderStage::Fragment => Ok(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        ShaderStage::AllGraphics => Ok(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+            | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        ShaderStage::None => Err(HalError::InvalidArgument),
+    }
+}
+
+pub(super) fn dx12_resource_state(state: ResourceState) -> Result<D3D12_RESOURCE_STATES, HalError> {
+    ResourceState::new(state.queue, state.stage, state.access)
+        .map_err(|_| HalError::InvalidArgument)?;
+    Ok(match state.access {
+        ResourceAccess::SampledRead | ResourceAccess::StorageRead => {
+            shader_read_state(state.stage)?
         }
+        ResourceAccess::IndirectStorageRead => {
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT | shader_read_state(state.stage)?
+        }
+        ResourceAccess::StorageWrite
+        | ResourceAccess::StorageReadWrite
+        | ResourceAccess::IndirectStorageReadWrite => D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         ResourceAccess::IndexRead => D3D12_RESOURCE_STATE_INDEX_BUFFER,
         ResourceAccess::IndirectRead => D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        ResourceAccess::IndirectStorageReadWrite => D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         ResourceAccess::ColorAttachmentWrite => D3D12_RESOURCE_STATE_RENDER_TARGET,
         ResourceAccess::DepthStencilRead => D3D12_RESOURCE_STATE_DEPTH_READ,
         ResourceAccess::DepthStencilWrite => D3D12_RESOURCE_STATE_DEPTH_WRITE,
         ResourceAccess::TransferRead => D3D12_RESOURCE_STATE_COPY_SOURCE,
         ResourceAccess::TransferWrite => D3D12_RESOURCE_STATE_COPY_DEST,
         ResourceAccess::Present => D3D12_RESOURCE_STATE_PRESENT,
-    }
+    })
 }
 
 pub(super) fn transition_barrier(
@@ -231,4 +245,61 @@ pub(super) fn create_frame_slots(device: &ID3D12Device) -> windows::core::Result
         });
     }
     Ok(slots)
+}
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+    use ez_gfx_hal::{QueueKind, ResourceState, ShaderStage};
+
+    #[test]
+    fn compute_to_mesh_hazard_uses_uav_then_non_pixel_state() {
+        let compute = ResourceState::new(
+            QueueKind::Compute,
+            ShaderStage::Compute,
+            ResourceAccess::StorageWrite,
+        )
+        .unwrap();
+        let mesh = ResourceState::new(
+            QueueKind::Graphics,
+            ShaderStage::Mesh,
+            ResourceAccess::StorageRead,
+        )
+        .unwrap();
+
+        assert_eq!(
+            dx12_resource_state(compute).unwrap(),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        );
+        assert_eq!(
+            dx12_resource_state(mesh).unwrap(),
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+        );
+    }
+
+    #[test]
+    fn read_hazards_preserve_pixel_and_non_pixel_visibility() {
+        for (stage, expected) in [
+            (
+                ShaderStage::Task,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            ),
+            (
+                ShaderStage::Mesh,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            ),
+            (
+                ShaderStage::Fragment,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            ),
+            (
+                ShaderStage::AllGraphics,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                    | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            ),
+        ] {
+            let state = ResourceState::new(QueueKind::Graphics, stage, ResourceAccess::SampledRead)
+                .unwrap();
+            assert_eq!(dx12_resource_state(state).unwrap(), expected);
+        }
+    }
 }

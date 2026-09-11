@@ -737,17 +737,41 @@ fn device_probe_reports_render_target_roles() {
 #[test]
 fn render_target_allocation_creates_sampled_color_resources() {
     use ez_gfx_runtime::target::Format;
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+    };
     let mut context = NativeContext::create_default(false).unwrap();
-    // RGBA8 and RGBA16F color targets allocate single-mip sampled resources.
-    for (binding, format, width, height) in [
-        (7_u32, Format::Rgba8Unorm, 64, 64),
-        (9_u32, Format::Rgba16Float, 32, 16),
+    // Every color target allocates a resource whose typed format matches its RTV and PSO.
+    for (binding, format, width, height, expected) in [
+        (
+            7_u32,
+            Format::Rgba8Unorm,
+            64,
+            64,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+        ),
+        (
+            8_u32,
+            Format::Bgra8Srgb,
+            64,
+            32,
+            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+        ),
+        (
+            9_u32,
+            Format::Rgba16Float,
+            32,
+            16,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+        ),
     ] {
         let target = context
             .create_render_target(format, width, height, binding, 1)
             .unwrap();
         assert_eq!(target.binding, binding);
         assert!(target.msaa.is_none());
+        // SAFETY: the target retains its resource through this descriptor query.
+        assert_eq!(unsafe { target.resource.GetDesc() }.Format, expected);
         context.destroy_texture(target).unwrap();
     }
     // Depth usage and empty extents fail before native allocation.

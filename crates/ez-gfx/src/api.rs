@@ -10,7 +10,7 @@ use std::{
 use compact_str::CompactString;
 
 use ez_gfx_core::{
-    capability::{CapabilityError, PresentationMode, PresentationModes},
+    capability::{CapabilityError, PresentationMode, PresentationModes, ShaderCapabilities},
     handle::{
         BufferHandle, ContextHandle, CounterBufferHandle, IndexAllocationHandle,
         RenderTargetHandle, ShaderHandle, SurfaceHandle, TextureHandle, VertexAllocationHandle,
@@ -399,6 +399,15 @@ impl Context {
         self.complete(state::texture_decode_worker_count(self.raw()))
     }
 
+    /// Returns optional shader stages enabled on the selected initialized device.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when the context is stale, unhealthy, reentered, or not initialized.
+    pub fn shader_capabilities(&self) -> Result<ShaderCapabilities> {
+        self.check_entry()?;
+        self.complete(state::shader_capabilities(self.raw()))
+    }
+
     /// Returns context-wide texture upload counters.
     ///
     /// # Errors
@@ -699,8 +708,9 @@ impl Drop for ShaderInner {
 }
 
 macro_rules! define_shader {
-    ($name:ident, $doc:literal) => {
+    ($(#[$attribute:meta])* $name:ident, $doc:literal) => {
         #[doc = $doc]
+        $(#[$attribute])*
         pub struct $name {
             inner: Rc<ShaderInner>,
         }
@@ -708,11 +718,35 @@ macro_rules! define_shader {
 }
 
 define_shader!(ComputeShader, "Owning compute-stage shader handle.");
+define_shader!(TaskShader, "Owning task-stage shader handle.");
+define_shader!(MeshShader, "Owning mesh-stage shader handle.");
 define_shader!(VertexShader, "Owning vertex-stage shader handle.");
 define_shader!(FragmentShader, "Owning fragment-stage shader handle.");
+#[derive(Clone, Copy)]
+/// Borrowed shader owners selected for a mesh graphics pipeline.
+pub struct MeshShaders<'a> {
+    /// Optional task shader.
+    pub task: Option<&'a TaskShader>,
+    /// Required mesh shader.
+    pub mesh: &'a MeshShader,
+    /// Required fragment shader.
+    pub fragment: &'a FragmentShader,
+}
+
+impl MeshShaders<'_> {
+    fn handles(&self) -> ez_gfx_hal::MeshStages<ShaderHandle> {
+        ez_gfx_hal::MeshStages {
+            task: self.task.map(|shader| shader.inner.handle),
+            mesh: self.mesh.inner.handle,
+            fragment: self.fragment.inner.handle,
+        }
+    }
+}
 
 impl ez_gfx_artifact::ShaderLoader for Context {
     type ComputeShader = ComputeShader;
+    type TaskShader = TaskShader;
+    type MeshShader = MeshShader;
     type VertexShader = VertexShader;
     type FragmentShader = FragmentShader;
     type Error = Error;
@@ -724,6 +758,16 @@ impl ez_gfx_artifact::ShaderLoader for Context {
     ) -> Result<Self::ComputeShader> {
         self.load_stage_shader(artifact, ez_gfx_artifact::Stage::Compute, entry_point)
             .map(|inner| ComputeShader { inner })
+    }
+
+    fn load_task_shader(&self, artifact: &[u8], entry_point: &str) -> Result<Self::TaskShader> {
+        self.load_stage_shader(artifact, ez_gfx_artifact::Stage::Task, entry_point)
+            .map(|inner| TaskShader { inner })
+    }
+
+    fn load_mesh_shader(&self, artifact: &[u8], entry_point: &str) -> Result<Self::MeshShader> {
+        self.load_stage_shader(artifact, ez_gfx_artifact::Stage::Mesh, entry_point)
+            .map(|inner| MeshShader { inner })
     }
 
     fn load_vertex_shader(&self, artifact: &[u8], entry_point: &str) -> Result<Self::VertexShader> {
@@ -882,159 +926,7 @@ impl Context {
     }
 }
 
-enum RenderTargetBacking {
-    Managed(String),
-    Surface {
-        format: ez_gfx_runtime::target::Format,
-        extent: (u32, u32),
-    },
-}
-
-struct RenderTargetInner {
-    context: Rc<ContextInner>,
-    backing: RenderTargetBacking,
-}
-impl RenderTargetInner {
-    fn managed_handle(&self) -> Result<RenderTargetHandle> {
-        let RenderTargetBacking::Managed(name) = &self.backing else {
-            return Err(Error::Unsupported);
-        };
-        self.context
-            .render_targets
-            .borrow()
-            .get(name)
-            .map(|target| target.handle)
-            .ok_or(Error::InvalidContext)
-    }
-}
-
-/// Owning logical render target.
-pub struct RenderTarget {
-    inner: Rc<RenderTargetInner>,
-    surface_lease: Option<Rc<SurfaceInner>>,
-}
-
-impl RenderTarget {
-    /// Returns the resolved target format.
-    ///
-    /// # Errors
-    /// Returns [`Error`] when the target is stale.
-    pub fn format(&self) -> Result<ez_gfx_runtime::target::Format> {
-        let context = Context {
-            inner: Rc::clone(&self.inner.context),
-            owner: false,
-        };
-        context.check_entry()?;
-        match &self.inner.backing {
-            RenderTargetBacking::Managed(name) => self
-                .inner
-                .context
-                .render_targets
-                .borrow()
-                .get(name)
-                .map(|target| target.format)
-                .ok_or(Error::InvalidContext),
-            RenderTargetBacking::Surface { format, .. } => Ok(*format),
-        }
-    }
-
-    /// Returns the target extent.
-    ///
-    /// # Errors
-    /// Returns [`Error`] when the target is stale.
-    pub fn extent(&self) -> Result<(u32, u32)> {
-        let context = Context {
-            inner: Rc::clone(&self.inner.context),
-            owner: false,
-        };
-        context.check_entry()?;
-        match &self.inner.backing {
-            RenderTargetBacking::Managed(name) => self
-                .inner
-                .context
-                .render_targets
-                .borrow()
-                .get(name)
-                .map(|target| target.extent)
-                .ok_or(Error::InvalidContext),
-            RenderTargetBacking::Surface { extent, .. } => Ok(*extent),
-        }
-    }
-
-    /// Returns the target clear value.
-    ///
-    /// # Errors
-    /// Returns [`Error`] when the target is stale.
-    pub fn clear(&self) -> Result<ez_gfx_runtime::target::ClearValue> {
-        let context = Context {
-            inner: Rc::clone(&self.inner.context),
-            owner: false,
-        };
-        context.check_entry()?;
-        match &self.inner.backing {
-            RenderTargetBacking::Managed(_) | RenderTargetBacking::Surface { .. } => {
-                Ok(ez_gfx_runtime::target::ClearValue::Color([
-                    0.1, 0.1, 0.1, 1.0,
-                ]))
-            }
-        }
-    }
-
-    /// Creates and schedules a unique readback request on `frame`.
-    ///
-    /// # Errors
-    /// Returns [`Error`] when the target is stale, foreign, already released, or not renderable.
-    pub fn prepare_readback(&self, frame: &mut Frame) -> Result<Readback> {
-        frame.prepare_target_readback(self)
-    }
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ReadbackState {
-    Queued,
-    Complete,
-    Aborted,
-}
-
-struct ReadbackInner {
-    _context: Rc<ContextInner>,
-    _target: Rc<RenderTargetInner>,
-    id: ReadbackId,
-    width: u32,
-    height: u32,
-    state: Cell<ReadbackState>,
-}
-
-/// Owning identity and target lease for one submitted readback.
-pub struct Readback {
-    inner: Rc<ReadbackInner>,
-}
-
-impl Readback {
-    /// Returns the opaque request identity delivered with its callback.
-    pub fn id(&self) -> ReadbackId {
-        self.inner.id
-    }
-}
-
-impl Context {
-    /// Probes one render-target format without allocating it.
-    ///
-    /// # Errors
-    /// Returns [`Error`] when the format or sample count is unsupported.
-    pub fn probe_render_target_format(
-        &self,
-        format: ez_gfx_runtime::target::Format,
-        samples: u8,
-    ) -> Result<()> {
-        self.check_entry()?;
-        self.complete(state::probe_render_target_format(
-            self.raw(),
-            format,
-            samples,
-        ))
-    }
-}
+include!("api_render_target.rs");
 
 struct VertexHeapInner {
     context: Rc<ContextInner>,

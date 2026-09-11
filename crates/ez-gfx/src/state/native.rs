@@ -67,6 +67,20 @@ pub(super) fn native_texture_compression(
     }
 }
 
+/// Returns the selected backend's mesh dispatch limits without allocation.
+pub(super) fn native_mesh_dispatch_limits(
+    context: &NativeContext,
+    has_task: bool,
+) -> std::result::Result<ez_gfx_hal::MeshDispatchLimits, HalError> {
+    match context {
+        NativeContext::Vulkan(native) => native.mesh_dispatch_limits(has_task),
+        #[cfg(windows)]
+        NativeContext::Dx12(native) => native.mesh_dispatch_limits(has_task),
+        #[cfg(target_vendor = "apple")]
+        NativeContext::Metal(native) => native.mesh_dispatch_limits(has_task),
+    }
+}
+
 pub(super) fn native_layouts(
     layout: &ez_gfx_runtime::binding::ReflectedBindings,
 ) -> std::result::Result<Vec<ez_gfx_hal::ShaderBufferLayout>, HalError> {
@@ -98,6 +112,17 @@ pub(super) fn pipeline_layout_key(
         )
     });
     key
+}
+pub(super) fn published_texture_handles_into(
+    published_mips: &HashMap<ez_gfx_core::handle::TextureHandle, u32>,
+    scratch: &mut Vec<ez_gfx_core::handle::TextureHandle>,
+) {
+    scratch.clear();
+    scratch.extend(
+        published_mips
+            .iter()
+            .filter_map(|(texture, mips)| (*mips != 0).then_some(*texture)),
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -226,6 +251,9 @@ pub(super) fn prepare_frame_binding_scratch(
     for payload in payloads {
         let range = match payload {
             super::ExecutableNode::Graphics {
+                layout, bindings, ..
+            }
+            | super::ExecutableNode::Mesh {
                 layout, bindings, ..
             }
             | super::ExecutableNode::Compute {
@@ -653,12 +681,13 @@ pub(super) fn map_hal(error: HalError) -> Error {
 mod binding_scratch_tests {
     use super::append_frame_bindings;
     use crate::state::frame::BindingProjection;
+    use crate::state::{MeshPipelineKeyDesc, PipelineKey};
     use ez_gfx_artifact::Stage;
     use ez_gfx_core::{
         Backend,
-        handle::{BufferHandle, LocalHandle, PackedHandle, ShaderHandle},
+        handle::{BufferHandle, LocalHandle, PackedHandle, ShaderHandle, TextureHandle},
     };
-    use ez_gfx_hal::QueueKind;
+    use ez_gfx_hal::{BlendMode, CullMode, FrontFace, MeshPipelineState, QueueKind};
     use ez_gfx_runtime::{
         binding::{PublicBinding, ReflectedBindings, ResourceIdentity},
         frame::{ExecutableNode, FrameRecorder},
@@ -712,6 +741,102 @@ mod binding_scratch_tests {
         operation();
         drop(guard);
         CALLS.get()
+    }
+
+    fn shader(slot: u32) -> ShaderHandle {
+        ShaderHandle::from_packed(
+            PackedHandle::child(
+                LocalHandle::new(1, 1).unwrap(),
+                LocalHandle::new(slot, 1).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn warmed_mesh_cache_key_and_texture_snapshot_perform_no_allocations() {
+        let metadata = br#"{"reflections":[
+            {"target":"Spirv","entry":"taskmain","stage":"Task","reflection":{"parameters":[{"semantic_name":"first","api_kind":"counter_buffer","binding_index":0,"binding_space":0}],"workgroup_size":[1,1,1]}},
+            {"target":"Spirv","entry":"meshmain","stage":"Mesh","reflection":{"parameters":[{"semantic_name":"second","api_kind":"buffer","binding_index":3,"binding_space":1}],"workgroup_size":[1,1,1]}},
+            {"target":"Spirv","entry":"fragmentmain","stage":"Fragment","reflection":{"parameters":[]}}
+        ]}"#;
+        let reflections = ez_gfx_runtime::binding::validate_stage_reflections(
+            metadata,
+            Backend::Vulkan,
+            &[
+                (Stage::Task, "taskmain"),
+                (Stage::Mesh, "meshmain"),
+                (Stage::Fragment, "fragmentmain"),
+            ],
+        )
+        .unwrap();
+        let stage_layouts = ez_gfx_hal::MeshStages {
+            task: Some(reflections[0].physical_layout_identity()),
+            mesh: reflections[1].physical_layout_identity(),
+            fragment: reflections[2].physical_layout_identity(),
+        };
+        let stages = (Some(shader(1)), shader(2), shader(3));
+        let state = MeshPipelineState {
+            cull: CullMode::Back,
+            front_face: FrontFace::CounterClockwise,
+            blend: BlendMode::Alpha,
+        };
+        let mut slot = None;
+        let prepare = |slot: &mut Option<PipelineKey>, has_task: bool| {
+            let selected_stage_layouts = ez_gfx_hal::MeshStages {
+                task: has_task.then_some(stage_layouts.task.unwrap()),
+                mesh: stage_layouts.mesh,
+                fragment: stage_layouts.fragment,
+            };
+            PipelineKey::prepare_mesh_slot(
+                slot,
+                MeshPipelineKeyDesc {
+                    backend: Backend::Vulkan,
+                    task_shader: has_task.then_some(stages.0.unwrap()),
+                    task_digest: has_task.then_some([1; 32]),
+                    task_entry: has_task.then_some("taskmain"),
+                    mesh_shader: stages.1,
+                    mesh_digest: [2; 32],
+                    mesh_entry: "meshmain",
+                    fragment_shader: stages.2,
+                    fragment_digest: [3; 32],
+                    fragment_entry: "fragmentmain",
+                    stage_layouts: &selected_stage_layouts,
+                    state,
+                    depth_required: true,
+                    color_format: 43,
+                    depth_format: 126,
+                    sample_count: 1,
+                },
+            );
+        };
+        prepare(&mut slot, true);
+        let task_key = slot.clone().unwrap();
+        prepare(&mut slot, false);
+        let cached = std::collections::HashSet::from([task_key, slot.clone().unwrap()]);
+        assert_eq!(cached.len(), 2);
+        let texture = TextureHandle::from_packed(
+            PackedHandle::child(
+                LocalHandle::new(1, 1).unwrap(),
+                LocalHandle::new(4, 1).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let published = std::collections::HashMap::from([(texture, 1)]);
+        let mut texture_scratch = Vec::new();
+        super::published_texture_handles_into(&published, &mut texture_scratch);
+
+        let calls = allocation_calls(|| {
+            for iteration in 0_usize..500 {
+                prepare(&mut slot, iteration.is_multiple_of(2));
+                assert!(cached.contains(slot.as_ref().unwrap()));
+                super::published_texture_handles_into(&published, &mut texture_scratch);
+                assert_eq!(texture_scratch.as_slice(), &[texture]);
+            }
+        });
+        assert_eq!(calls, 0);
     }
 
     #[test]

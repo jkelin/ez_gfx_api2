@@ -3,10 +3,10 @@ use super::{
     AllocatorCreateDesc, BACKEND, CompletionToken, CompressionSupport,
     DEFAULT_ALLOCATION_BLOCK_POLICY, DeferredNativeResource, DeferredResource, FRAMES_IN_FLIGHT,
     FrameSlot, FrameSlotTracker, HalError, MTLArgumentBuffersTier, MTLCommandBuffer,
-    MTLCommandBufferStatus, MTLCopyAllDevices, MTLCreateSystemDefaultDevice, MTLDevice,
-    MemoryAllocator, NativeContext, NativeSurface, ProtocolObject, QueueKind, Retained,
-    SemanticProfile, TEXTURE_DESCRIPTOR_CAPACITY, complete_deferred_slot, map_allocation_hal,
-    map_allocator, map_allocator_hal,
+    MTLCommandBufferStatus, MTLCopyAllDevices, MTLCreateSystemDefaultDevice, MTLDevice, MTLSize,
+    MemoryAllocator, NSInteger, NSProcessInfo, NativeContext, NativeSurface, ProtocolObject,
+    QueueKind, Retained, SemanticProfile, ShaderCapabilities, TEXTURE_DESCRIPTOR_CAPACITY,
+    complete_deferred_slot, map_allocation_hal, map_allocator, map_allocator_hal,
 };
 
 /// Architecture-guaranteed render-target roles per format.
@@ -50,6 +50,26 @@ fn target_format_support(max_color_samples: u8) -> Vec<ez_gfx_runtime::target::F
     ]
 }
 
+/// Minimum macOS major version shipping the Metal mesh-shader API (Metal 3).
+///
+/// GPU-family values alone cannot establish this: family identifiers exist on
+/// earlier releases, so the runtime version gates API availability.
+const MESH_SHADERS_MIN_MACOS_MAJOR: NSInteger = 13;
+
+/// Combines the macOS availability floor with the GPU-family probe into
+/// [`ShaderCapabilities`].
+///
+/// Both stages require a macOS 13+ runtime *and* a qualifying GPU family;
+/// either missing normalizes to disabled, keeping the `task => mesh`
+/// invariant that [`AdapterInfo::new`] enforces.
+const fn normalize_mesh_availability(
+    os_major: NSInteger,
+    family_supported: bool,
+) -> ShaderCapabilities {
+    let supported = os_major >= MESH_SHADERS_MIN_MACOS_MAJOR && family_supported;
+    ShaderCapabilities::normalized(supported, supported)
+}
+
 /// Describes one Metal device for identity and capabilities without creating queues.
 ///
 /// The stable identity derives from the registry ID and maximum buffer length,
@@ -62,6 +82,17 @@ fn describe_device(device: &ProtocolObject<dyn MTLDevice>) -> Result<AdapterInfo
     let tier_two = device.argumentBuffersSupport() == MTLArgumentBuffersTier::Tier2;
     let sampler_capacity =
         u32::try_from(device.maxArgumentBufferSamplerCount()).unwrap_or(u32::MAX);
+    // Family identifiers alone do not prove API availability (Apple7 predates
+    // macOS 13), so mesh support requires both a macOS 13+ runtime and a
+    // qualifying GPU: Apple7, its documented successors, or Mac2.
+    let os_major = NSProcessInfo::processInfo()
+        .operatingSystemVersion()
+        .majorVersion;
+    let family_supported = device.supportsFamily(objc2_metal::MTLGPUFamily::Apple7)
+        || device.supportsFamily(objc2_metal::MTLGPUFamily::Apple8)
+        || device.supportsFamily(objc2_metal::MTLGPUFamily::Apple9)
+        || device.supportsFamily(objc2_metal::MTLGPUFamily::Mac2);
+    let shader_stages = normalize_mesh_availability(os_major, family_supported);
     // BC and ASTC are independent: Apple GPUs can support both families.
     let mut compression = CompressionSupport::NONE;
     if device.supportsBCTextureCompression() {
@@ -80,6 +111,7 @@ fn describe_device(device: &ProtocolObject<dyn MTLDevice>) -> Result<AdapterInfo
         bindless_samplers: sampler_capacity,
         max_indirect_draw_count: u32::MAX,
         shader_model: 0x0605,
+        shader_stages,
         timeline_synchronization: true,
         resource_aliasing: true,
         dynamic_rendering: true,
@@ -177,6 +209,10 @@ impl NativeContext {
         device: Retained<ProtocolObject<dyn MTLDevice>>,
         adapter: AdapterInfo,
     ) -> Result<Self, HalError> {
+        // Mesh/object threadgroup products validated by later pipeline steps
+        // clamp against this coarse device ceiling; query once at admission.
+        // Pipeline-specific ceilings still apply at PSO creation.
+        let max_threads_per_threadgroup: MTLSize = device.maxThreadsPerThreadgroup();
         let queue = device.newCommandQueue().ok_or(HalError::NativeFailure)?;
         let transfer_queue = device.newCommandQueue().ok_or(HalError::NativeFailure)?;
         let texture_queue = device.newCommandQueue().ok_or(HalError::NativeFailure)?;
@@ -202,9 +238,10 @@ impl NativeContext {
             texture_completion_event.clone(),
         )
         .map_err(|_| HalError::NativeFailure)?;
-        Ok(Self {
+        let context = Self {
             device,
             queue,
+            max_threads_per_threadgroup,
             transfer_queue,
             texture_graphics_event,
             texture_completion_event,
@@ -236,7 +273,15 @@ impl NativeContext {
             pending_texture_transfers: Vec::new(),
             texture_worker: Some(texture_worker),
             texture_staging: ez_gfx_hal::ReusableStagingPool::new(256),
-        })
+        };
+        // The cached limit and the normalized stages derive from the same
+        // device; a mesh-capable device must report a nonzero limit.
+        debug_assert!(
+            !context.adapter.capabilities().shader_stages.mesh
+                || context.max_threads_per_threadgroup.width > 0,
+            "cached threadgroup limit agrees with normalized shader stages"
+        );
+        Ok(context)
     }
 
     /// Returns the immutable identity and capabilities of the admitted adapter.
@@ -549,6 +594,36 @@ impl NativeContext {
     }
 }
 
+#[cfg(test)]
+mod mesh_tests {
+    use super::normalize_mesh_availability;
+
+    #[test]
+    fn mesh_availability_rejects_pre_metal3_runtime_with_family() {
+        // macOS 12 with a qualifying family still disables both stages: the
+        // family identifier alone does not prove API availability.
+        let stages = normalize_mesh_availability(12, true);
+        assert!(!stages.task);
+        assert!(!stages.mesh);
+        assert!(stages.is_valid());
+    }
+
+    #[test]
+    fn mesh_availability_admits_metal3_runtime_with_family() {
+        let stages = normalize_mesh_availability(13, true);
+        assert!(stages.task);
+        assert!(stages.mesh);
+        assert!(stages.is_valid());
+    }
+
+    #[test]
+    fn mesh_availability_rejects_metal3_runtime_without_family() {
+        let stages = normalize_mesh_availability(13, false);
+        assert!(!stages.task);
+        assert!(!stages.mesh);
+        assert!(stages.is_valid());
+    }
+}
 #[cfg(test)]
 mod target_tests {
     use super::target_format_support;

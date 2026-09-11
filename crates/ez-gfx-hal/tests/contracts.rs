@@ -337,3 +337,74 @@ fn texture_regions_enforce_bounds_blocks_and_edge_extents() {
         assert!(validate_texture_region(TextureFormat::Bc7Unorm, 10, 9, 1, invalid).is_err());
     }
 }
+
+#[test]
+fn mesh_dispatch_validation_rejects_zero_overflow_and_native_limits() {
+    use ez_gfx_hal::{MeshDispatchError, MeshDispatchLimits, validate_mesh_dispatch};
+
+    let limits = MeshDispatchLimits {
+        max_groups: [65_535, 65_535, 65_535],
+        max_total_groups: 1024,
+        max_mesh_threads: 128,
+        max_task_threads: 64,
+    };
+    assert_eq!(
+        validate_mesh_dispatch([0, 1, 1], [32, 1, 1], None, limits),
+        Err(MeshDispatchError::InvalidGroups)
+    );
+    assert_eq!(
+        validate_mesh_dispatch([u32::MAX; 3], [32, 1, 1], None, limits),
+        Err(MeshDispatchError::InvalidGroups)
+    );
+    assert_eq!(
+        validate_mesh_dispatch([65_536, 1, 1], [32, 1, 1], None, limits),
+        Err(MeshDispatchError::InvalidGroups)
+    );
+    assert_eq!(
+        validate_mesh_dispatch([33, 32, 1], [32, 1, 1], None, limits),
+        Err(MeshDispatchError::InvalidGroups)
+    );
+    assert_eq!(
+        validate_mesh_dispatch([1, 1, 1], [0, 1, 1], None, limits),
+        Err(MeshDispatchError::InvalidWorkgroup)
+    );
+    assert_eq!(
+        validate_mesh_dispatch([1, 1, 1], [u32::MAX; 3], None, limits),
+        Err(MeshDispatchError::InvalidWorkgroup)
+    );
+    assert_eq!(
+        validate_mesh_dispatch([1, 1, 1], [129, 1, 1], None, limits),
+        Err(MeshDispatchError::UnsupportedWorkgroup)
+    );
+    assert_eq!(
+        validate_mesh_dispatch([1, 1, 1], [32, 1, 1], Some([65, 1, 1]), limits),
+        Err(MeshDispatchError::UnsupportedWorkgroup)
+    );
+    assert!(validate_mesh_dispatch([4, 2, 1], [32, 1, 1], Some([64, 1, 1]), limits).is_ok());
+}
+
+#[test]
+fn mesh_pipeline_state_has_no_vertex_topology() {
+    use ez_gfx_hal::{BlendMode, CullMode, FrontFace, MeshPipelineState};
+
+    let state = MeshPipelineState {
+        cull: CullMode::Back,
+        front_face: FrontFace::CounterClockwise,
+        blend: BlendMode::Alpha,
+    };
+    assert_eq!(state.cull, CullMode::Back);
+    assert_eq!(state.blend, BlendMode::Alpha);
+}
+
+#[test]
+fn task_and_mesh_stage_values_append_the_existing_abi() {
+    use ez_gfx_hal::ShaderStage;
+
+    assert_eq!(ShaderStage::None as u8, 0);
+    assert_eq!(ShaderStage::Vertex as u8, 1);
+    assert_eq!(ShaderStage::Fragment as u8, 2);
+    assert_eq!(ShaderStage::Compute as u8, 3);
+    assert_eq!(ShaderStage::AllGraphics as u8, 4);
+    assert_eq!(ShaderStage::Task as u8, 5);
+    assert_eq!(ShaderStage::Mesh as u8, 6);
+}

@@ -43,7 +43,7 @@ void computemain(uint3 id : SV_DispatchThreadID) {
     )
     .unwrap();
     let (product_index, _, entry) = runtime.shader_product();
-    let threads_per_group = runtime.compute_workgroup_size().unwrap();
+    let threads_per_group = runtime.workgroup_size().unwrap();
     assert_eq!(threads_per_group, [8, 2, 1]);
 
     let products = runtime
@@ -195,7 +195,7 @@ void computemain(uint3 id : SV_DispatchThreadID) {
     let action = NativeFrameAction::Compute(NativeComputeDispatch {
         pipeline: &pipeline,
         groups: [1, 1, 1],
-        threads_per_group: runtime.compute_workgroup_size().unwrap(),
+        threads_per_group: runtime.workgroup_size().unwrap(),
         bindings: &native_bindings,
         texture_heap: Some(texture_heap),
         textures: &textures,

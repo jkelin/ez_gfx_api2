@@ -48,6 +48,7 @@ impl DxFrameEncoder<'_> {
                 }
                 NativeFrameAction::Compute(dispatch) => self.compute(dispatch)?,
                 NativeFrameAction::Graphics(draw) => self.graphics(action_index, draw)?,
+                NativeFrameAction::Mesh(dispatch) => self.mesh(dispatch)?,
                 NativeFrameAction::TextureReadback { texture, .. } => {
                     self.texture_readback(texture)?;
                 }

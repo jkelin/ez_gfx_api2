@@ -257,7 +257,7 @@ pub fn admission_report(info: &AdapterInfo, allow_software: bool) -> AdapterRepo
 mod adapter_tests {
     use super::*;
     use ez_gfx_core::Backend;
-    use ez_gfx_core::capability::{AdapterCapabilities, CompressionSupport};
+    use ez_gfx_core::capability::{AdapterCapabilities, CompressionSupport, ShaderCapabilities};
 
     fn capable() -> AdapterCapabilities {
         AdapterCapabilities {
@@ -266,6 +266,7 @@ mod adapter_tests {
             bindless_samplers: 1024,
             max_indirect_draw_count: 65_535,
             shader_model: 0x0605,
+            shader_stages: ShaderCapabilities::default(),
             timeline_synchronization: true,
             resource_aliasing: true,
             dynamic_rendering: true,

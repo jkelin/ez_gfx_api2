@@ -12,7 +12,10 @@ pub(super) fn record_compute(
 ) -> Result<(), HalError> {
     // SAFETY: pipeline, descriptor sets, and command buffer belong to the live context.
     unsafe {
-        if pass_active || dispatch.groups.contains(&0) {
+        if pass_active
+            || dispatch.groups.contains(&0)
+            || dispatch.pipeline.kind != super::super::NativePipelineKind::Compute
+        {
             return Err(HalError::InvalidArgument);
         }
         let public = *public_set.ok_or(HalError::InvalidArgument)?;
@@ -44,12 +47,11 @@ pub(super) fn record_graphics(
     draw: &super::super::NativeDrawIndexed<'_>,
     public_set: Option<&vk::DescriptorSet>,
     texture_set: vk::DescriptorSet,
-    swapchain_extent: vk::Extent2D,
     pass_active: bool,
 ) -> Result<(), HalError> {
     // SAFETY: pipeline, descriptor sets, buffers, and command buffer belong to the live context.
     unsafe {
-        if !pass_active {
+        if !pass_active || draw.pipeline.kind != super::super::NativePipelineKind::Graphics {
             return Err(HalError::InvalidArgument);
         }
         let public = *public_set.ok_or(HalError::InvalidArgument)?;
@@ -85,7 +87,10 @@ pub(super) fn record_graphics(
             0,
             &[vk::Rect2D {
                 offset: vk::Offset2D::default(),
-                extent: swapchain_extent,
+                extent: vk::Extent2D {
+                    width: draw.width,
+                    height: draw.height,
+                },
             }],
         );
         encoding.device.cmd_bind_index_buffer(
@@ -102,6 +107,91 @@ pub(super) fn record_graphics(
             0,
             draw.draw_count,
             20,
+        );
+    }
+    Ok(())
+}
+
+/// Retained EXT dispatch loader plus the native limits its grids are checked against.
+pub(super) struct MeshSupport<'a> {
+    pub(super) loader: &'a ash::ext::mesh_shader::Device,
+    pub(super) limits: &'a super::super::MeshShaderLimits,
+}
+
+pub(super) fn record_mesh(
+    encoding: &VulkanEncoding<'_>,
+    support: &MeshSupport<'_>,
+    draw: &super::super::NativeMeshDraw<'_>,
+    public_set: Option<&vk::DescriptorSet>,
+    texture_set: vk::DescriptorSet,
+    pass_active: bool,
+) -> Result<(), HalError> {
+    // SAFETY: pipeline, descriptor sets, and command buffer belong to the live context, and the EXT loader was created from the same device.
+    unsafe {
+        // Mesh work executes only inside a normal render pass and only through
+        // an exact mesh pipeline whose retained task-stage identity agrees.
+        if !pass_active
+            || !matches!(
+                draw.pipeline.kind,
+                super::super::NativePipelineKind::Mesh { task_stage }
+                    if task_stage == draw.has_task
+            )
+        {
+            return Err(HalError::InvalidArgument);
+        }
+        super::super::check_mesh_groups(
+            support.limits,
+            draw.has_task,
+            draw.groups,
+            draw.mesh_workgroup_size,
+            draw.task_workgroup_size,
+        )?;
+        let public = *public_set.ok_or(HalError::InvalidArgument)?;
+        encoding.device.cmd_bind_pipeline(
+            encoding.command,
+            vk::PipelineBindPoint::GRAPHICS,
+            draw.pipeline.pipeline,
+        );
+        encoding.device.cmd_bind_descriptor_sets(
+            encoding.command,
+            vk::PipelineBindPoint::GRAPHICS,
+            draw.pipeline.layout,
+            0,
+            &[public, texture_set],
+            &[],
+        );
+        encoding.device.cmd_set_viewport(
+            encoding.command,
+            0,
+            &[vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: f32::from(u16::try_from(draw.width).map_err(|_| HalError::InvalidArgument)?),
+                height: f32::from(
+                    u16::try_from(draw.height).map_err(|_| HalError::InvalidArgument)?,
+                ),
+                min_depth: 0.0,
+                max_depth: 1.0,
+            }],
+        );
+        encoding.device.cmd_set_scissor(
+            encoding.command,
+            0,
+            &[vk::Rect2D {
+                offset: vk::Offset2D::default(),
+                extent: vk::Extent2D {
+                    width: draw.width,
+                    height: draw.height,
+                },
+            }],
+        );
+        // EXT-only mesh dispatch: no index buffer, no indirect command signature.
+        // SAFETY: group counts passed the retained native limit check above.
+        support.loader.cmd_draw_mesh_tasks(
+            encoding.command,
+            draw.groups[0],
+            draw.groups[1],
+            draw.groups[2],
         );
     }
     Ok(())

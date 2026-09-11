@@ -3,7 +3,7 @@ use core::fmt;
 use crate::Backend;
 
 /// Version of the normalized capability profile schema.
-pub const CAPABILITY_PROFILE_SCHEMA_VERSION: u32 = 1;
+pub const CAPABILITY_PROFILE_SCHEMA_VERSION: u32 = 2;
 /// Maximum supported bindless sampled textures in the semantic profile.
 pub const MAX_BINDLESS_SAMPLED_TEXTURES: u32 = 1024;
 
@@ -154,6 +154,36 @@ impl CompressionSupport {
     }
 }
 
+/// Optional programmable shader stages enabled on an initialized device.
+///
+/// Task shaders are only valid when mesh shaders are also enabled.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ShaderCapabilities {
+    /// Whether task shaders are enabled.
+    pub task: bool,
+    /// Whether mesh shaders are enabled.
+    pub mesh: bool,
+}
+
+impl ShaderCapabilities {
+    /// Normalizes raw stage support while enforcing the task-to-mesh dependency.
+    ///
+    /// A task-only signal is treated as no optional stage support because task
+    /// shaders cannot execute without mesh shaders.
+    #[must_use]
+    pub const fn normalized(task: bool, mesh: bool) -> Self {
+        Self {
+            task: task && mesh,
+            mesh,
+        }
+    }
+
+    /// Returns whether the cross-backend task/mesh dependency is satisfied.
+    pub const fn is_valid(self) -> bool {
+        !self.task || self.mesh
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Hardware limits and feature flags exposed through the normalized adapter profile.
 #[allow(
@@ -171,6 +201,8 @@ pub struct AdapterCapabilities {
     pub max_indirect_draw_count: u32,
     /// Backend-native shader capability normalized as `(major << 8) | minor`.
     pub shader_model: u32,
+    /// Optional shader stages enabled on the device.
+    pub shader_stages: ShaderCapabilities,
     /// Whether timeline synchronization is available.
     pub timeline_synchronization: bool,
     /// Whether resources may alias the same allocation.
@@ -320,8 +352,9 @@ impl AdapterInfo {
     ///
     /// # Errors
     ///
-    /// Returns [`AdapterError::UnstableIdentity`] for an all-zero ID or
-    /// [`AdapterError::InvalidText`] when the name or driver is empty.
+    /// Returns [`AdapterError::UnstableIdentity`] for an all-zero ID,
+    /// [`AdapterError::InvalidText`] when the name or driver is empty, or
+    /// [`AdapterError::InvalidCapabilities`] when task shaders are reported without mesh shaders.
     pub fn new(
         backend: Backend,
         stable_id: [u8; 16],
@@ -337,6 +370,9 @@ impl AdapterInfo {
         }
         if name.is_empty() || driver.is_empty() {
             return Err(AdapterError::InvalidText);
+        }
+        if !capabilities.shader_stages.is_valid() {
+            return Err(AdapterError::InvalidCapabilities);
         }
 
         Ok(Self {
@@ -382,6 +418,8 @@ pub enum AdapterError {
     UnstableIdentity,
     /// Adapter name or driver text is empty.
     InvalidText,
+    /// Adapter capabilities violate a cross-field invariant.
+    InvalidCapabilities,
     /// No adapter passed admission and selection policy.
     NoAdmittedAdapter,
 }

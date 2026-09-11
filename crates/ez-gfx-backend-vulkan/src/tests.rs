@@ -126,39 +126,123 @@ fn resource_access_selects_compatible_pipeline_stages() {
     let cases = [
         (
             ResourceAccess::IndexRead,
+            ShaderStage::None,
             vk::PipelineStageFlags::VERTEX_INPUT,
         ),
         (
             ResourceAccess::IndirectRead,
+            ShaderStage::None,
             vk::PipelineStageFlags::DRAW_INDIRECT,
         ),
         (
             ResourceAccess::ColorAttachmentWrite,
+            ShaderStage::Fragment,
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
         ),
         (
             ResourceAccess::DepthStencilWrite,
+            ShaderStage::Fragment,
             vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
                 | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
         ),
         (
             ResourceAccess::TransferRead,
+            ShaderStage::None,
             vk::PipelineStageFlags::TRANSFER,
         ),
         (
             ResourceAccess::Present,
+            ShaderStage::None,
             vk::PipelineStageFlags::BOTTOM_OF_PIPE,
         ),
     ];
 
-    for (access, expected) in cases {
-        let (stage, _, _) = vulkan_state(ResourceState {
-            queue: QueueKind::Graphics,
-            stage: ShaderStage::Fragment,
-            access,
-        });
+    for (access, shader_stage, expected) in cases {
+        let (stage, _, _) = vulkan_state(
+            ResourceState {
+                queue: QueueKind::Graphics,
+                stage: shader_stage,
+                access,
+            },
+            ez_gfx_core::capability::ShaderCapabilities {
+                task: false,
+                mesh: false,
+            },
+        )
+        .unwrap();
         assert_eq!(stage, expected, "{access:?}");
     }
+}
+
+#[test]
+fn disabled_mesh_stages_never_lower_unsupported_vulkan_bits() {
+    let disabled = ez_gfx_core::capability::ShaderCapabilities {
+        task: false,
+        mesh: false,
+    };
+    for stage in [ShaderStage::Task, ShaderStage::Mesh] {
+        assert_eq!(
+            vulkan_state(
+                ResourceState {
+                    queue: QueueKind::Graphics,
+                    stage,
+                    access: ResourceAccess::SampledRead,
+                },
+                disabled,
+            )
+            .map(|_| ()),
+            Err(HalError::Unsupported)
+        );
+    }
+
+    let enabled = ez_gfx_core::capability::ShaderCapabilities {
+        task: true,
+        mesh: true,
+    };
+    assert_eq!(
+        vulkan_state(
+            ResourceState {
+                queue: QueueKind::Graphics,
+                stage: ShaderStage::Task,
+                access: ResourceAccess::SampledRead,
+            },
+            enabled,
+        )
+        .unwrap()
+        .0,
+        vk::PipelineStageFlags::TASK_SHADER_EXT
+    );
+}
+
+#[test]
+fn compute_to_mesh_hazard_uses_exact_shader_stages() {
+    let capabilities = ez_gfx_core::capability::ShaderCapabilities {
+        task: true,
+        mesh: true,
+    };
+    let (compute_stage, compute_access, _) = vulkan_state(
+        ResourceState {
+            queue: QueueKind::Compute,
+            stage: ShaderStage::Compute,
+            access: ResourceAccess::StorageWrite,
+        },
+        capabilities,
+    )
+    .unwrap();
+    let (mesh_stage, mesh_access, _) = vulkan_state(
+        ResourceState {
+            queue: QueueKind::Graphics,
+            stage: ShaderStage::Mesh,
+            access: ResourceAccess::StorageRead,
+        },
+        capabilities,
+    )
+    .unwrap();
+
+    assert_eq!(compute_stage, vk::PipelineStageFlags::COMPUTE_SHADER);
+    assert_eq!(compute_access, vk::AccessFlags::SHADER_WRITE);
+    assert_eq!(mesh_stage, vk::PipelineStageFlags::MESH_SHADER_EXT);
+    assert_eq!(mesh_access, vk::AccessFlags::SHADER_READ);
 }
 
 #[test]

@@ -40,17 +40,22 @@ impl NativeContext {
         barrier: &ez_gfx_hal::ExecutionBarrier,
         resource: &NativeFrameResource<'_>,
     ) -> Result<(), HalError> {
+        let capabilities = self
+            .adapter_info()
+            .ok_or(HalError::NotReady)?
+            .capabilities()
+            .shader_stages;
         // SAFETY: all handles belong to the live context and ranges were validated during preflight.
         unsafe {
-            let (src_stage, src_access, old_layout) = barrier.before.map_or(
-                (
+            let (src_stage, src_access, old_layout) = match barrier.before {
+                Some(before) => vulkan_state(before, capabilities)?,
+                None => (
                     vk::PipelineStageFlags::TOP_OF_PIPE,
                     vk::AccessFlags::empty(),
                     vk::ImageLayout::UNDEFINED,
                 ),
-                vulkan_state,
-            );
-            let (dst_stage, dst_access, new_layout) = vulkan_state(barrier.after);
+            };
+            let (dst_stage, dst_access, new_layout) = vulkan_state(barrier.after, capabilities)?;
             match resource {
                 NativeFrameResource::Buffer(allocation) => {
                     let ez_gfx_hal::ExecutionRange::Buffer(range) = barrier.range else {
@@ -496,6 +501,7 @@ impl NativeContext {
             let bindings = match action {
                 NativeFrameAction::Compute(dispatch) => Some(dispatch.bindings.len()),
                 NativeFrameAction::Graphics(draw) => Some(draw.bindings.len()),
+                NativeFrameAction::Mesh(draw) => Some(draw.bindings.len()),
                 _ => None,
             };
             if let Some(count) = bindings {
@@ -539,6 +545,7 @@ impl NativeContext {
                     Some((dispatch.pipeline, dispatch.bindings))
                 }
                 NativeFrameAction::Graphics(draw) => Some((draw.pipeline, draw.bindings)),
+                NativeFrameAction::Mesh(draw) => Some((draw.pipeline, draw.bindings)),
                 _ => None,
             };
             let Some((pipeline, bindings)) = bindings else {
@@ -898,7 +905,27 @@ impl NativeContext {
                             draw,
                             public_set(public_sets, action_index),
                             prepared.texture_set,
-                            self.swapchain_extent,
+                            pass_active,
+                        )?;
+                    }
+                    NativeFrameAction::Mesh(draw) => {
+                        // Mesh support was rejected at pipeline creation; a missing
+                        // loader or limits here means the pipeline never existed.
+                        let loader = self
+                            .mesh_shader_loader
+                            .as_ref()
+                            .ok_or(HalError::Unsupported)?;
+                        let limits = self
+                            .mesh_shader_limits
+                            .as_ref()
+                            .ok_or(HalError::Unsupported)?;
+                        let support = record::MeshSupport { loader, limits };
+                        record::record_mesh(
+                            &encoding,
+                            &support,
+                            draw,
+                            public_set(public_sets, action_index),
+                            prepared.texture_set,
                             pass_active,
                         )?;
                     }
@@ -975,6 +1002,20 @@ impl NativeContext {
             return Err(HalError::InvalidArgument);
         }
         let (mut surface, extent, presentation_mode) = validate_surface_request(surface)?;
+        let shader_capabilities = self
+            .adapter_info()
+            .ok_or(HalError::NotReady)?
+            .capabilities()
+            .shader_stages;
+        actions.visit(&mut |_, action| {
+            if let NativeFrameAction::Barrier { barrier, .. } = action {
+                if let Some(before) = barrier.before {
+                    vulkan_state(before, shader_capabilities)?;
+                }
+                vulkan_state(barrier.after, shader_capabilities)?;
+            }
+            Ok(())
+        })?;
         let FramePlan {
             uses_surface,
             presents,
@@ -1149,3 +1190,5 @@ mod public_set_tests {
         assert_eq!(public_set(&[], 1), None);
     }
 }
+
+include!("frame_mesh_tests.rs");

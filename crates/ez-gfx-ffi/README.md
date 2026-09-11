@@ -2,11 +2,11 @@
 
 `ez-gfx-ffi` is the C ABI boundary for the `ez-gfx` runtime. C and other foreign-language clients include [`bindings/c/include/ez_gfx_api.h`](../../bindings/c/include/ez_gfx_api.h). Rust declarations and documentation are authoritative; `tools/bindgen` generates the XML contract and C header. Rust clients should depend on `ez-gfx`, not `ez-gfx-ffi`.
 
-The complete [C textured cube](../../examples/02_textured_cube_c/README.md) exercises ABI 40 portable GLFW window handles, presentation-mode selection, typed heap/allocation handles, one-frame compute-to-graphics buffers, creator-thread callbacks, resource diagnostics, stable error printing, and snapshot readback.
+The complete [C textured cube](../../examples/02_textured_cube_c/README.md) exercises portable GLFW window handles, presentation-mode selection, typed heap/allocation handles, one-frame compute-to-graphics buffers, creator-thread callbacks, resource diagnostics, stable error printing, and snapshot readback.
 
 ## Compatibility and ownership
 
-Before any other call, require `ez_gfx_abi_version() == EZ_GFX_ABI_VERSION` (ABI 40). Window and headless creation use separate descriptors. `EzGfxWindowSurfaceDesc` carries a validated native-window-system tag and handles but no extent; native code queries the drawable size. `EzGfxHeadlessSurfaceDesc` alone carries an explicit extent. Operations use canonical `ez_gfx_{object}_{operation}` names and context-first signatures.
+Before any other call, require `ez_gfx_abi_version() == EZ_GFX_ABI_VERSION`. Window and headless creation use separate descriptors. `EzGfxWindowSurfaceDesc` carries a validated native-window-system tag and handles but no extent; native code queries the drawable size. `EzGfxHeadlessSurfaceDesc` alone carries an explicit extent. Operations use canonical `ez_gfx_{object}_{operation}` names and context-first signatures.
 
 `ez_gfx_handle_inspect` decodes a packed handle into its context/child slot and generation fields; it does not validate that the handle is live in a context. `ez_gfx_semantic_id` accepts an exact 1-to-255-byte canonical semantic name and writes its fixed 16-byte identifier. Semantic names are ASCII dot-separated identifiers: every non-empty segment starts with an ASCII letter and continues with ASCII letters, digits, or underscores. Empty segments, non-ASCII bytes, embedded NUL, and terminators included in the supplied length are invalid.
 

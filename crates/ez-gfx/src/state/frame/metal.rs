@@ -4,10 +4,11 @@ use ez_gfx_core::capability::PresentationMode;
 use super::{
     Backend, ContextState, Error, ExecutableNode, ExecutionAction, FrameBindingSource,
     FrameBufferBindingRecord, FrameExecutionPlan, FrameNativeResource, GeometryAllocation, HashMap,
-    MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext, NativePipeline, NativeShader,
-    NativeSurface, NativeTexture, PipelineKey, RenderTargetHandle, RenderTargetRecord, ResourceId,
-    SURFACE_DEFAULT_CLEAR, ShaderRecord, TextureHandle, TextureId, map_hal, native_layouts,
-    pipeline_layout_key, prepare_frame_binding_scratch, should_capture_presented,
+    MAX_PIPELINE_CACHE_ENTRIES, MeshPipelineKeyDesc, MetalWorkgroupSizes, NativeAllocation,
+    NativeContext, NativePipeline, NativeShader, NativeSurface, NativeTexture, PipelineKey,
+    RenderTargetHandle, RenderTargetRecord, ResourceId, SURFACE_DEFAULT_CLEAR, ShaderRecord,
+    TextureHandle, TextureId, map_hal, native_layouts, pipeline_layout_key,
+    prepare_frame_binding_scratch, should_capture_presented,
 };
 use arrayvec::ArrayVec;
 use ez_gfx_backend_metal::native::{
@@ -32,6 +33,11 @@ type PreparedGraphicsPipeline = (
     PipelineKey,
     Option<NativePipeline>,
     Option<ShaderTextureHeapLayout>,
+);
+type PreparedMeshPipeline = (
+    Option<NativePipeline>,
+    Option<ShaderTextureHeapLayout>,
+    MetalWorkgroupSizes,
 );
 type MetalTextureRecords = HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>;
 
@@ -72,7 +78,7 @@ fn prepare_compute_pipeline(
     let texture_heap = metal_texture_heap(compute_layout.texture_heap())?;
     let workgroup_size = record
         .runtime
-        .compute_workgroup_size()
+        .workgroup_size()
         .map_err(|_| Error::InvalidArgument)?;
     let key = PipelineKey::Compute {
         backend: Backend::Metal,
@@ -93,6 +99,13 @@ fn prepare_compute_pipeline(
 
     Ok((key, pipeline, texture_heap, workgroup_size))
 }
+// `None` is the surface cache domain; runtime format discriminants keep targets distinct.
+fn metal_color_format_key(format: Option<ez_gfx_runtime::target::Format>) -> u32 {
+    match format {
+        None => 0,
+        Some(format) => u32::from(format as u8),
+    }
+}
 
 fn prepare_graphics_pipeline(
     shaders: &HashMap<ShaderHandle, ShaderRecord>,
@@ -103,6 +116,7 @@ fn prepare_graphics_pipeline(
     layout: &ReflectedBindings,
     pipeline_layout: &PipelineLayout,
     state: DynamicPipelineState,
+    color_format: Option<ez_gfx_runtime::target::Format>,
 ) -> Result<PreparedGraphicsPipeline> {
     let vertex = shaders.get(&vertex_shader).ok_or(Error::InvalidContext)?;
     let fragment = shaders.get(&fragment_shader).ok_or(Error::InvalidContext)?;
@@ -137,7 +151,7 @@ fn prepare_graphics_pipeline(
         texture_heap,
         state,
         depth_required,
-        color_format: 80,
+        color_format: metal_color_format_key(color_format),
         depth_format: if depth_required { 252 } else { 0 },
         sample_count: 1,
     };
@@ -152,6 +166,7 @@ fn prepare_graphics_pipeline(
                     &(vertex.product, vertex.entry.clone()),
                     &(fragment.product, fragment.entry.clone()),
                     state,
+                    color_format,
                     depth_required,
                     vertex_texture_heap,
                     fragment_texture_heap,
@@ -161,6 +176,152 @@ fn prepare_graphics_pipeline(
     };
 
     Ok((key, pipeline, texture_heap))
+}
+
+fn prepare_mesh_pipeline(
+    shaders: &HashMap<ShaderHandle, ShaderRecord>,
+    pipelines: &HashMap<PipelineKey, NativePipeline>,
+    key_slot: &mut Option<PipelineKey>,
+    native: &MetalContext,
+    stages: ez_gfx_hal::MeshStages<ShaderHandle>,
+    stage_layouts: &ez_gfx_hal::MeshStages<ez_gfx_runtime::binding::StageLayoutIdentity>,
+    pipeline_layout: &PipelineLayout,
+    state: ez_gfx_hal::MeshPipelineState,
+    color_format: Option<ez_gfx_runtime::target::Format>,
+) -> Result<PreparedMeshPipeline> {
+    let mesh = shaders.get(&stages.mesh).ok_or(Error::InvalidContext)?;
+    let fragment = shaders.get(&stages.fragment).ok_or(Error::InvalidContext)?;
+    let task = stages
+        .task
+        .map(|handle| shaders.get(&handle).ok_or(Error::InvalidContext))
+        .transpose()?;
+    let NativeShader::Metal(mesh_native) = &mesh.native else {
+        return Err(Error::NativeFailure);
+    };
+    let NativeShader::Metal(fragment_native) = &fragment.native else {
+        return Err(Error::NativeFailure);
+    };
+    let task_native = task
+        .map(|record| match &record.native {
+            NativeShader::Metal(shader) => Ok(shader),
+            _ => Err(Error::NativeFailure),
+        })
+        .transpose()?;
+
+    let texture_heap = metal_texture_heap(pipeline_layout.texture_heap())?;
+    let task_texture_heap = task
+        .map(|record| {
+            record
+                .runtime
+                .pipeline_layout(ez_gfx_artifact::Stage::Task)
+                .map_err(|_| Error::InvalidArgument)
+                .and_then(|layout| metal_texture_heap(layout.texture_heap()))
+        })
+        .transpose()?
+        .flatten();
+    let mesh_texture_heap = metal_texture_heap(
+        mesh.runtime
+            .pipeline_layout(ez_gfx_artifact::Stage::Mesh)
+            .map_err(|_| Error::InvalidArgument)?
+            .texture_heap(),
+    )?;
+    let fragment_texture_heap = metal_texture_heap(
+        fragment
+            .runtime
+            .pipeline_layout(ez_gfx_artifact::Stage::Fragment)
+            .map_err(|_| Error::InvalidArgument)?
+            .texture_heap(),
+    )?;
+    let task_threads = task
+        .map(|record| record.runtime.workgroup_size())
+        .transpose()
+        .map_err(|_| Error::InvalidArgument)?;
+    let mesh_threads = mesh
+        .runtime
+        .workgroup_size()
+        .map_err(|_| Error::InvalidArgument)?;
+    let depth_required = pipeline_layout.depth_required();
+    let key = PipelineKey::prepare_mesh_slot(
+        key_slot,
+        MeshPipelineKeyDesc {
+            backend: Backend::Metal,
+            task_shader: stages.task,
+            task_digest: task.map(|record| record.digest),
+            task_entry: task.map(|record| record.entry.as_str()),
+            mesh_shader: stages.mesh,
+            mesh_digest: mesh.digest,
+            mesh_entry: &mesh.entry,
+            fragment_shader: stages.fragment,
+            fragment_digest: fragment.digest,
+            fragment_entry: &fragment.entry,
+            stage_layouts,
+            state,
+            depth_required,
+            color_format: metal_color_format_key(color_format),
+            depth_format: if depth_required { 252 } else { 0 },
+            sample_count: 1,
+        },
+    );
+    let pipeline = if pipelines.contains_key(key) {
+        None
+    } else {
+        let task_buffer_layouts = task
+            .map(|record| {
+                record
+                    .runtime
+                    .bindings(ez_gfx_artifact::Stage::Task)
+                    .map_err(|_| Error::InvalidArgument)
+                    .and_then(|layout| native_layouts(&layout).map_err(map_hal))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let mesh_buffer_layouts = native_layouts(
+            &mesh
+                .runtime
+                .bindings(ez_gfx_artifact::Stage::Mesh)
+                .map_err(|_| Error::InvalidArgument)?,
+        )
+        .map_err(map_hal)?;
+        let fragment_buffer_layouts = native_layouts(
+            &fragment
+                .runtime
+                .bindings(ez_gfx_artifact::Stage::Fragment)
+                .map_err(|_| Error::InvalidArgument)?,
+        )
+        .map_err(map_hal)?;
+        let task_identity = task.map(|record| (record.product, record.entry.clone()));
+        Some(NativePipeline::Metal(
+            native
+                .create_mesh_pipeline(
+                    task_native,
+                    mesh_native,
+                    fragment_native,
+                    task_identity.as_ref(),
+                    &(mesh.product, mesh.entry.clone()),
+                    &(fragment.product, fragment.entry.clone()),
+                    state,
+                    color_format,
+                    depth_required,
+                    task_texture_heap,
+                    mesh_texture_heap,
+                    fragment_texture_heap,
+                    &task_buffer_layouts,
+                    &mesh_buffer_layouts,
+                    &fragment_buffer_layouts,
+                    task_threads,
+                    mesh_threads,
+                )
+                .map_err(map_hal)?,
+        ))
+    };
+    Ok((
+        pipeline,
+        texture_heap,
+        MetalWorkgroupSizes::Mesh {
+            task: task_threads,
+            mesh: mesh_threads,
+        },
+    ))
 }
 
 fn cache_metal_pipeline(
@@ -196,21 +357,52 @@ fn prepare_metal_pipelines(
     payloads: &[ExecutableNode],
     keys: &mut Vec<Option<PipelineKey>>,
     texture_heaps: &mut Vec<Option<ShaderTextureHeapLayout>>,
-    workgroup_sizes: &mut Vec<Option<[u32; 3]>>,
+    workgroup_sizes: &mut Vec<Option<MetalWorkgroupSizes>>,
+    color_format: Option<ez_gfx_runtime::target::Format>,
 ) -> Result<()> {
-    keys.clear();
+    keys.truncate(payloads.len());
     keys.resize_with(payloads.len(), || None);
     texture_heaps.clear();
     texture_heaps.resize(payloads.len(), None);
     workgroup_sizes.clear();
     workgroup_sizes.resize(payloads.len(), None);
     for (node_index, payload) in payloads.iter().enumerate() {
+        if let ExecutableNode::Mesh {
+            stages,
+            pipeline_layout,
+            stage_layouts,
+            state,
+            ..
+        } = payload
+        {
+            let (pipeline, texture_heap, workgroups) = prepare_mesh_pipeline(
+                shaders,
+                pipelines,
+                &mut keys[node_index],
+                native,
+                *stages,
+                stage_layouts,
+                pipeline_layout,
+                *state,
+                color_format,
+            )?;
+            texture_heaps[node_index] = texture_heap;
+            workgroup_sizes[node_index] = Some(workgroups);
+            if let Some(pipeline) = pipeline {
+                let key = keys[node_index]
+                    .as_ref()
+                    .ok_or(Error::InvalidArgument)?
+                    .clone();
+                cache_metal_pipeline(pipelines, native, key, Some(pipeline))?;
+            }
+            continue;
+        }
         let (key, pipeline) = match payload {
             ExecutableNode::Compute { shader, layout, .. } => {
                 let (key, pipeline, texture_heap, workgroup_size) =
                     prepare_compute_pipeline(shaders, pipelines, native, *shader, layout)?;
                 texture_heaps[node_index] = texture_heap;
-                workgroup_sizes[node_index] = Some(workgroup_size);
+                workgroup_sizes[node_index] = Some(MetalWorkgroupSizes::Compute(workgroup_size));
                 (key, pipeline)
             }
             ExecutableNode::Graphics {
@@ -230,10 +422,12 @@ fn prepare_metal_pipelines(
                     layout,
                     pipeline_layout,
                     *state,
+                    color_format,
                 )?;
                 texture_heaps[node_index] = texture_heap;
                 (key, pipeline)
             }
+            ExecutableNode::Mesh { .. } => unreachable!("mesh payload handled above"),
             ExecutableNode::TextureReadback { .. }
             | ExecutableNode::RenderTargetReadback { .. }
             | ExecutableNode::Present { .. } => continue,
@@ -262,7 +456,7 @@ struct MetalActionSource<'a, 'resources> {
     binding_records: &'a [FrameBufferBindingRecord],
     binding_ranges: &'a [core::ops::Range<usize>],
     texture_heaps: &'a [Option<ShaderTextureHeapLayout>],
-    workgroup_sizes: &'a [Option<[u32; 3]>],
+    workgroup_sizes: &'a [Option<MetalWorkgroupSizes>],
 }
 
 impl ez_gfx_backend_metal::native::NativeFrameActionSource for MetalActionSource<'_, '_> {
@@ -446,6 +640,54 @@ impl ez_gfx_backend_metal::native::NativeFrameActionSource for MetalActionSource
                             },
                         )
                     }
+                    ExecutableNode::Mesh {
+                        groups,
+                        pipeline_layout,
+                        state,
+                        ..
+                    } => {
+                        let range = self
+                            .binding_ranges
+                            .get(node)
+                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+                            .clone();
+                        binding_source = FrameBindingSource {
+                            records: self
+                                .binding_records
+                                .get(range)
+                                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?,
+                            allocations: self.allocations,
+                            vertex_heaps: self.vertex_heaps,
+                        };
+                        let NativePipeline::Metal(pipeline) = self
+                            .pipelines
+                            .get(
+                                self.keys[node]
+                                    .as_ref()
+                                    .ok_or(ez_gfx_hal::HalError::InvalidArgument)?,
+                            )
+                            .ok_or(ez_gfx_hal::HalError::NativeFailure)?
+                        else {
+                            return Err(ez_gfx_hal::HalError::NativeFailure);
+                        };
+                        let MetalWorkgroupSizes::Mesh { task, mesh } =
+                            self.workgroup_sizes[node]
+                                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+                        else {
+                            return Err(ez_gfx_hal::HalError::InvalidArgument);
+                        };
+                        MetalFrameAction::Mesh(ez_gfx_backend_metal::native::NativeMeshDraw {
+                            pipeline,
+                            groups: *groups,
+                            task_threads_per_group: task,
+                            mesh_threads_per_group: mesh,
+                            depth_required: pipeline_layout.depth_required(),
+                            state: *state,
+                            texture_heap: self.texture_heaps[node],
+                            bindings: &binding_source,
+                            textures: self.native_textures,
+                        })
+                    }
                     ExecutableNode::Compute { groups, .. } => {
                         let range = self
                             .binding_ranges
@@ -471,12 +713,17 @@ impl ez_gfx_backend_metal::native::NativeFrameActionSource for MetalActionSource
                         else {
                             return Err(ez_gfx_hal::HalError::NativeFailure);
                         };
+                        let MetalWorkgroupSizes::Compute(threads_per_group) = self.workgroup_sizes
+                            [node]
+                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+                        else {
+                            return Err(ez_gfx_hal::HalError::InvalidArgument);
+                        };
                         MetalFrameAction::Compute(
                             ez_gfx_backend_metal::native::NativeComputeDispatch {
                                 pipeline,
                                 groups: *groups,
-                                threads_per_group: self.workgroup_sizes[node]
-                                    .ok_or(ez_gfx_hal::HalError::InvalidArgument)?,
+                                threads_per_group,
                                 bindings: &binding_source,
                                 texture_heap: self.texture_heaps[node],
                                 textures: self.native_textures,
@@ -578,6 +825,10 @@ pub(super) fn execute_metal_frame_plan(
     let NativeContext::Metal(native) = &mut context.native else {
         return Err(Error::NativeFailure);
     };
+    let color_format = context
+        .frame_render_target
+        .and_then(|target| context.render_targets.get(&target))
+        .map(|record| record.format);
     prepare_metal_pipelines(
         &context.shaders,
         &mut context.pipelines,
@@ -586,6 +837,7 @@ pub(super) fn execute_metal_frame_plan(
         &mut context.frame_pipeline_keys,
         &mut context.frame_texture_heaps,
         &mut context.frame_workgroup_sizes,
+        color_format,
     )?;
     context.frame_action_indices.clear();
     context
@@ -614,6 +866,7 @@ pub(super) fn execute_metal_frame_plan(
         &mut context.frame_action_indices,
         &mut context.frame_binding_scratch,
         &mut context.frame_binding_ranges,
+        &mut context.frame_texture_handles,
         &mut context.frame_texture_heaps,
         &mut context.frame_workgroup_sizes,
     )?;

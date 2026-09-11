@@ -241,6 +241,14 @@
         "EzGfxEventKind_Snapshot": {}
       }
     },
+    "enum:EzGfxReadbackSourceKind": {
+      "attrs": {},
+      "children": {
+        "EzGfxReadbackSourceKind_None": {},
+        "EzGfxReadbackSourceKind_Texture": {},
+        "EzGfxReadbackSourceKind_RenderTarget": {}
+      }
+    },
     "struct:EzGfxAdapterDesc": {
       "attrs": {},
       "children": {
@@ -264,7 +272,8 @@
         },
         "admitted": {},
         "software_rejected": {},
-        "error_count": {}
+        "error_count": {},
+        "shader_stages": {}
       }
     },
     "struct:EzGfxContextDesc": {
@@ -493,6 +502,42 @@
         }
       }
     },
+    "struct:EzGfxMeshShaders": {
+      "attrs": {},
+      "children": {
+        "task_shader": {
+          "type": "EzGfxTaskShader"
+        },
+        "mesh_shader": {
+          "type": "EzGfxMeshShader"
+        },
+        "fragment_shader": {
+          "type": "EzGfxFragmentShader"
+        }
+      }
+    },
+    "struct:EzGfxMeshState": {
+      "attrs": {},
+      "children": {
+        "cull_mode": {
+          "type": "EzGfxCullMode"
+        },
+        "front_face": {
+          "type": "EzGfxFrontFace"
+        },
+        "blend_mode": {
+          "type": "EzGfxBlendMode"
+        },
+        "reserved": {}
+      }
+    },
+    "struct:EzGfxShaderCapabilities": {
+      "attrs": {},
+      "children": {
+        "task": {},
+        "mesh": {}
+      }
+    },
     "struct:EzGfxDynamicState": {
       "attrs": {},
       "children": {
@@ -607,8 +652,14 @@
         "readback_request_id": {
           "type": "EzGfxReadbackRequest"
         },
-        "readback_texture": {
-          "type": "EzGfxTexture"
+        "readback_source": {
+          "type": "uint64_t"
+        },
+        "readback_source_kind": {
+          "type": "EzGfxReadbackSourceKind"
+        },
+        "_pad_readback_source_kind": {
+          "array-length": "7"
         },
         "readback_width": {},
         "readback_height": {},
@@ -768,6 +819,25 @@
           "type": "EzGfxContext",
           "nullable": "false",
           "doc": "Owning context."
+        }
+      }
+    },
+    "function:ez_gfx_context_shader_capabilities": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns context, device, or output-pointer status."
+      },
+      "children": {
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning initialized context."
+        },
+        "out_capabilities": {
+          "type": "EzGfxShaderCapabilities *",
+          "nullable": "false",
+          "direction": "out",
+          "doc": "Receives capabilities only on success."
         }
       }
     },
@@ -1459,6 +1529,48 @@
         }
       }
     },
+    "function:ez_gfx_frame_execute_mesh": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns validation, capability, frame, or native status."
+      },
+      "children": {
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        },
+        "frame": {
+          "type": "EzGfxFrame",
+          "nullable": "false",
+          "doc": "Live owning frame."
+        },
+        "shaders": {
+          "type": "const EzGfxMeshShaders *",
+          "nullable": "false",
+          "direction": "in",
+          "doc": "Required mesh-stage descriptor."
+        },
+        "group_x": {
+          "validation": "greater-than-zero",
+          "doc": "X groups."
+        },
+        "group_y": {
+          "validation": "greater-than-zero",
+          "doc": "Y groups."
+        },
+        "group_z": {
+          "validation": "greater-than-zero",
+          "doc": "Z groups."
+        },
+        "state": {
+          "type": "const EzGfxMeshState *",
+          "nullable": "true",
+          "direction": "in",
+          "doc": "Optional mesh pipeline state."
+        }
+      }
+    },
     "function:ez_gfx_frame_execute_compute": {
       "attrs": {
         "return": "EzGfxResult",
@@ -1514,6 +1626,34 @@
           "type": "EzGfxFrame",
           "nullable": "false",
           "doc": "Live owning frame."
+        },
+        "out_request_id": {
+          "type": "EzGfxReadbackRequest *",
+          "direction": "out",
+          "doc": "Receives the stable request correlator."
+        }
+      }
+    },
+    "function:ez_gfx_frame_enqueue_render_target_readback": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns frame, handle, or output-pointer status."
+      },
+      "children": {
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        },
+        "frame": {
+          "type": "EzGfxFrame",
+          "nullable": "false",
+          "doc": "Live owning frame."
+        },
+        "render_target": {
+          "type": "EzGfxRenderTarget",
+          "nullable": "false",
+          "doc": "Render target to read back."
         },
         "out_request_id": {
           "type": "EzGfxReadbackRequest *",
@@ -2121,6 +2261,126 @@
           "type": "EzGfxComputeShader",
           "nullable": "false",
           "doc": "Compute shader to destroy."
+        }
+      }
+    },
+    "handle:EzGfxTaskShader": {
+      "attrs": {}
+    },
+    "function:ez_gfx_task_shader_load": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns EzGfxResult_Ok or validation/native failure."
+      },
+      "children": {
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        },
+        "data": {
+          "nullable": "false",
+          "direction": "in",
+          "array-length": "data_size",
+          "doc": "Validated artifact bytes."
+        },
+        "data_size": {
+          "validation": "greater-than-zero-at-most-boundary-limit",
+          "doc": "Artifact byte count."
+        },
+        "entry_point": {
+          "type": "const char *",
+          "nullable": "false",
+          "direction": "in",
+          "array-length": "entry_point_size",
+          "doc": "Exact UTF-8 entry-point name."
+        },
+        "entry_point_size": {
+          "validation": "greater-than-zero-at-most-boundary-limit",
+          "doc": "Entry-point byte count."
+        },
+        "out_shader": {
+          "type": "EzGfxTaskShader *",
+          "direction": "out",
+          "doc": "Receives the owning task shader handle."
+        }
+      }
+    },
+    "function:ez_gfx_task_shader_destroy": {
+      "attrs": {
+        "return": "void",
+        "returns-doc": "No return value; stale handles are ignored."
+      },
+      "children": {
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "true",
+          "doc": "Owning context; zero and stale values are ignored."
+        },
+        "shader": {
+          "type": "EzGfxTaskShader",
+          "nullable": "false",
+          "doc": "Task shader to destroy."
+        }
+      }
+    },
+    "handle:EzGfxMeshShader": {
+      "attrs": {}
+    },
+    "function:ez_gfx_mesh_shader_load": {
+      "attrs": {
+        "return": "EzGfxResult",
+        "returns-doc": "Returns EzGfxResult_Ok or validation/native failure."
+      },
+      "children": {
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "false",
+          "doc": "Owning context."
+        },
+        "data": {
+          "nullable": "false",
+          "direction": "in",
+          "array-length": "data_size",
+          "doc": "Validated artifact bytes."
+        },
+        "data_size": {
+          "validation": "greater-than-zero-at-most-boundary-limit",
+          "doc": "Artifact byte count."
+        },
+        "entry_point": {
+          "type": "const char *",
+          "nullable": "false",
+          "direction": "in",
+          "array-length": "entry_point_size",
+          "doc": "Exact UTF-8 entry-point name."
+        },
+        "entry_point_size": {
+          "validation": "greater-than-zero-at-most-boundary-limit",
+          "doc": "Entry-point byte count."
+        },
+        "out_shader": {
+          "type": "EzGfxMeshShader *",
+          "direction": "out",
+          "doc": "Receives the owning mesh shader handle."
+        }
+      }
+    },
+    "function:ez_gfx_mesh_shader_destroy": {
+      "attrs": {
+        "return": "void",
+        "returns-doc": "No return value; stale handles are ignored."
+      },
+      "children": {
+        "context": {
+          "type": "EzGfxContext",
+          "nullable": "true",
+          "doc": "Owning context; zero and stale values are ignored."
+        },
+        "shader": {
+          "type": "EzGfxMeshShader",
+          "nullable": "false",
+          "doc": "Mesh shader to destroy."
         }
       }
     },

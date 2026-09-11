@@ -38,6 +38,7 @@ This repository is a Rust/Cargo migration of `ez_gfx_api`. Preserve the recogniz
 - In personal-project implementations, comment edge cases local to the function being changed. Keep comments operational and specific; avoid speculative completion claims.
 - Examples propagate routine failures with direct `?`. They must not use `.context(...)`; avoid `.with_context(...)` as well when direct propagation or a concise standalone `anyhow!` keeps the call readable.
 - You can also read `VERIFICATION_HOSTS.md` to get addresses for ssh boxes to use for cross platform verification.
+- Keep volatile contract numbers out of README files: never state specific C ABI versions, shader artifact format versions, or artifact magic values. Those belong in the `ez-gfx-ffi` binding authority, generated outputs, and canonical plan documents as appropriate.
 
 ## Verification
 

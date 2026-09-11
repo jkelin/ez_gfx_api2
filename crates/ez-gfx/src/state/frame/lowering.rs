@@ -1,4 +1,3 @@
-
 #[allow(
     clippy::too_many_arguments,
     reason = "each independently retained lowering vector is accounted and discarded together"
@@ -9,18 +8,18 @@ fn account_frame_lowering_scratch(
     action_indices: &mut Vec<usize>,
     bindings: &mut Vec<FrameBufferBindingRecord>,
     ranges: &mut Vec<core::ops::Range<usize>>,
-    #[cfg(target_vendor = "apple")]
-    texture_heaps: &mut Vec<Option<ez_gfx_hal::ShaderTextureHeapLayout>>,
-    #[cfg(target_vendor = "apple")] workgroup_sizes: &mut Vec<Option<[u32; 3]>>,
+    texture_handles: &mut Vec<ez_gfx_core::handle::TextureHandle>,
+    #[cfg(target_vendor = "apple")] texture_heaps: &mut Vec<
+        Option<ez_gfx_hal::ShaderTextureHeapLayout>,
+    >,
+    #[cfg(target_vendor = "apple")] workgroup_sizes: &mut Vec<Option<MetalWorkgroupSizes>>,
 ) -> Result<()> {
     let bytes = pipeline_keys
         .capacity()
         .saturating_mul(core::mem::size_of::<Option<PipelineKey>>())
-        .saturating_add(
-            pipeline_keys.iter().flatten().fold(0_usize, |total, key| {
-                total.saturating_add(key.retained_bytes())
-            }),
-        )
+        .saturating_add(pipeline_keys.iter().flatten().fold(0_usize, |total, key| {
+            total.saturating_add(key.retained_bytes())
+        }))
         .saturating_add(
             action_indices
                 .capacity()
@@ -35,6 +34,11 @@ fn account_frame_lowering_scratch(
             ranges
                 .capacity()
                 .saturating_mul(core::mem::size_of::<core::ops::Range<usize>>()),
+        )
+        .saturating_add(
+            texture_handles
+                .capacity()
+                .saturating_mul(core::mem::size_of::<ez_gfx_core::handle::TextureHandle>()),
         );
     #[cfg(target_vendor = "apple")]
     let bytes = bytes
@@ -48,7 +52,7 @@ fn account_frame_lowering_scratch(
         .saturating_add(
             workgroup_sizes
                 .capacity()
-                .saturating_mul(core::mem::size_of::<Option<[u32; 3]>>()),
+                .saturating_mul(core::mem::size_of::<Option<MetalWorkgroupSizes>>()),
         );
     if let Err(error) = frame.set_lowering_scratch_bytes(bytes) {
         // Drop the complete lowering workspace together: retaining only some
@@ -57,6 +61,7 @@ fn account_frame_lowering_scratch(
         *action_indices = Vec::new();
         *bindings = Vec::new();
         *ranges = Vec::new();
+        *texture_handles = Vec::new();
         #[cfg(target_vendor = "apple")]
         {
             *texture_heaps = Vec::new();

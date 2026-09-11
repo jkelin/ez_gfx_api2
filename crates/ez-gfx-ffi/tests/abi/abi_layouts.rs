@@ -12,7 +12,7 @@ use super::*;
     reason = "sequential layout assertions share one ABI contract; splitting would hide drift"
 )]
 fn layouts_are_stable() {
-    // ABI 40 adds presentation-mode selection and surface capability querying.
+    // ABI 41 adds task and mesh shader stages.
     assert_eq!(
         (
             size_of::<EzGfxPresentationModes>(),
@@ -75,7 +75,7 @@ fn layouts_are_stable() {
             size_of::<EzGfxAdapterInfo>(),
             align_of::<EzGfxAdapterInfo>()
         ),
-        (24, 4)
+        (28, 4)
     );
     assert_eq!(
         [
@@ -84,9 +84,10 @@ fn layouts_are_stable() {
             offset_of!(EzGfxAdapterInfo, adapter_class),
             offset_of!(EzGfxAdapterInfo, admitted),
             offset_of!(EzGfxAdapterInfo, software_rejected),
-            offset_of!(EzGfxAdapterInfo, error_count)
+            offset_of!(EzGfxAdapterInfo, error_count),
+            offset_of!(EzGfxAdapterInfo, shader_stages)
         ],
-        [0, 16, 17, 18, 19, 20]
+        [0, 16, 17, 18, 19, 20, 24]
     );
     assert_eq!(
         (
@@ -186,6 +187,48 @@ fn layouts_are_stable() {
     );
     assert_eq!(
         (
+            size_of::<EzGfxMeshShaders>(),
+            align_of::<EzGfxMeshShaders>()
+        ),
+        (24, 8)
+    );
+    assert_eq!(
+        [
+            offset_of!(EzGfxMeshShaders, task_shader),
+            offset_of!(EzGfxMeshShaders, mesh_shader),
+            offset_of!(EzGfxMeshShaders, fragment_shader)
+        ],
+        [0, 8, 16]
+    );
+    assert_eq!(
+        (size_of::<EzGfxMeshState>(), align_of::<EzGfxMeshState>()),
+        (4, 1)
+    );
+    assert_eq!(
+        [
+            offset_of!(EzGfxMeshState, cull_mode),
+            offset_of!(EzGfxMeshState, front_face),
+            offset_of!(EzGfxMeshState, blend_mode),
+            offset_of!(EzGfxMeshState, reserved)
+        ],
+        [0, 1, 2, 3]
+    );
+    assert_eq!(
+        (
+            size_of::<EzGfxShaderCapabilities>(),
+            align_of::<EzGfxShaderCapabilities>()
+        ),
+        (2, 1)
+    );
+    assert_eq!(
+        [
+            offset_of!(EzGfxShaderCapabilities, task),
+            offset_of!(EzGfxShaderCapabilities, mesh)
+        ],
+        [0, 1]
+    );
+    assert_eq!(
+        (
             size_of::<EzGfxDynamicState>(),
             align_of::<EzGfxDynamicState>()
         ),
@@ -281,9 +324,12 @@ fn layouts_are_stable() {
     assert_eq!(EzGfxEventKind::ObservationsDropped as u8, 4);
     assert_eq!(EzGfxEventKind::Readback as u8, 5);
     assert_eq!(EzGfxEventKind::Snapshot as u8, 6);
+    assert_eq!(EzGfxReadbackSourceKind::None as u8, 0);
+    assert_eq!(EzGfxReadbackSourceKind::Texture as u8, 1);
+    assert_eq!(EzGfxReadbackSourceKind::RenderTarget as u8, 2);
     assert_eq!(
         (size_of::<EzGfxEvent>(), align_of::<EzGfxEvent>()),
-        (104, 8)
+        (112, 8)
     );
     assert_eq!(
         [
@@ -293,13 +339,15 @@ fn layouts_are_stable() {
             offset_of!(EzGfxEvent, level),
             offset_of!(EzGfxEvent, dropped),
             offset_of!(EzGfxEvent, readback_request_id),
-            offset_of!(EzGfxEvent, readback_texture),
+            offset_of!(EzGfxEvent, readback_source),
+            offset_of!(EzGfxEvent, readback_source_kind),
+            offset_of!(EzGfxEvent, _pad_readback_source_kind),
             offset_of!(EzGfxEvent, readback_width),
             offset_of!(EzGfxEvent, readback_height),
             offset_of!(EzGfxEvent, readback_byte_count),
             offset_of!(EzGfxEvent, readback_bytes)
         ],
-        [0, 8, 24, 48, 56, 64, 72, 80, 84, 88, 96]
+        [0, 8, 24, 48, 56, 64, 72, 80, 81, 88, 92, 96, 104]
     );
     assert_eq!(
         (
@@ -350,12 +398,20 @@ fn all_public_export_signatures_are_stable() {
     let _: unsafe extern "C" fn(Handle, Handle, *mut i32) -> Status =
         ffi::ez_gfx_surface_resize_pending;
     let _: extern "C" fn(Handle, Handle, i32) -> Status = ffi::ez_gfx_surface_set_snapshot_cache;
+    let _: unsafe extern "C" fn(Handle, *mut EzGfxShaderCapabilities) -> Status =
+        ffi::ez_gfx_context_shader_capabilities;
     let _: unsafe extern "C" fn(Handle, *const u8, usize, *const u8, usize, *mut Handle) -> Status =
         ffi::ez_gfx_compute_shader_load;
+    let _: unsafe extern "C" fn(Handle, *const u8, usize, *const u8, usize, *mut Handle) -> Status =
+        ffi::ez_gfx_task_shader_load;
+    let _: unsafe extern "C" fn(Handle, *const u8, usize, *const u8, usize, *mut Handle) -> Status =
+        ffi::ez_gfx_mesh_shader_load;
     let _: unsafe extern "C" fn(Handle, *const u8, usize, *const u8, usize, *mut Handle) -> Status =
         ffi::ez_gfx_vertex_shader_load;
     let _: unsafe extern "C" fn(Handle, *const u8, usize, *const u8, usize, *mut Handle) -> Status =
         ffi::ez_gfx_fragment_shader_load;
+    let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_task_shader_destroy;
+    let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_mesh_shader_destroy;
     let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_compute_shader_destroy;
     let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_vertex_shader_destroy;
     let _: extern "C" fn(Handle, Handle) = ffi::ez_gfx_fragment_shader_destroy;
@@ -413,10 +469,21 @@ fn all_public_export_signatures_are_stable() {
         Handle,
         *const EzGfxDynamicState,
     ) -> Status = ffi::ez_gfx_frame_execute_graphics;
+    let _: unsafe extern "C" fn(
+        Handle,
+        Handle,
+        *const EzGfxMeshShaders,
+        u32,
+        u32,
+        u32,
+        *const EzGfxMeshState,
+    ) -> Status = ffi::ez_gfx_frame_execute_mesh;
     let _: extern "C" fn(Handle, Handle, Handle, u32, u32, u32) -> Status =
         ffi::ez_gfx_frame_execute_compute;
     let _: unsafe extern "C" fn(Handle, Handle, Handle, *mut u64) -> Status =
         ffi::ez_gfx_frame_enqueue_texture_readback;
+    let _: unsafe extern "C" fn(Handle, Handle, Handle, *mut u64) -> Status =
+        ffi::ez_gfx_frame_enqueue_render_target_readback;
     let _: extern "C" fn(Handle, Handle) -> Status = ffi::ez_gfx_frame_end;
     let _: extern "C" fn(Handle, Handle) -> Status = ffi::ez_gfx_frame_abort;
     let _: unsafe extern "C" fn(Handle, EzGfxEventCallback, *mut c_void) -> Status =
@@ -473,6 +540,177 @@ fn stage_shader_load_signature_and_boundary_validation_are_stable() {
         EzGfxResult::InvalidArgument
     );
     assert_eq!(shader, 99);
+}
+
+#[test]
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "the test intentionally constructs a misaligned FFI output pointer"
+)]
+fn render_target_readback_validates_output_before_frame_access() {
+    let mut request_id = 0xA5_A5_u64;
+    assert_eq!(
+        // SAFETY: Null intentionally exercises checked output rejection.
+        unsafe { ffi::ez_gfx_frame_enqueue_render_target_readback(0, 0, 0, core::ptr::null_mut()) },
+        EzGfxResult::InvalidArgument
+    );
+
+    let mut bytes = [0_u8; size_of::<u64>() + align_of::<u64>()];
+    let alignment = align_of::<u64>();
+    let aligned_offset = (alignment - bytes.as_ptr().addr() % alignment) % alignment;
+    // SAFETY: The computed offset stays within `bytes`; the pointer is rejected before writing.
+    let misaligned = unsafe { bytes.as_mut_ptr().add(aligned_offset + 1).cast::<u64>() };
+    assert!(!misaligned.is_aligned());
+    assert_eq!(
+        // SAFETY: Misalignment is rejected before the output pointer is written.
+        unsafe { ffi::ez_gfx_frame_enqueue_render_target_readback(0, 0, 0, misaligned) },
+        EzGfxResult::InvalidArgument
+    );
+    assert_eq!(
+        // SAFETY: Output storage is live and aligned; the zero frame is rejected before writing.
+        unsafe { ffi::ez_gfx_frame_enqueue_render_target_readback(0, 0, 0, &raw mut request_id,) },
+        EzGfxResult::InvalidContext
+    );
+    assert_eq!(request_id, 0xA5_A5);
+}
+
+#[test]
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "the test intentionally constructs a misaligned FFI descriptor pointer"
+)]
+fn mesh_descriptor_boundaries_fail_before_frame_delegation() {
+    let shaders = EzGfxMeshShaders {
+        task_shader: 0,
+        mesh_shader: 1,
+        fragment_shader: 2,
+    };
+    let state = EzGfxMeshState {
+        cull_mode: 0,
+        front_face: 0,
+        blend_mode: 0,
+        reserved: 1,
+    };
+    assert_eq!(
+        // SAFETY: Null intentionally exercises checked descriptor rejection.
+        unsafe {
+            ffi::ez_gfx_frame_execute_mesh(0, 0, core::ptr::null(), 1, 1, 1, core::ptr::null())
+        },
+        EzGfxResult::InvalidArgument
+    );
+
+    let mut bytes = [0_u8; size_of::<EzGfxMeshShaders>() + align_of::<EzGfxMeshShaders>()];
+    let alignment = align_of::<EzGfxMeshShaders>();
+    let aligned_offset = (alignment - bytes.as_ptr().addr() % alignment) % alignment;
+    // One byte past an aligned address is deliberately misaligned for the u64 fields.
+    // SAFETY: The computed offset stays within `bytes`; the pointer is never dereferenced.
+    let misaligned = unsafe {
+        bytes
+            .as_mut_ptr()
+            .add(aligned_offset + 1)
+            .cast::<EzGfxMeshShaders>()
+    };
+    assert!(!misaligned.is_aligned());
+    assert_eq!(
+        // SAFETY: Misalignment is rejected before the pointer is read.
+        unsafe { ffi::ez_gfx_frame_execute_mesh(0, 0, misaligned, 1, 1, 1, core::ptr::null()) },
+        EzGfxResult::InvalidArgument
+    );
+    assert_eq!(
+        // SAFETY: Both descriptors are live and aligned; reserved-state validation rejects before frame access.
+        unsafe {
+            ffi::ez_gfx_frame_execute_mesh(0, 0, &raw const shaders, 1, 1, 1, &raw const state)
+        },
+        EzGfxResult::InvalidArgument
+    );
+    for invalid_state in [
+        EzGfxMeshState {
+            cull_mode: u8::MAX,
+            reserved: 0,
+            ..state
+        },
+        EzGfxMeshState {
+            front_face: u8::MAX,
+            reserved: 0,
+            ..state
+        },
+        EzGfxMeshState {
+            blend_mode: u8::MAX,
+            reserved: 0,
+            ..state
+        },
+    ] {
+        assert_eq!(
+            // SAFETY: Both descriptors are live and aligned; invalid discriminants reject before frame access.
+            unsafe {
+                ffi::ez_gfx_frame_execute_mesh(
+                    0,
+                    0,
+                    &raw const shaders,
+                    1,
+                    1,
+                    1,
+                    &raw const invalid_state,
+                )
+            },
+            EzGfxResult::InvalidArgument
+        );
+    }
+
+    let valid_state = EzGfxMeshState {
+        reserved: 0,
+        ..state
+    };
+    assert_eq!(
+        // SAFETY: Both descriptors are live and aligned; the zero group rejects before frame access.
+        unsafe {
+            ffi::ez_gfx_frame_execute_mesh(
+                0,
+                0,
+                &raw const shaders,
+                0,
+                1,
+                1,
+                &raw const valid_state,
+            )
+        },
+        EzGfxResult::InvalidArgument
+    );
+
+    assert_eq!(
+        // SAFETY: Both descriptors are live and aligned; the zero frame is rejected.
+        unsafe {
+            ffi::ez_gfx_frame_execute_mesh(
+                0,
+                0,
+                &raw const shaders,
+                1,
+                1,
+                1,
+                &raw const valid_state,
+            )
+        },
+        EzGfxResult::InvalidContext
+    );
+}
+#[test]
+fn shader_capability_query_writes_only_on_success() {
+    assert_eq!(
+        // SAFETY: Null intentionally exercises checked output rejection.
+        unsafe { ffi::ez_gfx_context_shader_capabilities(0, core::ptr::null_mut()) },
+        EzGfxResult::InvalidArgument
+    );
+
+    let mut capabilities = EzGfxShaderCapabilities {
+        task: 0xA5,
+        mesh: 0x5A,
+    };
+    assert_eq!(
+        // SAFETY: Output storage is live and aligned through the call.
+        unsafe { ffi::ez_gfx_context_shader_capabilities(0, &raw mut capabilities) },
+        EzGfxResult::InvalidContext
+    );
+    assert_eq!((capabilities.task, capabilities.mesh), (0xA5, 0x5A));
 }
 
 #[test]

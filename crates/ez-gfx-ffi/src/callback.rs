@@ -21,8 +21,8 @@ use core::ffi::c_void;
 use ez_gfx::raw::ContextHandle;
 
 use super::{
-    EzGfxEvent, EzGfxEventCallback, EzGfxEventKind, EzGfxResult, EzGfxRuntimeRecord,
-    EzGfxUploadEvent,
+    EzGfxEvent, EzGfxEventCallback, EzGfxEventKind, EzGfxReadbackSourceKind, EzGfxResult,
+    EzGfxRuntimeRecord, EzGfxUploadEvent,
 };
 use ez_gfx::{UploadResource, UploadStatus};
 
@@ -83,7 +83,9 @@ fn blank_event(kind: EzGfxEventKind) -> EzGfxEvent {
         _pad_level: [0; 7],
         dropped: 0,
         readback_request_id: 0,
-        readback_texture: 0,
+        readback_source: 0,
+        readback_source_kind: EzGfxReadbackSourceKind::None,
+        _pad_readback_source_kind: [0; 7],
         readback_width: 0,
         readback_height: 0,
         readback_byte_count: 0,
@@ -190,7 +192,8 @@ pub(crate) fn note_frame(frame: u64, owner: u64, surface: u64, target: u64) {
 #[derive(Clone, Copy)]
 pub(crate) struct ReadbackSource {
     pub(crate) request_id: u64,
-    pub(crate) texture: u64,
+    pub(crate) source: u64,
+    pub(crate) source_kind: EzGfxReadbackSourceKind,
     pub(crate) width: u32,
     pub(crate) height: u32,
 }
@@ -198,7 +201,8 @@ pub(crate) struct ReadbackSource {
 /// Reserves and records one stable correlator in graph insertion order.
 pub(crate) fn note_readback_source(
     frame: u64,
-    texture: u64,
+    source: u64,
+    source_kind: EzGfxReadbackSourceKind,
     width: u32,
     height: u32,
 ) -> Result<u64, EzGfxResult> {
@@ -211,7 +215,8 @@ pub(crate) fn note_readback_source(
     let entry = aux.get_mut(&frame).ok_or(EzGfxResult::InvalidContext)?;
     entry.readback_sources.push(ReadbackSource {
         request_id,
-        texture,
+        source,
+        source_kind,
         width,
         height,
     });
@@ -239,7 +244,8 @@ pub(crate) fn take_frame(frame: u64) -> Option<FrameAux> {
 pub(crate) struct ReadbackDelivery {
     pub(crate) kind: EzGfxEventKind,
     pub(crate) request_id: u64,
-    pub(crate) texture: u64,
+    pub(crate) source: u64,
+    pub(crate) source_kind: EzGfxReadbackSourceKind,
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) bytes: Vec<u8>,
@@ -317,7 +323,8 @@ pub(crate) fn dispatch_readback(
     let _guard = ResetGuard(key);
     let mut event = blank_event(delivery.kind);
     event.readback_request_id = delivery.request_id;
-    event.readback_texture = delivery.texture;
+    event.readback_source = delivery.source;
+    event.readback_source_kind = delivery.source_kind;
     event.readback_width = delivery.width;
     event.readback_height = delivery.height;
     event.readback_byte_count = delivery.bytes.len();

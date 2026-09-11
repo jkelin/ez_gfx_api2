@@ -21,58 +21,7 @@ type MetalArgumentEncoder = ThreadBound<super::Retained<ProtocolObject<dyn MTLAr
 type FrameSurface<'a> = (&'a mut NativeSurface, (u32, u32), PresentationMode);
 type ResolvedFrameSurface<'a> = (Option<&'a mut NativeSurface>, (u32, u32));
 
-fn validate_surface_request(
-    surface: Option<FrameSurface<'_>>,
-) -> Result<ResolvedFrameSurface<'_>, HalError> {
-    match surface {
-        Some((surface, extent, mode)) if extent.0 != 0 && extent.1 != 0 => {
-            surface.set_presentation_mode(mode)?;
-            Ok((Some(surface), extent))
-        }
-        Some(_) => Err(HalError::InvalidArgument),
-        None => Ok((None, (0, 0))),
-    }
-}
-
-fn buffer_range_fits(allocation_size: u64, range: ez_gfx_hal::BufferRange) -> bool {
-    range
-        .offset
-        .checked_add(range.size)
-        .is_some_and(|end| end <= allocation_size)
-}
-
-fn draw_ranges_fit(
-    index_physical_size: u64,
-    index_logical_size: u64,
-    indirect_physical_size: u64,
-    indirect_logical_size: u64,
-    draw_count: u32,
-) -> bool {
-    let required_indirect = u64::from(draw_count)
-        .checked_mul(20)
-        .and_then(|size| size.checked_add(COUNTER_BUFFER_ELEMENT_OFFSET));
-    index_logical_size != 0
-        && index_logical_size <= index_physical_size
-        && indirect_logical_size <= indirect_physical_size
-        && required_indirect.is_some_and(|required| required <= indirect_logical_size)
-}
-
-fn bindings_fit(bindings: &dyn super::NativeBufferBindingSource) -> Result<bool, HalError> {
-    let mut fits = true;
-    bindings.visit(&mut |_, binding| {
-        fits &= (binding.offset as u64) < binding.allocation.allocation.size();
-        Ok(())
-    })?;
-    Ok(fits)
-}
-
-fn metal_size(size: [u32; 3]) -> MTLSize {
-    MTLSize {
-        width: size[0] as usize,
-        height: size[1] as usize,
-        depth: size[2] as usize,
-    }
-}
+include!("frame_validation.rs");
 
 struct MetalFrameResources {
     slot_index: usize,
@@ -494,6 +443,46 @@ impl NativeContext {
         )
     }
 
+    fn prepare_mesh_argument_buffer(
+        &mut self,
+        slot: usize,
+        draw: &super::NativeMeshDraw<'_>,
+        argument_index: usize,
+    ) -> Result<Option<usize>, HalError> {
+        let NativePipeline::Mesh {
+            object_argument_encoder,
+            mesh_argument_encoder,
+            fragment_argument_encoder,
+            dispatch_limits,
+            ..
+        } = draw.pipeline
+        else {
+            return Err(HalError::InvalidArgument);
+        };
+        ez_gfx_hal::validate_mesh_dispatch(
+            draw.groups,
+            draw.mesh_threads_per_group,
+            draw.task_threads_per_group,
+            *dispatch_limits,
+        )
+        .map_err(super::pipeline::map_mesh_dispatch_error)?;
+        if !bindings_fit(draw.bindings)? {
+            return Err(HalError::InvalidArgument);
+        }
+        let encoders = [
+            object_argument_encoder.as_ref(),
+            mesh_argument_encoder.as_ref(),
+            fragment_argument_encoder.as_ref(),
+        ];
+        self.prepare_texture_argument_buffer(
+            slot,
+            draw.texture_heap,
+            draw.textures,
+            &encoders,
+            argument_index,
+        )
+    }
+
     fn prepare_compute_action(
         &mut self,
         slot: usize,
@@ -767,6 +756,18 @@ impl NativeContext {
                         Err(HalError::InvalidArgument)
                     } else {
                         self.prepare_graphics_argument_buffer(slot_index, draw, argument_count)
+                            .inspect(|prepared| {
+                                if prepared.is_some() {
+                                    argument_count += 1;
+                                }
+                            })
+                    }
+                }
+                NativeFrameAction::Mesh(draw) => {
+                    if !pass_active {
+                        Err(HalError::InvalidArgument)
+                    } else {
+                        self.prepare_mesh_argument_buffer(slot_index, draw, argument_count)
                             .inspect(|prepared| {
                                 if prepared.is_some() {
                                     argument_count += 1;
@@ -1069,6 +1070,7 @@ impl NativeContext {
                         encoder.compute(action_index, dispatch)?;
                     }
                     NativeFrameAction::Graphics(draw) => encoder.graphics(action_index, draw)?,
+                    NativeFrameAction::Mesh(draw) => encoder.mesh(action_index, draw)?,
                     NativeFrameAction::TextureReadback {
                         texture,
                         width,
@@ -1146,51 +1148,4 @@ impl NativeContext {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{NativeContext, buffer_range_fits, draw_ranges_fit, metal_size};
-    use ez_gfx_hal::{BufferRange, COUNTER_BUFFER_ELEMENT_OFFSET};
-
-    #[test]
-    fn buffer_barrier_range_must_fit_allocation() {
-        assert!(buffer_range_fits(64, BufferRange::new(16, 48).unwrap()));
-        assert!(!buffer_range_fits(63, BufferRange::new(16, 48).unwrap()));
-        assert!(!buffer_range_fits(
-            u64::MAX,
-            BufferRange {
-                offset: u64::MAX - 3,
-                size: 4,
-            }
-        ));
-    }
-
-    #[test]
-    fn indexed_indirect_logical_ranges_include_aligned_element_offset() {
-        let required = COUNTER_BUFFER_ELEMENT_OFFSET + 40;
-        assert!(draw_ranges_fit(64, 64, required, required, 2));
-        assert!(!draw_ranges_fit(64, 0, required, required, 2));
-        assert!(!draw_ranges_fit(64, 65, required, required, 2));
-        assert!(!draw_ranges_fit(64, 64, required, required - 1, 2));
-        assert!(!draw_ranges_fit(64, 64, required - 1, required, 2));
-    }
-
-    #[test]
-    fn reflected_threadgroup_dimensions_reach_metal_dispatch_shape() {
-        let size = metal_size([8, 2, 1]);
-        assert_eq!((size.width, size.height, size.depth), (8, 2, 1));
-    }
-
-    #[test]
-    fn demoted_view_extent_follows_published_coarse_tail() {
-        use NativeContext as Context;
-        // A fully resident view exposes the stored base extent.
-        assert_eq!(Context::published_view_extent(64, 64, 3, 3), Some((64, 64)));
-        // Demotion drops fine levels: level one of a 64-wide chain is 16 wide.
-        assert_eq!(Context::published_view_extent(64, 64, 3, 1), Some((16, 16)));
-        // Odd edges clamp at one texel rather than shifting to zero.
-        assert_eq!(Context::published_view_extent(7, 3, 3, 1), Some((1, 1)));
-        // An unpublished or over-published view has no readable extent.
-        assert_eq!(Context::published_view_extent(64, 64, 3, 0), None);
-        assert_eq!(Context::published_view_extent(64, 64, 3, 4), None);
-    }
-}
+include!("frame_tests.rs");

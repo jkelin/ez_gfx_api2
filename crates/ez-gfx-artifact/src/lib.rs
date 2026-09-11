@@ -9,9 +9,9 @@ use std::{
 
 /// Maximum encoded artifact size accepted by the container format.
 pub const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
-const MAGIC: &[u8; 8] = b"EZSHDR05";
+const MAGIC: &[u8; 8] = b"EZSHDR06";
 /// Current framed rkyv shader artifact format version.
-pub const ARTIFACT_FORMAT_VERSION: u32 = 5;
+pub const ARTIFACT_FORMAT_VERSION: u32 = 6;
 const HEADER_BYTES: usize = 56;
 const MAX_STRING: usize = 16 * 1024;
 const MAX_VARIANTS: usize = 64;
@@ -32,6 +32,10 @@ pub enum Stage {
     TessellationControl = 5,
     /// Tessellation evaluation shader.
     TessellationEvaluation = 6,
+    /// Task (amplification) shader.
+    Task = 7,
+    /// Mesh shader.
+    Mesh = 8,
 }
 
 /// Shader products supported by shader artifacts.
@@ -533,6 +537,32 @@ impl CompiledShader {
         loader.load_compute_shader(self.bytes.as_slice(), entry_point)
     }
 
+    /// Loads one exact task entry point into `loader`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the loader's validation or native creation error.
+    pub fn load_task_shader<L: ShaderLoader>(
+        &self,
+        loader: &L,
+        entry_point: &str,
+    ) -> Result<L::TaskShader, L::Error> {
+        loader.load_task_shader(self.bytes.as_slice(), entry_point)
+    }
+
+    /// Loads one exact mesh entry point into `loader`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the loader's validation or native creation error.
+    pub fn load_mesh_shader<L: ShaderLoader>(
+        &self,
+        loader: &L,
+        entry_point: &str,
+    ) -> Result<L::MeshShader, L::Error> {
+        loader.load_mesh_shader(self.bytes.as_slice(), entry_point)
+    }
+
     /// Loads one exact vertex entry point into `loader`.
     ///
     /// # Errors
@@ -564,6 +594,10 @@ impl CompiledShader {
 pub trait ShaderLoader {
     /// Compute-stage owning handle.
     type ComputeShader;
+    /// Task-stage owning handle.
+    type TaskShader;
+    /// Mesh-stage owning handle.
+    type MeshShader;
     /// Vertex-stage owning handle.
     type VertexShader;
     /// Fragment-stage owning handle.
@@ -581,6 +615,28 @@ pub trait ShaderLoader {
         artifact: &[u8],
         entry_point: &str,
     ) -> Result<Self::ComputeShader, Self::Error>;
+
+    /// Loads one named task entry point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the artifact or entry point is invalid.
+    fn load_task_shader(
+        &self,
+        artifact: &[u8],
+        entry_point: &str,
+    ) -> Result<Self::TaskShader, Self::Error>;
+
+    /// Loads one named mesh entry point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the artifact or entry point is invalid.
+    fn load_mesh_shader(
+        &self,
+        artifact: &[u8],
+        entry_point: &str,
+    ) -> Result<Self::MeshShader, Self::Error>;
 
     /// Loads one named vertex entry point.
     ///

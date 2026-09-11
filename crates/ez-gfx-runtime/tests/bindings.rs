@@ -245,27 +245,148 @@ fn graphics_stage_layouts_merge_only_identical_texture_heaps() {
 }
 
 #[test]
-fn compute_reflection_requires_nonzero_workgroup_size() {
-    let valid = br#"{"reflections":[{"target":"Metallib","entry":"computemain","stage":"Compute","reflection":{"parameters":[],"workgroup_size":[8,2,1]}}]}"#;
-    let reflections = ez_gfx_runtime::binding::validate_stage_reflections(
-        valid,
-        Backend::Metal,
-        &[(Stage::Compute, "computemain")],
-    )
-    .unwrap();
-    assert_eq!(reflections[0].workgroup_size(), Some([8, 2, 1]));
-
-    for invalid in [
-        br#"{"reflections":[{"target":"Metallib","entry":"computemain","stage":"Compute","reflection":{"parameters":[]}}]}"#.as_slice(),
-        br#"{"reflections":[{"target":"Metallib","entry":"computemain","stage":"Compute","reflection":{"parameters":[],"workgroup_size":[8,0,1]}}]}"#.as_slice(),
-    ] {
-        assert_eq!(
-            ez_gfx_runtime::binding::validate_stage_reflections(
-                invalid,
-                Backend::Metal,
-                &[(Stage::Compute, "computemain")],
-            ),
-            Err(BindingError::InvalidMetadata)
+fn dispatch_stage_reflections_require_nonzero_workgroup_size() {
+    for stage in [Stage::Compute, Stage::Task, Stage::Mesh] {
+        let valid = format!(
+            r#"{{"reflections":[{{"target":"Metallib","entry":"main","stage":"{stage:?}","reflection":{{"parameters":[],"workgroup_size":[8,2,1]}}}}]}}"#
         );
+        let reflections = ez_gfx_runtime::binding::validate_stage_reflections(
+            valid.as_bytes(),
+            Backend::Metal,
+            &[(stage, "main")],
+        )
+        .unwrap();
+        assert_eq!(reflections[0].workgroup_size(), Some([8, 2, 1]));
+
+        for invalid_workgroup in ["null", "[8,0,1]"] {
+            let invalid = format!(
+                r#"{{"reflections":[{{"target":"Metallib","entry":"main","stage":"{stage:?}","reflection":{{"parameters":[],"workgroup_size":{invalid_workgroup}}}}}]}}"#
+            );
+            assert_eq!(
+                ez_gfx_runtime::binding::validate_stage_reflections(
+                    invalid.as_bytes(),
+                    Backend::Metal,
+                    &[(stage, "main")],
+                ),
+                Err(BindingError::InvalidMetadata)
+            );
+        }
     }
+
+    let vertex_with_workgroup = br#"{"reflections":[{"target":"Metallib","entry":"main","stage":"Vertex","reflection":{"parameters":[],"workgroup_size":[1,1,1]}}]}"#;
+    assert_eq!(
+        ez_gfx_runtime::binding::validate_stage_reflections(
+            vertex_with_workgroup,
+            Backend::Metal,
+            &[(Stage::Vertex, "main")],
+        ),
+        Err(BindingError::InvalidMetadata)
+    );
+}
+
+#[test]
+fn mesh_stage_fold_validates_order_compatibility_and_retains_stage_layouts() {
+    let metadata = br#"{"reflections":[
+        {"target":"Metallib","entry":"taskmain","stage":"Task","reflection":{"parameters":[{"semantic_name":"draws","api_kind":"buffer","binding_index":0,"binding_space":0}],"workgroup_size":[1,1,1],"texture_heap":{"binding_space":1,"binding_index":6,"capacity":1024,"argument_stride":2,"texture_argument_offset":0,"sampler_argument_offset":1}}},
+        {"target":"Metallib","entry":"meshmain","stage":"Mesh","reflection":{"parameters":[{"semantic_name":"draws","api_kind":"buffer","binding_index":0,"binding_space":0}],"workgroup_size":[8,1,1]}},
+        {"target":"Metallib","entry":"fragmentmain","stage":"Fragment","reflection":{"parameters":[],"texture_heap":{"binding_space":1,"binding_index":6,"capacity":1024,"argument_stride":2,"texture_argument_offset":0,"sampler_argument_offset":1}}}
+    ]}"#;
+    let stages = [
+        (Stage::Task, "taskmain"),
+        (Stage::Mesh, "meshmain"),
+        (Stage::Fragment, "fragmentmain"),
+    ];
+    let reflections =
+        ez_gfx_runtime::binding::validate_stage_reflections(metadata, Backend::Metal, &stages)
+            .unwrap();
+    assert_eq!(reflections.len(), 3);
+    assert!(!reflections.spilled());
+    assert!(reflections[0].pipeline_layout().texture_heap().is_some());
+    assert!(reflections[1].pipeline_layout().texture_heap().is_none());
+    assert!(reflections[2].pipeline_layout().texture_heap().is_some());
+
+    assert_eq!(
+        ez_gfx_runtime::binding::validate_stage_reflections(
+            metadata,
+            Backend::Metal,
+            &[
+                (Stage::Mesh, "meshmain"),
+                (Stage::Task, "taskmain"),
+                (Stage::Fragment, "fragmentmain"),
+            ],
+        ),
+        Err(BindingError::InvalidMetadata)
+    );
+
+    let conflicting = std::str::from_utf8(metadata).unwrap().replacen(
+        "\"binding_index\":0",
+        "\"binding_index\":2",
+        1,
+    );
+    assert_eq!(
+        ez_gfx_runtime::binding::validate_stage_reflections(
+            conflicting.as_bytes(),
+            Backend::Metal,
+            &stages,
+        ),
+        Err(BindingError::ConflictingStageBinding("draws".into()))
+    );
+
+    let ambiguous = br#"{"reflections":[
+        {"target":"Metallib","entry":"meshmain","stage":"Mesh","reflection":{"parameters":[],"workgroup_size":[8,1,1]}},
+        {"target":"Metallib","entry":"meshmain","stage":"Mesh","reflection":{"parameters":[],"workgroup_size":[8,1,1]}}
+    ]}"#;
+    assert_eq!(
+        ez_gfx_runtime::binding::validate_stage_reflections(
+            ambiguous,
+            Backend::Metal,
+            &[(Stage::Mesh, "meshmain")],
+        ),
+        Err(BindingError::AmbiguousReflection)
+    );
+}
+
+#[test]
+fn stage_layout_identity_canonicalizes_adjacent_descriptor_partitions() {
+    let identity = |metadata: &[u8], stage| {
+        ez_gfx_runtime::binding::validate_stage_reflections(
+            metadata,
+            Backend::Metal,
+            &[(stage, "main")],
+        )
+        .unwrap()[0]
+            .physical_layout_identity()
+    };
+    let ranged = br#"{"reflections":[{"target":"Metallib","entry":"main","stage":"Mesh","reflection":{"parameters":[{"semantic_name":"all","api_kind":"buffer","binding_index":3,"binding_space":1,"descriptor_count":2,"resource_access":"Read"}],"workgroup_size":[1,1,1]}}]}"#;
+    let split = br#"{"reflections":[{"target":"Metallib","entry":"main","stage":"Mesh","reflection":{"parameters":[{"semantic_name":"later","api_kind":"buffer","binding_index":4,"binding_space":1,"resource_access":"Read"},{"semantic_name":"earlier","api_kind":"buffer","binding_index":3,"binding_space":1,"resource_access":"Read"}],"workgroup_size":[1,1,1]}}]}"#;
+
+    assert_eq!(identity(ranged, Stage::Mesh), identity(split, Stage::Mesh));
+}
+
+#[test]
+fn stage_layout_identity_distinguishes_consumed_descriptor_shape() {
+    let identity = |metadata: &[u8], stage| {
+        ez_gfx_runtime::binding::validate_stage_reflections(
+            metadata,
+            Backend::Metal,
+            &[(stage, "main")],
+        )
+        .unwrap()[0]
+            .physical_layout_identity()
+    };
+    let base = br#"{"reflections":[{"target":"Metallib","entry":"main","stage":"Mesh","reflection":{"parameters":[{"semantic_name":"all","api_kind":"buffer","binding_index":3,"binding_space":1,"descriptor_count":2,"resource_access":"Read"}],"workgroup_size":[1,1,1]}}]}"#;
+    let changed = [
+        br#"{"reflections":[{"target":"Metallib","entry":"main","stage":"Mesh","reflection":{"parameters":[{"semantic_name":"all","api_kind":"buffer","binding_index":3,"binding_space":1,"descriptor_count":2,"resource_access":"ReadWrite"}],"workgroup_size":[1,1,1]}}]}"#.as_slice(),
+        br#"{"reflections":[{"target":"Metallib","entry":"main","stage":"Mesh","reflection":{"parameters":[{"semantic_name":"all","api_kind":"buffer","binding_index":3,"binding_space":2,"descriptor_count":2,"resource_access":"Read"}],"workgroup_size":[1,1,1]}}]}"#,
+        br#"{"reflections":[{"target":"Metallib","entry":"main","stage":"Mesh","reflection":{"parameters":[{"semantic_name":"first","api_kind":"buffer","binding_index":3,"binding_space":1,"resource_access":"Read"},{"semantic_name":"second","api_kind":"buffer","binding_index":5,"binding_space":1,"resource_access":"Read"}],"workgroup_size":[1,1,1]}}]}"#,
+        br#"{"reflections":[{"target":"Metallib","entry":"main","stage":"Mesh","reflection":{"parameters":[{"semantic_name":"all","api_kind":"buffer","binding_index":3,"binding_space":1,"descriptor_count":2,"resource_access":"Read"}],"workgroup_size":[1,1,1],"texture_heap":{"binding_space":2,"binding_index":8,"capacity":16,"argument_stride":2,"texture_argument_offset":0,"sampler_argument_offset":1}}}]}"#,
+    ];
+    let base = identity(base, Stage::Mesh);
+
+    for metadata in changed {
+        assert_ne!(base, identity(metadata, Stage::Mesh));
+    }
+
+    let fragment = br#"{"reflections":[{"target":"Metallib","entry":"main","stage":"Fragment","reflection":{"parameters":[{"semantic_name":"all","api_kind":"buffer","binding_index":3,"binding_space":1,"descriptor_count":2,"resource_access":"Read"}]}}]}"#;
+    assert_ne!(base, identity(fragment, Stage::Fragment));
 }

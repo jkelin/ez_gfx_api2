@@ -58,15 +58,15 @@ use ez_gfx::raw::{
 };
 use ez_gfx::{
     Backend, ContextOptions, DrawIndexedCommand, DynamicPipelineState, HeadlessSurfaceOptions,
-    PresentationMode, raw,
+    MeshPipelineState, MeshStages, PresentationMode, raw,
 };
 use raw_window_handle::{
     AppKitDisplayHandle, AppKitWindowHandle, RawDisplayHandle, RawWindowHandle,
     WaylandDisplayHandle, WaylandWindowHandle, Win32WindowHandle, WindowsDisplayHandle,
     XcbDisplayHandle, XcbWindowHandle, XlibDisplayHandle, XlibWindowHandle,
 };
-/// Identifies C ABI revision 40 for compatibility checks.
-pub const EZ_GFX_ABI_VERSION: u32 = 40;
+/// Identifies C ABI revision 41 for compatibility checks.
+pub const EZ_GFX_ABI_VERSION: u32 = 41;
 /// Caps any caller-provided byte range at 16 MiB.
 pub const EZ_GFX_MAX_BOUNDARY_BYTES: usize = 16 * 1024 * 1024;
 fn nonzero_native_ptr(bits: u64) -> Result<core::ptr::NonNull<core::ffi::c_void>, EzGfxResult> {
@@ -253,6 +253,39 @@ pub extern "C" fn ez_gfx_context_wait_idle(context: EzGfxContext) -> EzGfxResult
         }
     })
 }
+#[unsafe(no_mangle)]
+/// Queries optional shader stages enabled on the selected initialized device.
+///
+/// The output is written only when the query succeeds.
+///
+/// # Safety
+///
+/// `out_capabilities` must address one writable, aligned value for this call.
+pub unsafe extern "C" fn ez_gfx_context_shader_capabilities(
+    context: EzGfxContext,
+    out_capabilities: *mut EzGfxShaderCapabilities,
+) -> EzGfxResult {
+    catch_status(|| {
+        if out_capabilities.is_null() || !out_capabilities.is_aligned() {
+            return EzGfxResult::InvalidArgument;
+        }
+        let context = try_handle!(ContextHandle, context);
+        match raw::shader_capabilities(context) {
+            Ok(capabilities) => {
+                // SAFETY: the caller keeps validated writable storage live through this write.
+                unsafe {
+                    out_capabilities.write(EzGfxShaderCapabilities {
+                        task: u8::from(capabilities.task),
+                        mesh: u8::from(capabilities.mesh),
+                    });
+                }
+                EzGfxResult::Ok
+            }
+            Err(status) => status.into(),
+        }
+    })
+}
+
 #[unsafe(no_mangle)]
 /// Destroys the graphics context after aborting every live descendant frame. Reentrant entry or
 /// a boundary panic reports `TeardownAbandoned` because teardown completion is unproven.
@@ -562,6 +595,83 @@ pub unsafe extern "C" fn ez_gfx_frame_execute_graphics(
 }
 
 #[unsafe(no_mangle)]
+/// Executes a direct mesh graphics dispatch from the current frame bindings.
+///
+/// A null `state` selects no culling, counter-clockwise front faces, and no blending.
+///
+/// # Safety
+///
+/// `shaders` must address one readable, aligned descriptor. Non-null `state`
+/// must address one readable, aligned value.
+pub unsafe extern "C" fn ez_gfx_frame_execute_mesh(
+    context: EzGfxContext,
+    frame: EzGfxFrame,
+    shaders: *const EzGfxMeshShaders,
+    group_x: u32,
+    group_y: u32,
+    group_z: u32,
+    state: *const EzGfxMeshState,
+) -> EzGfxResult {
+    catch_status(|| {
+        if shaders.is_null() || !shaders.is_aligned() || (!state.is_null() && !state.is_aligned()) {
+            return EzGfxResult::InvalidArgument;
+        }
+        if group_x == 0 || group_y == 0 || group_z == 0 {
+            return EzGfxResult::InvalidArgument;
+        }
+        // SAFETY: the required descriptor is non-null, aligned, and remains readable.
+        let shaders = unsafe { shaders.read() };
+        let state = if state.is_null() {
+            EzGfxMeshState {
+                cull_mode: 0,
+                front_face: 0,
+                blend_mode: 0,
+                reserved: 0,
+            }
+        } else {
+            // SAFETY: the optional state is aligned and remains readable.
+            unsafe { state.read() }
+        };
+        if state.reserved != 0 {
+            return EzGfxResult::InvalidArgument;
+        }
+        let Ok(decoded) =
+            DynamicPipelineState::from_abi(state.cull_mode, state.front_face, 0, state.blend_mode)
+        else {
+            return EzGfxResult::InvalidArgument;
+        };
+        let mesh = try_handle!(ShaderHandle, shaders.mesh_shader);
+        let fragment = try_handle!(ShaderHandle, shaders.fragment_shader);
+        let task = if shaders.task_shader == 0 {
+            None
+        } else {
+            Some(try_handle!(ShaderHandle, shaders.task_shader))
+        };
+        let context = try_frame!(context, frame);
+        let bindings = match materialized_bindings(frame) {
+            Ok(bindings) => bindings,
+            Err(status) => return status,
+        };
+        raw::execute_mesh(
+            context,
+            MeshStages {
+                task,
+                mesh,
+                fragment,
+            },
+            [group_x, group_y, group_z],
+            &bindings,
+            MeshPipelineState {
+                cull: decoded.cull,
+                front_face: decoded.front_face,
+                blend: decoded.blend,
+            },
+        )
+        .into_ffi_result()
+    })
+}
+
+#[unsafe(no_mangle)]
 /// Executes a compute dispatch from the current frame bindings.
 pub extern "C" fn ez_gfx_frame_execute_compute(
     context: EzGfxContext,
@@ -613,11 +723,68 @@ pub unsafe extern "C" fn ez_gfx_frame_enqueue_texture_readback(
             Ok(extent) => extent,
             Err(error) => return error.into(),
         };
-        let request_id = match callback::note_readback_source(frame, texture, width, height) {
+        let request_id = match callback::note_readback_source(
+            frame,
+            texture,
+            EzGfxReadbackSourceKind::Texture,
+            width,
+            height,
+        ) {
             Ok(request_id) => request_id,
             Err(status) => return status,
         };
         match raw::frame_enqueue_readback(context, texture_handle) {
+            Ok(()) => {
+                // SAFETY: The caller keeps validated writable storage alive through this write.
+                unsafe { out_request_id.write(request_id) };
+                EzGfxResult::Ok
+            }
+            Err(error) => {
+                callback::cancel_readback(frame, request_id);
+                error.into()
+            }
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Enqueues a render-target readback and returns its stable callback correlator.
+///
+/// The readback callback reports the target through `readback_source` with
+/// `readback_source_kind` set to `RenderTarget`.
+///
+/// # Safety
+///
+/// `out_request_id` must address one writable, aligned `u64`.
+pub unsafe extern "C" fn ez_gfx_frame_enqueue_render_target_readback(
+    context: EzGfxContext,
+    frame: EzGfxFrame,
+    render_target: EzGfxRenderTarget,
+    out_request_id: *mut u64,
+) -> EzGfxResult {
+    catch_status(|| {
+        if out_request_id.is_null() || !out_request_id.is_aligned() {
+            return EzGfxResult::InvalidArgument;
+        }
+        let context = try_frame!(context, frame);
+        let target_handle = try_handle!(RenderTargetHandle, render_target);
+        let (width, height) = match raw::render_target_extent(context, target_handle) {
+            Ok(extent) => extent,
+            // Unknown target records are stale, foreign, or wrong-kind handles at this boundary.
+            Err(ez_gfx::Error::InvalidArgument) => return EzGfxResult::InvalidContext,
+            Err(error) => return error.into(),
+        };
+        let request_id = match callback::note_readback_source(
+            frame,
+            render_target,
+            EzGfxReadbackSourceKind::RenderTarget,
+            width,
+            height,
+        ) {
+            Ok(request_id) => request_id,
+            Err(status) => return status,
+        };
+        match raw::frame_enqueue_render_target_readback(context, target_handle) {
             Ok(()) => {
                 // SAFETY: The caller keeps validated writable storage alive through this write.
                 unsafe { out_request_id.write(request_id) };
@@ -693,7 +860,8 @@ pub extern "C" fn ez_gfx_frame_end(context: EzGfxContext, frame: EzGfxFrame) -> 
             let delivery = callback::ReadbackDelivery {
                 kind: EzGfxEventKind::Readback,
                 request_id: source.request_id,
-                texture: source.texture,
+                source: source.source,
+                source_kind: source.source_kind,
                 width: source.width,
                 height: source.height,
                 bytes,
@@ -707,7 +875,8 @@ pub extern "C" fn ez_gfx_frame_end(context: EzGfxContext, frame: EzGfxFrame) -> 
             let delivery = callback::ReadbackDelivery {
                 kind: EzGfxEventKind::Snapshot,
                 request_id: 0,
-                texture: 0,
+                source: 0,
+                source_kind: EzGfxReadbackSourceKind::None,
                 width,
                 height,
                 bytes,
@@ -1007,161 +1176,9 @@ pub extern "C" fn ez_gfx_surface_destroy(
     })
 }
 
-trait IntoFfiResult {
-    fn into_ffi_result(self) -> EzGfxResult;
-}
+include!("ffi_result.rs");
 
-impl IntoFfiResult for EzGfxResult {
-    fn into_ffi_result(self) -> EzGfxResult {
-        self
-    }
-}
-
-impl IntoFfiResult for ez_gfx::Result<()> {
-    fn into_ffi_result(self) -> EzGfxResult {
-        self.map_or_else(Into::into, |()| EzGfxResult::Ok)
-    }
-}
-
-fn catch_status<T: IntoFfiResult>(operation: impl FnOnce() -> T) -> EzGfxResult {
-    // Reentrant calls would alias the owner-thread runtime while it dispatches.
-    if callback::is_invoking() {
-        return EzGfxResult::InvalidArgument;
-    }
-    catch_unwind(AssertUnwindSafe(operation))
-        .map(IntoFfiResult::into_ffi_result)
-        .unwrap_or(EzGfxResult::NativeFailure)
-}
-
-fn catch_context_destroy<T: IntoFfiResult>(operation: impl FnOnce() -> T) -> EzGfxResult {
-    // Any panic or reentrant rejection leaves context teardown unproven.
-    if callback::is_invoking() {
-        return EzGfxResult::TeardownAbandoned;
-    }
-    catch_unwind(AssertUnwindSafe(operation))
-        .map(IntoFfiResult::into_ffi_result)
-        .unwrap_or(EzGfxResult::TeardownAbandoned)
-}
-
-#[cfg(test)]
-mod context_destroy_tests {
-    use super::*;
-
-    #[test]
-    fn panic_maps_to_teardown_abandoned() {
-        assert_eq!(
-            catch_context_destroy(|| -> EzGfxResult { panic!("injected teardown panic") }),
-            EzGfxResult::TeardownAbandoned
-        );
-    }
-}
-
-fn catch_frame_terminal<T: IntoFfiResult>(
-    frame_handle: EzGfxFrame,
-    operation: impl FnOnce() -> T,
-) -> EzGfxResult {
-    // A panic must still retire the opaque handle and unwind the raw transaction.
-    let result = if let Ok(result) = catch_unwind(AssertUnwindSafe(operation)) {
-        result.into_ffi_result()
-    } else {
-        if let Ok(entry) = frame::remove(frame_handle, frame::FrameState::Aborted) {
-            callback::take_frame(frame_handle);
-            let _ = raw::frame_abort(entry.owner);
-        }
-        EzGfxResult::NativeFailure
-    };
-    clear_binding_draft(frame_handle);
-    buffer::clear_frame(frame_handle);
-    result
-}
-
-#[derive(Clone, Copy)]
-enum ValidatedBindingResource {
-    Buffer { handle: u64, kind: buffer::Kind },
-    RenderTarget(RenderTargetHandle),
-}
-
-type FrameBindingDraft = HashMap<String, ValidatedBindingResource>;
-static FRAME_BINDINGS: LazyLock<Mutex<HashMap<EzGfxFrame, FrameBindingDraft>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Validates one foreign binding completely before it can enter a frame draft.
-fn validate_binding(
-    frame: EzGfxFrame,
-    binding: EzGfxBinding,
-) -> Result<(String, ValidatedBindingResource), EzGfxResult> {
-    if binding.name_length > 255 {
-        return Err(EzGfxResult::InvalidArgument);
-    }
-    let name = read_bounded_string(binding.name, binding.name_length)?;
-    let resource = match (
-        binding.buffer != 0,
-        binding.counter_buffer != 0,
-        binding.render_target != 0,
-    ) {
-        (true, false, false) => ValidatedBindingResource::Buffer {
-            handle: binding.buffer,
-            kind: buffer::Kind::Buffer,
-        },
-        (false, true, false) => ValidatedBindingResource::Buffer {
-            handle: binding.counter_buffer,
-            kind: buffer::Kind::Counter,
-        },
-        (false, false, true) => {
-            let target = RenderTargetHandle::from_raw(binding.render_target)
-                .map_err(|_| EzGfxResult::InvalidContext)?;
-            ValidatedBindingResource::RenderTarget(target)
-        }
-        _ => return Err(EzGfxResult::InvalidArgument),
-    };
-    let frame_entry = frame::get(frame)?;
-    match resource {
-        ValidatedBindingResource::Buffer { handle, kind } => {
-            buffer::validate(frame, handle, kind)?;
-        }
-        ValidatedBindingResource::RenderTarget(target) => {
-            raw::render_target_extent(frame_entry.owner, target).map_err(EzGfxResult::from)?;
-        }
-    }
-    Ok((name, resource))
-}
-
-fn materialized_bindings(frame: EzGfxFrame) -> Result<Vec<PublicBinding>, EzGfxResult> {
-    let drafts = FRAME_BINDINGS
-        .lock()
-        .map_err(|_| EzGfxResult::NativeFailure)?;
-    let Some(draft) = drafts.get(&frame) else {
-        return Ok(Vec::new());
-    };
-    let mut bindings = Vec::with_capacity(draft.len());
-    for (name, binding) in draft {
-        let resource = match *binding {
-            ValidatedBindingResource::Buffer { handle, kind } => {
-                buffer::materialize(frame, handle, kind)?
-            }
-            ValidatedBindingResource::RenderTarget(target) => {
-                ResourceIdentity::RenderTarget(target)
-            }
-        };
-        bindings.push(PublicBinding {
-            name: name.clone(),
-            resource,
-        });
-    }
-    Ok(bindings)
-}
-
-fn clear_binding_draft(frame: EzGfxFrame) {
-    if let Ok(mut drafts) = FRAME_BINDINGS.lock() {
-        drafts.remove(&frame);
-    }
-}
-
-fn clear_owner_binding_drafts(owner: ContextHandle) {
-    if let Ok(mut drafts) = FRAME_BINDINGS.lock() {
-        drafts.retain(|frame, _| frame::get(*frame).is_ok_and(|entry| entry.owner != owner));
-    }
-}
+include!("frame_binding.rs");
 
 fn catch_void(operation: impl FnOnce()) {
     if callback::is_invoking() {

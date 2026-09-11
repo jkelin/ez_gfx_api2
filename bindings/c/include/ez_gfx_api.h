@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EZ_GFX_ABI_VERSION 40u
+#define EZ_GFX_ABI_VERSION 41u
 
 #if defined(__clang__)
 #  if __has_attribute(access)
@@ -39,6 +39,12 @@ typedef uint64_t EzGfxReadbackRequest;
 
 /** Opaque context-owned compute shader handle. */
 typedef uint64_t EzGfxComputeShader;
+
+/** Opaque context-owned task shader handle. */
+typedef uint64_t EzGfxTaskShader;
+
+/** Opaque context-owned mesh shader handle. */
+typedef uint64_t EzGfxMeshShader;
 
 /** Opaque context-owned vertex shader handle. */
 typedef uint64_t EzGfxVertexShader;
@@ -218,6 +224,21 @@ enum {
     EzGfxEventKind_ObservationsDropped = 4,
     EzGfxEventKind_Readback = 5,
     EzGfxEventKind_Snapshot = 6,
+};
+
+/**
+ * EzGfxReadbackSourceKind:
+ * @EzGfxReadbackSourceKind_None: No resource handle; used by unrequested presentation snapshots.
+ * @EzGfxReadbackSourceKind_Texture: `readback_source` is an [`EzGfxTexture`].
+ * @EzGfxReadbackSourceKind_RenderTarget: `readback_source` is an [`EzGfxRenderTarget`].
+ *
+ * Identifies the resource type stored in [`EzGfxEvent::readback_source`].
+ */
+typedef uint8_t EzGfxReadbackSourceKind;
+enum {
+    EzGfxReadbackSourceKind_None = 0,
+    EzGfxReadbackSourceKind_Texture = 1,
+    EzGfxReadbackSourceKind_RenderTarget = 2,
 };
 
 /**
@@ -497,26 +518,6 @@ typedef struct EzGfxAdapterDesc {
 } EzGfxAdapterDesc;
 
 /**
- * EzGfxAdapterInfo:
- * @stable_id: Stable 128-bit adapter identity from enumeration.
- * @backend: Backend code from `EzGfxBackend`.
- * @adapter_class: Class code from `EzGfxAdapterClass`.
- * @admitted: Whether the adapter passes admission under the queried policy; zero or one.
- * @software_rejected: Whether software policy alone rejects the adapter; zero or one.
- * @error_count: Count of unmet profile requirements; zero when admitted.
- *
- * Enumerated adapter identity with admission diagnostics under one software policy.
- */
-typedef struct EzGfxAdapterInfo {
-    uint8_t stable_id[16];
-    EzGfxBackend backend;
-    EzGfxAdapterClass adapter_class;
-    uint8_t admitted;
-    uint8_t software_rejected;
-    uint32_t error_count;
-} EzGfxAdapterInfo;
-
-/**
  * EzGfxBackendContextDesc:
  * @enable_debug: Enables graphics-backend debugging when nonzero.
  * @enable_validation: Enables graphics API validation when nonzero.
@@ -747,6 +748,48 @@ typedef struct EzGfxBinding {
 } EzGfxBinding;
 
 /**
+ * EzGfxMeshShaders:
+ * @task_shader: Optional task shader; zero means absent.
+ * @mesh_shader: Required mesh shader.
+ * @fragment_shader: Required fragment shader.
+ *
+ * Selects the shader stages for one mesh graphics dispatch.
+ */
+typedef struct EzGfxMeshShaders {
+    EzGfxTaskShader task_shader;
+    EzGfxMeshShader mesh_shader;
+    EzGfxFragmentShader fragment_shader;
+} EzGfxMeshShaders;
+
+/**
+ * EzGfxMeshState:
+ * @cull_mode: Selects the polygon culling mode by its C ABI numeric code.
+ * @front_face: Selects which winding is considered front-facing.
+ * @blend_mode: Selects the color blending mode by its C ABI numeric code.
+ * @reserved: Must be zero.
+ *
+ * Encodes rasterization and blending state for a mesh graphics pipeline.
+ */
+typedef struct EzGfxMeshState {
+    EzGfxCullMode cull_mode;
+    EzGfxFrontFace front_face;
+    EzGfxBlendMode blend_mode;
+    uint8_t reserved;
+} EzGfxMeshState;
+
+/**
+ * EzGfxShaderCapabilities:
+ * @task: Whether task shaders are enabled; zero or one.
+ * @mesh: Whether mesh shaders are enabled; zero or one.
+ *
+ * Reports optional programmable shader stages.
+ */
+typedef struct EzGfxShaderCapabilities {
+    uint8_t task;
+    uint8_t mesh;
+} EzGfxShaderCapabilities;
+
+/**
  * EzGfxDynamicState:
  * @cull_mode: Selects the polygon culling mode by its C ABI numeric code.
  * @front_face: Selects which vertex winding is considered front-facing.
@@ -874,7 +917,9 @@ typedef struct EzGfxDiagnostic {
  * @_pad_level: Reserves bytes that keep the C ABI layout stable.
  * @dropped: Discarded-record count; valid when `kind` is `ObservationsDropped`.
  * @readback_request_id: Stable request correlator, or zero for an unrequested snapshot.
- * @readback_texture: Readback source texture, or zero for a surface-presented snapshot.
+ * @readback_source: Opaque source handle, or zero when `readback_source_kind` is `None`.
+ * @readback_source_kind: Identifies how to interpret `readback_source`.
+ * @_pad_readback_source_kind: Reserves bytes that keep the C ABI layout stable.
  * @readback_width: Readback image width in pixels; valid for `Readback` or `Snapshot`.
  * @readback_height: Readback image height in pixels; valid for `Readback` or `Snapshot`.
  * @readback_byte_count: Readback byte count; valid for `Readback` or `Snapshot`.
@@ -891,7 +936,9 @@ typedef struct EzGfxEvent {
     uint8_t _pad_level[7];
     uint64_t dropped;
     EzGfxReadbackRequest readback_request_id;
-    EzGfxTexture readback_texture;
+    uint64_t readback_source;
+    EzGfxReadbackSourceKind readback_source_kind;
+    uint8_t _pad_readback_source_kind[7];
     uint32_t readback_width;
     uint32_t readback_height;
     size_t readback_byte_count;
@@ -915,6 +962,28 @@ typedef struct EzGfxContextDesc {
     uint32_t adapter_count;
     const EzGfxAdapterDesc * adapter;
 } EzGfxContextDesc;
+
+/**
+ * EzGfxAdapterInfo:
+ * @stable_id: Stable 128-bit adapter identity from enumeration.
+ * @backend: Backend code from `EzGfxBackend`.
+ * @adapter_class: Class code from `EzGfxAdapterClass`.
+ * @admitted: Whether the adapter passes admission under the queried policy; zero or one.
+ * @software_rejected: Whether software policy alone rejects the adapter; zero or one.
+ * @error_count: Count of unmet profile requirements; zero when admitted.
+ * @shader_stages: Optional task and mesh stages supported by this adapter.
+ *
+ * Enumerated adapter identity with admission diagnostics under one software policy.
+ */
+typedef struct EzGfxAdapterInfo {
+    uint8_t stable_id[16];
+    EzGfxBackend backend;
+    EzGfxAdapterClass adapter_class;
+    uint8_t admitted;
+    uint8_t software_rejected;
+    uint32_t error_count;
+    EzGfxShaderCapabilities shader_stages;
+} EzGfxAdapterInfo;
 
 /** Custom image decoder invoked concurrently by texture workers. */
 typedef EzGfxResult (*EzGfxTextureDecoderCallback)(const uint8_t * data, size_t data_size, uint8_t compression_support, EzGfxDecodedTexture * out_texture, void * user_data);
@@ -1180,6 +1249,17 @@ EzGfxResult ez_gfx_context_create_backend(const EzGfxBackendContextDesc * desc, 
 EzGfxResult ez_gfx_context_wait_idle(EzGfxContext context);
 
 /**
+ * ez_gfx_context_shader_capabilities:
+ * @context: Owning initialized context.
+ * @out_capabilities: Receives capabilities only on success.
+ *
+ * Queries optional shader stages enabled on the selected initialized device. The output is written only when the query succeeds.
+ *
+ * Returns: Returns context, device, or output-pointer status.
+ */
+EzGfxResult ez_gfx_context_shader_capabilities(EzGfxContext context, EzGfxShaderCapabilities * out_capabilities) EZ_GFX_ACCESS(write_only, 2);
+
+/**
  * ez_gfx_context_destroy:
  * @context: Context to destroy on its creator thread; zero, stale, repeated, and wrong-thread calls report EzGfxResult_InvalidContext.
  *
@@ -1294,6 +1374,22 @@ EzGfxResult ez_gfx_frame_bind(EzGfxContext context, EzGfxFrame frame, const EzGf
 EzGfxResult ez_gfx_frame_execute_graphics(EzGfxContext context, EzGfxFrame frame, EzGfxVertexShader vertex_shader, EzGfxFragmentShader fragment_shader, EzGfxCounterBuffer buffer, const EzGfxDynamicState * dynamic_state) EZ_GFX_ACCESS(read_only, 6);
 
 /**
+ * ez_gfx_frame_execute_mesh:
+ * @context: Owning context.
+ * @frame: Live owning frame.
+ * @shaders: Required mesh-stage descriptor.
+ * @group_x: X groups.
+ * @group_y: Y groups.
+ * @group_z: Z groups.
+ * @state: Optional mesh pipeline state.
+ *
+ * Executes a direct mesh graphics dispatch from the current frame bindings. A null `state` selects no culling, counter-clockwise front faces, and no blending.
+ *
+ * Returns: Returns validation, capability, frame, or native status.
+ */
+EzGfxResult ez_gfx_frame_execute_mesh(EzGfxContext context, EzGfxFrame frame, const EzGfxMeshShaders * shaders, uint32_t group_x, uint32_t group_y, uint32_t group_z, const EzGfxMeshState * state) EZ_GFX_ACCESS(read_only, 3) EZ_GFX_ACCESS(read_only, 7);
+
+/**
  * ez_gfx_frame_execute_compute:
  * @context: Owning context.
  * @frame: Live owning frame.
@@ -1320,6 +1416,19 @@ EzGfxResult ez_gfx_frame_execute_compute(EzGfxContext context, EzGfxFrame frame,
  * Returns: Returns frame, handle, or output-pointer status.
  */
 EzGfxResult ez_gfx_frame_enqueue_texture_readback(EzGfxContext context, EzGfxFrame frame, EzGfxTexture texture, EzGfxReadbackRequest * out_request_id) EZ_GFX_ACCESS(write_only, 4);
+
+/**
+ * ez_gfx_frame_enqueue_render_target_readback:
+ * @context: Owning context.
+ * @frame: Live owning frame.
+ * @render_target: Render target to read back.
+ * @out_request_id: Receives the stable request correlator.
+ *
+ * Enqueues a render-target readback and returns its stable callback correlator. The readback callback reports the target through `readback_source` with `readback_source_kind` set to `RenderTarget`.
+ *
+ * Returns: Returns frame, handle, or output-pointer status.
+ */
+EzGfxResult ez_gfx_frame_enqueue_render_target_readback(EzGfxContext context, EzGfxFrame frame, EzGfxRenderTarget render_target, EzGfxReadbackRequest * out_request_id) EZ_GFX_ACCESS(write_only, 4);
 
 /**
  * ez_gfx_frame_end:
@@ -1554,6 +1663,36 @@ EzGfxResult ez_gfx_render_target_frame_begin(EzGfxContext context, EzGfxRenderTa
 EzGfxResult ez_gfx_compute_shader_load(EzGfxContext context, const uint8_t * data, size_t data_size, const char * entry_point, size_t entry_point_size, EzGfxComputeShader * out_shader) EZ_GFX_ACCESS(read_only, 2, 3) EZ_GFX_ACCESS(read_only, 4, 5) EZ_GFX_ACCESS(write_only, 6);
 
 /**
+ * ez_gfx_task_shader_load:
+ * @context: Owning context.
+ * @data: Validated artifact bytes.
+ * @data_size: Artifact byte count.
+ * @entry_point: Exact UTF-8 entry-point name.
+ * @entry_point_size: Entry-point byte count.
+ * @out_shader: Receives the owning task shader handle.
+ *
+ * Loads one exact task entry point from a validated artifact.
+ *
+ * Returns: Returns EzGfxResult_Ok or validation/native failure.
+ */
+EzGfxResult ez_gfx_task_shader_load(EzGfxContext context, const uint8_t * data, size_t data_size, const char * entry_point, size_t entry_point_size, EzGfxTaskShader * out_shader) EZ_GFX_ACCESS(read_only, 2, 3) EZ_GFX_ACCESS(read_only, 4, 5) EZ_GFX_ACCESS(write_only, 6);
+
+/**
+ * ez_gfx_mesh_shader_load:
+ * @context: Owning context.
+ * @data: Validated artifact bytes.
+ * @data_size: Artifact byte count.
+ * @entry_point: Exact UTF-8 entry-point name.
+ * @entry_point_size: Entry-point byte count.
+ * @out_shader: Receives the owning mesh shader handle.
+ *
+ * Loads one exact mesh entry point from a validated artifact.
+ *
+ * Returns: Returns EzGfxResult_Ok or validation/native failure.
+ */
+EzGfxResult ez_gfx_mesh_shader_load(EzGfxContext context, const uint8_t * data, size_t data_size, const char * entry_point, size_t entry_point_size, EzGfxMeshShader * out_shader) EZ_GFX_ACCESS(read_only, 2, 3) EZ_GFX_ACCESS(read_only, 4, 5) EZ_GFX_ACCESS(write_only, 6);
+
+/**
  * ez_gfx_vertex_shader_load:
  * @context: Owning context.
  * @data: Validated artifact bytes.
@@ -1593,6 +1732,28 @@ EzGfxResult ez_gfx_fragment_shader_load(EzGfxContext context, const uint8_t * da
  * Returns: No return value; stale handles are ignored.
  */
 void ez_gfx_compute_shader_destroy(EzGfxContext context, EzGfxComputeShader shader);
+
+/**
+ * ez_gfx_task_shader_destroy:
+ * @context: Owning context; zero and stale values are ignored.
+ * @shader: Task shader to destroy.
+ *
+ * Invalidates immediately. An active frame retains its record through its terminal operation.
+ *
+ * Returns: No return value; stale handles are ignored.
+ */
+void ez_gfx_task_shader_destroy(EzGfxContext context, EzGfxTaskShader shader);
+
+/**
+ * ez_gfx_mesh_shader_destroy:
+ * @context: Owning context; zero and stale values are ignored.
+ * @shader: Mesh shader to destroy.
+ *
+ * Invalidates immediately. An active frame retains its record through its terminal operation.
+ *
+ * Returns: No return value; stale handles are ignored.
+ */
+void ez_gfx_mesh_shader_destroy(EzGfxContext context, EzGfxMeshShader shader);
 
 /**
  * ez_gfx_vertex_shader_destroy:

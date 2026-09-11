@@ -655,7 +655,7 @@ impl NativeContext {
             D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
         };
         use windows::Win32::Graphics::Dxgi::Common::{
-            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
             DXGI_FORMAT_R16G16B16A16_FLOAT,
         };
         let query = |format, dxgi| {
@@ -684,7 +684,7 @@ impl NativeContext {
         };
         let supports = [
             query(Format::Rgba8Unorm, DXGI_FORMAT_R8G8B8A8_UNORM)?,
-            query(Format::Bgra8Srgb, DXGI_FORMAT_B8G8R8A8_UNORM)?,
+            query(Format::Bgra8Srgb, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)?,
             query(Format::Rgba16Float, DXGI_FORMAT_R16G16B16A16_FLOAT)?,
             query(Format::Depth32Float, DXGI_FORMAT_D32_FLOAT)?,
         ]

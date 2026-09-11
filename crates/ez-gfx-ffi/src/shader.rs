@@ -1,6 +1,7 @@
 use crate::{
-    EZ_GFX_MAX_BOUNDARY_BYTES, EzGfxComputeShader, EzGfxContext, EzGfxFragmentShader, EzGfxResult,
-    EzGfxVertexShader, catch_status, catch_void, read_bounded_string,
+    EZ_GFX_MAX_BOUNDARY_BYTES, EzGfxComputeShader, EzGfxContext, EzGfxFragmentShader,
+    EzGfxMeshShader, EzGfxResult, EzGfxTaskShader, EzGfxVertexShader, catch_status, catch_void,
+    read_bounded_string,
 };
 use ez_gfx::raw::{self, ContextHandle, ShaderHandle};
 
@@ -62,6 +63,64 @@ pub unsafe extern "C" fn ez_gfx_compute_shader_load(
             entry_point,
             entry_point_size,
             ez_gfx::Stage::Compute,
+            out_shader,
+        )
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Loads one exact task entry point from a validated artifact.
+///
+/// # Safety
+///
+/// Input ranges must be readable and `out_shader` writable and aligned.
+pub unsafe extern "C" fn ez_gfx_task_shader_load(
+    context: EzGfxContext,
+    data: *const u8,
+    data_size: usize,
+    entry_point: *const u8,
+    entry_point_size: usize,
+    out_shader: *mut EzGfxTaskShader,
+) -> EzGfxResult {
+    // SAFETY: The caller guarantees the documented input readability and output
+    // writability; the stage loader validates ranges before dereferencing.
+    catch_status(|| unsafe {
+        load_stage_shader(
+            context,
+            data,
+            data_size,
+            entry_point,
+            entry_point_size,
+            ez_gfx::Stage::Task,
+            out_shader,
+        )
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Loads one exact mesh entry point from a validated artifact.
+///
+/// # Safety
+///
+/// Input ranges must be readable and `out_shader` writable and aligned.
+pub unsafe extern "C" fn ez_gfx_mesh_shader_load(
+    context: EzGfxContext,
+    data: *const u8,
+    data_size: usize,
+    entry_point: *const u8,
+    entry_point_size: usize,
+    out_shader: *mut EzGfxMeshShader,
+) -> EzGfxResult {
+    // SAFETY: The caller guarantees the documented input readability and output
+    // writability; the stage loader validates ranges before dereferencing.
+    catch_status(|| unsafe {
+        load_stage_shader(
+            context,
+            data,
+            data_size,
+            entry_point,
+            entry_point_size,
+            ez_gfx::Stage::Mesh,
             out_shader,
         )
     })
@@ -137,6 +196,18 @@ fn destroy_shader(context: EzGfxContext, shader: u64) {
 #[unsafe(no_mangle)]
 /// Invalidates immediately. An active frame retains its record through its terminal operation.
 pub extern "C" fn ez_gfx_compute_shader_destroy(context: EzGfxContext, shader: EzGfxComputeShader) {
+    catch_void(|| destroy_shader(context, shader));
+}
+
+#[unsafe(no_mangle)]
+/// Invalidates immediately. An active frame retains its record through its terminal operation.
+pub extern "C" fn ez_gfx_task_shader_destroy(context: EzGfxContext, shader: EzGfxTaskShader) {
+    catch_void(|| destroy_shader(context, shader));
+}
+
+#[unsafe(no_mangle)]
+/// Invalidates immediately. An active frame retains its record through its terminal operation.
+pub extern "C" fn ez_gfx_mesh_shader_destroy(context: EzGfxContext, shader: EzGfxMeshShader) {
     catch_void(|| destroy_shader(context, shader));
 }
 

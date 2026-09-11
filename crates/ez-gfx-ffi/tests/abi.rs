@@ -24,10 +24,11 @@ use ez_gfx_ffi::{
     EzGfxAdapterClass, EzGfxAdapterDesc, EzGfxAdapterInfo, EzGfxBackendContextDesc, EzGfxBinding,
     EzGfxByteBuffer, EzGfxContextDesc, EzGfxDiagnostic, EzGfxDrawIndexedCommand, EzGfxDynamicState,
     EzGfxEvent, EzGfxEventCallback, EzGfxEventKind, EzGfxHandleParts, EzGfxHeadlessSurfaceDesc,
-    EzGfxPresentationModes, EzGfxRenderTargetDesc, EzGfxRenderTargetFormat, EzGfxRenderTargetUsage,
-    EzGfxResult, EzGfxRuntimeRecord, EzGfxTextureDesc, EzGfxUploadEvent, EzGfxWindowSurfaceDesc,
-    ez_gfx_adapter_count, ez_gfx_adapter_query, ez_gfx_buffer_acquire, ez_gfx_buffer_release,
-    ez_gfx_buffer_write, ez_gfx_compute_shader_load, ez_gfx_context_create,
+    EzGfxMeshShaders, EzGfxMeshState, EzGfxPresentationModes, EzGfxReadbackSourceKind,
+    EzGfxRenderTargetDesc, EzGfxRenderTargetFormat, EzGfxRenderTargetUsage, EzGfxResult,
+    EzGfxRuntimeRecord, EzGfxShaderCapabilities, EzGfxTextureDesc, EzGfxUploadEvent,
+    EzGfxWindowSurfaceDesc, ez_gfx_adapter_count, ez_gfx_adapter_query, ez_gfx_buffer_acquire,
+    ez_gfx_buffer_release, ez_gfx_buffer_write, ez_gfx_compute_shader_load, ez_gfx_context_create,
     ez_gfx_context_create_backend, ez_gfx_context_destroy, ez_gfx_context_register_callback,
     ez_gfx_context_wait_idle, ez_gfx_counter_buffer_acquire, ez_gfx_counter_buffer_publish_count,
     ez_gfx_counter_buffer_release, ez_gfx_counter_buffer_write_draws, ez_gfx_frame_abort,
@@ -219,6 +220,7 @@ fn adapter_enumeration_reports_stable_diagnostics() {
         admitted: 0,
         software_rejected: 0,
         error_count: 0,
+        shader_stages: EzGfxShaderCapabilities { task: 0, mesh: 0 },
     };
     let mut infos = vec![blank; total as usize];
     assert_eq!(
@@ -243,221 +245,7 @@ fn adapter_enumeration_reports_stable_diagnostics() {
     }
 }
 
-#[test]
-#[allow(
-    clippy::float_cmp,
-    reason = "canary arrays verify untouched outputs with exact sentinel equality"
-)]
-fn render_target_create_rejects_invalid_ranges_before_delegating() {
-    let name = b"target";
-    let candidates = [1_u8];
-    let base = EzGfxRenderTargetDesc {
-        name: name.as_ptr(),
-        name_length: name.len(),
-        usage: 0,
-        relative_scale: 1.0,
-        samples: 1,
-        candidate_formats: candidates.as_ptr(),
-        candidate_count: u32::try_from(candidates.len()).expect("test candidate count fits u32"),
-        sampleable: 1,
-        use_clear: 1,
-        clear_color: [0.0, 0.0, 0.0, 1.0],
-    };
-    let mut target = 7;
-
-    // Null descriptors and outputs fail before any read; outputs stay untouched.
-    assert_eq!(
-        // SAFETY: Null descriptor intentionally exercises checked rejection; output storage is live and aligned.
-        unsafe { ez_gfx_render_target_create(0, core::ptr::null(), 64, 64, &raw mut target) },
-        EzGfxResult::InvalidArgument
-    );
-    assert_eq!(
-        // SAFETY: Null output intentionally exercises checked rejection; the descriptor names live test-owned ranges.
-        unsafe { ez_gfx_render_target_create(0, &raw const base, 64, 64, core::ptr::null_mut()) },
-        EzGfxResult::InvalidArgument
-    );
-    assert_eq!(target, 7);
-
-    // Zero extents fail before delegation.
-    for (width_in, height_in) in [(0, 64), (64, 0)] {
-        assert_eq!(
-            // SAFETY: The descriptor names live test-owned ranges; zero extents are rejected before any native call.
-            unsafe {
-                ez_gfx_render_target_create(
-                    0,
-                    &raw const base,
-                    width_in,
-                    height_in,
-                    &raw mut target,
-                )
-            },
-            EzGfxResult::InvalidArgument
-        );
-    }
-
-    // Unknown enum codes, non-boolean flags, and malformed count pairs fail closed.
-    for desc in [
-        EzGfxRenderTargetDesc { usage: 4, ..base },
-        EzGfxRenderTargetDesc { samples: 3, ..base },
-        EzGfxRenderTargetDesc {
-            sampleable: 2,
-            ..base
-        },
-        EzGfxRenderTargetDesc {
-            use_clear: 2,
-            ..base
-        },
-        EzGfxRenderTargetDesc {
-            relative_scale: f32::NAN,
-            ..base
-        },
-        EzGfxRenderTargetDesc {
-            candidate_formats: core::ptr::null(),
-            ..base
-        },
-        EzGfxRenderTargetDesc {
-            candidate_count: 0,
-            ..base
-        },
-        EzGfxRenderTargetDesc {
-            candidate_count: 17,
-            ..base
-        },
-        EzGfxRenderTargetDesc {
-            name: core::ptr::null(),
-            name_length: 0,
-            ..base
-        },
-    ] {
-        assert_eq!(
-            // SAFETY: Live pointers name the declared test-owned ranges; invalid fields are rejected before delegation.
-            unsafe { ez_gfx_render_target_create(0, &raw const desc, 64, 64, &raw mut target) },
-            EzGfxResult::InvalidArgument
-        );
-    }
-    assert_eq!(target, 7);
-
-    // An unknown candidate code fails without touching the output.
-    let bad_code = [7_u8];
-    let bad_candidate = EzGfxRenderTargetDesc {
-        candidate_formats: bad_code.as_ptr(),
-        ..base
-    };
-    assert_eq!(
-        // SAFETY: The candidate range is live; the unknown code is rejected before delegation.
-        unsafe {
-            ez_gfx_render_target_create(0, &raw const bad_candidate, 64, 64, &raw mut target)
-        },
-        EzGfxResult::InvalidArgument
-    );
-
-    // A non-finite stored clear fails before delegation.
-    let bad_clear = EzGfxRenderTargetDesc {
-        clear_color: [f32::INFINITY, 0.0, 0.0, 1.0],
-        ..base
-    };
-    assert_eq!(
-        // SAFETY: The descriptor names live test-owned ranges; the clear is rejected before delegation.
-        unsafe { ez_gfx_render_target_create(0, &raw const bad_clear, 64, 64, &raw mut target) },
-        EzGfxResult::InvalidArgument
-    );
-
-    // A well-formed descriptor reaches the safe layer, which rejects the null context.
-    assert_eq!(
-        // SAFETY: The descriptor names live test-owned ranges with valid fields.
-        unsafe { ez_gfx_render_target_create(0, &raw const base, 64, 64, &raw mut target) },
-        EzGfxResult::InvalidContext
-    );
-    assert_eq!(target, 7);
-
-    // Non-color usage passes FFI validation; the null context fails first.
-    // `Unsupported` mapping is pinned safe-side and in the hidden-GPU test below.
-    let depth = EzGfxRenderTargetDesc {
-        usage: 1,
-        use_clear: 0,
-        ..base
-    };
-    assert_eq!(
-        // SAFETY: The descriptor names live test-owned ranges; the null context fails delegation.
-        unsafe { ez_gfx_render_target_create(0, &raw const depth, 64, 64, &raw mut target) },
-        EzGfxResult::InvalidContext
-    );
-    assert_eq!(target, 7);
-}
-
-#[test]
-#[allow(
-    clippy::float_cmp,
-    reason = "canary arrays verify untouched outputs with exact sentinel equality"
-)]
-fn render_target_queries_probe_and_begin_validate_handles() {
-    let mut format = 9;
-    let mut width = 11;
-    let mut height = 13;
-    let mut use_clear = 15;
-    let mut color = [17.0, 19.0, 23.0, 29.0];
-
-    assert_eq!(
-        // SAFETY: Null format output intentionally exercises checked rejection.
-        unsafe { ez_gfx_render_target_get_format(0, 0, core::ptr::null_mut()) },
-        EzGfxResult::InvalidArgument
-    );
-    assert_eq!(
-        // SAFETY: Null extent outputs intentionally exercise checked rejection.
-        unsafe { ez_gfx_render_target_get_extent(0, 0, core::ptr::null_mut(), &raw mut height) },
-        EzGfxResult::InvalidArgument
-    );
-    assert_eq!(
-        // SAFETY: Null clear outputs intentionally exercise checked rejection.
-        unsafe { ez_gfx_render_target_get_clear(0, 0, &raw mut use_clear, core::ptr::null_mut()) },
-        EzGfxResult::InvalidArgument
-    );
-    assert_eq!(format, 9);
-    assert_eq!(height, 13);
-    assert_eq!(use_clear, 15);
-    assert_eq!(color, [17.0, 19.0, 23.0, 29.0]);
-
-    // Malformed handles fail before any context access.
-    assert_eq!(
-        // SAFETY: Outputs are live and aligned; the zero handles fail validation first.
-        unsafe { ez_gfx_render_target_get_format(0, 0, &raw mut format) },
-        EzGfxResult::InvalidContext
-    );
-    assert_eq!(
-        // SAFETY: Outputs are live and aligned; the zero handles fail validation first.
-        unsafe { ez_gfx_render_target_get_extent(0, 0, &raw mut width, &raw mut height) },
-        EzGfxResult::InvalidContext
-    );
-    assert_eq!(
-        // SAFETY: Outputs are live and aligned; the zero handles fail validation first.
-        unsafe { ez_gfx_render_target_get_clear(0, 0, &raw mut use_clear, color.as_mut_ptr()) },
-        EzGfxResult::InvalidContext
-    );
-    assert_eq!(
-        ez_gfx_render_target_probe_format(0, 7, 1),
-        EzGfxResult::InvalidArgument
-    );
-    assert_eq!(
-        ez_gfx_render_target_probe_format(0, 1, 3),
-        EzGfxResult::InvalidArgument
-    );
-    assert_eq!(
-        ez_gfx_render_target_probe_format(0, 1, 1),
-        EzGfxResult::InvalidContext
-    );
-    let mut frame = 0;
-    assert_eq!(
-        // SAFETY: The frame output is live and aligned; the zero handles fail validation.
-        unsafe { ez_gfx_render_target_frame_begin(0, 0, &raw mut frame) },
-        EzGfxResult::InvalidContext
-    );
-    // Destroy stays infallible over garbage handles.
-    ez_gfx_render_target_destroy(0, 0);
-    assert_eq!(format, 9);
-    assert_eq!((width, height), (11, 13));
-    assert_eq!(use_clear, 15);
-    assert_eq!(color, [17.0, 19.0, 23.0, 29.0]);
-}
+include!("abi/render_target_boundaries.rs");
 
 #[test]
 fn terminal_frame_calls_reject_null_and_stale_handles() {
@@ -1102,6 +890,7 @@ fn explicit_adapter_selection_creates_and_rejects_hidden_contexts() {
         admitted: 0,
         software_rejected: 0,
         error_count: 0,
+        shader_stages: EzGfxShaderCapabilities { task: 0, mesh: 0 },
     };
     let mut infos = vec![blank; total as usize];
     let mut written = 0;

@@ -1,25 +1,27 @@
 use crate::Result;
 
+#[cfg(test)]
+use super::CleanupTestOutcome;
 #[cfg(windows)]
 use super::Dx12Context;
 #[cfg(target_vendor = "apple")]
 use super::MetalContext;
+#[cfg(all(test, not(target_vendor = "apple")))]
+use super::SurfaceInsertTestFailure;
 use super::{
     AdapterCatalog, AdapterInfo, AdapterReport, AdapterSelection, Arc, AsyncTextureState, Backend,
     CONTEXT_HANDLES, CONTEXTS, ContextHandle, ContextIdentity, ContextOptions, ContextState,
     DiagnosticLevel, Error, FrameRecorder, GeometryManager, HalError, HashMap,
     IndexAllocationHandle, LocalHandle, NativeContext, NativeSurface, Observability, Ordering,
     PresentationMode, RenderTargetHandle, ResourceKind, RuntimeError, RuntimePhase, RuntimeRecord,
-    RuntimeStatus, SurfaceHandle, TextureRegistry, TextureUploadTelemetry, UploadEvent,
-    UploadResource, UploadStatus, VertexAllocationHandle, VulkanContext, admission_report,
-    completed_transfer_native, context_local, destroy_native_pipeline, destroy_native_shader,
-    destroy_native_surface, destroy_native_texture, free_native_allocation, map_allocation,
-    map_hal, map_lifecycle, map_native_loss, map_texture, progress_texture_upload_events,
-    pump_async_textures, render_target::destroy_all_render_targets, result_status,
-    wait_native_idle, with_context_mut,
+    RuntimeStatus, ShaderCapabilities, SurfaceHandle, TextureRegistry, TextureUploadTelemetry,
+    UploadEvent, UploadResource, UploadStatus, VertexAllocationHandle, VulkanContext,
+    admission_report, completed_transfer_native, context_local, destroy_native_pipeline,
+    destroy_native_shader, destroy_native_surface, destroy_native_texture, free_native_allocation,
+    map_allocation, map_hal, map_lifecycle, map_native_loss, map_texture,
+    progress_texture_upload_events, pump_async_textures, render_target::destroy_all_render_targets,
+    result_status, wait_native_idle, with_context_mut,
 };
-#[cfg(test)]
-use super::{CleanupTestOutcome, SurfaceInsertTestFailure};
 
 /// Creates a graphics context.
 ///
@@ -109,6 +111,7 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         frame_action_indices: Vec::new(),
         frame_binding_scratch: Vec::new(),
         frame_binding_ranges: Vec::new(),
+        frame_texture_handles: Vec::new(),
         #[cfg(target_vendor = "apple")]
         frame_texture_heaps: Vec::new(),
         #[cfg(target_vendor = "apple")]
@@ -131,6 +134,16 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         surface_insert_test_failure: None,
         #[cfg(test)]
         surface_rollback_test_abandoned: false,
+        #[cfg(test)]
+        shader_capabilities_override: None,
+        #[cfg(test)]
+        native_shader_allocation_attempts: 0,
+        #[cfg(all(test, not(target_vendor = "apple")))]
+        shader_destroy_requests: 0,
+        #[cfg(test)]
+        native_shader_destroys: 0,
+        #[cfg(all(test, windows))]
+        raw_native_frame_test_probe: super::RawNativeFrameTestProbe::default(),
     };
     let inserted = CONTEXTS.with(|contexts| {
         let mut contexts = contexts
@@ -149,6 +162,54 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         return Err(error);
     }
     Ok(handle)
+}
+
+/// Returns optional shader stages enabled on the selected initialized device.
+///
+/// # Errors
+///
+/// Returns an error when the context is stale, called from the wrong thread, unhealthy, or has no
+/// initialized device.
+pub fn shader_capabilities(context: ContextHandle) -> Result<ShaderCapabilities> {
+    with_context_mut(context, |context| {
+        context
+            .identity
+            .check_thread_and_health()
+            .map_err(map_lifecycle)?;
+        context_shader_capabilities(context)
+    })
+}
+
+pub(super) fn context_shader_capabilities(context: &ContextState) -> Result<ShaderCapabilities> {
+    #[cfg(test)]
+    if let Some(capabilities) = context.shader_capabilities_override {
+        return Ok(capabilities);
+    }
+    selected_shader_capabilities(&context.native)
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn inject_shader_capabilities(
+    context: ContextHandle,
+    capabilities: ShaderCapabilities,
+) -> Result<()> {
+    with_context_mut(context, |context| {
+        context.shader_capabilities_override = Some(capabilities);
+        Ok(())
+    })
+}
+
+pub(super) fn selected_shader_capabilities(native: &NativeContext) -> Result<ShaderCapabilities> {
+    match native {
+        NativeContext::Vulkan(native) => native
+            .adapter_info()
+            .map(|adapter| adapter.capabilities().shader_stages)
+            .ok_or(Error::NotReady),
+        #[cfg(windows)]
+        NativeContext::Dx12(native) => Ok(native.adapter_info().capabilities().shader_stages),
+        #[cfg(target_vendor = "apple")]
+        NativeContext::Metal(native) => Ok(native.adapter_info().capabilities().shader_stages),
+    }
 }
 
 /// Builds the backend-native context with legacy first-fit device selection.
@@ -521,7 +582,7 @@ pub fn drop_context(context: ContextHandle) -> Result<()> {
     cleanup_context_state(owned, remove_context_handle(local))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_vendor = "apple")))]
 pub(crate) fn inject_cleanup_outcome(
     context: ContextHandle,
     outcome: CleanupTestOutcome,
@@ -532,7 +593,7 @@ pub(crate) fn inject_cleanup_outcome(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_vendor = "apple")))]
 pub(crate) fn inject_surface_insert_failure(
     context: ContextHandle,
     failure: SurfaceInsertTestFailure,
@@ -608,7 +669,7 @@ pub(super) fn cleanup_context_state(
         std::mem::forget(owned);
         return Err(Error::TeardownAbandoned);
     }
-    #[cfg(test)]
+    #[cfg(all(test, not(target_vendor = "apple")))]
     if let Some(CleanupTestOutcome::DrainedFailure(error)) = owned.cleanup_test_outcome.take() {
         failure.get_or_insert(error);
     }

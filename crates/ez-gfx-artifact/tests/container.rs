@@ -78,6 +78,10 @@ fn global_target_subsets_round_trip_for_every_stage() {
         variant(Target::Msl, Stage::Vertex, "vs", "metal_3_0", 2),
         variant(Target::Spirv, Stage::Fragment, "fs", "spirv_1_5", 3),
         variant(Target::Msl, Stage::Fragment, "fs", "metal_3_0", 4),
+        variant(Target::Spirv, Stage::Task, "ts", "spirv_1_5", 5),
+        variant(Target::Msl, Stage::Task, "ts", "metal_3_0", 6),
+        variant(Target::Spirv, Stage::Mesh, "ms", "spirv_1_5", 7),
+        variant(Target::Msl, Stage::Mesh, "ms", "metal_3_0", 8),
     ];
     let artifact = Artifact::new(
         br"{}".to_vec(),
@@ -194,18 +198,18 @@ fn rejects_duplicate_exact_variant_and_invalid_bounds() {
 }
 
 #[test]
-fn encoding_uses_format_v5_and_rejects_v4() {
-    assert_eq!(ARTIFACT_FORMAT_VERSION, 5);
+fn encoding_uses_format_v6_and_rejects_v5() {
+    assert_eq!(ARTIFACT_FORMAT_VERSION, 6);
 
     let bytes = sample().encode().unwrap();
-    assert_eq!(&bytes[..8], b"EZSHDR05");
-    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 5);
+    assert_eq!(&bytes[..8], b"EZSHDR06");
+    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 6);
 
-    let mut version_four = bytes;
-    version_four[..8].copy_from_slice(b"EZSHDR04");
-    version_four[8..12].copy_from_slice(&4_u32.to_le_bytes());
+    let mut version_five = bytes;
+    version_five[..8].copy_from_slice(b"EZSHDR05");
+    version_five[8..12].copy_from_slice(&5_u32.to_le_bytes());
     assert!(matches!(
-        Artifact::decode(&version_four),
+        Artifact::decode(&version_five),
         Err(ArtifactError::InvalidHeader)
     ));
 }

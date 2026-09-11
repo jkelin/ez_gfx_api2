@@ -183,7 +183,7 @@ void computemain(uint3 id : SV_DispatchThreadID) {
             .unwrap()
             .requirements()[0]
             .binding as usize,
-        threads: runtime.compute_workgroup_size().unwrap(),
+        threads: runtime.workgroup_size().unwrap(),
     }
 }
 
@@ -355,11 +355,7 @@ fn coarse_compute_frame_completes_while_fine_upload_is_gpu_gated() {
     assert!(
         context
             .texture_staging
-            .take(
-                1,
-                ez_gfx_hal::QueueKind::TextureTransfer,
-                completed,
-            )
+            .take(1, ez_gfx_hal::QueueKind::TextureTransfer, completed,)
             .is_none()
     );
     gate.assert_closed();
@@ -997,6 +993,7 @@ float4 fragmentmain() : SV_Target {
             &vertex_identity,
             &fragment_identity,
             DynamicPipelineState::from_abi(0, 0, 0, 0).unwrap(),
+            Some(Format::Rgba8Unorm),
             false,
             None,
             None,

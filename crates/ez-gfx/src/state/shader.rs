@@ -5,6 +5,19 @@ use super::{
     ShaderRecord, map_hal, map_lifecycle, with_context_mut,
 };
 
+fn validate_stage_capability(
+    stage: ez_gfx_artifact::Stage,
+    capabilities: ez_gfx_core::capability::ShaderCapabilities,
+) -> Result<()> {
+    // Mesh is required independently; task additionally requires its own capability bit.
+    let supported = match stage {
+        ez_gfx_artifact::Stage::Task => capabilities.task,
+        ez_gfx_artifact::Stage::Mesh => capabilities.mesh,
+        _ => true,
+    };
+    supported.then_some(()).ok_or(Error::Unsupported)
+}
+
 /// Loads one exact stage entry point from a validated shader artifact.
 ///
 /// # Errors
@@ -22,6 +35,13 @@ pub fn load_shader(
             .identity
             .check_thread_and_health()
             .map_err(map_lifecycle)?;
+        if matches!(
+            stage,
+            ez_gfx_artifact::Stage::Task | ez_gfx_artifact::Stage::Mesh
+        ) {
+            let capabilities = super::context::context_shader_capabilities(context)?;
+            validate_stage_capability(stage, capabilities)?;
+        }
         let shader = ez_gfx_runtime::shader::RuntimeShader::load(
             artifact,
             context.options.backend,
@@ -35,6 +55,10 @@ pub fn load_shader(
         let product_index = product.0;
         let entry = product.2.to_owned();
         let products = [shader.product(stage).ok_or(Error::InvalidArgument)?];
+        #[cfg(test)]
+        {
+            context.native_shader_allocation_attempts += 1;
+        }
         let native = match &context.native {
             NativeContext::Vulkan(native) => {
                 NativeShader::Vulkan(native.create_shader(&products).map_err(map_hal)?)
@@ -70,6 +94,39 @@ pub fn load_shader(
         Ok(typed)
     })
 }
+/// Validates mesh-stage handles without recording or mutating the active graph.
+///
+/// # Errors
+///
+/// Returns an error for stale, foreign-owner, wrong-generation, or wrong-stage handles.
+pub(crate) fn validate_mesh_stages(
+    context: ContextHandle,
+    stages: ez_gfx_hal::MeshStages<ShaderHandle>,
+) -> Result<()> {
+    with_context_mut(context, |context| {
+        context
+            .identity
+            .check_thread_and_health()
+            .map_err(map_lifecycle)?;
+        let expected = [
+            stages
+                .task
+                .map(|shader| (shader, ez_gfx_artifact::Stage::Task)),
+            Some((stages.mesh, ez_gfx_artifact::Stage::Mesh)),
+            Some((stages.fragment, ez_gfx_artifact::Stage::Fragment)),
+        ];
+        for (shader, stage) in expected.into_iter().flatten() {
+            context
+                .identity
+                .resolve(shader.packed(), ResourceKind::Shader)
+                .map_err(map_lifecycle)?;
+            if context.shaders.get(&shader).map(|record| record.stage) != Some(stage) {
+                return Err(Error::InvalidContext);
+            }
+        }
+        Ok(())
+    })
+}
 
 /// Requests destruction of a loaded shader.
 ///
@@ -78,6 +135,10 @@ pub fn load_shader(
 /// mirrors the safe frame's owning `Rc` retention.
 pub fn destroy_shader(context: ContextHandle, shader: ShaderHandle) {
     let _ = with_context_mut(context, |context| {
+        #[cfg(all(test, not(target_vendor = "apple")))]
+        {
+            context.shader_destroy_requests += 1;
+        }
         context
             .identity
             .remove(shader.packed(), ResourceKind::Shader)
@@ -88,6 +149,28 @@ pub fn destroy_shader(context: ContextHandle, shader: ShaderHandle) {
         }
         retire_shader_record(context, shader)
     });
+}
+
+#[cfg(all(test, not(target_vendor = "apple")))]
+pub(crate) fn insert_shader_drop_probe(context: ContextHandle) -> Result<ShaderHandle> {
+    with_context_mut(context, |context| {
+        let packed = context
+            .identity
+            .insert(ResourceKind::Shader)
+            .map_err(map_lifecycle)?;
+        ShaderHandle::from_packed(packed).map_err(|_| Error::NativeFailure)
+    })
+}
+
+#[cfg(all(test, not(target_vendor = "apple")))]
+pub(crate) fn shader_destroy_requests(context: ContextHandle) -> Result<usize> {
+    with_context_mut(context, |context| Ok(context.shader_destroy_requests))
+}
+#[cfg(all(test, windows))]
+pub(crate) fn native_shader_allocation_attempts(context: ContextHandle) -> Result<usize> {
+    with_context_mut(context, |context| {
+        Ok(context.native_shader_allocation_attempts)
+    })
 }
 
 fn retire_shader_record(context: &mut super::ContextState, shader: ShaderHandle) -> Result<()> {
@@ -103,6 +186,10 @@ fn retire_shader_record(context: &mut super::ContextState, shader: ShaderHandle)
         .shaders
         .remove(&shader)
         .ok_or(Error::InvalidContext)?;
+    #[cfg(test)]
+    {
+        context.native_shader_destroys += 1;
+    }
     destroy_native_shader(&mut context.native, native.native);
     Ok(())
 }

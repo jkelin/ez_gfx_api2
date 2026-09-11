@@ -1,11 +1,16 @@
 //! Runtime integration and contract tests.
 
-use ez_gfx_core::handle::{LocalHandle, PackedHandle, TextureHandle};
+use ez_gfx_artifact::Stage;
+use ez_gfx_core::{
+    Backend,
+    handle::{CounterBufferHandle, LocalHandle, PackedHandle, ShaderHandle, TextureHandle},
+};
 use ez_gfx_hal::{
-    BufferRange, CompletionToken, ExecutionAction, QueueKind, ResourceAccess, ResourceState,
-    ShaderStage,
+    BufferRange, CompletionToken, DynamicPipelineState, ExecutionAction, MeshPipelineState,
+    MeshStages, QueueKind, ResourceAccess, ResourceState, ShaderStage,
 };
 use ez_gfx_runtime::{
+    binding::{PipelineLayout, ReflectedBindings},
     frame::{ExecutableNode, FrameError, FrameRecorder, FrameState},
     graph::{
         Access, Format, ImageRange, LoadOp, NodeDesc, PassInfo, ResourceDesc, ResourceLifetime,
@@ -23,6 +28,57 @@ fn texture(slot: u32) -> TextureHandle {
         .unwrap(),
     )
     .unwrap()
+}
+
+fn shader(slot: u32) -> ShaderHandle {
+    ShaderHandle::from_packed(
+        PackedHandle::child(
+            LocalHandle::new(1, 1).unwrap(),
+            LocalHandle::new(slot, 1).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+fn counter(slot: u32) -> CounterBufferHandle {
+    CounterBufferHandle::from_packed(
+        PackedHandle::child(
+            LocalHandle::new(1, 1).unwrap(),
+            LocalHandle::new(slot, 1).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+fn empty_mesh_layouts() -> (
+    ReflectedBindings,
+    PipelineLayout,
+    MeshStages<ez_gfx_runtime::binding::StageLayoutIdentity>,
+) {
+    let metadata = br#"{"reflections":[
+        {"target":"Spirv","entry":"meshmain","stage":"Mesh","reflection":{"parameters":[],"workgroup_size":[1,1,1]}},
+        {"target":"Spirv","entry":"fragmentmain","stage":"Fragment","reflection":{"parameters":[]}}
+    ]}"#;
+    let stages = ez_gfx_runtime::binding::validate_stage_reflections(
+        metadata,
+        Backend::Vulkan,
+        &[(Stage::Mesh, "meshmain"), (Stage::Fragment, "fragmentmain")],
+    )
+    .unwrap();
+    (
+        stages[0].bindings().merge(stages[1].bindings()).unwrap(),
+        stages[0]
+            .pipeline_layout()
+            .merge(stages[1].pipeline_layout())
+            .unwrap(),
+        MeshStages {
+            task: None,
+            mesh: stages[0].physical_layout_identity(),
+            fragment: stages[1].physical_layout_identity(),
+        },
+    )
 }
 
 #[test]
@@ -310,7 +366,7 @@ fn graph_template_hit_recomputes_dynamic_waits_and_transitions() {
     assert_eq!((stats.hits, stats.misses, stats.compiles), (1, 1, 1));
     assert_eq!(stats.entries, 1);
     assert!(stats.retained_bytes <= stats.high_water_bytes);
-    assert_eq!(stats.schema, 1);
+    assert_eq!(stats.schema, 2);
 }
 
 #[test]
@@ -397,4 +453,184 @@ fn graph_template_hit_recomputes_history_derived_transitions() {
 
     let stats = frame.workspace_stats().graph_cache;
     assert_eq!((stats.hits, stats.misses, stats.compiles), (1, 1, 1));
+}
+
+#[test]
+fn graph_structure_distinguishes_task_and_mesh_stages() {
+    let mut frame = FrameRecorder::new(1).unwrap();
+    for (index, stage) in [ShaderStage::Task, ShaderStage::Mesh]
+        .into_iter()
+        .enumerate()
+    {
+        frame.begin().unwrap();
+        let resource = frame
+            .add_resource(ResourceDesc::buffer(4, 4, ResourceLifetime::External).unwrap())
+            .unwrap();
+        let state =
+            ResourceState::new(QueueKind::Graphics, stage, ResourceAccess::SampledRead).unwrap();
+        frame
+            .record_node(
+                NodeDesc::new("mesh-stage", QueueKind::Graphics).access(Access::buffer(
+                    resource,
+                    BufferRange::new(0, 4).unwrap(),
+                    state,
+                )),
+                ExecutableNode::TextureReadback {
+                    texture: texture(u32::try_from(index + 1).unwrap()),
+                },
+            )
+            .unwrap();
+        let submission = frame.submit().unwrap();
+        frame.finish(submission).unwrap();
+    }
+
+    let stats = frame.workspace_stats().graph_cache;
+    assert_eq!((stats.hits, stats.misses, stats.compiles), (0, 2, 2));
+    assert_eq!(stats.schema, 2);
+}
+
+#[test]
+fn graph_template_hit_keeps_current_mesh_group_payload() {
+    let mut frame = FrameRecorder::new(1).unwrap();
+    let (layout, pipeline_layout, stage_layouts) = empty_mesh_layouts();
+    let stages = MeshStages {
+        task: None,
+        mesh: shader(1),
+        fragment: shader(2),
+    };
+
+    for (index, groups) in [[1, 2, 3], [9, 8, 7]].into_iter().enumerate() {
+        frame.begin().unwrap();
+        frame
+            .record_node(
+                NodeDesc::new("mesh", QueueKind::Graphics),
+                ExecutableNode::Mesh {
+                    stages,
+                    groups,
+                    bindings: 0..0,
+                    layout: layout.clone(),
+                    stage_layouts,
+                    pipeline_layout,
+                    state: MeshPipelineState {
+                        cull: ez_gfx_hal::CullMode::None,
+                        front_face: ez_gfx_hal::FrontFace::CounterClockwise,
+                        blend: ez_gfx_hal::BlendMode::None,
+                    },
+                },
+            )
+            .unwrap();
+        let submission = frame.submit().unwrap();
+        assert!(matches!(
+            &submission.nodes[0],
+            ExecutableNode::Mesh {
+                groups: current, ..
+            } if *current == groups
+        ));
+        frame.finish(submission).unwrap();
+        assert_eq!(
+            frame.workspace_stats().graph_cache.hits,
+            u64::try_from(index).unwrap()
+        );
+    }
+}
+
+#[test]
+fn traditional_mesh_traditional_nodes_share_attachment_load_store_pass() {
+    let mut frame = FrameRecorder::new(1).unwrap();
+    let (layout, pipeline_layout, stage_layouts) = empty_mesh_layouts();
+    frame.begin().unwrap();
+    let attachment = frame
+        .add_resource(
+            ResourceDesc::image(
+                16,
+                16,
+                1,
+                1,
+                Format::Rgba8Unorm,
+                1,
+                ResourceLifetime::Transient,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let attachment_state = ResourceState::new(
+        QueueKind::Graphics,
+        ShaderStage::Fragment,
+        ResourceAccess::ColorAttachmentWrite,
+    )
+    .unwrap();
+    let pass = |load| {
+        PassInfo::new(
+            vec![attachment],
+            None,
+            [0, 0, 16, 16],
+            1,
+            load,
+            StoreOp::Store,
+        )
+        .unwrap()
+    };
+    let node = |name, load| {
+        NodeDesc::new(name, QueueKind::Graphics)
+            .access(Access::image(
+                attachment,
+                ImageRange::all(1, 1).unwrap(),
+                attachment_state,
+            ))
+            .pass(pass(load))
+    };
+    let graphics = |vertex| ExecutableNode::Graphics {
+        vertex_shader: shader(vertex),
+        fragment_shader: shader(4),
+        counter: counter(1),
+        draw_capacity: 1,
+        bindings: 0..0,
+        layout: layout.clone(),
+        pipeline_layout,
+        state: DynamicPipelineState::from_abi(0, 0, 0, 0).unwrap(),
+    };
+    frame
+        .record_node(node("traditional-a", LoadOp::Clear), graphics(3))
+        .unwrap();
+    frame
+        .record_node(
+            node("mesh", LoadOp::Load),
+            ExecutableNode::Mesh {
+                stages: MeshStages {
+                    task: None,
+                    mesh: shader(5),
+                    fragment: shader(4),
+                },
+                groups: [1, 1, 1],
+                bindings: 0..0,
+                layout: layout.clone(),
+                stage_layouts,
+                pipeline_layout,
+                state: MeshPipelineState {
+                    cull: ez_gfx_hal::CullMode::None,
+                    front_face: ez_gfx_hal::FrontFace::CounterClockwise,
+                    blend: ez_gfx_hal::BlendMode::None,
+                },
+            },
+        )
+        .unwrap();
+    frame
+        .record_node(node("traditional-b", LoadOp::Load), graphics(6))
+        .unwrap();
+
+    let submission = frame.submit().unwrap();
+    assert_eq!(submission.graph.passes().len(), 1);
+    assert_eq!(submission.graph.passes()[0].nodes.len(), 3);
+    assert!(submission.plan.actions.iter().any(|action| matches!(
+        action,
+        ExecutionAction::BeginPass(pass)
+            if pass.load == ez_gfx_hal::AttachmentLoadOp::Clear
+                && pass.store == ez_gfx_hal::AttachmentStoreOp::Store
+    )));
+    assert!(matches!(submission.nodes.as_slice(), [
+        ExecutableNode::Graphics { counter: first, .. },
+        ExecutableNode::Mesh { .. },
+        ExecutableNode::Graphics { counter: second, .. }
+    ] if *first == counter(1) && *second == counter(1)));
+    frame.finish(submission).unwrap();
 }

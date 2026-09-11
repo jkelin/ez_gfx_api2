@@ -13,9 +13,9 @@ raw-window-handle.workspace = true
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2.workspace = true
-objc2-metal = { workspace = true, features = ["dispatch2", "MTLAllocation", "MTLArgument", "MTLArgumentEncoder", "MTLBlitCommandEncoder", "MTLBuffer", "MTLCommandBuffer", "MTLCommandEncoder", "MTLCommandQueue", "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLDepthStencil", "MTLDevice", "MTLDrawable", "MTLEvent", "MTLHeap", "MTLLibrary", "MTLRenderCommandEncoder", "MTLRenderPass", "MTLRenderPipeline", "MTLResource", "MTLSampler", "MTLTexture", "MTLTypes"] }
+objc2-metal = { workspace = true, features = ["dispatch2", "MTLAllocation", "MTLArgument", "MTLArgumentEncoder", "MTLBlitCommandEncoder", "MTLBuffer", "MTLCommandBuffer", "MTLCommandEncoder", "MTLCommandQueue", "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLDepthStencil", "MTLDevice", "MTLDrawable", "MTLEvent", "MTLHeap", "MTLLibrary", "MTLPipeline", "MTLRenderCommandEncoder", "MTLRenderPass", "MTLRenderPipeline", "MTLResource", "MTLSampler", "MTLTexture", "MTLTypes"] }
 objc2-core-foundation.workspace = true
-objc2-foundation.workspace = true
+objc2-foundation = { workspace = true, features = ["NSProcessInfo"] }
 gpu-allocator = { workspace = true, features = ["std", "metal"] }
 arrayvec.workspace = true
 dispatch2.workspace = true

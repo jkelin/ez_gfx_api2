@@ -7,12 +7,12 @@ pub use api::*;
 pub use ez_gfx_artifact::{CompiledShader, ShaderLoader, Stage};
 pub use ez_gfx_core::capability::{
     AdapterClass, AdapterInfo, CapabilityError, PresentationMode, PresentationModes,
-    PresentationModesError,
+    PresentationModesError, ShaderCapabilities,
 };
 pub use ez_gfx_core::{Backend, SemanticId};
 pub use ez_gfx_hal::{
-    DynamicPipelineState, SamplerAddressMode, SamplerFilter, TextureFormat, TextureRegion,
-    TextureSamplerDesc,
+    DynamicPipelineState, MeshPipelineState, MeshStages, SamplerAddressMode, SamplerFilter,
+    TextureFormat, TextureRegion, TextureSamplerDesc,
 };
 pub use ez_gfx_runtime::indirect::DrawIndexedCommand;
 pub use ez_gfx_runtime::target::{ClearValue, Format, TargetDeclaration, TargetError, TargetUsage};

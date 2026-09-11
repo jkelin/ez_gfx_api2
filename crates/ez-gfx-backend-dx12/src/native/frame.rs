@@ -18,77 +18,7 @@ use ez_gfx_hal::COUNTER_BUFFER_ELEMENT_OFFSET;
 type FrameSurface<'a> = (&'a mut NativeSurface, (u32, u32), PresentationMode);
 type ResolvedFrameSurface<'a> = (Option<&'a mut NativeSurface>, (u32, u32), PresentationMode);
 
-fn validate_surface_request(
-    surface: Option<FrameSurface<'_>>,
-) -> Result<ResolvedFrameSurface<'_>, HalError> {
-    match surface {
-        Some((surface, extent, mode)) if extent.0 != 0 && extent.1 != 0 => {
-            if !surface.presentation_modes().contains(mode) {
-                return Err(HalError::Unsupported);
-            }
-            Ok((Some(surface), extent, mode))
-        }
-        Some(_) => Err(HalError::InvalidArgument),
-        None => Ok((None, (0, 0), PresentationMode::Fifo)),
-    }
-}
-const DRAW_INDEXED_ARGUMENT_BYTES: u64 = core::mem::size_of::<
-    windows::Win32::Graphics::Direct3D12::D3D12_DRAW_INDEXED_ARGUMENTS,
->() as u64;
-
-struct DxFramePlan {
-    uses_surface: bool,
-    presents: bool,
-    external_waits: ArrayVec<CompletionToken, 2>,
-}
-
-// D3D12 copy commands are invalid between BeginRenderPass and EndRenderPass.
-fn validate_indirect_copy_phase(pass_active: bool) -> Result<(), HalError> {
-    if pass_active {
-        Err(HalError::InvalidArgument)
-    } else {
-        Ok(())
-    }
-}
-fn indirect_command_bytes(draw_count: u32) -> u64 {
-    u64::from(draw_count) * DRAW_INDEXED_ARGUMENT_BYTES
-}
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "one validation pass keeps cross-action frame invariants local"
-)]
-fn bindings_match_pipeline(
-    bindings: &dyn super::NativeBufferBindingSource,
-    writable: &[bool],
-) -> Result<bool, HalError> {
-    if bindings.len() != writable.len() {
-        return Ok(false);
-    }
-    let mut valid = true;
-    bindings.visit(&mut |index, binding| {
-        valid &= writable.get(index).is_some_and(|expected| {
-            binding.writable == *expected && binding.offset < binding.allocation.allocation.size()
-        });
-        Ok(())
-    })?;
-    Ok(valid)
-}
-
-fn indirect_binding_writable(
-    bindings: &dyn super::NativeBufferBindingSource,
-    indirect: &super::ID3D12Resource,
-) -> Result<Option<bool>, HalError> {
-    let indirect = windows::core::Interface::as_raw(indirect);
-    let mut found = None;
-    bindings.visit(&mut |_, binding| {
-        if windows::core::Interface::as_raw(&binding.allocation.resource) == indirect {
-            found = Some(binding.writable);
-        }
-        Ok(())
-    })?;
-    Ok(found)
-}
+include!("frame_validation.rs");
 
 fn validate_frame_plan(
     actions: &(impl NativeFrameActionSource + ?Sized),
@@ -126,7 +56,11 @@ fn validate_frame_plan(
                         .map_err(|_| HalError::InvalidArgument)?;
                 }
             }
-            NativeFrameAction::Barrier { resource, .. } => {
+            NativeFrameAction::Barrier { barrier, resource } => {
+                if let Some(before) = barrier.before {
+                    dx12_resource_state(before)?;
+                }
+                dx12_resource_state(barrier.after)?;
                 uses_surface |= matches!(
                     resource,
                     NativeFrameResource::Surface | NativeFrameResource::Depth
@@ -198,6 +132,7 @@ fn validate_frame_plan(
                     return Err(HalError::InvalidArgument);
                 }
             }
+            NativeFrameAction::Mesh(dispatch) => validate_mesh_plan(dispatch, pass_active)?,
             NativeFrameAction::TextureReadback { width, height, .. } => {
                 if pass_active || *width == 0 || *height == 0 {
                     return Err(HalError::InvalidArgument);
@@ -666,10 +601,11 @@ impl DxFrameEncoder<'_> {
                 1
             }
         };
-        let before = barrier.before.map_or(D3D12_RESOURCE_STATE_COMMON, |state| {
-            dx12_resource_state(state.access)
-        });
-        let after = dx12_resource_state(barrier.after.access);
+        let before = match barrier.before {
+            Some(state) => dx12_resource_state(state)?,
+            None => D3D12_RESOURCE_STATE_COMMON,
+        };
+        let after = dx12_resource_state(barrier.after)?;
         if before == after && after == D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
             for native in natives.iter().take(native_count).flatten() {
                 record_resource_barriers(self.list, [uav_barrier(native.clone())]);
@@ -751,6 +687,24 @@ impl DxFrameEncoder<'_> {
         {
             return Err(HalError::InvalidArgument);
         }
+        let viewport = D3D12_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: f32::from(
+                u16::try_from(target_extent.0).map_err(|_| HalError::InvalidArgument)?,
+            ),
+            Height: f32::from(
+                u16::try_from(target_extent.1).map_err(|_| HalError::InvalidArgument)?,
+            ),
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        let scissor = RECT {
+            left: 0,
+            top: 0,
+            right: i32::try_from(target_extent.0).map_err(|_| HalError::InvalidArgument)?,
+            bottom: i32::try_from(target_extent.1).map_err(|_| HalError::InvalidArgument)?,
+        };
         // SAFETY: `rtv` and the optional `dsv` are descriptor handles from retained
         // heaps, and their pointer storage remains readable through `OMSetRenderTargets`.
         unsafe {
@@ -760,6 +714,8 @@ impl DxFrameEncoder<'_> {
                 false,
                 pass.depth.and(self.dsv).as_ref().map(std::ptr::from_ref),
             );
+            self.list.RSSetViewports(core::slice::from_ref(&viewport));
+            self.list.RSSetScissorRects(core::slice::from_ref(&scissor));
             match pass.load {
                 AttachmentLoadOp::Load => {}
                 AttachmentLoadOp::Clear => {
@@ -928,6 +884,49 @@ impl DxFrameEncoder<'_> {
 
         Ok(())
     }
+
+    fn mesh(&mut self, dispatch: &super::NativeMeshDispatch<'_>) -> Result<(), HalError> {
+        // Mesh dispatches shade the active pass; outside one there is no target.
+        if !self.pass_active {
+            return Err(HalError::InvalidArgument);
+        }
+        let pipeline = dispatch.pipeline;
+        if !pipeline.mesh || dispatch.has_task != pipeline.task_stage {
+            return Err(HalError::InvalidArgument);
+        }
+        super::check_mesh_dispatch(
+            dispatch.has_task,
+            dispatch.groups,
+            dispatch.mesh_workgroup_size,
+            dispatch.task_workgroup_size,
+        )?;
+        // The OPTIONS7 tier probe gates this interface on the same runtime floor,
+        // so a cast failure here reports a genuine device problem.
+        let list = super::device::mesh_dispatch_list(self.list).map_err(map_windows)?;
+        // SAFETY: the encoder, `pipeline`, and `dispatch` references retain every command-list, state object, heap, resource, and binding pointer consumed by these recording calls until each call returns.
+        unsafe {
+            self.list.SetPipelineState(&pipeline.state);
+            self.list.SetGraphicsRootSignature(&pipeline.root);
+            let table = u32::try_from(pipeline.buffer_writable.len())
+                .map_err(|_| HalError::InvalidArgument)?;
+            self.list.SetGraphicsRootDescriptorTable(
+                table,
+                self.descriptor_heap.GetGPUDescriptorHandleForHeapStart(),
+            );
+            self.list.SetGraphicsRootDescriptorTable(
+                table + 1,
+                self.sampler_heap.GetGPUDescriptorHandleForHeapStart(),
+            );
+            bind_dx12_graphics_buffers(self.list, pipeline, dispatch.bindings)?;
+            // No input-assembler state, index buffer, or indirect signature:
+            // the workgroup grid alone drives task/mesh execution.
+            // SAFETY: grid counts passed the shared dispatch validation above.
+            list.DispatchMesh(dispatch.groups[0], dispatch.groups[1], dispatch.groups[2]);
+        }
+
+        Ok(())
+    }
+
     fn texture_readback(&mut self, texture: &super::NativeTexture) -> Result<(), HalError> {
         if self.pass_active {
             return Err(HalError::InvalidArgument);

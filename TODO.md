@@ -3,15 +3,15 @@
 ## P0
 
 - Lower compiled transient alias assignments into Vulkan, DX12, and Metal resource placement, including alias barriers and overlap-safe retirement (P-004, P-008, P-009).
-- Complete managed render-target history and cross-backend storage-image evidence. Cached resize, sampled binding, graph attachment, readback, and ownership-based lifetime are implemented; C ABI 40 retains explicit opaque-handle release (P-008, P-009, P-010, P-015).
+- Complete managed render-target history and cross-backend storage-image evidence. Cached resize, sampled binding, graph attachment, readback, and ownership-based lifetime are implemented; C ABI 41 retains explicit opaque-handle release (P-008, P-009, P-010, P-015).
 
 ## P1
 
-- Publish an API parity matrix, add screenshot-save and expanded graph-authoring interfaces, and cover them with ABI tests. Cached render-target configuration and callback-scoped readback are implemented; C value-buffer acquisition, frame bind draft, and frame execute parity are implemented at ABI 40 (P-002, P-010, P-019).
+- Publish an API parity matrix, add screenshot-save and expanded graph-authoring interfaces, and cover them with ABI tests. Cached render-target configuration and callback-scoped readback are implemented; C value-buffer acquisition, frame bind draft, and frame execute parity are implemented at ABI 41 (P-002, P-010, P-019).
 - Add the selected caller-writable mapped staging lease for procedural vertex/index writes (P-011). The existing slice path copies into mapped staging. The lease must retain its context/resource ownership, commit or cancel exactly once, cancel safely on `Drop`, and fail after loss. Acceptance is procedural-upload pixel parity, commit/cancel/failure coverage, and no cross-frame lease stalls.
 - Expose validated per-draw/per-pipeline viewport and scissor state and batch consecutive equal-state MDI ranges; current backends set only full-render-area state (P-016).
-- Complete Metal execution evidence for deterministic adapter enumeration, selection, admitted limits/formats, and rejection diagnostics through safe Rust and ABI 40 (P-003, P-022).
-- Add Linux X11/Wayland Vulkan surfaces, DPI-aware recreation coverage, and native presentation tests. Safe surfaces remain owning wrappers with atomic construction rollback; ABI 40 validates borrowed native handles without a caller-supplied platform discriminator (P-017, P-022).
+- Complete Metal execution evidence for deterministic adapter enumeration, selection, admitted limits/formats, and rejection diagnostics through safe Rust and ABI 41 (P-003, P-022).
+- Add Linux X11/Wayland Vulkan surfaces, DPI-aware recreation coverage, and native presentation tests. Safe surfaces remain owning wrappers with atomic construction rollback; ABI 41 validates borrowed native handles without a caller-supplied platform discriminator (P-017, P-022).
 - Add bounded, validated host-owned pipeline-cache import/export envelopes with backend/device/driver/schema compatibility; current caches are process-local only (P-007, P-024).
 - Finish terminal device-loss behavior for staging leases and waits. Pending texture decode/transfer uploads emit terminal loss events and transfer workers retain sticky loss; loader-lock teardown remains abandon-only (P-023, P-026).
 - Add correlation IDs, sequence/domain, clocks, units, payloads, and cleanup outcomes to the lossless typed upload-event queue. Texture/vertex/index ownership, readiness, cancellation, and failure transitions are already lossless; bounded runtime diagnostics remain separate and report dropped counts (P-023, P-026, P-028).
@@ -43,3 +43,4 @@
   - Smaller floors risk more native allocations, personal blocks, and fragmentation under texture/geometry/multi-pass/resize/streaming load.
 - Adopt the smaller floor only after the full backend matrix plus those workloads show acceptable latency and fragmentation on all three backends.
 - On-demand allocator telemetry (`Context::memory_telemetry`, HAL `BackendMemoryTelemetry`) exists to gather that evidence without per-frame cost.
+- Final mesh evidence (60 s per-process isolation, 0 failures/timeouts): Windows matrix 213 (HAL 21/Vulkan 58/DX12 35/ez-gfx 99, RTX 3080), Linux matrix 176 (HAL 21/Vulkan 60/ez-gfx 88/FFI 7, RTX 3090), macOS matrix 84 (HAL 21/Metal 27/ez-gfx 36, M2 Pro); exact pixel passes 4 Windows mesh/task-mesh + 2 Apple Metal; FFI ABI 39, runtime 27, artifact 11, compiler 12 Windows / 13 macOS; one hidden C Vulkan frame, 1,228,800 bytes. Detail: P-019 §Evidence summary.

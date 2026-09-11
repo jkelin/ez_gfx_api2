@@ -189,16 +189,24 @@ impl RuntimeShader {
             .ok_or(BindingError::MissingReflection)
     }
 
-    /// Returns the validated compute thread-group dimensions.
+    /// Returns the selected stage's canonical physical binding and texture-heap identity.
+    pub const fn physical_layout_identity(&self) -> crate::binding::StageLayoutIdentity {
+        self.reflection.physical_layout_identity()
+    }
+
+    /// Returns validated dispatch thread-group dimensions.
     ///
     /// # Errors
     ///
-    /// Returns `BindingError::MissingReflection` if no compute stage was selected.
-    pub fn compute_workgroup_size(&self) -> Result<[u32; 3], BindingError> {
-        (self.reflection.stage() == Stage::Compute)
-            .then(|| self.reflection.workgroup_size())
-            .flatten()
-            .ok_or(BindingError::MissingReflection)
+    /// Returns `BindingError::MissingReflection` if no compute, task, or mesh stage was selected.
+    pub fn workgroup_size(&self) -> Result<[u32; 3], BindingError> {
+        matches!(
+            self.reflection.stage(),
+            Stage::Compute | Stage::Task | Stage::Mesh
+        )
+        .then(|| self.reflection.workgroup_size())
+        .flatten()
+        .ok_or(BindingError::MissingReflection)
     }
 
     /// Returns the selected product identity.

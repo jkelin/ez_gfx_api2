@@ -4,11 +4,11 @@ use ez_gfx_core::capability::PresentationMode;
 use super::{
     Backend, ContextState, Error, ExecutableNode, ExecutionAction, ExecutionBarrier, ExecutionPass,
     FrameBindingSource, FrameBufferBindingRecord, FrameExecutionPlan, FrameNativeResource,
-    GeometryAllocation, HashMap, MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext,
-    NativePipeline, NativeShader, NativeSurface, NativeTexture, NativeTextureMap, PackedHandle,
-    PipelineKey, RenderTargetHandle, RenderTargetRecord, ResourceId, SURFACE_DEFAULT_CLEAR,
-    ShaderHandle, ShaderRecord, map_hal, native_layouts, pipeline_layout_key,
-    prepare_frame_binding_scratch, should_capture_presented,
+    GeometryAllocation, HashMap, MAX_PIPELINE_CACHE_ENTRIES, MeshPipelineKeyDesc, NativeAllocation,
+    NativeContext, NativePipeline, NativeShader, NativeSurface, NativeTexture, NativeTextureMap,
+    PackedHandle, PipelineKey, RenderTargetHandle, RenderTargetRecord, ResourceId,
+    SURFACE_DEFAULT_CLEAR, ShaderHandle, ShaderRecord, map_hal, native_layouts,
+    pipeline_layout_key, prepare_frame_binding_scratch, should_capture_presented,
 };
 
 use arrayvec::ArrayVec;
@@ -24,6 +24,104 @@ struct DxActionState<'a> {
     index_size: u64,
     extent: (u32, u32),
 }
+// `None` uses the swapchain format; non-color runtime formats fail before PSO creation.
+const fn dx12_color_format(format: Option<ez_gfx_runtime::target::Format>) -> Result<u32> {
+    use ez_gfx_runtime::target::Format;
+    match format {
+        None => Ok(29),
+        Some(Format::Rgba8Unorm) => Ok(28),
+        Some(Format::Bgra8Srgb) => Ok(91),
+        Some(Format::Rgba16Float) => Ok(10),
+        Some(_) => Err(Error::Unsupported),
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the backend mesh seam keeps native state, cache storage, and immutable node inputs explicit"
+)]
+fn prepare_dx12_mesh_pipeline(
+    native: &mut ez_gfx_backend_dx12::native::NativeContext,
+    shaders: &HashMap<ShaderHandle, ShaderRecord>,
+    pipelines: &HashMap<PipelineKey, NativePipeline>,
+    key_slot: &mut Option<PipelineKey>,
+    stages: &ez_gfx_hal::MeshStages<ShaderHandle>,
+    layout: &ez_gfx_runtime::binding::ReflectedBindings,
+    stage_layouts: &ez_gfx_hal::MeshStages<ez_gfx_runtime::binding::StageLayoutIdentity>,
+    pipeline_layout: &ez_gfx_runtime::binding::PipelineLayout,
+    state: ez_gfx_hal::MeshPipelineState,
+    color_format: Option<ez_gfx_runtime::target::Format>,
+) -> Result<Option<NativePipeline>> {
+    let task = stages
+        .task
+        .map(|handle| shaders.get(&handle).ok_or(Error::InvalidContext))
+        .transpose()?;
+    let mesh = shaders.get(&stages.mesh).ok_or(Error::InvalidContext)?;
+    let fragment = shaders.get(&stages.fragment).ok_or(Error::InvalidContext)?;
+    let task_native = task
+        .map(|record| match &record.native {
+            NativeShader::Dx12(native) => Ok(native),
+            NativeShader::Vulkan(_) => Err(Error::NativeFailure),
+        })
+        .transpose()?;
+    let NativeShader::Dx12(mesh_native) = &mesh.native else {
+        return Err(Error::NativeFailure);
+    };
+    let NativeShader::Dx12(fragment_native) = &fragment.native else {
+        return Err(Error::NativeFailure);
+    };
+
+    let task_workgroup_size = task
+        .map(|record| record.runtime.workgroup_size())
+        .transpose()
+        .map_err(|_| Error::InvalidArgument)?;
+    let mesh_workgroup_size = mesh
+        .runtime
+        .workgroup_size()
+        .map_err(|_| Error::InvalidArgument)?;
+    let depth_required = pipeline_layout.depth_required();
+    let key = PipelineKey::prepare_mesh_slot(
+        key_slot,
+        MeshPipelineKeyDesc {
+            backend: Backend::Dx12,
+            task_shader: stages.task,
+            task_digest: task.map(|record| record.digest),
+            task_entry: task.map(|record| record.entry.as_str()),
+            mesh_shader: stages.mesh,
+            mesh_digest: mesh.digest,
+            mesh_entry: &mesh.entry,
+            fragment_shader: stages.fragment,
+            fragment_digest: fragment.digest,
+            fragment_entry: &fragment.entry,
+            stage_layouts,
+            state,
+            depth_required,
+            color_format: dx12_color_format(color_format)?,
+            depth_format: if depth_required { 40 } else { 0 },
+            sample_count: 1,
+        },
+    );
+    if pipelines.contains_key(key) {
+        return Ok(None);
+    }
+    let layouts = native_layouts(layout).map_err(map_hal)?;
+    let pipeline = NativePipeline::Dx12(
+        native
+            .create_mesh_pipeline(ez_gfx_backend_dx12::native::NativeMeshPipelineDesc {
+                task: task_native.zip(task.map(|record| record.product)),
+                mesh: (mesh_native, mesh.product),
+                fragment: (fragment_native, fragment.product),
+                state,
+                color_format,
+                layouts: &layouts,
+                depth_required,
+                task_workgroup_size,
+                mesh_workgroup_size,
+            })
+            .map_err(map_hal)?,
+    );
+    Ok(Some(pipeline))
+}
 
 // Unsupported shader variants fail without inserting a partial pipeline-cache entry.
 fn prepare_dx12_pipelines(
@@ -32,10 +130,45 @@ fn prepare_dx12_pipelines(
     pipelines: &mut HashMap<PipelineKey, NativePipeline>,
     payloads: &[ExecutableNode],
     pipeline_keys: &mut Vec<Option<PipelineKey>>,
+    color_format: Option<ez_gfx_runtime::target::Format>,
 ) -> Result<()> {
-    pipeline_keys.clear();
+    pipeline_keys.truncate(payloads.len());
     pipeline_keys.resize_with(payloads.len(), || None);
     for (node_index, payload) in payloads.iter().enumerate() {
+        if let ExecutableNode::Mesh {
+            stages,
+            layout,
+            stage_layouts,
+            pipeline_layout,
+            state,
+            ..
+        } = payload
+        {
+            let pipeline = prepare_dx12_mesh_pipeline(
+                native,
+                shaders,
+                pipelines,
+                &mut pipeline_keys[node_index],
+                stages,
+                layout,
+                stage_layouts,
+                pipeline_layout,
+                *state,
+                color_format,
+            )?;
+            if let Some(pipeline) = pipeline {
+                if pipelines.len() == MAX_PIPELINE_CACHE_ENTRIES {
+                    native.wait_idle().map_err(map_hal)?;
+                    pipelines.clear();
+                }
+                let key = pipeline_keys[node_index]
+                    .as_ref()
+                    .ok_or(Error::InvalidArgument)?
+                    .clone();
+                pipelines.insert(key, pipeline);
+            }
+            continue;
+        }
         let (key, pipeline) = match payload {
             ExecutableNode::Compute { shader, layout, .. } => {
                 let record = shaders.get(shader).ok_or(Error::InvalidContext)?;
@@ -91,7 +224,7 @@ fn prepare_dx12_pipelines(
                     layouts: pipeline_layout_key(&layouts),
                     state: *state,
                     depth_required,
-                    color_format: 28,
+                    color_format: dx12_color_format(color_format)?,
                     depth_format: if depth_required { 40 } else { 0 },
                     sample_count: 1,
                 };
@@ -107,6 +240,7 @@ fn prepare_dx12_pipelines(
                                 fragment.product,
                                 *state,
                                 depth_required,
+                                color_format,
                                 &layouts,
                             )
                             .map_err(map_hal)?,
@@ -114,6 +248,7 @@ fn prepare_dx12_pipelines(
                 };
                 (key, pipeline)
             }
+            ExecutableNode::Mesh { .. } => unreachable!("mesh payload handled above"),
             ExecutableNode::TextureReadback { .. }
             | ExecutableNode::RenderTargetReadback { .. }
             | ExecutableNode::Present { .. } => continue,
@@ -237,6 +372,7 @@ struct DxActionSource<'a, 'resources> {
     plan: &'a FrameExecutionPlan,
     payloads: &'a [ExecutableNode],
     pipeline_keys: &'a [Option<PipelineKey>],
+    shaders: &'resources HashMap<ShaderHandle, ShaderRecord>,
     action_indices: &'a [usize],
     binding_records: &'a [FrameBufferBindingRecord],
     binding_ranges: &'a [core::ops::Range<usize>],
@@ -259,6 +395,55 @@ impl DxActionSource<'_, '_> {
                 .ok_or(ez_gfx_hal::HalError::InvalidArgument)?,
             allocations: self.state.allocations,
             vertex_heaps: self.state.vertex_heaps,
+        })
+    }
+
+    fn mesh_dispatch<'draw>(
+        &'draw self,
+        node: usize,
+        stages: &ez_gfx_hal::MeshStages<ShaderHandle>,
+        groups: [u32; 3],
+        bindings: &'draw FrameBindingSource<'_>,
+    ) -> std::result::Result<
+        ez_gfx_backend_dx12::native::NativeMeshDispatch<'draw>,
+        ez_gfx_hal::HalError,
+    > {
+        let key = self.pipeline_keys[node]
+            .as_ref()
+            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
+        let NativePipeline::Dx12(pipeline) = self
+            .state
+            .pipelines
+            .get(key)
+            .ok_or(ez_gfx_hal::HalError::NativeFailure)?
+        else {
+            return Err(ez_gfx_hal::HalError::NativeFailure);
+        };
+        let mesh_record = self
+            .shaders
+            .get(&stages.mesh)
+            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
+        let task_workgroup_size = stages
+            .task
+            .map(|handle| {
+                self.shaders
+                    .get(&handle)
+                    .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+                    .runtime
+                    .workgroup_size()
+                    .map_err(|_| ez_gfx_hal::HalError::InvalidArgument)
+            })
+            .transpose()?;
+        Ok(ez_gfx_backend_dx12::native::NativeMeshDispatch {
+            pipeline,
+            groups,
+            has_task: stages.task.is_some(),
+            mesh_workgroup_size: mesh_record
+                .runtime
+                .workgroup_size()
+                .map_err(|_| ez_gfx_hal::HalError::InvalidArgument)?,
+            task_workgroup_size,
+            bindings,
         })
     }
 }
@@ -373,6 +558,15 @@ impl ez_gfx_backend_dx12::native::NativeFrameActionSource for DxActionSource<'_,
                             },
                         )
                     }
+                    ExecutableNode::Mesh { stages, groups, .. } => {
+                        binding_source = self.binding_source(node)?;
+                        ez_gfx_backend_dx12::native::NativeFrameAction::Mesh(self.mesh_dispatch(
+                            node,
+                            stages,
+                            *groups,
+                            &binding_source,
+                        )?)
+                    }
                     ExecutableNode::TextureReadback { texture } => {
                         let (_, NativeTexture::Dx12(texture), width, height, _) = self
                             .state
@@ -414,6 +608,88 @@ impl ez_gfx_backend_dx12::native::NativeFrameActionSource for DxActionSource<'_,
     }
 }
 
+#[cfg(all(test, windows))]
+fn validate_raw_dx12_shader(
+    context: &ContextState,
+    handle: ShaderHandle,
+    stage: ez_gfx_artifact::Stage,
+) -> Result<()> {
+    let shader = context
+        .shaders
+        .get(&handle)
+        .filter(|shader| shader.stage == stage)
+        .ok_or(Error::NativeFailure)?;
+    if !matches!(shader.native, NativeShader::Dx12(_)) {
+        return Err(Error::NativeFailure);
+    }
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+fn execute_raw_native_frame_test_probe(
+    context: &mut ContextState,
+    plan: &FrameExecutionPlan,
+    payloads: &[ExecutableNode],
+) -> Option<Result<()>> {
+    if !context.raw_native_frame_test_probe.enabled {
+        return None;
+    }
+
+    let observed = (|| {
+        let mut mesh_executions = 0;
+        let mut graphics_executions = 0;
+        // Only executable plan actions count: unreferenced payloads are not
+        // executions, and an invalid node index fails closed.
+        for action in &plan.actions {
+            let ExecutionAction::ExecuteNode(node) = action else {
+                continue;
+            };
+            let node = usize::try_from(*node).map_err(|_| Error::NativeFailure)?;
+            match payloads.get(node).ok_or(Error::NativeFailure)? {
+                ExecutableNode::Mesh { stages, .. } => {
+                    if let Some(task) = stages.task {
+                        validate_raw_dx12_shader(context, task, ez_gfx_artifact::Stage::Task)?;
+                    }
+                    validate_raw_dx12_shader(context, stages.mesh, ez_gfx_artifact::Stage::Mesh)?;
+                    validate_raw_dx12_shader(
+                        context,
+                        stages.fragment,
+                        ez_gfx_artifact::Stage::Fragment,
+                    )?;
+                    mesh_executions += 1;
+                }
+                ExecutableNode::Graphics {
+                    vertex_shader,
+                    fragment_shader,
+                    ..
+                } => {
+                    validate_raw_dx12_shader(
+                        context,
+                        *vertex_shader,
+                        ez_gfx_artifact::Stage::Vertex,
+                    )?;
+                    validate_raw_dx12_shader(
+                        context,
+                        *fragment_shader,
+                        ez_gfx_artifact::Stage::Fragment,
+                    )?;
+                    graphics_executions += 1;
+                }
+                _ => {}
+            }
+        }
+        context.raw_native_frame_test_probe.submits += 1;
+        context.raw_native_frame_test_probe.mesh_executions += mesh_executions;
+        context.raw_native_frame_test_probe.graphics_executions += graphics_executions;
+        Ok(())
+    })();
+    Some(observed)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "linear native lowering plus a test-only raw-plan observation gate"
+)]
 #[cfg(windows)]
 pub(super) fn execute_dx12_frame_plan(
     context: &mut ContextState,
@@ -421,6 +697,11 @@ pub(super) fn execute_dx12_frame_plan(
     payloads: &[ExecutableNode],
     binding_resources: &[ez_gfx_runtime::binding::ResourceIdentity],
 ) -> Result<()> {
+    #[cfg(test)]
+    if let Some(observed) = execute_raw_native_frame_test_probe(context, plan, payloads) {
+        return observed;
+    }
+
     let surface_handle = payloads.iter().find_map(|payload| match payload {
         ExecutableNode::Present { surface } => Some(*surface),
         _ => None,
@@ -477,6 +758,10 @@ pub(super) fn execute_dx12_frame_plan(
                         .then_some(index)
                 }),
         );
+    let color_format = context
+        .frame_render_target
+        .and_then(|target| context.render_targets.get(&target))
+        .map(|record| record.format);
     {
         let NativeContext::Dx12(native) = &mut context.native else {
             return Err(Error::NativeFailure);
@@ -487,6 +772,7 @@ pub(super) fn execute_dx12_frame_plan(
             &mut context.pipelines,
             payloads,
             &mut context.frame_pipeline_keys,
+            color_format,
         )?;
     }
     prepare_frame_binding_scratch(
@@ -504,6 +790,7 @@ pub(super) fn execute_dx12_frame_plan(
         &mut context.frame_action_indices,
         &mut context.frame_binding_scratch,
         &mut context.frame_binding_ranges,
+        &mut context.frame_texture_handles,
     )?;
     let source = DxActionSource {
         state: DxActionState {
@@ -520,6 +807,7 @@ pub(super) fn execute_dx12_frame_plan(
         plan,
         payloads,
         pipeline_keys: &context.frame_pipeline_keys,
+        shaders: &context.shaders,
         action_indices: &context.frame_action_indices,
         binding_records: &context.frame_binding_scratch,
         binding_ranges: &context.frame_binding_ranges,
@@ -567,4 +855,21 @@ pub(super) fn execute_dx12_frame_plan(
         context.surfaces.insert(handle, surface);
     }
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ez_gfx_runtime::target::Format;
+
+    #[test]
+    fn target_and_surface_formats_keep_distinct_pipeline_keys() {
+        let surface = dx12_color_format(None).unwrap();
+        let rgba = dx12_color_format(Some(Format::Rgba8Unorm)).unwrap();
+        let bgra_srgb = dx12_color_format(Some(Format::Bgra8Srgb)).unwrap();
+
+        assert_eq!((surface, rgba, bgra_srgb), (29, 28, 91));
+        assert_ne!(surface, rgba);
+        assert_ne!(surface, bgra_srgb);
+    }
 }

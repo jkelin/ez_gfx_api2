@@ -12,88 +12,14 @@ use super::{
     AdapterCapabilities, AdapterClass, AdapterInfo, AllocationError, AllocationSizes, Allocator,
     AllocatorCreateDesc, Backend, CStr, CString, CompressionSupport,
     DEFAULT_ALLOCATION_BLOCK_POLICY, DeferredNativeResource, DeferredResource, DeviceProbe, Entry,
-    FrameSlot, HalError, MemoryAllocator, NativeContext, NativeSurface, PendingDevice,
-    PresentationMode, PresentationSupport, SemanticProfile, TEXTURE_DESCRIPTOR_CAPACITY,
-    create_frame_slots, khr, map_allocation_hal, map_allocation_vk, map_allocator,
-    map_allocator_hal, map_vk, paired_texture_capacity, texture_descriptor_layout_bindings,
-    texture_heap_rejection, transfer, vk,
+    FrameSlot, HalError, MemoryAllocator, MeshShaderLimits, NativeContext, NativeSurface,
+    PendingDevice, PresentationMode, PresentationSupport, SemanticProfile, ShaderCapabilities,
+    TEXTURE_DESCRIPTOR_CAPACITY, create_frame_slots, khr, map_allocation_hal, map_allocation_vk,
+    map_allocator, map_allocator_hal, map_vk, paired_texture_capacity,
+    texture_descriptor_layout_bindings, texture_heap_rejection, transfer, vk,
 };
 
-fn create_device_frame_state(
-    instance: &ash::Instance,
-    pending: &mut PendingDevice,
-    queue_family: u32,
-    swapchain_enabled: bool,
-) -> Result<(vk::DescriptorSet, Vec<FrameSlot>), HalError> {
-    let device = pending.device.as_ref().ok_or(HalError::NativeFailure)?;
-    let bindings = texture_descriptor_layout_bindings();
-    let binding_flags = [
-        vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
-        vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
-    ];
-    let mut binding_info =
-        vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
-    pending.descriptor_layout = Some(
-        // SAFETY: `create_descriptor_set_layout` reads the initialized `bindings` and `binding_info`/`binding_flags` stack storage only for this call on `pending.device`.
-        unsafe {
-            device.create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default()
-                    .bindings(&bindings)
-                    .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
-                    .push_next(&mut binding_info),
-                None,
-            )
-        }
-        .map_err(map_vk)?,
-    );
-    let descriptor_layout = pending.descriptor_layout.ok_or(HalError::NativeFailure)?;
-    pending.descriptor_pool = Some(
-        // SAFETY: `create_descriptor_pool` reads the create info and its inline pool-size array only during this call on `pending.device`.
-        unsafe {
-            device.create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(1)
-                    .pool_sizes(&[
-                        vk::DescriptorPoolSize {
-                            ty: vk::DescriptorType::SAMPLED_IMAGE,
-                            descriptor_count: TEXTURE_DESCRIPTOR_CAPACITY,
-                        },
-                        vk::DescriptorPoolSize {
-                            ty: vk::DescriptorType::SAMPLER,
-                            descriptor_count: TEXTURE_DESCRIPTOR_CAPACITY,
-                        },
-                    ])
-                    .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
-                None,
-            )
-        }
-        .map_err(map_vk)?,
-    );
-    let descriptor_pool = pending.descriptor_pool.ok_or(HalError::NativeFailure)?;
-    // SAFETY: `descriptor_pool` and `descriptor_layout` were created above by `device` with matching update-after-bind flags, and the one-element layout slice lasts through allocation.
-    let descriptor_set = unsafe {
-        device.allocate_descriptor_sets(
-            &vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(descriptor_pool)
-                .set_layouts(core::slice::from_ref(&descriptor_layout)),
-        )
-    }
-    .map_err(map_vk)?
-    .into_iter()
-    .next()
-    .ok_or(HalError::NativeFailure)?;
-    if swapchain_enabled {
-        pending.swapchain_loader = Some(khr::swapchain::Device::new(instance, device));
-        pending.image_available = Some(
-            // SAFETY: `create_semaphore` uses `pending.device`, no custom allocator, and a default create-info value whose storage lasts through the call.
-            unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
-                .map_err(map_vk)?,
-        );
-    }
-    let frame_slots = create_frame_slots(device, queue_family)?;
-
-    Ok((descriptor_set, frame_slots))
-}
+include!("device_frame_state.rs");
 
 fn select_transfer_family(properties: &[vk::QueueFamilyProperties], graphics: u32) -> u32 {
     properties
@@ -121,6 +47,33 @@ fn draw_feature_rejection(
     } else {
         None
     }
+}
+
+fn normalized_mesh_shader_capabilities(
+    extension_available: bool,
+    features: &vk::PhysicalDeviceMeshShaderFeaturesEXT<'_>,
+) -> ShaderCapabilities {
+    ShaderCapabilities::normalized(
+        extension_available && features.task_shader != vk::FALSE,
+        extension_available && features.mesh_shader != vk::FALSE,
+    )
+}
+
+fn mesh_shader_limits(
+    capabilities: ShaderCapabilities,
+    properties: &vk::PhysicalDeviceMeshShaderPropertiesEXT<'_>,
+) -> Option<MeshShaderLimits> {
+    capabilities.mesh.then_some(MeshShaderLimits {
+        task_supported: capabilities.task,
+        task_work_group_invocations: properties.max_task_work_group_invocations,
+        mesh_work_group_invocations: properties.max_mesh_work_group_invocations,
+        mesh_output_vertices: properties.max_mesh_output_vertices,
+        mesh_output_primitives: properties.max_mesh_output_primitives,
+        task_group_count: properties.max_task_work_group_count,
+        task_group_total_count: properties.max_task_work_group_total_count,
+        mesh_group_count: properties.max_mesh_work_group_count,
+        mesh_group_total_count: properties.max_mesh_work_group_total_count,
+    })
 }
 
 pub(crate) const fn cached_device_supports_surface(
@@ -185,6 +138,8 @@ impl NativeContext {
             surface_loader,
             headless_surface_enabled,
             wsi_capabilities: WsiCapabilities::from_enabled(&extensions),
+            mesh_shader_loader: None,
+            mesh_shader_limits: None,
             physical_device: None,
             device: None,
             idle_drained: true,
@@ -396,6 +351,9 @@ impl NativeContext {
                 features13,
                 vertex_storage,
                 multi_draw,
+                mesh_features,
+                mesh_limits,
+                mesh_extension_available,
             } = candidate;
             // Prefer a transfer-only family; otherwise use a second queue from the graphics
             // family when available, with queue zero as the universal fallback.
@@ -459,6 +417,11 @@ impl NativeContext {
                 .vertex_pipeline_stores_and_atomics(vertex_storage)
                 .multi_draw_indirect(multi_draw)
                 .sampler_anisotropy(core_features.sampler_anisotropy != 0);
+            let shader_stages =
+                normalized_mesh_shader_capabilities(mesh_extension_available, &mesh_features);
+            let mut enabled_mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
+                .task_shader(shader_stages.task)
+                .mesh_shader(shader_stages.mesh);
             // Portability devices require `VK_KHR_portability_subset`; ordinary devices omit it.
             // SAFETY: `physical` belongs to this live instance.
             let available_device_extensions = unsafe {
@@ -468,6 +431,7 @@ impl NativeContext {
             .map_err(map_vk)?;
             let (mut enabled_extensions, swapchain_enabled, fifo_latest_ready_extension) =
                 device_extensions(&available_device_extensions);
+            let mesh_shader_enabled = shader_stages.mesh;
             if surface.is_some() && !swapchain_enabled {
                 continue;
             }
@@ -478,6 +442,9 @@ impl NativeContext {
                     *extension == FIFO_LATEST_READY_KHR.as_ptr()
                         || *extension == FIFO_LATEST_READY_EXT.as_ptr()
                 });
+            }
+            if mesh_shader_enabled {
+                enabled_extensions.push(ash::ext::mesh_shader::NAME.as_ptr());
             }
             let mut latest_ready = PhysicalDevicePresentModeFifoLatestReadyFeatures {
                 present_mode_fifo_latest_ready: vk::TRUE,
@@ -490,6 +457,9 @@ impl NativeContext {
                 .push_next(&mut enabled11)
                 .push_next(&mut enabled12)
                 .push_next(&mut enabled13);
+            if mesh_shader_enabled {
+                create = create.push_next(&mut enabled_mesh);
+            }
             if fifo_latest_ready_enabled {
                 latest_ready.p_next = create.p_next.cast_mut();
                 create.p_next = (&raw const latest_ready).cast();
@@ -502,6 +472,8 @@ impl NativeContext {
                 .device
                 .as_ref()
                 .expect("pending device is initialized");
+            let mesh_shader_loader = mesh_shader_enabled
+                .then(|| ash::ext::mesh_shader::Device::new(&self.instance, device));
             // SAFETY: queue zero was requested from the selected graphics family above.
             let graphics_queue = unsafe { device.get_device_queue(queue_family, 0) };
             let transfer_index =
@@ -698,6 +670,8 @@ impl NativeContext {
             )
             .map_err(|_| HalError::NativeFailure)?;
             self.physical_device = Some(physical);
+            self.mesh_shader_loader = mesh_shader_loader;
+            self.mesh_shader_limits = mesh_limits;
             self.adapter_info = Some(adapter.clone());
             self.graphics_queue_family = Some(queue_family);
             self.transfer_queue_family = Some(transfer_family);
@@ -1093,12 +1067,27 @@ impl NativeContext {
             return Ok(None);
         };
 
+        // Optional shader stages are queried only when the defining extension is advertised.
+        // Absence never excludes an otherwise baseline-capable adapter.
+        // SAFETY: `physical` belongs to this instance; ash owns the returned extension storage.
+        let available_device_extensions = unsafe {
+            self.instance
+                .enumerate_device_extension_properties(physical)
+        }
+        .map_err(map_vk)?;
+        let mesh_extension_available =
+            available_extension(&available_device_extensions, ash::ext::mesh_shader::NAME)
+                .is_some();
         let mut features12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default();
+        let mut mesh_features = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
         let (vertex_storage, multi_draw, compression) = {
             let mut features = vk::PhysicalDeviceFeatures2::default()
                 .push_next(&mut features12)
                 .push_next(&mut features13);
+            if mesh_extension_available {
+                features = features.push_next(&mut mesh_features);
+            }
             // SAFETY: output feature chains are valid for the duration of the query.
             unsafe {
                 self.instance
@@ -1128,9 +1117,13 @@ impl NativeContext {
         let properties = unsafe { self.instance.get_physical_device_properties(physical) };
         let mut id = vk::PhysicalDeviceIDProperties::default();
         let mut indexing = vk::PhysicalDeviceDescriptorIndexingProperties::default();
+        let mut mesh_properties = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
         let mut properties2 = vk::PhysicalDeviceProperties2::default()
             .push_next(&mut id)
             .push_next(&mut indexing);
+        if mesh_extension_available {
+            properties2 = properties2.push_next(&mut mesh_properties);
+        }
         // SAFETY: `properties2` links initialized `id` and `indexing` output storage, all of which remains mutable and allocated for the properties query.
         unsafe {
             self.instance
@@ -1147,6 +1140,9 @@ impl NativeContext {
             _ => AdapterClass::Other,
         };
         let limits = properties.limits;
+        let shader_stages =
+            normalized_mesh_shader_capabilities(mesh_extension_available, &mesh_features);
+        let mesh_limits = mesh_shader_limits(shader_stages, &mesh_properties);
         let caps = AdapterCapabilities {
             bindless_sampled_textures: paired_texture_capacity(&indexing),
             bindless_storage_resources: indexing
@@ -1155,6 +1151,7 @@ impl NativeContext {
             bindless_samplers: paired_texture_capacity(&indexing),
             max_indirect_draw_count: limits.max_draw_indirect_count,
             shader_model: 0x0605,
+            shader_stages,
             timeline_synchronization: features12.timeline_semaphore != 0,
             resource_aliasing: true,
             dynamic_rendering: features13.dynamic_rendering != 0
@@ -1178,6 +1175,9 @@ impl NativeContext {
             features13,
             vertex_storage,
             multi_draw,
+            mesh_features,
+            mesh_limits,
+            mesh_extension_available,
         }))
     }
 }

@@ -46,6 +46,10 @@ fn adapter_info(info: &AdapterInfo, report: &AdapterReport) -> EzGfxAdapterInfo 
         admitted: u8::from(report.admitted()),
         software_rejected: u8::from(report.software_rejected()),
         error_count: u32::try_from(report.errors().len()).unwrap_or(u32::MAX),
+        shader_stages: super::EzGfxShaderCapabilities {
+            task: u8::from(info.capabilities().shader_stages.task),
+            mesh: u8::from(info.capabilities().shader_stages.mesh),
+        },
     }
 }
 

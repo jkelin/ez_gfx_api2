@@ -161,6 +161,28 @@ impl Frame {
         let retained: Rc<dyn Any> = resource.clone();
         self.retained.push(retained);
     }
+    fn retain_mesh_shaders(
+        &mut self,
+        shaders: MeshShaders<'_>,
+    ) -> Result<ez_gfx_hal::MeshStages<ShaderHandle>> {
+        if let Some(task) = shaders.task {
+            self.ensure_context(&task.inner.context)?;
+        }
+        self.ensure_context(&shaders.mesh.inner.context)?;
+        self.ensure_context(&shaders.fragment.inner.context)?;
+
+        let handles = shaders.handles();
+        if let Err(error) = state::validate_mesh_stages(self.context.handle, handles) {
+            return self.fail(error);
+        }
+
+        if let Some(task) = shaders.task {
+            self.retain(&task.inner);
+        }
+        self.retain(&shaders.mesh.inner);
+        self.retain(&shaders.fragment.inner);
+        Ok(handles)
+    }
 
     fn consume_transients(&self) {
         for transient in &self.transients {
@@ -396,6 +418,37 @@ impl Frame {
             vertex_shader.inner.handle,
             fragment_shader.inner.handle,
             counter_handle,
+            &self.raw_bindings,
+            state_desc,
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) => self.fail(error),
+        }
+    }
+
+    /// Executes a direct mesh graphics operation.
+    ///
+    /// The supplied grid dispatches task threadgroups when a task shader is present and mesh
+    /// threadgroups otherwise. Threadgroup dimensions come from shader reflection.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when capabilities, ownership, bindings, groups, reflection, or recording
+    /// state are invalid.
+    pub fn execute_mesh(
+        &mut self,
+        shaders: MeshShaders<'_>,
+        groups: [u32; 3],
+        state_desc: ez_gfx_hal::MeshPipelineState,
+    ) -> Result<()> {
+        let stages = self.retain_mesh_shaders(shaders)?;
+        self.prepare_raw_bindings()?;
+        if let Some(error) = self.poison {
+            return Err(error);
+        }
+        match state::execute_mesh(
+            self.context.handle,
+            stages,
+            groups,
             &self.raw_bindings,
             state_desc,
         ) {

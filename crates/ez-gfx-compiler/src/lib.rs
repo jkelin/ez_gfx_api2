@@ -323,8 +323,47 @@ fn artifact_stage(stage: shader_slang::Stage) -> Result<Stage, CompilerError> {
         shader_slang::Stage::Geometry => Ok(Stage::Geometry),
         shader_slang::Stage::Hull => Ok(Stage::TessellationControl),
         shader_slang::Stage::Domain => Ok(Stage::TessellationEvaluation),
+        shader_slang::Stage::Amplification => Ok(Stage::Task),
+        shader_slang::Stage::Mesh => Ok(Stage::Mesh),
         unsupported => Err(CompilerError::UnsupportedStage(format!("{unsupported:?}"))),
     }
+}
+
+fn slang_stage(stage: Stage) -> shader_slang::Stage {
+    match stage {
+        Stage::Vertex => shader_slang::Stage::Vertex,
+        Stage::Fragment => shader_slang::Stage::Fragment,
+        Stage::Compute => shader_slang::Stage::Compute,
+        Stage::Geometry => shader_slang::Stage::Geometry,
+        Stage::TessellationControl => shader_slang::Stage::Hull,
+        Stage::TessellationEvaluation => shader_slang::Stage::Domain,
+        Stage::Task => shader_slang::Stage::Amplification,
+        Stage::Mesh => shader_slang::Stage::Mesh,
+    }
+}
+
+fn component_entry_identity(
+    entry: &shader_slang::EntryPoint,
+) -> Result<DiscoveredEntry, CompilerError> {
+    use shader_slang::Downcast;
+
+    let layout = entry
+        .downcast()
+        .layout(0)
+        .map_err(|error| CompilerError::Native(error.to_string()))?;
+    let mut reflected = layout.entry_points();
+    let entry = reflected
+        .next()
+        .ok_or_else(|| CompilerError::Native("entry point reflection missing".into()))?;
+    if reflected.next().is_some() {
+        return Err(CompilerError::Native(
+            "ambiguous entry point reflection".into(),
+        ));
+    }
+    Ok(DiscoveredEntry {
+        name: entry.name().to_owned(),
+        stage: artifact_stage(entry.stage())?,
+    })
 }
 
 fn discover_entries(
@@ -332,14 +371,28 @@ fn discover_entries(
     target: Target,
     development: bool,
 ) -> Result<Vec<DiscoveredEntry>, CompilerError> {
-    use shader_slang::Downcast;
+    let entries = discover_entries_with_mesh_capability(source, target, development, false)?;
+    if target == Target::Spirv
+        && entries
+            .iter()
+            .any(|entry| matches!(entry.stage, Stage::Task | Stage::Mesh))
+    {
+        return discover_entries_with_mesh_capability(source, target, development, true);
+    }
+    Ok(entries)
+}
+
+fn discover_entries_with_mesh_capability(
+    source: &Path,
+    target: Target,
+    development: bool,
+    mesh_capability: bool,
+) -> Result<Vec<DiscoveredEntry>, CompilerError> {
     let module_name = module_name(source)?;
     let search = source_search_path(source)?;
 
     let global = shader_slang::GlobalSession::new().ok_or(CompilerError::NativeUnavailable)?;
-    let options = shader_slang::CompilerOptions::default()
-        .optimization(shader_slang::OptimizationLevel::High)
-        .matrix_layout_row(true);
+    let options = compiler_options_with_mesh_capability(&global, mesh_capability)?;
     let (artifact_target, profile) = discovery_target(target, development);
     let target_desc = shader_slang::TargetDesc::default()
         .format(compile_target(artifact_target))
@@ -361,30 +414,46 @@ fn discover_entries(
     if module_entries.is_empty() {
         return Err(CompilerError::NoEntryPoints);
     }
-    let mut components = Vec::with_capacity(module_entries.len() + 1);
-    components.push(module.downcast().clone());
-    components.extend(module_entries.iter().map(|entry| entry.downcast().clone()));
-    let linked = session
-        .create_composite_component_type(&components)
-        .and_then(|program| program.link())
-        .map_err(|error| CompilerError::Native(error.to_string()))?;
-    let layout = linked
-        .layout(0)
-        .map_err(|error| CompilerError::Native(error.to_string()))?;
-    let mut entries = Vec::with_capacity(module_entries.len());
-    for entry in layout.entry_points() {
-        let stage = artifact_stage(entry.stage())?;
-        entries.push(DiscoveredEntry {
-            name: entry.name().to_owned(),
-            stage,
-        });
+    module_entries
+        .iter()
+        .map(component_entry_identity)
+        .collect()
+}
+
+fn compiler_options() -> shader_slang::CompilerOptions {
+    shader_slang::CompilerOptions::default()
+        .optimization(shader_slang::OptimizationLevel::High)
+        .matrix_layout_row(true)
+}
+
+fn compiler_options_with_mesh_capability(
+    global: &shader_slang::GlobalSession,
+    mesh_capability: bool,
+) -> Result<shader_slang::CompilerOptions, CompilerError> {
+    let options = compiler_options();
+    if !mesh_capability {
+        return Ok(options);
     }
-    if entries.len() != module_entries.len() {
+
+    // EXT is the portable SPIR-V mesh-shading contract. NV capabilities are
+    // intentionally excluded so every emitted task/mesh product has one identity.
+    let capability = global.find_capability("spvMeshShadingEXT");
+    if capability.is_unknown() {
         return Err(CompilerError::Native(
-            "entry point reflection count mismatch".into(),
+            "Slang capability unavailable: spvMeshShadingEXT".into(),
         ));
     }
-    Ok(entries)
+    Ok(options.capability(capability))
+}
+
+fn target_options(
+    global: &shader_slang::GlobalSession,
+    target: &TargetRequest,
+) -> Result<shader_slang::CompilerOptions, CompilerError> {
+    compiler_options_with_mesh_capability(
+        global,
+        target.target == ArtifactTarget::Spirv && matches!(target.stage, Stage::Task | Stage::Mesh),
+    )
 }
 
 fn compile_request(
@@ -403,17 +472,21 @@ fn compile_request(
     let search = source_search_path(&request.source)?;
     let global = shader_slang::GlobalSession::new().ok_or(CompilerError::NativeUnavailable)?;
     let version = global.build_tag_string().to_owned();
-    let options = shader_slang::CompilerOptions::default()
-        .optimization(shader_slang::OptimizationLevel::High)
-        .matrix_layout_row(true);
+    let options = compiler_options();
+    let target_options: Vec<_> = request
+        .targets
+        .iter()
+        .map(|target| target_options(&global, target))
+        .collect::<Result<_, _>>()?;
     let target_descs: Vec<_> = request
         .targets
         .iter()
-        .map(|target| {
+        .zip(&target_options)
+        .map(|(target, options)| {
             shader_slang::TargetDesc::default()
                 .format(compile_target(target.target))
                 .profile(global.find_profile(target.profile))
-                .options(&options)
+                .options(options)
         })
         .collect();
     let paths = [search.as_ptr()];
@@ -427,14 +500,27 @@ fn compile_request(
     let module = session
         .load_module(module_name)
         .map_err(|error| CompilerError::Native(error.to_string()))?;
+    // Slang permits entry-point overloads whose exported names match across stages.
+    // Resolve component identity through reflection rather than the name-only lookup.
+    let module_entries: Vec<_> = module
+        .entry_points()
+        .map(|entry| component_entry_identity(&entry).map(|identity| (identity, entry)))
+        .collect::<Result<_, _>>()?;
     let entries: Vec<_> = request
         .targets
         .iter()
         .map(|target| {
-            module
-                .find_entry_point_by_name(&target.entry_point)
+            module_entries
+                .iter()
+                .find(|(identity, _)| {
+                    identity.stage == target.stage && identity.name == target.entry_point
+                })
+                .map(|(_, entry)| entry.clone())
                 .ok_or_else(|| {
-                    CompilerError::Native(format!("entry point missing: {}", target.entry_point))
+                    CompilerError::Native(format!(
+                        "entry point missing: {:?} {}",
+                        target.stage, target.entry_point
+                    ))
                 })
         })
         .collect::<Result<_, _>>()?;
@@ -587,13 +673,20 @@ fn parse_deployment_version(value: &str) -> Result<CompatibilityVersion, Compile
 fn metal_minimum_os(
     deployment_target: Option<&str>,
     host_os: CompatibilityVersion,
+    stage: Stage,
 ) -> Result<CompatibilityVersion, CompilerError> {
-    // An explicit deployment target is authoritative; otherwise use the host OS,
-    // never the SDK version, because SDKs commonly support older deployment targets.
-    deployment_target
+    // Explicit deployment targets remain authoritative. Task and mesh products
+    // fail closed when either an explicit target or the concrete host provenance is too old.
+    let minimum_os = deployment_target
         .map(parse_deployment_version)
-        .transpose()
-        .map(|value| value.unwrap_or(host_os))
+        .transpose()?
+        .unwrap_or(host_os);
+    if matches!(stage, Stage::Task | Stage::Mesh) && minimum_os < CompatibilityVersion::new(13, 0) {
+        return Err(CompilerError::InvalidRequest(
+            "task/mesh Metal deployment target",
+        ));
+    }
+    Ok(minimum_os)
 }
 
 fn host_macos_version() -> Result<CompatibilityVersion, CompilerError> {
@@ -647,6 +740,7 @@ fn target_compatibility(target: &TargetRequest) -> Result<TargetCompatibility, C
     let minimum_os = metal_minimum_os(
         std::env::var("MACOSX_DEPLOYMENT_TARGET").ok().as_deref(),
         host_macos_version()?,
+        target.stage,
     )?;
     let language = parse_compatibility_version(target.profile)?;
     let toolchain = apple_tool_output(&["metal", "--version"])?;
@@ -668,18 +762,20 @@ fn reflected_workgroup_size(
     reflected: [u64; 3],
     entry: &str,
 ) -> Result<Option<[u32; 3]>, CompilerError> {
-    if stage != Stage::Compute {
+    if !matches!(stage, Stage::Compute | Stage::Task | Stage::Mesh) {
+        // Slang may expose target defaults for non-dispatch stages; they are
+        // not stage metadata and must never enter the artifact contract.
         return Ok(None);
     }
     let dimension = |value| {
         u32::try_from(value)
-            .map_err(|_| CompilerError::Native(format!("invalid compute workgroup size: {entry}")))
+            .map_err(|_| CompilerError::Native(format!("invalid workgroup size: {entry}")))
     };
     let [x, y, z] = reflected;
     let size = [dimension(x)?, dimension(y)?, dimension(z)?];
     if size.contains(&0) {
         return Err(CompilerError::Native(format!(
-            "invalid compute workgroup size: {entry}"
+            "invalid workgroup size: {entry}"
         )));
     }
     Ok(Some(size))
@@ -747,27 +843,15 @@ fn compile_targets(
             .map_err(|e| CompilerError::Native(e.to_string()))?;
         let reflected_entry = layout
             .entry_points()
-            .find(|entry| entry.name() == target.entry_point)
+            .find(|entry| {
+                entry.name() == target.entry_point && entry.stage() == slang_stage(target.stage)
+            })
             .ok_or_else(|| {
                 CompilerError::Native(format!(
-                    "entry point reflection missing: {}",
-                    target.entry_point
+                    "entry point reflection missing: {:?} {}",
+                    target.stage, target.entry_point
                 ))
             })?;
-        let stage_matches = match target.stage {
-            Stage::Vertex => reflected_entry.stage() == shader_slang::Stage::Vertex,
-            Stage::Fragment => reflected_entry.stage() == shader_slang::Stage::Fragment,
-            Stage::Compute => reflected_entry.stage() == shader_slang::Stage::Compute,
-            Stage::Geometry => reflected_entry.stage() == shader_slang::Stage::Geometry,
-            Stage::TessellationControl => reflected_entry.stage() == shader_slang::Stage::Hull,
-            Stage::TessellationEvaluation => reflected_entry.stage() == shader_slang::Stage::Domain,
-        };
-        if !stage_matches {
-            return Err(CompilerError::Native(format!(
-                "stage mismatch: {}",
-                target.entry_point
-            )));
-        }
         let workgroup_size = reflected_workgroup_size(
             target.stage,
             reflected_entry.compute_thread_group_size(),
@@ -956,14 +1040,16 @@ mod compatibility_tests {
 
     #[test]
     fn reflected_workgroup_size_validates_each_fixed_dimension() {
+        for stage in [Stage::Compute, Stage::Task, Stage::Mesh] {
+            assert_eq!(
+                reflected_workgroup_size(stage, [8, 2, 1], "main").unwrap(),
+                Some([8, 2, 1])
+            );
+            assert!(reflected_workgroup_size(stage, [1, 0, 1], "main").is_err());
+            assert!(reflected_workgroup_size(stage, [1, u64::MAX, 1], "main").is_err());
+        }
         assert_eq!(
-            reflected_workgroup_size(Stage::Compute, [8, 2, 1], "main").unwrap(),
-            Some([8, 2, 1])
-        );
-        assert!(reflected_workgroup_size(Stage::Compute, [1, 0, 1], "main").is_err());
-        assert!(reflected_workgroup_size(Stage::Compute, [1, u64::MAX, 1], "main").is_err());
-        assert_eq!(
-            reflected_workgroup_size(Stage::Vertex, [0, 0, 0], "main").unwrap(),
+            reflected_workgroup_size(Stage::Vertex, [1, 1, 1], "main").unwrap(),
             None
         );
     }
@@ -1025,7 +1111,12 @@ mod compatibility_tests {
     fn metal_minimum_os_rejects_malformed_deployment_target() {
         for value in ["macos", "14.foo", "14.3.2", "prefix_14"] {
             assert!(
-                metal_minimum_os(Some(value), CompatibilityVersion::new(15, 7)).is_err(),
+                metal_minimum_os(
+                    Some(value),
+                    CompatibilityVersion::new(15, 7),
+                    Stage::Compute,
+                )
+                .is_err(),
                 "{value} must be rejected"
             );
         }
@@ -1034,7 +1125,12 @@ mod compatibility_tests {
     #[test]
     fn metal_minimum_os_prefers_explicit_deployment_target() {
         assert_eq!(
-            metal_minimum_os(Some("14.3"), CompatibilityVersion::new(26, 2)).unwrap(),
+            metal_minimum_os(
+                Some("14.3"),
+                CompatibilityVersion::new(26, 2),
+                Stage::Compute,
+            )
+            .unwrap(),
             CompatibilityVersion::new(14, 3)
         );
     }
@@ -1042,9 +1138,27 @@ mod compatibility_tests {
     #[test]
     fn metal_minimum_os_uses_host_when_deployment_target_is_absent() {
         assert_eq!(
-            metal_minimum_os(None, CompatibilityVersion::new(15, 7)).unwrap(),
+            metal_minimum_os(None, CompatibilityVersion::new(15, 7), Stage::Compute).unwrap(),
             CompatibilityVersion::new(15, 7)
         );
+    }
+
+    #[test]
+    fn task_and_mesh_metallibs_require_macos_thirteen() {
+        for stage in [Stage::Task, Stage::Mesh] {
+            assert!(
+                metal_minimum_os(Some("12.6"), CompatibilityVersion::new(15, 7), stage,).is_err()
+            );
+            assert!(metal_minimum_os(None, CompatibilityVersion::new(12, 6), stage).is_err());
+            assert_eq!(
+                metal_minimum_os(Some("13.0"), CompatibilityVersion::new(15, 7), stage,).unwrap(),
+                CompatibilityVersion::new(13, 0)
+            );
+            assert_eq!(
+                metal_minimum_os(None, CompatibilityVersion::new(15, 7), stage).unwrap(),
+                CompatibilityVersion::new(15, 7)
+            );
+        }
     }
 
     #[cfg(windows)]

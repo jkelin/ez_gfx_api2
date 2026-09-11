@@ -10,6 +10,7 @@ use ez_gfx_core::{
     handle::{BufferHandle, CounterBufferHandle, RenderTargetHandle},
 };
 use serde::Deserialize;
+use smallvec::SmallVec;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Classifies the GPU resource represented by a binding.
@@ -110,6 +111,10 @@ pub struct PipelineLayout {
     depth_required: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// Stable digest of one stage's physical buffer bindings and texture-heap layout.
+pub struct StageLayoutIdentity([u8; 32]);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Carries one fully parsed and semantically validated stage reflection.
 pub struct ValidatedStageReflection {
@@ -117,6 +122,7 @@ pub struct ValidatedStageReflection {
     bindings: ReflectedBindings,
     pipeline_layout: PipelineLayout,
     workgroup_size: Option<[u32; 3]>,
+    physical_layout_identity: StageLayoutIdentity,
 }
 
 impl ValidatedStageReflection {
@@ -135,7 +141,12 @@ impl ValidatedStageReflection {
         &self.pipeline_layout
     }
 
-    /// Returns the compute thread-group dimensions; non-compute stages have none.
+    /// Returns the stage's canonical physical binding and texture-heap identity.
+    pub const fn physical_layout_identity(&self) -> StageLayoutIdentity {
+        self.physical_layout_identity
+    }
+
+    /// Returns dispatch thread-group dimensions; non-dispatch stages have none.
     pub const fn workgroup_size(&self) -> Option<[u32; 3]> {
         self.workgroup_size
     }
@@ -385,21 +396,84 @@ impl ReflectedBindings {
     }
 }
 
+fn stage_layout_identity(
+    stage: Stage,
+    bindings: &ReflectedBindings,
+    pipeline_layout: &PipelineLayout,
+) -> StageLayoutIdentity {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ez-gfx-stage-layout-v2");
+    hasher.update(&[stage as u8]);
+    let requirements = bindings.requirements();
+    let descriptor_count = requirements
+        .iter()
+        .map(|binding| {
+            usize::try_from(binding.descriptor_count)
+                .expect("validated descriptor counts fit in usize")
+        })
+        .sum::<usize>();
+    let mut previous = None;
+    for _ in 0..descriptor_count {
+        // Flatten ranges before sorting: adjacent one-slot declarations and one
+        // array are equivalent, while gaps and DX12's SRV/UAV namespaces remain distinct.
+        let next = requirements
+            .iter()
+            .flat_map(|binding| {
+                (0..binding.descriptor_count).map(|offset| {
+                    (
+                        binding.space,
+                        binding
+                            .binding
+                            .checked_add(offset)
+                            .expect("validated descriptor ranges do not overflow"),
+                        binding.writable,
+                    )
+                })
+            })
+            .filter(|candidate| previous.is_none_or(|previous| *candidate > previous))
+            .min()
+            .expect("validated physical descriptor slots are unique");
+        hasher.update(&next.0.to_le_bytes());
+        hasher.update(&next.1.to_le_bytes());
+        hasher.update(&[u8::from(next.2)]);
+        previous = Some(next);
+    }
+    if let Some(heap) = pipeline_layout.texture_heap() {
+        hasher.update(&[1]);
+        hasher.update(&heap.space.to_le_bytes());
+        hasher.update(&heap.binding.to_le_bytes());
+        hasher.update(&heap.capacity.to_le_bytes());
+        hasher.update(&heap.argument_stride.to_le_bytes());
+        hasher.update(&heap.texture_argument_offset.to_le_bytes());
+        hasher.update(&heap.sampler_argument_offset.to_le_bytes());
+    } else {
+        hasher.update(&[0]);
+    }
+    StageLayoutIdentity(*hasher.finalize().as_bytes())
+}
+
 /// Parses metadata once and validates exactly one reflection for every selected stage.
+///
+/// The returned storage remains inline because executable pipelines contain at most task,
+/// mesh, and fragment stages.
 ///
 /// # Errors
 ///
-/// Returns an error for malformed metadata, absent or ambiguous stage reflection, invalid
-/// bindings, invalid texture heaps, or conflicting graphics-stage resource layouts.
+/// Returns an error for malformed metadata, more than three stages, absent or ambiguous stage
+/// reflection, invalid bindings, invalid texture heaps, or conflicting graphics-stage layouts.
 pub fn validate_stage_reflections(
     metadata: &[u8],
     backend: Backend,
     stages: &[(Stage, &str)],
-) -> Result<Vec<ValidatedStageReflection>, BindingError> {
+) -> Result<SmallVec<[ValidatedStageReflection; 3]>, BindingError> {
+    if stages.len() > 3 {
+        return Err(BindingError::InvalidMetadata);
+    }
+
     let envelope: MetadataEnvelope =
         serde_json::from_slice(metadata).map_err(|_| BindingError::InvalidMetadata)?;
     let target = target_name(backend);
-    let mut validated = Vec::with_capacity(stages.len());
+    let mut validated: SmallVec<[ValidatedStageReflection; 3]> = SmallVec::new();
     for &(stage, entry) in stages {
         if entry.is_empty() || entry.len() > 1024 || entry.as_bytes().contains(&0) {
             return Err(BindingError::InvalidMetadata);
@@ -415,30 +489,71 @@ pub fn validate_stage_reflections(
             return Err(BindingError::AmbiguousReflection);
         }
         let workgroup_size = reflection.reflection.workgroup_size;
-        if stage == Stage::Compute {
+        if matches!(stage, Stage::Compute | Stage::Task | Stage::Mesh) {
             if workgroup_size.is_none_or(|size| size.contains(&0)) {
                 return Err(BindingError::InvalidMetadata);
             }
         } else if workgroup_size.is_some() {
             return Err(BindingError::InvalidMetadata);
         }
+        let bindings = ReflectedBindings::from_reflection(reflection, backend)?;
+        let pipeline_layout = PipelineLayout::from_reflection(reflection)?;
         validated.push(ValidatedStageReflection {
             stage,
-            bindings: ReflectedBindings::from_reflection(reflection, backend)?,
-            pipeline_layout: PipelineLayout::from_reflection(reflection)?,
+            physical_layout_identity: stage_layout_identity(stage, &bindings, &pipeline_layout),
+            bindings,
+            pipeline_layout,
             workgroup_size,
         });
     }
 
-    let vertex = validated.iter().find(|value| value.stage == Stage::Vertex);
-    let fragment = validated
+    if validated
         .iter()
-        .find(|value| value.stage == Stage::Fragment);
-    if let (Some(vertex), Some(fragment)) = (vertex, fragment) {
-        vertex.bindings.merge(&fragment.bindings)?;
-        vertex.pipeline_layout.merge(&fragment.pipeline_layout)?;
+        .any(|value| matches!(value.stage, Stage::Task | Stage::Mesh))
+    {
+        validate_mesh_stage_fold(&validated)?;
+    } else {
+        let vertex = validated.iter().find(|value| value.stage == Stage::Vertex);
+        let fragment = validated
+            .iter()
+            .find(|value| value.stage == Stage::Fragment);
+        if let (Some(vertex), Some(fragment)) = (vertex, fragment) {
+            vertex.bindings.merge(&fragment.bindings)?;
+            vertex.pipeline_layout.merge(&fragment.pipeline_layout)?;
+        }
     }
     Ok(validated)
+}
+
+fn validate_mesh_stage_fold(stages: &[ValidatedStageReflection]) -> Result<(), BindingError> {
+    // A mesh pipeline has at most task, mesh, and fragment stages in execution order.
+    let expected = match stages.first().map(ValidatedStageReflection::stage) {
+        Some(Stage::Task) => [Stage::Task, Stage::Mesh, Stage::Fragment].as_slice(),
+        Some(Stage::Mesh) => [Stage::Mesh, Stage::Fragment].as_slice(),
+        _ => return Err(BindingError::InvalidMetadata),
+    };
+    if stages.len() > expected.len()
+        || stages
+            .iter()
+            .zip(expected)
+            .any(|(stage, expected)| stage.stage != *expected)
+    {
+        return Err(BindingError::InvalidMetadata);
+    }
+
+    let Some(first) = stages.first() else {
+        return Err(BindingError::InvalidMetadata);
+    };
+    stages.iter().skip(1).try_fold(
+        (first.bindings.clone(), first.pipeline_layout),
+        |(bindings, layout), stage| {
+            Ok((
+                bindings.merge(&stage.bindings)?,
+                layout.merge(&stage.pipeline_layout)?,
+            ))
+        },
+    )?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -579,5 +694,7 @@ const fn stage_name(stage: Stage) -> &'static str {
         Stage::Geometry => "Geometry",
         Stage::TessellationControl => "TessellationControl",
         Stage::TessellationEvaluation => "TessellationEvaluation",
+        Stage::Task => "Task",
+        Stage::Mesh => "Mesh",
     }
 }

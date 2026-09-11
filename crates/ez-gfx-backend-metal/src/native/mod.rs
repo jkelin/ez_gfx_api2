@@ -7,7 +7,7 @@ use crate::{
 use arrayvec::ArrayVec;
 use ez_gfx_core::capability::{
     AdapterCapabilities, AdapterClass, AdapterInfo, CompressionSupport, PresentationMode,
-    PresentationModes, SemanticProfile,
+    PresentationModes, SemanticProfile, ShaderCapabilities,
 };
 
 const MAX_ARGUMENT_BUFFERS_PER_SLOT: usize = 1024;
@@ -15,9 +15,9 @@ use ez_gfx_hal::{
     AllocationError, AllocationRequest, AttachmentLoadOp, AttachmentStoreOp, BlendMode,
     BufferTransfer, CompletionToken, CullMode, DEFAULT_ALLOCATION_BLOCK_POLICY,
     DynamicPipelineState, ExecutionBarrier, ExecutionPass, FrontFace, HalError, ImageMip,
-    MemoryAllocator, MemoryClass, PrimitiveTopology, QueueKind, SamplerAddressMode, SamplerFilter,
-    ShaderTextureHeapLayout, TextureFormat, TextureRegion, TextureSamplerDesc,
-    validate_texture_mips, validate_texture_region,
+    MemoryAllocator, MemoryClass, MeshPipelineState, PrimitiveTopology, QueueKind,
+    SamplerAddressMode, SamplerFilter, ShaderTextureHeapLayout, TextureFormat, TextureRegion,
+    TextureSamplerDesc, validate_texture_mips, validate_texture_region,
 };
 use gpu_allocator::{
     AllocationSizes, MemoryLocation,
@@ -27,14 +27,15 @@ use objc2::{rc::Retained, runtime::ProtocolObject};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use raw_window_metal::Layer;
 
-use objc2_foundation::{NSRange, NSString};
+use objc2_foundation::{NSInteger, NSProcessInfo, NSRange, NSString};
 use objc2_metal::{
     MTLArgumentBuffersTier, MTLArgumentEncoder, MTLBlendFactor, MTLBlitCommandEncoder, MTLBuffer,
     MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
     MTLCompareFunction, MTLComputeCommandEncoder, MTLComputePipelineState, MTLCopyAllDevices,
     MTLCreateSystemDefaultDevice, MTLCullMode, MTLDepthStencilDescriptor, MTLDepthStencilState,
-    MTLDevice, MTLEvent, MTLFunction, MTLHeap, MTLIndexType, MTLLibrary, MTLLoadAction, MTLOrigin,
-    MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
+    MTLDevice, MTLEvent, MTLFunction, MTLHeap, MTLIndexType, MTLLibrary, MTLLibraryErrorDomain,
+    MTLLoadAction, MTLMeshRenderPipelineDescriptor, MTLOrigin, MTLPipelineOption, MTLPixelFormat,
+    MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
     MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLRenderStages, MTLResource,
     MTLResourceOptions, MTLResourceUsage, MTLSamplerAddressMode, MTLSamplerDescriptor,
     MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLSamplerState, MTLSize, MTLStorageMode,
@@ -282,6 +283,28 @@ pub struct NativeGraphicsDraw<'a> {
     pub textures: &'a [&'a NativeTexture],
 }
 
+/// Fully resolved direct mesh draw consumed by Metal encoding.
+pub struct NativeMeshDraw<'a> {
+    /// Mesh render pipeline.
+    pub pipeline: &'a NativePipeline,
+    /// Direct object/mesh threadgroup grid.
+    pub groups: [u32; 3],
+    /// Reflected task/object threads; absent means no task stage.
+    pub task_threads_per_group: Option<[u32; 3]>,
+    /// Reflected mesh threads.
+    pub mesh_threads_per_group: [u32; 3],
+    /// Whether the active pass must enable depth testing.
+    pub depth_required: bool,
+    /// Mesh rasterization and blend state.
+    pub state: MeshPipelineState,
+    /// Merged bindless texture heap.
+    pub texture_heap: Option<ShaderTextureHeapLayout>,
+    /// Reflected public buffer bindings.
+    pub bindings: &'a dyn NativeBufferBindingSource,
+    /// Textures referenced by stage argument buffers.
+    pub textures: &'a [&'a NativeTexture],
+}
+
 /// Fully resolved compute dispatch consumed by Metal encoding.
 pub struct NativeComputeDispatch<'a> {
     /// Compute pipeline used by the dispatch.
@@ -344,6 +367,8 @@ pub enum NativeFrameAction<'a> {
     Compute(NativeComputeDispatch<'a>),
     /// Encode indexed indirect graphics work.
     Graphics(NativeGraphicsDraw<'a>),
+    /// Encode direct mesh graphics work.
+    Mesh(NativeMeshDraw<'a>),
     /// Copy a texture into shared host-readable storage.
     TextureReadback {
         /// Texture to copy.
@@ -493,6 +518,28 @@ pub enum NativePipeline {
         /// Encoder for a fragment-stage bindless texture heap.
         fragment_argument_encoder:
             Option<ThreadBound<Retained<ProtocolObject<dyn MTLArgumentEncoder>>>>,
+    },
+    /// Mesh pipeline state and object/mesh/fragment argument encoders.
+    Mesh {
+        /// Retained mesh render pipeline.
+        state: ThreadBound<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
+        /// Optional task/object texture argument encoder.
+        object_argument_encoder:
+            Option<ThreadBound<Retained<ProtocolObject<dyn MTLArgumentEncoder>>>>,
+        /// Mesh texture argument encoder.
+        mesh_argument_encoder:
+            Option<ThreadBound<Retained<ProtocolObject<dyn MTLArgumentEncoder>>>>,
+        /// Fragment texture argument encoder.
+        fragment_argument_encoder:
+            Option<ThreadBound<Retained<ProtocolObject<dyn MTLArgumentEncoder>>>>,
+        /// Public buffer intervals consumed by the optional task/object stage.
+        task_buffer_layouts: Vec<ez_gfx_hal::ShaderBufferLayout>,
+        /// Public buffer intervals consumed by the mesh stage.
+        mesh_buffer_layouts: Vec<ez_gfx_hal::ShaderBufferLayout>,
+        /// Public buffer intervals consumed by the fragment stage.
+        fragment_buffer_layouts: Vec<ez_gfx_hal::ShaderBufferLayout>,
+        /// Finite device-family grid ceilings and PSO-specific thread ceilings.
+        dispatch_limits: ez_gfx_hal::MeshDispatchLimits,
     },
 }
 struct FrameSlot {
@@ -692,6 +739,13 @@ impl NativeSurface {
 pub struct NativeContext {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    /// Coarse cached `maxThreadsPerThreadgroup` device ceiling for later mesh/object validation.
+    ///
+    /// This is only the device-wide limit. Per-pipeline ceilings reported by
+    /// the pipeline state (`maxTotalThreadsPerMeshThreadgroup`,
+    /// `maxTotalThreadsPerObjectThreadgroup`) are narrower and must still be
+    /// enforced when the mesh pipeline is created.
+    max_threads_per_threadgroup: MTLSize,
     transfer_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     texture_graphics_event: Retained<ProtocolObject<dyn MTLEvent>>,
     texture_completion_event: Retained<ProtocolObject<dyn MTLEvent>>,
