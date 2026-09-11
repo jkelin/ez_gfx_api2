@@ -25,6 +25,12 @@ pub use error::{Error, Result};
 pub use example::{Example, WindowFrame};
 #[allow(
     unused_imports,
+    reason = "Only the Windows split-thread example consumes render-thread automation."
+)]
+#[cfg(windows)]
+pub(crate) use example::{ThreadedFrameUpdate, ThreadedRenderConfig, ThreadedRenderOutput};
+#[allow(
+    unused_imports,
     reason = "Standalone examples use different shared interfaces."
 )]
 pub use host::{BackendConfig, HostSurface, backend_config, clip_y};
