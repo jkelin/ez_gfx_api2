@@ -699,10 +699,11 @@ fn render_target_clear_applies_attachment_color_on_begin() {
         },
         NativeFrameAction::BeginPass {
             pass: &pass,
-            colors: vec![PassAttachment {
+            colors: [PassAttachment {
                 resource: NativeFrameResource::RenderTarget(&target),
                 clear: [1.0, 0.0, 0.0, 1.0],
-            }],
+            }]
+            .into(),
         },
         NativeFrameAction::EndPass,
         NativeFrameAction::Barrier {
@@ -717,6 +718,7 @@ fn render_target_clear_applies_attachment_color_on_begin() {
         },
     ];
     context.execute_frame(None, &actions, false).unwrap();
+    drop(actions);
     let bytes = context.readback_texture_rgba8(&target, 64, 64).unwrap();
     assert_eq!(bytes.len(), 64 * 64 * 4);
     for pixel in bytes.chunks_exact(4) {
@@ -726,10 +728,11 @@ fn render_target_clear_applies_attachment_color_on_begin() {
     let probe = empty_texture(&mut context, 13);
     let textured = NativeFrameAction::BeginPass {
         pass: &pass,
-        colors: vec![PassAttachment {
+        colors: [PassAttachment {
             resource: NativeFrameResource::Texture(&probe),
             clear: [0.0, 0.0, 0.0, 1.0],
-        }],
+        }]
+        .into(),
     };
     assert!(context.execute_frame(None, &[textured], false).is_err());
     let depth_pass = ExecutionPass {
@@ -738,10 +741,11 @@ fn render_target_clear_applies_attachment_color_on_begin() {
     };
     let depth = NativeFrameAction::BeginPass {
         pass: &depth_pass,
-        colors: vec![PassAttachment {
+        colors: [PassAttachment {
             resource: NativeFrameResource::RenderTarget(&target),
             clear: [0.0, 0.0, 0.0, 1.0],
-        }],
+        }]
+        .into(),
     };
     assert!(context.execute_frame(None, &[depth], false).is_err());
     context.destroy_texture(target).unwrap();
@@ -816,10 +820,11 @@ fn render_target_msaa_clear_resolves_into_sampled_image() {
         },
         NativeFrameAction::BeginPass {
             pass: &pass,
-            colors: vec![PassAttachment {
+            colors: [PassAttachment {
                 resource: NativeFrameResource::RenderTarget(&target),
                 clear: [0.0, 1.0, 0.0, 1.0],
-            }],
+            }]
+            .into(),
         },
         NativeFrameAction::EndPass,
         NativeFrameAction::Barrier {
@@ -834,6 +839,7 @@ fn render_target_msaa_clear_resolves_into_sampled_image() {
         },
     ];
     context.execute_frame(None, &actions, false).unwrap();
+    drop(actions);
     // The pass clears multisampled storage; the resolve writes the exact clear
     // color into the sampled image that readback copies.
     let bytes = context.readback_texture_rgba8(&target, 64, 64).unwrap();
@@ -847,10 +853,11 @@ fn render_target_msaa_clear_resolves_into_sampled_image() {
         .unwrap();
     let mismatch = NativeFrameAction::BeginPass {
         pass: &pass,
-        colors: vec![PassAttachment {
+        colors: [PassAttachment {
             resource: NativeFrameResource::RenderTarget(&single),
             clear: [0.0, 0.0, 0.0, 1.0],
-        }],
+        }]
+        .into(),
     };
     assert!(context.execute_frame(None, &[mismatch], false).is_err());
     context.destroy_texture(target).unwrap();

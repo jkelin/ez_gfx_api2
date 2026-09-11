@@ -73,7 +73,7 @@ void computemain(uint3 id : SV_DispatchThreadID) {
         pipeline: &pipeline,
         groups: [1, 1, 1],
         threads_per_group,
-        bindings: std::slice::from_ref(&native_binding),
+        bindings: &std::slice::from_ref(&native_binding),
         texture_heap: None,
         textures: &[],
     });
@@ -194,7 +194,7 @@ void computemain(uint3 id : SV_DispatchThreadID) {
         pipeline: &pipeline,
         groups: [1, 1, 1],
         threads_per_group: runtime.compute_workgroup_size().unwrap(),
-        bindings: std::slice::from_ref(&native_binding),
+        bindings: &std::slice::from_ref(&native_binding),
         texture_heap: Some(texture_heap),
         textures: &textures,
     });

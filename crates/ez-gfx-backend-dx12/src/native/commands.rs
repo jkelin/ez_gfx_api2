@@ -11,8 +11,8 @@ use super::{
     D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_RESOURCE_UAV_BARRIER, D3D12_TEXTURE_COPY_LOCATION,
     D3D12_TEXTURE_COPY_LOCATION_0, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
     D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, FRAMES_IN_FLIGHT, FrameSlot, HalError, ID3D12Device,
-    ID3D12GraphicsCommandList, ID3D12PipelineState, ID3D12Resource, NativeBufferBinding,
-    NativePipeline, ResourceAccess,
+    ID3D12GraphicsCommandList, ID3D12PipelineState, ID3D12Resource, NativePipeline,
+    ResourceAccess,
 };
 
 pub(super) fn dx12_resource_state(access: ResourceAccess) -> D3D12_RESOURCE_STATES {
@@ -125,9 +125,16 @@ pub(super) unsafe fn copy_texture_to_readback(
 pub(super) unsafe fn bind_dx12_compute_buffers(
     list: &ID3D12GraphicsCommandList,
     pipeline: &NativePipeline,
-    bindings: &[NativeBufferBinding<'_>],
+    bindings: &dyn super::NativeBufferBindingSource,
 ) -> Result<(), HalError> {
-    for (index, (binding, writable)) in bindings.iter().zip(&pipeline.buffer_writable).enumerate() {
+    if bindings.len() != pipeline.buffer_writable.len() {
+        return Err(HalError::InvalidArgument);
+    }
+    bindings.visit(&mut |index, binding| {
+        let writable = pipeline
+            .buffer_writable
+            .get(index)
+            .ok_or(HalError::InvalidArgument)?;
         if binding.writable != *writable || binding.offset >= binding.allocation.allocation.size() {
             return Err(HalError::InvalidArgument);
         }
@@ -141,7 +148,7 @@ pub(super) unsafe fn bind_dx12_compute_buffers(
                 .checked_add(binding.offset)
         }
         .ok_or(HalError::InvalidArgument)?;
-        // SAFETY: SetComputeRootUnorderedAccessView/SetComputeRootShaderResourceView receives this pipeline binding's checked root index and the allocation resource's GPU base address plus an in-bounds offset.
+        // SAFETY: the checked root index and in-bounds GPU address match this pipeline binding.
         unsafe {
             if *writable {
                 list.SetComputeRootUnorderedAccessView(root_index, address);
@@ -149,8 +156,8 @@ pub(super) unsafe fn bind_dx12_compute_buffers(
                 list.SetComputeRootShaderResourceView(root_index, address);
             }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 ///
@@ -160,9 +167,16 @@ pub(super) unsafe fn bind_dx12_compute_buffers(
 pub(super) unsafe fn bind_dx12_graphics_buffers(
     list: &ID3D12GraphicsCommandList,
     pipeline: &NativePipeline,
-    bindings: &[NativeBufferBinding<'_>],
+    bindings: &dyn super::NativeBufferBindingSource,
 ) -> Result<(), HalError> {
-    for (index, (binding, writable)) in bindings.iter().zip(&pipeline.buffer_writable).enumerate() {
+    if bindings.len() != pipeline.buffer_writable.len() {
+        return Err(HalError::InvalidArgument);
+    }
+    bindings.visit(&mut |index, binding| {
+        let writable = pipeline
+            .buffer_writable
+            .get(index)
+            .ok_or(HalError::InvalidArgument)?;
         if binding.writable != *writable || binding.offset >= binding.allocation.allocation.size() {
             return Err(HalError::InvalidArgument);
         }
@@ -176,7 +190,7 @@ pub(super) unsafe fn bind_dx12_graphics_buffers(
                 .checked_add(binding.offset)
         }
         .ok_or(HalError::InvalidArgument)?;
-        // SAFETY: SetGraphicsRootUnorderedAccessView/SetGraphicsRootShaderResourceView receives this pipeline binding's checked root index and the allocation resource's GPU base address plus an in-bounds offset.
+        // SAFETY: the checked root index and in-bounds GPU address match this pipeline binding.
         unsafe {
             if *writable {
                 list.SetGraphicsRootUnorderedAccessView(root_index, address);
@@ -184,8 +198,8 @@ pub(super) unsafe fn bind_dx12_graphics_buffers(
                 list.SetGraphicsRootShaderResourceView(root_index, address);
             }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 ///
@@ -214,6 +228,7 @@ pub(super) fn create_frame_slots(device: &ID3D12Device) -> windows::core::Result
             list,
             fence_value: 0,
             garbage: Vec::new(),
+            indirect_scratch: Vec::new(),
         });
     }
     Ok(slots)

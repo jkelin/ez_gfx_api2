@@ -152,6 +152,10 @@ struct Cli {
     benchmark_warmup: Option<NonZeroU32>,
     #[arg(long)]
     benchmark_frames: Option<NonZeroU32>,
+    /// Allocation-probe only: require zero Rust allocations over the whole
+    /// measured window instead of the default scoped contract.
+    #[arg(long)]
+    strict_all: bool,
 }
 
 #[derive(Debug)]
@@ -167,6 +171,7 @@ pub(crate) struct ProgramOptions {
     pub(crate) debug: bool,
     pub(crate) validation: bool,
     pub(crate) resize_after_first_frame: bool,
+    pub(crate) strict_all: bool,
 }
 
 pub(crate) fn exit_config(error: impl std::fmt::Display) -> ! {
@@ -294,6 +299,7 @@ fn program_options_from(
         debug: cli.debug || env_flag_value("EZ_GFX_EXAMPLE_DEBUG")?,
         validation: cli.validation || env_flag_value("EZ_GFX_EXAMPLE_VALIDATION")?,
         resize_after_first_frame: env_flag_value("EZ_GFX_EXAMPLE_RESIZE_AFTER_FIRST_FRAME")?,
+        strict_all: cli.strict_all || env_flag_value("EZ_GFX_ALLOCATION_STRICT_ALL")?,
     })
 }
 
@@ -611,6 +617,20 @@ mod tests {
             program_options_from(cli, |_| None).unwrap_err().to_string(),
             "--frame-timings requires a finite frame limit"
         );
+    }
+    #[test]
+    fn strict_all_opts_in_through_cli_or_environment() {
+        let cli = Cli::try_parse_from(["example", "--strict-all"]).unwrap();
+        assert!(program_options_from(cli, |_| None).unwrap().strict_all);
+        let env = HashMap::from([("EZ_GFX_ALLOCATION_STRICT_ALL", OsString::from("1"))]);
+        let cli = Cli::try_parse_from(["example"]).unwrap();
+        assert!(
+            program_options_from(cli, |name| env.get(name).cloned())
+                .unwrap()
+                .strict_all
+        );
+        let cli = Cli::try_parse_from(["example"]).unwrap();
+        assert!(!program_options_from(cli, |_| None).unwrap().strict_all);
     }
 
     #[test]

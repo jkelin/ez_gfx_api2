@@ -1,4 +1,4 @@
-use crate::CompletionToken;
+use crate::{CompletionToken, QueueKind};
 use core::fmt;
 
 mod worker;
@@ -43,25 +43,57 @@ pub struct StagingEntry<T> {
     last_used: u64,
 }
 
+/// Point-in-time staging-pool telemetry for on-demand observation.
+///
+/// All sizes are retained bucket capacities in bytes and saturate, never wrap.
+/// Snapshot construction only reads lengths, so it never allocates; call it from
+/// explicit diagnostics paths, never per frame.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StagingPoolTelemetry {
+    /// Buckets currently retained.
+    pub buckets: usize,
+    /// Bucket capacity currently retained.
+    pub retained_bytes: u64,
+    /// Peak retained capacity since pool creation.
+    pub high_water_bytes: u64,
+    /// Configured retention ceiling; `u64::MAX` means unbounded.
+    pub byte_budget: u64,
+}
+
 /// Backend-neutral state for best-fit staging reuse and idle trimming.
 pub struct ReusableStagingPool<T> {
     entries: Vec<StagingEntry<T>>,
     epoch: u64,
     idle_epochs: u64,
+    /// Peak `retained_bytes` observed after any `put`.
+    high_water_bytes: u64,
+    /// Retention ceiling enforced only by explicit `trim_to_budget` calls.
+    byte_budget: u64,
 }
 
 impl<T> ReusableStagingPool<T> {
     /// Creates an empty pool. `idle_epochs` is clamped to one.
+    ///
+    /// The byte budget starts unbounded (`u64::MAX`) and the high-water mark at
+    /// zero, preserving the previous retention behavior until configured.
     pub const fn new(idle_epochs: u64) -> Self {
         Self {
             entries: Vec::new(),
             epoch: 0,
             idle_epochs: if idle_epochs == 0 { 1 } else { idle_epochs },
+            high_water_bytes: 0,
+            byte_budget: u64::MAX,
         }
     }
 
-    /// Removes and returns the smallest completed bucket containing `size`.
-    pub fn take(&mut self, size: u64, completed: u64) -> Option<(u64, T)> {
+    /// Removes and returns the smallest fitting bucket whose retirement
+    /// belongs to `completed_queue` and has reached `completed_value`.
+    pub fn take(
+        &mut self,
+        size: u64,
+        completed_queue: QueueKind,
+        completed_value: u64,
+    ) -> Option<(u64, T)> {
         self.epoch = self.epoch.saturating_add(1);
         let index = self
             .entries
@@ -69,9 +101,7 @@ impl<T> ReusableStagingPool<T> {
             .enumerate()
             .filter(|(_, entry)| {
                 entry.capacity >= size
-                    && entry
-                        .retirement
-                        .is_none_or(|token| token.value <= completed)
+                    && retirement_completed(entry.retirement, completed_queue, completed_value)
             })
             .min_by_key(|(_, entry)| entry.capacity)
             .map(|(index, _)| index)?;
@@ -88,19 +118,125 @@ impl<T> ReusableStagingPool<T> {
             retirement,
             last_used: self.epoch,
         });
+        // Peak is captured after insertion: `take` only shrinks retention, so the
+        // post-push total is the only candidate for a new maximum.
+        let retained = self.retained_bytes();
+        if retained > self.high_water_bytes {
+            self.high_water_bytes = retained;
+        }
     }
 
-    /// Removes completed buckets unused for the configured number of epochs.
-    pub fn trim(&mut self, completed: u64) -> Vec<T> {
+    /// Sets the retention ceiling enforced by explicit `trim_to_budget` calls.
+    ///
+    /// Setting a budget never evicts by itself; a zero budget retains nothing
+    /// after the next pressure trim, while `u64::MAX` restores unbounded retention.
+    pub fn set_byte_budget(&mut self, budget: u64) {
+        self.byte_budget = budget;
+    }
+
+    /// Returns the retention ceiling; `u64::MAX` means unbounded.
+    pub const fn byte_budget(&self) -> u64 {
+        self.byte_budget
+    }
+
+    /// Returns the peak retained capacity observed after any `put`.
+    pub const fn high_water_bytes(&self) -> u64 {
+        self.high_water_bytes
+    }
+
+    /// Returns a non-allocating snapshot for on-demand diagnostics.
+    pub fn telemetry(&self) -> StagingPoolTelemetry {
+        StagingPoolTelemetry {
+            buckets: self.entries.len(),
+            retained_bytes: self.retained_bytes(),
+            high_water_bytes: self.high_water_bytes,
+            byte_budget: self.byte_budget,
+        }
+    }
+
+    /// Evicts matching-queue completed buckets, largest first, until retention
+    /// fits the budget.
+    ///
+    /// Idle age is ignored here; completion gating is not. Buckets still owned
+    /// by in-flight GPU work stay even when retention exceeds the budget, so the
+    /// returned removals may leave the pool over budget when everything is pending.
+    pub fn trim_to_budget(
+        &mut self,
+        completed_queue: QueueKind,
+        completed_value: u64,
+    ) -> Vec<T> {
+        let mut removed = Vec::new();
+        while self.retained_bytes() > self.byte_budget {
+            let index = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    retirement_completed(entry.retirement, completed_queue, completed_value)
+                })
+                .max_by_key(|(_, entry)| entry.capacity)
+                .map(|(index, _)| index);
+            let Some(index) = index else {
+                break;
+            };
+            removed.push(self.entries.swap_remove(index).allocation);
+        }
+        removed
+    }
+
+    /// Returns the largest matching-queue completed bucket capacity without
+    /// evicting it.
+    ///
+    /// Backs context-wide aggregate budgets: the caller compares across pools
+    /// and pops from the largest one. Completion gating matches
+    /// `trim_to_budget`; buckets owned by in-flight work never surface here.
+    pub fn largest_completed_capacity(
+        &self,
+        completed_queue: QueueKind,
+        completed_value: u64,
+    ) -> Option<u64> {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                retirement_completed(entry.retirement, completed_queue, completed_value)
+            })
+            .map(|entry| entry.capacity)
+            .max()
+    }
+
+    /// Removes and returns the largest matching-queue completed bucket.
+    ///
+    /// Returns `None` when every retained bucket is still owned by in-flight
+    /// work. Best-fit behavior is untouched: `take` still selects the smallest
+    /// fitting bucket, so eviction order never affects reuse quality.
+    pub fn pop_largest_completed(
+        &mut self,
+        completed_queue: QueueKind,
+        completed_value: u64,
+    ) -> Option<T> {
+        let index = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                retirement_completed(entry.retirement, completed_queue, completed_value)
+            })
+            .max_by_key(|(_, entry)| entry.capacity)
+            .map(|(index, _)| index)?;
+        Some(self.entries.swap_remove(index).allocation)
+    }
+
+    /// Removes matching-queue completed buckets unused for the configured
+    /// number of epochs.
+    pub fn trim(&mut self, completed_queue: QueueKind, completed_value: u64) -> Vec<T> {
         let epoch = self.epoch;
         let idle_epochs = self.idle_epochs;
         let mut removed = Vec::new();
         let mut index = 0;
         while index < self.entries.len() {
             let entry = &self.entries[index];
-            let completed = entry
-                .retirement
-                .is_none_or(|token| token.value <= completed);
+            let completed =
+                retirement_completed(entry.retirement, completed_queue, completed_value);
             if completed && epoch.saturating_sub(entry.last_used) >= idle_epochs {
                 removed.push(self.entries.swap_remove(index).allocation);
             } else {
@@ -139,6 +275,17 @@ impl<T> ReusableStagingPool<T> {
     }
 }
 
+/// A completion counter only retires tokens from its own queue timeline.
+fn retirement_completed(
+    retirement: Option<CompletionToken>,
+    completed_queue: QueueKind,
+    completed_value: u64,
+) -> bool {
+    retirement.is_none_or(|token| {
+        token.queue == completed_queue && token.value <= completed_value
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,17 +312,164 @@ mod tests {
         pool.put(64, "small", Some(pending));
         pool.put(128, "large", None);
 
-        assert_eq!(pool.take(32, 2), Some((128, "large")));
+        assert_eq!(
+            pool.take(32, QueueKind::Transfer, 2),
+            Some((128, "large"))
+        );
         pool.put(128, "large", None);
-        assert_eq!(pool.take(32, 3), Some((64, "small")));
+        assert_eq!(
+            pool.take(32, QueueKind::Transfer, 3),
+            Some((64, "small"))
+        );
         pool.put(64, "small", None);
 
-        assert_eq!(pool.take(1024, 3), None);
-        assert_eq!(pool.take(1024, 3), None);
-        let mut trimmed = pool.trim(3);
+        assert_eq!(pool.take(1024, QueueKind::Transfer, 3), None);
+        assert_eq!(pool.take(1024, QueueKind::Transfer, 3), None);
+        let mut trimmed = pool.trim(QueueKind::Transfer, 3);
         trimmed.sort_unstable();
         assert_eq!(trimmed, ["large", "small"]);
         assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn staging_pool_tracks_high_water_across_take_and_put() {
+        let mut pool = ReusableStagingPool::new(2);
+        assert_eq!(pool.high_water_bytes(), 0);
+        assert_eq!(pool.byte_budget(), u64::MAX);
+        pool.put(64, "small", None);
+        pool.put(128, "large", None);
+        assert_eq!(pool.retained_bytes(), 192);
+        assert_eq!(pool.high_water_bytes(), 192);
+        // Takes shrink retention but never the observed peak.
+        assert_eq!(
+            pool.take(32, QueueKind::Transfer, 0),
+            Some((64, "small"))
+        );
+        assert_eq!(pool.retained_bytes(), 128);
+        assert_eq!(pool.high_water_bytes(), 192);
+        pool.put(64, "small", None);
+        assert_eq!(pool.high_water_bytes(), 192);
+        pool.put(256, "huge", None);
+        assert_eq!(pool.high_water_bytes(), 448);
+    }
+
+    #[test]
+    fn staging_pool_trims_largest_completed_first_to_budget() {
+        let pending = CompletionToken::new(QueueKind::Transfer, 3).unwrap();
+        let mut pool = ReusableStagingPool::new(2);
+        pool.put(64, "pending", Some(pending));
+        pool.put(128, "medium", None);
+        pool.put(256, "large", None);
+        // Setting a budget alone retains everything until an explicit trim.
+        pool.set_byte_budget(200);
+        assert_eq!(pool.retained_bytes(), 448);
+        let mut removed = pool.trim_to_budget(QueueKind::Transfer, 3);
+        removed.sort_unstable();
+        // Largest completed bucket leaves first; the in-flight 64-byte bucket
+        // stays even though retention (192) still fits only because 256 left.
+        assert_eq!(removed, ["large"]);
+        assert_eq!(pool.retained_bytes(), 192);
+        assert_eq!(pool.high_water_bytes(), 448);
+    }
+
+    #[test]
+    fn staging_pool_never_evicts_inflight_work_over_budget() {
+        let pending = CompletionToken::new(QueueKind::Transfer, 3).unwrap();
+        let mut pool = ReusableStagingPool::new(2);
+        pool.put(64, "pending", Some(pending));
+        pool.set_byte_budget(0);
+        // Nothing is completed at value 2, so pressure trim keeps GPU-owned memory.
+        assert!(
+            pool.trim_to_budget(QueueKind::Transfer, 2)
+                .is_empty()
+        );
+        assert_eq!(pool.retained_bytes(), 64);
+    }
+
+    #[test]
+    fn staging_pool_rejects_larger_wrong_queue_completion() {
+        let pending = CompletionToken::new(QueueKind::Transfer, 3).unwrap();
+        let mut pool = ReusableStagingPool::new(1);
+        pool.put(64, "pending", Some(pending));
+        pool.set_byte_budget(0);
+
+        assert_eq!(pool.take(1, QueueKind::Graphics, 30), None);
+        assert!(
+            pool.trim(QueueKind::Graphics, 30).is_empty()
+        );
+        assert!(
+            pool.trim_to_budget(QueueKind::Graphics, 30)
+                .is_empty()
+        );
+        assert_eq!(
+            pool.largest_completed_capacity(QueueKind::Graphics, 30),
+            None
+        );
+        assert_eq!(
+            pool.pop_largest_completed(QueueKind::Graphics, 30),
+            None
+        );
+        assert_eq!(pool.retained_bytes(), 64);
+
+        assert_eq!(
+            pool.pop_largest_completed(QueueKind::Transfer, 3),
+            Some("pending")
+        );
+    }
+
+    #[test]
+    fn largest_completed_peek_and_pop_skip_inflight_buckets() {
+        let pending = CompletionToken::new(QueueKind::Transfer, 3).unwrap();
+        let mut pool = ReusableStagingPool::new(2);
+        pool.put(64, "pending", Some(pending));
+        pool.put(128, "medium", None);
+        pool.put(256, "large", None);
+        // The in-flight bucket is invisible to both primitives at value 2.
+        assert_eq!(
+            pool.largest_completed_capacity(QueueKind::Transfer, 2),
+            Some(256)
+        );
+        assert_eq!(
+            pool.pop_largest_completed(QueueKind::Transfer, 2),
+            Some("large")
+        );
+        assert_eq!(
+            pool.largest_completed_capacity(QueueKind::Transfer, 2),
+            Some(128)
+        );
+        assert_eq!(pool.retained_bytes(), 192);
+        // Best-fit reuse is unaffected by eviction order.
+        assert_eq!(
+            pool.take(32, QueueKind::Transfer, 2),
+            Some((128, "medium"))
+        );
+        assert_eq!(
+            pool.largest_completed_capacity(QueueKind::Transfer, 2),
+            None
+        );
+        assert_eq!(
+            pool.pop_largest_completed(QueueKind::Transfer, 2),
+            None
+        );
+        // Only the in-flight bucket remains, still gated.
+        assert_eq!(pool.retained_bytes(), 64);
+    }
+
+    #[test]
+    fn staging_pool_telemetry_snapshot_reports_budget_state() {
+        let mut pool = ReusableStagingPool::new(2);
+        pool.put(128, "large", None);
+        pool.set_byte_budget(1000);
+        let snapshot = pool.telemetry();
+        assert_eq!(
+            snapshot,
+            StagingPoolTelemetry {
+                buckets: 1,
+                retained_bytes: 128,
+                high_water_bytes: 128,
+                byte_budget: 1000,
+            }
+        );
     }
 
     #[test]

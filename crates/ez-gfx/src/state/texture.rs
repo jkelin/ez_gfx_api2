@@ -122,6 +122,10 @@ pub fn load_texture(
             .identity
             .check_thread_and_health()
             .map_err(map_lifecycle)?;
+        // Build the lazy pool before admission: thread refusal fails here with
+        // no registry, identity, or pending state to roll back. The submit-site
+        // lookup below is then infallible on the creator thread.
+        context.async_textures.ensure_decode_pool()?;
         let texture = context
             .texture_registry
             .begin_upload()
@@ -168,7 +172,9 @@ pub fn load_texture(
         let ready = context.async_textures.ready_tx.clone();
         #[cfg(test)]
         let decode_gate = context.async_textures.decode_gate.clone();
-        let submitted = context.async_textures.pool.submit(move || {
+        // The pool was ensured before admission above, so this lookup cannot
+        // fail on the creator thread; every error below this point rolls back.
+        let submitted = context.async_textures.decode_pool()?.submit(move || {
             #[cfg(test)]
             if let Some(gate) = decode_gate {
                 gate.wait();
@@ -650,12 +656,12 @@ pub(super) fn record_texture_ready(
         status: UploadStatus::DeviceReady,
     });
 }
-
 /// Returns the async texture decode worker thread count for a context.
 ///
-/// This observes the pool sized at creation from `ContextOptions::texture_decode_workers`
-/// (zero selects the default topology), letting FFI callers verify the C descriptor
-/// value arrived without a C-side query export.
+/// This observes the worker policy sized at creation from
+/// `ContextOptions::texture_decode_workers` (zero selects the default topology),
+/// whether or not the lazily built pool has decoded anything yet, letting FFI
+/// callers verify the C descriptor value arrived without a C-side query export.
 ///
 /// # Errors
 ///
@@ -667,7 +673,7 @@ pub fn texture_decode_worker_count(context: ContextHandle) -> Result<u32> {
             .check_thread_and_health()
             .map_err(map_lifecycle)?;
         // Pool sizes always fit `u32`; the fallback only guards the conversion.
-        u32::try_from(context.async_textures.pool.thread_count()).map_err(|_| Error::NativeFailure)
+        u32::try_from(context.async_textures.worker_count()).map_err(|_| Error::NativeFailure)
     })
 }
 

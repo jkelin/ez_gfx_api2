@@ -213,7 +213,7 @@ fn enqueue_sample(
         pipeline: &pipeline.pipeline,
         groups: [1, 1, 1],
         threads_per_group: pipeline.threads,
-        bindings: std::slice::from_ref(&binding),
+        bindings: &std::slice::from_ref(&binding),
         texture_heap: Some(pipeline.heap),
         textures: &textures,
     });
@@ -352,7 +352,16 @@ fn coarse_compute_frame_completes_while_fine_upload_is_gpu_gated() {
     assert_eq!(sampled_pixel(&mut context, sample), RED);
     assert!(context.completed_texture_transfer_value().unwrap() < completions[1].value);
     let completed = context.completed_texture_transfer_value().unwrap();
-    assert!(context.texture_staging.take(1, completed).is_none());
+    assert!(
+        context
+            .texture_staging
+            .take(
+                1,
+                ez_gfx_hal::QueueKind::TextureTransfer,
+                completed,
+            )
+            .is_none()
+    );
     gate.assert_closed();
     drop(gate);
 
@@ -787,7 +796,8 @@ fn render_target_clear_applies_attachment_color_on_begin() {
             colors: vec![PassAttachment {
                 resource: NativeFrameResource::RenderTarget(&target),
                 clear: [0.0, 0.0, 1.0, 1.0],
-            }],
+            }]
+            .into(),
         },
         NativeFrameAction::EndPass,
         NativeFrameAction::Barrier {
@@ -817,7 +827,8 @@ fn render_target_clear_applies_attachment_color_on_begin() {
         colors: vec![PassAttachment {
             resource: NativeFrameResource::RenderTarget(&target),
             clear: [0.0, 0.0, 0.0, 1.0],
-        }],
+        }]
+        .into(),
     };
     assert!(context.execute_frame(None, &[depth], false).is_err());
     context.destroy_texture(target).unwrap();
@@ -895,7 +906,8 @@ fn render_target_msaa_clear_resolves_into_sampled_texture() {
             colors: vec![PassAttachment {
                 resource: NativeFrameResource::RenderTarget(&target),
                 clear: [1.0, 1.0, 0.0, 1.0],
-            }],
+            }]
+            .into(),
         },
         NativeFrameAction::EndPass,
         NativeFrameAction::Barrier {
@@ -1099,7 +1111,8 @@ float4 fragmentmain() : SV_Target {
                 colors: vec![PassAttachment {
                     resource: NativeFrameResource::RenderTarget(&target),
                     clear: [0.0, 0.0, 0.0, 1.0],
-                }],
+                }]
+                .into(),
             },
             NativeFrameAction::Graphics(draw),
             NativeFrameAction::EndPass,

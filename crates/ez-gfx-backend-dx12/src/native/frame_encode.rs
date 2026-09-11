@@ -2,14 +2,14 @@
 
 use super::{
     D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT, D3D12_VIEWPORT, DxFrameEncoder,
-    HalError, NativeFrameAction, RECT, copy_texture_to_readback, map_windows,
-    record_resource_barriers, transition_barrier,
+    HalError, NativeFrameAction, NativeFrameActionSource, RECT, copy_texture_to_readback,
+    map_windows, record_resource_barriers, transition_barrier,
 };
 
 impl DxFrameEncoder<'_> {
     pub(super) fn record(
         &mut self,
-        actions: &[NativeFrameAction<'_>],
+        actions: &(impl NativeFrameActionSource + ?Sized),
         capture_presented: bool,
         viewport: &D3D12_VIEWPORT,
         scissor: &RECT,
@@ -23,23 +23,27 @@ impl DxFrameEncoder<'_> {
             self.list.RSSetViewports(core::slice::from_ref(viewport));
             self.list.RSSetScissorRects(core::slice::from_ref(scissor));
         }
-        for (action_index, action) in actions.iter().enumerate() {
+        actions.visit(&mut |action_index, action| {
             match action {
                 NativeFrameAction::Wait(_) => {}
                 NativeFrameAction::Barrier { barrier, resource } => {
                     self.encode_barrier(barrier, resource)?;
                 }
                 NativeFrameAction::BeginPass { pass, colors } => {
-                    for (draw_index, candidate) in actions.iter().enumerate().skip(action_index + 1)
-                    {
+                    let mut ended = false;
+                    actions.visit(&mut |draw_index, candidate| {
+                        if draw_index <= action_index || ended {
+                            return Ok(());
+                        }
                         match candidate {
                             NativeFrameAction::Graphics(draw) => {
                                 self.copy_indirect_before_pass(draw_index, draw)?;
                             }
-                            NativeFrameAction::EndPass => break,
+                            NativeFrameAction::EndPass => ended = true,
                             _ => {}
                         }
-                    }
+                        Ok(())
+                    })?;
                     self.begin_pass(pass, colors)?;
                 }
                 NativeFrameAction::Compute(dispatch) => self.compute(dispatch)?,
@@ -161,7 +165,8 @@ impl DxFrameEncoder<'_> {
                     }
                 }
             }
-        }
+            Ok(())
+        })?;
         if self.pass_active {
             return Err(HalError::InvalidArgument);
         }

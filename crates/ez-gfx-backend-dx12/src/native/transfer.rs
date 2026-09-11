@@ -165,6 +165,11 @@ pub(super) fn start_worker(
     let shutdown_queues = [transfer_queue.clone(), graphics_queue.clone()];
     let mut slot = 0_usize;
     let mut copy_value = 0_u64;
+    // Batch snapshots and transition scratch live in the worker closure and
+    // retain high-water capacity across submissions. Indices freeze cancellation
+    // exactly once without retaining borrows from the batch slice.
+    let mut live_scratch: Vec<usize> = Vec::new();
+    let mut texture_scratch: Vec<(usize, u32, bool)> = Vec::new();
     ez_gfx_hal::TransferWorker::new_ordered_with_shutdown(
         ez_gfx_hal::DEFAULT_STAGING_POLICY,
         job_bytes,
@@ -204,8 +209,10 @@ pub(super) fn start_worker(
                     &mut resource.last_completion,
                     &mut copy_value,
                     &jobs[start..end],
+                    &mut live_scratch,
+                    &mut texture_scratch,
                 )
-                .map_err(|_| ez_gfx_hal::TransferWorkerError::Failed)?;
+                .map_err(map_transfer_worker_error)?;
                 slot = (slot + 1) % resources.len();
                 start = end;
             }
@@ -237,10 +244,52 @@ pub(super) fn start_worker(
     .map_err(|_| AllocationError::NativeFailure)
 }
 
+fn map_transfer_worker_error(error: windows::core::Error) -> ez_gfx_hal::TransferWorkerError {
+    if map_allocation_windows(&error) == AllocationError::DeviceLost {
+        ez_gfx_hal::TransferWorkerError::DeviceLost
+    } else {
+        ez_gfx_hal::TransferWorkerError::Failed
+    }
+}
+
+fn checked_completed_value(value: u64) -> windows::core::Result<u64> {
+    if value == u64::MAX {
+        Err(windows::core::Error::from_hresult(
+            windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED,
+        ))
+    } else {
+        Ok(value)
+    }
+}
+
+fn require_wait_succeeded(
+    status: windows::Win32::Foundation::WAIT_EVENT,
+) -> windows::core::Result<()> {
+    if status == windows::Win32::Foundation::WAIT_OBJECT_0 {
+        Ok(())
+    } else {
+        Err(windows::core::Error::from_thread())
+    }
+}
+
+fn snapshot_live_indices<T>(
+    jobs: &[T],
+    scratch: &mut Vec<usize>,
+    cancelled: impl Fn(&T) -> bool,
+) {
+    scratch.clear();
+    scratch.reserve(jobs.len());
+    scratch.extend(
+        jobs.iter()
+            .enumerate()
+            .filter_map(|(index, job)| (!cancelled(job)).then_some(index)),
+    );
+}
 #[expect(
     clippy::too_many_arguments,
     reason = "the worker keeps reusable COPY/DIRECT command state and paired queue synchronization local"
 )]
+
 fn submit_batch(
     transfer_queue: &ID3D12CommandQueue,
     graphics_queue: &ID3D12CommandQueue,
@@ -256,48 +305,62 @@ fn submit_batch(
     last_completion: &mut u64,
     copy_value: &mut u64,
     jobs: &[Dx12TransferJob],
+    live_scratch: &mut Vec<usize>,
+    texture_scratch: &mut Vec<(usize, u32, bool)>,
 ) -> windows::core::Result<()> {
     // SAFETY: the completion fence remains live while retained by the worker.
-    let completed = unsafe { completion_fence.GetCompletedValue() };
+    let completed = checked_completed_value(unsafe { completion_fence.GetCompletedValue() })?;
     if *last_completion != 0 && completed < *last_completion {
         // SAFETY: `event` is a live waitable handle retained by the batch resource.
         unsafe { completion_fence.SetEventOnCompletion(*last_completion, event)? };
         // SAFETY: `event` remains live until this blocking wait returns.
-        unsafe { WaitForSingleObject(event, INFINITE) };
+        require_wait_succeeded(unsafe { WaitForSingleObject(event, INFINITE) })?;
+        // An event wake is not completion proof until the owning fence confirms it.
+        // SAFETY: the completion fence remains live through the post-wake query.
+        let completed =
+            checked_completed_value(unsafe { completion_fence.GetCompletedValue() })?;
+        if completed < *last_completion {
+            return Err(windows::core::Error::from_thread());
+        }
     }
     // SAFETY: the slot is idle after the preceding completion wait, so its allocator and list may reset.
     unsafe {
         copy_allocator.Reset()?;
         copy_list.Reset(copy_allocator, None)?;
     }
-    // Cancellation is sampled once so every recorded release retains its copy and acquire.
-    let live = jobs
-        .iter()
-        .filter(|job| !job_cancelled(job))
-        .collect::<Vec<_>>();
+    // Snapshot cancellation once so every transition and copy below uses the
+    // same admitted jobs even if cancellation races native command recording.
+    snapshot_live_indices(jobs, live_scratch, job_cancelled);
     let texture_batch = jobs.first().is_some_and(|job| job_group(job) != 0);
-    let mut textures = Vec::with_capacity(live.len());
-    for job in &live {
+    texture_scratch.clear();
+    texture_scratch.reserve(live_scratch.len());
+    for &index in live_scratch.iter() {
         if let Dx12TransferCopy::Texture {
-            destination,
             subresource,
             transition_from_shader,
             ..
-        } = &job.copy
+        } = &jobs[index].copy
         {
-            textures.push((destination, *subresource, *transition_from_shader));
+            texture_scratch.push((index, *subresource, *transition_from_shader));
         }
     }
+    let textures: &[(usize, u32, bool)] = texture_scratch;
     if textures.iter().any(|(_, _, initialized)| *initialized) {
         // SAFETY: this slot's previous completion retired before reset.
         unsafe {
             pre_transition_allocator.Reset()?;
             pre_transition_list.Reset(pre_transition_allocator, None)?;
         }
-        for &(destination, subresource, initialized) in &textures {
+        for &(index, subresource, initialized) in textures {
             if !initialized {
                 continue;
             }
+            // Indices were recorded from texture jobs above, so the lookup cannot fail.
+            let Dx12TransferCopy::Texture { destination, .. } = &jobs[index].copy else {
+                return Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ));
+            };
             let transition = D3D12_RESOURCE_TRANSITION_BARRIER {
                 pResource: core::mem::ManuallyDrop::new(Some(destination.clone())),
                 Subresource: subresource,
@@ -330,8 +393,8 @@ fn submit_batch(
             transfer_queue.Wait(copy_fence, *copy_value)?;
         }
     }
-    for job in &live {
-        record_copy(copy_list, &job.copy);
+    for &index in live_scratch.iter() {
+        record_copy(copy_list, &jobs[index].copy);
     }
     // SAFETY: recording is complete and the list remains retained for submission.
     unsafe { copy_list.Close()? };
@@ -361,9 +424,15 @@ fn submit_batch(
         transition_allocator.Reset()?;
         transition_list.Reset(transition_allocator, None)?;
     }
-    for &(resource, subresource, _) in &textures {
+    for &(index, subresource, _) in textures {
+        // Indices were recorded from texture jobs above, so the lookup cannot fail.
+        let Dx12TransferCopy::Texture { destination, .. } = &jobs[index].copy else {
+            return Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_FAIL,
+            ));
+        };
         let transition = D3D12_RESOURCE_TRANSITION_BARRIER {
-            pResource: core::mem::ManuallyDrop::new(Some(resource.clone())),
+            pResource: core::mem::ManuallyDrop::new(Some(destination.clone())),
             Subresource: subresource,
             StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
             StateAfter: D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
@@ -391,17 +460,13 @@ fn submit_batch(
         unsafe { copy_fence.SetEventOnCompletion(*copy_value, event)? };
         loop {
             // SAFETY: the worker owns the live copy fence.
-            let completed = unsafe { copy_fence.GetCompletedValue() };
-            if completed == u64::MAX {
-                return Err(windows::core::Error::from_hresult(
-                    windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED,
-                ));
-            }
+            let completed = checked_completed_value(unsafe { copy_fence.GetCompletedValue() })?;
             if completed >= *copy_value {
                 break;
             }
             // SAFETY: the event remains live across each bounded wait.
-            if unsafe { WaitForSingleObject(event, 100) } == windows::Win32::Foundation::WAIT_FAILED
+            if unsafe { WaitForSingleObject(event, 100) }
+                == windows::Win32::Foundation::WAIT_FAILED
             {
                 return Err(windows::core::Error::from_thread());
             }
@@ -493,6 +558,10 @@ pub(super) fn submit_test_batch(
     // SAFETY: the live device owns the private fence.
     let copy_fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
     let mut copy_value = 0;
+    // Test-local scratch mirrors the worker closure; the capacity assertion below
+    // proves batches reuse rather than reallocate transition storage.
+    let mut texture_scratch: Vec<(usize, u32, bool)> = Vec::new();
+    let mut live_scratch: Vec<usize> = Vec::new();
     submit_batch(
         transfer_queue,
         graphics_queue,
@@ -508,8 +577,14 @@ pub(super) fn submit_test_batch(
         &mut resources.last_completion,
         &mut copy_value,
         jobs,
+        &mut live_scratch,
+        &mut texture_scratch,
     )
     .unwrap();
+    // Scratch retains its high-water capacity after the batch instead of freeing it.
+    // This helper covers texture batches, so the transition list is never empty here.
+    assert!(!texture_scratch.is_empty());
+    assert!(texture_scratch.capacity() >= texture_scratch.len());
     // SAFETY: resources and event remain alive until all lists have finished.
     unsafe {
         completion_fence
@@ -518,4 +593,67 @@ pub(super) fn submit_test_batch(
         WaitForSingleObject(resources.event.handle(), INFINITE);
     }
     copy_value
+}
+
+#[cfg(test)]
+mod cancellation_snapshot_tests {
+    use super::{
+        checked_completed_value, map_transfer_worker_error, require_wait_succeeded,
+        snapshot_live_indices,
+    };
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+
+    #[test]
+    fn cancellation_after_snapshot_keeps_the_gated_job_live() {
+        let cancelled = Arc::new([AtomicBool::new(false)]);
+        let gate = Arc::new(Barrier::new(2));
+        let (captured, wait_for_capture) = mpsc::channel();
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker_gate = Arc::clone(&gate);
+        let live = std::thread::spawn(move || {
+            let mut live = Vec::new();
+            snapshot_live_indices(&*worker_cancelled, &mut live, |value| {
+                value.load(Ordering::Acquire)
+            });
+            captured.send(()).unwrap();
+            worker_gate.wait();
+            live
+        });
+
+        wait_for_capture.recv().unwrap();
+        cancelled[0].store(true, Ordering::Release);
+        gate.wait();
+
+        assert_eq!(live.join().unwrap(), [0]);
+    }
+
+    #[test]
+    fn dxgi_device_removal_failures_are_sticky_worker_loss() {
+        for code in [
+            windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED,
+            windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_RESET,
+            windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_HUNG,
+        ] {
+            assert_eq!(
+                map_transfer_worker_error(windows::core::Error::from_hresult(code)),
+                ez_gfx_hal::TransferWorkerError::DeviceLost
+            );
+        }
+    }
+
+    #[test]
+    fn removal_sentinel_and_failed_wait_are_rejected() {
+        let error = checked_completed_value(u64::MAX).unwrap_err();
+        assert_eq!(
+            map_transfer_worker_error(error),
+            ez_gfx_hal::TransferWorkerError::DeviceLost
+        );
+        assert!(
+            require_wait_succeeded(windows::Win32::Foundation::WAIT_FAILED).is_err()
+        );
+    }
 }

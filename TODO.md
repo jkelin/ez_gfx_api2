@@ -15,7 +15,8 @@
 - Add bounded, validated host-owned pipeline-cache import/export envelopes with backend/device/driver/schema compatibility; current caches are process-local only (P-007, P-024).
 - Finish terminal device-loss behavior for staging leases and waits. Pending texture decode/transfer uploads emit terminal loss events and transfer workers retain sticky loss; loader-lock teardown remains abandon-only (P-023, P-026).
 - Add correlation IDs, sequence/domain, clocks, units, payloads, and cleanup outcomes to the lossless typed upload-event queue. Texture/vertex/index ownership, readiness, cancellation, and failure transitions are already lossless; bounded runtime diagnostics remain separate and report dropped counts (P-023, P-026, P-028).
-- Design a dedicated transition/acquire queue per Vulkan/DX12 transfer worker to remove remaining host waits (P-012, P-015). Metal nonblocking submission is implemented. Implementation moves acquire/transition barrier handoff off the calling thread onto the worker-owned queue so the submit path never blocks on transfer progress, keeping barrier ordering and error/loss propagation identical. Acceptance is nonblocking submit behavior under texture/vertex streaming load with pixel parity on Vulkan and DX12.
+- Design GPU-side transition/acquire handoff for Vulkan, DX12, and Metal so submission never waits on transfer progress (P-012, P-015). Metal command submission is asynchronous, but buffer-transfer waits still flush the worker and call `waitUntilCompleted` on the caller thread. Preserve barrier ordering and error/loss propagation. Acceptance is nonblocking submit behavior under texture/vertex streaming load with pixel parity on all three backends.
+- Reserved shader redesign: rebaseline the native allocation probe's excluded shader metadata/pipeline-key residual (`examples/allocation_probe` single-frame phase ceilings and whole-window baselines in `allocation_optimization_report.md`) after the redesign lands; safe begin/configure/acquire/bind phases and independent shader-free frame-plan/wait validation already assert zero on Vulkan and DX12, while descriptor preparation remains inside execute and Metal execution evidence still awaits its backend matrix run.
 - Optional: raise the synchronized texture heap capacity above 1024 (`docs/textures.md` §Texture heap capacity, P-007). The cap is one contract across core admission, compiler/HAL reflection, runtime handles, Vulkan/DX12 descriptor counts, Metal argument-buffer layout, and the Slang static array length, so the change must land atomically in every layer plus device-capability admission. Acceptance is updated capacity/admission tests and pixel coverage on all three backends.
 
 ## P2
@@ -29,3 +30,13 @@
 - Add target-native release jobs that publish separate runtime/FFI, compiler/tool, and optional Basis artifacts with deterministic manifests, license/provenance records, binary-import audits, signing, and Apple notarization (P-001, P-025, P-027, P-029).
 - Configure Miri and integrate it with nextest (P-019, P-029).
 - Linux remote multi-ICD enumeration is unstable in-process (not a driver fix yet): with 9 ICD manifests the full ez-gfx lib suite deterministically fails `explicit_selection_creates_context_for_enumerated_adapter` (report enumeration sees the NVIDIA adapter, the immediately following create enumeration lacks it, AdapterNotFound maps to InvalidArgument), while forced-NVIDIA and forced-Lavapipe full suites are each 32/32 green and deviceUUIDs are stable across processes. Interim: optional `REMOTE_TEST_LINUX_VK_DRIVER_FILES` pins `VK_ICD_FILENAMES` for remote-test-linux. Revisit with loader/ICD isolation diagnostics before claiming multi-ICD determinism.
+
+## Evidence
+
+- Allocator block minima stay at the shared default (16 MiB device / 256 MiB max, 8 MiB host / 64 MiB max).
+- The 4 MiB / 4 MiB experiment saved ~16 MiB private commit on DX12 and ~14–16 MiB on Vulkan for the small triangle workload, but that is single-workload evidence only:
+  - DX12 maintains separate heap categories that each establish their own floor.
+  - Metal shares the policy unmeasured.
+  - Smaller floors risk more native allocations, personal blocks, and fragmentation under texture/geometry/multi-pass/resize/streaming load.
+- Adopt the smaller floor only after the full backend matrix plus those workloads show acceptable latency and fragmentation on all three backends.
+- On-demand allocator telemetry (`Context::memory_telemetry`, HAL `BackendMemoryTelemetry`) exists to gather that evidence without per-frame cost.

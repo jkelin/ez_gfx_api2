@@ -6,7 +6,7 @@ type NativePipelineLayout = (
 );
 
 use super::{
-    BlendMode, CString, CullMode, DeferredResource, FrontFace, HalError, NativeBufferBinding,
+    BlendMode, CString, CullMode, DeferredResource, FrontFace, HalError,
     NativeContext, NativeGraphicsPipelineDesc, NativePipeline, NativeShader, NativeSurface,
     PresentationMode, PrimitiveTopology, ShaderBufferLayout, map_vk, vk,
 };
@@ -331,23 +331,38 @@ impl NativeContext {
         &self,
         pool: vk::DescriptorPool,
         pipeline: &NativePipeline,
-        bindings: &[NativeBufferBinding<'_>],
+        bindings: &dyn super::NativeBufferBindingSource,
+        infos: &mut Vec<vk::DescriptorBufferInfo>,
+        writes: &mut Vec<vk::WriteDescriptorSet<'static>>,
     ) -> Result<vk::DescriptorSet, HalError> {
         if bindings.len() != pipeline.buffer_writable.len() {
             return Err(HalError::InvalidArgument);
         }
         let device = self.device.as_ref().ok_or(HalError::NotReady)?;
-        // SAFETY: `device.allocate_descriptor_sets` reads the supplied `pool` and `pipeline.public_descriptor_layout` handles from allocation-info storage whose one-element layout slice remains allocated for the call.
-        let set = unsafe {
-            device.allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(pool)
-                    .set_layouts(core::slice::from_ref(&pipeline.public_descriptor_layout)),
+        let allocation_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(pool)
+            .set_layouts(core::slice::from_ref(&pipeline.public_descriptor_layout));
+        let mut set = vk::DescriptorSet::null();
+        // SAFETY: `pool` and `pipeline.public_descriptor_layout` are live objects from
+        // `device`; the slot is completion-gated, so descriptor-pool access is externally
+        // synchronized. `allocation_info` keeps its one layout pointer valid, and `set`
+        // provides writable storage for exactly `descriptor_set_count == 1` output handle.
+        let result = unsafe {
+            (device.fp_v1_0().allocate_descriptor_sets)(
+                device.handle(),
+                &raw const allocation_info,
+                &raw mut set,
             )
+        };
+        if result != vk::Result::SUCCESS {
+            return Err(map_vk(result));
         }
-        .map_err(map_vk)?[0];
-        let mut infos = Vec::with_capacity(bindings.len());
-        for (binding, writable) in bindings.iter().zip(&pipeline.buffer_writable) {
+        reserve_descriptor_shells(infos, writes, bindings.len())?;
+        bindings.visit(&mut |index, binding| {
+            let writable = pipeline
+                .buffer_writable
+                .get(index)
+                .ok_or(HalError::InvalidArgument)?;
             if binding.writable != *writable
                 || binding.range == 0
                 || binding
@@ -363,20 +378,37 @@ impl NativeContext {
                     .offset(binding.offset)
                     .range(binding.range),
             );
-        }
-        let writes = infos
-            .iter()
-            .enumerate()
-            .map(|(index, info)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(pipeline.buffer_bindings[index])
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(core::slice::from_ref(info))
-            })
-            .collect::<Vec<_>>();
-        // SAFETY: `set` was allocated above, each buffer range lies within its allocation, and every pointer in `writes` targets `infos` storage that remains allocated and unmodified for `device.update_descriptor_sets`.
-        unsafe { device.update_descriptor_sets(&writes, &[]) };
+            Ok(())
+        })?;
+        // SAFETY: the extended lifetime is a local encoding of call-scoped
+        // validity. Each entry points into `infos`' current buffer and is only
+        // read by the update call below: `writes` was cleared before `infos`
+        // was touched so no previous-call entry survives, both shells were
+        // reserved for `bindings.len()` up front so neither reallocs between
+        // this construction and the update, `infos` is not mutated in between,
+        // and `writes` is cleared again before return so no borrowed entry
+        // escapes this call. `WriteDescriptorSet` is covariant over its marker
+        // lifetime and carries only raw pointers beside it, so the extension
+        // preserves layout and aliasing validity.
+        writes.extend(infos.iter().enumerate().map(|(index, info)| {
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(pipeline.buffer_bindings[index])
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(core::slice::from_ref(info));
+            // SAFETY: `write` only borrows the current stable `infos` buffer through the update below.
+            unsafe {
+                core::mem::transmute::<vk::WriteDescriptorSet<'_>, vk::WriteDescriptorSet<'static>>(
+                    write,
+                )
+            }
+        }));
+        // SAFETY: all descriptor sets and referenced buffer infos are live and externally synchronized for this slot.
+        unsafe { device.update_descriptor_sets(writes, &[]) };
+        // No borrowed entries escape: the next call clears `writes` before
+        // touching `infos`, and clearing here keeps even a panicking caller
+        // from observing stale entries in the retained shell.
+        writes.clear();
         Ok(set)
     }
 
@@ -408,5 +440,75 @@ impl NativeContext {
     /// Returns the native color-format key used by graphics pipeline caching.
     pub fn graphics_format_key(&self) -> u32 {
         u32::try_from(self.swapchain_format.as_raw()).unwrap_or_default()
+    }
+}
+/// Clears borrowed write entries and reserves both descriptor shells.
+///
+/// `writes` entries borrow the `infos` buffer, so they must be dropped before
+/// `infos` is touched; reserving both shells up front then guarantees no
+/// realloc can occur while rebuilt entries are live.
+fn reserve_descriptor_shells(
+    infos: &mut Vec<vk::DescriptorBufferInfo>,
+    writes: &mut Vec<vk::WriteDescriptorSet<'static>>,
+    count: usize,
+) -> Result<(), HalError> {
+    writes.clear();
+    infos.clear();
+    infos
+        .try_reserve(count)
+        .map_err(|_| HalError::OutOfMemory)?;
+    writes
+        .try_reserve(count)
+        .map_err(|_| HalError::OutOfMemory)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod descriptor_shell_tests {
+    use super::reserve_descriptor_shells;
+    use ash::vk;
+
+    fn rebuild_test_writes(
+        writes: &mut Vec<vk::WriteDescriptorSet<'static>>,
+        infos: &[vk::DescriptorBufferInfo],
+    ) {
+        writes.extend(infos.iter().map(|info| {
+            let write = vk::WriteDescriptorSet::default().buffer_info(core::slice::from_ref(info));
+            // SAFETY: test-only mirror of the production encoding; entries are
+            // only read while `infos` is untouched and are cleared by the next
+            // reservation before any mutation.
+            unsafe {
+                core::mem::transmute::<vk::WriteDescriptorSet<'_>, vk::WriteDescriptorSet<'static>>(
+                    write,
+                )
+            }
+        }));
+    }
+
+    /// Simulates residue from a previous call, reserves for growth, and proves
+    /// the rebuild fill cannot realloc while borrowed entries are live.
+    #[test]
+    fn growth_across_calls_keeps_borrowed_entries_stable() {
+        let mut infos = Vec::new();
+        let mut writes: Vec<vk::WriteDescriptorSet<'static>> = Vec::new();
+        // First cycle leaves one borrowed entry behind, as a real call does
+        // before the post-update clear was added.
+        reserve_descriptor_shells(&mut infos, &mut writes, 1).unwrap();
+        infos.push(vk::DescriptorBufferInfo::default());
+        rebuild_test_writes(&mut writes, &infos);
+        assert_eq!(writes.len(), 1);
+        // Second cycle grows past the first buffer: the fixed order drops the
+        // borrowed entry before `infos` is touched, so the realloc below
+        // cannot strand it.
+        reserve_descriptor_shells(&mut infos, &mut writes, 64).unwrap();
+        assert!(writes.is_empty());
+        assert!(infos.capacity() >= 64 && writes.capacity() >= 64);
+        let stable = infos.as_ptr();
+        for _ in 0..64 {
+            infos.push(vk::DescriptorBufferInfo::default());
+        }
+        // No realloc across the whole fill, so entries built from this buffer
+        // stay valid through the subsequent update call.
+        assert!(core::ptr::eq(infos.as_ptr(), stable));
     }
 }

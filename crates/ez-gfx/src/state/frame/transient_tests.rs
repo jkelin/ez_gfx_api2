@@ -1,3 +1,4 @@
+use super::transients::{invalidate_unsafe_transients, recycle_consumed_transients};
 use super::*;
 use crate::state::{
     Backend, ContextOptions, DrawIndexedCommand, Error, LifecycleError, acquire_buffer_sized,

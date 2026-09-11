@@ -17,6 +17,7 @@ objc2-metal = { workspace = true, features = ["dispatch2", "MTLAllocation", "MTL
 objc2-core-foundation.workspace = true
 objc2-foundation.workspace = true
 gpu-allocator = { workspace = true, features = ["std", "metal"] }
+arrayvec.workspace = true
 dispatch2.workspace = true
 objc2-quartz-core.workspace = true
 raw-window-metal.workspace = true

@@ -51,6 +51,12 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         return Err(Error::NativeFailure);
     };
     let handle = identity.context_handle();
+    // Finite retention budgets apply from creation; idle and pressure trims
+    // enforce them explicitly, while `put` itself never evicts implicitly.
+    let mut staging = ez_gfx_hal::ReusableStagingPool::new(256);
+    staging.set_byte_budget(ez_gfx_hal::DEFAULT_SHARED_STAGING_BUDGET);
+    let mut counter_pool = ez_gfx_hal::ReusableStagingPool::new(256);
+    counter_pool.set_byte_budget(ez_gfx_hal::DEFAULT_COUNTER_STAGING_BUDGET);
     let state = ContextState {
         identity,
         options,
@@ -73,7 +79,8 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         indirects: HashMap::new(),
         transient_buffers: HashMap::new(),
         buffer_pool: HashMap::new(),
-        counter_pool: ez_gfx_hal::ReusableStagingPool::new(256),
+        counter_pool,
+        counter_scratch: Vec::new(),
         texture_registry,
         texture_ready: HashMap::new(),
         pending_textures: HashMap::new(),
@@ -93,10 +100,19 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         geometry_uploads: HashMap::new(),
         geometry_last_transfer: HashMap::new(),
         upload_events: ez_gfx_runtime::upload::UploadEventQueue::new(),
-        staging: ez_gfx_hal::ReusableStagingPool::new(256),
+        staging,
+        staging_high_water_bytes: 0,
         frame_vertex_heaps: HashMap::new(),
         frame_serial: 0,
         frame,
+        frame_pipeline_keys: Vec::new(),
+        frame_action_indices: Vec::new(),
+        frame_binding_scratch: Vec::new(),
+        frame_binding_ranges: Vec::new(),
+        #[cfg(target_vendor = "apple")]
+        frame_texture_heaps: Vec::new(),
+        #[cfg(target_vendor = "apple")]
+        frame_workgroup_sizes: Vec::new(),
         frame_resources: HashMap::new(),
         frame_native_resources: HashMap::new(),
         frame_index: None,
@@ -449,6 +465,10 @@ pub fn wait_idle(context: ContextHandle) -> Result<()> {
             NativeContext::Metal(native) => native.wait_idle(),
         };
         result.map_err(|error| map_native_loss(&context.identity, error))?;
+        // Native idle retires in-flight work, so completions are fresh: enforce
+        // the finite staging budgets now rather than letting retention ride
+        // until the next upload happens to sweep it.
+        super::buffers::trim_staging_caches(context)?;
 
         // Native idle advances completion counters, but publication remains safe-core state.
         // Progress once more so callers may use completed uploads immediately after this call.
@@ -558,7 +578,7 @@ pub(super) fn cleanup_context_state(
 ) -> Result<()> {
     // Handles become terminal before cleanup begins; later failures cannot expose partial state.
     owned.identity.invalidate_resources();
-    owned.async_textures.pool.shutdown();
+    owned.async_textures.shutdown();
     for (_, pending) in owned.pending_textures.drain() {
         pending.cancelled.store(true, Ordering::Release);
         if let Err(error) = owned.texture_registry.cancel_upload(pending.id) {

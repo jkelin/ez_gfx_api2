@@ -214,6 +214,7 @@ impl NativeContext {
                 .map(|_| FrameSlot {
                     command: None,
                     argument_buffers: Vec::new(),
+                    prepared_scratch: Vec::new(),
                     submission_value: 0,
                 })
                 .collect(),
@@ -383,6 +384,34 @@ impl NativeContext {
                 .map_err(map_allocation_hal)?;
         }
         Ok(())
+    }
+
+    /// Reports on-demand allocator and device-memory telemetry.
+    ///
+    /// Calls `generate_report`, which allocates; never call per frame. Counts
+    /// and sizes saturate instead of wrapping. Swapchain and depth storage are
+    /// surface-owned on this backend, so those estimates report zero here.
+    pub fn memory_telemetry(&self) -> ez_gfx_hal::BackendMemoryTelemetry {
+        // Report generation walks live blocks, so this observes the allocator
+        // exactly once per explicit query rather than sampling per frame.
+        let allocator = self.allocator.as_ref().map(|allocator| {
+            let report = allocator.generate_report();
+            ez_gfx_hal::AllocatorTelemetry {
+                live_bytes: report.total_allocated_bytes,
+                block_bytes: report.total_capacity_bytes,
+                block_count: u32::try_from(report.blocks.len()).unwrap_or(u32::MAX),
+                allocation_count: u32::try_from(report.allocations.len()).unwrap_or(u32::MAX),
+            }
+        });
+        ez_gfx_hal::BackendMemoryTelemetry {
+            allocator,
+            swapchain_images: 0,
+            swapchain_extent: (0, 0),
+            swapchain_format: 0,
+            swapchain_bytes: 0,
+            depth_bytes: 0,
+            frame_slots: u32::try_from(self.frame_slots.len()).unwrap_or(u32::MAX),
+        }
     }
 
     /// Whether the last idle drain proved that no submitted command still owns GPU work.

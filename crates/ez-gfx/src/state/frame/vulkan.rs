@@ -6,9 +6,12 @@ use super::{
     FrameExecutionPlan, FrameNativeResource, GeometryAllocation, HashMap,
     MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext, NativePipeline, NativeShader,
     NativeSurface, NativeTexture, NativeTextureMap, PackedHandle, PipelineKey, RenderTargetHandle,
-    RenderTargetRecord, ResourceId, SURFACE_DEFAULT_CLEAR, ShaderHandle, ShaderRecord, map_hal,
-    native_layouts, pipeline_layout_key, should_capture_presented, vulkan_bindings,
+    FrameBindingSource, FrameBufferBindingRecord, RenderTargetRecord, ResourceId,
+    SURFACE_DEFAULT_CLEAR, ShaderHandle, ShaderRecord, map_hal, native_layouts,
+    pipeline_layout_key, prepare_frame_binding_scratch, should_capture_presented,
 };
+
+use arrayvec::ArrayVec;
 
 struct VulkanActionState<'a> {
     allocations: &'a HashMap<PackedHandle, (u64, NativeAllocation)>,
@@ -148,8 +151,10 @@ fn prepare_vulkan_pipelines(
     shaders: &HashMap<ShaderHandle, ShaderRecord>,
     pipelines: &mut HashMap<PipelineKey, NativePipeline>,
     payloads: &[ExecutableNode],
-) -> Result<Vec<Option<PipelineKey>>> {
-    let mut pipeline_keys: Vec<Option<PipelineKey>> = (0..payloads.len()).map(|_| None).collect();
+    pipeline_keys: &mut Vec<Option<PipelineKey>>,
+) -> Result<()> {
+    pipeline_keys.clear();
+    pipeline_keys.resize_with(payloads.len(), || None);
     for (node_index, payload) in payloads.iter().enumerate() {
         let (key, pipeline) = match payload {
             ExecutableNode::Compute { shader, layout, .. } => {
@@ -249,15 +254,15 @@ fn prepare_vulkan_pipelines(
         }
         pipeline_keys[node_index] = Some(key);
     }
-    Ok(pipeline_keys)
+    Ok(())
 }
 
 // Barrier resource indices resolve to the native buffer, texture, surface,
 // render-target, depth, or index resource transitioned before submission.
-fn vulkan_barrier_resource<'a>(
-    state: &'a VulkanActionState<'a>,
+fn vulkan_barrier_resource<'resources>(
+    state: &VulkanActionState<'resources>,
     barrier: &ExecutionBarrier,
-) -> Result<ez_gfx_backend_vulkan::NativeFrameResource<'a>> {
+) -> Result<ez_gfx_backend_vulkan::NativeFrameResource<'resources>> {
     let resource = state
         .resources
         .get(&ResourceId::from_index(barrier.resource))
@@ -302,150 +307,225 @@ fn vulkan_barrier_resource<'a>(
 // Pass color indices resolve to surface or render-target attachments here;
 // textures, buffers, and depth images are never color attachments. Surfaces
 // keep the legacy clear.
-fn vulkan_pass_colors<'a>(
-    state: &'a VulkanActionState<'a>,
+fn vulkan_pass_colors<'resources>(
+    state: &VulkanActionState<'resources>,
     pass: &ExecutionPass,
-) -> Result<Vec<ez_gfx_backend_vulkan::PassAttachment<'a>>> {
-    let mut colors = Vec::with_capacity(pass.colors.len());
+) -> Result<ArrayVec<ez_gfx_backend_vulkan::PassAttachment<'resources>, 1>> {
+    let mut colors = ArrayVec::new();
     for index in &pass.colors {
         let resource = state
             .resources
             .get(&ResourceId::from_index(*index))
             .ok_or(Error::InvalidArgument)?;
-        colors.push(match *resource {
-            FrameNativeResource::Surface(_) => ez_gfx_backend_vulkan::PassAttachment {
-                resource: ez_gfx_backend_vulkan::NativeFrameResource::Surface,
-                clear: SURFACE_DEFAULT_CLEAR,
-            },
-            FrameNativeResource::RenderTarget(handle) => {
-                let record = state
-                    .render_targets
-                    .get(&handle)
-                    .ok_or(Error::InvalidContext)?;
-                ez_gfx_backend_vulkan::PassAttachment {
-                    resource: ez_gfx_backend_vulkan::NativeFrameResource::RenderTarget(
-                        record.native.vulkan()?,
-                    ),
-                    clear: super::super::render_target::render_target_clear_color(record),
+        colors
+            .try_push(match *resource {
+                FrameNativeResource::Surface(_) => ez_gfx_backend_vulkan::PassAttachment {
+                    resource: ez_gfx_backend_vulkan::NativeFrameResource::Surface,
+                    clear: SURFACE_DEFAULT_CLEAR,
+                },
+                FrameNativeResource::RenderTarget(handle) => {
+                    let record = state
+                        .render_targets
+                        .get(&handle)
+                        .ok_or(Error::InvalidContext)?;
+                    ez_gfx_backend_vulkan::PassAttachment {
+                        resource: ez_gfx_backend_vulkan::NativeFrameResource::RenderTarget(
+                            record.native.vulkan()?,
+                        ),
+                        clear: super::super::render_target::render_target_clear_color(record),
+                    }
                 }
-            }
-            _ => return Err(Error::InvalidArgument),
-        });
+                _ => return Err(Error::InvalidArgument),
+            })
+            .map_err(|_| Error::InvalidArgument)?;
     }
     Ok(colors)
 }
 
-// Missing resources and mismatched backend variants abort action construction before submission.
-fn vulkan_actions<'a>(
-    state: &'a VulkanActionState<'a>,
+// Rebuilds one borrowed native view at a time from retained plan records.
+// No reference survives its visitor call.
+struct VulkanActionSource<'a, 'resources> {
+    state: VulkanActionState<'resources>,
     plan: &'a FrameExecutionPlan,
     payloads: &'a [ExecutableNode],
-    binding_sets: &'a [Vec<ez_gfx_backend_vulkan::NativeBufferBinding<'a>>],
-    pipeline_keys: &[Option<PipelineKey>],
-) -> Result<Vec<ez_gfx_backend_vulkan::NativeFrameAction<'a>>> {
-    let mut actions = Vec::with_capacity(plan.actions.len());
-    for action in &plan.actions {
-        match action {
-            ExecutionAction::Wait(wait) => {
-                if let Some(token) = wait.external {
-                    actions.push(ez_gfx_backend_vulkan::NativeFrameAction::Wait(token));
-                }
-            }
-            ExecutionAction::Barrier(barrier) => {
-                let resource = vulkan_barrier_resource(state, barrier)?;
-                actions.push(ez_gfx_backend_vulkan::NativeFrameAction::Barrier {
-                    barrier: *barrier,
-                    resource,
-                });
-            }
-            ExecutionAction::BeginPass(pass) => {
-                let colors = vulkan_pass_colors(state, pass)?;
-                actions.push(ez_gfx_backend_vulkan::NativeFrameAction::BeginPass { pass, colors });
-            }
-            ExecutionAction::ExecuteNode(node) => {
-                let index_node = *node as usize;
-                let payload = payloads.get(index_node).ok_or(Error::InvalidArgument)?;
-                match payload {
-                    ExecutableNode::Compute { groups, .. } => {
-                        let key = pipeline_keys[index_node]
-                            .as_ref()
-                            .ok_or(Error::InvalidArgument)?;
-                        let pipeline = state
-                            .pipelines
-                            .get(key)
-                            .ok_or(Error::NativeFailure)?
-                            .vulkan()?;
-                        actions.push(ez_gfx_backend_vulkan::NativeFrameAction::Compute(
-                            ez_gfx_backend_vulkan::NativeComputeDispatch {
-                                pipeline,
-                                groups: *groups,
-                                bindings: &binding_sets[index_node],
-                            },
-                        ));
-                    }
-                    ExecutableNode::Graphics {
-                        counter,
-                        draw_capacity,
-                        ..
-                    } => {
-                        let indirect = state
-                            .allocations
-                            .get(&counter.packed())
-                            .ok_or(Error::InvalidContext)?
-                            .1
-                            .vulkan()?;
-                        let key = pipeline_keys[index_node]
-                            .as_ref()
-                            .ok_or(Error::InvalidArgument)?;
-                        let pipeline = state
-                            .pipelines
-                            .get(key)
-                            .ok_or(Error::NativeFailure)?
-                            .vulkan()?;
-                        actions.push(ez_gfx_backend_vulkan::NativeFrameAction::Graphics(
-                            ez_gfx_backend_vulkan::NativeDrawIndexed {
-                                width: state.extent.0,
-                                height: state.extent.1,
-                                pipeline,
-                                index_buffer: state.index.ok_or(Error::NotReady)?,
-                                indirect_buffer: indirect,
-                                draw_count: *draw_capacity,
-                                bindings: &binding_sets[index_node],
-                            },
-                        ));
-                    }
-                    ExecutableNode::TextureReadback { texture } => {
-                        let (_, texture, width, height, _) =
-                            state.textures.get(texture).ok_or(Error::InvalidContext)?;
-                        let texture = texture.vulkan()?;
-                        actions.push(ez_gfx_backend_vulkan::NativeFrameAction::TextureReadback {
-                            texture,
-                            width: *width,
-                            height: *height,
-                        });
-                    }
-                    ExecutableNode::RenderTargetReadback { target } => {
-                        let record = state
-                            .render_targets
-                            .get(target)
-                            .ok_or(Error::InvalidContext)?;
-                        actions.push(ez_gfx_backend_vulkan::NativeFrameAction::TextureReadback {
-                            texture: record.native.vulkan()?,
-                            width: record.width,
-                            height: record.height,
-                        });
-                    }
-                    ExecutableNode::Present { .. } => {
-                        actions.push(ez_gfx_backend_vulkan::NativeFrameAction::Present);
-                    }
-                }
-            }
-            ExecutionAction::EndPass => {
-                actions.push(ez_gfx_backend_vulkan::NativeFrameAction::EndPass);
-            }
-        }
+    pipeline_keys: &'a [Option<PipelineKey>],
+    binding_records: &'a [FrameBufferBindingRecord],
+    binding_ranges: &'a [core::ops::Range<usize>],
+}
+
+impl ez_gfx_backend_vulkan::NativeFrameActionSource for VulkanActionSource<'_, '_> {
+    fn len(&self) -> usize {
+        self.plan
+            .actions
+            .iter()
+            .filter(|action| {
+                !matches!(action, ExecutionAction::Wait(wait) if wait.external.is_none())
+            })
+            .count()
     }
-    Ok(actions)
+
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(
+            usize,
+            &ez_gfx_backend_vulkan::NativeFrameAction<'_>,
+        ) -> std::result::Result<(), ez_gfx_hal::HalError>,
+    ) -> std::result::Result<(), ez_gfx_hal::HalError> {
+        let mut output_index = 0_usize;
+        for action in &self.plan.actions {
+            let binding_source;
+            let native = match action {
+                ExecutionAction::Wait(wait) => {
+                    let Some(token) = wait.external else {
+                        continue;
+                    };
+                    ez_gfx_backend_vulkan::NativeFrameAction::Wait(token)
+                }
+                ExecutionAction::Barrier(barrier) => {
+                    let resource =
+                        vulkan_barrier_resource(&self.state, barrier).map_err(|_| {
+                            ez_gfx_hal::HalError::InvalidArgument
+                        })?;
+                    ez_gfx_backend_vulkan::NativeFrameAction::Barrier {
+                        barrier: *barrier,
+                        resource,
+                    }
+                }
+                ExecutionAction::BeginPass(pass) => {
+                    let colors = vulkan_pass_colors(&self.state, pass)
+                        .map_err(|_| ez_gfx_hal::HalError::InvalidArgument)?;
+                    ez_gfx_backend_vulkan::NativeFrameAction::BeginPass { pass, colors }
+                }
+                ExecutionAction::ExecuteNode(node) => {
+                    let node = *node as usize;
+                    let payload = self
+                        .payloads
+                        .get(node)
+                        .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
+                    match payload {
+                        ExecutableNode::Compute { groups, .. } => {
+                            let range = self
+                                .binding_ranges
+                                .get(node)
+                                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+                                .clone();
+                            binding_source = FrameBindingSource {
+                                records: self
+                                    .binding_records
+                                    .get(range)
+                                    .ok_or(ez_gfx_hal::HalError::InvalidArgument)?,
+                                allocations: self.state.allocations,
+                                vertex_heaps: self.state.vertex_heaps,
+                            };
+                            let key = self.pipeline_keys[node]
+                                .as_ref()
+                                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
+                            let pipeline = self
+                                .state
+                                .pipelines
+                                .get(key)
+                                .ok_or(ez_gfx_hal::HalError::NativeFailure)?
+                                .vulkan()
+                                .map_err(|_| ez_gfx_hal::HalError::NativeFailure)?;
+                            ez_gfx_backend_vulkan::NativeFrameAction::Compute(
+                                ez_gfx_backend_vulkan::NativeComputeDispatch {
+                                    pipeline,
+                                    groups: *groups,
+                                    bindings: &binding_source,
+                                },
+                            )
+                        }
+                        ExecutableNode::Graphics {
+                            counter,
+                            draw_capacity,
+                            ..
+                        } => {
+                            let range = self
+                                .binding_ranges
+                                .get(node)
+                                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+                                .clone();
+                            binding_source = FrameBindingSource {
+                                records: self
+                                    .binding_records
+                                    .get(range)
+                                    .ok_or(ez_gfx_hal::HalError::InvalidArgument)?,
+                                allocations: self.state.allocations,
+                                vertex_heaps: self.state.vertex_heaps,
+                            };
+                            let indirect = self.state
+                                .allocations
+                                .get(&counter.packed())
+                                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+                                .1
+                                .vulkan()
+                                .map_err(|_| ez_gfx_hal::HalError::InvalidArgument)?;
+                            let key = self.pipeline_keys[node]
+                                .as_ref()
+                                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
+                            let pipeline = self
+                                .state
+                                .pipelines
+                                .get(key)
+                                .ok_or(ez_gfx_hal::HalError::NativeFailure)?
+                                .vulkan()
+                                .map_err(|_| ez_gfx_hal::HalError::NativeFailure)?;
+                            ez_gfx_backend_vulkan::NativeFrameAction::Graphics(
+                                ez_gfx_backend_vulkan::NativeDrawIndexed {
+                                    width: self.state.extent.0,
+                                    height: self.state.extent.1,
+                                    pipeline,
+                                    index_buffer: self
+                                        .state
+                                        .index
+                                        .ok_or(ez_gfx_hal::HalError::NotReady)?,
+                                    indirect_buffer: indirect,
+                                    draw_count: *draw_capacity,
+                                    bindings: &binding_source,
+                                },
+                            )
+                        }
+                        ExecutableNode::TextureReadback { texture } => {
+                            let (_, texture, width, height, _) = self
+                                .state
+                                .textures
+                                .get(texture)
+                                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
+                            ez_gfx_backend_vulkan::NativeFrameAction::TextureReadback {
+                                texture: texture
+                                    .vulkan()
+                                    .map_err(|_| ez_gfx_hal::HalError::InvalidArgument)?,
+                                width: *width,
+                                height: *height,
+                            }
+                        }
+                        ExecutableNode::RenderTargetReadback { target } => {
+                            let record = self
+                                .state
+                                .render_targets
+                                .get(target)
+                                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
+                            ez_gfx_backend_vulkan::NativeFrameAction::TextureReadback {
+                                texture: record
+                                    .native
+                                    .vulkan()
+                                    .map_err(|_| ez_gfx_hal::HalError::InvalidArgument)?,
+                                width: record.width,
+                                height: record.height,
+                            }
+                        }
+                        ExecutableNode::Present { .. } => {
+                            ez_gfx_backend_vulkan::NativeFrameAction::Present
+                        }
+                    }
+                }
+                ExecutionAction::EndPass => ez_gfx_backend_vulkan::NativeFrameAction::EndPass,
+            };
+            visitor(output_index, &native)?;
+            output_index += 1;
+        }
+        Ok(())
+    }
 }
 
 fn presentation_mode(surface: Option<&SurfaceRecord>) -> PresentationMode {
@@ -456,6 +536,7 @@ pub(super) fn execute_vulkan_frame_plan(
     context: &mut ContextState,
     plan: &FrameExecutionPlan,
     payloads: &[ExecutableNode],
+    binding_resources: &[ez_gfx_runtime::binding::ResourceIdentity],
 ) -> Result<()> {
     let surface_handle = payloads.iter().find_map(|payload| match payload {
         ExecutableNode::Present { surface } => Some(*surface),
@@ -514,7 +595,7 @@ pub(super) fn execute_vulkan_frame_plan(
         .as_mut()
         .map(|surface| surface.native.vulkan_mut())
         .transpose()?;
-    let pipeline_keys = {
+    {
         let native = context.native.vulkan_mut()?;
         prepare_vulkan_surface(
             native,
@@ -524,52 +605,63 @@ pub(super) fn execute_vulkan_frame_plan(
             extent,
             presentation_mode,
         )?;
-        prepare_vulkan_pipelines(native, &context.shaders, &mut context.pipelines, payloads)?
+        prepare_vulkan_pipelines(
+            native,
+            &context.shaders,
+            &mut context.pipelines,
+            payloads,
+            &mut context.frame_pipeline_keys,
+        )?;
+    }
+    prepare_frame_binding_scratch(
+        payloads,
+        binding_resources,
+        &context.allocations,
+        &context.vertex_heaps,
+        &mut context.frame_binding_scratch,
+        &mut context.frame_binding_ranges,
+    )
+    .map_err(map_hal)?;
+    super::account_frame_lowering_scratch(
+        &mut context.frame,
+        &mut context.frame_pipeline_keys,
+        &mut context.frame_action_indices,
+        &mut context.frame_binding_scratch,
+        &mut context.frame_binding_ranges,
+        #[cfg(target_vendor = "apple")]
+        &mut context.frame_texture_heaps,
+        #[cfg(target_vendor = "apple")]
+        &mut context.frame_workgroup_sizes,
+    )?;
+    let source = VulkanActionSource {
+        state: VulkanActionState {
+            allocations: &context.allocations,
+            vertex_heaps: &context.vertex_heaps,
+            textures: &context.textures,
+            render_targets: &context.render_targets,
+            pipelines: &context.pipelines,
+            resources: &context.frame_native_resources,
+            index,
+            extent,
+        },
+        plan,
+        payloads,
+        pipeline_keys: &context.frame_pipeline_keys,
+        binding_records: &context.frame_binding_scratch,
+        binding_ranges: &context.frame_binding_ranges,
     };
-    let binding_sets = payloads
-        .iter()
-        .map(|payload| match payload {
-            ExecutableNode::Compute {
-                layout, bindings, ..
-            }
-            | ExecutableNode::Graphics {
-                layout, bindings, ..
-            } => vulkan_bindings(
-                layout,
-                bindings,
-                &context.allocations,
-                &context.vertex_heaps,
-            )
-            .map_err(map_hal),
-            ExecutableNode::TextureReadback { .. }
-            | ExecutableNode::RenderTargetReadback { .. }
-            | ExecutableNode::Present { .. } => Ok(Vec::new()),
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let state = VulkanActionState {
-        allocations: &context.allocations,
-        vertex_heaps: &context.vertex_heaps,
-        textures: &context.textures,
-        render_targets: &context.render_targets,
-        pipelines: &context.pipelines,
-        resources: &context.frame_native_resources,
-        index,
-        extent,
-    };
-    let actions = vulkan_actions(&state, plan, payloads, &binding_sets, &pipeline_keys)?;
     let execution = {
         let native = context.native.vulkan_mut()?;
         native
-            .execute_frame(
+            .execute_frame_source(
                 native_surface
                     .as_deref_mut()
                     .map(|surface| (surface, extent, presentation_mode)),
-                &actions,
+                &source,
                 capture,
             )
             .map_err(map_hal)
     };
-    drop(actions);
     let outcome = match execution {
         Ok(outputs) => {
             let texture_readbacks = payloads

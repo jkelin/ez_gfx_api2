@@ -6,9 +6,12 @@ use super::{
     FrameExecutionPlan, FrameNativeResource, GeometryAllocation, HashMap,
     MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext, NativePipeline, NativeShader,
     NativeSurface, NativeTexture, NativeTextureMap, PackedHandle, PipelineKey, RenderTargetHandle,
-    RenderTargetRecord, ResourceId, SURFACE_DEFAULT_CLEAR, ShaderHandle, ShaderRecord,
-    dx12_bindings, map_hal, native_layouts, pipeline_layout_key, should_capture_presented,
+    FrameBindingSource, FrameBufferBindingRecord, RenderTargetRecord, ResourceId,
+    SURFACE_DEFAULT_CLEAR, ShaderHandle, ShaderRecord, map_hal, native_layouts,
+    pipeline_layout_key, prepare_frame_binding_scratch, should_capture_presented,
 };
+
+use arrayvec::ArrayVec;
 
 struct DxActionState<'a> {
     allocations: &'a HashMap<PackedHandle, (u64, NativeAllocation)>,
@@ -28,8 +31,10 @@ fn prepare_dx12_pipelines(
     shaders: &HashMap<ShaderHandle, ShaderRecord>,
     pipelines: &mut HashMap<PipelineKey, NativePipeline>,
     payloads: &[ExecutableNode],
-) -> Result<Vec<Option<PipelineKey>>> {
-    let mut pipeline_keys: Vec<Option<PipelineKey>> = (0..payloads.len()).map(|_| None).collect();
+    pipeline_keys: &mut Vec<Option<PipelineKey>>,
+) -> Result<()> {
+    pipeline_keys.clear();
+    pipeline_keys.resize_with(payloads.len(), || None);
     for (node_index, payload) in payloads.iter().enumerate() {
         let (key, pipeline) = match payload {
             ExecutableNode::Compute { shader, layout, .. } => {
@@ -122,15 +127,15 @@ fn prepare_dx12_pipelines(
         }
         pipeline_keys[node_index] = Some(key);
     }
-    Ok(pipeline_keys)
+    Ok(())
 }
 
 // Barrier resource indices resolve to the native buffer, texture, surface,
 // depth, render-target, or index resource transitioned before submission.
-fn dx12_barrier_resource<'a>(
-    state: &'a DxActionState<'a>,
+fn dx12_barrier_resource<'resources>(
+    state: &DxActionState<'resources>,
     barrier: &ExecutionBarrier,
-) -> Result<ez_gfx_backend_dx12::native::NativeFrameResource<'a>> {
+) -> Result<ez_gfx_backend_dx12::native::NativeFrameResource<'resources>> {
     let resource = state
         .resources
         .get(&ResourceId::from_index(barrier.resource))
@@ -189,167 +194,224 @@ fn dx12_barrier_resource<'a>(
 // Pass color indices resolve to surface or render-target attachments here;
 // textures, buffers, and depth images are never color attachments. Surfaces
 // keep the legacy clear.
-fn dx12_pass_colors<'a>(
-    state: &'a DxActionState<'a>,
+fn dx12_pass_colors<'resources>(
+    state: &DxActionState<'resources>,
     pass: &ExecutionPass,
-) -> Result<Vec<ez_gfx_backend_dx12::native::PassAttachment<'a>>> {
-    let mut colors = Vec::with_capacity(pass.colors.len());
+) -> Result<ArrayVec<ez_gfx_backend_dx12::native::PassAttachment<'resources>, 1>> {
+    let mut colors = ArrayVec::new();
     for index in &pass.colors {
         let resource = state
             .resources
             .get(&ResourceId::from_index(*index))
             .ok_or(Error::InvalidArgument)?;
-        colors.push(match *resource {
-            FrameNativeResource::Surface(_) => ez_gfx_backend_dx12::native::PassAttachment {
-                resource: ez_gfx_backend_dx12::native::NativeFrameResource::Surface,
-                clear: SURFACE_DEFAULT_CLEAR,
-            },
-            FrameNativeResource::RenderTarget(handle) => {
-                let record = state
-                    .render_targets
-                    .get(&handle)
-                    .ok_or(Error::InvalidContext)?;
-                let NativeTexture::Dx12(texture) = &record.native else {
-                    return Err(Error::NativeFailure);
-                };
-                ez_gfx_backend_dx12::native::PassAttachment {
-                    resource: ez_gfx_backend_dx12::native::NativeFrameResource::RenderTarget(
-                        texture,
-                    ),
-                    clear: super::super::render_target::render_target_clear_color(record),
+        colors
+            .try_push(match *resource {
+                FrameNativeResource::Surface(_) => {
+                    ez_gfx_backend_dx12::native::PassAttachment {
+                        resource: ez_gfx_backend_dx12::native::NativeFrameResource::Surface,
+                        clear: SURFACE_DEFAULT_CLEAR,
+                    }
                 }
-            }
-            _ => return Err(Error::InvalidArgument),
-        });
+                FrameNativeResource::RenderTarget(handle) => {
+                    let record = state
+                        .render_targets
+                        .get(&handle)
+                        .ok_or(Error::InvalidContext)?;
+                    let NativeTexture::Dx12(texture) = &record.native else {
+                        return Err(Error::NativeFailure);
+                    };
+                    ez_gfx_backend_dx12::native::PassAttachment {
+                        resource: ez_gfx_backend_dx12::native::NativeFrameResource::RenderTarget(
+                            texture,
+                        ),
+                        clear: super::super::render_target::render_target_clear_color(record),
+                    }
+                }
+                _ => return Err(Error::InvalidArgument),
+            })
+            .map_err(|_| Error::InvalidArgument)?;
     }
     Ok(colors)
 }
 
-// Missing resources and mismatched backend variants abort action construction before submission.
-fn dx12_actions<'a>(
-    state: &'a DxActionState<'a>,
+struct DxActionSource<'a, 'resources> {
+    state: DxActionState<'resources>,
     plan: &'a FrameExecutionPlan,
     payloads: &'a [ExecutableNode],
-    binding_sets: &'a [Vec<ez_gfx_backend_dx12::native::NativeBufferBinding<'a>>],
-    pipeline_keys: &[Option<PipelineKey>],
-) -> Result<Vec<ez_gfx_backend_dx12::native::NativeFrameAction<'a>>> {
-    let mut actions = Vec::with_capacity(plan.actions.len());
-    for action in &plan.actions {
-        match action {
-            ExecutionAction::Wait(wait) => {
-                if let Some(token) = wait.external {
-                    actions.push(ez_gfx_backend_dx12::native::NativeFrameAction::Wait(token));
-                }
-            }
+    pipeline_keys: &'a [Option<PipelineKey>],
+    action_indices: &'a [usize],
+    binding_records: &'a [FrameBufferBindingRecord],
+    binding_ranges: &'a [core::ops::Range<usize>],
+}
+
+impl ez_gfx_backend_dx12::native::NativeFrameActionSource for DxActionSource<'_, '_> {
+    fn len(&self) -> usize {
+        self.action_indices.len()
+    }
+
+    fn with_action(
+        &self,
+        index: usize,
+        visitor: &mut dyn FnMut(
+            &ez_gfx_backend_dx12::native::NativeFrameAction<'_>,
+        ) -> std::result::Result<(), ez_gfx_hal::HalError>,
+    ) -> std::result::Result<(), ez_gfx_hal::HalError> {
+        let action = self
+            .plan
+            .actions
+            .get(*self.action_indices.get(index).ok_or(ez_gfx_hal::HalError::InvalidArgument)?)
+            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
+        let binding_source;
+        let native = match action {
+            ExecutionAction::Wait(wait) => ez_gfx_backend_dx12::native::NativeFrameAction::Wait(
+                wait.external.ok_or(ez_gfx_hal::HalError::InvalidArgument)?,
+            ),
             ExecutionAction::Barrier(barrier) => {
-                let resource = dx12_barrier_resource(state, barrier)?;
-                actions.push(ez_gfx_backend_dx12::native::NativeFrameAction::Barrier {
+                let resource = dx12_barrier_resource(&self.state, barrier)
+                    .map_err(|_| ez_gfx_hal::HalError::InvalidArgument)?;
+                ez_gfx_backend_dx12::native::NativeFrameAction::Barrier {
                     barrier: *barrier,
                     resource,
-                });
+                }
             }
             ExecutionAction::BeginPass(pass) => {
-                let colors = dx12_pass_colors(state, pass)?;
-                actions.push(ez_gfx_backend_dx12::native::NativeFrameAction::BeginPass {
-                    pass,
-                    colors,
-                });
+                let colors = dx12_pass_colors(&self.state, pass)
+                    .map_err(|_| ez_gfx_hal::HalError::InvalidArgument)?;
+                ez_gfx_backend_dx12::native::NativeFrameAction::BeginPass { pass, colors }
             }
             ExecutionAction::ExecuteNode(node) => {
-                let index_node = *node as usize;
-                match payloads.get(index_node).ok_or(Error::InvalidArgument)? {
+                let node = *node as usize;
+                match self
+                    .payloads
+                    .get(node)
+                    .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+                {
                     ExecutableNode::Compute { groups, .. } => {
-                        let key = pipeline_keys[index_node]
-                            .as_ref()
-                            .ok_or(Error::InvalidArgument)?;
-                        let NativePipeline::Dx12(pipeline) =
-                            state.pipelines.get(key).ok_or(Error::NativeFailure)?
-                        else {
-                            return Err(Error::NativeFailure);
+                        let range = self
+                            .binding_ranges
+                            .get(node)
+                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+                            .clone();
+                        binding_source = FrameBindingSource {
+                            records: self
+                                .binding_records
+                                .get(range)
+                                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?,
+                            allocations: self.state.allocations,
+                            vertex_heaps: self.state.vertex_heaps,
                         };
-                        actions.push(ez_gfx_backend_dx12::native::NativeFrameAction::Compute(
+                        let key = self.pipeline_keys[node]
+                            .as_ref()
+                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
+                        let NativePipeline::Dx12(pipeline) = self
+                            .state
+                            .pipelines
+                            .get(key)
+                            .ok_or(ez_gfx_hal::HalError::NativeFailure)?
+                        else {
+                            return Err(ez_gfx_hal::HalError::NativeFailure);
+                        };
+                        ez_gfx_backend_dx12::native::NativeFrameAction::Compute(
                             ez_gfx_backend_dx12::native::NativeComputeDispatch {
                                 pipeline,
                                 groups: *groups,
-                                bindings: &binding_sets[index_node],
+                                bindings: &binding_source,
                             },
-                        ));
+                        )
                     }
                     ExecutableNode::Graphics {
                         counter,
                         draw_capacity,
                         ..
                     } => {
-                        let (indirect_size, NativeAllocation::Dx12(indirect)) = state
+                        let range = self
+                            .binding_ranges
+                            .get(node)
+                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+                            .clone();
+                        binding_source = FrameBindingSource {
+                            records: self
+                                .binding_records
+                                .get(range)
+                                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?,
+                            allocations: self.state.allocations,
+                            vertex_heaps: self.state.vertex_heaps,
+                        };
+                        let (indirect_size, NativeAllocation::Dx12(indirect)) = self
+                            .state
                             .allocations
                             .get(&counter.packed())
-                            .ok_or(Error::InvalidContext)?
+                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
                         else {
-                            return Err(Error::NativeFailure);
+                            return Err(ez_gfx_hal::HalError::InvalidArgument);
                         };
-                        let key = pipeline_keys[index_node]
+                        let key = self.pipeline_keys[node]
                             .as_ref()
-                            .ok_or(Error::InvalidArgument)?;
-                        let NativePipeline::Dx12(pipeline) =
-                            state.pipelines.get(key).ok_or(Error::NativeFailure)?
+                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
+                        let NativePipeline::Dx12(pipeline) = self
+                            .state
+                            .pipelines
+                            .get(key)
+                            .ok_or(ez_gfx_hal::HalError::NativeFailure)?
                         else {
-                            return Err(Error::NativeFailure);
+                            return Err(ez_gfx_hal::HalError::NativeFailure);
                         };
-                        actions.push(ez_gfx_backend_dx12::native::NativeFrameAction::Graphics(
+                        ez_gfx_backend_dx12::native::NativeFrameAction::Graphics(
                             ez_gfx_backend_dx12::native::NativeDrawIndexed {
-                                width: state.extent.0,
-                                height: state.extent.1,
+                                width: self.state.extent.0,
+                                height: self.state.extent.1,
                                 pipeline,
-                                index_buffer: state.index.ok_or(Error::NotReady)?,
-                                index_size: state.index_size,
+                                index_buffer: self
+                                    .state
+                                    .index
+                                    .ok_or(ez_gfx_hal::HalError::NotReady)?,
+                                index_size: self.state.index_size,
                                 indirect_buffer: indirect,
                                 indirect_size: *indirect_size,
                                 draw_count: *draw_capacity,
-                                bindings: &binding_sets[index_node],
+                                bindings: &binding_source,
                             },
-                        ));
+                        )
                     }
                     ExecutableNode::TextureReadback { texture } => {
-                        let (_, NativeTexture::Dx12(texture), width, height, _) =
-                            state.textures.get(texture).ok_or(Error::InvalidContext)?
+                        let (_, NativeTexture::Dx12(texture), width, height, _) = self
+                            .state
+                            .textures
+                            .get(texture)
+                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
                         else {
-                            return Err(Error::NativeFailure);
+                            return Err(ez_gfx_hal::HalError::InvalidArgument);
                         };
-                        actions.push(
-                            ez_gfx_backend_dx12::native::NativeFrameAction::TextureReadback {
-                                texture,
-                                width: *width,
-                                height: *height,
-                            },
-                        );
+                        ez_gfx_backend_dx12::native::NativeFrameAction::TextureReadback {
+                            texture,
+                            width: *width,
+                            height: *height,
+                        }
                     }
                     ExecutableNode::RenderTargetReadback { target } => {
-                        let record = state
+                        let record = self
+                            .state
                             .render_targets
                             .get(target)
-                            .ok_or(Error::InvalidContext)?;
+                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
                         let NativeTexture::Dx12(texture) = &record.native else {
-                            return Err(Error::NativeFailure);
+                            return Err(ez_gfx_hal::HalError::InvalidArgument);
                         };
-                        actions.push(
-                            ez_gfx_backend_dx12::native::NativeFrameAction::TextureReadback {
-                                texture,
-                                width: record.width,
-                                height: record.height,
-                            },
-                        );
+                        ez_gfx_backend_dx12::native::NativeFrameAction::TextureReadback {
+                            texture,
+                            width: record.width,
+                            height: record.height,
+                        }
                     }
                     ExecutableNode::Present { .. } => {
-                        actions.push(ez_gfx_backend_dx12::native::NativeFrameAction::Present);
+                        ez_gfx_backend_dx12::native::NativeFrameAction::Present
                     }
                 }
             }
-            ExecutionAction::EndPass => {
-                actions.push(ez_gfx_backend_dx12::native::NativeFrameAction::EndPass);
-            }
-        }
+            ExecutionAction::EndPass => ez_gfx_backend_dx12::native::NativeFrameAction::EndPass,
+        };
+        visitor(&native)
     }
-    Ok(actions)
 }
 
 #[cfg(windows)]
@@ -357,6 +419,7 @@ pub(super) fn execute_dx12_frame_plan(
     context: &mut ContextState,
     plan: &FrameExecutionPlan,
     payloads: &[ExecutableNode],
+    binding_resources: &[ez_gfx_runtime::binding::ResourceIdentity],
 ) -> Result<()> {
     let surface_handle = payloads.iter().find_map(|payload| match payload {
         ExecutableNode::Present { surface } => Some(*surface),
@@ -412,59 +475,77 @@ pub(super) fn execute_dx12_frame_plan(
         };
         surface
     });
-    let binding_sets = payloads
-        .iter()
-        .map(|payload| match payload {
-            ExecutableNode::Compute {
-                layout, bindings, ..
-            }
-            | ExecutableNode::Graphics {
-                layout, bindings, ..
-            } => dx12_bindings(
-                layout,
-                bindings,
-                &context.allocations,
-                &context.vertex_heaps,
-            )
-            .map_err(map_hal),
-            ExecutableNode::TextureReadback { .. }
-            | ExecutableNode::RenderTargetReadback { .. }
-            | ExecutableNode::Present { .. } => Ok(Vec::new()),
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let pipeline_keys = {
+    context.frame_action_indices.clear();
+    context.frame_action_indices.extend(
+        plan.actions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, action)| {
+                (!matches!(action, ExecutionAction::Wait(wait) if wait.external.is_none()))
+                    .then_some(index)
+            }),
+    );
+    {
         let NativeContext::Dx12(native) = &mut context.native else {
             return Err(Error::NativeFailure);
         };
-        prepare_dx12_pipelines(native, &context.shaders, &mut context.pipelines, payloads)?
+        prepare_dx12_pipelines(
+            native,
+            &context.shaders,
+            &mut context.pipelines,
+            payloads,
+            &mut context.frame_pipeline_keys,
+        )?;
+    }
+    prepare_frame_binding_scratch(
+        payloads,
+        binding_resources,
+        &context.allocations,
+        &context.vertex_heaps,
+        &mut context.frame_binding_scratch,
+        &mut context.frame_binding_ranges,
+    )
+    .map_err(map_hal)?;
+    super::account_frame_lowering_scratch(
+        &mut context.frame,
+        &mut context.frame_pipeline_keys,
+        &mut context.frame_action_indices,
+        &mut context.frame_binding_scratch,
+        &mut context.frame_binding_ranges,
+    )?;
+    let source = DxActionSource {
+        state: DxActionState {
+            allocations: &context.allocations,
+            vertex_heaps: &context.vertex_heaps,
+            textures: &context.textures,
+            render_targets: &context.render_targets,
+            pipelines: &context.pipelines,
+            resources: &context.frame_native_resources,
+            index,
+            index_size,
+            extent,
+        },
+        plan,
+        payloads,
+        pipeline_keys: &context.frame_pipeline_keys,
+        action_indices: &context.frame_action_indices,
+        binding_records: &context.frame_binding_scratch,
+        binding_ranges: &context.frame_binding_ranges,
     };
-    let state = DxActionState {
-        allocations: &context.allocations,
-        vertex_heaps: &context.vertex_heaps,
-        textures: &context.textures,
-        render_targets: &context.render_targets,
-        pipelines: &context.pipelines,
-        resources: &context.frame_native_resources,
-        index,
-        index_size,
-        extent,
-    };
-    let actions = dx12_actions(&state, plan, payloads, &binding_sets, &pipeline_keys)?;
     let execution = {
         let NativeContext::Dx12(native) = &mut context.native else {
             return Err(Error::NativeFailure);
         };
         native
-            .execute_frame(
+            .execute_frame_source(
                 native_surface
                     .as_deref_mut()
                     .map(|surface| (surface, extent, presentation_mode)),
-                &actions,
+                &source,
                 capture,
             )
             .map_err(map_hal)
     };
-    drop(actions);
     let outcome = match execution {
         Ok(outputs) => {
             let texture_readbacks = payloads

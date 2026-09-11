@@ -145,7 +145,7 @@ impl NativeContext {
                 .map_err(map_allocator)?;
             return Err(AllocationError::OutOfMemory);
         };
-        let mut upload = if let Some((_, upload)) = self.texture_staging.take(total, completed) {
+        let mut upload = if let Some((_, upload)) = self.texture_staging.take(total, ez_gfx_hal::QueueKind::TextureTransfer, completed) {
             upload
         } else {
             match self.allocate(request) {
@@ -571,7 +571,7 @@ impl NativeContext {
             .map_err(|_| AllocationError::OutOfMemory)?;
         let completed = self.reclaim_texture_transfers()?;
         let request = AllocationRequest::new(bucket, 4, MemoryClass::Upload, true, None)?;
-        let mut upload = if let Some((_, upload)) = self.texture_staging.take(bytes, completed) {
+        let mut upload = if let Some((_, upload)) = self.texture_staging.take(bytes, ez_gfx_hal::QueueKind::TextureTransfer, completed) {
             upload
         } else {
             self.allocate(request)?
@@ -808,7 +808,7 @@ impl NativeContext {
         self.completed_texture_value = completed;
         self.pending_texture_transfers
             .retain(|pending| pending.value > completed);
-        for stale in self.texture_staging.trim(completed) {
+        for stale in self.texture_staging.trim(ez_gfx_hal::QueueKind::TextureTransfer, completed) {
             self.free(stale)?;
         }
         Ok(completed)

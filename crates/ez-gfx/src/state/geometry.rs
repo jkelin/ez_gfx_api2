@@ -474,7 +474,7 @@ fn upload_vertices_raw_impl(
             .vertex_heaps
             .get_mut(&name)
             .ok_or(Error::InvalidArgument)?;
-        match stage_upload(
+        let result = match stage_upload(
             &mut context.native,
             &mut context.staging,
             &heap.allocation,
@@ -502,7 +502,9 @@ fn upload_vertices_raw_impl(
                     .remove(packed, ResourceKind::VertexAllocation);
                 Err(map_allocation(error))
             }
-        }
+        };
+        super::observe_staging_high_water(context);
+        result
     })
 }
 
@@ -578,7 +580,7 @@ fn upload_indices_raw_impl(
             }
         };
         let heap = context.index_heap.as_mut().ok_or(Error::InvalidArgument)?;
-        match stage_upload(
+        let result = match stage_upload(
             &mut context.native,
             &mut context.staging,
             &heap.allocation,
@@ -606,7 +608,9 @@ fn upload_indices_raw_impl(
                     .remove(packed, ResourceKind::IndexAllocation);
                 Err(map_allocation(error))
             }
-        }
+        };
+        super::observe_staging_high_water(context);
+        result
     })
 }
 
@@ -751,18 +755,30 @@ pub(super) fn stage_upload(
     bytes: &[u8],
 ) -> std::result::Result<CompletionToken, ez_gfx_hal::AllocationError> {
     let completed = completed_transfer_native(context)?;
-    for stale in pool.trim(completed) {
+    // Idle eviction alone never enforces the finite budget; pressure eviction
+    // reclaims completed-but-fresh buckets once retention exceeds the ceiling.
+    // In-flight buckets stay regardless, so over-budget retention only means
+    // everything remaining is still owned by GPU work.
+    for stale in pool
+        .trim(ez_gfx_hal::QueueKind::Transfer, completed)
+        .into_iter()
+        .chain(pool.trim_to_budget(
+            ez_gfx_hal::QueueKind::Transfer,
+            completed,
+        ))
+    {
         free_native_allocation(context, stale)?;
     }
     let requested = bytes.len() as u64;
-    let (capacity, mut allocation) = if let Some(entry) = pool.take(requested, completed) {
-        entry
-    } else {
-        let bucket = staging_bucket_size(requested, DEFAULT_STAGING_POLICY)
-            .map_err(|_| ez_gfx_hal::AllocationError::OutOfMemory)?;
-        let request = AllocationRequest::new(bucket, 16, MemoryClass::Upload, true, None)?;
-        (bucket, allocate_native(context, request)?)
-    };
+    let (capacity, mut allocation) =
+        if let Some(entry) = pool.take(requested, ez_gfx_hal::QueueKind::Transfer, completed) {
+            entry
+        } else {
+            let bucket = staging_bucket_size(requested, DEFAULT_STAGING_POLICY)
+                .map_err(|_| ez_gfx_hal::AllocationError::OutOfMemory)?;
+            let request = AllocationRequest::new(bucket, 16, MemoryClass::Upload, true, None)?;
+            (bucket, allocate_native(context, request)?)
+        };
     if let Err(error) = write_native(context, &mut allocation, bytes) {
         pool.put(capacity, allocation, None);
         return Err(error);

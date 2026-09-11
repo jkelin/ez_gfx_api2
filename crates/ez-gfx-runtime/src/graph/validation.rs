@@ -3,6 +3,7 @@ use super::{
     PassInfo, QueueKind, ResourceAccess, ResourceDesc, ResourceId, ResourceRange, ResourceRecord,
     ResourceShape, StoreOp,
 };
+use arrayvec::ArrayVec;
 
 pub(crate) fn validate_pass(
     graph: &FrameGraph,
@@ -155,14 +156,14 @@ pub(crate) fn intersection(a: ResourceRange, b: ResourceRange) -> Option<Resourc
         _ => None,
     }
 }
-/// Splits a resource range into the regions left after removing an overlapping cut.
-pub(crate) fn subtract(range: ResourceRange, cut: ResourceRange) -> Vec<ResourceRange> {
+/// Splits a resource range into the at most four regions left after removing an overlapping cut.
+pub(crate) fn subtract(range: ResourceRange, cut: ResourceRange) -> ArrayVec<ResourceRange, 4> {
     let Some(overlap) = intersection(range, cut) else {
-        return vec![range];
+        return ArrayVec::from_iter([range]);
     };
     match (range, overlap) {
         (ResourceRange::Buffer(range), ResourceRange::Buffer(overlap)) => {
-            let mut result = Vec::with_capacity(2);
+            let mut result = ArrayVec::new();
             if range.offset < overlap.offset {
                 result.push(ResourceRange::Buffer(BufferRange {
                     offset: range.offset,
@@ -180,7 +181,7 @@ pub(crate) fn subtract(range: ResourceRange, cut: ResourceRange) -> Vec<Resource
             result
         }
         (ResourceRange::Image(range), ResourceRange::Image(overlap)) => {
-            let mut result = Vec::with_capacity(4);
+            let mut result = ArrayVec::new();
             let range_mip_end = range.first_mip + range.mip_count;
             let overlap_mip_end = overlap.first_mip + overlap.mip_count;
             let range_layer_end = range.first_layer + range.layer_count;
@@ -321,4 +322,39 @@ pub enum GraphError {
         /// Nodes participating in the cycle.
         nodes: Vec<NodeId>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::subtract;
+    use crate::graph::{ImageRange, ResourceRange};
+    use ez_gfx_hal::BufferRange;
+
+    #[test]
+    fn subtraction_is_inline_and_bounded_by_four_fragments() {
+        let image = ResourceRange::Image(ImageRange {
+            first_mip: 0,
+            mip_count: 4,
+            first_layer: 0,
+            layer_count: 4,
+        });
+        let center = ResourceRange::Image(ImageRange {
+            first_mip: 1,
+            mip_count: 2,
+            first_layer: 1,
+            layer_count: 2,
+        });
+        let fragments = subtract(image, center);
+
+        assert_eq!(fragments.len(), 4);
+        assert_eq!(fragments.capacity(), 4);
+        assert_eq!(
+            subtract(
+                ResourceRange::Buffer(BufferRange { offset: 0, size: 4 }),
+                ResourceRange::Buffer(BufferRange { offset: 8, size: 4 }),
+            )
+            .as_slice(),
+            &[ResourceRange::Buffer(BufferRange { offset: 0, size: 4 })]
+        );
+    }
 }

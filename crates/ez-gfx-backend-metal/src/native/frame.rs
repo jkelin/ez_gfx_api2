@@ -57,6 +57,15 @@ fn draw_ranges_fit(
         && required_indirect.is_some_and(|required| required <= indirect_logical_size)
 }
 
+fn bindings_fit(bindings: &dyn super::NativeBufferBindingSource) -> Result<bool, HalError> {
+    let mut fits = true;
+    bindings.visit(&mut |_, binding| {
+        fits &= (binding.offset as u64) < binding.allocation.allocation.size();
+        Ok(())
+    })?;
+    Ok(fits)
+}
+
 fn metal_size(size: [u32; 3]) -> MTLSize {
     MTLSize {
         width: size[0] as usize,
@@ -67,8 +76,22 @@ fn metal_size(size: [u32; 3]) -> MTLSize {
 
 struct MetalFrameResources {
     slot_index: usize,
-    prepared_arguments: Vec<Option<usize>>,
+    /// Prepared argument-buffer slots for aliased actions, in ascending action
+    /// order; every other action needs no entry.
+    prepared_arguments: Vec<(u32, usize)>,
     readbacks: Vec<MetalFrameReadback>,
+}
+
+/// Returns the prepared argument-buffer slot for one action, if it is aliased.
+///
+/// Entries are recorded in ascending action order, so binary search is valid.
+fn prepared_argument(prepared: &[(u32, usize)], action: usize) -> Option<usize> {
+    // Action counts always fit `u32`; the fallback only guards the conversion.
+    let action = u32::try_from(action).ok()?;
+    prepared
+        .binary_search_by_key(&action, |(action, _)| *action)
+        .ok()
+        .map(|index| prepared[index].1)
 }
 
 struct MetalFrameEncoder<'a> {
@@ -77,7 +100,7 @@ struct MetalFrameEncoder<'a> {
     extent: (u32, u32),
     drawable: Option<&'a ProtocolObject<dyn CAMetalDrawable>>,
     drawable_texture: Option<&'a ProtocolObject<dyn MTLTexture>>,
-    prepared_arguments: &'a [Option<usize>],
+    prepared_arguments: &'a [(u32, usize)],
     frame_slot: &'a super::FrameSlot,
     readbacks: &'a [MetalFrameReadback],
     render_encoder: Option<super::Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>>,
@@ -253,25 +276,24 @@ impl MetalFrameEncoder<'_> {
             .computeCommandEncoder()
             .ok_or(HalError::NativeFailure)?;
         encoder.setComputePipelineState(state);
-        for binding in dispatch.bindings {
+        dispatch.bindings.visit(&mut |_, binding| {
             if binding.offset as u64 >= binding.allocation.allocation.size() {
                 return Err(HalError::InvalidArgument);
             }
-            // SAFETY: the preceding check places `binding.offset` within the allocation backing `binding.allocation.buffer`, which remains stored in `binding.allocation` while `setBuffer_offset_atIndex` records the binding.
+            // SAFETY: the checked offset lies inside the retained allocation.
             unsafe {
                 encoder.setBuffer_offset_atIndex(
                     Some(&binding.allocation.buffer),
                     binding.offset,
                     binding.index,
                 );
-            };
-        }
+            }
+            Ok(())
+        })?;
         match (
             dispatch.texture_heap,
             argument_encoder.as_ref(),
-            self.prepared_arguments
-                .get(action_index)
-                .and_then(|prepared| *prepared),
+            prepared_argument(self.prepared_arguments, action_index),
         ) {
             (Some(heap), Some(_), Some(index)) => {
                 let buffer = &self.frame_slot.argument_buffers[index];
@@ -425,10 +447,7 @@ impl NativeContext {
                 draw.indirect_size,
                 draw.draw_count,
             )
-            || draw
-                .bindings
-                .iter()
-                .any(|binding| binding.offset as u64 >= binding.allocation.allocation.size())
+            || !bindings_fit(draw.bindings)?
         {
             return Err(HalError::InvalidArgument);
         }
@@ -491,10 +510,7 @@ impl NativeContext {
         if dispatch.groups.contains(&0)
             || dispatch.threads_per_group.contains(&0)
             || thread_count.is_none_or(|count| count > state.maxTotalThreadsPerThreadgroup() as u64)
-            || dispatch
-                .bindings
-                .iter()
-                .any(|binding| binding.offset as u64 >= binding.allocation.allocation.size())
+            || !bindings_fit(dispatch.bindings)?
         {
             return Err(HalError::InvalidArgument);
         }
@@ -548,47 +564,41 @@ impl NativeContext {
         &mut self,
         surface: &mut Option<&mut NativeSurface>,
         extent: (u32, u32),
-        actions: &[NativeFrameAction<'_>],
+        actions: &(impl super::NativeFrameActionSource + ?Sized),
         capture_presented: bool,
     ) -> Result<(bool, bool), HalError> {
-        let presents = actions
-            .iter()
-            .any(|action| matches!(action, NativeFrameAction::Present));
-        // Surface use is attachment-precise: render-target-only passes,
-        // barriers, and draws never acquire a drawable. Draws inherit their
-        // pass target, so only surface-attached passes, presents, and
-        // surface/depth barriers require a surface.
-        let uses_surface = actions.iter().any(|action| match action {
-            NativeFrameAction::BeginPass { colors, .. } => colors
-                .iter()
-                .any(|attachment| matches!(attachment.resource, NativeFrameResource::Surface)),
-            NativeFrameAction::Present => true,
-            NativeFrameAction::Barrier {
-                resource: NativeFrameResource::Surface | NativeFrameResource::Depth,
-                ..
-            } => true,
-            _ => false,
-        });
-        if uses_surface && surface.is_none() || (uses_surface || capture_presented) && !presents {
-            return Err(HalError::InvalidArgument);
-        }
-        for action in actions {
+        let mut presents = false;
+        let mut uses_surface = false;
+        let mut requires_depth = false;
+        actions.visit(&mut |_, action| {
+            presents |= matches!(action, NativeFrameAction::Present);
+            uses_surface |= match action {
+                NativeFrameAction::BeginPass { colors, .. } => colors.iter().any(|attachment| {
+                    matches!(attachment.resource, NativeFrameResource::Surface)
+                }),
+                NativeFrameAction::Present
+                | NativeFrameAction::Barrier {
+                    resource: NativeFrameResource::Surface | NativeFrameResource::Depth,
+                    ..
+                } => true,
+                _ => false,
+            };
+            requires_depth |= matches!(
+                action,
+                NativeFrameAction::BeginPass { pass, .. } if pass.depth.is_some()
+            );
             if let NativeFrameAction::Wait(token) = action {
                 if token.queue == QueueKind::TextureTransfer {
-                    // Texture work has a GPU event dependency; pending is valid, but fabricated
-                    // values and failed worker submission must fail before command encoding.
                     self.completed_texture_transfer_value()
                         .map_err(map_allocation_hal)?;
                     if token.value >= self.next_texture_value {
                         return Err(HalError::InvalidArgument);
                     }
-                    continue;
+                    return Ok(());
                 }
                 if token.queue != QueueKind::Transfer || token.value >= self.next_transfer_value {
                     return Err(HalError::InvalidArgument);
                 }
-                // Buffer admission is asynchronous. Finish only this accepted producer before
-                // graphics reads its destination; later queued copies need not complete.
                 self.transfer_worker
                     .as_ref()
                     .ok_or(HalError::NotReady)?
@@ -613,13 +623,12 @@ impl NativeContext {
                     return Err(HalError::NativeFailure);
                 }
             }
+            Ok(())
+        })?;
+        if uses_surface && surface.is_none() || (uses_surface || capture_presented) && !presents {
+            return Err(HalError::InvalidArgument);
         }
-        if actions.iter().any(|action| {
-            matches!(
-                action,
-                NativeFrameAction::BeginPass { pass, .. } if pass.depth.is_some()
-            )
-        }) {
+        if requires_depth {
             self.ensure_surface_depth(
                 surface.as_deref_mut().ok_or(HalError::InvalidArgument)?,
                 extent,
@@ -628,11 +637,23 @@ impl NativeContext {
         Ok((presents, uses_surface))
     }
 
+    /// Returns prepared-argument scratch to its frame slot, keeping capacity.
+    ///
+    /// Entries are pure CPU pairs with no GPU lifetime, so reuse needs no
+    /// completion wait of its own; the slot itself stays completion-gated.
+    /// A missing slot is unreachable after preparation, so falling back to a
+    /// drop preserves behavior and only loses retained capacity.
+    fn reclaim_prepared_scratch(&mut self, slot_index: usize, prepared: Vec<(u32, usize)>) {
+        if let Some(slot) = self.frame_slots.get_mut(slot_index) {
+            slot.prepared_scratch = prepared;
+        }
+    }
+
     fn prepare_frame_resources(
         &mut self,
         surface: Option<&NativeSurface>,
         extent: (u32, u32),
-        actions: &[NativeFrameAction<'_>],
+        actions: &(impl super::NativeFrameActionSource + ?Sized),
         capture_presented: bool,
         presents: bool,
     ) -> Result<MetalFrameResources, HalError> {
@@ -640,16 +661,23 @@ impl NativeContext {
         if must_wait {
             self.complete_frame_slot(slot_index)?;
         }
-        let mut prepared_arguments = Vec::with_capacity(actions.len());
+        // The slot is retired: the tracker waited on reuse and this frame has not
+        // submitted yet. Scratch capacity persists across frames; entries are pure
+        // CPU pairs with no GPU lifetime. Every error return below restores it.
+        let mut prepared_arguments = core::mem::take(
+            &mut self
+                .frame_slots
+                .get_mut(slot_index)
+                .ok_or(HalError::NativeFailure)?
+                .prepared_scratch,
+        );
+        prepared_arguments.clear();
         let mut argument_count = 0;
         let mut readbacks = Vec::new();
         let mut pass_active = false;
         let mut saw_present = false;
-        for action in actions {
+        let preparation = actions.visit(&mut |action_index, action| {
             if saw_present {
-                for (allocation, _, _, _, _) in readbacks {
-                    let _ = self.free(allocation);
-                }
                 return Err(HalError::InvalidArgument);
             }
             let item = match action {
@@ -771,34 +799,37 @@ impl NativeContext {
                     } else {
                         saw_present = true;
                         if capture_presented {
-                            match self.allocate_frame_readback(extent.0, extent.1) {
-                                Ok(readback) => readbacks.push(readback),
-                                Err(error) => {
-                                    for (allocation, _, _, _, _) in readbacks {
-                                        let _ = self.free(allocation);
-                                    }
-                                    return Err(error);
-                                }
+                            let readback =
+                                self.allocate_frame_readback(extent.0, extent.1)?;
+                            readbacks.push(readback);
                             }
-                        }
                         Ok(None)
                     }
                 }
             };
             match item {
-                Ok(item) => prepared_arguments.push(item),
-                Err(error) => {
-                    for (allocation, _, _, _, _) in readbacks {
-                        let _ = self.free(allocation);
-                    }
-                    return Err(error);
+                Ok(Some(index)) => {
+                    let action =
+                        u32::try_from(action_index).map_err(|_| HalError::InvalidArgument)?;
+                    prepared_arguments.push((action, index));
                 }
+                Ok(None) => {}
+                Err(error) => return Err(error),
             }
+            Ok(())
+        });
+        if let Err(error) = preparation {
+            for (allocation, _, _, _, _) in readbacks {
+                let _ = self.free(allocation);
+            }
+            self.reclaim_prepared_scratch(slot_index, prepared_arguments);
+            return Err(error);
         }
         if pass_active || saw_present != presents {
             for (allocation, _, _, _, _) in readbacks {
                 let _ = self.free(allocation);
             }
+            self.reclaim_prepared_scratch(slot_index, prepared_arguments);
             return Err(HalError::InvalidArgument);
         }
         Ok(MetalFrameResources {
@@ -921,16 +952,29 @@ impl NativeContext {
         }
     }
 
-    /// Records one complete frame into one Metal command buffer and presents only after every
-    /// action has been encoded successfully.
+    /// Records one complete frame into one Metal command buffer.
     ///
     /// # Errors
     ///
-    /// Returns an error for an invalid plan, allocation failure, or rejected Metal commands.
+    /// Returns an error for invalid plans, allocation failures, or rejected commands.
     pub fn execute_frame(
         &mut self,
         surface: Option<FrameSurface<'_>>,
         actions: &[NativeFrameAction<'_>],
+        capture_presented: bool,
+    ) -> Result<Vec<Vec<u8>>, HalError> {
+        self.execute_frame_source(surface, &actions, capture_presented)
+    }
+
+    /// Records a synchronous source without retaining borrowed native views.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::execute_frame`].
+    pub fn execute_frame_source(
+        &mut self,
+        surface: Option<FrameSurface<'_>>,
+        actions: &impl super::NativeFrameActionSource,
         capture_presented: bool,
     ) -> Result<Vec<Vec<u8>>, HalError> {
         if actions.is_empty() {
@@ -941,16 +985,16 @@ impl NativeContext {
             self.validate_frame_plan(&mut surface, extent, actions, capture_presented)?;
         // A failed producer must be rejected before allocating frame resources or queuing
         // an event wait that could otherwise remain permanently unsignaled.
-        if let Some(required) = actions
-            .iter()
-            .filter_map(|action| match action {
-                NativeFrameAction::Wait(token) if token.queue == QueueKind::TextureTransfer => {
-                    Some(token.value)
-                }
-                _ => None,
-            })
-            .max()
-        {
+        let mut required = None::<u64>;
+        actions.visit(&mut |_, action| {
+            if let NativeFrameAction::Wait(token) = action
+                && token.queue == QueueKind::TextureTransfer
+            {
+                required = Some(required.map_or(token.value, |value| value.max(token.value)));
+            }
+            Ok(())
+        })?;
+        if let Some(required) = required {
             self.texture_worker
                 .as_ref()
                 .ok_or(HalError::NotReady)?
@@ -976,6 +1020,7 @@ impl NativeContext {
                 for (allocation, _, _, _, _) in readbacks {
                     let _ = self.free(allocation);
                 }
+                self.reclaim_prepared_scratch(slot_index, prepared_arguments);
                 return Err(error);
             }
         };
@@ -984,17 +1029,19 @@ impl NativeContext {
             for (allocation, _, _, _, _) in readbacks {
                 let _ = self.free(allocation);
             }
+            self.reclaim_prepared_scratch(slot_index, prepared_arguments);
             return Err(HalError::NativeFailure);
         };
         // Encode waits before opening any encoder. Updates have already committed their
         // graphics release marker, so this cannot wait ahead of its own producer.
-        for action in actions {
+        actions.visit(&mut |_, action| {
             if let NativeFrameAction::Wait(token) = action
                 && token.queue == QueueKind::TextureTransfer
             {
                 command.encodeWaitForEvent_value(&self.texture_completion_event, token.value);
             }
-        }
+            Ok(())
+        })?;
         let mut encoder = MetalFrameEncoder {
             command: &command,
             surface: surface.as_deref(),
@@ -1010,7 +1057,7 @@ impl NativeContext {
             readback_index: 0,
         };
         let recording_result = (|| -> Result<(), HalError> {
-            for (action_index, action) in actions.iter().enumerate() {
+            actions.visit(&mut |action_index, action| {
                 match action {
                     NativeFrameAction::Wait(_) => {}
                     NativeFrameAction::Barrier { barrier, resource } => {
@@ -1077,7 +1124,8 @@ impl NativeContext {
                     }
                     NativeFrameAction::Present => encoder.present(capture_presented)?,
                 }
-            }
+                Ok(())
+            })?;
             if encoder.render_encoder.is_some()
                 || encoder.presented != presents
                 || encoder.readback_index != readbacks.len()
@@ -1086,6 +1134,9 @@ impl NativeContext {
             }
             Ok(())
         })();
+        // Encoder borrows end with the recording closure, so scratch returns to
+        // the slot on both exits; readback failures below never lose capacity.
+        self.reclaim_prepared_scratch(slot_index, prepared_arguments);
         if let Err(error) = recording_result {
             for (allocation, _, _, _, _) in readbacks {
                 let _ = self.free(allocation);

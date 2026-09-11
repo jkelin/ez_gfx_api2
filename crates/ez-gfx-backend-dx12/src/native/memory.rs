@@ -360,7 +360,12 @@ pub(super) fn map_windows(_: windows::core::Error) -> HalError {
     HalError::NativeFailure
 }
 pub(super) fn map_allocation_windows(error: &windows::core::Error) -> AllocationError {
-    if error.code() == windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED {
+    if matches!(
+        error.code(),
+        windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED
+            | windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_RESET
+            | windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_HUNG
+    ) {
         AllocationError::DeviceLost
     } else {
         AllocationError::NativeFailure

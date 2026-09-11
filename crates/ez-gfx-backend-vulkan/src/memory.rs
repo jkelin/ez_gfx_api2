@@ -1,8 +1,9 @@
 use super::{
     AllocationCreateDesc, AllocationError, AllocationRequest, AllocationScheme, BufferTransfer,
-    CompletionToken, DeferredResource, FRAME_DESCRIPTOR_SET_CAPACITY, FRAMES_IN_FLIGHT, FrameSlot,
-    HalError, MemoryAllocator, MemoryClass, MemoryLocation, NativeAllocation, NativeContext,
-    QueueKind, ResourceAccess, ResourceState, RetiredAllocation, ShaderStage,
+    CompletionToken, DeferredResource, FRAMES_IN_FLIGHT, FrameSlot, HalError,
+    MAX_FRAME_DESCRIPTOR_SETS, MAX_FRAME_DESCRIPTORS, MemoryAllocator, MemoryClass, MemoryLocation,
+    NativeAllocation, NativeContext, QueueKind, ResourceAccess, ResourceState, RetiredAllocation,
+    ShaderStage,
     transfer::{VulkanTransferCopy, VulkanTransferJob},
     vk,
 };
@@ -515,10 +516,66 @@ pub(super) fn create_frame_slots(
     Ok(slots)
 }
 
+/// Creates one frame-slot descriptor pool with explicit set/descriptor sizes.
+pub(super) fn create_descriptor_pool(
+    device: &ash::Device,
+    sets: u32,
+    descriptors: u32,
+) -> Result<vk::DescriptorPool, HalError> {
+    // SAFETY: the DescriptorPoolSize and create-info storage remain allocated throughout create_descriptor_pool, and the caller guarantees nonzero counts.
+    unsafe {
+        device.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default()
+                .max_sets(sets)
+                .pool_sizes(core::slice::from_ref(
+                    &vk::DescriptorPoolSize::default()
+                        .ty(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(descriptors),
+                )),
+            None,
+        )
+    }
+    .map_err(map_vk)
+}
+
+/// Computes demand-driven pool growth: doubles toward `needed`, capped at ceiling.
+///
+/// Sets and descriptors grow independently from their current sizes. A zero
+/// current size means the pool is still deferred; growth then starts from one.
+/// Returning the current sizes means no recreation is needed.
 ///
 /// # Errors
 ///
-/// Returns an error if Vulkan fails to create the command pool, allocate the command buffer, or create a semaphore, fence, or descriptor pool.
+/// Returns `HalError::InvalidArgument` when either need exceeds its documented
+/// ceiling instead of letting the frame exhaust the pool mid-allocation.
+pub(super) fn next_descriptor_capacity(
+    current_sets: u32,
+    current_descriptors: u32,
+    needed_sets: u32,
+    needed_descriptors: u32,
+) -> Result<(u32, u32), HalError> {
+    // Doubling starts from at least one: a zero current capacity means the pool
+    // is still deferred, and the first growth lands at or just above the need.
+    if needed_sets > MAX_FRAME_DESCRIPTOR_SETS || needed_descriptors > MAX_FRAME_DESCRIPTORS {
+        return Err(HalError::InvalidArgument);
+    }
+    let mut sets = current_sets.max(1);
+    while sets < needed_sets {
+        sets = sets.saturating_mul(2).min(MAX_FRAME_DESCRIPTOR_SETS);
+    }
+    let mut descriptors = current_descriptors.max(1);
+    while descriptors < needed_descriptors {
+        descriptors = descriptors.saturating_mul(2).min(MAX_FRAME_DESCRIPTORS);
+    }
+    Ok((sets, descriptors))
+}
+
+/// Creates one frame slot with a deferred descriptor pool and empty CPU scratch.
+///
+/// The pool stays null until the first preflight that needs a pipeline set;
+/// set-less frames never pay for one.
+///
+/// Returns an error if Vulkan fails to create the command pool, allocate the command buffer, or create a semaphore or fence.
 pub(super) fn create_frame_slot(
     device: &ash::Device,
     queue_family: u32,
@@ -564,35 +621,22 @@ pub(super) fn create_frame_slot(
                 return Err(map_vk(error));
             }
         };
-        // SAFETY: the DescriptorPoolSize and create-info storage remain allocated throughout create_descriptor_pool, and their declared counts are nonzero.
-        let descriptor_pool = match unsafe {
-            device.create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(FRAME_DESCRIPTOR_SET_CAPACITY)
-                    .pool_sizes(core::slice::from_ref(
-                        &vk::DescriptorPoolSize::default()
-                            .ty(vk::DescriptorType::STORAGE_BUFFER)
-                            .descriptor_count(FRAME_DESCRIPTOR_SET_CAPACITY * 4),
-                    )),
-                None,
-            )
-        } {
-            Ok(value) => value,
-            Err(error) => {
-                // SAFETY: fence and available were created with allocator None and never submitted.
-                unsafe {
-                    device.destroy_fence(fence, None);
-                    device.destroy_semaphore(available, None);
-                }
-                return Err(map_vk(error));
-            }
-        };
+        // The descriptor pool starts uncreated: the first preflight that needs a
+        // pipeline set creates it at the exact requirement, and set-less frames
+        // never pay for a pool at all.
         Ok(FrameSlot {
             command_pool: pool,
             command_buffer: command,
             image_available: available,
             fence,
-            descriptor_pool,
+            descriptor_pool: vk::DescriptorPool::null(),
+            descriptor_sets_capacity: 0,
+            descriptor_count_capacity: 0,
+            descriptor_sets_high_water: 0,
+            descriptor_count_high_water: 0,
+            public_sets_scratch: Vec::new(),
+            descriptor_info_scratch: Vec::new(),
+            descriptor_write_scratch: Vec::new(),
             in_flight: false,
             submission_value: 0,
         })
@@ -612,9 +656,11 @@ pub(super) fn destroy_frame_slot(device: &ash::Device, slot: &FrameSlot) {
         descriptor_pool,
         ..
     } = slot;
-    // SAFETY: callers use destroy_frame_slot only before submission or after device idle; destroying the pool releases command_buffer, and every listed handle uses allocator None.
+    // SAFETY: callers use destroy_frame_slot only before submission or after device idle; destroying the pool releases command_buffer, and every listed handle uses allocator None. A null pool was deferred and never created.
     unsafe {
-        device.destroy_descriptor_pool(*descriptor_pool, None);
+        if *descriptor_pool != vk::DescriptorPool::null() {
+            device.destroy_descriptor_pool(*descriptor_pool, None);
+        }
         device.destroy_fence(*fence, None);
         device.destroy_semaphore(*image_available, None);
         device.destroy_command_pool(*command_pool, None);
@@ -632,5 +678,60 @@ pub(super) fn map_vk(error: vk::Result) -> HalError {
         | vk::Result::ERROR_FEATURE_NOT_PRESENT
         | vk::Result::ERROR_INCOMPATIBLE_DRIVER => HalError::Unsupported,
         _ => HalError::NativeFailure,
+    }
+}
+
+#[cfg(test)]
+mod descriptor_capacity_tests {
+    use super::{MAX_FRAME_DESCRIPTOR_SETS, MAX_FRAME_DESCRIPTORS, next_descriptor_capacity};
+    use crate::HalError;
+
+    #[test]
+    fn sufficient_capacity_needs_no_recreation() {
+        assert_eq!(
+            next_descriptor_capacity(1024, 4096, 3, 12),
+            Ok((1024, 4096))
+        );
+        assert_eq!(
+            next_descriptor_capacity(1024, 4096, 1024, 4096),
+            Ok((1024, 4096))
+        );
+    }
+
+    #[test]
+    fn growth_doubles_toward_need_per_dimension() {
+        // Sets need two doublings, descriptors need one; each stops at its need.
+        assert_eq!(
+            next_descriptor_capacity(1024, 4096, 3000, 5000),
+            Ok((4096, 8192))
+        );
+    }
+
+    #[test]
+    fn needs_at_ceiling_are_admitted() {
+        assert_eq!(
+            next_descriptor_capacity(1024, 4096, MAX_FRAME_DESCRIPTOR_SETS, MAX_FRAME_DESCRIPTORS),
+            Ok((MAX_FRAME_DESCRIPTOR_SETS, MAX_FRAME_DESCRIPTORS))
+        );
+    }
+
+    #[test]
+    fn needs_beyond_ceiling_fail_fast() {
+        assert_eq!(
+            next_descriptor_capacity(1024, 4096, MAX_FRAME_DESCRIPTOR_SETS + 1, 1).map(|_| ()),
+            Err(HalError::InvalidArgument)
+        );
+        assert_eq!(
+            next_descriptor_capacity(1024, 4096, 1, MAX_FRAME_DESCRIPTORS + 1).map(|_| ()),
+            Err(HalError::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn deferred_capacity_grows_from_zero_to_need() {
+        // A zero current capacity means the pool was never created; the first
+        // growth doubles from one to cover a small triangle frame.
+        assert_eq!(next_descriptor_capacity(0, 0, 1, 2), Ok((1, 2)));
+        assert_eq!(next_descriptor_capacity(0, 0, 0, 0), Ok((1, 1)));
     }
 }

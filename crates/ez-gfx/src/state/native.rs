@@ -1,3 +1,5 @@
+use core::ops::Range;
+
 use super::{
     AllocationRequest, BufferTransfer, COUNTER_BUFFER_ELEMENT_OFFSET, CompletionToken,
     ContextIdentity, Error, GeometryAllocation, GeometryError, HalError, HashMap, LifecycleError,
@@ -98,217 +100,257 @@ pub(super) fn pipeline_layout_key(
     key
 }
 
-pub(super) fn vulkan_bindings<'a>(
-    layout: &ez_gfx_runtime::binding::ReflectedBindings,
-    bindings: &[ez_gfx_runtime::binding::PublicBinding],
-    allocations: &'a HashMap<PackedHandle, (u64, NativeAllocation)>,
-    vertex_heaps: &'a HashMap<String, GeometryAllocation>,
-) -> std::result::Result<Vec<ez_gfx_backend_vulkan::NativeBufferBinding<'a>>, HalError> {
-    let mut native = Vec::new();
-    for requirement in layout.requirements() {
-        if requirement.kind == ez_gfx_runtime::binding::BindingKind::VertexHeap {
-            if requirement.descriptor_count != 1 {
-                return Err(HalError::Unsupported);
-            }
-            let heap = vertex_heaps
-                .get(&requirement.name)
-                .ok_or(HalError::InvalidArgument)?;
-            #[cfg(not(any(windows, target_vendor = "apple")))]
-            let NativeAllocation::Vulkan(allocation) = &heap.allocation;
-            #[cfg(any(windows, target_vendor = "apple"))]
-            let NativeAllocation::Vulkan(allocation) = &heap.allocation else {
-                return Err(HalError::InvalidArgument);
-            };
-            native.push(ez_gfx_backend_vulkan::NativeBufferBinding {
-                allocation,
-                offset: 0,
-                range: heap.size,
-                writable: requirement.writable,
-            });
-            continue;
-        }
-        let public = bindings
-            .iter()
-            .find(|binding| binding.name == requirement.name)
-            .ok_or(HalError::InvalidArgument)?;
-        let handle = match public.resource {
-            ez_gfx_runtime::binding::ResourceIdentity::Buffer(handle)
-                if requirement.kind == ez_gfx_runtime::binding::BindingKind::Buffer
-                    && requirement.descriptor_count == 1 =>
-            {
-                handle.packed()
-            }
-            ez_gfx_runtime::binding::ResourceIdentity::Counter(handle)
-                if requirement.kind == ez_gfx_runtime::binding::BindingKind::CounterBuffer
-                    && requirement.descriptor_count == 2 =>
-            {
-                handle.packed()
-            }
-            _ => return Err(HalError::Unsupported),
-        };
-        let (size, allocation) = allocations.get(&handle).ok_or(HalError::InvalidArgument)?;
-        #[cfg(not(any(windows, target_vendor = "apple")))]
-        let NativeAllocation::Vulkan(allocation) = allocation;
-        #[cfg(any(windows, target_vendor = "apple"))]
-        let NativeAllocation::Vulkan(allocation) = allocation else {
-            return Err(HalError::InvalidArgument);
-        };
-        if requirement.descriptor_count == 2 {
-            let command_size = size
-                .checked_sub(COUNTER_BUFFER_ELEMENT_OFFSET)
-                .ok_or(HalError::InvalidArgument)?;
-            native.push(ez_gfx_backend_vulkan::NativeBufferBinding {
-                allocation,
-                offset: 0,
-                range: 4,
-                writable: requirement.writable,
-            });
-            native.push(ez_gfx_backend_vulkan::NativeBufferBinding {
-                allocation,
-                offset: COUNTER_BUFFER_ELEMENT_OFFSET,
-                range: command_size,
-                writable: requirement.writable,
-            });
-        } else {
-            native.push(ez_gfx_backend_vulkan::NativeBufferBinding {
-                allocation,
-                offset: 0,
-                range: *size,
-                writable: requirement.writable,
-            });
-        }
-    }
-    Ok(native)
+#[derive(Clone, Copy)]
+pub(super) enum FrameBindingResource {
+    Allocation(PackedHandle),
+    VertexHeap(u32),
 }
 
-#[cfg(target_vendor = "apple")]
-pub(super) fn metal_bindings<'a>(
+#[derive(Clone, Copy)]
+pub(super) struct FrameBufferBindingRecord {
+    pub(super) resource: FrameBindingResource,
+    pub(super) offset: u64,
+    pub(super) range: u64,
+    pub(super) writable: bool,
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    pub(super) index: usize,
+}
+
+pub(super) fn frame_bindings(
     layout: &ez_gfx_runtime::binding::ReflectedBindings,
-    bindings: &[ez_gfx_runtime::binding::PublicBinding],
-    allocations: &'a HashMap<PackedHandle, (u64, NativeAllocation)>,
-    vertex_heaps: &'a HashMap<String, GeometryAllocation>,
-) -> std::result::Result<Vec<ez_gfx_backend_metal::native::NativeBufferBinding<'a>>, HalError> {
-    let mut native = Vec::new();
+    bindings: &[ez_gfx_runtime::binding::ResourceIdentity],
+    allocations: &HashMap<PackedHandle, (u64, NativeAllocation)>,
+    vertex_heaps: &HashMap<String, GeometryAllocation>,
+    scratch: &mut Vec<FrameBufferBindingRecord>,
+) -> std::result::Result<Range<usize>, HalError> {
+    append_frame_bindings(
+        layout,
+        bindings,
+        |handle| allocations.get(&handle).map(|(size, _)| *size),
+        |name| {
+            vertex_heaps
+                .get(name)
+                .and_then(|heap| heap.heap_id.map(|id| (id, heap.size)))
+        },
+        scratch,
+    )
+}
+
+fn append_frame_bindings(
+    layout: &ez_gfx_runtime::binding::ReflectedBindings,
+    bindings: &[ez_gfx_runtime::binding::ResourceIdentity],
+    mut allocation_size: impl FnMut(PackedHandle) -> Option<u64>,
+    mut vertex_heap: impl FnMut(&str) -> Option<(u32, u64)>,
+    scratch: &mut Vec<FrameBufferBindingRecord>,
+) -> std::result::Result<Range<usize>, HalError> {
+    let start = scratch.len();
+    scratch.reserve(layout.requirements().len().saturating_mul(2));
+    let mut bindings = bindings.iter();
     for requirement in layout.requirements() {
         if requirement.kind == ez_gfx_runtime::binding::BindingKind::VertexHeap {
             if requirement.descriptor_count != 1 {
                 return Err(HalError::Unsupported);
             }
-            let heap = vertex_heaps
-                .get(&requirement.name)
-                .ok_or(HalError::InvalidArgument)?;
-            let NativeAllocation::Metal(allocation) = &heap.allocation else {
-                return Err(HalError::InvalidArgument);
-            };
-            native.push(ez_gfx_backend_metal::native::NativeBufferBinding {
-                allocation,
+            let (heap_id, size) =
+                vertex_heap(&requirement.name).ok_or(HalError::InvalidArgument)?;
+            scratch.push(FrameBufferBindingRecord {
+                resource: FrameBindingResource::VertexHeap(heap_id),
                 offset: 0,
+                range: size,
+                writable: requirement.writable,
                 index: requirement.binding as usize,
             });
             continue;
         }
-        let public = bindings
-            .iter()
-            .find(|binding| binding.name == requirement.name)
-            .ok_or(HalError::InvalidArgument)?;
-        let (handle, count) = match public.resource {
+        let resource = *bindings.next().ok_or(HalError::InvalidArgument)?;
+        let handle = match resource {
             ez_gfx_runtime::binding::ResourceIdentity::Buffer(handle)
                 if requirement.kind == ez_gfx_runtime::binding::BindingKind::Buffer
                     && requirement.descriptor_count == 1 =>
             {
-                (handle.packed(), 1)
+                handle.packed()
             }
             ez_gfx_runtime::binding::ResourceIdentity::Counter(handle)
                 if requirement.kind == ez_gfx_runtime::binding::BindingKind::CounterBuffer
                     && requirement.descriptor_count == 2 =>
             {
-                (handle.packed(), 2)
+                handle.packed()
             }
             _ => return Err(HalError::Unsupported),
         };
-        let (_, allocation) = allocations.get(&handle).ok_or(HalError::InvalidArgument)?;
-        let NativeAllocation::Metal(allocation) = allocation else {
-            return Err(HalError::InvalidArgument);
-        };
-        for descriptor in 0..count {
+        let size = allocation_size(handle).ok_or(HalError::InvalidArgument)?;
+        for descriptor in 0..requirement.descriptor_count {
             let offset = if descriptor == 0 {
                 0
             } else {
-                usize::try_from(COUNTER_BUFFER_ELEMENT_OFFSET)
-                    .map_err(|_| HalError::InvalidArgument)?
+                COUNTER_BUFFER_ELEMENT_OFFSET
             };
-            native.push(ez_gfx_backend_metal::native::NativeBufferBinding {
-                allocation,
+            let range = if requirement.descriptor_count == 2 {
+                if descriptor == 0 {
+                    4
+                } else {
+                    size.checked_sub(offset).ok_or(HalError::InvalidArgument)?
+                }
+            } else {
+                size
+            };
+            scratch.push(FrameBufferBindingRecord {
+                resource: FrameBindingResource::Allocation(handle),
                 offset,
-                index: requirement.binding as usize + descriptor,
+                range,
+                writable: requirement.writable,
+                index: requirement.binding as usize + descriptor as usize,
             });
         }
     }
-    Ok(native)
+    if bindings.next().is_some() {
+        return Err(HalError::InvalidArgument);
+    }
+    Ok(start..scratch.len())
+}
+
+pub(super) fn prepare_frame_binding_scratch(
+    payloads: &[super::ExecutableNode],
+    binding_resources: &[ez_gfx_runtime::binding::ResourceIdentity],
+    allocations: &HashMap<PackedHandle, (u64, NativeAllocation)>,
+    vertex_heaps: &HashMap<String, GeometryAllocation>,
+    scratch: &mut Vec<FrameBufferBindingRecord>,
+    ranges: &mut Vec<Range<usize>>,
+) -> std::result::Result<(), HalError> {
+    scratch.clear();
+    ranges.clear();
+    ranges.reserve(payloads.len());
+    for payload in payloads {
+        let range = match payload {
+            super::ExecutableNode::Graphics {
+                layout, bindings, ..
+            }
+            | super::ExecutableNode::Compute {
+                layout, bindings, ..
+            } => frame_bindings(
+                layout,
+                binding_resources
+                    .get(bindings.clone())
+                    .ok_or(HalError::InvalidArgument)?,
+                allocations,
+                vertex_heaps,
+                scratch,
+            )?,
+            super::ExecutableNode::TextureReadback { .. }
+            | super::ExecutableNode::RenderTargetReadback { .. }
+            | super::ExecutableNode::Present { .. } => scratch.len()..scratch.len(),
+        };
+        ranges.push(range);
+    }
+    Ok(())
+}
+
+pub(super) struct FrameBindingSource<'a> {
+    pub(super) records: &'a [FrameBufferBindingRecord],
+    pub(super) allocations: &'a HashMap<PackedHandle, (u64, NativeAllocation)>,
+    pub(super) vertex_heaps: &'a HashMap<String, GeometryAllocation>,
+}
+
+impl FrameBindingSource<'_> {
+    fn allocation(&self, resource: FrameBindingResource) -> std::result::Result<&NativeAllocation, HalError> {
+        match resource {
+            FrameBindingResource::Allocation(handle) => self
+                .allocations
+                .get(&handle)
+                .map(|(_, allocation)| allocation)
+                .ok_or(HalError::InvalidArgument),
+            FrameBindingResource::VertexHeap(heap_id) => self
+                .vertex_heaps
+                .values()
+                .find(|heap| heap.heap_id == Some(heap_id))
+                .map(|heap| &heap.allocation)
+                .ok_or(HalError::InvalidArgument),
+        }
+    }
+}
+
+impl ez_gfx_backend_vulkan::NativeBufferBindingSource for FrameBindingSource<'_> {
+    fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(
+            usize,
+            &ez_gfx_backend_vulkan::NativeBufferBinding<'_>,
+        ) -> std::result::Result<(), HalError>,
+    ) -> std::result::Result<(), HalError> {
+        for (index, record) in self.records.iter().enumerate() {
+            #[cfg(not(any(windows, target_vendor = "apple")))]
+            let NativeAllocation::Vulkan(allocation) = self.allocation(record.resource)?;
+            #[cfg(any(windows, target_vendor = "apple"))]
+            let NativeAllocation::Vulkan(allocation) = self.allocation(record.resource)? else {
+                return Err(HalError::InvalidArgument);
+            };
+            visitor(index, &ez_gfx_backend_vulkan::NativeBufferBinding {
+                allocation,
+                offset: record.offset,
+                range: record.range,
+                writable: record.writable,
+            })?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
-pub(super) fn dx12_bindings<'a>(
-    layout: &ez_gfx_runtime::binding::ReflectedBindings,
-    bindings: &[ez_gfx_runtime::binding::PublicBinding],
-    allocations: &'a HashMap<PackedHandle, (u64, NativeAllocation)>,
-    vertex_heaps: &'a HashMap<String, GeometryAllocation>,
-) -> std::result::Result<Vec<ez_gfx_backend_dx12::native::NativeBufferBinding<'a>>, HalError> {
-    let mut native = Vec::new();
-    for requirement in layout.requirements() {
-        if requirement.kind == ez_gfx_runtime::binding::BindingKind::VertexHeap {
-            if requirement.descriptor_count != 1 {
-                return Err(HalError::Unsupported);
-            }
-            let heap = vertex_heaps
-                .get(&requirement.name)
-                .ok_or(HalError::InvalidArgument)?;
-            let NativeAllocation::Dx12(allocation) = &heap.allocation else {
+impl ez_gfx_backend_dx12::native::NativeBufferBindingSource for FrameBindingSource<'_> {
+    fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(
+            usize,
+            &ez_gfx_backend_dx12::native::NativeBufferBinding<'_>,
+        ) -> std::result::Result<(), HalError>,
+    ) -> std::result::Result<(), HalError> {
+        for (index, record) in self.records.iter().enumerate() {
+            let NativeAllocation::Dx12(allocation) = self.allocation(record.resource)? else {
                 return Err(HalError::InvalidArgument);
             };
-            native.push(ez_gfx_backend_dx12::native::NativeBufferBinding {
+            visitor(index, &ez_gfx_backend_dx12::native::NativeBufferBinding {
                 allocation,
-                offset: 0,
-                writable: requirement.writable,
-            });
-            continue;
+                offset: record.offset,
+                writable: record.writable,
+            })?;
         }
-        let public = bindings
-            .iter()
-            .find(|binding| binding.name == requirement.name)
-            .ok_or(HalError::InvalidArgument)?;
-        let (handle, count) = match public.resource {
-            ez_gfx_runtime::binding::ResourceIdentity::Buffer(handle)
-                if requirement.kind == ez_gfx_runtime::binding::BindingKind::Buffer
-                    && requirement.descriptor_count == 1 =>
-            {
-                (handle.packed(), 1)
-            }
-            ez_gfx_runtime::binding::ResourceIdentity::Counter(handle)
-                if requirement.kind == ez_gfx_runtime::binding::BindingKind::CounterBuffer
-                    && requirement.descriptor_count == 2 =>
-            {
-                (handle.packed(), 2)
-            }
-            _ => return Err(HalError::Unsupported),
-        };
-        let (_, allocation) = allocations.get(&handle).ok_or(HalError::InvalidArgument)?;
-        let NativeAllocation::Dx12(allocation) = allocation else {
-            return Err(HalError::InvalidArgument);
-        };
-        for descriptor in 0..count {
-            native.push(ez_gfx_backend_dx12::native::NativeBufferBinding {
-                allocation,
-                offset: if descriptor == 0 {
-                    0
-                } else {
-                    COUNTER_BUFFER_ELEMENT_OFFSET
-                },
-                writable: requirement.writable,
-            });
-        }
+        Ok(())
     }
-    Ok(native)
+}
+
+#[cfg(target_vendor = "apple")]
+impl ez_gfx_backend_metal::native::NativeBufferBindingSource for FrameBindingSource<'_> {
+    fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(
+            usize,
+            &ez_gfx_backend_metal::native::NativeBufferBinding<'_>,
+        ) -> std::result::Result<(), HalError>,
+    ) -> std::result::Result<(), HalError> {
+        for (index, record) in self.records.iter().enumerate() {
+            let NativeAllocation::Metal(allocation) = self.allocation(record.resource)? else {
+                return Err(HalError::InvalidArgument);
+            };
+            visitor(index, &ez_gfx_backend_metal::native::NativeBufferBinding {
+                allocation,
+                offset: usize::try_from(record.offset).map_err(|_| HalError::InvalidArgument)?,
+                index: record.index,
+            })?;
+        }
+        Ok(())
+    }
 }
 
 pub(super) fn wait_native_idle(context: &mut NativeContext) -> std::result::Result<(), HalError> {
@@ -358,6 +400,16 @@ pub(super) fn last_native_frame_completion(
         NativeContext::Metal(context) => context.last_frame_completion(),
     }
     .ok_or(Error::NativeFailure)
+}
+
+pub(super) fn native_device_initialized(context: &NativeContext) -> bool {
+    match context {
+        NativeContext::Vulkan(context) => context.adapter_info().is_some(),
+        #[cfg(windows)]
+        NativeContext::Dx12(_) => true,
+        #[cfg(target_vendor = "apple")]
+        NativeContext::Metal(_) => true,
+    }
 }
 
 pub(super) fn allocate_native(
@@ -578,5 +630,232 @@ pub(super) fn map_hal(error: HalError) -> Error {
         HalError::NotReady => Error::NotReady,
         HalError::DeviceLost => Error::DeviceLost,
         HalError::OutOfMemory | HalError::NativeFailure => Error::NativeFailure,
+    }
+}
+
+#[cfg(test)]
+mod binding_scratch_tests {
+    use super::append_frame_bindings;
+    use crate::state::frame::BindingProjection;
+    use ez_gfx_artifact::Stage;
+    use ez_gfx_core::{
+        Backend,
+        handle::{BufferHandle, LocalHandle, PackedHandle, ShaderHandle},
+    };
+    use ez_gfx_hal::QueueKind;
+    use ez_gfx_runtime::{
+        binding::{PublicBinding, ReflectedBindings, ResourceIdentity},
+        frame::{ExecutableNode, FrameRecorder},
+        graph::NodeDesc,
+    };
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    struct CountingAllocator;
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: the unchanged request is delegated to the system allocator.
+            let pointer = unsafe { System.alloc(layout) };
+            if ENABLED.load(Ordering::Relaxed) && !pointer.is_null() {
+                CALLS.fetch_add(1, Ordering::Relaxed);
+            }
+            pointer
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            // SAFETY: the pointer and layout came from the system allocator above.
+            unsafe { System.dealloc(pointer, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    #[test]
+    fn more_than_64_bindings_are_accepted_without_warmed_allocations() {
+        let parameters = (0..65)
+            .map(|index| {
+                format!(
+                    r#"{{"semantic_name":"buffer{index}","api_kind":"buffer","binding_index":{index},"binding_space":0}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let metadata = format!(
+            r#"{{"reflections":[{{"target":"Spirv","entry":"main","stage":"Compute","reflection":{{"parameters":[{parameters}]}}}}]}}"#
+        );
+        let layout =
+            ReflectedBindings::parse(metadata.as_bytes(), Backend::Vulkan, "main", Stage::Compute)
+                .unwrap();
+        let public_bindings = (0..65)
+            .map(|index| {
+                let packed = PackedHandle::child(
+                    LocalHandle::new(1, 1).unwrap(),
+                    LocalHandle::new(index + 1, 1).unwrap(),
+                )
+                .unwrap();
+                PublicBinding {
+                    name: format!("buffer{index}"),
+                    resource: ResourceIdentity::Buffer(BufferHandle::from_packed(packed).unwrap()),
+                }
+            })
+            .collect::<Vec<_>>();
+        let bindings = BindingProjection::new(&layout, &public_bindings)
+            .resources()
+            .collect::<Vec<_>>();
+        let mut scratch = Vec::new();
+        append_frame_bindings(&layout, &bindings, |_| Some(1024), |_| None, &mut scratch)
+            .unwrap();
+        assert_eq!(scratch.len(), 65);
+
+        CALLS.store(0, Ordering::Relaxed);
+        ENABLED.store(true, Ordering::Relaxed);
+        for _ in 0..500 {
+            scratch.clear();
+            append_frame_bindings(&layout, &bindings, |_| Some(1024), |_| None, &mut scratch)
+                .unwrap();
+        }
+        ENABLED.store(false, Ordering::Relaxed);
+        assert_eq!(CALLS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn warmed_more_than_64_binding_execution_recording_performs_no_allocations() {
+        let parameters = (0..65)
+            .map(|index| {
+                format!(
+                    r#"{{"semantic_name":"buffer{index}","api_kind":"buffer","binding_index":{index},"binding_space":0}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let metadata = format!(
+            r#"{{"reflections":[{{"target":"Spirv","entry":"main","stage":"Compute","reflection":{{"parameters":[{parameters}]}}}}]}}"#
+        );
+        let layout =
+            ReflectedBindings::parse(metadata.as_bytes(), Backend::Vulkan, "main", Stage::Compute)
+                .unwrap();
+        let mut bindings = (0..65)
+            .map(|index| PublicBinding {
+                name: format!("buffer{index}"),
+                resource: ResourceIdentity::Buffer(
+                    BufferHandle::from_packed(
+                        PackedHandle::child(
+                            LocalHandle::new(1, 1).unwrap(),
+                            LocalHandle::new(index + 1, 1).unwrap(),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                ),
+            })
+            .collect::<Vec<_>>();
+        let shader = ShaderHandle::from_packed(
+            PackedHandle::child(
+                LocalHandle::new(1, 1).unwrap(),
+                LocalHandle::new(100, 1).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut recorder = FrameRecorder::new(1).unwrap();
+        let baseline_retained = recorder.workspace_stats().retained_bytes;
+        for _ in 0..4 {
+            recorder.begin().unwrap();
+            let projection = BindingProjection::new(&layout, &bindings);
+            projection.validate().unwrap();
+            let payload_layout = layout.clone();
+            recorder
+                .record_bound_node(
+                    NodeDesc::new("compute", QueueKind::Compute),
+                    projection.resources(),
+                    move |bindings| ExecutableNode::Compute {
+                        shader,
+                        groups: [1, 1, 1],
+                        bindings,
+                        layout: payload_layout,
+                    },
+                )
+                .unwrap();
+            recorder.abort();
+        }
+
+        CALLS.store(0, Ordering::Relaxed);
+        ENABLED.store(true, Ordering::Relaxed);
+        for _ in 0..500 {
+            recorder.begin().unwrap();
+            let projection = BindingProjection::new(&layout, &bindings);
+            projection.validate().unwrap();
+            let payload_layout = layout.clone();
+            recorder
+                .record_bound_node(
+                    NodeDesc::new("compute", QueueKind::Compute),
+                    projection.resources(),
+                    move |bindings| ExecutableNode::Compute {
+                        shader,
+                        groups: [1, 1, 1],
+                        bindings,
+                        layout: payload_layout,
+                    },
+                )
+                .unwrap();
+            recorder.abort();
+        }
+        ENABLED.store(false, Ordering::Relaxed);
+        assert_eq!(CALLS.load(Ordering::Relaxed), 0);
+
+        let original = bindings[0].resource;
+        recorder.begin().unwrap();
+        for _ in 0..1 {
+            let projection = BindingProjection::new(&layout, &bindings);
+            let payload_layout = layout.clone();
+            recorder
+                .record_bound_node(
+                    NodeDesc::new("compute-before-rebind", QueueKind::Compute),
+                    projection.resources(),
+                    move |bindings| ExecutableNode::Compute {
+                        shader,
+                        groups: [1, 1, 1],
+                        bindings,
+                        layout: payload_layout,
+                    },
+                )
+                .unwrap();
+        }
+        bindings[0].resource = ResourceIdentity::Buffer(
+            BufferHandle::from_packed(
+                PackedHandle::child(
+                    LocalHandle::new(1, 1).unwrap(),
+                    LocalHandle::new(99, 1).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let rebound = bindings[0].resource;
+        let projection = BindingProjection::new(&layout, &bindings);
+        let payload_layout = layout.clone();
+        recorder
+            .record_bound_node(
+                NodeDesc::new("compute-after-rebind", QueueKind::Compute),
+                projection.resources(),
+                move |bindings| ExecutableNode::Compute {
+                    shader,
+                    groups: [1, 1, 1],
+                    bindings,
+                    layout: payload_layout,
+                },
+            )
+            .unwrap();
+        let submission = recorder.submit().unwrap();
+        assert_eq!(submission.binding_resources[0], original);
+        assert_eq!(submission.binding_resources[65], rebound);
+        recorder.finish(submission).unwrap();
+        assert!(recorder.workspace_stats().retained_bytes > baseline_retained);
     }
 }

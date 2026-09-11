@@ -29,7 +29,6 @@ use ez_gfx_hal::{
     QueueKind, ResourceAccess, ResourceState, SURFACE_DEFAULT_CLEAR, ShaderStage, TextureFormat,
     TextureRegion, staging_bucket_size,
 };
-use ez_gfx_runtime::render::{ExecutionError, execute_compiled_graph};
 use ez_gfx_runtime::{
     AdapterCatalog, AdapterReport, AdapterSelection, ContextIdentity, ContextOptions,
     HeadlessSurfaceOptions, LifecycleError, ResourceKind, RuntimeError, SurfaceState,
@@ -126,6 +125,7 @@ enum PipelineKey {
     },
 }
 
+
 impl PipelineKey {
     fn involves_shader(&self, shader: ShaderHandle) -> bool {
         match self {
@@ -137,6 +137,28 @@ impl PipelineKey {
                 fragment_shader,
                 ..
             } => *vertex_shader == shader || *fragment_shader == shader,
+        }
+    }
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Compute { entry, layouts, .. } => entry.capacity().saturating_add(
+                layouts
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<ez_gfx_hal::ShaderBufferLayout>()),
+            ),
+            Self::Graphics {
+                vertex_entry,
+                fragment_entry,
+                layouts,
+                ..
+            } => vertex_entry
+                .capacity()
+                .saturating_add(fragment_entry.capacity())
+                .saturating_add(
+                    layouts
+                        .capacity()
+                        .saturating_mul(core::mem::size_of::<ez_gfx_hal::ShaderBufferLayout>()),
+                ),
         }
     }
 }
@@ -225,7 +247,11 @@ struct DecodedTextureJob {
 }
 
 struct AsyncTextureState {
-    pool: ez_gfx_assets::CpuPool,
+    /// Validated worker policy resolved at creation; the Rayon pool is built on
+    /// first decode so context creation never spawns threads for textureless use.
+    threads: usize,
+    /// Decode pool built lazily by `decode_pool`; `None` until first decode.
+    pool: Option<ez_gfx_assets::CpuPool>,
     ready_tx: crossbeam_channel::Sender<DecodedTextureJob>,
     ready_rx: crossbeam_channel::Receiver<DecodedTextureJob>,
     #[cfg(test)]
@@ -236,9 +262,9 @@ impl AsyncTextureState {
     fn new_with_workers(workers: u32) -> Result<Self> {
         // Zero preserves the historical default topology; an explicit count is
         // honored verbatim so embedders can pin decode concurrency. Counts above
-        // the pool admission cap fail here, before Rayon spawns one OS thread
-        // per worker, so both the Rust option and the C descriptor fail fast
-        // with InvalidArgument instead of grinding thread creation.
+        // the pool admission cap fail here, before any thread exists, so both the
+        // Rust option and the C descriptor fail fast with InvalidArgument instead
+        // of grinding thread creation. Pool construction itself waits for first use.
         let threads = if workers == 0 {
             std::thread::available_parallelism()
                 .map_or(2, usize::from)
@@ -253,7 +279,8 @@ impl AsyncTextureState {
         };
         let (ready_tx, ready_rx) = crossbeam_channel::unbounded();
         Ok(Self {
-            pool: ez_gfx_assets::CpuPool::new(threads).map_err(|_| Error::NativeFailure)?,
+            threads,
+            pool: None,
             ready_tx,
             ready_rx,
             #[cfg(test)]
@@ -261,15 +288,50 @@ impl AsyncTextureState {
         })
     }
 
-    #[cfg(test)]
+    /// Returns the decode pool, constructing it on the first decode.
+    ///
+    /// The count was validated at creation, so late construction only fails when
+    /// the OS refuses threads; that surfaces as `NativeFailure` at admission,
+    /// matching the previous eager-construction failure at the same boundary.
+    fn decode_pool(&mut self) -> Result<&ez_gfx_assets::CpuPool> {
+        if self.pool.is_none() {
+            let pool =
+                ez_gfx_assets::CpuPool::new(self.threads).map_err(|_| Error::NativeFailure)?;
+            self.pool = Some(pool);
+        }
+        // Inserted above when absent, so `None` is unreachable without a borrow break.
+        self.pool.as_ref().ok_or(Error::NativeFailure)
+    }
+
+    /// Builds the lazy decode pool before any admission that would need rollback.
+    ///
+    /// Callers must invoke this before registering registry, identity, or
+    /// pending-texture state: late OS thread refusal then fails with nothing to
+    /// unwind. The creator-thread model means no other thread can drop the pool
+    /// between this call and submission.
+    fn ensure_decode_pool(&mut self) -> Result<()> {
+        self.decode_pool().map(|_| ())
+    }
+    /// Cancels queued and future CPU work when a pool was ever built.
+    fn shutdown(&self) {
+        // An unbuilt pool owns no threads or jobs, so skipping shutdown preserves
+        // the lazy savings instead of constructing a pool only to cancel it.
+        if let Some(pool) = self.pool.as_ref() {
+            pool.shutdown();
+        }
+    }
+
+    /// Configured worker count; reports policy before the first decode builds the pool.
     fn worker_count(&self) -> usize {
-        self.pool.thread_count()
+        self.pool
+            .as_ref()
+            .map_or(self.threads, ez_gfx_assets::CpuPool::thread_count)
     }
 }
 
 impl Drop for AsyncTextureState {
     fn drop(&mut self) {
-        self.pool.shutdown();
+        self.shutdown();
     }
 }
 
@@ -326,6 +388,9 @@ struct ContextState {
     transient_buffers: HashMap<PackedHandle, TransientBuffer>,
     buffer_pool: HashMap<u32, ez_gfx_hal::ReusableStagingPool<NativeAllocation>>,
     counter_pool: ez_gfx_hal::ReusableStagingPool<NativeAllocation>,
+    /// Retained command/payload serialization buffer; cleared per counter write
+    /// so steady-state uploads reuse capacity instead of allocating per frame.
+    counter_scratch: Vec<u8>,
     render_targets: HashMap<RenderTargetHandle, render_target::RenderTargetRecord>,
     texture_formats: HashMap<TextureHandle, TextureFormat>,
     texture_published_mips: HashMap<TextureHandle, u32>,
@@ -357,7 +422,26 @@ struct ContextState {
     geometry_last_transfer: HashMap<PackedHandle, CompletionToken>,
     upload_events: UploadEventQueue,
     staging: ez_gfx_hal::ReusableStagingPool<NativeAllocation>,
+    /// Peak aggregate staging retention recorded at pool mutation boundaries.
+    ///
+    /// Telemetry reads this value without mutating state or reconstructing a
+    /// peak from per-pool maxima that may not have occurred simultaneously.
+    staging_high_water_bytes: u64,
     frame: FrameRecorder,
+    /// Reusable graph-indexed pipeline lookup storage for native lowering.
+    frame_pipeline_keys: Vec<Option<PipelineKey>>,
+    /// Reusable mapping from emitted native actions to frame-plan records.
+    frame_action_indices: Vec<usize>,
+    /// Reusable owned binding coordinates for synchronous native lowering.
+    frame_binding_scratch: Vec<native::FrameBufferBindingRecord>,
+    /// Binding ranges aligned with frame payloads.
+    frame_binding_ranges: Vec<core::ops::Range<usize>>,
+    #[cfg(target_vendor = "apple")]
+    /// Reusable Metal texture-heap metadata aligned with frame nodes.
+    frame_texture_heaps: Vec<Option<ez_gfx_hal::ShaderTextureHeapLayout>>,
+    #[cfg(target_vendor = "apple")]
+    /// Reusable Metal workgroup metadata aligned with frame nodes.
+    frame_workgroup_sizes: Vec<Option<[u32; 3]>>,
     frame_resources: HashMap<PackedHandle, ResourceId>,
     frame_vertex_heaps: HashMap<u32, ResourceId>,
     frame_serial: u64,
@@ -463,17 +547,14 @@ mod diagnostics;
 mod frame;
 mod geometry;
 mod native;
-#[cfg(windows)]
-use native::dx12_bindings;
-#[cfg(target_vendor = "apple")]
-use native::metal_bindings;
 use native::{
-    allocate_native, completed_native_frame_value, completed_texture_transfer_native,
-    completed_transfer_native, copy_native, destroy_native_texture, free_native_allocation,
-    last_native_frame_completion, map_allocation, map_frame, map_geometry, map_hal, map_lifecycle,
-    map_native_loss, map_texture, native_layouts, native_texture_compression, pipeline_layout_key,
-    poll_native_frame_completion, result_status, retire_native_allocation, vulkan_bindings,
-    wait_native_idle, write_native,
+    FrameBindingSource, FrameBufferBindingRecord, allocate_native,
+    completed_native_frame_value, completed_texture_transfer_native, completed_transfer_native,
+    copy_native, destroy_native_texture, free_native_allocation, last_native_frame_completion,
+    map_allocation, map_frame, map_geometry, map_hal, map_lifecycle, map_native_loss, map_texture,
+    native_device_initialized, native_layouts, native_texture_compression, pipeline_layout_key,
+    poll_native_frame_completion, prepare_frame_binding_scratch, result_status,
+    retire_native_allocation, wait_native_idle, write_native,
 };
 mod render_target;
 mod shader;

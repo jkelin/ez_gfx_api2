@@ -205,6 +205,21 @@ fn value_buffer_stores_exactly_one_pod_value() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn pooled_buffer_without_initial_data_is_zeroed() -> Result<()> {
+    let (context, _surface) = headless()?;
+    let buffer = context.acquire_buffer_from([u32::MAX; 2].as_slice())?;
+    let original = Rc::as_ptr(&buffer.inner);
+    drop(buffer);
+
+    let buffer = context.acquire_buffer::<u32>(2)?;
+
+    assert_eq!(Rc::as_ptr(&buffer.inner), original);
+    assert_eq!(buffer.inner.bytes.borrow().as_slice(), &[0; 8]);
+    Ok(())
+}
+
 #[cfg(windows)]
 thread_local! {
     static LATE_CONTEXT: std::cell::RefCell<Option<Context>> = const {
@@ -478,4 +493,21 @@ fn context_drop_after_state_tls_teardown_does_not_panic() {
     })
     .join()
     .expect("thread-local context drop must not panic");
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn event_dispatch_scratch_bounds_burst_retention() -> Result<()> {
+    let (context, _surface) = headless()?;
+    // Simulate a burst pinned in scratch; restore must clear and cap capacity
+    // so one spike never pins its peak for the context lifetime.
+    let mut burst = context.inner.event_scratch.take();
+    for _ in 0..(MAX_DISPATCH_SCRATCH_EVENTS + 4000) {
+        burst.push(Event::ObservationsDropped(1));
+    }
+    context.restore_event_scratch(burst);
+    let scratch = context.inner.event_scratch.borrow();
+    assert!(scratch.is_empty());
+    assert!(scratch.capacity() <= MAX_DISPATCH_SCRATCH_EVENTS);
+    Ok(())
 }

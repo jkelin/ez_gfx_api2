@@ -8,6 +8,7 @@ use ez_gfx_core::capability::{
     AdapterCapabilities, AdapterClass, AdapterInfo, CompressionSupport, PresentationMode,
     PresentationModes, SemanticProfile,
 };
+use arrayvec::ArrayVec;
 
 const MAX_ARGUMENT_BUFFERS_PER_SLOT: usize = 1024;
 use ez_gfx_hal::{
@@ -202,6 +203,60 @@ pub struct NativeBufferBinding<'a> {
     pub index: usize,
 }
 
+/// Synchronous provider for resolved Metal buffer arguments.
+pub trait NativeBufferBindingSource {
+    /// Number of bindings supplied to the pipeline.
+    fn len(&self) -> usize;
+
+    /// Visits each binding; borrowed allocation views cannot escape the call.
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(usize, &NativeBufferBinding<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError>;
+}
+
+impl NativeBufferBindingSource for [NativeBufferBinding<'_>] {
+    fn len(&self) -> usize {
+        <[NativeBufferBinding<'_>]>::len(self)
+    }
+
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(usize, &NativeBufferBinding<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError> {
+        for (index, binding) in self.iter().enumerate() {
+            visitor(index, binding)?;
+        }
+        Ok(())
+    }
+}
+
+
+impl NativeBufferBindingSource for &[NativeBufferBinding<'_>] {
+    fn len(&self) -> usize {
+        <[NativeBufferBinding<'_>]>::len(self)
+    }
+
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(usize, &NativeBufferBinding<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError> {
+        <[NativeBufferBinding<'_>] as NativeBufferBindingSource>::visit(self, visitor)
+    }
+}
+impl<const N: usize> NativeBufferBindingSource for [NativeBufferBinding<'_>; N] {
+    fn len(&self) -> usize {
+        N
+    }
+
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(usize, &NativeBufferBinding<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError> {
+        self.as_slice().visit(visitor)
+    }
+}
+
 /// Fully resolved indexed draw consumed by Metal encoding.
 pub struct NativeGraphicsDraw<'a> {
     /// Graphics pipeline used by the draw.
@@ -223,7 +278,7 @@ pub struct NativeGraphicsDraw<'a> {
     /// Number of indirect commands to encode.
     pub draw_count: u32,
     /// Reflected public buffer bindings.
-    pub bindings: &'a [NativeBufferBinding<'a>],
+    pub bindings: &'a dyn NativeBufferBindingSource,
     /// Textures referenced by the argument buffer.
     pub textures: &'a [&'a NativeTexture],
 }
@@ -237,7 +292,7 @@ pub struct NativeComputeDispatch<'a> {
     /// Threads launched in each workgroup, reflected from the compute entry point.
     pub threads_per_group: [u32; 3],
     /// Reflected public buffer bindings.
-    pub bindings: &'a [NativeBufferBinding<'a>],
+    pub bindings: &'a dyn NativeBufferBindingSource,
     /// Reflected compute texture argument-buffer layout, when present.
     pub texture_heap: Option<ShaderTextureHeapLayout>,
     /// Textures referenced by the compute argument buffer.
@@ -284,7 +339,7 @@ pub enum NativeFrameAction<'a> {
         /// Backend-neutral pass description.
         pass: &'a ExecutionPass,
         /// One attachment per pass color, in order.
-        colors: Vec<PassAttachment<'a>>,
+        colors: ArrayVec<PassAttachment<'a>, 1>,
     },
     /// Encode a compute dispatch.
     Compute(NativeComputeDispatch<'a>),
@@ -303,6 +358,77 @@ pub enum NativeFrameAction<'a> {
     EndPass,
     /// Present the current drawable.
     Present,
+}
+
+/// Synchronous provider whose borrowed native actions live only for each visit.
+pub trait NativeFrameActionSource {
+    /// Number of stable action records.
+    fn len(&self) -> usize;
+
+    /// Visits one action by stable index.
+    fn with_action(
+        &self,
+        index: usize,
+        visitor: &mut dyn FnMut(&NativeFrameAction<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError>;
+
+    /// Visits all actions in order.
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(usize, &NativeFrameAction<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError> {
+        for index in 0..self.len() {
+            self.with_action(index, &mut |action| visitor(index, action))?;
+        }
+        Ok(())
+    }
+
+    /// Returns whether no action records exist.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl NativeFrameActionSource for [NativeFrameAction<'_>] {
+    fn len(&self) -> usize {
+        <[NativeFrameAction<'_>]>::len(self)
+    }
+
+    fn with_action(
+        &self,
+        index: usize,
+        visitor: &mut dyn FnMut(&NativeFrameAction<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError> {
+        visitor(self.get(index).ok_or(HalError::InvalidArgument)?)
+    }
+}
+
+impl NativeFrameActionSource for &[NativeFrameAction<'_>] {
+    fn len(&self) -> usize {
+        <[NativeFrameAction<'_>]>::len(self)
+    }
+
+    fn with_action(
+        &self,
+        index: usize,
+        visitor: &mut dyn FnMut(&NativeFrameAction<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError> {
+        self.as_ref().with_action(index, visitor)
+    }
+}
+
+impl<const N: usize> NativeFrameActionSource for [NativeFrameAction<'_>; N] {
+    fn len(&self) -> usize {
+        N
+    }
+
+    fn with_action(
+        &self,
+        index: usize,
+        visitor: &mut dyn FnMut(&NativeFrameAction<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError> {
+        self.as_slice().with_action(index, visitor)
+    }
 }
 
 /// Validated metallib products retained as one shader artifact.
@@ -373,6 +499,9 @@ pub enum NativePipeline {
 struct FrameSlot {
     command: Option<ThreadBound<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
     argument_buffers: Vec<ThreadBound<Retained<ProtocolObject<dyn MTLBuffer>>>>,
+    /// Retained prepared-argument entries; pure CPU pairs with no GPU lifetime,
+    /// reused across frames once the slot's submission completes.
+    prepared_scratch: Vec<(u32, usize)>,
     submission_value: u64,
 }
 
@@ -531,6 +660,32 @@ impl NativeSurface {
     /// Empty before the first cached presentation.
     pub fn presented_rgba8(&self) -> &[u8] {
         &self.presented_rgba8
+    }
+
+    /// Reports retained drawable images for on-demand memory telemetry.
+    ///
+    /// Core Animation owns the drawables; the layer's maximum drawable count is
+    /// the only retained-image bound the backend can observe without presenting.
+    pub fn telemetry_images(&self) -> u32 {
+        // Drawable counts are small; the fallback only guards the conversion.
+        u32::try_from(self.metal_layer().maximumDrawableCount()).unwrap_or(u32::MAX)
+    }
+
+    /// Reports the swapchain format code for memory telemetry.
+    ///
+    /// Layers are configured as `BGRA8Unorm_sRGB` (125); the code is constant
+    /// so format alignment never depends on presentation having occurred.
+    pub const fn telemetry_format(&self) -> u32 {
+        125
+    }
+
+    /// Reports retained depth storage for memory telemetry.
+    ///
+    pub fn telemetry_depth_extent(&self) -> Option<(u32, u32)> {
+        match &self.depth {
+            Some(depth) => Some(depth.extent),
+            None => None,
+        }
     }
 }
 

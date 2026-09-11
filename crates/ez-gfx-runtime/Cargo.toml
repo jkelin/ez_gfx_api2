@@ -22,6 +22,9 @@ blake3.workspace = true
 bytemuck = { workspace = true, features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+arrayvec.workspace = true
+smallvec.workspace = true
+compact_str.workspace = true
 
 [lints]
 workspace = true
