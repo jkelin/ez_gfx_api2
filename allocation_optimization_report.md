@@ -693,6 +693,8 @@ The native probe defaults to scoped success and keeps whole-window totals visibl
 
 In-scope safe phases hard-assert zero after warm-up on both backends: begin, swapchain configure, transient/counter acquisition, and frame binding each record zero calls, bytes, peak-live increase, and live delta. Independent shader-free unit tests (`spill_cardinality_plan_validation_performs_no_allocations` in the Vulkan and DX12 backends) assert frame-plan and wait validation at 65 actions. They do not execute pipeline actions, descriptor accounting, descriptor allocation, or descriptor lowering. Residual traffic is confined to execute/finish phases and classified as excluded shader metadata/pipeline-key ownership: triangle execute observes 4 calls and 125 B; triangle finish observes 7 calls and 742–750 B; compute observes 3 calls and 2,540–2,580 B; graphics observes 8 calls and 465 B; multipass finish observes 12 calls and 4,601 B on Vulkan and 16 calls and 1,595 B on DX12.
 
+Post-ABI40 rebase, DX12 triangle execute observes 125 B usually with one 541 B sample (6 calls, within the 10-call ceiling), so its excluded byte ceiling is 768 B: the smallest fixed margin above the observed maximum that keeps the phase bounded while the unchanged whole-window residual ceiling still catches systematic regression. No whole-window ceiling and no in-scope zero assertion changed.
+
 Post-workload telemetry remained separately categorized:
 
 | Backend | GPU live / block / waste | Frame slots | Staging current / high-water | Counter scratch | Pipelines | Readback |
