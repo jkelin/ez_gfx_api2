@@ -69,11 +69,12 @@ void computemain(uint3 id : SV_DispatchThreadID) {
         offset: 0,
         index: binding_index,
     };
+    let native_bindings = [native_binding];
     let action = NativeFrameAction::Compute(NativeComputeDispatch {
         pipeline: &pipeline,
         groups: [1, 1, 1],
         threads_per_group,
-        bindings: &std::slice::from_ref(&native_binding),
+        bindings: &native_bindings,
         texture_heap: None,
         textures: &[],
     });
@@ -190,11 +191,12 @@ void computemain(uint3 id : SV_DispatchThreadID) {
         index: binding_index,
     };
     let textures = [&texture];
+    let native_bindings = [native_binding];
     let action = NativeFrameAction::Compute(NativeComputeDispatch {
         pipeline: &pipeline,
         groups: [1, 1, 1],
         threads_per_group: runtime.compute_workgroup_size().unwrap(),
-        bindings: &std::slice::from_ref(&native_binding),
+        bindings: &native_bindings,
         texture_heap: Some(texture_heap),
         textures: &textures,
     });
