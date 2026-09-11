@@ -720,6 +720,7 @@ impl NativeContext {
             self.texture_descriptor_layout = pending.descriptor_layout.take();
             self.texture_descriptor_set = Some(descriptor_set);
             self.presentation_support.fifo_latest_ready = fifo_latest_ready_enabled;
+            self.swapchain_loader = pending.swapchain_loader.take();
             self.image_available = pending.image_available.take();
             self.frame_slots = frame_slots;
             return Ok(adapter);

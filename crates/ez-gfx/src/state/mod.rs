@@ -193,6 +193,7 @@ struct SurfaceRecord {
     state: SurfaceState,
     initialized: bool,
     presentation_mode: PresentationMode,
+    presentation_modes: Option<PresentationModes>,
     is_window: bool,
 }
 

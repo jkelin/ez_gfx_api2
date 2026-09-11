@@ -162,6 +162,7 @@ fn insert_surface(
             state,
             initialized: false,
             presentation_mode: PresentationMode::Fifo,
+            presentation_modes: None,
             is_window,
         },
     );
@@ -316,6 +317,8 @@ pub fn init_device(context: ContextHandle, surface: SurfaceHandle) -> Result<()>
             _ => Err(HalError::InvalidArgument),
         }
         .map_err(|error| map_native_loss(&context.identity, error))?;
+        // Reinitialization may select another adapter with different surface support.
+        record.presentation_modes = None;
         record.initialized = true;
         context.active_surface = Some(surface);
         if first_initialization {
@@ -404,7 +407,10 @@ pub fn resize_surface(
             .map_err(|error| match error {
                 ez_gfx_runtime::PublicApiError::NotReady => Error::NotReady,
                 _ => Error::InvalidArgument,
-            })
+            })?;
+        // A moved or recreated native window may expose a different mode set.
+        record.presentation_modes = None;
+        Ok(())
     }))
 }
 /// Returns the current surface extent.

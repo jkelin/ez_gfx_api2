@@ -71,7 +71,8 @@ impl HostState {
             width,
             height,
             window: None,
-            pending_resize: None,
+            // Undefined Vulkan extents need the toolkit's requested size before the first frame.
+            pending_resize: Some((width, height)),
             pending_input: Vec::new(),
             redraw_ready: false,
             closed: false,
@@ -622,6 +623,23 @@ impl ClearFromSlice for Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_extent_is_forwarded_once_before_hidden_frames() {
+        let mut state = HostState::new("hidden", 640, 480, None, false);
+        let mut forwarded = Vec::new();
+
+        assert!(
+            state
+                .apply_pending_resize(|width, height| {
+                    forwarded.push((width, height));
+                    Ok(())
+                })
+                .unwrap()
+        );
+        assert_eq!(forwarded, [(640, 480)]);
+        assert_eq!(state.pending_resize, None);
+    }
 
     #[test]
     fn minimized_resize_waits_until_nonzero_restore() {
