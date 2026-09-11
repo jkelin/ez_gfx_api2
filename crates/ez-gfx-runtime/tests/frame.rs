@@ -274,7 +274,6 @@ fn frame_rejects_submission_from_another_recorder() {
     second.abort();
 }
 
-
 #[test]
 fn graph_template_hit_recomputes_dynamic_waits_and_transitions() {
     let mut frame = FrameRecorder::new(1).unwrap();

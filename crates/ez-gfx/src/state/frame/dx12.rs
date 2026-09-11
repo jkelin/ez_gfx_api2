@@ -3,12 +3,12 @@ use ez_gfx_core::capability::PresentationMode;
 
 use super::{
     Backend, ContextState, Error, ExecutableNode, ExecutionAction, ExecutionBarrier, ExecutionPass,
-    FrameExecutionPlan, FrameNativeResource, GeometryAllocation, HashMap,
-    MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext, NativePipeline, NativeShader,
-    NativeSurface, NativeTexture, NativeTextureMap, PackedHandle, PipelineKey, RenderTargetHandle,
-    FrameBindingSource, FrameBufferBindingRecord, RenderTargetRecord, ResourceId,
-    SURFACE_DEFAULT_CLEAR, ShaderHandle, ShaderRecord, map_hal, native_layouts,
-    pipeline_layout_key, prepare_frame_binding_scratch, should_capture_presented,
+    FrameBindingSource, FrameBufferBindingRecord, FrameExecutionPlan, FrameNativeResource,
+    GeometryAllocation, HashMap, MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext,
+    NativePipeline, NativeShader, NativeSurface, NativeTexture, NativeTextureMap, PackedHandle,
+    PipelineKey, RenderTargetHandle, RenderTargetRecord, ResourceId, SURFACE_DEFAULT_CLEAR,
+    ShaderHandle, ShaderRecord, map_hal, native_layouts, pipeline_layout_key,
+    prepare_frame_binding_scratch, should_capture_presented,
 };
 
 use arrayvec::ArrayVec;
@@ -206,12 +206,10 @@ fn dx12_pass_colors<'resources>(
             .ok_or(Error::InvalidArgument)?;
         colors
             .try_push(match *resource {
-                FrameNativeResource::Surface(_) => {
-                    ez_gfx_backend_dx12::native::PassAttachment {
-                        resource: ez_gfx_backend_dx12::native::NativeFrameResource::Surface,
-                        clear: SURFACE_DEFAULT_CLEAR,
-                    }
-                }
+                FrameNativeResource::Surface(_) => ez_gfx_backend_dx12::native::PassAttachment {
+                    resource: ez_gfx_backend_dx12::native::NativeFrameResource::Surface,
+                    clear: SURFACE_DEFAULT_CLEAR,
+                },
                 FrameNativeResource::RenderTarget(handle) => {
                     let record = state
                         .render_targets
@@ -244,6 +242,27 @@ struct DxActionSource<'a, 'resources> {
     binding_ranges: &'a [core::ops::Range<usize>],
 }
 
+impl DxActionSource<'_, '_> {
+    fn binding_source(
+        &self,
+        node: usize,
+    ) -> std::result::Result<FrameBindingSource<'_>, ez_gfx_hal::HalError> {
+        let range = self
+            .binding_ranges
+            .get(node)
+            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+            .clone();
+        Ok(FrameBindingSource {
+            records: self
+                .binding_records
+                .get(range)
+                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?,
+            allocations: self.state.allocations,
+            vertex_heaps: self.state.vertex_heaps,
+        })
+    }
+}
+
 impl ez_gfx_backend_dx12::native::NativeFrameActionSource for DxActionSource<'_, '_> {
     fn len(&self) -> usize {
         self.action_indices.len()
@@ -259,7 +278,12 @@ impl ez_gfx_backend_dx12::native::NativeFrameActionSource for DxActionSource<'_,
         let action = self
             .plan
             .actions
-            .get(*self.action_indices.get(index).ok_or(ez_gfx_hal::HalError::InvalidArgument)?)
+            .get(
+                *self
+                    .action_indices
+                    .get(index)
+                    .ok_or(ez_gfx_hal::HalError::InvalidArgument)?,
+            )
             .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
         let binding_source;
         let native = match action {
@@ -287,19 +311,7 @@ impl ez_gfx_backend_dx12::native::NativeFrameActionSource for DxActionSource<'_,
                     .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
                 {
                     ExecutableNode::Compute { groups, .. } => {
-                        let range = self
-                            .binding_ranges
-                            .get(node)
-                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
-                            .clone();
-                        binding_source = FrameBindingSource {
-                            records: self
-                                .binding_records
-                                .get(range)
-                                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?,
-                            allocations: self.state.allocations,
-                            vertex_heaps: self.state.vertex_heaps,
-                        };
+                        binding_source = self.binding_source(node)?;
                         let key = self.pipeline_keys[node]
                             .as_ref()
                             .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
@@ -324,19 +336,7 @@ impl ez_gfx_backend_dx12::native::NativeFrameActionSource for DxActionSource<'_,
                         draw_capacity,
                         ..
                     } => {
-                        let range = self
-                            .binding_ranges
-                            .get(node)
-                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
-                            .clone();
-                        binding_source = FrameBindingSource {
-                            records: self
-                                .binding_records
-                                .get(range)
-                                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?,
-                            allocations: self.state.allocations,
-                            vertex_heaps: self.state.vertex_heaps,
-                        };
+                        binding_source = self.binding_source(node)?;
                         let (indirect_size, NativeAllocation::Dx12(indirect)) = self
                             .state
                             .allocations
@@ -436,17 +436,7 @@ pub(super) fn execute_dx12_frame_plan(
     let presentation_mode = surface
         .as_ref()
         .map_or(PresentationMode::Fifo, |surface| surface.presentation_mode);
-    // Target-only frames size draws and validations from the target extents.
-    let extent = surface
-        .as_ref()
-        .and_then(|surface| surface.state.extent())
-        .or_else(|| {
-            context
-                .frame_render_target
-                .and_then(|target| context.render_targets.get(&target))
-                .map(|record| (record.width, record.height))
-        })
-        .unwrap_or((0, 0));
+    let extent = super::frame_target_extent(context, surface.as_ref());
     let capture = should_capture_presented(
         surface
             .as_ref()
@@ -476,15 +466,17 @@ pub(super) fn execute_dx12_frame_plan(
         surface
     });
     context.frame_action_indices.clear();
-    context.frame_action_indices.extend(
-        plan.actions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, action)| {
-                (!matches!(action, ExecutionAction::Wait(wait) if wait.external.is_none()))
-                    .then_some(index)
-            }),
-    );
+    context
+        .frame_action_indices
+        .extend(
+            plan.actions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, action)| {
+                    (!matches!(action, ExecutionAction::Wait(wait) if wait.external.is_none()))
+                        .then_some(index)
+                }),
+        );
     {
         let NativeContext::Dx12(native) = &mut context.native else {
             return Err(Error::NativeFailure);
@@ -548,17 +540,7 @@ pub(super) fn execute_dx12_frame_plan(
     };
     let outcome = match execution {
         Ok(outputs) => {
-            let texture_readbacks = payloads
-                .iter()
-                .filter(|payload| {
-                    matches!(
-                        payload,
-                        ExecutableNode::TextureReadback { .. }
-                            | ExecutableNode::RenderTargetReadback { .. }
-                    )
-                })
-                .count();
-            let expected = texture_readbacks + usize::from(capture);
+            let expected = super::expected_frame_output_count(payloads, capture);
             if outputs.len() != expected {
                 if let (Some(handle), Some(surface)) = (surface_handle, surface) {
                     context.surfaces.insert(handle, surface);

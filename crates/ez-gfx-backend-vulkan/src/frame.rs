@@ -554,8 +554,8 @@ impl NativeContext {
             )?;
             public_sets.push((action, set));
             used_sets = used_sets.saturating_add(1);
-            used_descriptors = used_descriptors
-                .saturating_add(u32::try_from(bindings.len()).unwrap_or(u32::MAX));
+            used_descriptors =
+                used_descriptors.saturating_add(u32::try_from(bindings.len()).unwrap_or(u32::MAX));
             Ok(())
         });
         if let Err(error) = descriptor_result {
@@ -911,13 +911,16 @@ impl NativeContext {
                             pass_active,
                         )?;
                     }
-                    NativeFrameAction::EndPass => unsafe {
+                    NativeFrameAction::EndPass => {
                         if !pass_active {
                             return Err(HalError::InvalidArgument);
                         }
-                        prepared.device.cmd_end_rendering(prepared.command_handle);
+                        // SAFETY: this command buffer owns the active dynamic-rendering pass.
+                        unsafe {
+                            prepared.device.cmd_end_rendering(prepared.command_handle);
+                        }
                         pass_active = false;
-                    },
+                    }
                     NativeFrameAction::Present => {
                         record::record_present_readback(
                             &encoding,
@@ -1001,6 +1004,7 @@ impl NativeContext {
         self.next_frame_value = frame_value.checked_add(1).ok_or(HalError::NativeFailure)?;
         let (readbacks, public_sets) =
             self.allocate_frame_bindings(prepared.slot_index, actions, extent, capture_presented)?;
+        // SAFETY: the reset primary command buffer is idle and recording begins once.
         if let Err(error) = unsafe {
             prepared.device.begin_command_buffer(
                 prepared.command_handle,

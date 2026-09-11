@@ -5,8 +5,8 @@
 use ez_gfx_hal::TransferWorker;
 use std::ffi::{CStr, CString};
 
-use ash::{Entry, Instance, khr, vk};
 use arrayvec::ArrayVec;
+use ash::{Entry, Instance, khr, vk};
 
 use ez_gfx_core::{
     Backend,
@@ -144,13 +144,25 @@ pub struct NativeBufferBinding<'a> {
     /// Whether shaders may write through the descriptor.
     pub writable: bool,
 }
-
 /// Synchronous provider for resolved buffer bindings.
 pub trait NativeBufferBindingSource {
     /// Number of bindings supplied to the pipeline.
     fn len(&self) -> usize;
 
+    /// Returns whether the source has no bindings.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Visits each binding; borrowed allocation views cannot escape the call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a binding cannot resolve its native allocation or the visitor fails.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the object-safe callback keeps borrowed native allocation views scoped to each visit"
+    )]
     fn visit(
         &self,
         visitor: &mut dyn FnMut(usize, &NativeBufferBinding<'_>) -> Result<(), HalError>,
@@ -172,7 +184,6 @@ impl NativeBufferBindingSource for [NativeBufferBinding<'_>] {
         Ok(())
     }
 }
-
 
 impl NativeBufferBindingSource for &[NativeBufferBinding<'_>] {
     fn len(&self) -> usize {
@@ -314,6 +325,10 @@ pub trait NativeFrameActionSource {
     ///
     /// Returns an error when a record cannot resolve its current native owner,
     /// or when the visitor rejects an action.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the object-safe callback keeps borrowed native action views scoped to each visit"
+    )]
     fn visit(
         &self,
         visitor: &mut dyn FnMut(usize, &NativeFrameAction<'_>) -> Result<(), HalError>,

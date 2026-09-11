@@ -573,9 +573,9 @@ impl NativeContext {
         actions.visit(&mut |_, action| {
             presents |= matches!(action, NativeFrameAction::Present);
             uses_surface |= match action {
-                NativeFrameAction::BeginPass { colors, .. } => colors.iter().any(|attachment| {
-                    matches!(attachment.resource, NativeFrameResource::Surface)
-                }),
+                NativeFrameAction::BeginPass { colors, .. } => colors
+                    .iter()
+                    .any(|attachment| matches!(attachment.resource, NativeFrameResource::Surface)),
                 NativeFrameAction::Present
                 | NativeFrameAction::Barrier {
                     resource: NativeFrameResource::Surface | NativeFrameResource::Depth,
@@ -799,10 +799,9 @@ impl NativeContext {
                     } else {
                         saw_present = true;
                         if capture_presented {
-                            let readback =
-                                self.allocate_frame_readback(extent.0, extent.1)?;
+                            let readback = self.allocate_frame_readback(extent.0, extent.1)?;
                             readbacks.push(readback);
-                            }
+                        }
                         Ok(None)
                     }
                 }

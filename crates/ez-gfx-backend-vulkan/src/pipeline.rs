@@ -6,9 +6,9 @@ type NativePipelineLayout = (
 );
 
 use super::{
-    BlendMode, CString, CullMode, DeferredResource, FrontFace, HalError,
-    NativeContext, NativeGraphicsPipelineDesc, NativePipeline, NativeShader, NativeSurface,
-    PresentationMode, PrimitiveTopology, ShaderBufferLayout, map_vk, vk,
+    BlendMode, CString, CullMode, DeferredResource, FrontFace, HalError, NativeContext,
+    NativeGraphicsPipelineDesc, NativePipeline, NativeShader, NativeSurface, PresentationMode,
+    PrimitiveTopology, ShaderBufferLayout, map_vk, vk,
 };
 
 impl NativeContext {

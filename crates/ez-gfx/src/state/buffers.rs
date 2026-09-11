@@ -103,10 +103,9 @@ pub fn acquire_counter(context: ContextHandle, capacity: u32) -> Result<CounterB
             .checked_add(COUNTER_BUFFER_ELEMENT_OFFSET)
             .ok_or(Error::InvalidArgument)?;
         let completed = completed_native_frame_value(&mut context.native)?;
-        let reused =
-            context
-                .counter_pool
-                .take(size, ez_gfx_hal::QueueKind::Graphics, completed);
+        let reused = context
+            .counter_pool
+            .take(size, ez_gfx_hal::QueueKind::Graphics, completed);
         let mut stale = context
             .counter_pool
             .trim(ez_gfx_hal::QueueKind::Graphics, completed);
@@ -560,9 +559,7 @@ pub(super) fn trim_staging_caches(context: &mut ContextState) -> Result<()> {
     );
     for pool in context.buffer_pool.values_mut() {
         stale.extend(pool.trim(ez_gfx_hal::QueueKind::Graphics, completions.graphics));
-        stale.extend(
-            pool.trim_to_budget(ez_gfx_hal::QueueKind::Graphics, completions.graphics),
-        );
+        stale.extend(pool.trim_to_budget(ez_gfx_hal::QueueKind::Graphics, completions.graphics));
     }
     stale.extend(
         context
@@ -625,11 +622,7 @@ fn trim_staging_to_aggregate_budget_after_graphics(
         return Ok(());
     }
     let transfer = completed_transfer_native(&mut context.native).map_err(map_allocation)?;
-    trim_staging_to_aggregate_budget(
-        context,
-        StagingCompletions { transfer, graphics },
-        stale,
-    );
+    trim_staging_to_aggregate_budget(context, StagingCompletions { transfer, graphics }, stale);
     Ok(())
 }
 
@@ -692,19 +685,14 @@ pub(super) fn trim_staging_to_aggregate_budget(
             break;
         };
         let evicted = match source {
-            0 => context.staging.pop_largest_completed(
-                ez_gfx_hal::QueueKind::Transfer,
-                completed.transfer,
-            ),
-            1 => context.counter_pool.pop_largest_completed(
-                ez_gfx_hal::QueueKind::Graphics,
-                completed.graphics,
-            ),
+            0 => context
+                .staging
+                .pop_largest_completed(ez_gfx_hal::QueueKind::Transfer, completed.transfer),
+            1 => context
+                .counter_pool
+                .pop_largest_completed(ez_gfx_hal::QueueKind::Graphics, completed.graphics),
             _ => context.buffer_pool.get_mut(&key).and_then(|pool| {
-                pool.pop_largest_completed(
-                    ez_gfx_hal::QueueKind::Graphics,
-                    completed.graphics,
-                )
+                pool.pop_largest_completed(ez_gfx_hal::QueueKind::Graphics, completed.graphics)
             }),
         };
         if let Some(allocation) = evicted {

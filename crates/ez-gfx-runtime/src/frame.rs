@@ -15,7 +15,6 @@ use ez_gfx_hal::{
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Recording lifecycle state for a frame.
 pub enum FrameState {
@@ -623,10 +622,7 @@ mod submission_tests {
             validate_submission_recycle(1, 2, 1, 1, 2, FRAME_WORKSPACE_BYTE_LIMIT),
             Err(FrameError::CapacityExhausted)
         );
-        assert_eq!(
-            validate_submission_recycle(1, 2, 1, 1, 2, 2),
-            Ok(3)
-        );
+        assert_eq!(validate_submission_recycle(1, 2, 1, 1, 2, 2), Ok(3));
     }
 
     #[test]

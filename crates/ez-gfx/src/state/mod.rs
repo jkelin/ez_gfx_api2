@@ -125,7 +125,6 @@ enum PipelineKey {
     },
 }
 
-
 impl PipelineKey {
     fn involves_shader(&self, shader: ShaderHandle) -> bool {
         match self {
@@ -549,10 +548,10 @@ mod frame;
 mod geometry;
 mod native;
 use native::{
-    FrameBindingSource, FrameBufferBindingRecord, allocate_native,
-    completed_native_frame_value, completed_texture_transfer_native, completed_transfer_native,
-    copy_native, destroy_native_texture, free_native_allocation, last_native_frame_completion,
-    map_allocation, map_frame, map_geometry, map_hal, map_lifecycle, map_native_loss, map_texture,
+    FrameBindingSource, FrameBufferBindingRecord, allocate_native, completed_native_frame_value,
+    completed_texture_transfer_native, completed_transfer_native, copy_native,
+    destroy_native_texture, free_native_allocation, last_native_frame_completion, map_allocation,
+    map_frame, map_geometry, map_hal, map_lifecycle, map_native_loss, map_texture,
     native_device_initialized, native_layouts, native_texture_compression, pipeline_layout_key,
     poll_native_frame_completion, prepare_frame_binding_scratch, result_status,
     retire_native_allocation, wait_native_idle, write_native,

@@ -762,10 +762,7 @@ pub(super) fn stage_upload(
     for stale in pool
         .trim(ez_gfx_hal::QueueKind::Transfer, completed)
         .into_iter()
-        .chain(pool.trim_to_budget(
-            ez_gfx_hal::QueueKind::Transfer,
-            completed,
-        ))
+        .chain(pool.trim_to_budget(ez_gfx_hal::QueueKind::Transfer, completed))
     {
         free_native_allocation(context, stale)?;
     }

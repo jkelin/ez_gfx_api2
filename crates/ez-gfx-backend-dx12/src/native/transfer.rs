@@ -212,7 +212,7 @@ pub(super) fn start_worker(
                     &mut live_scratch,
                     &mut texture_scratch,
                 )
-                .map_err(map_transfer_worker_error)?;
+                .map_err(|error| map_transfer_worker_error(&error))?;
                 slot = (slot + 1) % resources.len();
                 start = end;
             }
@@ -244,8 +244,8 @@ pub(super) fn start_worker(
     .map_err(|_| AllocationError::NativeFailure)
 }
 
-fn map_transfer_worker_error(error: windows::core::Error) -> ez_gfx_hal::TransferWorkerError {
-    if map_allocation_windows(&error) == AllocationError::DeviceLost {
+fn map_transfer_worker_error(error: &windows::core::Error) -> ez_gfx_hal::TransferWorkerError {
+    if map_allocation_windows(error) == AllocationError::DeviceLost {
         ez_gfx_hal::TransferWorkerError::DeviceLost
     } else {
         ez_gfx_hal::TransferWorkerError::Failed
@@ -272,11 +272,7 @@ fn require_wait_succeeded(
     }
 }
 
-fn snapshot_live_indices<T>(
-    jobs: &[T],
-    scratch: &mut Vec<usize>,
-    cancelled: impl Fn(&T) -> bool,
-) {
+fn snapshot_live_indices<T>(jobs: &[T], scratch: &mut Vec<usize>, cancelled: impl Fn(&T) -> bool) {
     scratch.clear();
     scratch.reserve(jobs.len());
     scratch.extend(
@@ -289,7 +285,6 @@ fn snapshot_live_indices<T>(
     clippy::too_many_arguments,
     reason = "the worker keeps reusable COPY/DIRECT command state and paired queue synchronization local"
 )]
-
 fn submit_batch(
     transfer_queue: &ID3D12CommandQueue,
     graphics_queue: &ID3D12CommandQueue,
@@ -317,8 +312,7 @@ fn submit_batch(
         require_wait_succeeded(unsafe { WaitForSingleObject(event, INFINITE) })?;
         // An event wake is not completion proof until the owning fence confirms it.
         // SAFETY: the completion fence remains live through the post-wake query.
-        let completed =
-            checked_completed_value(unsafe { completion_fence.GetCompletedValue() })?;
+        let completed = checked_completed_value(unsafe { completion_fence.GetCompletedValue() })?;
         if completed < *last_completion {
             return Err(windows::core::Error::from_thread());
         }
@@ -465,8 +459,7 @@ fn submit_batch(
                 break;
             }
             // SAFETY: the event remains live across each bounded wait.
-            if unsafe { WaitForSingleObject(event, 100) }
-                == windows::Win32::Foundation::WAIT_FAILED
+            if unsafe { WaitForSingleObject(event, 100) } == windows::Win32::Foundation::WAIT_FAILED
             {
                 return Err(windows::core::Error::from_thread());
             }
@@ -639,7 +632,7 @@ mod cancellation_snapshot_tests {
             windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_HUNG,
         ] {
             assert_eq!(
-                map_transfer_worker_error(windows::core::Error::from_hresult(code)),
+                map_transfer_worker_error(&windows::core::Error::from_hresult(code)),
                 ez_gfx_hal::TransferWorkerError::DeviceLost
             );
         }
@@ -649,11 +642,9 @@ mod cancellation_snapshot_tests {
     fn removal_sentinel_and_failed_wait_are_rejected() {
         let error = checked_completed_value(u64::MAX).unwrap_err();
         assert_eq!(
-            map_transfer_worker_error(error),
+            map_transfer_worker_error(&error),
             ez_gfx_hal::TransferWorkerError::DeviceLost
         );
-        assert!(
-            require_wait_succeeded(windows::Win32::Foundation::WAIT_FAILED).is_err()
-        );
+        assert!(require_wait_succeeded(windows::Win32::Foundation::WAIT_FAILED).is_err());
     }
 }

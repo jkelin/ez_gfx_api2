@@ -438,11 +438,7 @@ fn coarse_compute_frame_completes_while_fine_copy_is_gpu_blocked() {
     assert!(
         context
             .texture_staging
-            .take(
-                1,
-                ez_gfx_hal::QueueKind::TextureTransfer,
-                completed,
-            )
+            .take(1, ez_gfx_hal::QueueKind::TextureTransfer, completed,)
             .is_none()
     );
 

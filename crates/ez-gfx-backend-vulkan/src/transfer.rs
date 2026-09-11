@@ -189,11 +189,7 @@ pub(super) fn start_worker(
     .map_err(|_| AllocationError::NativeFailure)
 }
 
-fn snapshot_live_indices<T>(
-    jobs: &[T],
-    scratch: &mut Vec<usize>,
-    cancelled: impl Fn(&T) -> bool,
-) {
+fn snapshot_live_indices<T>(jobs: &[T], scratch: &mut Vec<usize>, cancelled: impl Fn(&T) -> bool) {
     scratch.clear();
     scratch.reserve(jobs.len());
     scratch.extend(
@@ -210,7 +206,6 @@ fn snapshot_live_indices<T>(
     clippy::too_many_lines,
     reason = "one native queue transaction keeps ownership barriers and timeline submission ordered"
 )]
-
 fn submit_batch(
     device: &ash::Device,
     transfer_queue: vk::Queue,

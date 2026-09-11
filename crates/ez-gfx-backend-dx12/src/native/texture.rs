@@ -344,23 +344,29 @@ impl NativeContext {
             ez_gfx_hal::staging_bucket_size(upload_size, ez_gfx_hal::DEFAULT_STAGING_POLICY)
                 .map_err(|_| AllocationError::OutOfMemory)?;
         let completed = self.completed_texture_transfer_value()?;
-        for stale in self.texture_staging.trim(ez_gfx_hal::QueueKind::TextureTransfer, completed) {
+        for stale in self
+            .texture_staging
+            .trim(ez_gfx_hal::QueueKind::TextureTransfer, completed)
+        {
             self.free(stale)?;
         }
         let request = AllocationRequest::new(bucket, 256, MemoryClass::Upload, true, None)
             .map_err(|_| AllocationError::ZeroSize)?;
-        let mut upload =
-            if let Some((_, upload)) = self.texture_staging.take(upload_size, ez_gfx_hal::QueueKind::TextureTransfer, completed) {
-                upload
-            } else {
-                match self.allocate(request) {
-                    Ok(upload) => upload,
-                    Err(error) => {
-                        self.destroy_unpublished_texture(resource, allocation, None);
-                        return Err(error);
-                    }
+        let mut upload = if let Some((_, upload)) = self.texture_staging.take(
+            upload_size,
+            ez_gfx_hal::QueueKind::TextureTransfer,
+            completed,
+        ) {
+            upload
+        } else {
+            match self.allocate(request) {
+                Ok(upload) => upload,
+                Err(error) => {
+                    self.destroy_unpublished_texture(resource, allocation, None);
+                    return Err(error);
                 }
-            };
+            }
+        };
         if let Err(error) = self.populate_texture_upload(
             mips,
             &footprints,
@@ -516,17 +522,23 @@ impl NativeContext {
             ez_gfx_hal::staging_bucket_size(upload_size, ez_gfx_hal::DEFAULT_STAGING_POLICY)
                 .map_err(|_| AllocationError::OutOfMemory)?;
         let completed = self.completed_texture_transfer_value()?;
-        for stale in self.texture_staging.trim(ez_gfx_hal::QueueKind::TextureTransfer, completed) {
+        for stale in self
+            .texture_staging
+            .trim(ez_gfx_hal::QueueKind::TextureTransfer, completed)
+        {
             self.free(stale)?;
         }
         let request = AllocationRequest::new(bucket, 256, MemoryClass::Upload, true, None)
             .map_err(|_| AllocationError::ZeroSize)?;
-        let mut upload =
-            if let Some((_, upload)) = self.texture_staging.take(upload_size, ez_gfx_hal::QueueKind::TextureTransfer, completed) {
-                upload
-            } else {
-                self.allocate(request)?
-            };
+        let mut upload = if let Some((_, upload)) = self.texture_staging.take(
+            upload_size,
+            ez_gfx_hal::QueueKind::TextureTransfer,
+            completed,
+        ) {
+            upload
+        } else {
+            self.allocate(request)?
+        };
         let populate = (|| -> Result<(), AllocationError> {
             let target = self.mapped_slice_mut(&mut upload)?;
             for row in 0..row_count {

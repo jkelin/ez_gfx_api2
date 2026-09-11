@@ -6,11 +6,10 @@ use ez_gfx_core::capability::{AdapterInfo, MAX_BINDLESS_SAMPLED_TEXTURES};
 mod telemetry;
 pub use telemetry::{
     AllocationBlockPolicy, AllocationBlockPolicyError, AllocatorTelemetry, BackendMemoryTelemetry,
-    COUNTER_BUFFER_ELEMENT_OFFSET, DEFAULT_ALLOCATION_BLOCK_POLICY,
-    DEFAULT_BUFFER_STAGING_BUDGET, DEFAULT_COUNTER_STAGING_BUDGET,
-    DEFAULT_SHARED_STAGING_BUDGET, DEFAULT_STAGING_AGGREGATE_BUDGET,
-    DEFAULT_STAGING_POLICY, StagingPolicy, StagingPolicyError, rgba8_image_bytes,
-    staging_bucket_size,
+    COUNTER_BUFFER_ELEMENT_OFFSET, DEFAULT_ALLOCATION_BLOCK_POLICY, DEFAULT_BUFFER_STAGING_BUDGET,
+    DEFAULT_COUNTER_STAGING_BUDGET, DEFAULT_SHARED_STAGING_BUDGET,
+    DEFAULT_STAGING_AGGREGATE_BUDGET, DEFAULT_STAGING_POLICY, StagingPolicy, StagingPolicyError,
+    rgba8_image_bytes, staging_bucket_size,
 };
 
 mod transfer;
