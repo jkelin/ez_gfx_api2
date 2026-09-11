@@ -40,6 +40,11 @@ description = "Run 01_triangle with DirectX 12"
 env = { EZ_GFX_BACKEND = "dx12" }
 run = "cargo run -p ez-gfx-examples --bin 01_triangle"
 
+[tasks.example-1-second-thread-dx12]
+description = "Run 01_triangle with DirectX 12"
+env = { EZ_GFX_BACKEND = "dx12" }
+run = "cargo run -p ez-gfx-examples --bin 01_triangle_second_thread"
+
 [tasks.example-1-metal]
 description = "Run 01_triangle with Metal"
 env = { EZ_GFX_BACKEND = "metal" }

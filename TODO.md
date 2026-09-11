@@ -24,6 +24,7 @@
 - Add deterministic offscreen pixel goldens for fork/join graphs, scaled targets, storage images, history, aliasing, and all supported backends; run Vulkan, DX12, and Metal native suites on guaranteed-capability GPU runners (P-019, P-020, P-022).
 - Benchmark graph compilation, pass coalescing, alias savings, event latency, async Sponza loading, GPU frame time, and package size before claiming broader selected-plan performance gains. Scoped texture staging/batching and 2048² atlas measurements are recorded in `docs/textures.md`, not full-scene performance evidence (P-007, P-008, P-009, P-012, P-018, P-028).
 - Resolve the P-004 allocator-selection mismatch: `gpu-allocator` covers Vulkan/DX12, while Metal uses a backend-native allocator; either supply equivalent selected evidence and amend the decision or adopt a maintained cross-backend implementation (P-004).
+- Extend `01_triangle_second_thread` beyond Windows only with a platform-safe host seam. Its Windows path now shares benchmark/frame-timing/report/snapshot semantics, render-owned warmup/measured/+1 timing, terminal readback, and 5 Hz title diagnostics with ordinary examples while retaining lock-free per-frame publication. Linux raw window handles are not `Send`, and Metal surface creation is main-thread constrained while safe `Context`/`Surface` values are creator-thread-bound. The Windows example captures process-wide native handles under an `Arc<Window>` and joins graphics before host teardown; do not generalize that `Send` proof to other platforms.
 
 ## Tooling
 
