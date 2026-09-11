@@ -1,4 +1,0 @@
-Basis Universal transcoder headers copied from basisu_c_sys 0.9.0:
-https://github.com/beicause/basisu_c_sys/tree/v0.9.0/vendored/basis_universal/transcoder
-
-Copyright 2019-2026 Binomial LLC. Licensed under Apache-2.0. Each source header retains its upstream license notice.

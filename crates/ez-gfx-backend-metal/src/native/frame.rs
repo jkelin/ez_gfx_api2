@@ -249,7 +249,7 @@ impl MetalFrameEncoder<'_> {
                 for texture in dispatch.textures {
                     let resource = <ProtocolObject<dyn MTLTexture> as AsRef<
                         ProtocolObject<dyn MTLResource>,
-                    >>::as_ref(&*texture.texture);
+                    >>::as_ref(texture.texture);
                     encoder.useResource_usage(resource, MTLResourceUsage::Read);
                 }
                 // SAFETY: frame preparation encoded the complete compute argument buffer and retains it through command completion.
@@ -320,7 +320,7 @@ impl NativeContext {
         &mut self,
         slot: usize,
         heap: Option<ez_gfx_hal::ShaderTextureHeapLayout>,
-        textures: &[&NativeTexture],
+        textures: &[super::NativeSampledTexture<'_>],
         encoders: &[Option<&MetalArgumentEncoder>],
         argument_index: usize,
     ) -> Result<Option<usize>, HalError> {
@@ -373,8 +373,8 @@ impl NativeContext {
                     + heap.sampler_argument_offset as usize;
                 // SAFETY: validated heap capacity and stride/offset metadata place both argument indices in the encoder-declared layout.
                 unsafe {
-                    encoder.setTexture_atIndex(Some(&texture.texture), texture_index);
-                    encoder.setSamplerState_atIndex(Some(&texture.sampler), sampler_index);
+                    encoder.setTexture_atIndex(Some(texture.texture), texture_index);
+                    encoder.setSamplerState_atIndex(Some(texture.sampler), sampler_index);
                 }
             }
         }

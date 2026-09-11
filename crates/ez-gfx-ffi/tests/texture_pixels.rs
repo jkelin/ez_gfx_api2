@@ -9,9 +9,15 @@ mod common;
 #[cfg(not(any(windows, target_vendor = "apple")))]
 #[path = "common/headless.rs"]
 mod common;
+#[path = "texture_pixels/decoder.rs"]
+mod decoder;
+use decoder::Decoder;
 #[cfg(target_vendor = "apple")]
 #[path = "texture_pixels/ingestion.rs"]
 mod ingestion;
+#[cfg(not(target_vendor = "apple"))]
+#[path = "texture_pixels/validation.rs"]
+mod validation;
 
 use std::{
     sync::{Arc, LazyLock},
@@ -28,110 +34,7 @@ use ez_gfx::{
 use ez_gfx_compiler::{EasyGraphicsCompiler, Target};
 use ez_gfx_ffi::EzGfxResult;
 
-fn frame_readback(context: ContextHandle) -> ez_gfx::Result<Vec<u8>> {
-    frame_readbacks(context)?.pop().ok_or(Error::NotReady)
-}
-
-#[cfg(not(target_vendor = "apple"))]
-#[test]
-fn vulkan_bc_pixels_survive_region_updates_and_unload() {
-    const CHILD: &str = "EZ_GFX_TEXTURE_PIXELS_VALIDATION_CHILD";
-    if std::env::var_os(CHILD).is_some() {
-        exercise_backend(1);
-    } else {
-        assert_validation_clean(CHILD);
-    }
-}
-
-#[cfg(windows)]
-#[test]
-fn dx12_bc_pixels_survive_region_updates_and_unload() {
-    exercise_backend(2);
-}
-
-#[cfg(target_vendor = "apple")]
-#[test]
-fn metal_compressed_pixels_survive_region_updates_and_unload() {
-    exercise_backend(3);
-}
-
-#[cfg(not(target_vendor = "apple"))]
-fn assert_validation_clean(child_marker: &str) {
-    #[cfg(windows)]
-    use std::os::windows::process::CommandExt;
-    use std::{
-        io::{Read, Write},
-        process::{Command, Stdio},
-    };
-
-    // The validation layer writes directly to native stdout/stderr, outside Rust's test capture.
-    // A child process makes those messages test failures even when the rendered pixels look right.
-    let mut command = Command::new(std::env::current_exe().unwrap());
-    command.args([
-        "--exact",
-        "vulkan_bc_pixels_survive_region_updates_and_unload",
-        "--nocapture",
-        "--test-threads=1",
-    ]);
-    command.env(child_marker, "1");
-    // CREATE_NO_WINDOW: never create or activate a console.
-    #[cfg(windows)]
-    command.creation_flags(0x0800_0000);
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn hidden Vulkan validation regression");
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    // Drain both pipes concurrently: a flood of validation errors must not deadlock the child.
-    let output = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout
-            .read_to_end(&mut bytes)
-            .expect("read Vulkan child stdout");
-        bytes
-    });
-    let errors = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr
-            .read_to_end(&mut bytes)
-            .expect("read Vulkan child stderr");
-        bytes
-    });
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let (status, timed_out) = loop {
-        if let Some(status) = child.try_wait().expect("poll Vulkan validation child") {
-            break (status, false);
-        }
-        if Instant::now() >= deadline {
-            child
-                .kill()
-                .expect("terminate stalled Vulkan validation child");
-            break (child.wait().expect("reap Vulkan validation child"), true);
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let output = output.join().expect("join Vulkan stdout reader");
-    let errors = errors.join().expect("join Vulkan stderr reader");
-    std::io::stdout()
-        .write_all(&output)
-        .expect("re-emit Vulkan stdout");
-    std::io::stderr()
-        .write_all(&errors)
-        .expect("re-emit Vulkan stderr");
-    assert!(!timed_out, "Vulkan validation child exceeded 120 seconds");
-    assert!(status.success(), "Vulkan validation child failed: {status}");
-    for bytes in [&output, &errors] {
-        let text = String::from_utf8_lossy(bytes);
-        assert!(
-            !text.contains("VUID-") && !text.contains("Validation EzGfxResult"),
-            "Vulkan validation reported an error; see native output above"
-        );
-    }
-}
-
-fn exercise_backend(backend: u8) {
+fn cube_artifact() -> &'static [u8] {
     // One compilation avoids concurrent compiler artifact writes by the backend tests.
     static ARTIFACT: LazyLock<Vec<u8>> = LazyLock::new(|| {
         #[cfg(windows)]
@@ -150,6 +53,36 @@ fn exercise_backend(backend: u8) {
         .expect("compile cube shader artifact")
         .save_shader()
     });
+    &ARTIFACT
+}
+fn frame_readback(context: ContextHandle) -> ez_gfx::Result<Vec<u8>> {
+    frame_readbacks(context)?.pop().ok_or(Error::NotReady)
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn vulkan_bc_pixels_survive_region_updates_and_unload() {
+    const CHILD: &str = "EZ_GFX_TEXTURE_PIXELS_VALIDATION_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        exercise_backend(1);
+    } else {
+        validation::assert_validation_clean(CHILD);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn dx12_bc_pixels_survive_region_updates_and_unload() {
+    exercise_backend(2);
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn metal_compressed_pixels_survive_region_updates_and_unload() {
+    exercise_backend(3);
+}
+
+fn exercise_backend(backend: u8) {
     #[cfg(not(target_vendor = "apple"))]
     // A missing Vulkan validation layer is a failure, never a silent unvalidated run.
     let native = if backend == 1 {
@@ -162,7 +95,7 @@ fn exercise_backend(backend: u8) {
     let context = ContextHandle::from_raw(native.context).unwrap();
     let surface = SurfaceHandle::from_raw(native.surface).unwrap();
     assert_eq!(surface_extent(context, surface).unwrap(), (64, 64));
-    let quad = Quad::create(context, surface, &ARTIFACT);
+    let quad = Quad::create(context, surface, cube_artifact());
     #[cfg(all(target_vendor = "apple", feature = "basis"))]
     ingestion::universal(context, &quad);
 
@@ -479,9 +412,26 @@ fn exercise_retirement(
     assert_stale(context, texture, &pixels.green);
     let mut retired_bindings = std::collections::HashSet::from([original_binding]);
     let mut reused = false;
-    for _ in 0..32 {
-        let replacement =
-            load_texture(context, decoder.source(), &pixels.updated, false, config).unwrap();
+    for iteration in 0..32 {
+        let mut replacement_config = *config;
+        if iteration % 2 == 0 {
+            replacement_config.sampler = TextureSamplerDesc {
+                min_filter: SamplerFilter::Linear,
+                mag_filter: SamplerFilter::Nearest,
+                max_anisotropy: 1.0,
+                address_u: SamplerAddressMode::Repeat,
+                address_v: SamplerAddressMode::Clamp,
+                address_w: SamplerAddressMode::Repeat,
+            };
+        }
+        let replacement = load_texture(
+            context,
+            decoder.source(),
+            &pixels.updated,
+            false,
+            &replacement_config,
+        )
+        .unwrap();
         // Unload has already run against submitted work. Draining afterward lets the next
         // upload publish descriptors without depending on frame-slot reclamation timing.
         assert_eq!(wait_idle(context), Ok(()));
@@ -535,7 +485,7 @@ fn assert_abi_odd_base_unsupported(
     bytes: &[u8],
 ) {
     use ez_gfx_ffi::{
-        EzGfxTextureDesc, ez_gfx_texture_get_binding, ez_gfx_texture_load, ez_gfx_texture_unload,
+        EzGfxTextureDesc, ez_gfx_texture_get_residency, ez_gfx_texture_load, ez_gfx_texture_unload,
     };
 
     // Call the exported C ABI, including descriptor validation and asynchronous status mapping.
@@ -580,10 +530,17 @@ fn assert_abi_odd_base_unsupported(
     );
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let mut binding = 0;
-        // SAFETY: binding remains writable and both handles are live.
-        let status =
-            unsafe { ez_gfx_texture_get_binding(context.into_raw(), texture, &raw mut binding) };
+        let mut resident = 0;
+        let mut total = 0;
+        // SAFETY: both outputs remain writable and both handles are live.
+        let status = unsafe {
+            ez_gfx_texture_get_residency(
+                context.into_raw(),
+                texture,
+                &raw mut resident,
+                &raw mut total,
+            )
+        };
         if status != EzGfxResult::NotReady {
             assert_eq!(status, EzGfxResult::Unsupported, "{format:?} ABI odd base");
             break;
@@ -774,10 +731,10 @@ fn await_texture_status(context: ContextHandle, texture: TextureHandle) -> ez_gf
             Ok(_) => {}
             Err(status) => return Err(status),
         }
-        match texture_binding(context, texture) {
-            Ok(_) => return Ok(()),
-            Err(Error::NotReady) => {
-                assert!(Instant::now() < deadline, "sample-ready handoff timed out");
+        match texture_residency(context, texture) {
+            Ok((resident, _)) if resident != 0 => return Ok(()),
+            Ok(_) | Err(Error::NotReady) => {
+                assert!(Instant::now() < deadline, "real texture handoff timed out");
                 std::thread::yield_now();
             }
             Err(status) => return Err(status),
@@ -790,10 +747,6 @@ fn assert_stale(context: ContextHandle, texture: TextureHandle, bytes: &[u8]) {
     assert_eq!(
         texture_binding(context, texture),
         Err(Error::Lifecycle(LifecycleError::StaleHandle))
-    );
-    assert_eq!(
-        texture_binding(context, texture).unwrap_err(),
-        Error::Lifecycle(LifecycleError::StaleHandle)
     );
     assert_eq!(
         update_texture_region(
@@ -855,89 +808,6 @@ fn assert_halves(pixels: &[u8], format: TextureFormat, left_channel: usize, widt
             index % 64,
             index / 64
         );
-    }
-}
-
-struct Decoder(u8);
-
-impl Decoder {
-    fn register(id: u8, format: TextureFormat, width: u32, height: u32) -> Self {
-        // These fixtures contain exactly two block columns and one (possibly clipped) block row.
-        assert!((5..=8).contains(&width) && (1..=4).contains(&height));
-        Context::register_texture_decoder(
-            id,
-            Arc::new(move |bytes, _| {
-                // Reject malformed custom payloads instead of padding missing compressed blocks.
-                let expected = match format {
-                    TextureFormat::Bc1Unorm | TextureFormat::Bc1Srgb => 16,
-                    TextureFormat::Rgba8Unorm => width as usize * height as usize * 4,
-                    _ => 32,
-                };
-                if bytes.len() != expected {
-                    return Err(TextureError::InvalidData);
-                }
-                Ok(DecodedTexture {
-                    width,
-                    height,
-                    mip_count: 1,
-                    format,
-                    mips: vec![DecodedMip {
-                        width,
-                        height,
-                        bytes: bytes.to_vec(),
-                    }],
-                })
-            }),
-        )
-        .unwrap();
-        Self(id)
-    }
-
-    fn register_chain(id: u8, format: TextureFormat) -> Self {
-        // Three real compressed mips use ceil-divided block counts, including clipped mip2 edges.
-        let block_bytes = solid_block(format, 0).len();
-        Context::register_texture_decoder(
-            id,
-            Arc::new(move |bytes, _| {
-                if bytes.len() != (21 + 8 + 2) * block_bytes {
-                    return Err(TextureError::InvalidData);
-                }
-                let mut offset = 0;
-                let mips = [(28, 12, 21), (14, 6, 8), (7, 3, 2)]
-                    .into_iter()
-                    .map(|(width, height, blocks)| {
-                        let end = offset + blocks * block_bytes;
-                        let mip = DecodedMip {
-                            width,
-                            height,
-                            bytes: bytes[offset..end].to_vec(),
-                        };
-                        offset = end;
-                        mip
-                    })
-                    .collect();
-                Ok(DecodedTexture {
-                    width: 28,
-                    height: 12,
-                    mip_count: 3,
-                    format,
-                    mips,
-                })
-            }),
-        )
-        .unwrap();
-        Self(id)
-    }
-
-    fn source(&self) -> TextureSource {
-        TextureSource::Custom(self.0)
-    }
-}
-
-impl Drop for Decoder {
-    fn drop(&mut self) {
-        // All loads copy/retain their callback at admission; unregister cannot invalidate work.
-        Context::unregister_texture_decoder(self.0).unwrap();
     }
 }
 

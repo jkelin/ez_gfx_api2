@@ -822,11 +822,11 @@
       <param name="texture" nullable="false" type="EzGfxTexture" doc="Texture request handle."/>
       <returns doc="Returns Ok when cancellation wins, or InvalidArgument for a terminal or stale request."/>
     </function>
-    <function name="ez_gfx_texture_get_binding" return="EzGfxResult" doc="Queries the binding index assigned to a loaded texture.">
+    <function name="ez_gfx_texture_get_binding" return="EzGfxResult" doc="Queries the stable binding assigned at load; it samples fallback until `DeviceReady`.">
       <param name="context" nullable="false" type="EzGfxContext" doc="Owning context."/>
       <param name="texture" nullable="false" type="EzGfxTexture" doc="Texture handle."/>
       <param name="out_binding" direction="out" type="uint32_t *" doc="Receives binding index."/>
-      <returns doc="Returns EzGfxResult_NotReady while upload remains in flight."/>
+      <returns doc="Returns the stable binding immediately after load; it samples opaque magenta until DeviceReady."/>
     </function>
     <function name="ez_gfx_texture_get_residency" return="EzGfxResult" doc="Queries the resident and total mip counts for a loaded texture.">
       <param name="context" nullable="false" type="EzGfxContext" doc="Owning context."/>

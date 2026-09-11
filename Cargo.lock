@@ -193,16 +193,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
 
 [[package]]
-name = "basisu_c_sys"
-version = "0.9.0"
+name = "basisu"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf599e8ecd49d2f2bb4d43a0bd5734df69b5ae810276e9e6a3517c046acdee2d"
+checksum = "36056503b9996959defdfcf058811637fdf68a2e35a48ee8e39c89a787fe9cdc"
 dependencies = [
- "bindgen",
- "bitflags 2.13.1",
- "cc",
- "spin",
- "thiserror 2.0.20",
+ "portable-atomic",
+ "ruzstd",
 ]
 
 [[package]]
@@ -783,8 +780,8 @@ dependencies = [
 name = "ez-gfx-assets"
 version = "0.1.0"
 dependencies = [
+ "basisu",
  "crossbeam-channel",
- "ez-gfx-basis",
  "parking_lot",
  "rayon",
 ]
@@ -845,14 +842,6 @@ dependencies = [
  "parking_lot",
  "raw-window-handle",
  "smallvec",
-]
-
-[[package]]
-name = "ez-gfx-basis"
-version = "0.1.0"
-dependencies = [
- "basisu_c_sys",
- "cc",
 ]
 
 [[package]]
@@ -942,12 +931,11 @@ name = "ez-gfx-runtime"
 version = "0.1.0"
 dependencies = [
  "arrayvec",
- "basisu_c_sys",
+ "basisu",
  "blake3",
  "bytemuck",
  "compact_str",
  "ez-gfx-artifact",
- "ez-gfx-basis",
  "ez-gfx-core",
  "ez-gfx-hal",
  "image",
@@ -2288,6 +2276,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "ruzstd"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fad02996bfc73da3e301efe90b1837be9ed8f4a462b6ed410aa35d00381de89f"
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2477,15 +2471,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd538fb6910ac1099850255cf94a94df6551fbdd602454387d0adb2d1ca6dead"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "spin"
-version = "0.12.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0134f9043ed38b087ac4f7d4af44c79e2c9e5094421fe3164f435ce585953b10"
-dependencies = [
- "portable-atomic",
 ]
 
 [[package]]

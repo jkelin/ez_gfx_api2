@@ -421,10 +421,10 @@ impl Context {
 
     /// Returns pending-upload counts with retained bytes plus retained cache sizes.
     ///
-    /// Decode-pending textures report admitted source bytes; transfer-pending
-    /// textures report decoded staging bytes. Vertex and index counts are
-    /// outstanding upload allocations. Device loss does not fail this
-    /// observation: teardown titles keep reporting until context destruction.
+    /// Queued and active decodes report owned source or decoded bytes; native-transfer work
+    /// reports decoded payload bytes through its final completion. Vertex and index counts are
+    /// outstanding upload allocations. Device loss does not fail this observation: teardown
+    /// titles keep reporting until context destruction.
     ///
     /// # Errors
     /// Returns [`Error`] when the context is stale, called from the wrong thread,
@@ -819,8 +819,11 @@ pub struct Texture {
 impl Texture {
     /// Returns this texture's stable shader binding index.
     ///
+    /// The slot samples the context's opaque-magenta fallback until `DeviceReady` reports real
+    /// texture publication.
+    ///
     /// # Errors
-    /// Returns [`Error`] until the texture is resident or when it is stale.
+    /// Returns [`Error`] when the texture is stale or terminally failed.
     pub fn binding(&self) -> Result<u32> {
         let context = Context {
             inner: Rc::clone(&self.inner.context),
@@ -903,8 +906,10 @@ impl Texture {
 impl Context {
     /// Queues texture decode and upload while owning the copied input.
     ///
+    /// The texture manager admits natural FIFO submissions under its internal memory budget.
+    ///
     /// # Errors
-    /// Returns [`Error`] when input, scheduling, decode admission, or ownership validation fails.
+    /// Returns [`Error`] when input, decode preparation, or ownership validation fails.
     pub fn load_texture(
         &self,
         source: ez_gfx_runtime::texture::TextureSource,

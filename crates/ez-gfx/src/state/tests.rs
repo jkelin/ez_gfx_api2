@@ -169,6 +169,9 @@ fn texture_config() -> TextureConfig {
     }
 }
 
+#[path = "tests/texture_manager.rs"]
+mod texture_manager_tests;
+
 #[cfg(not(target_vendor = "apple"))]
 #[test]
 fn texture_admission_is_nonblocking_and_pending_cancellation_invalidates_the_handle() {
@@ -198,7 +201,7 @@ fn texture_admission_is_nonblocking_and_pending_cancellation_invalidates_the_han
             status: crate::UploadStatus::SourceStaged,
         }))
     );
-    assert_eq!(texture_binding(context, texture), Err(Error::NotReady));
+    assert_eq!(texture_binding(context, texture), Ok(0));
 
     assert_eq!(cancel_texture_load(context, texture), Ok(()));
     assert_eq!(
@@ -219,6 +222,48 @@ fn texture_admission_is_nonblocking_and_pending_cancellation_invalidates_the_han
     );
 
     gate.wait();
+    assert_eq!(destroy_context(context), Ok(()));
+}
+
+#[cfg(windows)]
+#[test]
+fn natural_texture_submissions_need_one_context_wait_and_keep_lossless_events() {
+    let context = dx12_context();
+    let mut textures = Vec::new();
+    for color in 0_u8..9 {
+        textures.push(
+            load_texture(
+                context,
+                TextureSource::Rgba8 {
+                    width: 1,
+                    height: 1,
+                },
+                &[color, color, color, 255],
+                false,
+                &texture_config(),
+            )
+            .unwrap(),
+        );
+    }
+
+    assert_eq!(wait_idle(context), Ok(()));
+    let bindings = textures
+        .iter()
+        .map(|texture| texture_binding(context, *texture).unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(bindings.len(), textures.len());
+    assert_eq!(resource_diagnostics(context).unwrap().pending_textures, 0);
+
+    let mut staged = 0;
+    let mut ready = 0;
+    while let Some(event) = poll_upload_event(context).unwrap() {
+        match event.status {
+            crate::UploadStatus::SourceStaged => staged += 1,
+            crate::UploadStatus::DeviceReady => ready += 1,
+            status => panic!("unexpected terminal upload status: {status:?}"),
+        }
+    }
+    assert_eq!((staged, ready), (textures.len(), textures.len()));
     assert_eq!(destroy_context(context), Ok(()));
 }
 
@@ -771,13 +816,14 @@ fn device_loss_sweeps_pending_decodes_to_fast_device_lost() {
         &texture_config(),
     )
     .unwrap();
-    assert_eq!(texture_binding(context, texture), Err(Error::NotReady));
+    assert_eq!(texture_binding(context, texture), Ok(0));
 
     // Loss preserves the already-queued ownership transition, then emits one terminal event.
     with_context_mut(context, |owned| {
         owned.identity.mark_lost().map_err(map_lifecycle)
     })
     .unwrap();
+    assert_eq!(texture_binding(context, texture), Err(Error::DeviceLost));
     assert_eq!(
         poll_upload_event(context),
         Ok(Some(crate::UploadEvent {

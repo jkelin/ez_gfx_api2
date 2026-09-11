@@ -1831,9 +1831,9 @@ EzGfxResult ez_gfx_texture_cancel(EzGfxContext context, EzGfxTexture texture);
  * @texture: Texture handle.
  * @out_binding: Receives binding index.
  *
- * Queries the binding index assigned to a loaded texture.
+ * Queries the stable binding assigned at load; it samples fallback until `DeviceReady`.
  *
- * Returns: Returns EzGfxResult_NotReady while upload remains in flight.
+ * Returns: Returns the stable binding immediately after load; it samples opaque magenta until DeviceReady.
  */
 EzGfxResult ez_gfx_texture_get_binding(EzGfxContext context, EzGfxTexture texture, uint32_t * out_binding) EZ_GFX_ACCESS(write_only, 3);
 

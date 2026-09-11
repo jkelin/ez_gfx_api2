@@ -67,7 +67,7 @@ fn uastc_containers_preserve_srgb_and_explicit_linear_override() {
     use ez_gfx_hal::TextureFormat;
     use ez_gfx_runtime::texture::TextureDestination;
     // Generated from examples/02_textured_cube/cube.png, resized to 32x32 with Triangle filtering,
-    // by basisu_c_sys 0.9.0: UASTC LDR4x4, sRGB defaults, no Zstd; same encoded source in both containers.
+    // as UASTC LDR 4x4 with sRGB metadata and no Zstandard supercompression.
     let ktx = include_bytes!("fixtures/cube-uastc-srgb.ktx2");
     let basis = include_bytes!("fixtures/cube-uastc-srgb.basis");
     for (source, bytes) in [
@@ -90,6 +90,46 @@ fn uastc_containers_preserve_srgb_and_explicit_linear_override() {
     let ktx_rgba = TextureDecoder::decode(TextureSource::Ktx2, ktx).unwrap();
     let basis_rgba = TextureDecoder::decode(TextureSource::Basis, basis).unwrap();
     assert_eq!(ktx_rgba.mips, basis_rgba.mips);
+}
+
+#[cfg(all(feature = "basis", feature = "ktx2"))]
+#[test]
+fn zstd_uastc_matches_unsupercompressed_pixels_and_blocks() {
+    use ez_gfx_core::capability::CompressionSupport;
+    use ez_gfx_runtime::texture::TextureDestination;
+
+    // Derived from `cube-uastc-srgb.ktx2` with Zstandard CLI 1.5.7:
+    // `zstd -q -19 -c` compressed its 1,024-byte level, then the KTX2 scheme and level index
+    // were set to Zstandard (2), compressed length 917, and uncompressed length 1,024.
+    let plain = include_bytes!("fixtures/cube-uastc-srgb.ktx2");
+    let zstd = include_bytes!("fixtures/cube-uastc-zstd-srgb.ktx2");
+    for (compression, destination) in [
+        (CompressionSupport::NONE, TextureDestination::Rgba8Unorm),
+        (CompressionSupport::BC, TextureDestination::Bc7Srgb),
+    ] {
+        let expected = TextureDecoder::decode_for_destination(
+            TextureSource::Ktx2,
+            plain,
+            compression,
+            destination,
+        )
+        .unwrap();
+        let actual = TextureDecoder::decode_for_destination(
+            TextureSource::Ktx2,
+            zstd,
+            compression,
+            destination,
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    let mut oversized_scratch = zstd.to_vec();
+    oversized_scratch[96..104].copy_from_slice(&(65_u64 * 1024 * 1024).to_le_bytes());
+    assert_eq!(
+        TextureDecoder::decode(TextureSource::Ktx2, &oversized_scratch),
+        Err(ez_gfx_runtime::texture::TextureError::InvalidData)
+    );
 }
 
 #[cfg(all(feature = "basis", feature = "ktx2"))]
@@ -190,6 +230,12 @@ fn direct_ktx2_validates_geometry_and_exact_levels() {
             Err(TextureError::InvalidData | TextureError::TooLarge)
         ));
     }
+    let mut direct_supercompressed = source.clone();
+    direct_supercompressed[44..48].copy_from_slice(&2_u32.to_le_bytes());
+    assert_eq!(
+        TextureDecoder::decode(TextureSource::Ktx2, &direct_supercompressed),
+        Err(TextureError::Unsupported)
+    );
     let mut malformed = source;
     malformed[20..24].copy_from_slice(&1_u32.to_le_bytes());
     malformed[24..28].copy_from_slice(&1_u32.to_le_bytes());

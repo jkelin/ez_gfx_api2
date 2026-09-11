@@ -54,6 +54,19 @@ fn primitive_ids(primitives: &[PrimitiveData], vertex_count: usize) -> anyhow::R
     Ok(ids)
 }
 
+fn primitive_texture_binding(
+    primitive_index: usize,
+    primitive: &PrimitiveData,
+    image_bindings: &[u32],
+) -> anyhow::Result<u32> {
+    let image_index = primitive.image.ok_or_else(|| {
+        anyhow::anyhow!("Sponza primitive {primitive_index} has no base-color image")
+    })?;
+    image_bindings.get(image_index).copied().ok_or_else(|| {
+        anyhow::anyhow!("Sponza primitive {primitive_index} references missing image {image_index}")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +103,25 @@ mod tests {
         ] {
             assert!(primitive_ids(&primitives, vertices).is_err());
         }
+    }
+
+    #[test]
+    fn sponza_primitives_require_valid_image_bindings() {
+        let mesh = load_textured_glb(include_bytes!("../shared/assets/sponza.glb")).unwrap();
+        let bindings = (0..mesh.images.len())
+            .map(|index| u32::try_from(index).unwrap())
+            .collect::<Vec<_>>();
+        for (index, primitive) in mesh.primitives.iter().enumerate() {
+            assert_eq!(
+                primitive_texture_binding(index, primitive, &bindings).unwrap(),
+                bindings[primitive.image.unwrap()]
+            );
+        }
+
+        let mut missing = primitive(0);
+        assert!(primitive_texture_binding(0, &missing, &bindings).is_err());
+        missing.image = Some(bindings.len());
+        assert!(primitive_texture_binding(0, &missing, &bindings).is_err());
     }
 }
 
@@ -138,33 +170,6 @@ fn main() -> anyhow::Result<()> {
     let _uvs = uvs_heap.upload(&mesh.uvs)?;
     let primitive_ids_heap = context.create_vertex_heap("primitive_ids")?;
     let _primitive_ids_buffer = primitive_ids_heap.upload(&primitive_ids)?;
-    let repeat_sampler = TextureSamplerDesc {
-        min_filter: SamplerFilter::Linear,
-        mag_filter: SamplerFilter::Linear,
-        max_anisotropy: 1.0,
-        address_u: SamplerAddressMode::Repeat,
-        address_v: SamplerAddressMode::Repeat,
-        address_w: SamplerAddressMode::Repeat,
-    };
-    let fallback_config = TextureConfig {
-        width: 1,
-        height: 1,
-        mip_count: 0,
-        destination: ez_gfx::TextureDestination::Rgba8Unorm,
-        sampler: repeat_sampler,
-    };
-    let fallback = context.load_texture(
-        TextureSource::Rgba8 {
-            width: 1,
-            height: 1,
-        },
-        &[255, 255, 255, 255],
-        false,
-        &fallback_config,
-    )?;
-    context.wait_idle()?;
-    let fallback_binding = fallback.binding()?;
-    let mut textures = vec![fallback];
     let mut image_bindings = Vec::with_capacity(mesh.images.len());
     for image in &mesh.images {
         if image.mime_type != "image/ktx2" {
@@ -176,38 +181,38 @@ fn main() -> anyhow::Result<()> {
             mip_count: 0,
             destination: ez_gfx::TextureDestination::Rgba8Unorm,
             sampler: TextureSamplerDesc {
+                min_filter: SamplerFilter::Linear,
+                mag_filter: SamplerFilter::Linear,
                 max_anisotropy: 16.0,
-                ..repeat_sampler
+                address_u: SamplerAddressMode::Repeat,
+                address_v: SamplerAddressMode::Repeat,
+                address_w: SamplerAddressMode::Repeat,
             },
         };
-        let texture = match context.load_texture(TextureSource::Ktx2, &image.bytes, true, &config) {
-            Ok(value) => value,
-            Err(error) => {
-                return Err(anyhow::anyhow!("{error:?}"));
-            }
-        };
-        context.wait_idle()?;
-        let binding = texture.binding()?;
-        image_bindings.push(binding);
-        textures.push(texture);
+        // Stable bindings remain context-owned after the access wrapper drops.
+        image_bindings.push(
+            context
+                .load_texture(TextureSource::Ktx2, &image.bytes, true, &config)?
+                .binding()?,
+        );
     }
     let records = mesh
         .primitives
         .iter()
-        .map(|primitive| PrimitiveTextured {
-            first_index: primitive.first_index + first_index,
-            index_count: primitive.index_count,
-            vertex_offset: primitive.vertex_offset,
-            normal_offset: primitive.normal_offset,
-            uv_offset: primitive.uv_offset,
-            texture_id: primitive
-                .image
-                .and_then(|index| image_bindings.get(index).copied())
-                .unwrap_or(fallback_binding),
-            padding: [0; 2],
-            transform: row_major(primitive.transform),
+        .enumerate()
+        .map(|(index, primitive)| {
+            Ok(PrimitiveTextured {
+                first_index: primitive.first_index + first_index,
+                index_count: primitive.index_count,
+                vertex_offset: primitive.vertex_offset,
+                normal_offset: primitive.normal_offset,
+                uv_offset: primitive.uv_offset,
+                texture_id: primitive_texture_binding(index, primitive, &image_bindings)?,
+                padding: [0; 2],
+                transform: row_major(primitive.transform),
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let compute_shader = shader_bytes.load_compute_shader(&context, "computemain")?;
     let vertex_shader = shader_bytes.load_vertex_shader(&context, "vertexmain")?;
     let fragment_shader = shader_bytes.load_fragment_shader(&context, "fragmentmain")?;
@@ -221,7 +226,7 @@ fn main() -> anyhow::Result<()> {
         padding: [0; 3],
     };
 
-    while let Some(window_frame) = example.wait_for_next_frame(&surface)? {
+    while let Some(window_frame) = example.wait_for_next_frame(&context, &surface)? {
         let mut frame = surface.begin_frame()?;
         let swapchain_target = frame.configure_swapchain(
             window_frame.size,

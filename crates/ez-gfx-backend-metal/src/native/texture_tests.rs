@@ -12,9 +12,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "texture_fallback_tests.rs"]
+mod texture_fallback_tests;
+
 const RED: [u8; 4] = [255, 0, 0, 255];
 const GREEN: [u8; 4] = [0, 255, 0, 255];
 const BLUE: [u8; 4] = [0, 0, 255, 255];
+const MAGENTA: [u8; 4] = [255, 0, 255, 255];
 const LIMIT: Duration = Duration::from_secs(5);
 const SAMPLER: TextureSamplerDesc = TextureSamplerDesc {
     min_filter: SamplerFilter::Nearest,
@@ -192,9 +196,9 @@ struct Sample {
     command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
 }
 
-fn enqueue_sample(
+fn enqueue_sampled(
     context: &mut NativeContext,
-    texture: &NativeTexture,
+    texture: NativeSampledTexture<'_>,
     pipeline: &SamplingPipeline,
     wait: Option<CompletionToken>,
 ) -> Sample {
@@ -228,6 +232,15 @@ fn enqueue_sample(
     let command = context.queue.commandBuffer().unwrap();
     command.commit();
     Sample { output, command }
+}
+
+fn enqueue_sample(
+    context: &mut NativeContext,
+    texture: &NativeTexture,
+    pipeline: &SamplingPipeline,
+    wait: Option<CompletionToken>,
+) -> Sample {
+    enqueue_sampled(context, texture.sampled(), pipeline, wait)
 }
 
 fn sampled_pixel(context: &mut NativeContext, mut sample: Sample) -> [u8; 4] {

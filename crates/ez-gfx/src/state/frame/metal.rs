@@ -7,7 +7,7 @@ use super::{
     MAX_PIPELINE_CACHE_ENTRIES, MeshPipelineKeyDesc, MetalWorkgroupSizes, NativeAllocation,
     NativeContext, NativePipeline, NativeShader, NativeSurface, NativeTexture, PipelineKey,
     RenderTargetHandle, RenderTargetRecord, ResourceId, SURFACE_DEFAULT_CLEAR, ShaderRecord,
-    TextureHandle, TextureId, map_hal, native_layouts, pipeline_layout_key,
+    TextureHandle, TextureId, map_hal, map_texture, native_layouts, pipeline_layout_key,
     prepare_frame_binding_scratch, should_capture_presented,
 };
 use arrayvec::ArrayVec;
@@ -799,20 +799,41 @@ pub(super) fn execute_metal_frame_plan(
             .is_some_and(|surface| surface.state.snapshot_cache()),
         context.frame_capture_surface.is_some(),
     );
+    let NativeTexture::Metal(fallback) = context.texture_fallback.ready().ok_or(Error::NotReady)?
+    else {
+        return Err(Error::NativeFailure);
+    };
     let mut native_textures = ArrayVec::<_, { MAX_BINDLESS_SAMPLED_TEXTURES as usize }>::new();
-    for (handle, (_, texture, _, _, _)) in &context.textures {
-        if !context
+    // Only live and pending handles participate. Failed handles and both retirement queues have
+    // ended their documented binding lifetime, so their fallback aliases are intentionally absent.
+    for (handle, (id, texture, _, _, _)) in &context.textures {
+        let sampled = if context
             .texture_published_mips
             .get(handle)
             .is_some_and(|mips| *mips != 0)
         {
-            continue;
-        }
-        let NativeTexture::Metal(texture) = texture else {
-            return Err(Error::NativeFailure);
+            let NativeTexture::Metal(texture) = texture else {
+                return Err(Error::NativeFailure);
+            };
+            texture.sampled()
+        } else {
+            let binding = context
+                .texture_registry
+                .reserved_binding(*id)
+                .map_err(map_texture)?;
+            fallback.fallback_sampled(binding)
         };
         native_textures
-            .try_push(texture)
+            .try_push(sampled)
+            .map_err(|_| Error::NativeFailure)?;
+    }
+    for pending in context.pending_textures.values() {
+        let binding = context
+            .texture_registry
+            .reserved_binding(pending.id)
+            .map_err(map_texture)?;
+        native_textures
+            .try_push(fallback.fallback_sampled(binding))
             .map_err(|_| Error::NativeFailure)?;
     }
     let (index, index_size) = match context.index_heap.as_ref() {

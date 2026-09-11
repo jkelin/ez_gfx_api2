@@ -11,8 +11,8 @@ use super::SurfaceInsertTestFailure;
 use super::{
     Backend, ContextHandle, ContextState, Error, HeadlessSurfaceOptions, NativeContext,
     NativeSurface, PresentationMode, PresentationModes, ResourceKind, SurfaceHandle, SurfaceRecord,
-    SurfaceState, SurfaceWindow, map_hal, map_lifecycle, map_native_loss, result_status,
-    with_context_mut, with_surface_mut,
+    SurfaceState, SurfaceWindow, initialize_texture_fallback, map_hal, map_lifecycle,
+    map_native_loss, result_status, with_context_mut, with_surface_mut,
 };
 
 /// Creates a headless surface with an explicit initial extent.
@@ -285,38 +285,45 @@ pub fn init_device(context: ContextHandle, surface: SurfaceHandle) -> Result<()>
             .identity
             .resolve(handle, ResourceKind::Surface)
             .map_err(map_lifecycle)?;
-        let record = context
-            .surfaces
-            .get_mut(&surface)
-            .ok_or(Error::InvalidContext)?;
         let first_initialization = context.active_surface.is_none();
         // Explicit selection is enforced at device creation: Vulkan instances
         // are adapter-agnostic, so the stable identity resolves here.
         let selection = context.options.adapter_selection;
-        let adapter = match (&mut context.native, &mut record.native) {
-            (NativeContext::Vulkan(native), NativeSurface::Vulkan(surface)) => {
-                let presentation_surface = (!surface.is_headless()).then_some(&*surface);
-                match selection {
-                    Some(selected) => native.init_device_for_adapter(
-                        presentation_surface,
-                        selected.stable_id,
-                        selected.allow_software,
-                    ),
-                    None => native.init_device(presentation_surface),
+        let adapter = {
+            let record = context
+                .surfaces
+                .get_mut(&surface)
+                .ok_or(Error::InvalidContext)?;
+            match (&mut context.native, &mut record.native) {
+                (NativeContext::Vulkan(native), NativeSurface::Vulkan(surface)) => {
+                    let presentation_surface = (!surface.is_headless()).then_some(&*surface);
+                    match selection {
+                        Some(selected) => native.init_device_for_adapter(
+                            presentation_surface,
+                            selected.stable_id,
+                            selected.allow_software,
+                        ),
+                        None => native.init_device(presentation_surface),
+                    }
                 }
+                #[cfg(windows)]
+                (NativeContext::Dx12(native), NativeSurface::Dx12(surface)) => {
+                    native.init_device(surface)
+                }
+                #[cfg(target_vendor = "apple")]
+                (NativeContext::Metal(native), NativeSurface::Metal(surface)) => {
+                    native.init_device(surface)
+                }
+                #[cfg(any(windows, target_vendor = "apple"))]
+                _ => Err(HalError::InvalidArgument),
             }
-            #[cfg(windows)]
-            (NativeContext::Dx12(native), NativeSurface::Dx12(surface)) => {
-                native.init_device(surface)
-            }
-            #[cfg(target_vendor = "apple")]
-            (NativeContext::Metal(native), NativeSurface::Metal(surface)) => {
-                native.init_device(surface)
-            }
-            #[cfg(any(windows, target_vendor = "apple"))]
-            _ => Err(HalError::InvalidArgument),
         }
         .map_err(|error| map_native_loss(&context.identity, error))?;
+        initialize_texture_fallback(context)?;
+        let record = context
+            .surfaces
+            .get_mut(&surface)
+            .ok_or(Error::InvalidContext)?;
         // Reinitialization may select another adapter with different surface support.
         record.presentation_modes = None;
         record.initialized = true;

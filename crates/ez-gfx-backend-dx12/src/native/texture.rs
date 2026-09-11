@@ -95,24 +95,7 @@ fn write_texture_view(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "construction receives the validated native texture contract as one explicit handoff"
-)]
-fn publish_texture(
-    context: &NativeContext,
-    resource: ID3D12Resource,
-    allocation: Allocation,
-    format: TextureFormat,
-    width: u32,
-    height: u32,
-    binding: u32,
-    sampler_desc: TextureSamplerDesc,
-    cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    completions: Vec<CompletionToken>,
-) -> (NativeTexture, Vec<CompletionToken>) {
-    let mip_count = u32::try_from(completions.len()).expect("validated mip count fits u32");
-    write_texture_view(context, &resource, format, binding, mip_count, 1);
+fn write_texture_sampler(context: &NativeContext, binding: u32, sampler_desc: TextureSamplerDesc) {
     let filter = if sampler_desc.max_anisotropy > 1.0 {
         D3D12_FILTER_ANISOTROPIC
     } else {
@@ -141,24 +124,41 @@ fn publish_texture(
         ..Default::default()
     };
     // SAFETY: the sampler heap remains live and `binding` was range-checked.
-    let mut sampler_handle = unsafe { context.samplers.GetCPUDescriptorHandleForHeapStart() };
-    sampler_handle.ptr += binding as usize * context.sampler_stride as usize;
+    let mut handle = unsafe { context.samplers.GetCPUDescriptorHandleForHeapStart() };
+    handle.ptr += binding as usize * context.sampler_stride as usize;
     // SAFETY: the initialized sampler is written into the range-checked stable binding.
     unsafe {
-        context
-            .device
-            .CreateSampler(&raw const sampler, sampler_handle);
+        context.device.CreateSampler(&raw const sampler, handle);
     };
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "construction receives the validated native texture contract as one explicit handoff"
+)]
+fn publish_texture(
+    resource: ID3D12Resource,
+    allocation: Allocation,
+    format: TextureFormat,
+    width: u32,
+    height: u32,
+    binding: u32,
+    sampler_desc: TextureSamplerDesc,
+    cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    completions: Vec<CompletionToken>,
+) -> (NativeTexture, Vec<CompletionToken>) {
+    let mip_count = u32::try_from(completions.len()).expect("validated mip count fits u32");
     let mip_completions = completions.iter().rev().map(|token| token.value).collect();
     (
         NativeTexture {
             resource,
             allocation,
             format,
+            sampler_desc: Some(sampler_desc),
             width,
             height,
             mip_count,
-            resident_mips: 1,
+            resident_mips: 0,
             mip_completions,
             cancellation,
             binding,
@@ -429,7 +429,6 @@ impl NativeContext {
         let capacity = upload.allocation.size();
         self.texture_staging.put(capacity, upload, Some(completion));
         Ok(publish_texture(
-            self,
             resource,
             allocation,
             format,
@@ -591,6 +590,40 @@ impl NativeContext {
         Ok(completion)
     }
 
+    /// Points one reserved descriptor slot at the context-owned fallback resource and sampler.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the binding is outside the synchronized heap capacity.
+    pub fn publish_texture_fallback(
+        &mut self,
+        fallback: &NativeTexture,
+        binding: u32,
+    ) -> Result<(), AllocationError> {
+        if binding >= TEXTURE_DESCRIPTOR_CAPACITY || fallback.resident_mips == 0 {
+            return Err(AllocationError::ZeroSize);
+        }
+        let index = usize::try_from(binding).map_err(|_| AllocationError::NativeFailure)?;
+        if self
+            .texture_fallback_bindings
+            .get(index)
+            .copied()
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let sampler = fallback
+            .sampler_desc
+            .ok_or(AllocationError::NativeFailure)?;
+        write_texture_view(self, &fallback.resource, fallback.format, binding, 1, 1);
+        write_texture_sampler(self, binding, sampler);
+        if self.texture_fallback_bindings.len() <= index {
+            self.texture_fallback_bindings.resize(index + 1, false);
+        }
+        self.texture_fallback_bindings[index] = true;
+        Ok(())
+    }
+
     /// Rewrites the stable binding to expose exactly the requested contiguous coarse mip range.
     ///
     /// # Errors
@@ -636,6 +669,14 @@ impl NativeContext {
             texture.mip_count,
             resident_mips,
         );
+        let sampler = texture.sampler_desc.ok_or(AllocationError::NativeFailure)?;
+        write_texture_sampler(self, texture.binding, sampler);
+        if let Some(alias) = self
+            .texture_fallback_bindings
+            .get_mut(texture.binding as usize)
+        {
+            *alias = false;
+        }
         texture.resident_mips = resident_mips;
         Ok(())
     }

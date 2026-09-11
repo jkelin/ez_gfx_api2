@@ -1037,7 +1037,7 @@
     "function:ez_gfx_texture_get_binding": {
       "attrs": {
         "return": "EzGfxResult",
-        "returns-doc": "Returns EzGfxResult_NotReady while upload remains in flight."
+        "returns-doc": "Returns the stable binding immediately after load; it samples opaque magenta until DeviceReady."
       },
       "children": {
         "texture": {

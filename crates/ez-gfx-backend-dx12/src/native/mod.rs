@@ -537,6 +537,8 @@ pub struct NativeTexture {
     resource: ID3D12Resource,
     allocation: Allocation,
     format: TextureFormat,
+    /// Sampler installed with the first sampled-view publication; absent for render targets.
+    sampler_desc: Option<TextureSamplerDesc>,
     width: u32,
     height: u32,
     mip_count: u32,
@@ -747,6 +749,9 @@ pub struct NativeContext {
     descriptor_stride: u32,
     samplers: ID3D12DescriptorHeap,
     sampler_stride: u32,
+    /// Slots whose descriptors currently alias the shared fallback texture and sampler.
+    /// Every sampled-heap writer must set `true` for aliases and `false` for real descriptors.
+    texture_fallback_bindings: Vec<bool>,
 }
 
 // SAFETY: D3D12/DXGI interfaces are agile and the event handle is process-wide; higher layers

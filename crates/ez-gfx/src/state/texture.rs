@@ -6,15 +6,23 @@ use super::Dx12Context;
 use super::MetalContext;
 use super::{
     Arc, AtomicBool, CompletionToken, ContextHandle, ContextState, DecodedTextureJob, Error,
-    ImageMip, Instant, NativeContext, NativeTexture, Ordering, PendingTexture, QueueKind,
-    ResourceKind, RetiredTexture, RuntimePhase, TextureDecoder, TextureDestination, TextureError,
-    TextureFormat, TextureHandle, TextureId, TextureRegion, TextureSource,
-    TextureUploadTelemetrySnapshot, UploadEvent, UploadResource, UploadStatus, VulkanContext,
-    completed_texture_transfer_native, destroy_native_texture, generate_mips, map_allocation,
-    map_lifecycle, map_texture, poll_native_frame_completion, runtime_record, runtime_status,
+    Instant, NativeContext, NativeTexture, Ordering, PendingTexture, QueueKind,
+    QueuedTextureDecode, ResourceKind, RetiredTexture, RetiredTextureBinding, RuntimePhase,
+    TextureDecoder, TextureDestination, TextureError, TextureFormat, TextureHandle, TextureId,
+    TextureRegion, TextureSource, TextureUploadTelemetrySnapshot, UploadEvent, UploadResource,
+    UploadStatus, VulkanContext, completed_texture_transfer_native, destroy_native_texture,
+    generate_mips, map_allocation, map_lifecycle, map_texture, poll_native_frame_completion,
+    publish_reserved_fallback, pump_async_textures, runtime_record, runtime_status,
     with_context_mut,
 };
 use ez_gfx_runtime::ContextHealth;
+
+pub(super) const TEXTURE_WORKING_SET_BUDGET: u64 =
+    4 * ez_gfx_runtime::texture::MAX_TEXTURE_BYTES as u64;
+pub(super) const TEXTURE_DECODE_RESERVATION: u64 =
+    ez_gfx_runtime::texture::MAX_TEXTURE_BYTES as u64;
+// Four worst-case requests preserve useful decode parallelism while bounding active payloads.
+// The empty-window exception keeps a future larger valid request from starving permanently.
 
 #[derive(Clone, Copy, Debug)]
 /// Dimensions, mip policy, and sampling configuration for a texture.
@@ -90,15 +98,16 @@ mod publish_tests {
     }
 }
 
-/// Queues texture decode, mip generation, and transfer preparation without blocking the caller.
+/// Queues texture decode and upload without blocking the caller.
 ///
-/// The input bytes are copied before this function returns; callers retain no asynchronous
-/// lifetime obligation.
+/// The manager copies source bytes, reserves the stable binding, and admits FIFO decode and
+/// transfer waves under its internal working-set budget. Callers retain no asynchronous lifetime
+/// or batch-size obligation.
 ///
 /// # Errors
 ///
-/// Returns an error for invalid input, an unvalidated sampler, exhausted handles,
-/// worker backpressure, or a stale context.
+/// Returns an error for invalid input, an unvalidated sampler, exhausted handles, or a stale
+/// context.
 pub fn load_texture(
     context: ContextHandle,
     source: TextureSource,
@@ -111,8 +120,6 @@ pub fn load_texture(
     }
     validate_texture_sampler(&config.sampler)?;
     let owned = bytes.to_vec().into_boxed_slice();
-    // `bytes` is copied into the decode closure below; retain only its length here so
-    // diagnostics can report decode-pending sizes without retaining a second copy.
     let source_bytes = owned.len() as u64;
     let config = *config;
 
@@ -122,10 +129,22 @@ pub fn load_texture(
             .identity
             .check_thread_and_health()
             .map_err(map_lifecycle)?;
-        // Build the lazy pool before admission: thread refusal fails here with
-        // no registry, identity, or pending state to roll back. The submit-site
-        // lookup below is then infallible on the creator thread.
+        if !context.texture_fallback.permits_load() {
+            return Err(Error::NotReady);
+        }
         context.async_textures.ensure_decode_pool()?;
+        let compression = match &context.native {
+            NativeContext::Vulkan(native) => native.adapter_info().map_or(
+                ez_gfx_core::capability::CompressionSupport::NONE,
+                |adapter| adapter.capabilities().compression,
+            ),
+            #[cfg(windows)]
+            NativeContext::Dx12(native) => native.adapter_info().capabilities().compression,
+            #[cfg(target_vendor = "apple")]
+            NativeContext::Metal(native) => native.adapter_info().capabilities().compression,
+        };
+        let prepared = TextureDecoder::prepare(source, compression, config.destination)
+            .map_err(map_texture)?;
         let texture = context
             .texture_registry
             .begin_upload()
@@ -137,7 +156,21 @@ pub fn load_texture(
                 return Err(map_lifecycle(error));
             }
         };
-        let typed = TextureHandle::from_packed(handle).map_err(|_| Error::NativeFailure)?;
+        let Ok(typed) = TextureHandle::from_packed(handle) else {
+            let _ = context.identity.remove(handle, ResourceKind::Texture);
+            let _ = context.texture_registry.cancel_upload(texture);
+            return Err(Error::NativeFailure);
+        };
+        let binding = context
+            .texture_registry
+            .reserved_binding(texture)
+            .map_err(map_texture)?;
+        let fallback_ready = context.texture_fallback.is_ready();
+        if fallback_ready && let Err(error) = publish_reserved_fallback(context, binding) {
+            let _ = context.identity.remove(handle, ResourceKind::Texture);
+            let _ = context.texture_registry.cancel_upload(texture);
+            return Err(error);
+        }
         let cancelled = Arc::new(AtomicBool::new(false));
         context.pending_textures.insert(
             typed,
@@ -145,35 +178,64 @@ pub fn load_texture(
                 id: texture,
                 cancelled: cancelled.clone(),
                 config,
+                fallback_published: fallback_ready,
                 source_bytes,
+                decoded_bytes: None,
                 admitted_at: Instant::now(),
             },
         );
-        let compression = match &context.native {
-            NativeContext::Vulkan(native) => native.adapter_info().map_or(
-                ez_gfx_core::capability::CompressionSupport::NONE,
-                |adapter| adapter.capabilities().compression,
-            ),
-            #[cfg(windows)]
-            NativeContext::Dx12(native) => native.adapter_info().capabilities().compression,
-            #[cfg(target_vendor = "apple")]
-            NativeContext::Metal(native) => native.adapter_info().capabilities().compression,
-        };
-        let prepared = match TextureDecoder::prepare(source, compression, config.destination) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                context.pending_textures.remove(&typed);
-                let _ = context.identity.remove(handle, ResourceKind::Texture);
-                let _ = context.texture_registry.cancel_upload(texture);
-                return Err(map_texture(error));
-            }
-        };
+        context.async_textures.order.push_back(typed);
+        context
+            .async_textures
+            .queued
+            .push_back(QueuedTextureDecode {
+                handle: typed,
+                prepared,
+                bytes: owned,
+                generate,
+                cancelled,
+            });
+        let record = runtime_record(context, typed.into_raw(), RuntimePhase::Admission, Ok(()));
+        context.observability.push_event(record);
+        context.upload_events.push(UploadEvent {
+            resource: UploadResource::Texture(typed),
+            status: UploadStatus::SourceStaged,
+        });
+        schedule_texture_decodes(context)?;
+        Ok(typed)
+    })
+}
+
+/// Fills the private decode window without blocking a worker or exposing policy to callers.
+///
+/// Each active job reserves the per-request maximum because encoded formats and custom decoders
+/// need not reveal their output size before decoding.
+pub(super) fn schedule_texture_decodes(context: &mut ContextState) -> Result<()> {
+    while context.async_textures.active < context.async_textures.threads
+        && (!context.async_textures.queued.is_empty())
+        && (context
+            .async_textures
+            .working_bytes
+            .checked_add(TEXTURE_DECODE_RESERVATION)
+            .is_some_and(|bytes| bytes <= TEXTURE_WORKING_SET_BUDGET)
+            || context.async_textures.working_bytes == 0)
+    {
+        let job = context
+            .async_textures
+            .queued
+            .pop_front()
+            .ok_or(Error::NativeFailure)?;
+        let handle = job.handle;
+        let cancelled = job.cancelled.clone();
         let telemetry = context.texture_telemetry.clone();
         let ready = context.async_textures.ready_tx.clone();
         #[cfg(test)]
         let decode_gate = context.async_textures.decode_gate.clone();
-        // The pool was ensured before admission above, so this lookup cannot
-        // fail on the creator thread; every error below this point rolls back.
+        context.async_textures.active = context.async_textures.active.saturating_add(1);
+        context.async_textures.working_bytes = context
+            .async_textures
+            .working_bytes
+            .saturating_add(TEXTURE_DECODE_RESERVATION);
         let submitted = context.async_textures.decode_pool()?.submit(move || {
             #[cfg(test)]
             if let Some(gate) = decode_gate {
@@ -184,8 +246,8 @@ pub fn load_texture(
                 Err(TextureError::NotFound)
             } else {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    prepared.decode(&owned).and_then(|texture| {
-                        if generate {
+                    job.prepared.decode(&job.bytes).and_then(|texture| {
+                        if job.generate {
                             generate_mips(texture)
                         } else {
                             Ok(texture)
@@ -194,34 +256,33 @@ pub fn load_texture(
                 }))
                 .unwrap_or(Err(TextureError::InvalidData))
             };
-            let decode_microseconds =
-                u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-            telemetry.record_decode(decode_microseconds);
-            // A cancelled request has already retired its public and registry handles.
-            if !cancelled.load(Ordering::Acquire) {
-                let _ = ready.send(DecodedTextureJob {
-                    handle: typed,
-                    decoded,
-                });
-            }
+            telemetry
+                .record_decode(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+            let _ = ready.send(DecodedTextureJob { handle, decoded });
         });
         if submitted.is_err() {
-            context.pending_textures.remove(&typed);
-            let _ = context.identity.remove(handle, ResourceKind::Texture);
-            let _ = context.texture_registry.cancel_upload(texture);
-            return Err(Error::QueueFull);
+            context.async_textures.active = context.async_textures.active.saturating_sub(1);
+            context.async_textures.working_bytes = context
+                .async_textures
+                .working_bytes
+                .saturating_sub(TEXTURE_DECODE_RESERVATION);
+            if let Some(pending) = context.pending_textures.remove(&handle) {
+                fail_texture_job(context, handle, pending.id, Error::QueueFull);
+            }
+            context
+                .async_textures
+                .order
+                .retain(|queued| *queued != handle);
         }
-        let record = runtime_record(context, typed.into_raw(), RuntimePhase::Admission, Ok(()));
-        context.observability.push_event(record);
-        context.upload_events.push(UploadEvent {
-            resource: UploadResource::Texture(typed),
-            status: UploadStatus::SourceStaged,
-        });
-        Ok(typed)
-    })
+    }
+    Ok(())
 }
 
-fn record_texture_failure(context: &mut ContextState, handle: TextureHandle, error: Error) {
+pub(super) fn record_texture_failure(
+    context: &mut ContextState,
+    handle: TextureHandle,
+    error: Error,
+) {
     // Decode failures retain the public handle long enough for deterministic polling.
     context.texture_failures.insert(handle, error);
     let record = runtime_record(context, handle.into_raw(), RuntimePhase::Decode, Err(error));
@@ -232,22 +293,40 @@ fn record_texture_failure(context: &mut ContextState, handle: TextureHandle, err
     });
 }
 
-fn fail_texture_job(
+fn retire_pending_texture_binding(context: &mut ContextState, id: TextureId) -> Result<()> {
+    if context.texture_fallback.is_ready() {
+        context.texture_registry.retire(id).map_err(map_texture)?;
+        context
+            .retired_texture_bindings
+            .push(RetiredTextureBinding { id });
+    } else {
+        context
+            .texture_registry
+            .cancel_upload(id)
+            .map_err(map_texture)?;
+    }
+    Ok(())
+}
+
+pub(super) fn fail_texture_job(
     context: &mut ContextState,
     handle: TextureHandle,
     id: TextureId,
     error: Error,
 ) {
-    let _ = context.texture_registry.cancel_upload(id);
+    let _ = retire_pending_texture_binding(context, id);
     record_texture_failure(context, handle, error);
 }
 
-/// Synchronously cancels every queued decode, reusing destroy's drain loop.
 pub(super) fn cancel_all_pending_textures(context: &mut ContextState) {
     for (_, pending) in context.pending_textures.drain() {
         pending.cancelled.store(true, Ordering::Release);
         let _ = context.texture_registry.cancel_upload(pending.id);
     }
+    context.async_textures.queued.clear();
+    context.async_textures.order.clear();
+    context.async_textures.decoded.clear();
+    context.async_textures.working_bytes = 0;
 }
 
 /// Marks terminal loss once, emits terminal upload events, and sweeps queued decodes.
@@ -262,151 +341,9 @@ pub(super) fn note_device_lost(context: &mut ContextState) {
     }
     let _ = context.identity.mark_lost();
     // Terminal failure events retire every pending outcome, so no transfer keeps a
-    // pending size afterwards; `texture_ready` tokens linger for teardown ordering.
     context.texture_transfer_bytes.clear();
+    context.texture_transfer_work.clear();
     cancel_all_pending_textures(context);
-}
-
-pub(super) fn pump_async_textures(context: &mut ContextState) -> Result<usize> {
-    reclaim_retired_textures(context)?;
-    let mut completed = 0;
-    while let Ok(job) = context.async_textures.ready_rx.try_recv() {
-        let Some(pending) = context.pending_textures.remove(&job.handle) else {
-            continue;
-        };
-        if pending.cancelled.load(Ordering::Acquire) {
-            continue;
-        }
-        let decoded = match job.decoded {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                fail_texture_job(context, job.handle, pending.id, map_texture(error));
-                completed += 1;
-                continue;
-            }
-        };
-        if (pending.config.width != 0 && decoded.width != pending.config.width)
-            || (pending.config.height != 0 && decoded.height != pending.config.height)
-            || (pending.config.mip_count != 0 && decoded.mip_count != pending.config.mip_count)
-        {
-            fail_texture_job(context, job.handle, pending.id, Error::InvalidArgument);
-            completed += 1;
-            continue;
-        }
-        let mips = decoded
-            .mips
-            .iter()
-            .map(|mip| ImageMip {
-                width: mip.width,
-                height: mip.height,
-                bytes: &mip.bytes,
-            })
-            .collect::<Vec<_>>();
-        let submitted_at = Instant::now();
-        let binding = context
-            .texture_registry
-            .reserved_binding(pending.id)
-            .map_err(map_texture)?;
-        let created = match &mut context.native {
-            NativeContext::Vulkan(native) => native
-                .create_texture(decoded.format, &mips, binding, pending.config.sampler)
-                .map(|(texture, tokens)| (NativeTexture::Vulkan(texture), tokens)),
-            #[cfg(windows)]
-            NativeContext::Dx12(native) => native
-                .create_texture(decoded.format, &mips, binding, pending.config.sampler)
-                .map(|(texture, tokens)| (NativeTexture::Dx12(texture), tokens)),
-            #[cfg(target_vendor = "apple")]
-            NativeContext::Metal(native) => native
-                .create_texture(decoded.format, &mips, binding, pending.config.sampler)
-                .map(|(texture, tokens)| (NativeTexture::Metal(texture), tokens)),
-        };
-        let (native, completions) = match created {
-            Ok(created) => created,
-            Err(error) => {
-                // Pump records per-job failures without returning, so a loss observed
-                // here must sweep directly or siblings would stay NotReady.
-                let mapped = map_allocation(error);
-                fail_texture_job(context, job.handle, pending.id, mapped);
-                if mapped == Error::DeviceLost {
-                    note_device_lost(context);
-                }
-                completed += 1;
-                continue;
-            }
-        };
-        if completions.len() != decoded.mip_count as usize {
-            rollback_texture_upload(context, pending.id, native)?;
-            record_texture_failure(context, job.handle, Error::NativeFailure);
-            completed += 1;
-            continue;
-        }
-        let last = *completions.last().ok_or(Error::NativeFailure)?;
-        let mut completions = completions.into_iter();
-        let first = completions.next().ok_or(Error::NativeFailure)?;
-        let tracked = context
-            .texture_registry
-            .mark_submitted(pending.id, first)
-            .map_err(map_texture)
-            .and_then(|()| {
-                for (index, completion) in completions.enumerate() {
-                    let resident_mips = u32::try_from(index)
-                        .ok()
-                        .and_then(|index| index.checked_add(2))
-                        .ok_or(Error::NativeFailure)?;
-                    context
-                        .texture_registry
-                        .mark_mips_submitted(pending.id, resident_mips, completion)
-                        .map_err(map_texture)?;
-                }
-                Ok(())
-            });
-        if let Err(error) = tracked {
-            rollback_texture_upload(context, pending.id, native)?;
-            record_texture_failure(context, job.handle, error);
-            completed += 1;
-            continue;
-        }
-        context.texture_telemetry.record_queue_latency(
-            u64::try_from(submitted_at.duration_since(pending.admitted_at).as_micros())
-                .unwrap_or(u64::MAX),
-        );
-        let staging_bytes = decoded.mips.iter().fold(0_u64, |total, mip| {
-            total.saturating_add(mip.bytes.len() as u64)
-        });
-        context
-            .texture_telemetry
-            .record_staging_bytes(staging_bytes);
-        context.textures.insert(
-            job.handle,
-            (
-                pending.id,
-                native,
-                decoded.width,
-                decoded.height,
-                decoded.mip_count,
-            ),
-        );
-        context.texture_formats.insert(job.handle, decoded.format);
-        context.texture_published_mips.insert(job.handle, 0);
-        context
-            .texture_residency_targets
-            .insert(job.handle, decoded.mip_count);
-        context.texture_last_transfer.insert(job.handle, last);
-        context.texture_ready.insert(job.handle, first);
-        // Transfer-pending sizes mirror `texture_ready` so diagnostics can report them;
-        // publication, cancel, loss, and teardown each remove the entry alongside it.
-        context
-            .texture_transfer_bytes
-            .insert(job.handle, staging_bytes);
-        context.texture_handoffs.insert(job.handle, submitted_at);
-        let decode = runtime_record(context, job.handle.into_raw(), RuntimePhase::Decode, Ok(()));
-        context.observability.push_event(decode);
-        let upload = runtime_record(context, job.handle.into_raw(), RuntimePhase::Upload, Ok(()));
-        context.observability.push_event(upload);
-        completed += 1;
-    }
-    reclaim_retired_textures(context)?;
-    Ok(completed)
 }
 
 pub(super) fn rollback_texture_upload(
@@ -415,6 +352,10 @@ pub(super) fn rollback_texture_upload(
     native: NativeTexture,
 ) -> Result<()> {
     let completion = native_texture_last_completion(&native)?;
+    let binding = context
+        .texture_registry
+        .reserved_binding(texture)
+        .map_err(map_texture)?;
     cancel_native_texture_transfers(&native);
     context
         .texture_registry
@@ -422,6 +363,7 @@ pub(super) fn rollback_texture_upload(
         .map_err(map_texture)?;
     context.retired_textures.push(RetiredTexture {
         id: texture,
+        binding,
         native,
         completion,
     });
@@ -491,7 +433,33 @@ fn native_texture_retirement_ready(
     }
 }
 
-fn reclaim_retired_textures(context: &mut ContextState) -> Result<()> {
+fn texture_descriptors_ready(context: &NativeContext) -> Result<bool> {
+    match context {
+        NativeContext::Vulkan(context) => Ok(context.texture_descriptor_update_ready()),
+        #[cfg(windows)]
+        NativeContext::Dx12(context) => context
+            .texture_descriptor_update_ready()
+            .map_err(map_allocation),
+        #[cfg(target_vendor = "apple")]
+        NativeContext::Metal(context) => Ok(context.texture_descriptor_update_ready()),
+    }
+}
+
+fn reclaim_retired_texture_bindings(context: &mut ContextState) -> Result<()> {
+    if context.retired_texture_bindings.is_empty() || !texture_descriptors_ready(&context.native)? {
+        return Ok(());
+    }
+    for retired in context.retired_texture_bindings.drain(..) {
+        context
+            .texture_registry
+            .release_retired(retired.id)
+            .map_err(map_texture)?;
+    }
+    Ok(())
+}
+
+pub(super) fn reclaim_retired_textures(context: &mut ContextState) -> Result<()> {
+    reclaim_retired_texture_bindings(context)?;
     let mut index = 0;
     while index < context.retired_textures.len() {
         let retired = &context.retired_textures[index];
@@ -501,6 +469,10 @@ fn reclaim_retired_textures(context: &mut ContextState) -> Result<()> {
             index += 1;
             continue;
         }
+        let binding = retired.binding;
+        // Reset the slot before destroying its real resource; retirement readiness proves no
+        // submitted frame can still observe the old descriptor.
+        publish_reserved_fallback(context, binding)?;
         let retired = context.retired_textures.swap_remove(index);
         destroy_native_texture(&mut context.native, retired.native).map_err(map_allocation)?;
         context
@@ -511,7 +483,7 @@ fn reclaim_retired_textures(context: &mut ContextState) -> Result<()> {
     Ok(())
 }
 
-fn publish_native_texture_mips(
+pub(super) fn publish_native_texture_mips(
     context: &mut NativeContext,
     texture: &mut NativeTexture,
     resident_mips: u32,
@@ -593,16 +565,7 @@ fn advance_texture_residency(context: &mut ContextState, completed: u64) -> Resu
         return Ok(());
     }
 
-    // Only DX12's descriptor fence query can fail; preserve its device-loss error.
-    let descriptors_ready = match &context.native {
-        NativeContext::Vulkan(context) => context.texture_descriptor_update_ready(),
-        #[cfg(windows)]
-        NativeContext::Dx12(context) => context
-            .texture_descriptor_update_ready()
-            .map_err(map_allocation)?,
-        #[cfg(target_vendor = "apple")]
-        NativeContext::Metal(context) => context.texture_descriptor_update_ready(),
-    };
+    let descriptors_ready = texture_descriptors_ready(&context.native)?;
     if !descriptors_ready {
         return Ok(());
     }
@@ -643,7 +606,6 @@ pub(super) fn record_texture_ready(
     }
 
     context.texture_ready.remove(&texture);
-    context.texture_transfer_bytes.remove(&texture);
     if let Some(submitted_at) = context.texture_handoffs.remove(&texture) {
         context.texture_telemetry.record_handoff_latency(
             u64::try_from(submitted_at.elapsed().as_micros()).unwrap_or(u64::MAX),
@@ -677,43 +639,35 @@ pub fn texture_decode_worker_count(context: ContextHandle) -> Result<u32> {
     })
 }
 
-/// Returns a texture binding index.
+/// Returns a texture's reserved stable binding.
+///
+/// A successful load makes this slot sample the context fallback until real publication.
 ///
 /// # Errors
 ///
-/// Returns an error when the context or texture handle is invalid or stale.
+/// Returns an error when the context or texture handle is invalid, stale, or terminally failed.
 pub fn texture_binding(context: ContextHandle, texture: TextureHandle) -> Result<u32> {
     with_context_mut(context, |context| {
         context
             .identity
             .check_thread_and_health()
             .map_err(map_lifecycle)?;
-        pump_async_textures(context)?;
         if let Some(error) = context.texture_failures.get(&texture).copied() {
             return Err(error);
         }
-        if context.pending_textures.contains_key(&texture) {
-            return Err(Error::NotReady);
-        }
-        let handle = texture.packed();
         context
             .identity
-            .resolve(handle, ResourceKind::Texture)
+            .resolve(texture.packed(), ResourceKind::Texture)
             .map_err(map_lifecycle)?;
-        let completed =
-            completed_texture_transfer_native(&mut context.native).map_err(map_allocation)?;
-        advance_texture_residency(context, completed)?;
-        record_texture_ready(context, texture, completed);
-        if context.texture_ready.contains_key(&texture) {
-            return Err(Error::NotReady);
-        }
-        let (id, _, _, _, _) = context
-            .textures
+        let id = context
+            .pending_textures
             .get(&texture)
+            .map(|pending| pending.id)
+            .or_else(|| context.textures.get(&texture).map(|(id, _, _, _, _)| *id))
             .ok_or(Error::InvalidContext)?;
         context
             .texture_registry
-            .binding_index(*id)
+            .reserved_binding(id)
             .map_err(map_texture)
     })
 }
@@ -1013,6 +967,10 @@ fn retire_live_texture(context: &mut ContextState, texture: TextureHandle) -> Re
         .get(&texture)
         .map(|(id, _, _, _, _)| *id)
         .ok_or(Error::InvalidContext)?;
+    let binding = context
+        .texture_registry
+        .reserved_binding(id)
+        .map_err(map_texture)?;
     context
         .identity
         .resolve(texture.packed(), ResourceKind::Texture)
@@ -1027,19 +985,44 @@ fn retire_live_texture(context: &mut ContextState, texture: TextureHandle) -> Re
         .remove(&texture)
         .ok_or(Error::InvalidContext)?;
     cancel_native_texture_transfers(&native);
+    if let Some(work) = context.texture_transfer_work.remove(&texture) {
+        // Cancelled transfers never reach their final fence value, so the reclaim
+        // path cannot release them: drop the working-set reservation here.
+        context.async_textures.working_bytes = context
+            .async_textures
+            .working_bytes
+            .saturating_sub(work.bytes);
+    }
     context.texture_ready.remove(&texture);
     context.texture_transfer_bytes.remove(&texture);
-    context.texture_handoffs.remove(&texture);
     context.texture_formats.remove(&texture);
     context.texture_published_mips.remove(&texture);
     context.texture_residency_targets.remove(&texture);
     context.texture_last_transfer.remove(&texture);
     context.retired_textures.push(RetiredTexture {
         id,
+        binding,
         native,
         completion,
     });
     Ok(())
+}
+
+fn remove_pending_decode_state(context: &mut ContextState, texture: TextureHandle) {
+    context
+        .async_textures
+        .queued
+        .retain(|queued| queued.handle != texture);
+    context
+        .async_textures
+        .order
+        .retain(|queued| *queued != texture);
+    if context.async_textures.decoded.remove(&texture).is_some() {
+        context.async_textures.working_bytes = context
+            .async_textures
+            .working_bytes
+            .saturating_sub(TEXTURE_DECODE_RESERVATION);
+    }
 }
 
 /// Cancels a texture before or after native transfer-worker admission.
@@ -1069,10 +1052,7 @@ pub fn cancel_texture_load(context: ContextHandle, texture: TextureHandle) -> Re
             .get(&texture)
             .map(|pending| pending.id)
         {
-            context
-                .texture_registry
-                .cancel_upload(id)
-                .map_err(map_texture)?;
+            retire_pending_texture_binding(context, id)?;
             context
                 .identity
                 .remove(texture.packed(), ResourceKind::Texture)
@@ -1082,6 +1062,7 @@ pub fn cancel_texture_load(context: ContextHandle, texture: TextureHandle) -> Re
                 .remove(&texture)
                 .ok_or(Error::InvalidContext)?;
             pending.cancelled.store(true, Ordering::Release);
+            remove_pending_decode_state(context, texture);
         } else {
             retire_live_texture(context, texture)?;
         }
@@ -1113,10 +1094,7 @@ pub fn unload_texture(context: ContextHandle, texture: TextureHandle) {
             .resolve(texture.packed(), ResourceKind::Texture)
             .map_err(map_lifecycle)?;
         if let Some(id) = pending {
-            context
-                .texture_registry
-                .cancel_upload(id)
-                .map_err(map_texture)?;
+            retire_pending_texture_binding(context, id)?;
             context
                 .identity
                 .remove(texture.packed(), ResourceKind::Texture)
@@ -1126,6 +1104,7 @@ pub fn unload_texture(context: ContextHandle, texture: TextureHandle) {
                 .remove(&texture)
                 .ok_or(Error::InvalidContext)?;
             pending.cancelled.store(true, Ordering::Release);
+            remove_pending_decode_state(context, texture);
             return Ok(());
         }
         if failed {

@@ -7,13 +7,13 @@ license.workspace = true
 
 [features]
 default = []
-basis = ["dep:ez-gfx-basis"]
+basis = ["dep:basisu"]
 
 [dependencies]
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
 rayon = "1.10"
-ez-gfx-basis = { path = "../ez-gfx-basis", optional = true }
+basisu = { workspace = true, optional = true }
 
 [lints]
 workspace = true

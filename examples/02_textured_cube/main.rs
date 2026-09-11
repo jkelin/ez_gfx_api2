@@ -91,14 +91,15 @@ fn main() -> anyhow::Result<()> {
             address_w: SamplerAddressMode::Clamp,
         },
     };
-    let texture = context.load_texture(
-        TextureSource::Png,
-        include_bytes!("cube.png"),
-        true,
-        &config,
-    )?;
-    context.wait_idle()?;
-    let texture_id = texture.binding()?;
+    // Stable bindings remain context-owned and sample the fallback while this load completes.
+    let texture_id = context
+        .load_texture(
+            TextureSource::Png,
+            include_bytes!("cube.png"),
+            true,
+            &config,
+        )?
+        .binding()?;
     let vertex_shader = shader_bytes.load_vertex_shader(&context, "vertexmain")?;
     let fragment_shader = shader_bytes.load_fragment_shader(&context, "fragmentmain")?;
     let index_count = indices.len() as u32;
@@ -109,7 +110,7 @@ fn main() -> anyhow::Result<()> {
         texture_id,
         padding: [0; 3],
     };
-    while let Some(window_frame) = example.wait_for_next_frame(&surface)? {
+    while let Some(window_frame) = example.wait_for_next_frame(&context, &surface)? {
         let mut frame = surface.begin_frame()?;
         let swapchain_target = frame.configure_swapchain(
             window_frame.size,

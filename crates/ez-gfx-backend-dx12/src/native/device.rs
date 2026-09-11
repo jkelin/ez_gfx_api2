@@ -144,6 +144,7 @@ fn initialize_context(
         descriptor_stride,
         samplers,
         sampler_stride: u32::try_from(sampler_stride).unwrap_or(u32::MAX),
+        texture_fallback_bindings: Vec::new(),
     };
     // The cached tier and the normalized stages derive from the same probe;
     // a mismatch would admit an adapter whose execution gate disagrees.
