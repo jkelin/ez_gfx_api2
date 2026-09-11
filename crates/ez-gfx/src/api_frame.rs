@@ -102,8 +102,21 @@ impl Drop for TransientInner {
     }
 }
 
+/// Caps reusable facade storage without rejecting valid one-frame acquisitions.
+const MAX_FACADE_BUFFER_POOL_ENTRIES: usize = 64;
+const MAX_FACADE_BUFFER_POOL_BYTES: usize = 32 * 1024 * 1024;
+
+const fn facade_pool_can_retain(
+    entry_count: usize,
+    retained_bytes: usize,
+    candidate_bytes: usize,
+) -> bool {
+    entry_count < MAX_FACADE_BUFFER_POOL_ENTRIES
+        && retained_bytes.saturating_add(candidate_bytes) <= MAX_FACADE_BUFFER_POOL_BYTES
+}
+
 struct BufferInner {
-    context: Rc<ContextInner>,
+    context: Weak<ContextInner>,
     element_size: u32,
     element_count: u32,
     bytes: RefCell<Vec<u8>>,
@@ -137,6 +150,7 @@ impl BufferInner {
 
 /// Context-owned typed buffer uploaded when a frame first binds it.
 pub struct Buffer<T: bytemuck::Pod> {
+    context: Rc<ContextInner>,
     inner: Rc<BufferInner>,
     marker: PhantomData<T>,
 }
@@ -147,7 +161,7 @@ impl<T: bytemuck::Pod> Buffer<T> {
     /// # Errors
     /// Returns [`Error`] when the context is dispatching a callback or the range is invalid.
     pub fn write(&self, start_index: usize, values: &[T]) -> Result<()> {
-        let context = Context { inner: Rc::clone(&self.inner.context), owner: false, };
+        let context = Context { inner: Rc::clone(&self.context), owner: false, };
         context.check_entry()?;
         self.inner.write(start_index, values)
     }
@@ -155,6 +169,7 @@ impl<T: bytemuck::Pod> Buffer<T> {
 
 /// Context-acquired one-frame buffer with a shader-writable count.
 pub struct CounterBuffer<T: bytemuck::Pod> {
+    context: Rc<ContextInner>,
     inner: Rc<BufferInner>,
     marker: PhantomData<T>,
 }
@@ -167,7 +182,7 @@ impl<T: bytemuck::Pod> CounterBuffer<T> {
     /// # Errors
     /// Returns [`Error`] when the context is dispatching a callback or the range is invalid.
     pub fn write(&self, start_index: usize, values: &[T]) -> Result<()> {
-        let context = Context { inner: Rc::clone(&self.inner.context), owner: false, };
+        let context = Context { inner: Rc::clone(&self.context), owner: false, };
         context.check_entry()?;
         self.inner.write(start_index, values)?;
         let end = start_index
@@ -181,6 +196,8 @@ impl<T: bytemuck::Pod> CounterBuffer<T> {
 
 /// Context-acquired one-frame buffer containing exactly one POD value.
 pub struct ValueBuffer<T: bytemuck::Pod> {
+    /// Keeps the creating context alive exactly as long as this public resource wrapper.
+    context: Rc<ContextInner>,
     inner: Rc<BufferInner>,
     marker: PhantomData<T>,
 }
@@ -201,21 +218,46 @@ impl Context {
             .checked_mul(element_count as usize)
             .filter(|size| element_size != 0 && element_count != 0 && *size <= 16 * 1024 * 1024)
             .ok_or(Error::InvalidArgument)?;
-        let bytes = match initial {
-            Some(values) if values.len() == element_count as usize => {
-                bytemuck::cast_slice(values).to_vec()
+        if initial.is_some_and(|values| values.len() != element_count as usize) {
+            return Err(Error::InvalidArgument);
+        }
+        let mut pool = self.inner.facade_buffers.borrow_mut();
+        if let Some(inner) = pool.iter().find(|inner| {
+            Rc::strong_count(inner) == 1
+                && inner.element_size == element_size
+                && inner.element_count == element_count
+        }) {
+            let mut bytes = inner.bytes.borrow_mut();
+            bytes.resize(byte_count, 0);
+            if let Some(values) = initial {
+                bytes.copy_from_slice(bytemuck::cast_slice(values));
+            } else {
+                bytes.fill(0);
             }
-            Some(_) => return Err(Error::InvalidArgument),
-            None => vec![0; byte_count],
-        };
-        Ok(Rc::new(BufferInner {
-            context: Rc::clone(&self.inner),
+            inner.published_count.set(published_count);
+            inner.usage.set(BufferUse::Available);
+            return Ok(Rc::clone(inner));
+        }
+        let mut bytes = vec![0; byte_count];
+        if let Some(values) = initial {
+            bytes.copy_from_slice(bytemuck::cast_slice(values));
+        }
+        let inner = Rc::new(BufferInner {
+            context: Rc::downgrade(&self.inner),
             element_size,
             element_count,
             bytes: RefCell::new(bytes),
             published_count: Cell::new(published_count),
             usage: Cell::new(BufferUse::Available),
-        }))
+        });
+        // Oversized or shape-heavy workloads remain valid but bypass retention once bounded.
+        let retained_bytes = pool.iter().fold(0_usize, |total, buffer| {
+            total.saturating_add(buffer.bytes.borrow().capacity())
+        });
+        if facade_pool_can_retain(pool.len(), retained_bytes, byte_count) {
+            pool.push(Rc::clone(&inner));
+        }
+        Ok(inner)
     }
 
     /// Acquires a one-frame typed buffer by element count.
@@ -224,6 +266,7 @@ impl Context {
     /// Returns [`Error`] when the count, type size, or context is invalid.
     pub fn acquire_buffer<T: bytemuck::Pod>(&self, element_count: usize) -> Result<Buffer<T>> {
         Ok(Buffer {
+            context: Rc::clone(&self.inner),
             inner: self.allocate_buffer::<T>(element_count, None, 0)?,
             marker: PhantomData,
         })
@@ -240,6 +283,7 @@ impl Context {
     pub fn acquire_buffer_from<D: BufferData>(&self, data: D) -> Result<Buffer<D::Element>> {
         let values = buffer_data_slice(&data);
         Ok(Buffer {
+            context: Rc::clone(&self.inner),
             inner: self.allocate_buffer(values.len(), Some(values), 0)?,
             marker: PhantomData,
         })
@@ -248,9 +292,9 @@ impl Context {
     /// Acquires a one-frame buffer containing exactly one POD value.
     ///
     /// # Errors
-    /// Returns [`Error`] when the value is zero-sized, oversized, or the context is invalid.
     pub fn acquire_value_buffer<T: bytemuck::Pod>(&self, value: T) -> Result<ValueBuffer<T>> {
         Ok(ValueBuffer {
+            context: Rc::clone(&self.inner),
             inner: self.allocate_buffer(1, Some(core::slice::from_ref(&value)), 0)?,
             marker: PhantomData,
         })
@@ -265,6 +309,7 @@ impl Context {
         element_count: usize,
     ) -> Result<CounterBuffer<T>> {
         Ok(CounterBuffer {
+            context: Rc::clone(&self.inner),
             inner: self.allocate_buffer::<T>(element_count, None, 0)?,
             marker: PhantomData,
         })
@@ -287,12 +332,14 @@ impl Context {
         let values = buffer_data_slice(&data);
         let published_count = u32::try_from(values.len()).map_err(|_| Error::InvalidArgument)?;
         Ok(CounterBuffer {
+            context: Rc::clone(&self.inner),
             inner: self.allocate_buffer(values.len(), Some(values), published_count)?,
             marker: PhantomData,
         })
     }
 }
 
+#[derive(Clone)]
 enum DraftBinding {
     Buffer(Rc<BufferInner>),
     Counter(Rc<BufferInner>),
@@ -305,26 +352,27 @@ mod bindable_buffer {
 /// Buffer resource accepted by [`Frame::bind_buffer`].
 pub trait BindableBuffer: bindable_buffer::Sealed {
     #[doc(hidden)]
-    fn bind_to_frame(&self, frame: &mut Frame, name: String) -> Result<()>;
+    fn bind_to_frame(&self, frame: &mut Frame, name: CompactString) -> Result<()>;
 }
 
 impl<T: bytemuck::Pod> bindable_buffer::Sealed for Buffer<T> {}
 impl<T: bytemuck::Pod> BindableBuffer for Buffer<T> {
-    fn bind_to_frame(&self, frame: &mut Frame, name: String) -> Result<()> {
+    fn bind_to_frame(&self, frame: &mut Frame, name: CompactString) -> Result<()> {
         frame.bind_draft(name, DraftBinding::Buffer(Rc::clone(&self.inner)))
     }
 }
 
 impl<T: bytemuck::Pod> bindable_buffer::Sealed for ValueBuffer<T> {}
 impl<T: bytemuck::Pod> BindableBuffer for ValueBuffer<T> {
-    fn bind_to_frame(&self, frame: &mut Frame, name: String) -> Result<()> {
+    fn bind_to_frame(&self, frame: &mut Frame, name: CompactString) -> Result<()> {
+        frame.ensure_context(&self.context)?;
         frame.bind_draft(name, DraftBinding::Buffer(Rc::clone(&self.inner)))
     }
 }
 
 impl<T: bytemuck::Pod> bindable_buffer::Sealed for CounterBuffer<T> {}
 impl<T: bytemuck::Pod> BindableBuffer for CounterBuffer<T> {
-    fn bind_to_frame(&self, frame: &mut Frame, name: String) -> Result<()> {
+    fn bind_to_frame(&self, frame: &mut Frame, name: CompactString) -> Result<()> {
         frame.bind_draft(name, DraftBinding::Counter(Rc::clone(&self.inner)))
     }
 }
@@ -341,6 +389,69 @@ enum PendingReadback {
     RequestedPresentation(Rc<ReadbackInner>),
 }
 
+type FrameTransients = SmallVec<[TransientInner; 4]>;
+type FrameRetained = SmallVec<[Rc<dyn Any>; 4]>;
+type FrameBindings = SmallVec<[(CompactString, DraftBinding); 4]>;
+
+/// Safe-facade frame storage is reusable, but one pathological frame must not
+/// pin arbitrary capacity for the context lifetime.
+const MAX_FACADE_FRAME_SCRATCH_BYTES: usize = 1024 * 1024;
+
+#[derive(Default)]
+struct FacadeFrameScratch {
+    retained: FrameRetained,
+    transients: FrameTransients,
+    readbacks: Vec<PendingReadback>,
+    bindings: FrameBindings,
+    raw_bindings: Vec<RawBinding>,
+}
+
+impl FacadeFrameScratch {
+    fn retained_bytes(&self) -> usize {
+        self.retained
+            .capacity()
+            .saturating_mul(core::mem::size_of::<Rc<dyn Any>>())
+            .saturating_add(
+                self.transients
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<TransientInner>()),
+            )
+            .saturating_add(
+                self.readbacks
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<PendingReadback>()),
+            )
+            .saturating_add(
+                self.bindings
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<(CompactString, DraftBinding)>()),
+            )
+            .saturating_add(
+                self.raw_bindings
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<RawBinding>()),
+            )
+            .saturating_add(
+                self.raw_bindings.iter().fold(0_usize, |bytes, binding| {
+                    bytes.saturating_add(binding.name.capacity())
+                }),
+            )
+    }
+
+    fn clear_owned_values(&mut self) {
+        self.retained.clear();
+        self.transients.clear();
+        self.readbacks.clear();
+        self.bindings.clear();
+        for binding in &mut self.raw_bindings {
+            binding.name.clear();
+        }
+    }
+
+    fn can_retain(&self) -> bool {
+        self.retained_bytes() <= MAX_FACADE_FRAME_SCRATCH_BYTES
+    }
+}
 
 /// One explicit recording transaction.
 ///
@@ -350,12 +461,13 @@ pub struct Frame {
     context: Rc<ContextInner>,
     target: FrameTarget,
     surface: Option<Rc<SurfaceInner>>,
-    retained: Vec<Rc<dyn Any>>,
-    transients: Vec<Rc<TransientInner>>,
+    retained: FrameRetained,
+    transients: FrameTransients,
     poison: Option<Error>,
     terminal: bool,
     readbacks: Vec<PendingReadback>,
-    bindings: HashMap<String, DraftBinding>,
+    bindings: FrameBindings,
+    raw_bindings: Vec<RawBinding>,
 }
 
 impl Frame {
@@ -413,11 +525,13 @@ impl Frame {
 
     fn materialize_buffer_state(
         context: &Rc<ContextInner>,
-        transients: &mut Vec<Rc<TransientInner>>,
-        retained: &mut Vec<Rc<dyn Any>>,
+        transients: &mut FrameTransients,
         inner: &Rc<BufferInner>,
     ) -> Result<BufferHandle> {
-        if !Rc::ptr_eq(context, &inner.context) {
+        let Some(owner) = inner.context.upgrade() else {
+            return Err(Error::InvalidContext);
+        };
+        if !Rc::ptr_eq(context, &owner) {
             return Err(Error::InvalidContext);
         }
         if let Some(handle) = transients.iter().find_map(|transient| {
@@ -443,25 +557,25 @@ impl Frame {
             return Err(error);
         }
         inner.usage.set(BufferUse::Claimed);
-        transients.push(Rc::new(TransientInner {
+        transients.push(TransientInner {
             context: Rc::clone(context),
             buffer: Rc::clone(inner),
             handle: TransientHandle::Buffer(handle),
             state: Cell::new(TransientState::Live),
-        }));
-        let retained_inner: Rc<dyn Any> = inner.clone();
-        retained.push(retained_inner);
+        });
         Ok(handle)
     }
 
 
     fn materialize_counter_state(
         context: &Rc<ContextInner>,
-        transients: &mut Vec<Rc<TransientInner>>,
-        retained: &mut Vec<Rc<dyn Any>>,
+        transients: &mut FrameTransients,
         inner: &Rc<BufferInner>,
     ) -> Result<CounterBufferHandle> {
-        if !Rc::ptr_eq(context, &inner.context) {
+        let Some(owner) = inner.context.upgrade() else {
+            return Err(Error::InvalidContext);
+        };
+        if !Rc::ptr_eq(context, &owner) {
             return Err(Error::InvalidContext);
         }
         if inner.element_size as usize
@@ -491,14 +605,12 @@ impl Frame {
             return Err(error);
         }
         inner.usage.set(BufferUse::Claimed);
-        transients.push(Rc::new(TransientInner {
+        transients.push(TransientInner {
             context: Rc::clone(context),
             buffer: Rc::clone(inner),
             handle: TransientHandle::Counter(handle),
             state: Cell::new(TransientState::Live),
-        }));
-        let retained_inner: Rc<dyn Any> = inner.clone();
-        retained.push(retained_inner);
+        });
         Ok(handle)
     }
 
@@ -506,7 +618,6 @@ impl Frame {
         match Self::materialize_counter_state(
             &self.context,
             &mut self.transients,
-            &mut self.retained,
             inner,
         ) {
             Ok(handle) => Ok(handle),
@@ -514,35 +625,45 @@ impl Frame {
         }
     }
 
-    fn raw_bindings(&mut self) -> Result<Vec<RawBinding>> {
-        let mut raw = Vec::with_capacity(self.bindings.len());
-        for (name, binding) in &self.bindings {
-            let resource = match binding {
-                DraftBinding::Buffer(inner) => Self::materialize_buffer_state(
-                    &self.context,
-                    &mut self.transients,
-                    &mut self.retained,
-                    inner,
-                )
-                .map(ResourceIdentity::Buffer),
-                DraftBinding::Counter(inner) => Self::materialize_counter_state(
-                    &self.context,
-                    &mut self.transients,
-                    &mut self.retained,
-                    inner,
-                )
-                .map(ResourceIdentity::Counter),
-            };
-            let resource = match resource {
-                Ok(resource) => resource,
-                Err(error) => return self.fail(error),
-            };
-            raw.push(RawBinding {
-                name: name.clone(),
-                resource,
-            });
+    fn prepare_raw_bindings(&mut self) -> Result<()> {
+        let result = {
+            let context = &self.context;
+            let bindings = &self.bindings;
+            let raw_bindings = &mut self.raw_bindings;
+            let transients = &mut self.transients;
+
+            (|| {
+                for (index, (name, binding)) in bindings.iter().enumerate() {
+                    let resource = match binding {
+                        DraftBinding::Buffer(inner) => {
+                            Self::materialize_buffer_state(context, transients, inner)
+                                .map(ResourceIdentity::Buffer)?
+                        }
+                        DraftBinding::Counter(inner) => {
+                            Self::materialize_counter_state(context, transients, inner)
+                                .map(ResourceIdentity::Counter)?
+                        }
+                    };
+                    if let Some(raw) = raw_bindings.get_mut(index) {
+                        raw.name.clear();
+                        raw.name.push_str(name.as_str());
+                        raw.resource = resource;
+                    } else {
+                        raw_bindings.push(RawBinding {
+                            name: name.to_string(),
+                            resource,
+                        });
+                    }
+                }
+                raw_bindings.truncate(bindings.len());
+                Ok(())
+            })()
+        };
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => self.fail(error),
         }
-        Ok(raw)
     }
 
     /// Adds or replaces one named buffer in the frame binding set.
@@ -551,20 +672,23 @@ impl Frame {
     /// Returns [`Error`] when the name, frame, resource state, or ownership is invalid.
     pub fn bind_buffer<B: BindableBuffer + ?Sized>(
         &mut self,
-        name: impl Into<String>,
+        name: impl Into<CompactString>,
         buffer: &B,
     ) -> Result<()> {
         buffer.bind_to_frame(self, name.into())
     }
 
-    fn bind_draft(&mut self, name: String, binding: DraftBinding) -> Result<()> {
+    fn bind_draft(&mut self, name: CompactString, binding: DraftBinding) -> Result<()> {
         if name.is_empty() || name.len() > 255 || name.as_bytes().contains(&0) {
             return self.fail(Error::InvalidArgument);
         }
         let inner = match &binding {
             DraftBinding::Buffer(inner) | DraftBinding::Counter(inner) => inner,
         };
-        self.ensure_context(&inner.context)?;
+        let Some(owner) = inner.context.upgrade() else {
+            return self.fail(Error::InvalidContext);
+        };
+        self.ensure_context(&owner)?;
         let valid_state = match inner.usage.get() {
             BufferUse::Available => true,
             BufferUse::Claimed => self.transients.iter().any(|transient| {
@@ -576,7 +700,11 @@ impl Frame {
         if !valid_state {
             return self.fail(Error::NotReady);
         }
-        self.bindings.insert(name, binding);
+        if let Some((_, current)) = self.bindings.iter_mut().find(|(key, _)| key.as_str() == name.as_str()) {
+            *current = binding;
+        } else {
+            self.bindings.push((name, binding));
+        }
         Ok(())
     }
 
@@ -594,19 +722,23 @@ impl Frame {
         self.ensure_context(&vertex_shader.inner.context)?;
         self.ensure_context(&fragment_shader.inner.context)?;
         let counter_handle = self.materialize_counter(&counter.inner)?;
-        let raw_bindings = self.raw_bindings()?;
+        self.prepare_raw_bindings()?;
         self.retain(&vertex_shader.inner);
         self.retain(&fragment_shader.inner);
-        self.record(|context| {
-            state::execute_graphics(
-                context,
-                vertex_shader.inner.handle,
-                fragment_shader.inner.handle,
-                counter_handle,
-                &raw_bindings,
-                state_desc,
-            )
-        })
+        if let Some(error) = self.poison {
+            return Err(error);
+        }
+        match state::execute_graphics(
+            self.context.handle,
+            vertex_shader.inner.handle,
+            fragment_shader.inner.handle,
+            counter_handle,
+            &self.raw_bindings,
+            state_desc,
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) => self.fail(error),
+        }
     }
 
     /// Executes a compute dispatch with one exact compute entry point.
@@ -615,11 +747,20 @@ impl Frame {
     /// Returns [`Error`] when resources, bindings, dispatch, stage ownership, or recording state are invalid.
     pub fn execute_compute(&mut self, shader: &ComputeShader, groups: [u32; 3]) -> Result<()> {
         self.ensure_context(&shader.inner.context)?;
-        let raw_bindings = self.raw_bindings()?;
+        self.prepare_raw_bindings()?;
         self.retain(&shader.inner);
-        self.record(|context| {
-            state::execute_compute(context, shader.inner.handle, groups, &raw_bindings)
-        })
+        if let Some(error) = self.poison {
+            return Err(error);
+        }
+        match state::execute_compute(
+            self.context.handle,
+            shader.inner.handle,
+            groups,
+            &self.raw_bindings,
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) => self.fail(error),
+        }
     }
 
     /// Enqueues a texture readback and retains the texture until completion.
@@ -1001,7 +1142,19 @@ impl Drop for Frame {
                 }
             }
         }
-    }
+        let mut recycled = FacadeFrameScratch {
+            retained: std::mem::take(&mut self.retained),
+            transients: std::mem::take(&mut self.transients),
+            readbacks: std::mem::take(&mut self.readbacks),
+            bindings: std::mem::take(&mut self.bindings),
+            raw_bindings: std::mem::take(&mut self.raw_bindings),
+        };
+        recycled.clear_owned_values();
+        if !recycled.can_retain() {
+            recycled = FacadeFrameScratch::default();
+        }
+        *self.context.frame_scratch.borrow_mut() = recycled;
+}
 }
 
 impl Surface {
@@ -1015,16 +1168,19 @@ impl Surface {
         context.dispatch_events()?;
         state::frame_begin(context.raw())?;
         let target_lease: Rc<dyn Any> = self.inner.clone();
+        let mut scratch = std::mem::take(&mut *context.inner.frame_scratch.borrow_mut());
+        scratch.retained.push(target_lease);
         Ok(Frame {
             context: Rc::clone(&context.inner),
             target: FrameTarget::Unconfigured,
             surface: Some(Rc::clone(&self.inner)),
-            retained: vec![target_lease],
-            transients: Vec::new(),
+            retained: scratch.retained,
+            transients: scratch.transients,
             poison: None,
             terminal: false,
-            readbacks: Vec::new(),
-            bindings: HashMap::new(),
+            readbacks: scratch.readbacks,
+            bindings: scratch.bindings,
+            raw_bindings: scratch.raw_bindings,
         })
     }
 }
@@ -1038,16 +1194,18 @@ impl Context {
         self.check_entry()?;
         self.dispatch_events()?;
         state::frame_begin(self.raw())?;
+        let scratch = std::mem::take(&mut *self.inner.frame_scratch.borrow_mut());
         Ok(Frame {
             context: Rc::clone(&self.inner),
             target: FrameTarget::Unconfigured,
             surface: None,
-            retained: Vec::new(),
-            transients: Vec::new(),
+            retained: scratch.retained,
+            transients: scratch.transients,
             poison: None,
             terminal: false,
-            readbacks: Vec::new(),
-            bindings: HashMap::new(),
+            readbacks: scratch.readbacks,
+            bindings: scratch.bindings,
+            raw_bindings: scratch.raw_bindings,
         })
     }
 }
@@ -1079,5 +1237,73 @@ impl Surface {
         self.presentation_modes()?
             .resolve(requested)
             .ok_or(Error::Unsupported)
+    }
+}
+
+#[cfg(test)]
+mod inline_storage_tests {
+    use super::{
+        FacadeFrameScratch, FrameTransients, MAX_FACADE_BUFFER_POOL_BYTES,
+        MAX_FACADE_BUFFER_POOL_ENTRIES, MAX_FACADE_FRAME_SCRATCH_BYTES, facade_pool_can_retain,
+    };
+    use std::{any::Any, rc::Rc};
+
+    #[test]
+    fn common_transient_storage_remains_bounded() {
+        assert!(
+            core::mem::size_of::<FrameTransients>() <= 256,
+            "four inline transient leases must keep Frame reasonably compact",
+        );
+    }
+
+    #[test]
+    fn facade_pool_rejects_entry_and_byte_overflow() {
+        for (entries, retained, candidate, expected) in [
+            (0, 0, 1, true),
+            (
+                MAX_FACADE_BUFFER_POOL_ENTRIES,
+                0,
+                1,
+                false,
+            ),
+            (0, MAX_FACADE_BUFFER_POOL_BYTES, 1, false),
+            (0, usize::MAX, usize::MAX, false),
+        ] {
+            assert_eq!(
+                facade_pool_can_retain(entries, retained, candidate),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn warmed_spill_cardinality_reuses_backing_and_releases_owners() {
+        let owners = (0..8).map(Rc::new).collect::<Vec<_>>();
+        let mut scratch = FacadeFrameScratch::default();
+        scratch
+            .retained
+            .extend(owners.iter().cloned().map(|owner| owner as Rc<dyn Any>));
+        let warmed_capacity = scratch.retained.capacity();
+        let warmed_backing = scratch.retained.as_ptr();
+
+        scratch.clear_owned_values();
+        assert!(owners.iter().all(|owner| Rc::strong_count(owner) == 1));
+        scratch
+            .retained
+            .extend(owners.iter().cloned().map(|owner| owner as Rc<dyn Any>));
+
+        assert!(warmed_capacity > 4);
+        assert_eq!(scratch.retained.capacity(), warmed_capacity);
+        assert_eq!(scratch.retained.as_ptr(), warmed_backing);
+    }
+
+    #[test]
+    fn facade_frame_scratch_has_a_hard_byte_bound() {
+        let mut scratch = FacadeFrameScratch::default();
+        let entries =
+            MAX_FACADE_FRAME_SCRATCH_BYTES / core::mem::size_of::<super::PendingReadback>() + 1;
+        scratch.readbacks.reserve_exact(entries);
+
+        assert!(!scratch.can_retain());
     }
 }

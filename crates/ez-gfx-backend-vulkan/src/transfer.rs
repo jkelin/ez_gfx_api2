@@ -103,6 +103,11 @@ pub(super) fn start_worker(
     let mut ownership_value = 0_u64;
     let mut slot_values = [0_u64; COMMAND_SLOTS];
     let mut slot = 0_usize;
+    // Batch snapshots and transition scratch live in the worker closure and
+    // retain high-water capacity across submissions. Indices freeze cancellation
+    // exactly once without retaining borrows from the batch slice.
+    let mut live_scratch: Vec<usize> = Vec::new();
+    let mut texture_scratch: Vec<(vk::Image, u32, bool)> = Vec::new();
     TransferWorker::new_ordered_with_shutdown(
         DEFAULT_STAGING_POLICY,
         job_bytes,
@@ -152,6 +157,8 @@ pub(super) fn start_worker(
                 &mut ownership_value,
                 &graphics_lock,
                 &jobs,
+                &mut live_scratch,
+                &mut texture_scratch,
             )
             .map_err(map_submit)?;
             let value = jobs.iter().map(|job| job.value).max().unwrap_or(0);
@@ -182,6 +189,19 @@ pub(super) fn start_worker(
     .map_err(|_| AllocationError::NativeFailure)
 }
 
+fn snapshot_live_indices<T>(
+    jobs: &[T],
+    scratch: &mut Vec<usize>,
+    cancelled: impl Fn(&T) -> bool,
+) {
+    scratch.clear();
+    scratch.reserve(jobs.len());
+    scratch.extend(
+        jobs.iter()
+            .enumerate()
+            .filter_map(|(index, job)| (!cancelled(job)).then_some(index)),
+    );
+}
 #[expect(
     clippy::too_many_arguments,
     reason = "one function keeps paired Vulkan release/acquire barriers and rollback-visible submission local"
@@ -190,6 +210,7 @@ pub(super) fn start_worker(
     clippy::too_many_lines,
     reason = "one native queue transaction keeps ownership barriers and timeline submission ordered"
 )]
+
 fn submit_batch(
     device: &ash::Device,
     transfer_queue: vk::Queue,
@@ -204,17 +225,19 @@ fn submit_batch(
     ownership_value: &mut u64,
     graphics_lock: &parking_lot::Mutex<()>,
     jobs: &[VulkanTransferJob],
+    live_scratch: &mut Vec<usize>,
+    texture_scratch: &mut Vec<(vk::Image, u32, bool)>,
 ) -> Result<(), vk::Result> {
     let separate = transfer_family != graphics_family;
-    // Snapshot cancellation once: a release must retain its matching copy and acquire even if
-    // cancellation races recording. Skipped jobs still retire in FIFO completion order.
-    let live = jobs
-        .iter()
-        .filter(|job| !job_cancelled(job))
-        .collect::<Vec<_>>();
+    // Snapshot cancellation once: every release, copy, and acquire below uses
+    // these same indices even if cancellation races native command recording.
+    // Skipped jobs still retire in FIFO completion order.
     let texture_batch = jobs.first().is_some_and(|job| job_group(job) != 0);
-    let mut textures = Vec::with_capacity(live.len());
-    for job in &live {
+    snapshot_live_indices(jobs, live_scratch, job_cancelled);
+    texture_scratch.clear();
+    texture_scratch.reserve(live_scratch.len());
+    for &index in live_scratch.iter() {
+        let job = &jobs[index];
         if let VulkanTransferCopy::Texture {
             destination,
             region,
@@ -224,14 +247,15 @@ fn submit_batch(
         {
             let mip = region.image_subresource.mip_level;
             // Several region writes can target one mip; ownership changes only once per batch.
-            if !textures
+            if !texture_scratch
                 .iter()
                 .any(|(image, level, _)| image == destination && *level == mip)
             {
-                textures.push((*destination, mip, *initialized));
+                texture_scratch.push((*destination, mip, *initialized));
             }
         }
     }
+    let textures: &[(vk::Image, u32, bool)] = texture_scratch;
 
     let mut transfer_wait = None;
     if textures.iter().any(|(_, _, initialized)| *initialized) {
@@ -244,7 +268,7 @@ fn submit_batch(
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
-            for &(image, mip_level, initialized) in &textures {
+            for &(image, mip_level, initialized) in textures {
                 if !initialized {
                     continue;
                 }
@@ -302,7 +326,8 @@ fn submit_batch(
             &vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
         )?;
-        for (index, job) in live.iter().enumerate() {
+        for (live_position, &index) in live_scratch.iter().enumerate() {
+            let job = &jobs[index];
             match &job.copy {
                 VulkanTransferCopy::Buffer {
                     source,
@@ -321,12 +346,15 @@ fn submit_batch(
                         .base_mip_level(region.image_subresource.mip_level)
                         .level_count(1)
                         .layer_count(1);
-                    let repeated = live[..index].iter().any(|previous| matches!(
-                        &previous.copy,
-                        VulkanTransferCopy::Texture { destination: image, region: copy, .. }
-                            if image == destination
-                                && copy.image_subresource.mip_level == region.image_subresource.mip_level
-                    ));
+                    let repeated = live_scratch[..live_position].iter().any(|previous| {
+                        matches!(
+                            &jobs[*previous].copy,
+                            VulkanTransferCopy::Texture { destination: image, region: copy, .. }
+                                if image == destination
+                                    && copy.image_subresource.mip_level
+                                        == region.image_subresource.mip_level
+                        )
+                    });
                     if repeated {
                         // Overlapping region writes must preserve admission order while the mip
                         // stays transfer-owned between its first and last copy.
@@ -388,12 +416,15 @@ fn submit_batch(
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         core::slice::from_ref(region),
                     );
-                    let copied_again = live[index + 1..].iter().any(|next| matches!(
-                        &next.copy,
-                        VulkanTransferCopy::Texture { destination: image, region: copy, .. }
-                            if image == destination
-                                && copy.image_subresource.mip_level == region.image_subresource.mip_level
-                    ));
+                    let copied_again = live_scratch[live_position + 1..].iter().any(|next| {
+                        matches!(
+                            &jobs[*next].copy,
+                            VulkanTransferCopy::Texture { destination: image, region: copy, .. }
+                                if image == destination
+                                    && copy.image_subresource.mip_level
+                                        == region.image_subresource.mip_level
+                        )
+                    });
                     if copied_again {
                         continue;
                     }
@@ -490,7 +521,7 @@ fn submit_batch(
             &vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
         )?;
-        for &(image, mip_level, _) in &textures {
+        for &(image, mip_level, _) in textures {
             let range = vk::ImageSubresourceRange::default()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
                 .base_mip_level(mip_level)
@@ -626,6 +657,36 @@ pub(super) mod submission_observation {
 mod tests {
     use super::*;
     use ash::vk::Handle;
+
+    #[test]
+    fn cancellation_after_snapshot_keeps_the_gated_job_live() {
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+
+        let cancelled = Arc::new([AtomicBool::new(false)]);
+        let gate = Arc::new(Barrier::new(2));
+        let (captured, wait_for_capture) = mpsc::channel();
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker_gate = Arc::clone(&gate);
+        let live = std::thread::spawn(move || {
+            let mut live = Vec::new();
+            snapshot_live_indices(&*worker_cancelled, &mut live, |value| {
+                value.load(Ordering::Acquire)
+            });
+            captured.send(()).unwrap();
+            worker_gate.wait();
+            live
+        });
+
+        wait_for_capture.recv().unwrap();
+        cancelled[0].store(true, Ordering::Release);
+        gate.wait();
+
+        assert_eq!(live.join().unwrap(), [0]);
+    }
 
     #[test]
     fn native_texture_stages_coalesce_without_skipping_fine_mips() {

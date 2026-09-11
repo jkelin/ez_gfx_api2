@@ -452,12 +452,12 @@ impl NativeContext {
         // SAFETY: `swapchain` is the undestroyed result of `loader.create_swapchain` above, and ash keeps its image-enumeration buffer allocated until `get_swapchain_images` returns.
         let images = unsafe { loader.get_swapchain_images(swapchain) }.map_err(map_vk)?;
         let mut views = Vec::with_capacity(images.len());
-        for image in images {
+        for image in &images {
             // SAFETY: `image` was enumerated from the new swapchain on `device`, its format and one-level color range match that swapchain, and the temporary create-info outlives `create_image_view`.
             match unsafe {
                 device.create_image_view(
                     &vk::ImageViewCreateInfo::default()
-                        .image(image)
+                        .image(*image)
                         .view_type(vk::ImageViewType::TYPE_2D)
                         .format(chosen.format)
                         .subresource_range(vk::ImageSubresourceRange {
@@ -508,6 +508,7 @@ impl NativeContext {
         }
         self.swapchain = Some(swapchain);
         self.swapchain_presentation_mode = presentation_mode;
+        self.swapchain_images = images;
         self.swapchain_views = views;
         self.swapchain_finished = finished;
         self.swapchain_initialized = vec![false; self.swapchain_views.len()];

@@ -25,10 +25,8 @@ impl MetalFrameEncoder<'_> {
         else {
             return Err(HalError::InvalidArgument);
         };
-        let argument_buffer = self
-            .prepared_arguments
-            .get(action_index)
-            .and_then(|prepared| prepared.map(|index| &self.frame_slot.argument_buffers[index]));
+        let argument_buffer = super::prepared_argument(self.prepared_arguments, action_index)
+            .map(|index| &self.frame_slot.argument_buffers[index]);
         encoder.setRenderPipelineState(state);
         if draw.depth_required {
             let depth = self
@@ -55,11 +53,11 @@ impl MetalFrameEncoder<'_> {
             znear: 0.0,
             zfar: 1.0,
         });
-        for binding in draw.bindings {
+        draw.bindings.visit(&mut |_, binding| {
             if binding.offset as u64 >= binding.allocation.allocation.size() {
                 return Err(HalError::InvalidArgument);
             }
-            // SAFETY: the preceding check places `binding.offset` within the allocation backing `binding.allocation.buffer`, which remains stored in `binding.allocation` while the vertex and fragment buffer bindings are recorded.
+            // SAFETY: the checked offset lies inside the retained allocation.
             unsafe {
                 encoder.setVertexBuffer_offset_atIndex(
                     Some(&binding.allocation.buffer),
@@ -72,7 +70,8 @@ impl MetalFrameEncoder<'_> {
                     binding.index,
                 );
             }
-        }
+            Ok(())
+        })?;
         match (draw.texture_heap, argument_buffer) {
             (Some(heap), Some(buffer)) => {
                 for texture in draw.textures {

@@ -1,6 +1,7 @@
 use crate::{BACKEND, TEXTURE_DESCRIPTOR_CAPACITY};
 use core::{ffi::c_void, ptr};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+use arrayvec::ArrayVec;
 
 use ez_gfx_core::capability::{
     AdapterCapabilities, AdapterClass, AdapterInfo, CompressionSupport, PresentationMode,
@@ -143,6 +144,60 @@ pub struct NativeBufferBinding<'a> {
     pub writable: bool,
 }
 
+/// Synchronous provider for resolved root-buffer bindings.
+pub trait NativeBufferBindingSource {
+    /// Number of bindings supplied to the pipeline.
+    fn len(&self) -> usize;
+
+    /// Visits each binding; borrowed allocation views cannot escape the call.
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(usize, &NativeBufferBinding<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError>;
+}
+
+impl NativeBufferBindingSource for [NativeBufferBinding<'_>] {
+    fn len(&self) -> usize {
+        <[NativeBufferBinding<'_>]>::len(self)
+    }
+
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(usize, &NativeBufferBinding<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError> {
+        for (index, binding) in self.iter().enumerate() {
+            visitor(index, binding)?;
+        }
+        Ok(())
+    }
+}
+
+
+impl NativeBufferBindingSource for &[NativeBufferBinding<'_>] {
+    fn len(&self) -> usize {
+        <[NativeBufferBinding<'_>]>::len(self)
+    }
+
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(usize, &NativeBufferBinding<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError> {
+        <[NativeBufferBinding<'_>] as NativeBufferBindingSource>::visit(self, visitor)
+    }
+}
+impl<const N: usize> NativeBufferBindingSource for [NativeBufferBinding<'_>; N] {
+    fn len(&self) -> usize {
+        N
+    }
+
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(usize, &NativeBufferBinding<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError> {
+        self.as_slice().visit(visitor)
+    }
+}
+
 /// Fully resolved indexed draw consumed by command-list recording.
 pub struct NativeDrawIndexed<'a> {
     /// Render width in pixels.
@@ -162,7 +217,7 @@ pub struct NativeDrawIndexed<'a> {
     /// Number of indirect commands to execute.
     pub draw_count: u32,
     /// Reflected root buffer bindings.
-    pub bindings: &'a [NativeBufferBinding<'a>],
+    pub bindings: &'a dyn NativeBufferBindingSource,
 }
 
 /// Fully resolved compute dispatch consumed by command-list recording.
@@ -172,7 +227,7 @@ pub struct NativeComputeDispatch<'a> {
     /// Workgroup count for each dimension.
     pub groups: [u32; 3],
     /// Reflected root buffer bindings.
-    pub bindings: &'a [NativeBufferBinding<'a>],
+    pub bindings: &'a dyn NativeBufferBindingSource,
 }
 
 /// D3D12 resource referenced by a compiled frame barrier.
@@ -215,7 +270,7 @@ pub enum NativeFrameAction<'a> {
         /// Backend-neutral pass description.
         pass: &'a ExecutionPass,
         /// One attachment per pass color, in order.
-        colors: Vec<PassAttachment<'a>>,
+        colors: ArrayVec<PassAttachment<'a>, 1>,
     },
     /// Encode a compute dispatch.
     Compute(NativeComputeDispatch<'a>),
@@ -234,6 +289,77 @@ pub enum NativeFrameAction<'a> {
     EndPass,
     /// Present the active swapchain buffer.
     Present,
+}
+
+/// Synchronous provider whose borrowed native actions live only for each visit.
+pub trait NativeFrameActionSource {
+    /// Number of stable action records.
+    fn len(&self) -> usize;
+
+    /// Visits one action by stable index.
+    fn with_action(
+        &self,
+        index: usize,
+        visitor: &mut dyn FnMut(&NativeFrameAction<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError>;
+
+    /// Visits all actions in order.
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(usize, &NativeFrameAction<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError> {
+        for index in 0..self.len() {
+            self.with_action(index, &mut |action| visitor(index, action))?;
+        }
+        Ok(())
+    }
+
+    /// Returns whether no action records exist.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl NativeFrameActionSource for [NativeFrameAction<'_>] {
+    fn len(&self) -> usize {
+        <[NativeFrameAction<'_>]>::len(self)
+    }
+
+    fn with_action(
+        &self,
+        index: usize,
+        visitor: &mut dyn FnMut(&NativeFrameAction<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError> {
+        visitor(self.get(index).ok_or(HalError::InvalidArgument)?)
+    }
+}
+
+impl NativeFrameActionSource for &[NativeFrameAction<'_>] {
+    fn len(&self) -> usize {
+        <[NativeFrameAction<'_>]>::len(self)
+    }
+
+    fn with_action(
+        &self,
+        index: usize,
+        visitor: &mut dyn FnMut(&NativeFrameAction<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError> {
+        self.as_ref().with_action(index, visitor)
+    }
+}
+
+impl<const N: usize> NativeFrameActionSource for [NativeFrameAction<'_>; N] {
+    fn len(&self) -> usize {
+        N
+    }
+
+    fn with_action(
+        &self,
+        index: usize,
+        visitor: &mut dyn FnMut(&NativeFrameAction<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError> {
+        self.as_slice().with_action(index, visitor)
+    }
 }
 
 /// Validated DXIL products retained until pipeline creation.
@@ -317,6 +443,10 @@ struct FrameSlot {
     list: ID3D12GraphicsCommandList,
     fence_value: u64,
     garbage: Vec<NativeAllocation>,
+    /// Retained indirect-copy entry shell; entries own GPU allocations while in
+    /// flight, so only the emptied shell returns here, completion-gated by the
+    /// slot fence wait in `prepare_frame`.
+    indirect_scratch: Vec<frame::IndirectCopyEntry>,
 }
 
 enum DeferredResource {
@@ -418,6 +548,35 @@ impl NativeSurface {
     /// Returns the most recently captured RGBA8 frame, or an empty slice before capture.
     pub fn presented_rgba8(&self) -> &[u8] {
         &self.presented
+    }
+
+    /// Reports retained swapchain images for on-demand memory telemetry.
+    ///
+    /// Buffers die with resize, so this observes only currently retained images.
+    pub fn telemetry_images(&self) -> u32 {
+        // Back-buffer counts are small; the fallback only guards the conversion.
+        u32::try_from(self.buffers.len()).unwrap_or(u32::MAX)
+    }
+
+    /// Reports the last configured swapchain extent for memory telemetry.
+    ///
+    /// Zero means no swapchain was ever configured for this surface.
+    pub const fn telemetry_extent(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// Reports the swapchain format code for memory telemetry.
+    ///
+    /// Swapchains are created as `DXGI_FORMAT_R8G8B8A8_UNORM` (28); a missing
+    /// swapchain still reports the configured format so format alignment never
+    /// depends on presentation having occurred.
+    pub const fn telemetry_format(&self) -> u32 {
+        28
+    }
+
+    /// Reports whether depth storage is retained for memory telemetry.
+    pub const fn telemetry_has_depth(&self) -> bool {
+        self.depth.is_some()
     }
 }
 

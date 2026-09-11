@@ -1,8 +1,16 @@
-use std::collections::{BTreeMap, BTreeSet};
+use compact_str::CompactString;
+use smallvec::SmallVec;
+use std::{cmp::Reverse, collections::BinaryHeap, mem::size_of};
 
 use ez_gfx_hal::{BufferRange, CompletionToken, QueueKind, ResourceAccess, ResourceState};
 
 pub use crate::target::{Format, LoadOp, StoreOp};
+mod cache;
+mod compiler;
+use cache::GRAPH_TEMPLATE_SCHEMA;
+pub(crate) use cache::GraphTemplateCache;
+pub use cache::GraphTemplateCacheStats;
+pub(crate) use compiler::GraphWorkspace;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 /// Stable handle identifying a graph resource.
@@ -210,7 +218,7 @@ impl Access {
 /// Describes render attachments, render area, sampling, and load/store behavior.
 pub struct PassInfo {
     /// Color attachments in binding order.
-    colors: Vec<ResourceId>,
+    colors: SmallVec<[ResourceId; 2]>,
     /// Optional depth attachment.
     depth: Option<ResourceId>,
     /// Render area as `[x, y, width, height]`.
@@ -240,17 +248,16 @@ impl PassInfo {
             || area[2] == 0
             || area[3] == 0
             || !matches!(samples, 1 | 2 | 4 | 8)
+            || colors
+                .iter()
+                .enumerate()
+                .any(|(index, color)| colors[index + 1..].contains(color))
+            || depth.is_some_and(|value| colors.contains(&value))
         {
             return Err(GraphError::InvalidPass);
         }
-        let mut unique = colors.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        if unique.len() != colors.len() || depth.is_some_and(|value| colors.contains(&value)) {
-            return Err(GraphError::InvalidPass);
-        }
         Ok(Self {
-            colors,
+            colors: colors.into_iter().collect(),
             depth,
             area,
             samples,
@@ -258,7 +265,32 @@ impl PassInfo {
             store,
         })
     }
-
+    /// Creates the common one-color render-pass description without temporary heap storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GraphError::InvalidPass` if the area is empty or the sample count is unsupported.
+    pub fn single_color(
+        color: ResourceId,
+        area: [u32; 4],
+        samples: u8,
+        load: LoadOp,
+        store: StoreOp,
+    ) -> Result<Self, GraphError> {
+        if area[2] == 0 || area[3] == 0 || !matches!(samples, 1 | 2 | 4 | 8) {
+            return Err(GraphError::InvalidPass);
+        }
+        let mut colors = SmallVec::new();
+        colors.push(color);
+        Ok(Self {
+            colors,
+            depth: None,
+            area,
+            samples,
+            load,
+            store,
+        })
+    }
     /// Returns the color attachments in binding order.
     pub fn colors(&self) -> &[ResourceId] {
         &self.colors
@@ -294,24 +326,24 @@ impl PassInfo {
 /// Describes a queued graph node, its accesses, dependencies, and optional render pass.
 pub struct NodeDesc {
     /// Human-readable node name used for diagnostics.
-    name: String,
+    name: CompactString,
     /// Queue on which the node executes.
     queue: QueueKind,
     /// Resource accesses performed by the node.
-    accesses: Vec<Access>,
+    accesses: SmallVec<[Access; 8]>,
     /// Nodes that must complete before this node.
-    dependencies: Vec<NodeId>,
+    dependencies: SmallVec<[NodeId; 2]>,
     /// Optional render-pass metadata for attachment work.
     pass: Option<PassInfo>,
 }
 impl NodeDesc {
     /// Creates an empty node description for the named queue operation.
-    pub fn new(name: impl Into<String>, queue: QueueKind) -> Self {
+    pub fn new(name: impl AsRef<str>, queue: QueueKind) -> Self {
         Self {
-            name: name.into(),
+            name: CompactString::new(name),
             queue,
-            accesses: Vec::new(),
-            dependencies: Vec::new(),
+            accesses: SmallVec::new(),
+            dependencies: SmallVec::new(),
             pass: None,
         }
     }
@@ -343,10 +375,13 @@ pub struct FrameGraph {
     /// Nodes in insertion order.
     nodes: Vec<NodeDesc>,
     /// Explicit prerequisite-to-dependent edges.
-    explicit_edges: BTreeSet<(NodeId, NodeId)>,
-    /// Previously recorded states for persistent history resources.
-    history: BTreeMap<ResourceId, ResourceState>,
+    explicit_edges: Vec<(NodeId, NodeId)>,
+    /// Previously recorded states indexed by dense resource ID.
+    history: Vec<Option<ResourceState>>,
 }
+
+pub(crate) const FRAME_WORKSPACE_BYTE_LIMIT: usize = 64 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 struct ResourceRecord {
     desc: ResourceDesc,
@@ -373,6 +408,7 @@ impl FrameGraph {
             ready: None,
             initial: None,
         });
+        self.history.push(None);
         Ok(id)
     }
 
@@ -419,7 +455,7 @@ impl FrameGraph {
         if self.resource(resource)?.desc.lifetime != ResourceLifetime::PersistentHistory {
             return Err(GraphError::NotHistory);
         }
-        self.history.insert(resource, state);
+        self.history[resource.0 as usize] = Some(state);
         Ok(())
     }
 
@@ -463,7 +499,10 @@ impl FrameGraph {
             if dependency.0 as usize >= self.nodes.len() {
                 return Err(GraphError::UnknownNode);
             }
-            self.explicit_edges.insert((*dependency, id));
+            let edge = (*dependency, id);
+            if !self.explicit_edges.contains(&edge) {
+                self.explicit_edges.push(edge);
+            }
         }
         self.nodes.push(node);
         Ok(id)
@@ -486,346 +525,11 @@ impl FrameGraph {
                 nodes: vec![prerequisite],
             });
         }
-        self.explicit_edges.insert((prerequisite, dependent));
-        Ok(())
-    }
-
-    /// Validates and schedules the graph, producing synchronization, transitions, passes, and aliases.
-    ///
-    /// # Errors
-    ///
-    /// Returns `GraphError::Cycle` if the dependency graph is cyclic or `GraphError::InvalidPass` if a transient attachment is loaded before initialization.
-    pub fn compile(&self) -> Result<CompiledGraph, GraphError> {
-        // Explicit dependencies define the legal direction for otherwise ambiguous hazards.
-        let explicit_order = stable_topological(self.nodes.len(), &self.explicit_edges)?;
-        let hazards = self.build_hazards(&explicit_order);
-        let mut edges = self.explicit_edges.clone();
-        edges.extend(hazards.iter().map(|edge| (edge.from, edge.to)));
-        let order = stable_topological(self.nodes.len(), &edges)?;
-        self.validate_transient_attachment_loads(&order)?;
-        let positions: BTreeMap<_, _> = order
-            .iter()
-            .enumerate()
-            .map(|(index, node)| (*node, index))
-            .collect();
-        let waits = self.build_waits(&order, &edges);
-        let (transitions, history_states) = self.build_transitions(&order);
-        let passes = self.coalesce_passes(&order, &transitions);
-        let aliases = self.assign_aliases(&positions, &edges);
-        Ok(CompiledGraph {
-            order,
-            hazards,
-            waits,
-            transitions,
-            passes,
-            aliases,
-            history_states,
-        })
-    }
-
-    /// Rejects loading a transient attachment before any scheduled write initializes it.
-    ///
-    /// # Errors
-    ///
-    /// Returns `GraphError::InvalidPass` if a transient attachment is loaded before an earlier scheduled write initializes it.
-    fn validate_transient_attachment_loads(&self, order: &[NodeId]) -> Result<(), GraphError> {
-        let mut initialized: BTreeMap<ResourceId, Vec<ResourceRange>> = BTreeMap::new();
-        for node_id in order {
-            let node = &self.nodes[node_id.0 as usize];
-            if let Some(pass) = &node.pass {
-                let attachments = pass.colors.iter().copied().chain(pass.depth);
-                if pass.load == LoadOp::Load {
-                    for attachment in attachments.clone() {
-                        if self.resources[attachment.0 as usize].desc.lifetime
-                            != ResourceLifetime::Transient
-                        {
-                            continue;
-                        }
-                        for access in node.accesses.iter().filter(|access| {
-                            access.resource == attachment
-                                && matches!(
-                                    access.state.access,
-                                    ResourceAccess::ColorAttachmentWrite
-                                        | ResourceAccess::DepthStencilRead
-                                        | ResourceAccess::DepthStencilWrite
-                                )
-                        }) {
-                            let mut uncovered = vec![access.range];
-                            for covered in initialized.get(&attachment).into_iter().flatten() {
-                                uncovered = uncovered
-                                    .into_iter()
-                                    .flat_map(|range| subtract(range, *covered))
-                                    .collect();
-                            }
-                            // Loading is valid only when prior writes cover the exact attachment range.
-                            if !uncovered.is_empty() {
-                                return Err(GraphError::InvalidPass);
-                            }
-                        }
-                    }
-                }
-            }
-
-            for access in node
-                .accesses
-                .iter()
-                .filter(|access| is_write(access.state.access))
-            {
-                initialized
-                    .entry(access.resource)
-                    .or_default()
-                    .push(access.range);
-            }
-
-            if let Some(pass) = &node.pass
-                && pass.store == StoreOp::Discard
-            {
-                for attachment in pass.colors.iter().copied().chain(pass.depth) {
-                    let discarded: Vec<_> = node
-                        .accesses
-                        .iter()
-                        .filter(|access| {
-                            access.resource == attachment
-                                && matches!(
-                                    access.state.access,
-                                    ResourceAccess::ColorAttachmentWrite
-                                        | ResourceAccess::DepthStencilRead
-                                        | ResourceAccess::DepthStencilWrite
-                                )
-                        })
-                        .map(|access| access.range)
-                        .collect();
-                    if let Some(ranges) = initialized.get_mut(&attachment) {
-                        for discard in discarded {
-                            *ranges = ranges
-                                .drain(..)
-                                .flat_map(|range| subtract(range, discard))
-                                .collect();
-                        }
-                    }
-                }
-            }
+        let edge = (prerequisite, dependent);
+        if !self.explicit_edges.contains(&edge) {
+            self.explicit_edges.push(edge);
         }
         Ok(())
-    }
-
-    /// Derives ordered read/write hazard edges for overlapping resource accesses.
-    fn build_hazards(&self, order: &[NodeId]) -> Vec<HazardEdge> {
-        let mut result = Vec::new();
-        for later_position in 0..order.len() {
-            let later = order[later_position];
-            for earlier in order[..later_position].iter().copied() {
-                for before in &self.nodes[earlier.0 as usize].accesses {
-                    for after in &self.nodes[later.0 as usize].accesses {
-                        if before.resource != after.resource || !overlaps(before.range, after.range)
-                        {
-                            continue;
-                        }
-                        if let Some(kind) = hazard_kind(before.state.access, after.state.access) {
-                            result.push(HazardEdge::new(earlier, later, before.resource, kind));
-                        }
-                    }
-                }
-            }
-        }
-        result.sort_unstable_by_key(|edge| (edge.from, edge.to, edge.resource, edge.kind));
-        result.dedup();
-        result
-    }
-
-    /// Builds external readiness waits and cross-queue dependency waits.
-    fn build_waits(&self, order: &[NodeId], edges: &BTreeSet<(NodeId, NodeId)>) -> Vec<QueueWait> {
-        let mut waits = Vec::new();
-        let mut first = BTreeSet::new();
-        for node in order {
-            for access in &self.nodes[node.0 as usize].accesses {
-                if first.insert(access.resource)
-                    && let Some(token) = self.resources[access.resource.0 as usize].ready
-                {
-                    waits.push(QueueWait {
-                        node: *node,
-                        source: None,
-                        external: Some(token),
-                    });
-                }
-            }
-        }
-        for (from, to) in edges {
-            let source_queue = self.nodes[from.0 as usize].queue;
-            let target_queue = self.nodes[to.0 as usize].queue;
-            let wait = QueueWait {
-                node: *to,
-                source: Some(*from),
-                external: None,
-            };
-            if source_queue != target_queue && !waits.contains(&wait) {
-                waits.push(wait);
-            }
-        }
-        waits
-    }
-
-    /// Derives per-range state transitions and final uniform history states.
-    fn build_transitions(
-        &self,
-        order: &[NodeId],
-    ) -> (Vec<Transition>, BTreeMap<ResourceId, ResourceState>) {
-        let mut tracked: BTreeMap<ResourceId, Vec<(ResourceRange, ResourceState)>> =
-            BTreeMap::new();
-        for (index, resource) in self.resources.iter().enumerate() {
-            if let Some(state) = resource.initial {
-                tracked.insert(
-                    ResourceId(u32::try_from(index).expect("validated index fits u32")),
-                    vec![(full_range(&resource.desc), state)],
-                );
-            }
-        }
-        for (resource, state) in &self.history {
-            tracked.entry(*resource).or_default().push((
-                full_range(&self.resources[resource.0 as usize].desc),
-                *state,
-            ));
-        }
-        let mut transitions = Vec::new();
-        for node in order {
-            for access in &self.nodes[node.0 as usize].accesses {
-                let states = tracked.entry(access.resource).or_default();
-                let mut uncovered = vec![access.range];
-                for (range, state) in states.iter() {
-                    let Some(overlap) = intersection(*range, access.range) else {
-                        continue;
-                    };
-                    if *state != access.state {
-                        transitions.push(Transition {
-                            node: *node,
-                            resource: access.resource,
-                            range: overlap,
-                            before: Some(*state),
-                            after: access.state,
-                        });
-                    }
-                    uncovered = uncovered
-                        .into_iter()
-                        .flat_map(|range| subtract(range, overlap))
-                        .collect();
-                }
-                transitions.extend(uncovered.into_iter().map(|range| Transition {
-                    node: *node,
-                    resource: access.resource,
-                    range,
-                    before: None,
-                    after: access.state,
-                }));
-                let mut updated = Vec::new();
-                for (range, state) in states.drain(..) {
-                    updated.extend(
-                        subtract(range, access.range)
-                            .into_iter()
-                            .map(|remainder| (remainder, state)),
-                    );
-                }
-                updated.push((access.range, access.state));
-                *states = updated;
-            }
-        }
-        let mut history = BTreeMap::new();
-        for (resource, states) in tracked {
-            if self.resources[resource.0 as usize].desc.lifetime
-                != ResourceLifetime::PersistentHistory
-            {
-                continue;
-            }
-            if let Some(state) = states.first().map(|(_, state)| *state)
-                && states.iter().all(|(_, candidate)| *candidate == state)
-            {
-                history.insert(resource, state);
-            }
-        }
-        (transitions, history)
-    }
-
-    /// Merges adjacent compatible render nodes when no transition interrupts them.
-    fn coalesce_passes(&self, order: &[NodeId], transitions: &[Transition]) -> Vec<CompiledPass> {
-        let mut passes: Vec<CompiledPass> = Vec::new();
-        let mut previous_was_pass = false;
-        for node in order {
-            let Some(info) = self.nodes[node.0 as usize].pass.clone() else {
-                previous_was_pass = false;
-                continue;
-            };
-            let requires_transition = transitions
-                .iter()
-                .any(|transition| transition.node == *node);
-            match passes.last_mut() {
-                Some(pass)
-                    if previous_was_pass
-                        && !requires_transition
-                        && pass_compatible(&pass.info, &info) =>
-                {
-                    pass.info.store = info.store;
-                    pass.nodes.push(*node);
-                }
-                _ => passes.push(CompiledPass {
-                    info,
-                    nodes: vec![*node],
-                }),
-            }
-            previous_was_pass = true;
-        }
-        passes
-    }
-
-    /// Assigns reusable storage slots to nonoverlapping compatible transient resources.
-    fn assign_aliases(
-        &self,
-        positions: &BTreeMap<NodeId, usize>,
-        edges: &BTreeSet<(NodeId, NodeId)>,
-    ) -> BTreeMap<ResourceId, AliasAssignment> {
-        let mut intervals = Vec::new();
-        for (index, resource) in self.resources.iter().enumerate() {
-            if resource.desc.lifetime != ResourceLifetime::Transient {
-                continue;
-            }
-            let id = ResourceId(u32::try_from(index).expect("validated index fits u32"));
-            let uses: Vec<_> = self
-                .nodes
-                .iter()
-                .enumerate()
-                .filter(|(_, node)| node.accesses.iter().any(|access| access.resource == id))
-                .map(|(node, _)| NodeId(u32::try_from(node).expect("validated index fits u32")))
-                .collect();
-            if let (Some(first), Some(last)) = (
-                uses.iter().min_by_key(|node| positions[node]),
-                uses.iter().max_by_key(|node| positions[node]),
-            ) {
-                intervals.push((id, *first, *last));
-            }
-        }
-        intervals.sort_unstable_by_key(|(id, first, _)| (positions[first], *id));
-        let mut slots: Vec<(AliasClass, NodeId)> = Vec::new();
-        let mut result = BTreeMap::new();
-        for (id, first, last) in intervals {
-            let class = alias_class(&self.resources[id.0 as usize].desc);
-            let slot = slots
-                .iter()
-                .position(|(existing, prior_last)| {
-                    let same_queue = self.nodes[prior_last.0 as usize].queue
-                        == self.nodes[first.0 as usize].queue;
-                    *existing == class && (same_queue || reachable(*prior_last, first, edges))
-                })
-                .unwrap_or_else(|| {
-                    slots.push((class.clone(), first));
-                    slots.len() - 1
-                });
-            slots[slot].1 = last;
-            result.insert(
-                id,
-                AliasAssignment {
-                    slot: u32::try_from(slot).expect("validated index fits u32"),
-                },
-            );
-        }
-        result
     }
 
     /// Returns the record for a known resource handle.
@@ -932,6 +636,7 @@ pub struct AliasAssignment {
 }
 
 /// Contains the schedule and synchronization metadata produced from a frame graph.
+#[derive(Default)]
 pub struct CompiledGraph {
     /// Nodes in dependency-respecting execution order.
     order: Vec<NodeId>,
@@ -943,10 +648,10 @@ pub struct CompiledGraph {
     transitions: Vec<Transition>,
     /// Coalesced render passes in execution order.
     passes: Vec<CompiledPass>,
-    /// Transient storage assignments indexed by resource.
-    aliases: BTreeMap<ResourceId, AliasAssignment>,
-    /// Final uniform states retained for persistent history resources.
-    history_states: BTreeMap<ResourceId, ResourceState>,
+    /// Transient storage assignments indexed by dense resource ID.
+    aliases: Vec<Option<AliasAssignment>>,
+    /// Final uniform states indexed by dense history-resource ID.
+    history_states: Vec<Option<ResourceState>>,
 }
 impl CompiledGraph {
     /// Returns nodes in dependency-respecting execution order.
@@ -971,79 +676,66 @@ impl CompiledGraph {
     }
     /// Returns the transient storage assignment for a resource, if any.
     pub fn alias(&self, resource: ResourceId) -> Option<AliasAssignment> {
-        self.aliases.get(&resource).copied()
+        self.aliases.get(resource.0 as usize).copied().flatten()
     }
     /// Returns the final uniform state retained for a history resource, if any.
     pub fn history_state(&self, resource: ResourceId) -> Option<ResourceState> {
-        self.history_states.get(&resource).copied()
+        self.history_states
+            .get(resource.0 as usize)
+            .copied()
+            .flatten()
     }
 }
 
-/// Reports whether directed edges connect one node to another.
-fn reachable(from: NodeId, to: NodeId, edges: &BTreeSet<(NodeId, NodeId)>) -> bool {
-    let mut pending = vec![from];
-    let mut visited = BTreeSet::new();
-    while let Some(node) = pending.pop() {
-        if !visited.insert(node) {
-            continue;
-        }
-        for (_, next) in edges.range((node, NodeId(0))..=(node, NodeId(u32::MAX))) {
-            if *next == to {
-                return true;
-            }
-            pending.push(*next);
-        }
+impl CompiledGraph {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        vec_bytes(&self.order)
+            .saturating_add(vec_bytes(&self.hazards))
+            .saturating_add(vec_bytes(&self.waits))
+            .saturating_add(vec_bytes(&self.transitions))
+            .saturating_add(vec_bytes(&self.passes))
+            .saturating_add(
+                self.passes
+                    .iter()
+                    .map(|pass| vec_bytes(&pass.nodes))
+                    .sum::<usize>(),
+            )
+            .saturating_add(vec_bytes(&self.aliases))
+            .saturating_add(vec_bytes(&self.history_states))
     }
-    false
 }
 
-/// Produces a deterministic topological order, preferring lower node indices.
-///
-/// # Errors
-///
-/// Returns `GraphError::Cycle` if the directed edges contain a cycle.
-fn stable_topological(
-    count: usize,
-    edges: &BTreeSet<(NodeId, NodeId)>,
-) -> Result<Vec<NodeId>, GraphError> {
-    let mut indegree = vec![0_u32; count];
-    let mut outgoing: Vec<Vec<NodeId>> = vec![Vec::new(); count];
-    for (from, to) in edges {
-        indegree[to.0 as usize] += 1;
-        outgoing[from.0 as usize].push(*to);
-    }
-    let mut ready: BTreeSet<_> = indegree
-        .iter()
-        .enumerate()
-        .filter(|(_, value)| **value == 0)
-        .map(|(index, _)| NodeId(u32::try_from(index).expect("validated index fits u32")))
-        .collect();
-    let mut order = Vec::with_capacity(count);
-
-    while let Some(node) = ready.pop_first() {
-        order.push(node);
-        for next in &outgoing[node.0 as usize] {
-            indegree[next.0 as usize] -= 1;
-            if indegree[next.0 as usize] == 0 {
-                ready.insert(*next);
-            }
-        }
-    }
-    if order.len() != count {
-        return Err(GraphError::Cycle {
-            nodes: indegree
-                .iter()
-                .enumerate()
-                .filter(|(_, value)| **value > 0)
-                .map(|(index, _)| NodeId(u32::try_from(index).expect("validated index fits u32")))
-                .collect(),
-        });
-    }
-    Ok(order)
+fn vec_bytes<T>(values: &Vec<T>) -> usize {
+    values.capacity().saturating_mul(size_of::<T>())
 }
+
+fn nested_vec_bytes<T>(values: &Vec<Vec<T>>) -> usize {
+    vec_bytes(values).saturating_add(values.iter().map(|value| vec_bytes(value)).sum::<usize>())
+}
+
 mod validation;
 pub use validation::GraphError;
 use validation::{
     AliasClass, alias_class, full_range, hazard_kind, intersection, is_write, overlaps,
     pass_compatible, subtract, validate_access, validate_pass,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::{LoadOp, PassInfo, ResourceId, StoreOp};
+
+    #[test]
+    fn single_color_pass_validates_boundaries_without_spilling() {
+        let color = ResourceId(0);
+        let pass =
+            PassInfo::single_color(color, [0, 0, 1, 1], 1, LoadOp::Clear, StoreOp::Store).unwrap();
+
+        assert_eq!(pass.colors(), &[color]);
+        assert!(
+            PassInfo::single_color(color, [0, 0, 0, 1], 1, LoadOp::Clear, StoreOp::Store).is_err()
+        );
+        assert!(
+            PassInfo::single_color(color, [0, 0, 1, 1], 3, LoadOp::Clear, StoreOp::Store).is_err()
+        );
+    }
+}

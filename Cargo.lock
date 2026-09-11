@@ -377,6 +377,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "castaway"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dec551ab6e7578819132c713a93c022a05d60159dc86e7a7050223577484c55a"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "cc"
 version = "1.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -510,6 +519,19 @@ checksum = "cfc320937d09e6de266b31b9afb480f197d7a861be86be7cb2ea7e5d1bfffc5e"
 dependencies = [
  "bytes",
  "memchr",
+]
+
+[[package]]
+name = "compact_str"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79fcda08c33bb58b97008b2cdada6622500e949e060f5913361763121abd2416"
+dependencies = [
+ "castaway",
+ "cfg-if",
+ "itoa",
+ "static_assertions",
+ "zmij",
 ]
 
 [[package]]
@@ -730,8 +752,10 @@ dependencies = [
 name = "ez-gfx"
 version = "0.1.0"
 dependencies = [
+ "arrayvec",
  "blake3",
  "bytemuck",
+ "compact_str",
  "crossbeam-channel",
  "ez-gfx-artifact",
  "ez-gfx-assets",
@@ -742,6 +766,7 @@ dependencies = [
  "ez-gfx-hal",
  "ez-gfx-runtime",
  "raw-window-handle",
+ "smallvec",
  "static_assertions",
  "thiserror 2.0.20",
 ]
@@ -768,6 +793,7 @@ dependencies = [
 name = "ez-gfx-backend-dx12"
 version = "0.1.0"
 dependencies = [
+ "arrayvec",
  "ez-gfx-artifact",
  "ez-gfx-compiler",
  "ez-gfx-core",
@@ -776,6 +802,7 @@ dependencies = [
  "gpu-allocator",
  "parking_lot",
  "raw-window-handle",
+ "smallvec",
  "windows",
 ]
 
@@ -783,6 +810,7 @@ dependencies = [
 name = "ez-gfx-backend-metal"
 version = "0.1.0"
 dependencies = [
+ "arrayvec",
  "dispatch2",
  "ez-gfx-artifact",
  "ez-gfx-compiler",
@@ -804,6 +832,7 @@ dependencies = [
 name = "ez-gfx-backend-vulkan"
 version = "0.1.0"
 dependencies = [
+ "arrayvec",
  "ash",
  "ash-window",
  "ez-gfx-artifact",
@@ -815,6 +844,7 @@ dependencies = [
  "libloading",
  "parking_lot",
  "raw-window-handle",
+ "smallvec",
 ]
 
 [[package]]
@@ -911,9 +941,11 @@ dependencies = [
 name = "ez-gfx-runtime"
 version = "0.1.0"
 dependencies = [
+ "arrayvec",
  "basisu_c_sys",
  "blake3",
  "bytemuck",
+ "compact_str",
  "ez-gfx-artifact",
  "ez-gfx-basis",
  "ez-gfx-core",
@@ -922,6 +954,7 @@ dependencies = [
  "ktx2",
  "serde",
  "serde_json",
+ "smallvec",
 ]
 
 [[package]]

@@ -217,6 +217,7 @@ impl NativeContext {
             swapchain_loader: None,
             presentation_support: PresentationSupport::default(),
             swapchain: None,
+            swapchain_images: Vec::new(),
             swapchain_views: Vec::new(),
             swapchain_finished: Vec::new(),
             swapchain_initialized: Vec::new(),
@@ -785,6 +786,43 @@ impl NativeContext {
         Ok(())
     }
 
+    /// Reports on-demand allocator and device-memory telemetry.
+    ///
+    /// Calls `generate_report`, which allocates; never call per frame. Counts
+    /// and sizes saturate instead of wrapping, and unknown context-level values
+    /// report zero. Swapchain and depth sizes are resolution-scaled estimates,
+    /// not driver measurements.
+    pub fn memory_telemetry(&self) -> ez_gfx_hal::BackendMemoryTelemetry {
+        // Report generation walks live blocks, so this observes the allocator
+        // exactly once per explicit query rather than sampling per frame.
+        let allocator = self.allocator.as_ref().map(|allocator| {
+            let report = allocator.generate_report();
+            ez_gfx_hal::AllocatorTelemetry {
+                live_bytes: report.total_allocated_bytes,
+                block_bytes: report.total_capacity_bytes,
+                block_count: u32::try_from(report.blocks.len()).unwrap_or(u32::MAX),
+                allocation_count: u32::try_from(report.allocations.len()).unwrap_or(u32::MAX),
+            }
+        });
+        let images = u32::try_from(self.swapchain_images.len()).unwrap_or(u32::MAX);
+        let depth_bytes = self.depth_target.as_ref().map_or(0, |target| {
+            ez_gfx_hal::rgba8_image_bytes(1, target.extent.width, target.extent.height)
+        });
+        ez_gfx_hal::BackendMemoryTelemetry {
+            allocator,
+            swapchain_images: images,
+            swapchain_extent: (self.swapchain_extent.width, self.swapchain_extent.height),
+            swapchain_format: u32::try_from(self.swapchain_format.as_raw()).unwrap_or(u32::MAX),
+            swapchain_bytes: ez_gfx_hal::rgba8_image_bytes(
+                images,
+                self.swapchain_extent.width,
+                self.swapchain_extent.height,
+            ),
+            depth_bytes,
+            frame_slots: u32::try_from(self.frame_slots.len()).unwrap_or(u32::MAX),
+        }
+    }
+
     /// Reports whether the last idle attempt proved native storage safe to release.
     /// Call `wait_idle` immediately before consulting this terminal-cleanup status.
     pub const fn is_drained(&self) -> bool {
@@ -999,7 +1037,12 @@ impl NativeContext {
             unsafe { loader.destroy_swapchain(swapchain, None) };
         }
         self.swapchain_format = vk::Format::UNDEFINED;
+        // Images die with their swapchain; dropping the cache here keeps stale
+        // handles from surviving past destruction.
+        self.swapchain_images.clear();
         self.swapchain_initialized.clear();
+        // Images, views, and the swapchain are gone; the extent must die with
+        // them or telemetry keeps reporting a resolution for a dead surface.
         self.swapchain_extent = vk::Extent2D::default();
         if surface.handle != vk::SurfaceKHR::null() {
             // SAFETY: the host window is still live and no swapchain references this surface.

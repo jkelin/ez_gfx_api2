@@ -4,8 +4,9 @@ use super::{
     AllocationRequest, BufferHandle, COUNTER_BUFFER_ELEMENT_OFFSET, ContextHandle, ContextState,
     CounterBufferHandle, DrawIndexedCommand, Error, IndexedIndirectBuffer, MemoryClass,
     NativeAllocation, PackedHandle, ResourceKind, TransientBuffer, TransientUse, allocate_native,
-    completed_native_frame_value, free_native_allocation, map_allocation, map_lifecycle,
-    result_status, retire_native_allocation, stage_upload, with_context_mut,
+    completed_native_frame_value, completed_transfer_native, free_native_allocation,
+    map_allocation, map_lifecycle, native_device_initialized, result_status,
+    retire_native_allocation, stage_upload, with_context_mut,
 };
 
 /// Acquires a runtime-typed structured buffer for the C ABI.
@@ -36,15 +37,26 @@ fn acquire_buffer_raw_impl(
     with_context_mut(context, |context| {
         require_recording(context)?;
         let completed = completed_native_frame_value(&mut context.native)?;
-        let (reused, stale) = {
-            let pool = context
-                .buffer_pool
-                .entry(element_size)
-                .or_insert_with(|| ez_gfx_hal::ReusableStagingPool::new(256));
-            let reused = pool.take(size, completed);
-            let stale = pool.trim(completed);
+        let (reused, mut stale) = {
+            let pool = context.buffer_pool.entry(element_size).or_insert_with(|| {
+                // Lazily created stride pools inherit the finite per-entry budget;
+                // creation alone never evicts, pressure trims below do.
+                let mut pool = ez_gfx_hal::ReusableStagingPool::new(256);
+                pool.set_byte_budget(ez_gfx_hal::DEFAULT_BUFFER_STAGING_BUDGET);
+                pool
+            });
+            let reused = pool.take(size, ez_gfx_hal::QueueKind::Graphics, completed);
+            let mut stale = pool.trim(ez_gfx_hal::QueueKind::Graphics, completed);
+            // Idle trimming evicts only stale buckets; the budget trim evicts
+            // completed-but-fresh buckets once retention exceeds the ceiling.
+            stale.extend(pool.trim_to_budget(ez_gfx_hal::QueueKind::Graphics, completed));
             (reused, stale)
         };
+        // Stride pools retain independently, so only this global pass bounds
+        // their sum. The transfer counter is queried only under aggregate
+        // pressure, never on the ordinary acquisition hot path.
+        trim_staging_to_aggregate_budget_after_graphics(context, completed, &mut stale)?;
+        observe_staging_high_water(context);
         for allocation in stale {
             free_native_allocation(&mut context.native, allocation).map_err(map_allocation)?;
         }
@@ -91,8 +103,21 @@ pub fn acquire_counter(context: ContextHandle, capacity: u32) -> Result<CounterB
             .checked_add(COUNTER_BUFFER_ELEMENT_OFFSET)
             .ok_or(Error::InvalidArgument)?;
         let completed = completed_native_frame_value(&mut context.native)?;
-        let reused = context.counter_pool.take(size, completed);
-        for allocation in context.counter_pool.trim(completed) {
+        let reused =
+            context
+                .counter_pool
+                .take(size, ez_gfx_hal::QueueKind::Graphics, completed);
+        let mut stale = context
+            .counter_pool
+            .trim(ez_gfx_hal::QueueKind::Graphics, completed);
+        stale.extend(
+            context
+                .counter_pool
+                .trim_to_budget(ez_gfx_hal::QueueKind::Graphics, completed),
+        );
+        trim_staging_to_aggregate_budget_after_graphics(context, completed, &mut stale)?;
+        observe_staging_high_water(context);
+        for allocation in stale {
             free_native_allocation(&mut context.native, allocation).map_err(map_allocation)?;
         }
         let (byte_capacity, allocation) = if let Some(reused) = reused {
@@ -173,31 +198,66 @@ pub fn write_counter_commands(
             return Ok(());
         }
         let byte_size = usize::try_from(byte_size).map_err(|_| Error::InvalidArgument)?;
-        let mut bytes = Vec::with_capacity(byte_size);
-        for command in commands {
-            bytes.extend_from_slice(&command.index_count.to_le_bytes());
-            bytes.extend_from_slice(&command.instance_count.to_le_bytes());
-            bytes.extend_from_slice(&command.first_index.to_le_bytes());
-            bytes.extend_from_slice(&command.vertex_offset.to_le_bytes());
-            bytes.extend_from_slice(&command.first_instance.to_le_bytes());
-        }
         let ContextState {
             native,
             staging,
             allocations,
             allocation_ready,
+            counter_scratch,
             ..
         } = context;
-        let (_, allocation) = allocations.get(&handle).ok_or(Error::InvalidContext)?;
-        stage_upload(native, staging, allocation, 0, &visible_count.to_le_bytes())
-            .map_err(map_allocation)?;
-        let token =
-            stage_upload(native, staging, allocation, offset, &bytes).map_err(map_allocation)?;
-        allocation_ready.insert(handle, token);
-        Ok(())
+        // Retained scratch keeps steady-state counter writes allocation-free; the
+        // copy into mapped staging storage still occurs per call via stage_upload.
+        counter_scratch.clear();
+        counter_scratch.reserve(byte_size);
+        for command in commands {
+            counter_scratch.extend_from_slice(&command.index_count.to_le_bytes());
+            counter_scratch.extend_from_slice(&command.instance_count.to_le_bytes());
+            counter_scratch.extend_from_slice(&command.first_index.to_le_bytes());
+            counter_scratch.extend_from_slice(&command.vertex_offset.to_le_bytes());
+            counter_scratch.extend_from_slice(&command.first_instance.to_le_bytes());
+        }
+        // The fallible tail runs inside a closure so a failed upload still
+        // trims below: without the guard, one failed multi-megabyte write
+        // would pin its capacity for the context lifetime.
+        let result = (|| -> Result<()> {
+            let (_, allocation) = allocations.get(&handle).ok_or(Error::InvalidContext)?;
+            stage_upload(native, staging, allocation, 0, &visible_count.to_le_bytes())
+                .map_err(map_allocation)?;
+            let token = stage_upload(native, staging, allocation, offset, counter_scratch)
+                .map_err(map_allocation)?;
+            allocation_ready.insert(handle, token);
+            Ok(())
+        })();
+        trim_counter_scratch(counter_scratch);
+        observe_staging_high_water(context);
+        result
     }))
 }
-fn counter_payload(bytes: &[u8], initial_count: u32) -> Result<Vec<u8>> {
+
+/// Maximum counter serialization capacity retained across writes.
+///
+/// Steady-state counter payloads are a few kilobytes; one pathological
+/// multi-megabyte write must not pin that capacity for the context lifetime.
+const COUNTER_SCRATCH_RETAIN_LIMIT: usize = 64 * 1024;
+
+/// Releases retained serialization capacity above the retention limit.
+///
+/// Call after the staged payload no longer needs scratch storage; steady-state
+/// writes below the limit keep reusing capacity allocation-free.
+fn trim_counter_scratch(scratch: &mut Vec<u8>) {
+    // Clearing first means the shrink frees everything above zero instead of
+    // pinning the just-written payload size.
+    scratch.clear();
+    if scratch.capacity() > COUNTER_SCRATCH_RETAIN_LIMIT {
+        scratch.shrink_to_fit();
+    }
+}
+fn counter_payload<'scratch>(
+    scratch: &'scratch mut Vec<u8>,
+    bytes: &[u8],
+    initial_count: u32,
+) -> Result<&'scratch [u8]> {
     // Padding is explicitly zeroed so no stale pooled bytes exist between the count and elements.
     let element_offset =
         usize::try_from(COUNTER_BUFFER_ELEMENT_OFFSET).map_err(|_| Error::InvalidArgument)?;
@@ -205,11 +265,13 @@ fn counter_payload(bytes: &[u8], initial_count: u32) -> Result<Vec<u8>> {
         .len()
         .checked_add(element_offset)
         .ok_or(Error::InvalidArgument)?;
-    let mut payload = Vec::with_capacity(payload_size);
-    payload.extend_from_slice(&initial_count.to_le_bytes());
-    payload.resize(element_offset, 0);
-    payload.extend_from_slice(bytes);
-    Ok(payload)
+    // Retained scratch removes the per-call payload Vec; capacity persists across writes.
+    scratch.clear();
+    scratch.reserve(payload_size);
+    scratch.extend_from_slice(&initial_count.to_le_bytes());
+    scratch.resize(element_offset, 0);
+    scratch.extend_from_slice(bytes);
+    Ok(scratch)
 }
 
 /// Stages a complete counter-buffer payload without an intermediate command copy.
@@ -244,19 +306,27 @@ pub fn write_counter_bytes(
         {
             return Err(Error::InvalidArgument);
         }
-        let payload = counter_payload(bytes, initial_count)?;
         let ContextState {
             native,
             staging,
             allocations,
             allocation_ready,
+            counter_scratch,
             ..
         } = context;
-        let (_, allocation) = allocations.get(&handle).ok_or(Error::InvalidContext)?;
-        let token =
-            stage_upload(native, staging, allocation, 0, &payload).map_err(map_allocation)?;
-        allocation_ready.insert(handle, token);
-        Ok(())
+        // Same retained scratch as the command path; the guard trims even when
+        // payload construction or the upload below fails partway through.
+        let result = (|| -> Result<()> {
+            let payload = counter_payload(counter_scratch, bytes, initial_count)?;
+            let (_, allocation) = allocations.get(&handle).ok_or(Error::InvalidContext)?;
+            let token =
+                stage_upload(native, staging, allocation, 0, payload).map_err(map_allocation)?;
+            allocation_ready.insert(handle, token);
+            Ok(())
+        })();
+        trim_counter_scratch(counter_scratch);
+        observe_staging_high_water(context);
+        result
     }))
 }
 
@@ -334,10 +404,13 @@ fn write_buffer_raw_impl(
             ..
         } = context;
         let (_, allocation) = allocations.get(&handle).ok_or(Error::InvalidContext)?;
-        let token =
-            stage_upload(native, staging, allocation, offset, bytes).map_err(map_allocation)?;
-        allocation_ready.insert(handle, token);
-        Ok(())
+        let result =
+            stage_upload(native, staging, allocation, offset, bytes).map_err(map_allocation);
+        if let Ok(token) = &result {
+            allocation_ready.insert(handle, *token);
+        }
+        observe_staging_high_water(context);
+        result.map(|_| ())
     }))
 }
 
@@ -460,6 +533,208 @@ pub(super) fn reclaim_available_transients(context: &mut ContextState) -> Result
     Ok(())
 }
 
+/// Evicts completed staging buckets down to finite budgets, freeing them natively.
+///
+/// Shared by the memory-pressure entry point and the native-idle path; both run
+/// outside frame recording, where completion values are fresh. Only buckets
+/// retired by completed GPU work are evicted: in-flight retention may keep a
+/// pool over budget, which the next idle or pressure call revisits.
+pub(super) fn trim_staging_caches(context: &mut ContextState) -> Result<()> {
+    let completions = if native_device_initialized(&context.native) {
+        staging_completions(context)?
+    } else {
+        // No queue exists before Vulkan device admission, so no submitted
+        // retirement token can exist; unsubmitted buckets remain reclaimable.
+        StagingCompletions {
+            transfer: 0,
+            graphics: 0,
+        }
+    };
+    let mut stale = context
+        .staging
+        .trim(ez_gfx_hal::QueueKind::Transfer, completions.transfer);
+    stale.extend(
+        context
+            .staging
+            .trim_to_budget(ez_gfx_hal::QueueKind::Transfer, completions.transfer),
+    );
+    for pool in context.buffer_pool.values_mut() {
+        stale.extend(pool.trim(ez_gfx_hal::QueueKind::Graphics, completions.graphics));
+        stale.extend(
+            pool.trim_to_budget(ez_gfx_hal::QueueKind::Graphics, completions.graphics),
+        );
+    }
+    stale.extend(
+        context
+            .counter_pool
+            .trim(ez_gfx_hal::QueueKind::Graphics, completions.graphics),
+    );
+    stale.extend(
+        context
+            .counter_pool
+            .trim_to_budget(ez_gfx_hal::QueueKind::Graphics, completions.graphics),
+    );
+    trim_staging_to_aggregate_budget(context, completions, &mut stale);
+    observe_staging_high_water(context);
+    for allocation in stale {
+        free_native_allocation(&mut context.native, allocation).map_err(map_allocation)?;
+    }
+    trim_counter_scratch(&mut context.counter_scratch);
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct StagingCompletions {
+    transfer: u64,
+    graphics: u64,
+}
+
+fn staging_completions(context: &mut ContextState) -> Result<StagingCompletions> {
+    let transfer = completed_transfer_native(&mut context.native).map_err(map_allocation)?;
+    let graphics = completed_native_frame_value(&mut context.native)?;
+    Ok(StagingCompletions { transfer, graphics })
+}
+
+/// Sums retained staging capacity across the shared, stride, and counter pools.
+///
+/// Saturating addition keeps diagnostics honest: the total must never wrap even
+/// under pathological retention.
+pub(super) fn aggregate_staging_retained(context: &ContextState) -> u64 {
+    let mut total = context.staging.retained_bytes();
+    for pool in context.buffer_pool.values() {
+        total = total.saturating_add(pool.retained_bytes());
+    }
+    total.saturating_add(context.counter_pool.retained_bytes())
+}
+
+/// Records the actual aggregate peak after a staging-pool mutation or burst.
+///
+/// The scan only reads pool storage and performs no allocation.
+pub(super) fn observe_staging_high_water(context: &mut ContextState) {
+    context.staging_high_water_bytes = context
+        .staging_high_water_bytes
+        .max(aggregate_staging_retained(context));
+}
+
+fn trim_staging_to_aggregate_budget_after_graphics(
+    context: &mut ContextState,
+    graphics: u64,
+    stale: &mut Vec<NativeAllocation>,
+) -> Result<()> {
+    if aggregate_staging_retained(context) <= ez_gfx_hal::DEFAULT_STAGING_AGGREGATE_BUDGET {
+        return Ok(());
+    }
+    let transfer = completed_transfer_native(&mut context.native).map_err(map_allocation)?;
+    trim_staging_to_aggregate_budget(
+        context,
+        StagingCompletions { transfer, graphics },
+        stale,
+    );
+    Ok(())
+}
+
+/// Evicts completed buckets until summed retention fits the aggregate budget.
+///
+/// Per-pool ceilings cannot bound the stride map, which grows one pool per
+/// element width: this pass evicts the largest completed bucket across every
+/// pool until the total fits. Eviction order never affects reuse quality
+/// because `take` always selects the smallest fitting bucket. Exact ties
+/// prefer shared, then counter, then stride pools, so evicted byte totals stay
+/// deterministic; in-flight buckets are never candidates and may keep the
+/// total over budget until the next call. Pushes evictions into `stale` for
+/// the caller to free; allocates nothing itself.
+pub(super) fn trim_staging_to_aggregate_budget(
+    context: &mut ContextState,
+    completed: StagingCompletions,
+    stale: &mut Vec<NativeAllocation>,
+) {
+    while aggregate_staging_retained(context) > ez_gfx_hal::DEFAULT_STAGING_AGGREGATE_BUDGET {
+        let mut best: Option<(u8, u32)> = None;
+        let mut best_capacity = 0_u64;
+        {
+            // Scoped so the mutable `best` borrow ends before eviction below.
+            let mut consider = |source: u8, key: u32, capacity: Option<u64>| {
+                if let Some(capacity) = capacity
+                    && (best.is_none() || capacity > best_capacity)
+                {
+                    best = Some((source, key));
+                    best_capacity = capacity;
+                }
+            };
+            consider(
+                0,
+                0,
+                context.staging.largest_completed_capacity(
+                    ez_gfx_hal::QueueKind::Transfer,
+                    completed.transfer,
+                ),
+            );
+            consider(
+                1,
+                0,
+                context.counter_pool.largest_completed_capacity(
+                    ez_gfx_hal::QueueKind::Graphics,
+                    completed.graphics,
+                ),
+            );
+            for (stride, pool) in &context.buffer_pool {
+                consider(
+                    2,
+                    *stride,
+                    pool.largest_completed_capacity(
+                        ez_gfx_hal::QueueKind::Graphics,
+                        completed.graphics,
+                    ),
+                );
+            }
+        }
+        let Some((source, key)) = best else {
+            break;
+        };
+        let evicted = match source {
+            0 => context.staging.pop_largest_completed(
+                ez_gfx_hal::QueueKind::Transfer,
+                completed.transfer,
+            ),
+            1 => context.counter_pool.pop_largest_completed(
+                ez_gfx_hal::QueueKind::Graphics,
+                completed.graphics,
+            ),
+            _ => context.buffer_pool.get_mut(&key).and_then(|pool| {
+                pool.pop_largest_completed(
+                    ez_gfx_hal::QueueKind::Graphics,
+                    completed.graphics,
+                )
+            }),
+        };
+        if let Some(allocation) = evicted {
+            stale.push(allocation);
+        } else {
+            // Unreachable: the capacity was just observed above, so a bucket
+            // must still be there; break anyway to guard against logic drift.
+            break;
+        }
+    }
+}
+
+/// Releases retained staging caches down to their finite budgets.
+///
+/// Trims the shared, buffer, and counter staging pools plus excess counter
+/// serialization capacity, freeing evicted buckets natively. Completion-gated
+/// buckets owned by in-flight GPU work stay retained. Call on memory pressure
+/// or after large streaming bursts — never per frame, since the completion
+/// query itself costs a native round trip.
+///
+/// # Errors
+///
+/// Returns an error for stale handles, wrong-thread calls, or native failures.
+pub fn release_staging_memory(context: ContextHandle) -> Result<()> {
+    result_status(with_context_mut(context, |context| {
+        context.identity.check_thread().map_err(map_lifecycle)?;
+        trim_staging_caches(context)
+    }))
+}
+
 fn require_recording(context: &ContextState) -> Result<()> {
     context
         .identity
@@ -533,14 +808,33 @@ mod tests {
     }
 
     #[test]
+    fn counter_scratch_trim_bounds_pathological_retention() {
+        let mut scratch = vec![0x5a; COUNTER_SCRATCH_RETAIN_LIMIT + 1];
+        trim_counter_scratch(&mut scratch);
+        assert!(scratch.is_empty());
+        assert!(scratch.capacity() <= COUNTER_SCRATCH_RETAIN_LIMIT);
+        // Steady-state sizes keep their warm capacity allocation-free.
+        scratch.reserve(1024);
+        let warm = scratch.capacity();
+        trim_counter_scratch(&mut scratch);
+        assert_eq!(scratch.capacity(), warm);
+    }
+
+    #[test]
     fn counter_payload_places_elements_at_shared_aligned_offset() {
         let command = [0x5a; 20];
-        let payload = counter_payload(&command, 7).unwrap();
+        let mut scratch = Vec::new();
+        let payload = counter_payload(&mut scratch, &command, 7).unwrap();
         let offset = usize::try_from(COUNTER_BUFFER_ELEMENT_OFFSET).unwrap();
 
         assert_eq!(&payload[..4], &7_u32.to_le_bytes());
         assert!(payload[4..offset].iter().all(|byte| *byte == 0));
         assert_eq!(&payload[offset..], &command);
         assert_eq!(payload.len(), offset + command.len());
+        // A second equal-size write must reuse capacity without reallocating.
+        let capacity = scratch.capacity();
+        let payload = counter_payload(&mut scratch, &command, 3).unwrap();
+        assert_eq!(&payload[..4], &3_u32.to_le_bytes());
+        assert_eq!(scratch.capacity(), capacity);
     }
 }

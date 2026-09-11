@@ -5,8 +5,10 @@
 //! transfer-pending uploads with their retained byte sizes, plus retained
 //! staging, pipeline, and readback cache sizes.
 
-use super::{ContextHandle, map_lifecycle, with_context_mut};
-use crate::{Error, ResourceDiagnostics, Result};
+use super::{
+    ContextHandle, NativeContext, aggregate_staging_retained, map_lifecycle, with_context_mut,
+};
+use crate::{Error, MemoryTelemetryReport, ResourceDiagnostics, Result};
 
 /// Returns pending-upload counts with retained bytes plus retained cache sizes.
 ///
@@ -88,4 +90,165 @@ pub fn resource_diagnostics(context: ContextHandle) -> Result<ResourceDiagnostic
             });
         Ok(diagnostics)
     })
+}
+
+/// Returns on-demand allocator and memory telemetry without dispatching events.
+///
+/// Backend allocators report through `generate_report` exactly once per call;
+/// callers must query explicitly and never per frame. Staging sizes aggregate
+/// the shared pool with the buffer and counter pools; worker and slot counts
+/// come from live context state. Unlike [`resource_diagnostics`], this never
+/// dispatches callbacks, so a dispatch failure cannot mask the snapshot.
+///
+/// # Errors
+///
+/// Returns an error for an invalid or stale context handle, or when called from
+/// a thread other than the context creator.
+pub fn memory_telemetry(context: ContextHandle) -> Result<MemoryTelemetryReport> {
+    with_context_mut(context, |context| {
+        context.identity.check_thread().map_err(map_lifecycle)?;
+        let backend = match &context.native {
+            NativeContext::Vulkan(native) => native.memory_telemetry(),
+            #[cfg(windows)]
+            NativeContext::Dx12(native) => native.memory_telemetry(),
+            #[cfg(target_vendor = "apple")]
+            NativeContext::Metal(native) => native.memory_telemetry(),
+        };
+        // Pool telemetry only reads lengths, so aggregation never allocates;
+        // counts accumulate with saturation and bucket totals cap at `u32::MAX`.
+        let mut buckets = context.staging.len();
+        for pool in context.buffer_pool.values() {
+            buckets = buckets.saturating_add(pool.len());
+        }
+        buckets = buckets.saturating_add(context.counter_pool.len());
+        let bytes = aggregate_staging_retained(context);
+        let high_water = context.staging_high_water_bytes;
+        let surface = aggregate_surface_telemetry(context, &backend);
+        let mut report = backend;
+        report.swapchain_images = surface.images;
+        report.swapchain_extent = surface.extent;
+        report.swapchain_format = surface.format;
+        report.swapchain_bytes = ez_gfx_hal::rgba8_image_bytes(
+            surface.images,
+            surface.extent.0,
+            surface.extent.1,
+        );
+        report.depth_bytes = surface
+            .depth_extent
+            .map_or(0, |(width, height)| {
+                ez_gfx_hal::rgba8_image_bytes(1, width, height)
+            });
+        Ok(MemoryTelemetryReport {
+            backend: report,
+            staging_buckets: u32::try_from(buckets).unwrap_or(u32::MAX),
+            staging_bytes: bytes,
+            staging_high_water: high_water,
+            // Retained serialization capacity, not live occupancy; bounded by
+            // the write-path trim.
+            counter_scratch_bytes: u64::try_from(context.counter_scratch.capacity())
+                .unwrap_or(u64::MAX),
+            // Pool sizes always fit `u32`; the fallback only guards the conversion.
+            decode_workers: u32::try_from(context.async_textures.worker_count())
+                .unwrap_or(u32::MAX),
+        })
+    })
+}
+
+/// Surface image counts, extents, formats, and depth aggregated in one convention.
+struct SurfaceTelemetry {
+    images: u32,
+    extent: (u32, u32),
+    format: u32,
+    depth_extent: Option<(u32, u32)>,
+}
+
+/// Aggregates surface memory telemetry from active safe surface state.
+///
+/// Extents prefer the safe `SurfaceState` every backend maintains, so headless
+/// and window surfaces share one source; the backend contributes only what safe
+/// state cannot observe (image counts, format codes, depth presence). Vulkan
+/// swapchain fields are device-global, so Vulkan-backed surfaces reuse the
+/// backend report once instead of once per surface.
+fn aggregate_surface_telemetry(
+    context: &super::ContextState,
+    backend: &ez_gfx_hal::BackendMemoryTelemetry,
+) -> SurfaceTelemetry {
+    let mut images = 0_u32;
+    let mut extent = (0_u32, 0_u32);
+    let mut format = 0_u32;
+    let mut depth_extent = None;
+    let mut vulkan_counted = false;
+    // The active surface owns presentation; without one, the largest surface
+    // still describes retention better than zeros.
+    let mut preferred = context.active_surface;
+    if preferred.is_none() {
+        let mut largest = 0_u64;
+        for (handle, record) in &context.surfaces {
+            let area = record
+                .state
+                .extent()
+                .map_or(0, |(width, height)| {
+                    u64::from(width).saturating_mul(u64::from(height))
+                });
+            if area > largest {
+                largest = area;
+                preferred = Some(*handle);
+            }
+        }
+    }
+    for (handle, record) in &context.surfaces {
+        let extent_here = record.state.extent();
+        match (&context.native, &record.native) {
+            (NativeContext::Vulkan(_), super::NativeSurface::Vulkan(_)) => {
+                // Device-global swapchain: count once however many surfaces exist.
+                if !vulkan_counted {
+                    vulkan_counted = true;
+                    images = images.saturating_add(backend.swapchain_images);
+                }
+                if Some(*handle) == preferred {
+                    extent = extent_here.unwrap_or(backend.swapchain_extent);
+                    format = backend.swapchain_format;
+                    // Depth matches the swapchain; the backend already resolved it.
+                    if backend.depth_bytes > 0 {
+                        depth_extent = Some(extent);
+                    }
+                }
+            }
+            #[cfg(windows)]
+            (NativeContext::Dx12(_), super::NativeSurface::Dx12(surface)) => {
+                images = images.saturating_add(surface.telemetry_images());
+                if Some(*handle) == preferred {
+                    extent = extent_here.unwrap_or_else(|| surface.telemetry_extent());
+                    format = surface.telemetry_format();
+                    if surface.telemetry_has_depth() {
+                        depth_extent = Some(extent);
+                    }
+                }
+            }
+            #[cfg(target_vendor = "apple")]
+            (NativeContext::Metal(_), super::NativeSurface::Metal(surface)) => {
+                images = images.saturating_add(surface.telemetry_images());
+                if Some(*handle) == preferred {
+                    // Metal has no backend extent query without mutating the
+                    // layer, so safe state is the only extent source here.
+                    extent = extent_here.unwrap_or((0, 0));
+                    format = surface.telemetry_format();
+                    depth_extent = surface.telemetry_depth_extent();
+                }
+            }
+            #[cfg(any(windows, target_vendor = "apple"))]
+            _ => {}
+        }
+    }
+    // Without images nothing is retained; a stale format or extent would mislead.
+    if images == 0 {
+        extent = (0, 0);
+        format = 0;
+    }
+    SurfaceTelemetry {
+        images,
+        extent,
+        format,
+        depth_extent,
+    }
 }

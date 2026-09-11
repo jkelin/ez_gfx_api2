@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 
 use ez_gfx_artifact::Stage;
 use ez_gfx_core::{
@@ -21,7 +21,7 @@ pub enum BindingKind {
     RenderTarget,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Associates a typed runtime handle with its GPU resource kind.
 pub enum ResourceIdentity {
     /// A general buffer handle.
@@ -75,7 +75,7 @@ pub struct ReflectedBindings {
     /// Graphics API targeted by the reflected metadata.
     backend: Backend,
     /// Named resource requirements sorted by semantic name.
-    requirements: Vec<BindingRequirement>,
+    requirements: Arc<[BindingRequirement]>,
 }
 
 /// Maximum number of sampled textures supported by the bindless heap.
@@ -288,7 +288,7 @@ impl ReflectedBindings {
         requirements.sort_unstable_by(|left, right| left.name.cmp(&right.name));
         Ok(Self {
             backend,
-            requirements,
+            requirements: requirements.into(),
         })
     }
 
@@ -342,8 +342,8 @@ impl ReflectedBindings {
         if self.backend != other.backend {
             return Err(BindingError::InvalidMetadata);
         }
-        let mut requirements = self.requirements.clone();
-        for requirement in &other.requirements {
+        let mut requirements = self.requirements.to_vec();
+        for requirement in other.requirements.iter() {
             if let Some(existing) = requirements
                 .iter()
                 .find(|existing| existing.name == requirement.name)
@@ -377,7 +377,7 @@ impl ReflectedBindings {
         requirements.sort_unstable_by(|left, right| left.name.cmp(&right.name));
         Ok(Self {
             backend: self.backend,
-            requirements,
+            requirements: requirements.into(),
         })
     }
 }

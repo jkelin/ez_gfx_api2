@@ -4,9 +4,12 @@ use super::{
     NativeSurface, NativeTexture, PresentationMode, QueueKind, ResourceAccess, map_allocation_hal,
     map_vk, vk, vulkan_state,
 };
+use arrayvec::ArrayVec;
+#[path = "frame_plan.rs"]
+mod plan;
 #[path = "frame_record.rs"]
 mod record;
-use ez_gfx_hal::COUNTER_BUFFER_ELEMENT_OFFSET;
+use plan::{FramePlan, validate_frame_plan};
 
 type FrameSurface<'a> = (&'a mut NativeSurface, (u32, u32), PresentationMode);
 type ResolvedFrameSurface<'a> = (Option<&'a mut NativeSurface>, (u32, u32), PresentationMode);
@@ -366,18 +369,99 @@ impl NativeContext {
 }
 
 type FrameReadback = (u32, u32, u64, bool, super::NativeAllocation);
-type FrameBindings = (Vec<FrameReadback>, Vec<Option<vk::DescriptorSet>>);
+/// Allocated public descriptor sets for pipeline actions, in ascending action
+/// order; every other action needs no entry.
+type FrameBindings = (Vec<FrameReadback>, Vec<(u32, vk::DescriptorSet)>);
 
+/// Returns the public descriptor set for one action, if it uses a pipeline.
+///
+/// Entries are recorded in ascending action order, so binary search is valid.
+fn public_set(sets: &[(u32, vk::DescriptorSet)], action: usize) -> Option<&vk::DescriptorSet> {
+    // Action counts always fit `u32`; the fallback only guards the conversion.
+    let action = u32::try_from(action).ok()?;
+    sets.binary_search_by_key(&action, |(action, _)| *action)
+        .ok()
+        .map(|index| &sets[index].1)
+}
 impl NativeContext {
+    /// Returns public-set result storage to its frame slot, keeping capacity.
+    ///
+    /// Sets are pool-allocated per frame and die with the pool reset, so only
+    /// the emptied shell is retained. A missing slot is unreachable after
+    /// preparation; dropping instead preserves behavior and only loses capacity.
+    fn restore_public_sets(&mut self, slot_index: usize, sets: Vec<(u32, vk::DescriptorSet)>) {
+        if let Some(slot) = self.frame_slots.get_mut(slot_index) {
+            slot.public_sets_scratch = sets;
+        }
+    }
+    /// Returns descriptor construction shells to their frame slot, keeping capacity.
+    ///
+    /// Shells hold no GPU work; they are cleared per pipeline action and only
+    /// retain high-water storage. A missing slot is unreachable after
+    /// preparation; dropping instead preserves behavior and only loses capacity.
+    fn restore_descriptor_scratch(
+        &mut self,
+        slot_index: usize,
+        infos: Vec<vk::DescriptorBufferInfo>,
+        writes: Vec<vk::WriteDescriptorSet<'static>>,
+    ) {
+        if let Some(slot) = self.frame_slots.get_mut(slot_index) {
+            slot.descriptor_info_scratch = infos;
+            slot.descriptor_write_scratch = writes;
+        }
+    }
+
+    /// Grows a retired slot's descriptor pool to the preflighted need.
+    ///
+    /// The slot just passed the fence wait and pool reset in `prepare_frame_slot`
+    /// and nothing has submitted from it yet, so destroying and recreating its
+    /// pool cannot race GPU use. Capacities and high-water marks update only on
+    /// successful recreation; a failed recreation leaves the old pool destroyed
+    /// and reports the error, and the next frame retries from current capacity.
+    fn ensure_descriptor_capacity(
+        &mut self,
+        slot_index: usize,
+        needed_sets: u32,
+        needed_descriptors: u32,
+    ) -> Result<vk::DescriptorPool, HalError> {
+        let device = self.device.as_ref().ok_or(HalError::NotReady)?.clone();
+        let slot = self
+            .frame_slots
+            .get_mut(slot_index)
+            .ok_or(HalError::NotReady)?;
+        if needed_sets <= slot.descriptor_sets_capacity
+            && needed_descriptors <= slot.descriptor_count_capacity
+        {
+            return Ok(slot.descriptor_pool);
+        }
+        let (sets, descriptors) = super::memory::next_descriptor_capacity(
+            slot.descriptor_sets_capacity,
+            slot.descriptor_count_capacity,
+            needed_sets,
+            needed_descriptors,
+        )?;
+        // The replacement is created before the old pool is destroyed, so a
+        // failed growth leaves a working pool behind and the next frame simply
+        // retries; capacities update only on success.
+        let pool = super::memory::create_descriptor_pool(&device, sets, descriptors)?;
+        // SAFETY: the slot is retired (fence-waited and pool-reset) with no
+        // submission yet this frame, so no command references the old pool.
+        unsafe { device.destroy_descriptor_pool(slot.descriptor_pool, None) };
+        slot.descriptor_pool = pool;
+        slot.descriptor_sets_capacity = sets;
+        slot.descriptor_count_capacity = descriptors;
+        Ok(pool)
+    }
+
     fn allocate_frame_bindings(
         &mut self,
-        actions: &[NativeFrameAction<'_>],
-        descriptor_pool: vk::DescriptorPool,
+        slot_index: usize,
+        actions: &(impl super::NativeFrameActionSource + ?Sized),
         extent: (u32, u32),
         capture_presented: bool,
     ) -> Result<FrameBindings, HalError> {
         let mut readbacks = Vec::new();
-        for action in actions {
+        let allocation_result = actions.visit(&mut |_, action| {
             let dimensions = match action {
                 NativeFrameAction::TextureReadback { width, height, .. } => {
                     Some((*width, *height, false))
@@ -386,52 +470,108 @@ impl NativeContext {
                 _ => None,
             };
             if let Some((width, height, surface_readback)) = dimensions {
-                let created = (|| {
-                    let size = u64::from(width)
-                        .checked_mul(u64::from(height))
-                        .and_then(|value| value.checked_mul(4))
-                        .ok_or(HalError::InvalidArgument)?;
-                    let request =
-                        AllocationRequest::new(size, 4, MemoryClass::Readback, true, None)
-                            .map_err(|_| HalError::InvalidArgument)?;
-                    let allocation = self.allocate(request).map_err(map_allocation_hal)?;
-                    Ok((width, height, size, surface_readback, allocation))
-                })();
-                match created {
-                    Ok(readback) => readbacks.push(readback),
-                    Err(error) => {
-                        for (_, _, _, _, allocation) in readbacks {
-                            let _ = self.free(allocation);
-                        }
-                        return Err(error);
-                    }
-                }
+                let size = u64::from(width)
+                    .checked_mul(u64::from(height))
+                    .and_then(|value| value.checked_mul(4))
+                    .ok_or(HalError::InvalidArgument)?;
+                let request = AllocationRequest::new(size, 4, MemoryClass::Readback, true, None)
+                    .map_err(|_| HalError::InvalidArgument)?;
+                let allocation = self.allocate(request).map_err(map_allocation_hal)?;
+                readbacks.push((width, height, size, surface_readback, allocation));
             }
+            Ok(())
+        });
+        if let Err(error) = allocation_result {
+            for (_, _, _, _, allocation) in readbacks {
+                let _ = self.free(allocation);
+            }
+            return Err(error);
         }
-        let mut public_sets = Vec::with_capacity(actions.len());
-        for action in actions {
-            let created = match action {
-                NativeFrameAction::Compute(dispatch) => self
-                    .create_public_descriptor_set(
-                        descriptor_pool,
-                        dispatch.pipeline,
-                        dispatch.bindings,
-                    )
-                    .map(Some),
-                NativeFrameAction::Graphics(draw) => self
-                    .create_public_descriptor_set(descriptor_pool, draw.pipeline, draw.bindings)
-                    .map(Some),
-                _ => Ok(None),
+        // Preflight: one set per pipeline action, descriptors from its bindings.
+        // Counts are tiny frameside values; saturation guards pathological plans.
+        let mut needed_sets = 0_u32;
+        let mut needed_descriptors = 0_u32;
+        actions.visit(&mut |_, action| {
+            let bindings = match action {
+                NativeFrameAction::Compute(dispatch) => Some(dispatch.bindings.len()),
+                NativeFrameAction::Graphics(draw) => Some(draw.bindings.len()),
+                _ => None,
             };
-            match created {
-                Ok(set) => public_sets.push(set),
-                Err(error) => {
-                    for (_, _, _, _, allocation) in readbacks {
-                        let _ = self.free(allocation);
-                    }
-                    return Err(error);
-                }
+            if let Some(count) = bindings {
+                needed_sets = needed_sets.saturating_add(1);
+                needed_descriptors =
+                    needed_descriptors.saturating_add(u32::try_from(count).unwrap_or(u32::MAX));
             }
+            Ok(())
+        })?;
+        let descriptor_pool =
+            self.ensure_descriptor_capacity(slot_index, needed_sets, needed_descriptors)?;
+        // Slot scratch is retired: the pool was just reset after the fence wait
+        // and nothing has submitted from this slot yet this frame.
+        let mut public_sets = core::mem::take(
+            &mut self
+                .frame_slots
+                .get_mut(slot_index)
+                .ok_or(HalError::NotReady)?
+                .public_sets_scratch,
+        );
+        public_sets.clear();
+        let mut descriptor_infos = core::mem::take(
+            &mut self
+                .frame_slots
+                .get_mut(slot_index)
+                .ok_or(HalError::NotReady)?
+                .descriptor_info_scratch,
+        );
+        let mut descriptor_writes = core::mem::take(
+            &mut self
+                .frame_slots
+                .get_mut(slot_index)
+                .ok_or(HalError::NotReady)?
+                .descriptor_write_scratch,
+        );
+        let mut used_sets = 0_u32;
+        let mut used_descriptors = 0_u32;
+        let descriptor_result = actions.visit(&mut |action_index, action| {
+            let bindings = match action {
+                NativeFrameAction::Compute(dispatch) => {
+                    Some((dispatch.pipeline, dispatch.bindings))
+                }
+                NativeFrameAction::Graphics(draw) => Some((draw.pipeline, draw.bindings)),
+                _ => None,
+            };
+            let Some((pipeline, bindings)) = bindings else {
+                return Ok(());
+            };
+            let action = u32::try_from(action_index).map_err(|_| HalError::InvalidArgument)?;
+            let set = self.create_public_descriptor_set(
+                descriptor_pool,
+                pipeline,
+                bindings,
+                &mut descriptor_infos,
+                &mut descriptor_writes,
+            )?;
+            public_sets.push((action, set));
+            used_sets = used_sets.saturating_add(1);
+            used_descriptors = used_descriptors
+                .saturating_add(u32::try_from(bindings.len()).unwrap_or(u32::MAX));
+            Ok(())
+        });
+        if let Err(error) = descriptor_result {
+            for (_, _, _, _, allocation) in readbacks {
+                let _ = self.free(allocation);
+            }
+            self.restore_public_sets(slot_index, public_sets);
+            self.restore_descriptor_scratch(slot_index, descriptor_infos, descriptor_writes);
+            return Err(error);
+        }
+        self.restore_descriptor_scratch(slot_index, descriptor_infos, descriptor_writes);
+        if let Some(slot) = self.frame_slots.get_mut(slot_index) {
+            // High-water records proven need; growth decisions compare against it
+            // indirectly through capacity, which only rises on preflight misses.
+            slot.descriptor_sets_high_water = slot.descriptor_sets_high_water.max(used_sets);
+            slot.descriptor_count_high_water =
+                slot.descriptor_count_high_water.max(used_descriptors);
         }
         Ok((readbacks, public_sets))
     }
@@ -492,7 +632,6 @@ struct PreparedFrame {
     slot_index: usize,
     available: vk::Semaphore,
     command_handle: vk::CommandBuffer,
-    descriptor_pool: vk::DescriptorPool,
     fence: vk::Fence,
     queue: vk::Queue,
     texture_set: vk::DescriptorSet,
@@ -529,17 +668,19 @@ impl NativeContext {
                 unsafe { device.wait_for_fences(&[slot.fence], true, u64::MAX) }.map_err(map_vk)?;
                 slot.in_flight = false;
             }
-            // SAFETY: `slot.command_buffer` and `slot.descriptor_pool` are this `device`'s per-slot objects, and the slot is not in flight after the conditional wait, so resetting them cannot race GPU use.
+            // SAFETY: `slot.command_buffer` is this `device`'s per-slot object, and the slot is not in flight after the conditional wait, so resetting it cannot race GPU use. A null descriptor pool was deferred and needs no reset; the preflight creates it on first need.
             unsafe {
                 device
                     .reset_command_buffer(slot.command_buffer, vk::CommandBufferResetFlags::empty())
                     .map_err(map_vk)?;
-                device
-                    .reset_descriptor_pool(
-                        slot.descriptor_pool,
-                        vk::DescriptorPoolResetFlags::empty(),
-                    )
-                    .map_err(map_vk)?;
+                if slot.descriptor_pool != vk::DescriptorPool::null() {
+                    device
+                        .reset_descriptor_pool(
+                            slot.descriptor_pool,
+                            vk::DescriptorPoolResetFlags::empty(),
+                        )
+                        .map_err(map_vk)?;
+                }
             }
             completed
         };
@@ -550,7 +691,6 @@ impl NativeContext {
         let slot = self.frame_slots.get(slot_index).ok_or(HalError::NotReady)?;
         let available = slot.image_available;
         let command_handle = slot.command_buffer;
-        let descriptor_pool = slot.descriptor_pool;
         let fence = slot.fence;
         let queue = self.graphics_queue.ok_or(HalError::NotReady)?;
         let texture_set = self.texture_descriptor_set.ok_or(HalError::NotReady)?;
@@ -561,7 +701,6 @@ impl NativeContext {
             slot_index,
             available,
             command_handle,
-            descriptor_pool,
             fence,
             queue,
             texture_set,
@@ -571,9 +710,9 @@ impl NativeContext {
 
 struct FrameRecordRequest<'a> {
     plan: &'a FramePlan,
-    actions: &'a [NativeFrameAction<'a>],
+    actions: &'a dyn super::NativeFrameActionSource,
     readbacks: &'a [FrameReadback],
-    public_sets: &'a [Option<vk::DescriptorSet>],
+    public_sets: &'a [(u32, vk::DescriptorSet)],
     extent: (u32, u32),
     capture_presented: bool,
 }
@@ -625,9 +764,9 @@ impl NativeContext {
                 .end_command_buffer(prepared.command_handle)
                 .map_err(map_vk)?;
             let _queue_guard = self.graphics_queue_lock.lock();
-            let mut wait_semaphores = Vec::with_capacity(3);
-            let mut wait_values = Vec::with_capacity(3);
-            let mut wait_stages = Vec::with_capacity(2);
+            let mut wait_semaphores = ArrayVec::<_, 3>::new();
+            let mut wait_values = ArrayVec::<_, 3>::new();
+            let mut wait_stages = ArrayVec::<_, 3>::new();
             if plan.uses_surface {
                 wait_semaphores.push(prepared.available);
                 wait_values.push(0);
@@ -710,10 +849,16 @@ impl NativeContext {
                 }
                 .map_err(map_vk)?;
                 acquired_image_index = Some(image_index);
-                // SAFETY: `loader` was cloned from the context's swapchain loader and `prepared.swapchain` was selected from that same swapchain setup for `get_swapchain_images`.
-                let images =
-                    unsafe { loader.get_swapchain_images(prepared.swapchain) }.map_err(map_vk)?;
-                let image = *images
+                // Images are cached at swapchain creation/recreation in presentation
+                // order; `prepared.swapchain` was read from the context at prepare
+                // time and nothing recreates it before this fetch, so the cache is
+                // current. The copy ends the borrow before encoding begins.
+                debug_assert_eq!(
+                    prepared.swapchain,
+                    self.swapchain.unwrap_or(vk::SwapchainKHR::null())
+                );
+                let image = *self
+                    .swapchain_images
                     .get(usize::try_from(image_index).map_err(|_| HalError::NativeFailure)?)
                     .ok_or(HalError::NativeFailure)?;
                 (image_index, image)
@@ -727,7 +872,7 @@ impl NativeContext {
                 surface_image,
             };
             let mut pass_active = false;
-            for (action_index, action) in actions.iter().enumerate() {
+            actions.visit(&mut |action_index, action| {
                 match action {
                     NativeFrameAction::Wait(_) => {}
                     NativeFrameAction::Barrier { barrier, resource } => {
@@ -741,7 +886,7 @@ impl NativeContext {
                         record::record_compute(
                             &encoding,
                             dispatch,
-                            public_sets[action_index].as_ref(),
+                            public_set(public_sets, action_index),
                             prepared.texture_set,
                             pass_active,
                         )?;
@@ -750,7 +895,7 @@ impl NativeContext {
                         record::record_graphics(
                             &encoding,
                             draw,
-                            public_sets[action_index].as_ref(),
+                            public_set(public_sets, action_index),
                             prepared.texture_set,
                             self.swapchain_extent,
                             pass_active,
@@ -765,7 +910,6 @@ impl NativeContext {
                             pass_active,
                         )?;
                     }
-                    // SAFETY: `prepared.command_handle` is recording, and `pass_active` is set only after its unmatched `cmd_begin_rendering`, so `cmd_end_rendering` closes that rendering scope.
                     NativeFrameAction::EndPass => unsafe {
                         if !pass_active {
                             return Err(HalError::InvalidArgument);
@@ -783,7 +927,8 @@ impl NativeContext {
                         )?;
                     }
                 }
-            }
+                Ok(())
+            })?;
             if pass_active {
                 return Err(HalError::InvalidArgument);
             }
@@ -795,198 +940,31 @@ impl NativeContext {
     }
 }
 
-struct FramePlan {
-    uses_surface: bool,
-    presents: bool,
-    external_wait: Vec<CompletionToken>,
-}
-
-/// Requires exact sample-count agreement between a pass and its color target.
-///
-/// Surfaces stay single-sample; a multisampled pass needs a multisampled
-/// target rendering at exactly the pass count, and vice versa.
-fn samples_agree(resource: &NativeFrameResource<'_>, samples: u8) -> bool {
-    match resource {
-        NativeFrameResource::Surface => samples == 1,
-        NativeFrameResource::RenderTarget(texture) => {
-            texture.msaa.as_ref().map_or(1, |msaa| msaa.samples) == samples
-        }
-        _ => false,
-    }
-}
-
-fn validate_frame_plan(
-    actions: &[NativeFrameAction<'_>],
-    extent: (u32, u32),
-    surface_available: bool,
-    capture_presented: bool,
-) -> Result<FramePlan, HalError> {
-    let present_count = actions
-        .iter()
-        .filter(|action| matches!(action, NativeFrameAction::Present))
-        .count();
-    let presents = present_count == 1;
-    // Surface use is attachment-precise: render-target-only passes, barriers,
-    // and draws never acquire the swapchain. Draws inherit their pass target,
-    // so only surface-attached passes, presents, and surface/depth barriers
-    // require a surface.
-    let uses_surface = actions.iter().any(|action| match action {
-        NativeFrameAction::BeginPass { colors, .. } => colors
-            .iter()
-            .any(|attachment| matches!(attachment.resource, NativeFrameResource::Surface)),
-        NativeFrameAction::Present
-        | NativeFrameAction::Barrier {
-            resource: NativeFrameResource::Surface | NativeFrameResource::Depth,
-            ..
-        } => true,
-        _ => false,
-    });
-    if present_count > 1
-        || uses_surface && !surface_available
-        || (uses_surface || capture_presented) && !presents
-    {
-        return Err(HalError::InvalidArgument);
-    }
-    let external_wait = actions
-        .iter()
-        .filter_map(|action| match action {
-            NativeFrameAction::Wait(token)
-                if matches!(
-                    token.queue,
-                    QueueKind::Transfer | QueueKind::TextureTransfer
-                ) =>
-            {
-                Some(Ok(*token))
-            }
-            NativeFrameAction::Wait(_) => Some(Err(HalError::InvalidArgument)),
-            _ => None,
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut pass_active = false;
-    let mut saw_present = false;
-    for action in actions {
-        if saw_present {
-            return Err(HalError::InvalidArgument);
-        }
-        match action {
-            NativeFrameAction::Wait(_) => {}
-            NativeFrameAction::Barrier { barrier, resource } => match (resource, barrier.range) {
-                (
-                    NativeFrameResource::Buffer(allocation),
-                    ez_gfx_hal::ExecutionRange::Buffer(range),
-                ) if range
-                    .offset
-                    .checked_add(range.size)
-                    .is_some_and(|end| end <= allocation.allocation.size()) => {}
-                (
-                    NativeFrameResource::Texture(_)
-                    | NativeFrameResource::Surface
-                    | NativeFrameResource::Depth
-                    | NativeFrameResource::RenderTarget(_),
-                    ez_gfx_hal::ExecutionRange::Image(_),
-                ) => {}
-                _ => return Err(HalError::InvalidArgument),
-            },
-            NativeFrameAction::BeginPass { pass, colors } => {
-                // Textures, buffers, and depth images are never color
-                // attachments; depth with a render target stays unsupported.
-                // A multisampled pass needs a multisampled target and vice
-                // versa; surfaces stay single-sample.
-                let mut target_extent = None;
-                let mut valid = !pass_active
-                    && pass.colors.len() == 1
-                    && colors.len() == 1
-                    && matches!(pass.samples, 1 | 2 | 4 | 8);
-                if let Some(attachment) = colors.first() {
-                    valid &= samples_agree(&attachment.resource, pass.samples);
-                    target_extent = match attachment.resource {
-                        NativeFrameResource::Surface => Some(extent),
-                        NativeFrameResource::RenderTarget(texture) => {
-                            valid &= pass.depth.is_none();
-                            Some((texture.width, texture.height))
-                        }
-                        _ => None,
-                    };
-                }
-                let Some((target_width, target_height)) = target_extent else {
-                    return Err(HalError::InvalidArgument);
-                };
-                if !valid
-                    || pass.area[0]
-                        .checked_add(pass.area[2])
-                        .is_none_or(|end| end > target_width)
-                    || pass.area[1]
-                        .checked_add(pass.area[3])
-                        .is_none_or(|end| end > target_height)
-                {
-                    return Err(HalError::InvalidArgument);
-                }
-                pass_active = true;
-            }
-            NativeFrameAction::Compute(dispatch) => {
-                if pass_active || dispatch.groups.contains(&0) {
-                    return Err(HalError::InvalidArgument);
-                }
-            }
-            NativeFrameAction::Graphics(draw) => {
-                let indirect_size = u64::from(draw.draw_count)
-                    .checked_mul(20)
-                    .and_then(|size| size.checked_add(COUNTER_BUFFER_ELEMENT_OFFSET))
-                    .ok_or(HalError::InvalidArgument)?;
-                if !pass_active
-                    || draw.width == 0
-                    || draw.height == 0
-                    || draw.width > extent.0
-                    || draw.height > extent.1
-                    || draw.draw_count == 0
-                    || draw.indirect_buffer.allocation.size() < indirect_size
-                {
-                    return Err(HalError::InvalidArgument);
-                }
-            }
-            NativeFrameAction::TextureReadback { width, height, .. } => {
-                if pass_active || *width == 0 || *height == 0 {
-                    return Err(HalError::InvalidArgument);
-                }
-            }
-            NativeFrameAction::EndPass => {
-                if !pass_active {
-                    return Err(HalError::InvalidArgument);
-                }
-                pass_active = false;
-            }
-            NativeFrameAction::Present => {
-                if pass_active {
-                    return Err(HalError::InvalidArgument);
-                }
-                saw_present = true;
-            }
-        }
-    }
-    if pass_active {
-        return Err(HalError::InvalidArgument);
-    }
-    Ok(FramePlan {
-        uses_surface,
-        presents,
-        external_wait,
-    })
-}
-
 impl NativeContext {
     /// Validates, records, submits, and optionally presents one complete frame plan.
     ///
-    /// # Panics
-    ///
-    /// Panics if an acquired swapchain image has no corresponding view or an action has no corresponding descriptor-set entry.
-    ///
     /// # Errors
     ///
-    /// Returns an error for an invalid frame plan, unavailable required context resources, readback or descriptor setup failures, or failed Vulkan frame operations.
+    /// Returns an error for an invalid frame plan, unavailable resources, allocation
+    /// failures, or failed Vulkan operations.
     pub fn execute_frame(
         &mut self,
         surface: Option<FrameSurface<'_>>,
         actions: &[NativeFrameAction<'_>],
+        capture_presented: bool,
+    ) -> Result<Vec<Vec<u8>>, HalError> {
+        self.execute_frame_source(surface, &actions, capture_presented)
+    }
+
+    /// Records a synchronous action source without retaining borrowed views.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::execute_frame`].
+    pub fn execute_frame_source(
+        &mut self,
+        surface: Option<FrameSurface<'_>>,
+        actions: &impl super::NativeFrameActionSource,
         capture_presented: bool,
     ) -> Result<Vec<Vec<u8>>, HalError> {
         if actions.is_empty() {
@@ -1006,26 +984,22 @@ impl NativeContext {
                 presentation_mode,
             )?;
         }
-        if actions.iter().any(|action| {
-            matches!(
+        let mut requires_depth = false;
+        actions.visit(&mut |_, action| {
+            requires_depth |= matches!(
                 action,
                 NativeFrameAction::BeginPass { pass, .. } if pass.depth.is_some()
-            )
-        }) {
+            );
+            Ok(())
+        })?;
+        if requires_depth {
             self.ensure_depth_target(self.swapchain_extent)?;
         }
         let prepared = self.prepare_frame_slot(uses_surface)?;
         let frame_value = self.next_frame_value;
         self.next_frame_value = frame_value.checked_add(1).ok_or(HalError::NativeFailure)?;
-
-        let (readbacks, public_sets) = self.allocate_frame_bindings(
-            actions,
-            prepared.descriptor_pool,
-            extent,
-            capture_presented,
-        )?;
-
-        // SAFETY: `prepare_frame_slot` reset `prepared.command_handle` on `prepared.device` after any prior submission completed, and the `CommandBufferBeginInfo` temporary lasts through `begin_command_buffer`.
+        let (readbacks, public_sets) =
+            self.allocate_frame_bindings(prepared.slot_index, actions, extent, capture_presented)?;
         if let Err(error) = unsafe {
             prepared.device.begin_command_buffer(
                 prepared.command_handle,
@@ -1036,6 +1010,7 @@ impl NativeContext {
             for (_, _, _, _, allocation) in readbacks {
                 let _ = self.free(allocation);
             }
+            self.restore_public_sets(prepared.slot_index, public_sets);
             return Err(map_vk(error));
         }
         let plan = FramePlan {
@@ -1054,7 +1029,6 @@ impl NativeContext {
                 capture_presented,
             },
         );
-
         if submitted {
             let slot = self
                 .frame_slots
@@ -1065,7 +1039,7 @@ impl NativeContext {
             self.last_frame_value = frame_value;
         }
         if submitted && (recorded.is_err() || !readbacks.is_empty()) {
-            // SAFETY: when `submitted` is true, `prepared.fence` was passed to `prepared.device.queue_submit`, and the one-element fence slice lasts through `wait_for_fences`.
+            // SAFETY: submitted work owns this fence until it signals.
             unsafe {
                 prepared
                     .device
@@ -1088,6 +1062,7 @@ impl NativeContext {
             for (_, _, _, _, allocation) in readbacks {
                 let _ = self.free(allocation);
             }
+            self.restore_public_sets(prepared.slot_index, public_sets);
             return Err(error);
         }
         if let Some(image_index) = acquired_image_index {
@@ -1096,6 +1071,146 @@ impl NativeContext {
                 .get_mut(image_index as usize)
                 .ok_or(HalError::NativeFailure)? = true;
         }
+        self.restore_public_sets(prepared.slot_index, public_sets);
         self.collect_frame_readbacks(readbacks, capture_presented, surface)
+    }
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use super::{HalError, NativeFrameAction, validate_frame_plan};
+    use ez_gfx_hal::{CompletionToken, QueueKind};
+
+    #[test]
+    fn frame_waits_collapse_to_one_maximum_per_transfer_queue() {
+        let actions = [
+            NativeFrameAction::Wait(CompletionToken {
+                queue: QueueKind::Transfer,
+                value: 1,
+            }),
+            NativeFrameAction::Wait(CompletionToken {
+                queue: QueueKind::TextureTransfer,
+                value: 2,
+            }),
+            NativeFrameAction::Wait(CompletionToken {
+                queue: QueueKind::Transfer,
+                value: 3,
+            }),
+        ];
+        let plan = validate_frame_plan(&actions, (1, 1), false, false).unwrap();
+
+        assert_eq!(plan.external_wait.len(), 2);
+        assert!(
+            plan.external_wait
+                .iter()
+                .any(|token| { token.queue == QueueKind::Transfer && token.value == 3 })
+        );
+        assert!(
+            plan.external_wait
+                .iter()
+                .any(|token| { token.queue == QueueKind::TextureTransfer && token.value == 2 })
+        );
+        assert!(matches!(
+            validate_frame_plan(
+                &[NativeFrameAction::Wait(CompletionToken {
+                    queue: QueueKind::Graphics,
+                    value: 1,
+                })],
+                (1, 1),
+                false,
+                false,
+            ),
+            Err(HalError::InvalidArgument)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod public_set_tests {
+    use super::public_set;
+    use ash::vk::{self, Handle};
+
+    #[test]
+    fn compact_sets_resolve_only_pipeline_actions() {
+        let first = vk::DescriptorSet::null();
+        let second = vk::DescriptorSet::from_raw(7);
+        let sets = [(1_u32, first), (4_u32, second)];
+        assert_eq!(public_set(&sets, 1), Some(&first));
+        assert_eq!(public_set(&sets, 4), Some(&second));
+        // Barrier, pass, and readback actions hold no entry.
+        assert_eq!(public_set(&sets, 0), None);
+        assert_eq!(public_set(&sets, 2), None);
+        assert_eq!(public_set(&sets, 9), None);
+        assert_eq!(public_set(&[], 1), None);
+    }
+}
+
+#[cfg(test)]
+mod descriptor_count_tests {
+    use super::{NativeContext, vk};
+
+    fn headless() -> NativeContext {
+        // No surface is created, shown, or activated by this test.
+        let mut context = NativeContext::create(false, false).unwrap();
+        context.init_device(None).unwrap();
+        context
+    }
+
+    fn storage_layout(device: &ash::Device, count: u32) -> vk::DescriptorSetLayout {
+        let binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(count)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE);
+        // SAFETY: the binding storage spans the create call on this live device.
+        unsafe {
+            device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default()
+                        .bindings(core::slice::from_ref(&binding)),
+                    None,
+                )
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn ensure_path_covers_real_allocated_set_counts() {
+        let mut context = headless();
+        // Preflight need: two pipeline actions holding three plus five descriptors.
+        let pool = context.ensure_descriptor_capacity(0, 2, 8).unwrap();
+        assert_eq!(context.frame_slots[0].descriptor_sets_capacity, 2);
+        assert_eq!(context.frame_slots[0].descriptor_count_capacity, 8);
+        let device = context.device.as_ref().unwrap().clone();
+        let first = storage_layout(&device, 3);
+        let second = storage_layout(&device, 5);
+        // SAFETY: both layouts are live, their counts fit the pool, and nothing
+        // else allocates from this pool during the test.
+        let sets = unsafe {
+            device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(pool)
+                        .set_layouts(&[first, second]),
+                )
+                .unwrap()
+        };
+        // The real path backs exactly the preflighted counts: two sets, eight
+        // descriptors across layouts that sum to the pool capacity.
+        assert_eq!(sets.len(), 2);
+        // The same need reuses the pool instead of recreating it.
+        let reused = context.ensure_descriptor_capacity(0, 2, 8).unwrap();
+        assert_eq!(reused, pool);
+        // Growth doubles sets toward the need while descriptors already cover.
+        context.ensure_descriptor_capacity(0, 3, 8).unwrap();
+        assert_eq!(context.frame_slots[0].descriptor_sets_capacity, 4);
+        assert_eq!(context.frame_slots[0].descriptor_count_capacity, 8);
+        // SAFETY: the sets came from pools owned by this device and both
+        // layouts are still live; the context drop destroys the pools.
+        unsafe {
+            device.free_descriptor_sets(pool, &sets).unwrap();
+            device.destroy_descriptor_set_layout(first, None);
+            device.destroy_descriptor_set_layout(second, None);
+        }
     }
 }

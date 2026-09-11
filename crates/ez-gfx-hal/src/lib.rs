@@ -3,168 +3,14 @@
 
 use core::fmt;
 use ez_gfx_core::capability::{AdapterInfo, MAX_BINDLESS_SAMPLED_TEXTURES};
-
-const ALLOCATION_BLOCK_ALIGNMENT: u64 = 4 * 1024 * 1024;
-/// Portable byte offset of the element array in a counter buffer.
-///
-/// The count occupies the first four bytes; the gap keeps the element descriptor
-/// aligned for every supported storage-buffer backend.
-pub const COUNTER_BUFFER_ELEMENT_OFFSET: u64 = 256;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Initial and maximum allocator block sizes for device-local and host-visible memory.
-pub struct AllocationBlockPolicy {
-    /// Initial device-local block size in bytes.
-    pub initial_device: u64,
-    /// Maximum device-local block size in bytes.
-    pub maximum_device: u64,
-    /// Initial host-visible block size in bytes.
-    pub initial_host: u64,
-    /// Maximum host-visible block size in bytes.
-    pub maximum_host: u64,
-}
-
-impl AllocationBlockPolicy {
-    /// Creates a block policy after validating sizes and alignment.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a size is zero, not 4 MiB aligned, or exceeds its maximum.
-    pub const fn new(
-        initial_device: u64,
-        maximum_device: u64,
-        initial_host: u64,
-        maximum_host: u64,
-    ) -> Result<Self, AllocationBlockPolicyError> {
-        // gpu-allocator accepts only 4 MiB block increments; reject instead of allowing it to clamp.
-        if initial_device == 0 || maximum_device == 0 || initial_host == 0 || maximum_host == 0 {
-            return Err(AllocationBlockPolicyError::ZeroSize);
-        }
-        if !initial_device.is_multiple_of(ALLOCATION_BLOCK_ALIGNMENT)
-            || !maximum_device.is_multiple_of(ALLOCATION_BLOCK_ALIGNMENT)
-            || !initial_host.is_multiple_of(ALLOCATION_BLOCK_ALIGNMENT)
-            || !maximum_host.is_multiple_of(ALLOCATION_BLOCK_ALIGNMENT)
-        {
-            return Err(AllocationBlockPolicyError::InvalidAlignment);
-        }
-        if initial_device > maximum_device || initial_host > maximum_host {
-            return Err(AllocationBlockPolicyError::InvalidRange);
-        }
-        Ok(Self {
-            initial_device,
-            maximum_device,
-            initial_host,
-            maximum_host,
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Reasons an allocation block policy is invalid.
-pub enum AllocationBlockPolicyError {
-    /// A configured block size is zero.
-    ZeroSize,
-    /// A configured block size is not 4 MiB aligned.
-    InvalidAlignment,
-    /// An initial size exceeds its maximum.
-    InvalidRange,
-}
-
-/// Default allocation block sizing policy.
-pub const DEFAULT_ALLOCATION_BLOCK_POLICY: AllocationBlockPolicy = AllocationBlockPolicy {
-    initial_device: 16 * 1024 * 1024,
-    maximum_device: 256 * 1024 * 1024,
-    initial_host: 8 * 1024 * 1024,
-    maximum_host: 64 * 1024 * 1024,
-};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Shared limits for reusable staging and adaptive transfer batches.
-pub struct StagingPolicy {
-    /// Smallest power-of-two staging bucket.
-    pub minimum_bucket_bytes: u64,
-    /// Largest accepted staging allocation.
-    pub maximum_bucket_bytes: u64,
-    /// Byte threshold that flushes a transfer batch.
-    pub batch_bytes: u64,
-    /// Copy-count threshold that flushes a transfer batch.
-    pub batch_copies: usize,
-}
-
-impl StagingPolicy {
-    /// Creates a staging policy with power-of-two buckets and nonzero batch limits.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StagingPolicyError::InvalidPolicy`] for zero, non-power-of-two, or inverted limits.
-    pub const fn new(
-        minimum_bucket_bytes: u64,
-        maximum_bucket_bytes: u64,
-        batch_bytes: u64,
-        batch_copies: usize,
-    ) -> Result<Self, StagingPolicyError> {
-        if minimum_bucket_bytes == 0
-            || maximum_bucket_bytes == 0
-            || batch_bytes == 0
-            || batch_copies == 0
-            || !minimum_bucket_bytes.is_power_of_two()
-            || !maximum_bucket_bytes.is_power_of_two()
-            || minimum_bucket_bytes > maximum_bucket_bytes
-        {
-            return Err(StagingPolicyError::InvalidPolicy);
-        }
-        Ok(Self {
-            minimum_bucket_bytes,
-            maximum_bucket_bytes,
-            batch_bytes,
-            batch_copies,
-        })
-    }
-
-    /// Reports whether an accumulated batch reached either configured limit.
-    pub const fn should_flush(self, copies: usize, bytes: u64) -> bool {
-        copies >= self.batch_copies || bytes >= self.batch_bytes
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Invalid staging-policy or staging-size request.
-pub enum StagingPolicyError {
-    /// Policy limits are zero, inverted, or not powers of two.
-    InvalidPolicy,
-    /// A staging request is zero or exceeds the configured maximum.
-    InvalidSize,
-}
-
-/// Returns the smallest configured power-of-two bucket containing `bytes`.
-///
-/// # Errors
-///
-/// Returns [`StagingPolicyError::InvalidSize`] when `bytes` is zero, exceeds the maximum, or cannot round up.
-pub const fn staging_bucket_size(
-    bytes: u64,
-    policy: StagingPolicy,
-) -> Result<u64, StagingPolicyError> {
-    if bytes == 0 || bytes > policy.maximum_bucket_bytes {
-        return Err(StagingPolicyError::InvalidSize);
-    }
-    let requested = if bytes < policy.minimum_bucket_bytes {
-        policy.minimum_bucket_bytes
-    } else {
-        bytes
-    };
-    match requested.checked_next_power_of_two() {
-        Some(bucket) if bucket <= policy.maximum_bucket_bytes => Ok(bucket),
-        _ => Err(StagingPolicyError::InvalidSize),
-    }
-}
-
-/// Default staging and transfer batching limits.
-pub const DEFAULT_STAGING_POLICY: StagingPolicy = StagingPolicy {
-    minimum_bucket_bytes: 64 * 1024,
-    maximum_bucket_bytes: 64 * 1024 * 1024,
-    batch_bytes: 32 * 1024 * 1024,
-    batch_copies: 64,
+mod telemetry;
+pub use telemetry::{
+    AllocationBlockPolicy, AllocationBlockPolicyError, AllocatorTelemetry, BackendMemoryTelemetry,
+    COUNTER_BUFFER_ELEMENT_OFFSET, DEFAULT_ALLOCATION_BLOCK_POLICY,
+    DEFAULT_BUFFER_STAGING_BUDGET, DEFAULT_COUNTER_STAGING_BUDGET,
+    DEFAULT_SHARED_STAGING_BUDGET, DEFAULT_STAGING_AGGREGATE_BUDGET,
+    DEFAULT_STAGING_POLICY, StagingPolicy, StagingPolicyError, rgba8_image_bytes,
+    staging_bucket_size,
 };
 
 mod transfer;
@@ -1184,4 +1030,33 @@ pub trait FrameExecutionBackend<P> {
     ///
     /// Returns the backend-defined execution error when the preflighted plan cannot be recorded or completed.
     fn execute(&mut self, plan: &FrameExecutionPlan, payloads: &[P]) -> Result<(), Self::Error>;
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::{AllocatorTelemetry, rgba8_image_bytes};
+
+    #[test]
+    fn waste_is_capacity_minus_live_without_wrapping() {
+        let telemetry = AllocatorTelemetry {
+            live_bytes: 100,
+            block_bytes: 256,
+            block_count: 2,
+            allocation_count: 3,
+        };
+        assert_eq!(telemetry.waste_bytes(), 156);
+        // A corrupt snapshot with live above capacity saturates instead of wrapping.
+        let inverted = AllocatorTelemetry {
+            live_bytes: 300,
+            ..telemetry
+        };
+        assert_eq!(inverted.waste_bytes(), 0);
+    }
+
+    #[test]
+    fn image_estimates_scale_and_saturate() {
+        assert_eq!(rgba8_image_bytes(3, 1920, 1080), 3 * 1920 * 1080 * 4);
+        assert_eq!(rgba8_image_bytes(0, 1920, 1080), 0);
+        assert_eq!(rgba8_image_bytes(u32::MAX, u32::MAX, u32::MAX), u64::MAX);
+    }
 }

@@ -1,30 +1,103 @@
 use crate::Result;
 
-#[cfg(windows)]
-use super::dx12_bindings;
-#[cfg(target_vendor = "apple")]
-use super::metal_bindings;
 use super::{
     Access, Backend, BufferRange, ContextHandle, ContextState, CounterBufferHandle,
     DiagnosticLevel, DynamicPipelineState, Error, ExecutableNode, ExecutionAction,
-    ExecutionBarrier, ExecutionError, ExecutionPass, Format, FrameExecutionBackend,
-    FrameExecutionPlan, FrameNativeResource, GeometryAllocation, HashMap, ImageRange, LoadOp,
-    MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext, NativePipeline, NativeShader,
+    ExecutionBarrier, ExecutionPass, Format, FrameBindingSource, FrameBufferBindingRecord,
+    FrameExecutionBackend, FrameExecutionPlan, FrameNativeResource, GeometryAllocation, HashMap,
+    ImageRange, LoadOp, MAX_PIPELINE_CACHE_ENTRIES, NativeAllocation, NativeContext,
+    NativePipeline, NativeShader,
     NativeSurface, NativeTexture, NodeDesc, PackedHandle, PassInfo, PipelineKey, QueueKind,
     RenderTargetHandle, RenderTargetRecord, ResourceAccess, ResourceDesc, ResourceId, ResourceKind,
     ResourceLifetime, ResourceState, RuntimePhase, SURFACE_DEFAULT_CLEAR, ShaderHandle,
     ShaderRecord, ShaderStage, StoreOp, SurfaceHandle, TextureFormat, TextureHandle, TextureId,
-    execute_compiled_graph, last_native_frame_completion, map_frame, map_hal, map_lifecycle,
-    native_layouts, pipeline_layout_key, result_status, runtime_record, vulkan_bindings,
-    wait_native_idle, with_context_mut,
+    last_native_frame_completion, map_frame, map_hal, map_lifecycle, native_layouts,
+    pipeline_layout_key, prepare_frame_binding_scratch, result_status, runtime_record,
+    wait_native_idle,
+    with_context_mut,
 };
 
 mod binding;
+#[cfg(test)]
+pub(in crate::state) use binding::BindingProjection;
+mod transients;
+use transients::{invalidate_unsafe_transients, recycle_consumed_transients};
 
 #[cfg(test)]
 mod transient_tests;
 type NativeTextureMap = HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>;
 
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each independently retained lowering vector is accounted and discarded together"
+)]
+fn account_frame_lowering_scratch(
+    frame: &mut ez_gfx_runtime::frame::FrameRecorder,
+    pipeline_keys: &mut Vec<Option<PipelineKey>>,
+    action_indices: &mut Vec<usize>,
+    bindings: &mut Vec<FrameBufferBindingRecord>,
+    ranges: &mut Vec<core::ops::Range<usize>>,
+    #[cfg(target_vendor = "apple")]
+    texture_heaps: &mut Vec<Option<ez_gfx_hal::ShaderTextureHeapLayout>>,
+    #[cfg(target_vendor = "apple")] workgroup_sizes: &mut Vec<Option<[u32; 3]>>,
+) -> Result<()> {
+    let bytes = pipeline_keys
+        .capacity()
+        .saturating_mul(core::mem::size_of::<Option<PipelineKey>>())
+        .saturating_add(
+            pipeline_keys.iter().flatten().fold(0_usize, |total, key| {
+                total.saturating_add(key.retained_bytes())
+            }),
+        )
+        .saturating_add(
+            action_indices
+                .capacity()
+                .saturating_mul(core::mem::size_of::<usize>()),
+        )
+        .saturating_add(
+            bindings
+                .capacity()
+                .saturating_mul(core::mem::size_of::<FrameBufferBindingRecord>()),
+        )
+        .saturating_add(
+            ranges
+                .capacity()
+                .saturating_mul(core::mem::size_of::<core::ops::Range<usize>>()),
+        );
+    #[cfg(target_vendor = "apple")]
+    let bytes = bytes
+        .saturating_add(
+            texture_heaps
+                .capacity()
+                .saturating_mul(core::mem::size_of::<
+                    Option<ez_gfx_hal::ShaderTextureHeapLayout>,
+                >()),
+        )
+        .saturating_add(
+            workgroup_sizes
+                .capacity()
+                .saturating_mul(core::mem::size_of::<Option<[u32; 3]>>()),
+        );
+    if let Err(error) = frame.set_lowering_scratch_bytes(bytes) {
+        // Drop the complete lowering workspace together: retaining only some
+        // vectors would make accounting dependent on the rejected frame.
+        *pipeline_keys = Vec::new();
+        *action_indices = Vec::new();
+        *bindings = Vec::new();
+        *ranges = Vec::new();
+        #[cfg(target_vendor = "apple")]
+        {
+            *texture_heaps = Vec::new();
+            *workgroup_sizes = Vec::new();
+        }
+        frame
+            .set_lowering_scratch_bytes(0)
+            .map_err(|reset| map_frame(&reset))?;
+        return Err(map_frame(&error));
+    }
+    Ok(())
+}
 /// Begins frame recording.
 ///
 /// # Errors
@@ -311,7 +384,7 @@ fn add_binding_accesses(
     context: &mut ContextState,
     mut node: NodeDesc,
     layout: &ez_gfx_runtime::binding::ReflectedBindings,
-    bindings: &[ez_gfx_runtime::binding::PublicBinding],
+    bindings: binding::BindingProjection<'_>,
     queue: QueueKind,
     stage: ShaderStage,
     combined_indirect: Option<CounterBufferHandle>,
@@ -570,7 +643,7 @@ pub fn frame_enqueue_render_target_readback(
 fn graphics_node(
     context: &mut ContextState,
     layout: &ez_gfx_runtime::binding::ReflectedBindings,
-    bindings: &[ez_gfx_runtime::binding::PublicBinding],
+    bindings: binding::BindingProjection<'_>,
     indirect: CounterBufferHandle,
     pipeline_layout: ez_gfx_runtime::binding::PipelineLayout,
 ) -> Result<NodeDesc> {
@@ -616,14 +689,18 @@ fn graphics_node(
     } else {
         LoadOp::Clear
     };
-    let pass = PassInfo::new(
-        vec![color],
-        depth,
-        [0, 0, width, height],
-        samples,
-        load,
-        StoreOp::Store,
-    )
+    let pass = if let Some(depth) = depth {
+        PassInfo::new(
+            vec![color],
+            Some(depth),
+            [0, 0, width, height],
+            samples,
+            load,
+            StoreOp::Store,
+        )
+    } else {
+        PassInfo::single_color(color, [0, 0, width, height], samples, load, StoreOp::Store)
+    }
     .map_err(|_| Error::InvalidArgument)?;
     let color_state = ResourceState::new(
         QueueKind::Graphics,
@@ -777,10 +854,10 @@ pub fn execute_graphics(
                     .and_then(|fragment_layout| vertex_layout.merge(&fragment_layout))
             })
             .map_err(|_| Error::InvalidArgument)?;
-        let bindings = binding::select_bindings(&layout, bindings);
-        validate_binding_handles(context, &bindings)?;
-        layout
-            .validate(&bindings)
+        let bindings = binding::BindingProjection::new(&layout, bindings);
+        validate_binding_handles(context, bindings)?;
+        bindings
+            .validate()
             .map_err(|_| Error::InvalidArgument)?;
         let draw_capacity = context
             .indirects
@@ -797,26 +874,26 @@ pub fn execute_graphics(
                     .and_then(|fragment_layout| vertex_layout.merge(&fragment_layout))
             })
             .map_err(|_| Error::InvalidArgument)?;
-        let node = graphics_node(context, &layout, &bindings, counter, pipeline_layout)?;
+        let node = graphics_node(context, &layout, bindings, counter, pipeline_layout)?;
+        let payload_layout = layout.clone();
         context
             .frame
-            .record_node(
-                node,
+            .record_bound_node(node, bindings.resources(), move |bindings| {
                 ExecutableNode::Graphics {
                     vertex_shader,
                     fragment_shader,
                     counter,
                     draw_capacity,
-                    bindings: bindings.clone(),
-                    layout,
+                    bindings,
+                    layout: payload_layout,
                     pipeline_layout,
                     state,
-                },
-            )
+                }
+            })
             .map_err(|error| map_frame(&error))?;
         context.frame_shaders.insert(vertex_shader);
         context.frame_shaders.insert(fragment_shader);
-        mark_transient_bindings_interned(context, &bindings)?;
+        mark_transient_bindings_interned(context, bindings)?;
         mark_transient_interned(context, counter_handle)?;
         context.frame_has_graphics = true;
         Ok(())
@@ -851,44 +928,44 @@ pub fn execute_compute(
             .runtime
             .bindings(ez_gfx_artifact::Stage::Compute)
             .map_err(|_| Error::InvalidArgument)?;
-        let bindings = binding::select_bindings(&layout, bindings);
-        validate_binding_handles(context, &bindings)?;
-        layout
-            .validate(&bindings)
+        let bindings = binding::BindingProjection::new(&layout, bindings);
+        validate_binding_handles(context, bindings)?;
+        bindings
+            .validate()
             .map_err(|_| Error::InvalidArgument)?;
         let node = add_binding_accesses(
             context,
             NodeDesc::new("compute", QueueKind::Compute),
             &layout,
-            &bindings,
+            bindings,
             QueueKind::Compute,
             ShaderStage::Compute,
             None,
         )?;
         let node = add_texture_accesses(context, node, QueueKind::Compute, ShaderStage::Compute)?;
+        let payload_layout = layout.clone();
         context
             .frame
-            .record_node(
-                node,
+            .record_bound_node(node, bindings.resources(), move |bindings| {
                 ExecutableNode::Compute {
                     shader,
                     groups,
-                    bindings: bindings.clone(),
-                    layout,
-                },
-            )
+                    bindings,
+                    layout: payload_layout,
+                }
+            })
             .map_err(|error| map_frame(&error))?;
         context.frame_shaders.insert(shader);
-        mark_transient_bindings_interned(context, &bindings)?;
+        mark_transient_bindings_interned(context, bindings)?;
         Ok(())
     }))
 }
 
 fn validate_binding_handles(
     context: &ContextState,
-    bindings: &[ez_gfx_runtime::binding::PublicBinding],
+    bindings: binding::BindingProjection<'_>,
 ) -> Result<()> {
-    for binding in bindings {
+    for binding in bindings.iter() {
         let (packed, kind) = match binding.resource {
             ez_gfx_runtime::binding::ResourceIdentity::Buffer(handle) => {
                 (handle.packed(), ResourceKind::Buffer)
@@ -924,9 +1001,9 @@ fn validate_binding_handles(
 
 fn mark_transient_bindings_interned(
     context: &mut ContextState,
-    bindings: &[ez_gfx_runtime::binding::PublicBinding],
+    bindings: binding::BindingProjection<'_>,
 ) -> Result<()> {
-    for binding in bindings {
+    for binding in bindings.iter() {
         let handle = match binding.resource {
             ez_gfx_runtime::binding::ResourceIdentity::Buffer(handle) => handle.packed(),
             ez_gfx_runtime::binding::ResourceIdentity::Counter(handle) => handle.packed(),
@@ -997,24 +1074,30 @@ pub fn frame_submit(context: ContextHandle) -> Result<()> {
             }
             let submission = context.frame.submit().map_err(|error| map_frame(&error))?;
             native_started = true;
-            let mut adapter = NativeFrameAdapter { context };
-            execute_compiled_graph(&submission.graph, &submission.nodes, &mut adapter)
-                .map_err(|error| map_execution(&error))?;
-            let completion = last_native_frame_completion(&adapter.context.native)?;
-            adapter
-                .context
+            let execution = {
+                let mut adapter = NativeFrameAdapter {
+                    context,
+                    binding_resources: &submission.binding_resources,
+                };
+                adapter
+                    .execute(&submission.plan, &submission.nodes)
+                    .and_then(|()| last_native_frame_completion(&adapter.context.native))
+            };
+            // Even failed native encoding no longer strands the reusable CPU buffers.
+            context
                 .frame
-                .finish()
+                .finish(submission)
                 .map_err(|error| map_frame(&error))?;
+            let completion = execution?;
             super::geometry::finalize_recording_range_drops(
-                adapter.context,
+                context,
                 frame_serial,
                 Some(completion),
             )?;
-            recycle_consumed_transients(adapter.context, completion)?;
-            super::buffers::reclaim_available_transients(adapter.context)?;
-            let record = runtime_record(adapter.context, 0, RuntimePhase::Submit, Ok(()));
-            adapter.context.observability.push_event(record);
+            recycle_consumed_transients(context, completion)?;
+            super::buffers::reclaim_available_transients(context)?;
+            let record = runtime_record(context, 0, RuntimePhase::Submit, Ok(()));
+            context.observability.push_event(record);
             Ok(())
         })();
         if let Err(status) = result {
@@ -1093,17 +1176,9 @@ pub fn frame_readbacks(context: ContextHandle) -> Result<Vec<Vec<u8>>> {
     })
 }
 
-fn map_execution(error: &ExecutionError<Error>) -> Error {
-    match error {
-        ExecutionError::Backend(error) => *error,
-        ExecutionError::MissingPayload { .. }
-        | ExecutionError::UnexpectedPayloads
-        | ExecutionError::InvalidCompiledRange => Error::InvalidArgument,
-    }
-}
-
 struct NativeFrameAdapter<'a> {
     context: &'a mut ContextState,
+    binding_resources: &'a [ez_gfx_runtime::binding::ResourceIdentity],
 }
 
 impl FrameExecutionBackend<ExecutableNode> for NativeFrameAdapter<'_> {
@@ -1115,15 +1190,30 @@ impl FrameExecutionBackend<ExecutableNode> for NativeFrameAdapter<'_> {
         payloads: &[ExecutableNode],
     ) -> std::result::Result<(), Self::Error> {
         if matches!(self.context.native, NativeContext::Vulkan(_)) {
-            return execute_vulkan_frame_plan(self.context, plan, payloads);
+            return execute_vulkan_frame_plan(
+                self.context,
+                plan,
+                payloads,
+                self.binding_resources,
+            );
         }
         #[cfg(windows)]
         if matches!(self.context.native, NativeContext::Dx12(_)) {
-            return execute_dx12_frame_plan(self.context, plan, payloads);
+            return execute_dx12_frame_plan(
+                self.context,
+                plan,
+                payloads,
+                self.binding_resources,
+            );
         }
         #[cfg(target_vendor = "apple")]
         if matches!(self.context.native, NativeContext::Metal(_)) {
-            return execute_metal_frame_plan(self.context, plan, payloads);
+            return execute_metal_frame_plan(
+                self.context,
+                plan,
+                payloads,
+                self.binding_resources,
+            );
         }
         Err(Error::NativeFailure)
     }

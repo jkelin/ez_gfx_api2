@@ -6,6 +6,7 @@ use ez_gfx_hal::TransferWorker;
 use std::ffi::{CStr, CString};
 
 use ash::{Entry, Instance, khr, vk};
+use arrayvec::ArrayVec;
 
 use ez_gfx_core::{
     Backend,
@@ -144,6 +145,60 @@ pub struct NativeBufferBinding<'a> {
     pub writable: bool,
 }
 
+/// Synchronous provider for resolved buffer bindings.
+pub trait NativeBufferBindingSource {
+    /// Number of bindings supplied to the pipeline.
+    fn len(&self) -> usize;
+
+    /// Visits each binding; borrowed allocation views cannot escape the call.
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(usize, &NativeBufferBinding<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError>;
+}
+
+impl NativeBufferBindingSource for [NativeBufferBinding<'_>] {
+    fn len(&self) -> usize {
+        <[NativeBufferBinding<'_>]>::len(self)
+    }
+
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(usize, &NativeBufferBinding<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError> {
+        for (index, binding) in self.iter().enumerate() {
+            visitor(index, binding)?;
+        }
+        Ok(())
+    }
+}
+
+
+impl NativeBufferBindingSource for &[NativeBufferBinding<'_>] {
+    fn len(&self) -> usize {
+        <[NativeBufferBinding<'_>]>::len(self)
+    }
+
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(usize, &NativeBufferBinding<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError> {
+        <[NativeBufferBinding<'_>] as NativeBufferBindingSource>::visit(self, visitor)
+    }
+}
+impl<const N: usize> NativeBufferBindingSource for [NativeBufferBinding<'_>; N] {
+    fn len(&self) -> usize {
+        N
+    }
+
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(usize, &NativeBufferBinding<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError> {
+        self.as_slice().visit(visitor)
+    }
+}
+
 /// Immutable inputs used to create a graphics pipeline.
 pub struct NativeGraphicsPipelineDesc<'a> {
     /// Index of the vertex module in the owning shader.
@@ -173,7 +228,7 @@ pub struct NativeDrawIndexed<'a> {
     /// Number of indirect commands to execute.
     pub draw_count: u32,
     /// Reflected public buffer bindings.
-    pub bindings: &'a [NativeBufferBinding<'a>],
+    pub bindings: &'a dyn NativeBufferBindingSource,
 }
 
 /// Fully resolved compute dispatch consumed by frame recording.
@@ -183,7 +238,7 @@ pub struct NativeComputeDispatch<'a> {
     /// Workgroup count for each dispatch dimension.
     pub groups: [u32; 3],
     /// Reflected public buffer bindings.
-    pub bindings: &'a [NativeBufferBinding<'a>],
+    pub bindings: &'a dyn NativeBufferBindingSource,
 }
 
 /// Backend resource referenced by a compiled frame barrier.
@@ -226,7 +281,7 @@ pub enum NativeFrameAction<'a> {
         /// Backend-neutral pass description.
         pass: &'a ExecutionPass,
         /// One attachment per pass color, in order.
-        colors: Vec<PassAttachment<'a>>,
+        colors: ArrayVec<PassAttachment<'a>, 1>,
     },
     /// Encode a compute dispatch.
     Compute(NativeComputeDispatch<'a>),
@@ -245,6 +300,71 @@ pub enum NativeFrameAction<'a> {
     EndPass,
     /// Present the current surface image.
     Present,
+}
+
+/// Synchronous provider for frame actions whose borrowed native views are
+/// valid only for each visitor call.
+pub trait NativeFrameActionSource {
+    /// Number of actions produced by one traversal.
+    fn len(&self) -> usize;
+
+    /// Rebuilds each borrowed view in stable action order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a record cannot resolve its current native owner,
+    /// or when the visitor rejects an action.
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(usize, &NativeFrameAction<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError>;
+
+    /// Returns whether the source has no actions.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl NativeFrameActionSource for [NativeFrameAction<'_>] {
+    fn len(&self) -> usize {
+        <[NativeFrameAction<'_>]>::len(self)
+    }
+
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(usize, &NativeFrameAction<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError> {
+        for (index, action) in self.iter().enumerate() {
+            visitor(index, action)?;
+        }
+        Ok(())
+    }
+}
+
+impl NativeFrameActionSource for &[NativeFrameAction<'_>] {
+    fn len(&self) -> usize {
+        <[NativeFrameAction<'_>]>::len(self)
+    }
+
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(usize, &NativeFrameAction<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError> {
+        <[NativeFrameAction<'_>] as NativeFrameActionSource>::visit(self, visitor)
+    }
+}
+
+impl<const N: usize> NativeFrameActionSource for [NativeFrameAction<'_>; N] {
+    fn len(&self) -> usize {
+        N
+    }
+
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(usize, &NativeFrameAction<'_>) -> Result<(), HalError>,
+    ) -> Result<(), HalError> {
+        self.as_slice().visit(visitor)
+    }
 }
 
 /// Validated Vulkan shader modules owned as one artifact.
@@ -332,7 +452,11 @@ struct DeferredNativeResource {
 }
 
 const FRAMES_IN_FLIGHT: usize = 3;
-const FRAME_DESCRIPTOR_SET_CAPACITY: u32 = 1024;
+/// Documented ceiling for demand-driven per-slot descriptor-set growth.
+/// Frames needing more than 4,096 sets fail before pool allocation.
+const MAX_FRAME_DESCRIPTOR_SETS: u32 = 4096;
+/// Documented ceiling for demand-driven storage-buffer descriptor growth.
+const MAX_FRAME_DESCRIPTORS: u32 = 16384;
 
 struct FrameSlot {
     command_pool: vk::CommandPool,
@@ -340,6 +464,22 @@ struct FrameSlot {
     image_available: vk::Semaphore,
     fence: vk::Fence,
     descriptor_pool: vk::DescriptorPool,
+    /// Current pool size in sets; grows demand-driven to the documented ceiling.
+    descriptor_sets_capacity: u32,
+    /// Current pool size in storage-buffer descriptors; grows with the sets.
+    descriptor_count_capacity: u32,
+    /// Peak sets allocated in one frame; proves the pool is not oversized.
+    descriptor_sets_high_water: u32,
+    /// Peak storage-buffer descriptors allocated in one frame.
+    descriptor_count_high_water: u32,
+    /// Retained public-set result shell; cleared per frame after the fence wait.
+    public_sets_scratch: Vec<(u32, vk::DescriptorSet)>,
+    /// Retained descriptor-info construction shell; cleared per pipeline action.
+    descriptor_info_scratch: Vec<vk::DescriptorBufferInfo>,
+    /// Retained descriptor-write construction shell; cleared and rebuilt per
+    /// pipeline action. Entries point into the info shell's current buffer and
+    /// are only read by the update call that immediately follows each rebuild.
+    descriptor_write_scratch: Vec<vk::WriteDescriptorSet<'static>>,
     in_flight: bool,
     submission_value: u64,
 }
@@ -484,6 +624,9 @@ pub struct NativeContext {
     swapchain_loader: Option<khr::swapchain::Device>,
     presentation_support: PresentationSupport,
     swapchain: Option<vk::SwapchainKHR>,
+    /// Swapchain images in presentation order, cached at creation/recreation so
+    /// frames never re-enumerate them; images die with their swapchain.
+    swapchain_images: Vec<vk::Image>,
     swapchain_views: Vec<vk::ImageView>,
     swapchain_finished: Vec<vk::Semaphore>,
     swapchain_initialized: Vec<bool>,

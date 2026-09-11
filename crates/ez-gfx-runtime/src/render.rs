@@ -2,14 +2,52 @@ pub use ez_gfx_hal::{
     BlendMode, CullMode, DynamicPipelineState, FrontFace, PrimitiveTopology, RenderStateError,
 };
 
-use std::collections::{BTreeMap, BTreeSet};
-
 use ez_gfx_hal::{
     AttachmentLoadOp, AttachmentStoreOp, ExecutionAction, ExecutionBarrier, ExecutionPass,
     ExecutionRange, ExecutionWait, FrameExecutionBackend, FrameExecutionPlan, ImageSubresources,
 };
 
 use crate::graph::{CompiledGraph, LoadOp, ResourceRange, StoreOp};
+
+#[derive(Default)]
+pub(crate) struct RenderWorkspace {
+    pass_starts: Vec<Option<ExecutionPass>>,
+    pass_ends: Vec<bool>,
+    reusable_pass_vectors: Vec<(Vec<u32>, Vec<u32>)>,
+}
+
+impl RenderWorkspace {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let starts = self
+            .pass_starts
+            .capacity()
+            .saturating_mul(core::mem::size_of::<Option<ExecutionPass>>());
+        let ends = self
+            .pass_ends
+            .capacity()
+            .saturating_mul(core::mem::size_of::<bool>());
+        let reusable = self
+            .reusable_pass_vectors
+            .capacity()
+            .saturating_mul(core::mem::size_of::<(Vec<u32>, Vec<u32>)>())
+            .saturating_add(
+                self.reusable_pass_vectors
+                    .iter()
+                    .map(|(nodes, colors)| {
+                        nodes
+                            .capacity()
+                            .saturating_mul(core::mem::size_of::<u32>())
+                            .saturating_add(
+                                colors
+                                    .capacity()
+                                    .saturating_mul(core::mem::size_of::<u32>()),
+                            )
+                    })
+                    .sum::<usize>(),
+            );
+        starts.saturating_add(ends).saturating_add(reusable)
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Errors that can prevent a compiled render graph from becoming or executing a frame plan.
@@ -36,6 +74,20 @@ pub fn build_execution_plan(
     graph: &CompiledGraph,
     payload_count: usize,
 ) -> Result<FrameExecutionPlan, ExecutionError<core::convert::Infallible>> {
+    let mut plan = FrameExecutionPlan {
+        actions: Vec::new(),
+    };
+    let mut workspace = RenderWorkspace::default();
+    build_execution_plan_into(graph, payload_count, &mut plan, &mut workspace)?;
+    Ok(plan)
+}
+
+pub(crate) fn build_execution_plan_into(
+    graph: &CompiledGraph,
+    payload_count: usize,
+    plan: &mut FrameExecutionPlan,
+    workspace: &mut RenderWorkspace,
+) -> Result<(), ExecutionError<core::convert::Infallible>> {
     if let Some(node) = graph
         .order()
         .iter()
@@ -47,42 +99,48 @@ pub fn build_execution_plan(
         return Err(ExecutionError::UnexpectedPayloads);
     }
 
-    let mut pass_starts = BTreeMap::new();
-    let mut pass_ends = BTreeSet::new();
+    for action in plan.actions.drain(..) {
+        if let ExecutionAction::BeginPass(pass) = action {
+            workspace
+                .reusable_pass_vectors
+                .push((pass.nodes, pass.colors));
+        }
+    }
+    workspace.pass_starts.clear();
+    workspace.pass_starts.resize_with(payload_count, || None);
+    workspace.pass_ends.clear();
+    workspace.pass_ends.resize(payload_count, false);
+
     for pass in graph.passes() {
         let (Some(first), Some(last)) = (pass.nodes.first(), pass.nodes.last()) else {
             continue;
         };
-        pass_starts.insert(
-            first.index(),
-            ExecutionPass {
-                nodes: pass.nodes.iter().map(|node| node.index()).collect(),
-                colors: pass
-                    .info
-                    .colors()
-                    .iter()
-                    .map(|resource| resource.index())
-                    .collect(),
-                depth: pass.info.depth().map(super::graph::ResourceId::index),
-                area: pass.info.area(),
-                samples: pass.info.samples(),
-                load: match pass.info.load() {
-                    LoadOp::Load => AttachmentLoadOp::Load,
-                    LoadOp::Clear => AttachmentLoadOp::Clear,
-                    LoadOp::Discard => AttachmentLoadOp::Discard,
-                },
-                store: match pass.info.store() {
-                    StoreOp::Store => AttachmentStoreOp::Store,
-                    StoreOp::Discard => AttachmentStoreOp::Discard,
-                },
+        let (mut nodes, mut colors) = workspace.reusable_pass_vectors.pop().unwrap_or_default();
+        nodes.clear();
+        colors.clear();
+        nodes.extend(pass.nodes.iter().map(|node| node.index()));
+        colors.extend(pass.info.colors().iter().map(|resource| resource.index()));
+        workspace.pass_starts[first.index() as usize] = Some(ExecutionPass {
+            nodes,
+            colors,
+            depth: pass.info.depth().map(super::graph::ResourceId::index),
+            area: pass.info.area(),
+            samples: pass.info.samples(),
+            load: match pass.info.load() {
+                LoadOp::Load => AttachmentLoadOp::Load,
+                LoadOp::Clear => AttachmentLoadOp::Clear,
+                LoadOp::Discard => AttachmentLoadOp::Discard,
             },
-        );
-        pass_ends.insert(last.index());
+            store: match pass.info.store() {
+                StoreOp::Store => AttachmentStoreOp::Store,
+                StoreOp::Discard => AttachmentStoreOp::Discard,
+            },
+        });
+        workspace.pass_ends[last.index() as usize] = true;
     }
 
-    let mut actions = Vec::new();
     for node in graph.order() {
-        actions.extend(
+        plan.actions.extend(
             graph
                 .waits()
                 .iter()
@@ -112,23 +170,25 @@ pub fn build_execution_plan(
                     .map_err(|_| ExecutionError::InvalidCompiledRange)?,
                 ),
             };
-            actions.push(ExecutionAction::Barrier(ExecutionBarrier {
-                node: node.index(),
-                resource: transition.resource.index(),
-                range,
-                before: transition.before,
-                after: transition.after,
-            }));
+            plan.actions
+                .push(ExecutionAction::Barrier(ExecutionBarrier {
+                    node: node.index(),
+                    resource: transition.resource.index(),
+                    range,
+                    before: transition.before,
+                    after: transition.after,
+                }));
         }
-        if let Some(pass) = pass_starts.remove(&node.index()) {
-            actions.push(ExecutionAction::BeginPass(pass));
+        if let Some(pass) = workspace.pass_starts[node.index() as usize].take() {
+            plan.actions.push(ExecutionAction::BeginPass(pass));
         }
-        actions.push(ExecutionAction::ExecuteNode(node.index()));
-        if pass_ends.contains(&node.index()) {
-            actions.push(ExecutionAction::EndPass);
+        plan.actions
+            .push(ExecutionAction::ExecuteNode(node.index()));
+        if workspace.pass_ends[node.index() as usize] {
+            plan.actions.push(ExecutionAction::EndPass);
         }
     }
-    Ok(FrameExecutionPlan { actions })
+    Ok(())
 }
 
 /// Preflights the whole plan, then gives it to the backend as one atomic frame submission.

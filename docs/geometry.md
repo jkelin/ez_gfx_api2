@@ -73,6 +73,10 @@ Geometry staging grows subject to allocator and OS failure, not a fixed slot cou
 
 The typed slice upload interface derives and checks count, stride, multiplication, and byte length before one caller-slice to mapped-staging copy, followed by the GPU copy. Raw pointer/count conversion and the 16 MiB caller boundary remain in `ez-gfx-ffi`. The interface does not provide a direct mapped lease.
 
+## Upload retention bounds
+
+Staging buckets retire by queue-qualified completion token and are reused only when a completion from that same queue reaches the token value; a numerically larger counter from another queue cannot retire them. Finite retention ceilings are enforced by explicit trims: every upload path evicts idle plus over-budget completed buckets, `wait_idle` sweeps once transfer and graphics completions are fresh, and `Context::release_staging_memory` exposes the sweep for memory pressure while propagating either completion-query failure. Because one pool exists per stride, per-pool ceilings alone cannot bound the sum, so a 64 MiB context-wide aggregate ceiling evicts the largest matching-queue completed bucket across all pools until the total fits; in-flight buckets stay retained. Counter command serialization reuses one retained scratch buffer instead of allocating per write; capacity above 64 KiB is released after every write whether the upload succeeds or fails, so one pathological write cannot pin its peak for the context lifetime.
+
 ## One-frame buffers
 
 Applications acquire `Buffer<T>`, `CounterBuffer<T>`, and single-value `ValueBuffer<T>` (`acquire_value_buffer`) from `Context`, then populate them before a frame first uses them. `acquire_buffer_from` and `acquire_counter_buffer_from` size and initialize storage from `BufferSource::one(&value)`, a slice, or a borrowed `Vec<T>` without an intermediate collection; arrays use `.as_slice()` to make element intent explicit. The counter helper publishes the input length. Shaders use counters through `set_count`/`add_count`/`set`/`get` over a GPU-writable count plus elements.

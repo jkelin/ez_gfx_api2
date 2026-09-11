@@ -152,6 +152,7 @@ impl HostState {
 pub struct Example {
     identity: &'static str,
     backend_name: &'static str,
+    strict_all: bool,
     snapshot: Option<OsString>,
     update_snapshots: bool,
     report_stdout: bool,
@@ -196,6 +197,7 @@ impl Example {
         let mut example = Self {
             identity,
             backend_name: super::host::backend_name_for(options.backend),
+            strict_all: options.strict_all,
             snapshot: options.snapshot,
             update_snapshots: options.update_snapshots,
             report_stdout: options.report,
@@ -451,6 +453,46 @@ impl Example {
         Ok(())
     }
 
+    /// Submits one hidden allocation-probe frame without terminal readback or reporting.
+    ///
+    /// # Errors
+    /// Returns an error for a visible host, missing pending frame, mismatched extent, or failed submission.
+    pub fn handle_allocation_frame(
+        &mut self,
+        frame: Frame,
+        swapchain_target: ez_gfx::RenderTarget,
+    ) -> Result<()> {
+        if self.state.visible {
+            return Err(Error::message("allocation probe requires a hidden host"));
+        }
+        self.pending_frame_started
+            .take()
+            .ok_or_else(|| Error::message("frame timing began without a pending host frame"))?;
+        if swapchain_target.extent()? != (self.state.width, self.state.height) {
+            return Err(Error::message(
+                "swapchain target extent does not match host size",
+            ));
+        }
+        drop(swapchain_target);
+        frame.finish()?;
+        self.frames = self.frames.saturating_add(1);
+        Ok(())
+    }
+
+    /// Returns whether the native host was created hidden.
+    pub const fn is_hidden(&self) -> bool {
+        !self.state.visible
+    }
+
+    /// Returns the stable backend name used by reports.
+    pub const fn backend_name(&self) -> &'static str {
+        self.backend_name
+    }
+    /// Returns whether the probe must require whole-window zero allocations.
+    pub const fn strict_all(&self) -> bool {
+        self.strict_all
+    }
+
     pub fn backend(&self) -> Backend {
         self.backend
     }
@@ -643,6 +685,7 @@ mod tests {
         let _example = Example {
             identity: "drop_regression",
             backend_name: "vulkan",
+            strict_all: false,
             snapshot: Some(missing_snapshot.into_os_string()),
             update_snapshots: false,
             report_stdout: false,

@@ -296,15 +296,18 @@ fn destroy_context_before_device_initialization_is_successful_and_terminal() {
 #[test]
 fn decode_worker_topology_defaults_and_honors_explicit_counts() {
     // Zero preserves `available_parallelism - 1`; an explicit count pins the pool.
-    // This exercises pool construction directly so every host covers the topology.
+    // Policy is validated at creation while pool construction waits for first use.
     let expected_default = std::thread::available_parallelism()
         .map_or(2, usize::from)
         .saturating_sub(1)
         .max(1);
     let default_state = AsyncTextureState::new_with_workers(0).unwrap();
     assert_eq!(default_state.worker_count(), expected_default);
+    // Laziness is the point: no Rayon threads exist before the first decode.
+    assert!(default_state.pool.is_none());
     let explicit_state = AsyncTextureState::new_with_workers(2).unwrap();
     assert_eq!(explicit_state.worker_count(), 2);
+    assert!(explicit_state.pool.is_none());
 }
 
 #[test]
@@ -395,6 +398,169 @@ fn resource_diagnostics_reports_pending_uploads_then_rejects_stale_context() {
     assert_eq!(destroy_context(context), Ok(()));
     // Stale handles fail fast instead of reporting zeroed diagnostics.
     assert_eq!(resource_diagnostics(context), Err(Error::InvalidContext));
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn memory_telemetry_reports_slots_workers_and_empty_staging() {
+    // A fresh headless context has a sized decode pool and empty staging pools.
+    // Frame slots appear at device initialization, so only the capacity bound
+    // is asserted here; allocator presence likewise depends on device init.
+    let context = create_context(vulkan_options().unwrap()).unwrap();
+    let report = memory_telemetry(context).unwrap();
+    assert!(report.backend.frame_slots <= 3);
+    assert!(report.decode_workers >= 1);
+    assert_eq!(report.staging_buckets, 0);
+    assert_eq!(report.staging_bytes, 0);
+    assert_eq!(report.counter_scratch_bytes, 0);
+    assert_eq!(report.staging_high_water, 0);
+    // No surface exists, so the aggregation must gate every surface field to
+    // unknown rather than leaking a backend default extent or format code.
+    assert_eq!(report.backend.swapchain_images, 0);
+    assert_eq!(report.backend.swapchain_extent, (0, 0));
+    assert_eq!(report.backend.swapchain_format, 0);
+    assert_eq!(report.backend.swapchain_bytes, 0);
+    assert_eq!(report.backend.depth_bytes, 0);
+    // The pressure entry is a no-op on empty pools but must still succeed.
+    assert_eq!(release_staging_memory(context), Ok(()));
+    assert_eq!(memory_telemetry(context).unwrap().staging_high_water, 0);
+    assert_eq!(destroy_context(context), Ok(()));
+    assert_eq!(memory_telemetry(context), Err(Error::InvalidContext));
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn failed_counter_write_still_trims_pathological_scratch() {
+    // A failed upload must not pin multi-megabyte serialization capacity:
+    // sabotage the allocation after validation so the write fails after the
+    // 80 KiB scratch fill, then prove the guard trimmed back to the bound.
+    let context = create_context(vulkan_options().unwrap()).unwrap();
+    let surface =
+        create_surface_headless(context, HeadlessSurfaceOptions::new(1, 1, 0).unwrap()).unwrap();
+    assert_eq!(init_device(context, surface), Ok(()));
+    frame_begin(context).unwrap();
+    let counter = acquire_counter(context, 4096).unwrap();
+    with_context_mut(context, |state| {
+        state.allocations.remove(&counter.packed());
+        Ok(())
+    })
+    .unwrap();
+    let commands = vec![
+        DrawIndexedCommand {
+            index_count: 3,
+            instance_count: 1,
+            first_index: 0,
+            vertex_offset: 0,
+            first_instance: 0,
+        };
+        4096
+    ];
+    assert!(write_counter_commands(context, counter, 0, &commands).is_err());
+    with_context_mut(context, |state| {
+        // The 64 KiB bound mirrors the write-path retain limit in `buffers.rs`.
+        assert!(state.counter_scratch.capacity() <= 64 * 1024);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(destroy_context(context), Ok(()));
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn aggregate_staging_budget_bounds_many_distinct_strides() {
+    // Ten stride pools plus the shared pool each retain one completed 8 MiB
+    // bucket: 88 MiB total against the 64 MiB aggregate ceiling while every
+    // per-pool ceiling still passes. The pressure release must evict down to
+    // the aggregate bound and free the evictions natively.
+    let context = create_context(vulkan_options().unwrap()).unwrap();
+    let surface =
+        create_surface_headless(context, HeadlessSurfaceOptions::new(1, 1, 0).unwrap()).unwrap();
+    assert_eq!(init_device(context, surface), Ok(()));
+    with_context_mut(context, |state| {
+        // Unsubmitted buckets carry no retirement token, so they are
+        // reclaimable at any completion value, including pre-frame zero.
+        for stride in [4_u32, 8, 12, 16, 20, 24, 28, 32, 36, 40] {
+            let request = ez_gfx_hal::AllocationRequest::new(
+                8 * 1024 * 1024,
+                16,
+                ez_gfx_hal::MemoryClass::Device,
+                false,
+                None,
+            )
+            .map_err(|_| Error::InvalidArgument)?;
+            let allocation =
+                allocate_native(&mut state.native, request).map_err(map_allocation)?;
+            let pool = state.buffer_pool.entry(stride).or_insert_with(|| {
+                let mut pool = ez_gfx_hal::ReusableStagingPool::new(256);
+                pool.set_byte_budget(ez_gfx_hal::DEFAULT_BUFFER_STAGING_BUDGET);
+                pool
+            });
+            pool.put(8 * 1024 * 1024, allocation, None);
+        }
+        let request = ez_gfx_hal::AllocationRequest::new(
+            8 * 1024 * 1024,
+            16,
+            ez_gfx_hal::MemoryClass::Device,
+            false,
+            None,
+        )
+        .map_err(|_| Error::InvalidArgument)?;
+        let allocation = allocate_native(&mut state.native, request).map_err(map_allocation)?;
+        state.staging.put(8 * 1024 * 1024, allocation, None);
+        observe_staging_high_water(state);
+        Ok(())
+    })
+    .unwrap();
+    let before_release = memory_telemetry(context).unwrap();
+    assert_eq!(before_release.staging_bytes, 88 * 1024 * 1024);
+    assert_eq!(before_release.staging_high_water, 88 * 1024 * 1024);
+    assert_eq!(release_staging_memory(context), Ok(()));
+    with_context_mut(context, |state| {
+        let mut total = state.staging.retained_bytes();
+        for pool in state.buffer_pool.values() {
+            total = total.saturating_add(pool.retained_bytes());
+        }
+        total = total.saturating_add(state.counter_pool.retained_bytes());
+        // 88 MiB retained against a 64 MiB ceiling evicts exactly three 8 MiB
+        // buckets largest-first; per-pool ceilings never bound this shape.
+        assert_eq!(total, ez_gfx_hal::DEFAULT_STAGING_AGGREGATE_BUDGET);
+        assert_eq!(state.staging_high_water_bytes, 88 * 1024 * 1024);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(destroy_context(context), Ok(()));
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn failed_texture_admission_leaves_no_pending_state_behind() {
+    // The lazy pool builds before admission, so even a rejected load leaves no
+    // registry, identity, or pending residue behind.
+    let context = create_context(vulkan_options().unwrap()).unwrap();
+    with_context_mut(context, |state| {
+        assert!(state.async_textures.pool.is_none());
+        Ok(())
+    })
+    .unwrap();
+    // An unregistered custom decoder fails synchronous preparation after
+    // admission and must roll everything back.
+    assert!(
+        load_texture(
+            context,
+            TextureSource::Custom(200),
+            &[1, 2, 3],
+            false,
+            &texture_config(),
+        )
+        .is_err()
+    );
+    with_context_mut(context, |state| {
+        assert!(state.async_textures.pool.is_some());
+        assert!(state.pending_textures.is_empty());
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(destroy_context(context), Ok(()));
 }
 
 #[cfg(windows)]

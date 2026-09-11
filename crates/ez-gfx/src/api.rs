@@ -4,8 +4,10 @@ use std::{
     collections::HashMap,
     marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind},
-    rc::Rc,
+    rc::{Rc, Weak},
 };
+
+use compact_str::CompactString;
 
 use ez_gfx_core::{
     capability::{CapabilityError, PresentationMode, PresentationModes},
@@ -20,6 +22,7 @@ use ez_gfx_runtime::{
     binding::{PublicBinding as RawBinding, ResourceIdentity},
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use smallvec::SmallVec;
 
 trait SurfaceHost: HasWindowHandle + HasDisplayHandle {}
 
@@ -82,68 +85,9 @@ pub struct ReadbackId {
     generation: u64,
 }
 
-/// Creator-thread event delivered by [`Context::register_callback`].
-#[derive(Clone, Copy, Debug)]
-#[non_exhaustive]
-pub enum Event<'a> {
-    /// One asynchronous upload state transition.
-    Upload(ez_gfx_runtime::upload::UploadEvent),
-    /// One runtime observation.
-    Runtime(ez_gfx_runtime::observability::RuntimeRecord),
-    /// One diagnostic observation.
-    Diagnostic {
-        /// Diagnostic severity.
-        level: ez_gfx_runtime::observability::DiagnosticLevel,
-        /// Runtime operation that produced the diagnostic.
-        record: ez_gfx_runtime::observability::RuntimeRecord,
-    },
-    /// Bounded observability storage discarded records.
-    ObservationsDropped(u64),
-    /// Completed requested readback; bytes are valid only for this callback.
-    Readback {
-        /// Request identity.
-        request: ReadbackId,
-        /// Pixel width.
-        width: u32,
-        /// Pixel height.
-        height: u32,
-        /// Tightly packed RGBA8 pixels.
-        bytes: &'a [u8],
-    },
-    /// Completed implicit terminal-frame snapshot.
-    Snapshot(&'a [u8]),
-}
-
-/// Point-in-time pending-upload counts with retained bytes plus retained cache sizes.
-///
-/// Unlike [`Context::texture_upload_telemetry`], which reports monotonic pipeline
-/// counters, this snapshot describes what is outstanding right now. Counts are
-/// outstanding upload allocations and bytes accumulate with saturation, never
-/// wrapping. Vertex and index uploads each carry the byte size reserved by the
-/// original upload.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ResourceDiagnostics {
-    /// Texture uploads awaiting decode or transfer completion.
-    pub pending_textures: u32,
-    /// Admitted source bytes (decode) plus decoded staging bytes (transfer).
-    pub pending_texture_bytes: u64,
-    /// Vertex uploads awaiting transfer completion.
-    pub pending_vertex_uploads: u32,
-    /// Vertex bytes awaiting transfer completion.
-    pub pending_vertex_bytes: u64,
-    /// Index uploads awaiting transfer completion.
-    pub pending_index_uploads: u32,
-    /// Index bytes awaiting transfer completion.
-    pub pending_index_bytes: u64,
-    /// Staging buckets retained across the shared, buffer, and counter pools.
-    pub staging_buckets: u32,
-    /// Staging bucket capacity retained across those pools.
-    pub staging_bytes: u64,
-    /// Compiled pipeline entries retained in the context cache.
-    pub pipeline_entries: u32,
-    /// Bytes retained across completed readback frames.
-    pub readback_bytes: u64,
-}
+#[path = "api_telemetry.rs"]
+mod api_telemetry;
+pub use api_telemetry::{Event, MemoryTelemetryReport, ResourceDiagnostics};
 
 type EventCallback = dyn for<'a> FnMut(Event<'a>);
 #[derive(Clone, Copy)]
@@ -173,11 +117,23 @@ struct ContextInner {
     handle: ContextHandle,
     callback: RefCell<Option<Box<EventCallback>>>,
     dispatching: Cell<bool>,
+    /// Reused dispatch buffer; restored with bounded retention after every dispatch.
+    event_scratch: RefCell<Vec<Event<'static>>>,
     render_targets: RefCell<HashMap<String, CachedRenderTarget>>,
+    /// Reusable safe-facade transient storage; entries are recycled after wrapper/frame release.
+    facade_buffers: RefCell<Vec<Rc<BufferInner>>>,
+    /// Reused bounded storage owned by the single active safe frame.
+    frame_scratch: RefCell<FacadeFrameScratch>,
     closed: Cell<bool>,
     next_readback: Cell<u64>,
     teardown: Cell<ContextTeardownDisposition>,
 }
+
+/// Maximum dispatch-buffer capacity retained across event dispatches.
+///
+/// One burst can otherwise pin its peak allocation for the context lifetime;
+/// dispatches beyond this keep working and only lose warm capacity.
+const MAX_DISPATCH_SCRATCH_EVENTS: usize = 1024;
 
 struct DispatchGuard<'a>(&'a Cell<bool>);
 
@@ -231,6 +187,9 @@ impl Context {
                 callback: RefCell::new(None),
                 render_targets: RefCell::new(HashMap::new()),
                 dispatching: Cell::new(false),
+                event_scratch: RefCell::new(Vec::new()),
+                facade_buffers: RefCell::new(Vec::new()),
+                frame_scratch: RefCell::new(FacadeFrameScratch::default()),
                 next_readback: Cell::new(1),
                 closed: Cell::new(false),
                 teardown: Cell::new(ContextTeardownDisposition::Live),
@@ -276,6 +235,16 @@ impl Context {
         }
     }
 
+    fn restore_event_scratch(&self, mut events: Vec<Event<'static>>) {
+        // The dispatching flag already blocks reentrancy and no other path borrows
+        // this cell, so `borrow_mut` cannot panic here outside a broken invariant.
+        events.clear();
+        if events.capacity() > MAX_DISPATCH_SCRATCH_EVENTS {
+            events = Vec::with_capacity(MAX_DISPATCH_SCRATCH_EVENTS);
+        }
+        *self.inner.event_scratch.borrow_mut() = events;
+    }
+
     fn dispatch_events(&self) -> Result<()> {
         if self.inner.callback.borrow().is_none() {
             return Ok(());
@@ -284,14 +253,34 @@ impl Context {
             return Err(Error::ReentrantCallback);
         }
         let dispatch_guard = DispatchGuard(&self.inner.dispatching);
-        let mut events: Vec<Event<'static>> = Vec::new();
+        // Steady-state dispatches reuse one buffer; every exit below restores it
+        // before returning so a poll failure never leaks the warm allocation.
+        let mut events: Vec<Event<'static>> = self.inner.event_scratch.take();
 
         // Drain raw queues into owned records before invoking user code. Each poll
         // releases the context TLS borrow before any callback can run.
         for _ in 0..4096 {
-            let upload = state::poll_upload_event(self.raw())?.map(Event::Upload);
-            let (runtime, runtime_dropped) = state::poll_runtime_event(self.raw())?;
-            let (diagnostic, diagnostic_dropped) = state::poll_diagnostic(self.raw())?;
+            let upload = match state::poll_upload_event(self.raw()) {
+                Ok(event) => event.map(Event::Upload),
+                Err(error) => {
+                    self.restore_event_scratch(events);
+                    return Err(error);
+                }
+            };
+            let (runtime, runtime_dropped) = match state::poll_runtime_event(self.raw()) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    self.restore_event_scratch(events);
+                    return Err(error);
+                }
+            };
+            let (diagnostic, diagnostic_dropped) = match state::poll_diagnostic(self.raw()) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    self.restore_event_scratch(events);
+                    return Err(error);
+                }
+            };
             let dropped = runtime_dropped.saturating_add(diagnostic_dropped);
             let pending = [
                 upload,
@@ -306,7 +295,9 @@ impl Context {
         }
 
         let mut callback_panicked = false;
-        for event in events {
+        // `drain` keeps ownership of the buffer so it can be restored below;
+        // callbacks run without any context-state borrow held across the call.
+        for event in events.drain(..) {
             let mut slot = self.inner.callback.borrow_mut();
             let Some(callback) = slot.as_mut() else {
                 continue;
@@ -317,6 +308,7 @@ impl Context {
             }
         }
         drop(dispatch_guard);
+        self.restore_event_scratch(events);
         if callback_panicked {
             Err(Error::CallbackPanicked)
         } else {
@@ -438,6 +430,35 @@ impl Context {
             Ok(()) | Err(Error::DeviceLost) => Ok(snapshot),
             Err(error) => Err(error),
         }
+    }
+
+    /// Returns on-demand allocator and memory telemetry without dispatching events.
+    ///
+    /// Backend allocators report through `generate_report` exactly once per
+    /// query, so query explicitly and never per frame. Unlike
+    /// [`Context::resource_diagnostics`], this never dispatches callbacks.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when the context is stale, called from the wrong thread,
+    /// or reentered from a callback.
+    pub fn memory_telemetry(&self) -> Result<MemoryTelemetryReport> {
+        self.check_entry()?;
+        state::memory_telemetry(self.raw())
+    }
+
+    /// Releases retained staging caches down to their finite budgets.
+    ///
+    /// Trims the shared, buffer, and counter staging pools plus excess counter
+    /// serialization capacity, freeing evicted buckets natively. Buckets owned
+    /// by in-flight GPU work stay retained. Call on memory pressure or after
+    /// large streaming bursts — never per frame.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when the context is stale, called from the wrong thread,
+    /// or reentered from a callback.
+    pub fn release_staging_memory(&self) -> Result<()> {
+        self.check_entry()?;
+        state::release_staging_memory(self.raw())
     }
 
     /// Deterministically destroys this context and every resource it owns.

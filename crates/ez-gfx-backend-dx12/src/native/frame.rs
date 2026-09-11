@@ -6,12 +6,13 @@ use super::{
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT,
     D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_VIEWPORT, DXGI_FORMAT_R32_UINT, FRAMES_IN_FLIGHT,
     HalError, ID3D12CommandList, ID3D12PipelineState, INFINITE, Interface, MemoryAllocator,
-    MemoryClass, NativeAllocation, NativeContext, NativeFrameAction, NativeFrameResource,
-    NativeSurface, PresentationMode, QueueKind, RECT, WaitForSingleObject,
+    MemoryClass, NativeAllocation, NativeContext, NativeFrameAction, NativeFrameActionSource,
+    NativeFrameResource, NativeSurface, PresentationMode, QueueKind, RECT, WaitForSingleObject,
     bind_dx12_compute_buffers, bind_dx12_graphics_buffers, copy_texture_to_readback,
     dx12_resource_state, map_windows, presentation_parameters, record_resource_barriers,
     transition_barrier, uav_barrier,
 };
+use arrayvec::ArrayVec;
 use ez_gfx_hal::COUNTER_BUFFER_ELEMENT_OFFSET;
 
 type FrameSurface<'a> = (&'a mut NativeSurface, (u32, u32), PresentationMode);
@@ -38,7 +39,7 @@ const DRAW_INDEXED_ARGUMENT_BYTES: u64 = core::mem::size_of::<
 struct DxFramePlan {
     uses_surface: bool,
     presents: bool,
-    external_waits: Vec<CompletionToken>,
+    external_waits: ArrayVec<CompletionToken, 2>,
 }
 
 // D3D12 copy commands are invalid between BeginRenderPass and EndRenderPass.
@@ -53,66 +54,89 @@ fn indirect_command_bytes(draw_count: u32) -> u64 {
     u64::from(draw_count) * DRAW_INDEXED_ARGUMENT_BYTES
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one validation pass keeps cross-action frame invariants local"
+)]
+fn bindings_match_pipeline(
+    bindings: &dyn super::NativeBufferBindingSource,
+    writable: &[bool],
+) -> Result<bool, HalError> {
+    if bindings.len() != writable.len() {
+        return Ok(false);
+    }
+    let mut valid = true;
+    bindings.visit(&mut |index, binding| {
+        valid &= writable.get(index).is_some_and(|expected| {
+            binding.writable == *expected
+                && binding.offset < binding.allocation.allocation.size()
+        });
+        Ok(())
+    })?;
+    Ok(valid)
+}
+
+fn indirect_binding_writable(
+    bindings: &dyn super::NativeBufferBindingSource,
+    indirect: &super::ID3D12Resource,
+) -> Result<Option<bool>, HalError> {
+    let indirect = windows::core::Interface::as_raw(indirect);
+    let mut found = None;
+    bindings.visit(&mut |_, binding| {
+        if windows::core::Interface::as_raw(&binding.allocation.resource) == indirect {
+            found = Some(binding.writable);
+        }
+        Ok(())
+    })?;
+    Ok(found)
+}
+
 fn validate_frame_plan(
-    actions: &[NativeFrameAction<'_>],
+    actions: &(impl NativeFrameActionSource + ?Sized),
     extent: (u32, u32),
     surface_available: bool,
     capture_presented: bool,
 ) -> Result<DxFramePlan, HalError> {
-    let present_count = actions
-        .iter()
-        .filter(|action| matches!(action, NativeFrameAction::Present))
-        .count();
-    let presents = present_count == 1;
-    // Surface use is attachment-precise: render-target-only passes, barriers,
-    // and draws never acquire the swapchain. Draws inherit their pass target,
-    // so only surface-attached passes, presents, and surface/depth barriers
-    // require a surface.
-    let uses_surface = actions.iter().any(|action| match action {
-        NativeFrameAction::BeginPass { colors, .. } => colors
-            .iter()
-            .any(|attachment| matches!(attachment.resource, NativeFrameResource::Surface)),
-        NativeFrameAction::Present
-        | NativeFrameAction::Barrier {
-            resource: NativeFrameResource::Surface | NativeFrameResource::Depth,
-            ..
-        } => true,
-        _ => false,
-    });
-    if present_count > 1
-        || uses_surface && !surface_available
-        || (uses_surface || capture_presented) && !presents
-    {
-        return Err(HalError::InvalidArgument);
-    }
-    let external_waits = actions
-        .iter()
-        .filter_map(|action| match action {
-            NativeFrameAction::Wait(token)
-                if matches!(
-                    token.queue,
-                    QueueKind::Transfer | QueueKind::TextureTransfer
-                ) =>
-            {
-                Some(Ok(*token))
-            }
-            NativeFrameAction::Wait(_) => Some(Err(HalError::InvalidArgument)),
-            _ => None,
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut present_count = 0_usize;
+    let mut uses_surface = false;
+    let mut external_waits = ArrayVec::<CompletionToken, 2>::new();
     let mut pass_active = false;
     let mut saw_present = false;
-    for action in actions {
+    actions.visit(&mut |_, action| {
         if saw_present {
             return Err(HalError::InvalidArgument);
         }
         match action {
-            NativeFrameAction::Wait(_) | NativeFrameAction::Barrier { .. } => {}
+            NativeFrameAction::Wait(token) => {
+                if !matches!(
+                    token.queue,
+                    QueueKind::Transfer | QueueKind::TextureTransfer
+                ) {
+                    return Err(HalError::InvalidArgument);
+                }
+                if let Some(existing) = external_waits
+                    .iter_mut()
+                    .find(|existing| existing.queue == token.queue)
+                {
+                    if token.value > existing.value {
+                        *existing = *token;
+                    }
+                } else {
+                    external_waits
+                        .try_push(*token)
+                        .map_err(|_| HalError::InvalidArgument)?;
+                }
+            }
+            NativeFrameAction::Barrier { resource, .. } => {
+                uses_surface |= matches!(
+                    resource,
+                    NativeFrameResource::Surface | NativeFrameResource::Depth
+                );
+            }
             NativeFrameAction::BeginPass { pass, colors } => {
-                // Textures, buffers, and depth images are never color
-                // attachments; depth with a render target stays unsupported.
-                // A multisampled pass needs a multisampled target and vice
-                // versa; surfaces stay single-sample.
+                uses_surface |= colors
+                    .iter()
+                    .any(|attachment| matches!(attachment.resource, NativeFrameResource::Surface));
                 let mut target_extent = None;
                 let mut valid = !pass_active
                     && pass.colors.len() == 1
@@ -151,15 +175,10 @@ fn validate_frame_plan(
             NativeFrameAction::Compute(dispatch) => {
                 if pass_active
                     || dispatch.groups.contains(&0)
-                    || dispatch.bindings.len() != dispatch.pipeline.buffer_writable.len()
-                    || dispatch
-                        .bindings
-                        .iter()
-                        .zip(&dispatch.pipeline.buffer_writable)
-                        .any(|(binding, writable)| {
-                            binding.writable != *writable
-                                || binding.offset >= binding.allocation.allocation.size()
-                        })
+                    || !bindings_match_pipeline(
+                        dispatch.bindings,
+                        &dispatch.pipeline.buffer_writable,
+                    )?
                 {
                     return Err(HalError::InvalidArgument);
                 }
@@ -170,20 +189,15 @@ fn validate_frame_plan(
                     .ok_or(HalError::InvalidArgument)?;
                 if !pass_active
                     || draw.draw_count == 0
-                    || draw.bindings.len() != draw.pipeline.buffer_writable.len()
+                    || !bindings_match_pipeline(
+                        draw.bindings,
+                        &draw.pipeline.buffer_writable,
+                    )?
                     || draw.pipeline.topology.is_none()
                     || draw.pipeline.signature.is_none()
                     || draw.index_size == 0
                     || draw.index_size > u64::from(u32::MAX)
                     || draw.indirect_size < indirect_size
-                    || draw
-                        .bindings
-                        .iter()
-                        .zip(&draw.pipeline.buffer_writable)
-                        .any(|(binding, writable)| {
-                            binding.writable != *writable
-                                || binding.offset >= binding.allocation.allocation.size()
-                        })
                 {
                     return Err(HalError::InvalidArgument);
                 }
@@ -203,11 +217,19 @@ fn validate_frame_plan(
                 if pass_active {
                     return Err(HalError::InvalidArgument);
                 }
+                present_count += 1;
                 saw_present = true;
+                uses_surface = true;
             }
         }
-    }
-    if pass_active {
+        Ok(())
+    })?;
+    let presents = present_count == 1;
+    if pass_active
+        || present_count > 1
+        || uses_surface && !surface_available
+        || (uses_surface || capture_presented) && !presents
+    {
         return Err(HalError::InvalidArgument);
     }
     Ok(DxFramePlan {
@@ -224,6 +246,7 @@ struct DxPreparedFrame {
     dsv: Option<windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE>,
     slot_index: usize,
     list: super::ID3D12GraphicsCommandList,
+    garbage: Vec<NativeAllocation>,
 }
 
 type DxReadback = (
@@ -234,7 +257,27 @@ type DxReadback = (
     NativeAllocation,
 );
 
-type DxFrameResources = (Vec<DxReadback>, Vec<Option<NativeAllocation>>);
+/// Indirect-copy staging for one aliased graphics action, in ascending action order.
+///
+/// Only draws whose indirect buffer is also shader-bound need a staging copy;
+/// every other action needs no entry, so this replaces the action-sized optional
+/// list without changing encoder semantics.
+pub(super) struct IndirectCopyEntry {
+    action: usize,
+    allocation: NativeAllocation,
+}
+
+type DxFrameResources = (Vec<DxReadback>, Vec<IndirectCopyEntry>);
+
+/// Returns the staging copy for one graphics action, if the action is aliased.
+///
+/// Entries are pushed in ascending action order, so binary search is valid.
+fn indirect_copy(entries: &[IndirectCopyEntry], action: usize) -> Option<&NativeAllocation> {
+    entries
+        .binary_search_by_key(&action, |entry| entry.action)
+        .ok()
+        .map(|index| &entries[index].allocation)
+}
 
 impl NativeContext {
     fn collect_frame_readbacks(
@@ -305,15 +348,27 @@ impl NativeContext {
 }
 
 impl NativeContext {
+    /// Returns an emptied indirect-copy shell to its frame slot, keeping capacity.
+    ///
+    /// Callers drain or free every entry allocation first; the shell itself owns
+    /// no GPU work. A missing slot is unreachable after preparation, so falling
+    /// back to a drop preserves behavior and only loses retained capacity.
+    fn restore_indirect_scratch(&mut self, slot_index: usize, entries: Vec<IndirectCopyEntry>) {
+        if let Some(slot) = self.frame_slots.get_mut(slot_index) {
+            slot.indirect_scratch = entries;
+        }
+    }
+
     fn allocate_frame_resources(
         &mut self,
-        actions: &[NativeFrameAction<'_>],
+        slot_index: usize,
+        actions: &(impl NativeFrameActionSource + ?Sized),
         capture_presented: bool,
         extent: (u32, u32),
         back_buffer: Option<&super::ID3D12Resource>,
     ) -> Result<DxFrameResources, HalError> {
         let mut readbacks = Vec::new();
-        for action in actions {
+        let readback_result = actions.visit(&mut |_, action| {
             let resource = match action {
                 NativeFrameAction::TextureReadback { texture, .. } => {
                     Some(texture.resource.clone())
@@ -322,16 +377,16 @@ impl NativeContext {
                 _ => None,
             };
             let Some(resource) = resource else {
-                continue;
+                return Ok(());
             };
-            // SAFETY: `resource` retains the `ID3D12Resource` object and vtable storage for the duration of `GetDesc`.
+            // SAFETY: the cloned resource remains live throughout this query.
             let desc = unsafe { resource.GetDesc() };
             let mut footprint =
                 windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
             let mut rows = 0;
             let mut row_size = 0;
             let mut total = 0;
-            // SAFETY: `self` retains the `ID3D12Device` during `GetCopyableFootprints`; `desc` is initialized, and the distinct output locals provide writable storage through the call.
+            // SAFETY: distinct output locals remain writable for the native call.
             unsafe {
                 self.device.GetCopyableFootprints(
                     &raw const desc,
@@ -344,64 +399,65 @@ impl NativeContext {
                     Some(&raw mut total),
                 );
             }
-            let Ok(request) = AllocationRequest::new(total, 256, MemoryClass::Readback, true, None)
-            else {
-                for (_, _, _, _, allocation) in readbacks {
-                    let _ = self.free(allocation);
-                }
-                return Err(HalError::InvalidArgument);
-            };
-            let Ok(allocation) = self.allocate(request) else {
-                for (_, _, _, _, allocation) in readbacks {
-                    let _ = self.free(allocation);
-                }
-                return Err(HalError::NativeFailure);
-            };
+            let request = AllocationRequest::new(total, 256, MemoryClass::Readback, true, None)
+                .map_err(|_| HalError::InvalidArgument)?;
+            let allocation = self.allocate(request).map_err(|_| HalError::NativeFailure)?;
             let dimensions = match action {
                 NativeFrameAction::TextureReadback { width, height, .. } => (*width, *height),
                 NativeFrameAction::Present => extent,
                 _ => unreachable!(),
             };
             readbacks.push((dimensions.0, dimensions.1, footprint, total, allocation));
-        }
-        let mut indirect_copies: Vec<Option<NativeAllocation>> =
-            (0..actions.len()).map(|_| None).collect();
-        for (action_index, action) in actions.iter().enumerate() {
-            let NativeFrameAction::Graphics(draw) = action else {
-                continue;
-            };
-            let indirect_raw = windows::core::Interface::as_raw(&draw.indirect_buffer.resource);
-            if !draw.bindings.iter().any(|binding| {
-                windows::core::Interface::as_raw(&binding.allocation.resource) == indirect_raw
-            }) {
-                continue;
+            Ok(())
+        });
+        if let Err(error) = readback_result {
+            for (_, _, _, _, allocation) in readbacks {
+                let _ = self.free(allocation);
             }
-            let Ok(request) = AllocationRequest::new(
+            return Err(error);
+        }
+        // The slot is retired: `prepare_frame` waited its fence before returning
+        // it, and this frame has not submitted yet. Only the emptied shell is
+        // retained; entry allocations join frame garbage on success.
+        let mut indirect_copies = core::mem::take(
+            &mut self
+                .frame_slots
+                .get_mut(slot_index)
+                .ok_or(HalError::NotReady)?
+                .indirect_scratch,
+        );
+        indirect_copies.clear();
+        let indirect_result = actions.visit(&mut |action_index, action| {
+            let NativeFrameAction::Graphics(draw) = action else {
+                return Ok(());
+            };
+            if indirect_binding_writable(draw.bindings, &draw.indirect_buffer.resource)?.is_none() {
+                return Ok(());
+            }
+            let request = AllocationRequest::new(
                 indirect_command_bytes(draw.draw_count) + COUNTER_BUFFER_ELEMENT_OFFSET,
                 16,
                 MemoryClass::Device,
                 false,
                 None,
-            ) else {
-                for (_, _, _, _, allocation) in readbacks {
-                    let _ = self.free(allocation);
-                }
-                for allocation in indirect_copies.into_iter().flatten() {
-                    let _ = self.free(allocation);
-                }
-                return Err(HalError::InvalidArgument);
-            };
-            indirect_copies[action_index] = if let Ok(allocation) = self.allocate(request) {
-                Some(allocation)
-            } else {
-                for (_, _, _, _, allocation) in readbacks {
-                    let _ = self.free(allocation);
-                }
-                for allocation in indirect_copies.into_iter().flatten() {
-                    let _ = self.free(allocation);
-                }
-                return Err(HalError::NativeFailure);
-            };
+            )
+            .map_err(|_| HalError::InvalidArgument)?;
+            let allocation = self.allocate(request).map_err(|_| HalError::NativeFailure)?;
+            indirect_copies.push(IndirectCopyEntry {
+                action: action_index,
+                allocation,
+            });
+            Ok(())
+        });
+        if let Err(error) = indirect_result {
+            for (_, _, _, _, allocation) in readbacks {
+                let _ = self.free(allocation);
+            }
+            for entry in indirect_copies.drain(..) {
+                let _ = self.free(entry.allocation);
+            }
+            self.restore_indirect_scratch(slot_index, indirect_copies);
+            return Err(error);
         }
         Ok((readbacks, indirect_copies))
     }
@@ -412,20 +468,22 @@ impl NativeContext {
         &mut self,
         surface: &mut Option<&mut NativeSurface>,
         extent: (u32, u32),
-        actions: &[NativeFrameAction<'_>],
+        actions: &(impl NativeFrameActionSource + ?Sized),
         uses_surface: bool,
     ) -> Result<DxPreparedFrame, HalError> {
         // Queue the worker's DIRECT release/acquire before a frame waits on its completion.
         // Waiting first would stall the same queue that must execute the handoff signal.
         for queue in [QueueKind::Transfer, QueueKind::TextureTransfer] {
-            if let Some(required) = actions
-                .iter()
-                .filter_map(|action| match action {
-                    NativeFrameAction::Wait(token) if token.queue == queue => Some(token.value),
-                    _ => None,
-                })
-                .max()
-            {
+            let mut required = None::<u64>;
+            actions.visit(&mut |_, action| {
+                if let NativeFrameAction::Wait(token) = action
+                    && token.queue == queue
+                {
+                    required = Some(required.map_or(token.value, |value| value.max(token.value)));
+                }
+                Ok(())
+            })?;
+            if let Some(required) = required {
                 let worker = if queue == QueueKind::Transfer {
                     self.transfer_worker.as_ref()
                 } else {
@@ -444,12 +502,15 @@ impl NativeContext {
                 extent.1,
             )?;
         }
-        if actions.iter().any(|action| {
-            matches!(
+        let mut requires_depth = false;
+        actions.visit(&mut |_, action| {
+            requires_depth |= matches!(
                 action,
                 NativeFrameAction::BeginPass { pass, .. } if pass.depth.is_some()
-            )
-        }) {
+            );
+            Ok(())
+        })?;
+        if requires_depth {
             self.ensure_surface_depth(surface.as_deref_mut().ok_or(HalError::InvalidArgument)?)?;
         }
 
@@ -493,7 +554,7 @@ impl NativeContext {
 
         let slot_index = self.frame_cursor;
         self.frame_cursor = (self.frame_cursor + 1) % FRAMES_IN_FLIGHT;
-        let (allocator, list, fence_value, garbage) = {
+        let (allocator, list, fence_value, mut garbage) = {
             let slot = self
                 .frame_slots
                 .get_mut(slot_index)
@@ -519,7 +580,7 @@ impl NativeContext {
         }
         self.reclaim_deferred()
             .map_err(|_| HalError::NativeFailure)?;
-        for allocation in garbage {
+        for allocation in garbage.drain(..) {
             self.free(allocation).map_err(|_| HalError::NativeFailure)?;
         }
         // SAFETY: the fence wait above has completed this slot's prior commands, so `allocator` is no longer in GPU use; `list` and `allocator` remain retained through both resets.
@@ -535,6 +596,7 @@ impl NativeContext {
             dsv,
             slot_index,
             list,
+            garbage,
         })
     }
 }
@@ -549,7 +611,7 @@ struct DxFrameEncoder<'a> {
     dsv: Option<windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE>,
     extent: (u32, u32),
     readbacks: &'a [DxReadback],
-    indirect_copies: &'a [Option<NativeAllocation>],
+    indirect_copies: &'a [IndirectCopyEntry],
     pass_active: bool,
     pass_target: Option<super::ID3D12Resource>,
     /// Pending multisampled resolve `(render, destination, format)` recorded at
@@ -761,18 +823,12 @@ impl DxFrameEncoder<'_> {
         draw: &super::NativeDrawIndexed<'_>,
     ) -> Result<(), HalError> {
         validate_indirect_copy_phase(self.pass_active)?;
-        let Some(copy) = self.indirect_copies[action_index].as_ref() else {
+        let Some(copy) = indirect_copy(self.indirect_copies, action_index) else {
             return Ok(());
         };
-        let indirect_raw = windows::core::Interface::as_raw(&draw.indirect_buffer.resource);
-        let binding = draw
-            .bindings
-            .iter()
-            .find(|binding| {
-                windows::core::Interface::as_raw(&binding.allocation.resource) == indirect_raw
-            })
+        let writable = indirect_binding_writable(draw.bindings, &draw.indirect_buffer.resource)?
             .ok_or(HalError::InvalidArgument)?;
-        let shader_state = if binding.writable {
+        let shader_state = if writable {
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS
         } else {
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
@@ -841,8 +897,7 @@ impl DxFrameEncoder<'_> {
             SizeInBytes: index_size,
             Format: DXGI_FORMAT_R32_UINT,
         };
-        let indirect_resource = self.indirect_copies[action_index]
-            .as_ref()
+        let indirect_resource = indirect_copy(self.indirect_copies, action_index)
             .map_or(&draw.indirect_buffer.resource, |copy| &copy.resource);
         // SAFETY: the encoder, `pipeline`, and `draw` references retain every command-list, state object, heap, resource, index-view, and binding pointer consumed by these recording calls until each call returns.
         unsafe {
@@ -899,11 +954,29 @@ impl NativeContext {
     ///
     /// # Errors
     ///
-    /// Returns an error if the frame plan or extent is invalid, required surface or frame resources are unavailable, resource allocation or readback fails, or a Direct3D/DXGI operation fails.
+    /// Returns an error if validation, allocation, encoding, or submission fails.
     pub fn execute_frame(
         &mut self,
         surface: Option<FrameSurface<'_>>,
         actions: &[NativeFrameAction<'_>],
+        capture_presented: bool,
+    ) -> Result<Vec<Vec<u8>>, HalError> {
+        self.execute_frame_source(surface, &actions, capture_presented)
+    }
+
+    /// Records a synchronous source without retaining borrowed native views.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::execute_frame`].
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one transaction keeps frame resource cleanup and submission ordering local"
+    )]
+    pub fn execute_frame_source(
+        &mut self,
+        surface: Option<FrameSurface<'_>>,
+        actions: &impl NativeFrameActionSource,
         capture_presented: bool,
     ) -> Result<Vec<Vec<u8>>, HalError> {
         if actions.is_empty() {
@@ -924,8 +997,10 @@ impl NativeContext {
             dsv,
             slot_index,
             list,
+            garbage: mut frame_garbage,
         } = self.prepare_frame(&mut surface, extent, actions, uses_surface)?;
-        let (readbacks, indirect_copies) = self.allocate_frame_resources(
+        let (readbacks, mut indirect_copies) = self.allocate_frame_resources(
+            slot_index,
             actions,
             capture_presented,
             extent,
@@ -971,9 +1046,10 @@ impl NativeContext {
             for (_, _, _, _, allocation) in readbacks {
                 let _ = self.free(allocation);
             }
-            for allocation in indirect_copies.into_iter().flatten() {
-                let _ = self.free(allocation);
+            for entry in indirect_copies.drain(..) {
+                let _ = self.free(entry.allocation);
             }
+            self.restore_indirect_scratch(slot_index, indirect_copies);
             return Err(error);
         }
         let command: ID3D12CommandList = match list.cast() {
@@ -982,9 +1058,10 @@ impl NativeContext {
                 for (_, _, _, _, allocation) in readbacks {
                     let _ = self.free(allocation);
                 }
-                for allocation in indirect_copies.into_iter().flatten() {
-                    let _ = self.free(allocation);
+                for entry in indirect_copies.drain(..) {
+                    let _ = self.free(entry.allocation);
                 }
+                self.restore_indirect_scratch(slot_index, indirect_copies);
                 return Err(map_windows(error));
             }
         };
@@ -999,23 +1076,30 @@ impl NativeContext {
                 for (_, _, _, _, allocation) in readbacks {
                     let _ = self.free(allocation);
                 }
-                for allocation in indirect_copies.into_iter().flatten() {
-                    let _ = self.free(allocation);
+                for entry in indirect_copies.drain(..) {
+                    let _ = self.free(entry.allocation);
                 }
+                self.restore_indirect_scratch(slot_index, indirect_copies);
                 return Err(map_windows(error));
             }
         }
-        let mut frame_garbage = indirect_copies.into_iter().flatten().collect::<Vec<_>>();
+        frame_garbage.extend(indirect_copies.drain(..).map(|entry| entry.allocation));
         // SAFETY: `command` retains the closed command-list interface through `ExecuteCommandLists`, and the one-element interface array remains readable for the call.
         unsafe { self.queue.ExecuteCommandLists(&[Some(command)]) };
         let value = self.next_fence;
         self.next_fence = value.checked_add(1).ok_or(HalError::NativeFailure)?;
         // SAFETY: `self` retains the command queue and fence through `Signal`, and `value` is the newly reserved monotonically increasing fence value.
         unsafe { self.queue.Signal(&self.fence, value) }.map_err(map_windows)?;
-        self.frame_slots
-            .get_mut(slot_index)
-            .ok_or(HalError::NativeFailure)?
-            .fence_value = value;
+        {
+            let slot = self
+                .frame_slots
+                .get_mut(slot_index)
+                .ok_or(HalError::NativeFailure)?;
+            slot.fence_value = value;
+            // Entries drained into garbage above; the emptied shell returns to the
+            // retired slot for the next frame.
+            slot.indirect_scratch = indirect_copies;
+        }
         let present_error = if presents {
             // SAFETY: `swapchain` retains the `IDXGISwapChain4` object and vtable storage through `Present`, after the recorded back-buffer transition to `PRESENT`.
             unsafe {
@@ -1059,6 +1143,10 @@ impl NativeContext {
         self.collect_frame_readbacks(readbacks, capture_presented, surface)
     }
 }
+
+#[cfg(test)]
+#[path = "frame_tests.rs"]
+mod plan_tests;
 
 #[cfg(test)]
 mod tests {

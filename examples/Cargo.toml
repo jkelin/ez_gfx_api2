@@ -28,6 +28,9 @@ path = "05_helmet/main.rs"
 [[bin]]
 name = "06_sponza_ktx2"
 path = "06_sponza_ktx2/main.rs"
+[[bin]]
+name = "allocation_probe"
+path = "allocation_probe/main.rs"
 [[test]]
 name = "smoke"
 path = "tests/smoke.rs"
