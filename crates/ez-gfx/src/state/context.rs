@@ -778,7 +778,14 @@ fn configure_surface_recording(
         .identity
         .resolve(surface.packed(), ResourceKind::Surface)
         .map_err(map_lifecycle)?;
-    let available = super::surface::presentation_modes_for_record(context, surface)?;
+    let available = context
+        .surfaces
+        .get(&surface)
+        .and_then(|record| record.presentation_modes)
+        .map_or_else(
+            || super::surface::presentation_modes_for_record(context, surface),
+            Ok,
+        )?;
     let effective = available.resolve(requested).ok_or(Error::Unsupported)?;
     let record = context
         .surfaces
@@ -787,6 +794,8 @@ fn configure_surface_recording(
     if record.state.extent().is_none() {
         return Err(Error::NotReady);
     }
+    // Keep same-mode frame configuration allocation-free until resize or reinitialization.
+    record.presentation_modes = Some(available);
     record.presentation_mode = effective;
     context.active_surface = Some(surface);
     Ok(())

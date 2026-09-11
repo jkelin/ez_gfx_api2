@@ -3,7 +3,7 @@ use std::sync::Once;
 use ez_gfx_ffi::{
     EzGfxBackendContextDesc, EzGfxContext, EzGfxResult, EzGfxSurface, EzGfxWindowSurfaceDesc,
     ez_gfx_context_create_backend, ez_gfx_context_destroy, ez_gfx_context_init_device,
-    ez_gfx_surface_create_window, ez_gfx_surface_destroy,
+    ez_gfx_surface_create_window, ez_gfx_surface_destroy, ez_gfx_surface_resize,
 };
 use windows::{
     Win32::{
@@ -109,6 +109,11 @@ impl TestContext {
         let native = Self::create_uninitialized(backend, validation);
         assert_eq!(
             ez_gfx_context_init_device(native.context, native.surface),
+            EzGfxResult::Ok
+        );
+        // Undefined Vulkan extents require the host's known client size before frame begin.
+        assert_eq!(
+            ez_gfx_surface_resize(native.context, native.surface, WIDTH, HEIGHT),
             EzGfxResult::Ok
         );
         native
