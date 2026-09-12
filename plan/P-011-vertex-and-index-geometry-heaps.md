@@ -2,7 +2,7 @@
 
 ## Problem
 
-Define safe ownership for named vertex heaps, their allocations, the singleton context index heap, index allocations, and one-frame buffer/counter/value buffers. Preserve generation/owner validation at the C seam.
+Define safe ownership for named vertex heaps, their allocations, the singleton context index heap, index allocations, and one-frame buffer/counter/value buffers. Preserve generation/owner validation at the C boundary.
 
 ## Constraints
 

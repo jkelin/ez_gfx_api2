@@ -1,6 +1,6 @@
 //! Point-in-time resource and cache diagnostics.
 //!
-//! Unlike the monotonic [`TextureUploadTelemetrySnapshot`](ez_gfx_runtime::texture::TextureUploadTelemetrySnapshot)
+//! Unlike the monotonic [`TextureUploadTelemetrySnapshot`](ez_gfx_texture_manager::texture::TextureUploadTelemetrySnapshot)
 //! counters, this snapshot describes what is outstanding right now: decode- and
 //! transfer-pending uploads with their retained byte sizes, plus retained
 //! staging, pipeline, and readback cache sizes.
@@ -27,17 +27,17 @@ pub fn resource_diagnostics(context: ContextHandle) -> Result<ResourceDiagnostic
     with_context_mut(context, |context| {
         context.identity.check_thread().map_err(map_lifecycle)?;
         let mut diagnostics = ResourceDiagnostics::default();
-        for pending in context.pending_textures.values() {
+        for pending in context.texture_pipeline.pending().values() {
             diagnostics.pending_textures = diagnostics.pending_textures.saturating_add(1);
             diagnostics.pending_texture_bytes = diagnostics
                 .pending_texture_bytes
                 .saturating_add(pending.decoded_bytes.unwrap_or(pending.source_bytes));
         }
-        for (handle, bytes) in &context.texture_transfer_bytes {
+        for (handle, bytes) in context.texture_pipeline.transfer_bytes() {
             // Manager uploads hold a transfer reservation; region rewrites only
             // re-arm texture_ready, so both gates report outstanding transfers.
-            if context.texture_transfer_work.contains_key(handle)
-                || context.texture_ready.contains_key(handle)
+            if context.texture_pipeline.work().contains_key(handle)
+                || context.texture_pipeline.ready().contains_key(handle)
             {
                 diagnostics.pending_textures = diagnostics.pending_textures.saturating_add(1);
                 diagnostics.pending_texture_bytes =
@@ -54,13 +54,13 @@ pub fn resource_diagnostics(context: ContextHandle) -> Result<ResourceDiagnostic
             // Each pending key is one outstanding upload allocation; element
             // totals stay behind the typed range queries, not this summary.
             match kind {
-                ez_gfx_runtime::geometry::GeometryHeapKind::Vertex => {
+                ez_gfx_geometry_manager::GeometryHeapKind::Vertex => {
                     diagnostics.pending_vertex_uploads =
                         diagnostics.pending_vertex_uploads.saturating_add(1);
                     diagnostics.pending_vertex_bytes =
                         diagnostics.pending_vertex_bytes.saturating_add(bytes);
                 }
-                ez_gfx_runtime::geometry::GeometryHeapKind::Index => {
+                ez_gfx_geometry_manager::GeometryHeapKind::Index => {
                     diagnostics.pending_index_uploads =
                         diagnostics.pending_index_uploads.saturating_add(1);
                     diagnostics.pending_index_bytes =
@@ -143,7 +143,7 @@ pub fn memory_telemetry(context: ContextHandle) -> Result<MemoryTelemetryReport>
             counter_scratch_bytes: u64::try_from(context.counter_scratch.capacity())
                 .unwrap_or(u64::MAX),
             // Pool sizes always fit `u32`; the fallback only guards the conversion.
-            decode_workers: u32::try_from(context.async_textures.worker_count())
+            decode_workers: u32::try_from(context.decode_textures.worker_count())
                 .unwrap_or(u32::MAX),
         })
     })

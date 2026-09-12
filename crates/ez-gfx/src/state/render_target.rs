@@ -14,7 +14,7 @@ use super::{
     result_status, with_context_mut,
 };
 use ez_gfx_runtime::target::{Format, TargetDeclaration, TargetError, TargetUsage};
-use ez_gfx_runtime::texture::TextureId;
+use ez_gfx_texture_manager::TextureId;
 
 /// Resolves the clear color applied when a pass clears this target.
 ///
@@ -99,7 +99,7 @@ pub fn create_render_target(
             .and_then(|pixels| pixels.checked_mul(bytes_per_texel))
             .and_then(|single| single.checked_mul(u64::from(declaration.samples())))
             .ok_or(Error::NativeFailure)?;
-        if bytes > ez_gfx_runtime::texture::MAX_TEXTURE_BYTES as u64 {
+        if bytes > super::MAX_TEXTURE_BYTES as u64 {
             return Err(Error::NativeFailure);
         }
         let id = context
@@ -193,7 +193,10 @@ pub fn destroy_render_target(context: ContextHandle, target: RenderTargetHandle)
 /// # Errors
 ///
 /// Returns [`Error::InvalidArgument`] for an unknown or destroyed handle.
-#[allow(dead_code, reason = "the C raw seam queries physical target metadata")]
+#[allow(
+    dead_code,
+    reason = "the C raw boundary queries physical target metadata"
+)]
 pub fn render_target_format(context: ContextHandle, target: RenderTargetHandle) -> Result<Format> {
     with_context_mut(context, |context| {
         context
@@ -213,7 +216,10 @@ pub fn render_target_format(context: ContextHandle, target: RenderTargetHandle) 
 /// # Errors
 ///
 /// Returns [`Error::InvalidArgument`] for an unknown or destroyed handle.
-#[allow(dead_code, reason = "the C raw seam queries physical target metadata")]
+#[allow(
+    dead_code,
+    reason = "the C raw boundary queries physical target metadata"
+)]
 pub fn render_target_extent(
     context: ContextHandle,
     target: RenderTargetHandle,
@@ -239,7 +245,10 @@ pub fn render_target_extent(
 /// # Errors
 ///
 /// Returns [`Error::InvalidArgument`] for an unknown or destroyed handle.
-#[allow(dead_code, reason = "the C raw seam queries physical target metadata")]
+#[allow(
+    dead_code,
+    reason = "the C raw boundary queries physical target metadata"
+)]
 pub fn render_target_clear(
     context: ContextHandle,
     target: RenderTargetHandle,

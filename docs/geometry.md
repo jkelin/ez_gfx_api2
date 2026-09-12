@@ -1,6 +1,6 @@
 # Geometry
 
-Geometry uses owning auto-growing named vertex heaps and one lazy context-owned device-local `u32` index heap. Their allocation wrappers retain both the shared `Rc<ContextInner>` and the parent resource lease. `Buffer`, `CounterBuffer`, and `ValueBuffer` are separate one-frame consumables bound by shader-declared name.
+Geometry uses owning auto-growing named vertex heaps and one lazy context-owned device-local `u32` index heap. Generic heap allocation and upload readiness live in `ez-gfx-geometry-manager` (`GeometryManager`, see its README); native staging reuse lives in the shared HAL `ReusableStagingPool`, and every upload records its bytes in the context's one shared transfer budget (`ez-gfx-texture-manager::SharedTransferPool`, see its README) until the transfer-queue token retires them. Their allocation wrappers retain both the shared `Rc<ContextInner>` and the parent resource lease. `Buffer`, `CounterBuffer`, and `ValueBuffer` are separate one-frame consumables bound by shader-declared name.
 
 ## Public path
 
@@ -61,7 +61,7 @@ The index heap is a context singleton, not a freely creatable family of named he
 
 `VertexHeap::upload(&[T])` and `Context::upload_indices(&[u32])` enqueue lossless typed transitions: `SourceStaged`, `DeviceReady`, `Failed(status)`, or `Cancelled`.
 
-`Context::register_callback` is the sole safe event channel. The facade dispatches queued events at creator-thread operation seams; applications do not poll internal runtime queues.
+`Context::register_callback` is the sole safe event channel. The facade dispatches queued events at creator-thread operation boundaries; applications do not poll internal runtime queues.
 
 A heap-level maximum readiness token is used when a frame imports a named heap. It may wait for a later allocation in the same heap, but never permits early use.
 

@@ -9,19 +9,19 @@ use super::MetalContext;
 #[cfg(all(test, not(target_vendor = "apple")))]
 use super::SurfaceInsertTestFailure;
 use super::{
-    AdapterCatalog, AdapterInfo, AdapterReport, AdapterSelection, Arc, AsyncTextureState, Backend,
-    CONTEXT_HANDLES, CONTEXTS, ContextHandle, ContextIdentity, ContextOptions, ContextState,
-    DiagnosticLevel, Error, FrameRecorder, GeometryManager, HalError, HashMap,
+    AdapterCatalog, AdapterInfo, AdapterReport, AdapterSelection, Backend, CONTEXT_HANDLES,
+    CONTEXTS, ContextHandle, ContextIdentity, ContextOptions, ContextState, DecodeDriver,
+    DecodeDriverError, DiagnosticLevel, Error, FrameRecorder, GeometryManager, HalError, HashMap,
     IndexAllocationHandle, LocalHandle, NativeContext, NativeSurface, Observability, Ordering,
     PresentationMode, RenderTargetHandle, ResourceKind, RuntimeError, RuntimePhase, RuntimeRecord,
-    RuntimeStatus, ShaderCapabilities, SurfaceHandle, TextureFallback, TextureRegistry,
-    TextureUploadTelemetry, UploadEvent, UploadResource, UploadStatus, VertexAllocationHandle,
-    VulkanContext, admission_report, completed_transfer_native, context_local,
-    destroy_native_pipeline, destroy_native_shader, destroy_native_surface, destroy_native_texture,
-    free_native_allocation, initialize_texture_fallback, map_allocation, map_hal, map_lifecycle,
-    map_native_loss, map_texture, native_device_initialized, progress_texture_upload_events,
-    pump_async_textures, render_target::destroy_all_render_targets, result_status, wait_native_idle,
-    with_context_mut,
+    RuntimeStatus, ShaderCapabilities, SharedTransferPool, SurfaceHandle, TextureFallback,
+    TexturePipeline, TextureRegistry, UploadEvent, UploadResource, UploadStatus,
+    VertexAllocationHandle, VulkanContext, WORKING_SET_BUDGET_BYTES, admission_report,
+    completed_transfer_native, context_local, destroy_native_pipeline, destroy_native_shader,
+    destroy_native_surface, destroy_native_texture, free_native_allocation,
+    initialize_texture_fallback, map_allocation, map_hal, map_lifecycle, map_native_loss,
+    map_texture, native_device_initialized, progress_texture_upload_events, pump_async_textures,
+    render_target::destroy_all_render_targets, result_status, wait_native_idle, with_context_mut,
 };
 
 /// Creates a graphics context.
@@ -41,7 +41,10 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
     .map_err(|_| Error::NativeFailure)?;
     let frame = FrameRecorder::new(1024).map_err(|_| Error::NativeFailure)?;
     let observability = Observability::new(1024, 256).map_err(|_| Error::NativeFailure)?;
-    let async_textures = AsyncTextureState::new_with_workers(options.texture_decode_workers)?;
+    let decode_textures = DecodeDriver::new(options.texture_decode_workers).map_err(|error| {
+        debug_assert_eq!(error, DecodeDriverError::InvalidWorkerCount);
+        Error::InvalidArgument
+    })?;
     let local = CONTEXT_HANDLES
         .lock()
         .map_err(|_| Error::NativeFailure)?
@@ -72,10 +75,6 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         pending_shader_destroys: std::collections::HashSet::new(),
         textures: HashMap::new(),
         render_targets: HashMap::new(),
-        texture_formats: HashMap::new(),
-        texture_published_mips: HashMap::new(),
-        texture_residency_targets: HashMap::new(),
-        texture_last_transfer: HashMap::new(),
         retired_textures: Vec::new(),
         retired_texture_bindings: Vec::new(),
         pipelines: HashMap::new(),
@@ -87,13 +86,9 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         counter_scratch: Vec::new(),
         texture_registry,
         texture_fallback: TextureFallback::Uninitialized,
-        texture_ready: HashMap::new(),
-        pending_textures: HashMap::new(),
-        texture_transfer_bytes: HashMap::new(),
-        texture_transfer_work: HashMap::new(),
-        texture_handoffs: HashMap::new(),
-        texture_telemetry: Arc::new(TextureUploadTelemetry::default()),
-        async_textures,
+        texture_pipeline: TexturePipeline::new(),
+        transfer_pool: SharedTransferPool::new(WORKING_SET_BUDGET_BYTES),
+        decode_textures,
         texture_failures: HashMap::new(),
         geometry: GeometryManager::new(),
         vertex_heaps: HashMap::new(),
@@ -526,15 +521,19 @@ pub fn wait_idle(context: ContextHandle) -> Result<()> {
             .identity
             .check_thread_and_health()
             .map_err(map_lifecycle)?;
-        if !context.texture_fallback.is_ready() && !context.pending_textures.is_empty() {
-            // A pre-device or failed-initialization Vulkan context cannot make native upload
+        if !context.texture_fallback.is_ready() && !context.texture_pipeline.pending().is_empty() {
             // progress; returning keeps `wait_idle` finite while preserving queued decode data.
             return Err(Error::NotReady);
         }
-        while !context.pending_textures.is_empty() {
+        // Retained phase-two levels submit through the same pump, so idle
+        // waits for the full chain, not just initial admission.
+        loop {
             pump_async_textures(context)?;
-            if !context.pending_textures.is_empty() {
-                std::thread::yield_now();
+            progress_texture_upload_events(context)?;
+            if context.texture_pipeline.pending().is_empty()
+                && context.texture_pipeline.fine().is_empty()
+            {
+                break;
             }
         }
         let result = match &mut context.native {
@@ -658,15 +657,21 @@ pub(super) fn cleanup_context_state(
 ) -> Result<()> {
     // Handles become terminal before cleanup begins; later failures cannot expose partial state.
     owned.identity.invalidate_resources();
-    owned.async_textures.shutdown();
-    for (_, pending) in owned.pending_textures.drain() {
-        pending.cancelled.store(true, Ordering::Release);
-        if let Err(error) = owned.texture_registry.cancel_upload(pending.id) {
-            failure.get_or_insert_with(|| map_texture(error));
+    owned.decode_textures.shutdown();
+    for handle in owned
+        .texture_pipeline
+        .pending()
+        .keys()
+        .copied()
+        .collect::<Vec<_>>()
+    {
+        if let Some(pending) = owned.texture_pipeline.remove_pending(handle) {
+            pending.cancelled.store(true, Ordering::Release);
+            if let Err(error) = owned.texture_registry.cancel_upload(pending.id) {
+                failure.get_or_insert_with(|| map_texture(error));
+            }
         }
     }
-    owned.texture_failures.clear();
-    // Vulkan reports `NotReady` only when no native device or GPU work exists before `init_device`.
     if let Err(error) = wait_native_idle(&mut owned.native)
         && error != HalError::NotReady
     {
@@ -699,9 +704,15 @@ pub(super) fn cleanup_context_state(
     for (_, shader) in owned.shaders.drain() {
         destroy_native_shader(&mut owned.native, shader.native);
     }
-    for (handle, (id, texture, _, _, _)) in owned.textures.drain() {
-        owned.texture_ready.remove(&handle);
-        if let Err(error) = owned.texture_registry.unload(id) {
+    for (handle, texture) in owned.textures.drain() {
+        let id = owned
+            .texture_pipeline
+            .submitted()
+            .get(&handle)
+            .map(|info| info.id);
+        if let Some(id) = id
+            && let Err(error) = owned.texture_registry.unload(id)
+        {
             failure.get_or_insert_with(|| map_texture(error));
         }
         if let Err(error) = destroy_native_texture(&mut owned.native, texture) {
@@ -722,13 +733,7 @@ pub(super) fn cleanup_context_state(
         failure.get_or_insert_with(|| map_allocation(error));
     }
     destroy_all_render_targets(&mut owned);
-    owned.texture_formats.clear();
-    owned.texture_published_mips.clear();
-    owned.texture_residency_targets.clear();
-    owned.texture_last_transfer.clear();
-    owned.texture_ready.clear();
-    owned.texture_handoffs.clear();
-    owned.texture_transfer_bytes.clear();
+    owned.texture_pipeline.reset();
     if let Err(error) = owned.texture_registry.clear() {
         failure.get_or_insert_with(|| map_texture(error));
     }
@@ -812,7 +817,7 @@ fn destroy_buffer_state(owned: &mut ContextState, failure: &mut Option<Error>) {
 /// Returns an error when validation, handle ownership, readiness, or a backend operation fails.
 #[allow(
     dead_code,
-    reason = "the C raw seam begins an already-configured surface frame"
+    reason = "the C raw boundary begins an already-configured surface frame"
 )]
 pub fn begin_render(
     context: ContextHandle,
@@ -891,7 +896,7 @@ fn configure_surface_recording(
 /// Returns an error when the target is invalid, unsupported, or another frame is active.
 #[allow(
     dead_code,
-    reason = "the C raw seam begins a preconfigured managed-target frame"
+    reason = "the C raw boundary begins a preconfigured managed-target frame"
 )]
 pub fn begin_render_target(context: ContextHandle, target: RenderTargetHandle) -> Result<()> {
     result_status(with_context_mut(context, |context| {

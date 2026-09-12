@@ -176,6 +176,18 @@ fn main() -> anyhow::Result<()> {
             anyhow::bail!("Sponza base-color image is not KTX2");
         }
         let config = TextureConfig {
+            source: TextureSource::Ktx2,
+            generate_mips: true,
+            // Snapshot runs pin the full chain through the frame GPU wait;
+            // interactive runs stay optional: frames never wait for texture
+            // CPU decode and bindings sample magenta fallback until each
+            // first real coarse mip publishes, then stream finer levels.
+            // Submission drives either contract with no application waiting.
+            required_mips: if example.snapshot_enabled() {
+                ez_gfx::REQUIRED_MIPS_FULL
+            } else {
+                0
+            },
             width: 0,
             height: 0,
             mip_count: 0,
@@ -190,11 +202,7 @@ fn main() -> anyhow::Result<()> {
             },
         };
         // Stable bindings remain context-owned after the access wrapper drops.
-        image_bindings.push(
-            context
-                .load_texture(TextureSource::Ktx2, &image.bytes, true, &config)?
-                .binding()?,
-        );
+        image_bindings.push(context.load_texture(&image.bytes, &config)?.binding()?);
     }
     let records = mesh
         .primitives

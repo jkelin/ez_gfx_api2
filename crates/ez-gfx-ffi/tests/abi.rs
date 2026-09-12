@@ -549,6 +549,7 @@ fn texture_descriptor_rejects_unsupported_pipeline_state_before_context_access()
         height: 1,
         mip_count: 1,
         generate_mips: 0,
+        required_mips: 0,
         min_filter: 0,
         mag_filter: 1,
         max_anisotropy: 1.0,

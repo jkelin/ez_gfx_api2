@@ -7,7 +7,8 @@ use super::{
     GeometryAllocation, HashMap, MAX_PIPELINE_CACHE_ENTRIES, MeshPipelineKeyDesc, NativeAllocation,
     NativeContext, NativePipeline, NativeShader, NativeSurface, NativeTexture, NativeTextureMap,
     PackedHandle, PipelineKey, RenderTargetHandle, RenderTargetRecord, ResourceId,
-    SURFACE_DEFAULT_CLEAR, ShaderHandle, ShaderRecord, map_hal, native_layouts,
+    SURFACE_DEFAULT_CLEAR, ShaderHandle, ShaderRecord, SubmittedInfo, TextureHandle, map_hal,
+    native_layouts,
     pipeline_layout_key, prepare_frame_binding_scratch, should_capture_presented,
 };
 
@@ -17,6 +18,7 @@ struct DxActionState<'a> {
     allocations: &'a HashMap<PackedHandle, (u64, NativeAllocation)>,
     vertex_heaps: &'a HashMap<String, GeometryAllocation>,
     textures: &'a NativeTextureMap,
+    submitted: &'a HashMap<TextureHandle, SubmittedInfo>,
     render_targets: &'a HashMap<RenderTargetHandle, RenderTargetRecord>,
     pipelines: &'a HashMap<PipelineKey, NativePipeline>,
     resources: &'a HashMap<ResourceId, FrameNativeResource>,
@@ -288,7 +290,7 @@ fn dx12_barrier_resource<'resources>(
             ez_gfx_backend_dx12::native::NativeFrameResource::Buffer(allocation)
         }
         FrameNativeResource::Texture(handle) => {
-            let (_, NativeTexture::Dx12(texture), _, _, _) =
+            let NativeTexture::Dx12(texture) =
                 state.textures.get(&handle).ok_or(Error::InvalidContext)?
             else {
                 return Err(Error::NativeFailure);
@@ -568,7 +570,13 @@ impl ez_gfx_backend_dx12::native::NativeFrameActionSource for DxActionSource<'_,
                         )?)
                     }
                     ExecutableNode::TextureReadback { texture } => {
-                        let (_, NativeTexture::Dx12(texture), width, height, _) = self
+                        let info = self
+                            .state
+                            .submitted
+                            .get(texture)
+                            .copied()
+                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
+                        let NativeTexture::Dx12(texture) = self
                             .state
                             .textures
                             .get(texture)
@@ -578,8 +586,8 @@ impl ez_gfx_backend_dx12::native::NativeFrameActionSource for DxActionSource<'_,
                         };
                         ez_gfx_backend_dx12::native::NativeFrameAction::TextureReadback {
                             texture,
-                            width: *width,
-                            height: *height,
+                            width: info.width,
+                            height: info.height,
                         }
                     }
                     ExecutableNode::RenderTargetReadback { target } => {
@@ -797,6 +805,7 @@ pub(super) fn execute_dx12_frame_plan(
             allocations: &context.allocations,
             vertex_heaps: &context.vertex_heaps,
             textures: &context.textures,
+            submitted: context.texture_pipeline.submitted(),
             render_targets: &context.render_targets,
             pipelines: &context.pipelines,
             resources: &context.frame_native_resources,

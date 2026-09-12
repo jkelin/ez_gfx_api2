@@ -193,7 +193,8 @@ pub(super) fn initialize_texture_fallback(context: &mut ContextState) -> Result<
     }
 
     let bindings = context
-        .pending_textures
+        .texture_pipeline
+        .pending()
         .iter()
         .filter(|(_, pending)| !pending.fallback_published)
         .map(|(handle, pending)| {
@@ -207,7 +208,8 @@ pub(super) fn initialize_texture_fallback(context: &mut ContextState) -> Result<
     for (handle, binding) in bindings {
         publish_reserved_fallback(context, binding)?;
         context
-            .pending_textures
+            .texture_pipeline
+            .pending_mut()
             .get_mut(&handle)
             .ok_or(Error::InvalidContext)?
             .fallback_published = true;

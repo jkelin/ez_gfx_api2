@@ -1,11 +1,12 @@
-//! Runtime integration and contract tests.
+//! Texture decode integration and contract tests.
 
 use ez_gfx_core::capability::CompressionSupport;
 use ez_gfx_hal::{CompletionToken, QueueKind, TextureFormat};
-use ez_gfx_runtime::texture::{
-    DecodedMip, DecodedTexture, TextureDecoder, TextureDestination, TextureError, TextureEvent,
-    TextureRegistry, TextureSource, TextureUploadTelemetry, coarse_to_fine_mip_levels,
-    generate_mips, register_texture_decoder, unregister_texture_decoder,
+use ez_gfx_texture_manager::TextureRegistry;
+use ez_gfx_texture_manager::texture::{
+    DecodedMip, DecodedTexture, TextureDecoder, TextureDestination, TextureError, TextureSource,
+    TextureUploadTelemetry, coarse_to_fine_mip_levels, generate_mips, register_texture_decoder,
+    unregister_texture_decoder,
 };
 use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
 use std::sync::Arc;
@@ -653,40 +654,19 @@ fn polling_reports_not_ready_until_transfer_tokens_reach_ready() {
     assert_eq!(registry.binding_index(texture), Err(TextureError::NotReady));
     assert_eq!(registry.poll(QueueKind::Transfer, 3).unwrap(), 1);
     assert_eq!(registry.binding_index(texture), Ok(0));
-    assert_eq!(
-        registry.drain_events(),
-        vec![TextureEvent::Resident {
-            texture,
-            binding: 0,
-            resident_mips: 1
-        }]
-    );
     assert_eq!(registry.poll(QueueKind::Transfer, 4).unwrap(), 0);
     assert_eq!(registry.resident_mips(texture), Ok(1));
     assert_eq!(registry.poll(QueueKind::Transfer, 5).unwrap(), 1);
     assert_eq!(registry.resident_mips(texture), Ok(2));
-    assert_eq!(
-        registry.drain_events(),
-        vec![TextureEvent::Resident {
-            texture,
-            binding: 0,
-            resident_mips: 2
-        }]
-    );
     registry.unload(texture).unwrap();
-    assert_eq!(
-        registry.drain_events(),
-        vec![TextureEvent::Unloaded { texture }]
-    );
     assert_eq!(registry.binding_index(texture), Err(TextureError::NotFound));
 }
 
 #[test]
-fn cancel_upload_reuses_binding_without_emitting_public_events() {
+fn cancel_upload_reuses_binding_silently() {
     let mut registry = TextureRegistry::new(1, 1).unwrap();
     let failed = registry.begin_upload().unwrap();
     registry.cancel_upload(failed).unwrap();
-    assert!(registry.drain_events().is_empty());
 
     let replacement = registry.begin_upload().unwrap();
     assert_ne!(replacement, failed);
@@ -711,7 +691,6 @@ fn clear_invalidates_every_slot_and_rebuilds_the_free_list() {
 
     registry.clear().unwrap();
 
-    assert!(registry.drain_events().is_empty());
     for stale in [resident, allocated, vacant] {
         assert_eq!(registry.binding_index(stale), Err(TextureError::NotFound));
     }

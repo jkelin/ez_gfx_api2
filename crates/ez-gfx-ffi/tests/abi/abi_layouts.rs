@@ -126,7 +126,7 @@ fn layouts_are_stable() {
             size_of::<EzGfxTextureDesc>(),
             align_of::<EzGfxTextureDesc>()
         ),
-        (48, 8)
+        (56, 8)
     );
     assert_eq!(
         [
@@ -143,9 +143,10 @@ fn layouts_are_stable() {
             offset_of!(EzGfxTextureDesc, address_mode_v),
             offset_of!(EzGfxTextureDesc, address_mode_w),
             offset_of!(EzGfxTextureDesc, debug_label),
-            offset_of!(EzGfxTextureDesc, debug_label_length)
+            offset_of!(EzGfxTextureDesc, debug_label_length),
+            offset_of!(EzGfxTextureDesc, required_mips)
         ],
-        [0, 1, 4, 8, 12, 16, 17, 18, 20, 24, 25, 26, 32, 40]
+        [0, 1, 4, 8, 12, 16, 17, 18, 20, 24, 25, 26, 32, 40, 48]
     );
     // ABI 25 adds the render-target declaration struct. Discriminant-carrying
     // enums stay one byte; the descriptor borrows its name and candidate ranges.
@@ -809,6 +810,7 @@ fn optional_and_nested_counted_strings_enforce_the_same_contract() {
         height: 1,
         mip_count: 1,
         generate_mips: 0,
+        required_mips: 0,
         min_filter: 0,
         mag_filter: 0,
         max_anisotropy: 1.0,

@@ -146,9 +146,15 @@ fn publish_texture(
     sampler_desc: TextureSamplerDesc,
     cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     completions: Vec<CompletionToken>,
+    total_mips: u32,
 ) -> (NativeTexture, Vec<CompletionToken>) {
-    let mip_count = u32::try_from(completions.len()).expect("validated mip count fits u32");
-    let mip_completions = completions.iter().rev().map(|token| token.value).collect();
+    let mip_count = total_mips;
+    // Submitted tokens occupy the coarse tail of largest-first storage;
+    // finer levels keep zero until a later upload submits them.
+    let mut mip_completions = vec![0_u64; total_mips as usize];
+    for (slot, token) in completions.iter().rev().enumerate() {
+        mip_completions[total_mips as usize - completions.len() + slot] = token.value;
+    }
     (
         NativeTexture {
             resource,
@@ -316,7 +322,30 @@ impl NativeContext {
         binding: u32,
         sampler_desc: TextureSamplerDesc,
     ) -> Result<(NativeTexture, Vec<CompletionToken>), AllocationError> {
+        let prefix = u32::try_from(mips.len()).map_err(|_| AllocationError::NativeFailure)?;
+        self.create_texture_with_prefix(format, mips, binding, sampler_desc, prefix)
+    }
+
+    /// Creates full sampled storage but submits only the coarsest `prefix` mips.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty or over-long prefix on top of every
+    /// [`Self::create_texture`] failure.
+    pub fn create_texture_with_prefix(
+        &mut self,
+        format: TextureFormat,
+        mips: &[ImageMip<'_>],
+        binding: u32,
+        sampler_desc: TextureSamplerDesc,
+        prefix: u32,
+    ) -> Result<(NativeTexture, Vec<CompletionToken>), AllocationError> {
         validate_texture_request(format, mips, binding)?;
+        // The prefix names submitted coarse levels, never stored ones: zero
+        // would publish nothing and over-length would gate a missing token.
+        if prefix == 0 || prefix as usize > mips.len() {
+            return Err(AllocationError::ZeroSize);
+        }
         let dxgi = texture_format_dxgi(format).ok_or(AllocationError::NativeFailure)?;
         let (resource, allocation, desc) =
             self.create_texture_resource(mips, dxgi, D3D12_RESOURCE_FLAG_NONE, 1)?;
@@ -380,8 +409,12 @@ impl NativeContext {
         }
         let cancellation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let first = self.next_texture_fence;
+        // Coarse-first job order pairs the head of this range with the
+        // smallest mips; zipping stops the batch at exactly `prefix` jobs so
+        // finer levels wait for a later upload instead of head-of-line
+        // blocking behind earlier textures.
         let next = first
-            .checked_add(mips.len() as u64)
+            .checked_add(u64::from(prefix))
             .ok_or(AllocationError::NativeFailure)?;
         let completions = (first..next)
             .map(|value| CompletionToken::new(QueueKind::TextureTransfer, value))
@@ -438,6 +471,7 @@ impl NativeContext {
             sampler_desc,
             cancellation,
             completions,
+            u32::try_from(mips.len()).map_err(|_| AllocationError::NativeFailure)?,
         ))
     }
 
@@ -640,6 +674,11 @@ impl NativeContext {
         }
         let first = usize::try_from(texture.mip_count - resident_mips)
             .map_err(|_| AllocationError::NativeFailure)?;
+        // Unsubmitted levels stay zero until a later phase-two upload fills
+        // them; exposing them early would sample uninitialized storage.
+        if texture.mip_completions[first..].contains(&0) {
+            return Err(AllocationError::NativeFailure);
+        }
         let required = texture.mip_completions[first..]
             .iter()
             .copied()
@@ -648,16 +687,54 @@ impl NativeContext {
         if self.completed_texture_transfer_value()? < required {
             return Err(AllocationError::NativeFailure);
         }
+        self.install_prefix_view(texture, resident_mips)
+    }
+
+    /// Installs the required-prefix view and descriptor before its transfer completes.
+    ///
+    /// Unlike [`Self::publish_texture_mips`], this skips the transfer-completion gate:
+    /// the caller attaches the required completion token as a GPU wait before any draw
+    /// executes, which orders the copy and the pixel-shader-resource transition before
+    /// sampling. Graphics-fence loss and in-flight descriptor guards still apply, so a
+    /// busy heap defers installation instead of racing prior draws.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty/out-of-range range, unsubmitted levels, worker
+    /// failure, or device loss.
+    pub fn reference_texture_prefix(
+        &mut self,
+        texture: &mut NativeTexture,
+        resident_mips: u32,
+    ) -> Result<(), AllocationError> {
+        if resident_mips == 0 || resident_mips > texture.mip_count {
+            return Err(AllocationError::ZeroSize);
+        }
+        let first = usize::try_from(texture.mip_count - resident_mips)
+            .map_err(|_| AllocationError::NativeFailure)?;
+        // Only submitted levels may be exposed; the GPU wait attached by the
+        // caller covers their content and resource-state transition.
+        if texture.mip_completions[first..].contains(&0) {
+            return Err(AllocationError::NativeFailure);
+        }
         // SAFETY: the context retains the graphics fence throughout this nonblocking counter read.
         let graphics_completed = unsafe { self.fence.GetCompletedValue() };
         if graphics_completed == u64::MAX {
             return Err(AllocationError::DeviceLost);
         }
         // Shader-visible descriptors cannot be overwritten while an earlier frame may still
-        // consume the slot. Publishing remains nonblocking and can be retried after polling.
+        // consume the slot. Referencing remains nonblocking and retries after polling.
         if graphics_completed < self.next_fence.saturating_sub(1) {
             return Err(AllocationError::NativeFailure);
         }
+        self.install_prefix_view(texture, resident_mips)
+    }
+
+    fn install_prefix_view(
+        &mut self,
+        texture: &mut NativeTexture,
+        resident_mips: u32,
+    ) -> Result<(), AllocationError> {
         if texture.resident_mips == resident_mips {
             return Ok(());
         }
@@ -957,9 +1034,30 @@ impl NativeContext {
         Ok(value)
     }
 }
+impl NativeContext {
+    /// Returns retained texture-staging bucket capacity for global eviction.
+    pub fn retained_texture_staging_bytes(&self) -> u64 {
+        self.texture_staging.retained_bytes()
+    }
+
+    /// Returns the largest completed texture-staging bucket for global eviction.
+    pub fn largest_texture_staging_completed(&self, completed: u64) -> Option<u64> {
+        self.texture_staging
+            .largest_completed_capacity(ez_gfx_hal::QueueKind::TextureTransfer, completed)
+    }
+
+    /// Removes the largest completed texture-staging bucket for global eviction.
+    pub fn pop_largest_texture_staging(&mut self, completed: u64) -> Option<NativeAllocation> {
+        self.texture_staging
+            .pop_largest_completed(ez_gfx_hal::QueueKind::TextureTransfer, completed)
+    }
+}
+
 #[path = "texture_render_target.rs"]
 mod render_target;
 
+#[path = "texture_backend.rs"]
+mod texture_backend;
 #[cfg(test)]
 mod tests {
     use super::*;

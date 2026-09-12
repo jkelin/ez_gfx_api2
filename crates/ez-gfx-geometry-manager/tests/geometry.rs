@@ -1,8 +1,8 @@
-//! Runtime geometry allocation contracts.
+//! Geometry manager allocation contracts behind the extraction boundary.
 
 use ez_gfx_core::handle::{LocalHandle, PackedHandle};
+use ez_gfx_geometry_manager::{GeometryError, GeometryManager};
 use ez_gfx_hal::{CompletionToken, QueueKind};
-use ez_gfx_runtime::geometry::{GeometryError, GeometryManager, StagingPool};
 
 fn handle(slot: u32, generation: u32) -> PackedHandle {
     PackedHandle::child(
@@ -127,23 +127,4 @@ fn heap_growth_rejects_nonincreasing_capacity() {
         geometry.grow_index_heap(8),
         Err(GeometryError::InvalidCapacity)
     );
-}
-
-#[test]
-fn staging_pool_grows_without_fixed_slot_admission() {
-    let mut pool = StagingPool::new();
-    let slots: Vec<_> = (0..1_000).map(|_| pool.checkout(64, 0).unwrap()).collect();
-    assert_eq!(slots.len(), 1_000);
-}
-
-#[test]
-fn staging_pool_reuses_only_completed_compatible_slots() {
-    let mut pool = StagingPool::new();
-    let first = pool.checkout(64, 0).unwrap();
-    pool.retire(first, CompletionToken::new(QueueKind::Transfer, 3).unwrap())
-        .unwrap();
-    let second = pool.checkout(64, 2).unwrap();
-    assert_ne!(first, second);
-    pool.release_unsubmitted(second).unwrap();
-    assert_eq!(pool.checkout(64, 3).unwrap(), first);
 }

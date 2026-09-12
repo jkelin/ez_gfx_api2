@@ -1,4 +1,5 @@
 use super::*;
+use ez_gfx_texture_manager::texture::{TextureDestination, TextureSource};
 use std::collections::HashSet;
 
 #[cfg(not(target_vendor = "apple"))]
@@ -154,6 +155,12 @@ fn surface_insert_rollback_reports_abandonment_for_every_failure_branch() {
 #[cfg(not(target_vendor = "apple"))]
 fn texture_config() -> TextureConfig {
     TextureConfig {
+        source: TextureSource::Rgba8 {
+            width: 1,
+            height: 1,
+        },
+        generate_mips: false,
+        required_mips: 1,
         width: 1,
         height: 1,
         mip_count: 1,
@@ -178,22 +185,12 @@ fn texture_admission_is_nonblocking_and_pending_cancellation_invalidates_the_han
     let context = create_context(vulkan_options().unwrap()).unwrap();
     let gate = Arc::new(std::sync::Barrier::new(2));
     with_context_mut(context, |state| {
-        state.async_textures.decode_gate = Some(gate.clone());
+        state.decode_textures.set_decode_gate(Some(gate.clone()));
         Ok(())
     })
     .unwrap();
 
-    let texture = load_texture(
-        context,
-        TextureSource::Rgba8 {
-            width: 1,
-            height: 1,
-        },
-        &[1, 2, 3, 4],
-        false,
-        &texture_config(),
-    )
-    .unwrap();
+    let texture = load_texture(context, &[1, 2, 3, 4], &texture_config()).unwrap();
     assert_eq!(
         poll_upload_event(context),
         Ok(Some(crate::UploadEvent {
@@ -231,19 +228,8 @@ fn natural_texture_submissions_need_one_context_wait_and_keep_lossless_events() 
     let context = dx12_context();
     let mut textures = Vec::new();
     for color in 0_u8..9 {
-        textures.push(
-            load_texture(
-                context,
-                TextureSource::Rgba8 {
-                    width: 1,
-                    height: 1,
-                },
-                &[color, color, color, 255],
-                false,
-                &texture_config(),
-            )
-            .unwrap(),
-        );
+        textures
+            .push(load_texture(context, &[color, color, color, 255], &texture_config()).unwrap());
     }
 
     assert_eq!(wait_idle(context), Ok(()));
@@ -303,12 +289,12 @@ fn first_coarse_publication_records_handoff_telemetry_once() {
             .insert(ResourceKind::Texture)
             .map_err(map_lifecycle)?;
         let texture = TextureHandle::from_packed(packed).map_err(|_| Error::NativeFailure)?;
-        state.texture_ready.insert(
+        state.texture_pipeline.ready_mut().insert(
             texture,
             CompletionToken::new(QueueKind::TextureTransfer, 3)
                 .map_err(|_| Error::NativeFailure)?,
         );
-        state.texture_handoffs.insert(
+        state.texture_pipeline.handoffs_mut().insert(
             texture,
             Instant::now()
                 .checked_sub(std::time::Duration::from_micros(10))
@@ -316,20 +302,21 @@ fn first_coarse_publication_records_handoff_telemetry_once() {
         );
 
         record_texture_ready(state, texture, 2);
-        assert!(state.texture_ready.contains_key(&texture));
+        assert!(state.texture_pipeline.ready().contains_key(&texture));
         record_texture_ready(state, texture, 3);
         // GPU completion alone is insufficient while a frame still prevents publication.
-        assert!(state.texture_ready.contains_key(&texture));
+        assert!(state.texture_pipeline.ready().contains_key(&texture));
         assert_eq!(
             state
-                .texture_telemetry
+                .texture_pipeline
+                .telemetry()
                 .snapshot()
                 .handoff_latency_microseconds,
             0
         );
-        state.texture_published_mips.insert(texture, 1);
+        state.texture_pipeline.published_mut().insert(texture, 1);
         record_texture_ready(state, texture, 3);
-        assert!(!state.texture_ready.contains_key(&texture));
+        assert!(!state.texture_pipeline.ready().contains_key(&texture));
         Ok(texture)
     })
     .unwrap();
@@ -340,7 +327,8 @@ fn first_coarse_publication_records_handoff_telemetry_once() {
         record_texture_ready(state, texture, u64::MAX);
         assert_eq!(
             state
-                .texture_telemetry
+                .texture_pipeline
+                .telemetry()
                 .snapshot()
                 .handoff_latency_microseconds,
             snapshot.handoff_latency_microseconds
@@ -373,21 +361,21 @@ fn decode_worker_topology_defaults_and_honors_explicit_counts() {
         .map_or(2, usize::from)
         .saturating_sub(1)
         .max(1);
-    let default_state = AsyncTextureState::new_with_workers(0).unwrap();
+    let default_state = DecodeDriver::new(0).unwrap();
     assert_eq!(default_state.worker_count(), expected_default);
     // Laziness is the point: no Rayon threads exist before the first decode.
-    assert!(default_state.pool.is_none());
-    let explicit_state = AsyncTextureState::new_with_workers(2).unwrap();
+    assert!(!default_state.is_started());
+    let explicit_state = DecodeDriver::new(2).unwrap();
     assert_eq!(explicit_state.worker_count(), 2);
-    assert!(explicit_state.pool.is_none());
+    assert!(!explicit_state.is_started());
 }
 
 #[test]
 fn decode_worker_topology_rejects_absurd_counts_before_spawning() {
     // The admission cap precedes pool construction, so no threads are spawned.
     assert_eq!(
-        AsyncTextureState::new_with_workers(u32::MAX).map(|_| ()),
-        Err(Error::InvalidArgument)
+        DecodeDriver::new(u32::MAX).map(|_| ()),
+        Err(DecodeDriverError::InvalidWorkerCount)
     );
 }
 
@@ -398,7 +386,7 @@ fn context_decode_worker_count_reaches_pool_construction() {
     let explicit_options = vulkan_options().unwrap().with_texture_decode_workers(2);
     let explicit_context = create_context(explicit_options).unwrap();
     let explicit_workers = with_context_mut(explicit_context, |state| {
-        Ok(state.async_textures.worker_count())
+        Ok(state.decode_textures.worker_count())
     })
     .unwrap();
     assert_eq!(explicit_workers, 2);
@@ -432,21 +420,11 @@ fn resource_diagnostics_reports_pending_uploads_then_rejects_stale_context() {
     // Hold the decode worker so the admitted texture stays decode-pending.
     let gate = Arc::new(std::sync::Barrier::new(2));
     with_context_mut(context, |state| {
-        state.async_textures.decode_gate = Some(gate.clone());
+        state.decode_textures.set_decode_gate(Some(gate.clone()));
         Ok(())
     })
     .unwrap();
-    let _texture = load_texture(
-        context,
-        TextureSource::Rgba8 {
-            width: 1,
-            height: 1,
-        },
-        &[1, 2, 3, 4],
-        false,
-        &texture_config(),
-    )
-    .unwrap();
+    let _texture = load_texture(context, &[1, 2, 3, 4], &texture_config()).unwrap();
     let heap = create_vertex_heap(context, "positions", 4).unwrap();
     let _vertices = upload_vertices(context, heap, &[1u32, 2, 3, 4]).unwrap();
     let _indices = upload_indices(context, &[0u32, 1, 2]).unwrap();
@@ -592,9 +570,14 @@ fn aggregate_staging_budget_bounds_many_distinct_strides() {
             total = total.saturating_add(pool.retained_bytes());
         }
         total = total.saturating_add(state.counter_pool.retained_bytes());
-        // 88 MiB retained against a 64 MiB ceiling evicts exactly three 8 MiB
+        // 88 MiB retained against a 64 MiB ceiling evicts exactly four 8 MiB
         // buckets largest-first; per-pool ceilings never bound this shape.
-        assert_eq!(total, ez_gfx_hal::DEFAULT_STAGING_AGGREGATE_BUDGET);
+        // The fourth eviction proves the backend texture cache (one 64 KiB
+        // fallback bucket) counts toward the combined cap: without it the
+        // loop would stop at 64 MiB after three evictions.
+        assert_eq!(total, 56 * 1024 * 1024);
+        let combined = total.saturating_add(retained_native_texture_staging(&state.native));
+        assert!(combined <= ez_gfx_hal::DEFAULT_STAGING_AGGREGATE_BUDGET);
         assert_eq!(state.staging_high_water_bytes, 88 * 1024 * 1024);
         Ok(())
     })
@@ -609,7 +592,7 @@ fn failed_texture_admission_leaves_no_pending_state_behind() {
     // registry, identity, or pending residue behind.
     let context = create_context(vulkan_options().unwrap()).unwrap();
     with_context_mut(context, |state| {
-        assert!(state.async_textures.pool.is_none());
+        assert!(!state.decode_textures.is_started());
         Ok(())
     })
     .unwrap();
@@ -618,16 +601,17 @@ fn failed_texture_admission_leaves_no_pending_state_behind() {
     assert!(
         load_texture(
             context,
-            TextureSource::Custom(200),
             &[1, 2, 3],
-            false,
-            &texture_config(),
+            &TextureConfig {
+                source: TextureSource::Custom(200),
+                ..texture_config()
+            },
         )
         .is_err()
     );
     with_context_mut(context, |state| {
-        assert!(state.async_textures.pool.is_some());
-        assert!(state.pending_textures.is_empty());
+        assert!(state.decode_textures.is_started());
+        assert!(state.texture_pipeline.pending().is_empty());
         Ok(())
     })
     .unwrap();
@@ -800,22 +784,12 @@ fn device_loss_sweeps_pending_decodes_to_fast_device_lost() {
     let context = create_context(vulkan_options().unwrap()).unwrap();
     let gate = Arc::new(std::sync::Barrier::new(2));
     with_context_mut(context, |state| {
-        state.async_textures.decode_gate = Some(gate.clone());
+        state.decode_textures.set_decode_gate(Some(gate.clone()));
         Ok(())
     })
     .unwrap();
 
-    let texture = load_texture(
-        context,
-        TextureSource::Rgba8 {
-            width: 1,
-            height: 1,
-        },
-        &[1, 2, 3, 4],
-        false,
-        &texture_config(),
-    )
-    .unwrap();
+    let texture = load_texture(context, &[1, 2, 3, 4], &texture_config()).unwrap();
     assert_eq!(texture_binding(context, texture), Ok(0));
 
     // Loss preserves the already-queued ownership transition, then emits one terminal event.
@@ -840,7 +814,7 @@ fn device_loss_sweeps_pending_decodes_to_fast_device_lost() {
     );
     assert_eq!(poll_upload_event(context), Err(Error::DeviceLost));
     with_context_mut(context, |state| {
-        assert!(state.pending_textures.is_empty());
+        assert!(state.texture_pipeline.pending().is_empty());
         Ok(())
     })
     .unwrap();
@@ -851,23 +825,388 @@ fn device_loss_sweeps_pending_decodes_to_fast_device_lost() {
     assert_eq!(destroy_context(context), Ok(()));
 }
 
+#[cfg(not(target_vendor = "apple"))]
 #[test]
-fn coarse_range_completion_ignores_hidden_fine_updates() {
-    for (values, resident, expected) in [
-        (&[7, 2, 1][..], 1, Some(1)),
-        (&[7, 9, 1][..], 2, Some(9)),
-        (&[7, 9, 1][..], 3, Some(9)),
-        (&[0, 2, 1][..], 2, Some(2)),
-        (&[0, 2, 1][..], 3, None),
-        (&[1][..], 0, None),
-        (&[1][..], 2, None),
-        (&[][..], 1, None),
-    ] {
+fn render_target_lifecycle_rejects_misuse_before_native_work() {
+    use ez_gfx_runtime::target::{ClearValue, TargetDeclaration, TargetUsage};
+    let context = create_context(vulkan_options().unwrap()).unwrap();
+    let declaration = TargetDeclaration::new(
+        "rt-proof",
+        TargetUsage::Color,
+        1.0,
+        1,
+        vec![Format::Rgba8Unorm],
+        ClearValue::Color([1.0, 0.0, 0.0, 1.0]),
+        true,
+    )
+    .unwrap();
+    // Empty extents fail before leasing allocator state; no device is needed.
+    assert_eq!(
+        create_render_target(context, &declaration, 0, 64),
+        Err(Error::InvalidArgument)
+    );
+    // Depth usage is deferred to the pass-attachment slice.
+    let depth = TargetDeclaration::new(
+        "rt-depth",
+        TargetUsage::Depth,
+        1.0,
+        1,
+        vec![Format::Depth32Float],
+        ClearValue::DepthStencil {
+            depth: 1.0,
+            stencil: 0,
+        },
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        create_render_target(context, &depth, 64, 64),
+        Err(Error::Unsupported)
+    );
+    // Unknown handles never reach native code. Live-target creation, format,
+    // extent, clear, and destroy need an initialized device, which requires a
+    // real surface; that path is proven by the native allocation tests on
+    // Vulkan, DX12, and Metal instead of here.
+    let phantom = RenderTargetHandle::from_packed(
+        PackedHandle::child(
+            LocalHandle::new(1, 1).unwrap(),
+            LocalHandle::new(7, 1).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        render_target_format(context, phantom),
+        Err(Error::InvalidArgument)
+    );
+    assert_eq!(
+        render_target_extent(context, phantom),
+        Err(Error::InvalidArgument)
+    );
+    assert_eq!(
+        render_target_clear(context, phantom),
+        Err(Error::InvalidArgument)
+    );
+    destroy_render_target(context, phantom);
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn probe_render_target_format_rejects_misuse_before_native_work() {
+    let context = create_context(vulkan_options().unwrap()).unwrap();
+    // Sample counts outside the closed set fail before probing any device.
+    assert_eq!(
+        probe_render_target_format(context, Format::Rgba8Unorm, 3),
+        Err(Error::InvalidArgument)
+    );
+    // Probing without an initialized device cannot query adapter capabilities.
+    // Live-device resolution is proven by the native allocation tests on
+    // Vulkan, DX12, and Metal instead of here.
+    assert_eq!(
+        probe_render_target_format(context, Format::Rgba8Unorm, 1),
+        Err(Error::NativeFailure)
+    );
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn begin_render_target_rejects_foreign_handles() {
+    let context = create_context(vulkan_options().unwrap()).unwrap();
+    // A forged handle resolves to nothing.
+    let phantom = RenderTargetHandle::from_packed(
+        PackedHandle::child(
+            LocalHandle::new(1, 1).unwrap(),
+            LocalHandle::new(7, 1).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        begin_render_target(context, phantom),
+        Err(Error::Lifecycle(LifecycleError::WrongOwner))
+    );
+    // A live texture handle is the wrong kind, never an alias.
+    let texture = load_texture(context, &[1, 2, 3, 4], &texture_config()).unwrap();
+    let mistaken = RenderTargetHandle::from_packed(texture.packed()).unwrap();
+    assert_eq!(
+        begin_render_target(context, mistaken),
+        Err(Error::Lifecycle(LifecycleError::WrongResourceKind))
+    );
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn stale_target() -> RenderTargetHandle {
+    RenderTargetHandle::from_packed(
+        PackedHandle::child(
+            LocalHandle::new(1, 1).unwrap(),
+            LocalHandle::new(7, 1).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn frame_begin_clears_stale_render_target_override() {
+    let context = create_context(vulkan_options().unwrap()).unwrap();
+    with_context_mut(context, |context| {
+        context.frame_render_target = Some(stale_target());
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(frame_begin(context), Ok(()));
+    with_context_mut(context, |context| {
+        assert_eq!(context.frame_render_target, None);
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn destroy_render_target_clears_bound_override() {
+    let context = create_context(vulkan_options().unwrap()).unwrap();
+    with_context_mut(context, |context| {
+        context.frame_render_target = Some(stale_target());
+        Ok(())
+    })
+    .unwrap();
+    // Unknown handles stay infallible, but a matching stale binding is dropped.
+    destroy_render_target(context, stale_target());
+    with_context_mut(context, |context| {
+        assert_eq!(context.frame_render_target, None);
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn heap_slots_unify_textures_and_render_targets_without_collision() {
+    use std::collections::HashSet;
+    let context = create_context(vulkan_options().unwrap()).unwrap();
+    with_context_mut(context, |context| {
+        // Textures (`begin_upload`) and render targets (same call in
+        // `create_render_target`) draw from one free-list, so interleaved
+        // leases must never share a binding.
+        let mut leased = Vec::new();
+        for _ in 0..3 {
+            let texture = context.texture_registry.begin_upload().unwrap();
+            let target = context.texture_registry.begin_upload().unwrap();
+            leased.push(texture);
+            leased.push(target);
+        }
+        let bindings: HashSet<u32> = leased
+            .iter()
+            .map(|id| context.texture_registry.reserved_binding(*id).unwrap())
+            .collect();
+        assert_eq!(bindings.len(), leased.len());
+        for id in leased {
+            context.texture_registry.cancel_upload(id).unwrap();
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn heap_slot_release_reuses_the_freed_binding() {
+    let context = create_context(vulkan_options().unwrap()).unwrap();
+    with_context_mut(context, |context| {
+        // `destroy_render_target` releases via `cancel_upload`; the next lease
+        // must reuse the freed slot instead of growing the heap.
+        let first = context.texture_registry.begin_upload().unwrap();
+        let binding = context.texture_registry.reserved_binding(first).unwrap();
+        context.texture_registry.cancel_upload(first).unwrap();
+        let second = context.texture_registry.begin_upload().unwrap();
         assert_eq!(
-            super::texture::mip_range_completion(values, resident),
-            expected
+            context.texture_registry.reserved_binding(second).unwrap(),
+            binding
         );
+        context.texture_registry.cancel_upload(second).unwrap();
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn heap_slot_exhaustion_is_shared_and_fail_fast() {
+    let capacity = ez_gfx_runtime::binding::MAX_TEXTURE_HEAP_CAPACITY as usize;
+    let context = create_context(vulkan_options().unwrap()).unwrap();
+    with_context_mut(context, |context| {
+        // Textures and targets share one cap: filling it with texture leases
+        // leaves no room for a target lease, mapping to `NativeFailure` like
+        // the old top-down range exhaustion did.
+        let mut leased = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            leased.push(context.texture_registry.begin_upload().unwrap());
+        }
+        assert_eq!(
+            context.texture_registry.begin_upload().map(|_| ()),
+            Err(ez_gfx_texture_manager::TextureError::CapacityExceeded)
+        );
+        for id in leased {
+            context.texture_registry.cancel_upload(id).unwrap();
+        }
+        // The heap is whole again after release.
+        context.texture_registry.begin_upload().unwrap();
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn rejected_render_target_admissions_leave_no_allocator_residue() {
+    use ez_gfx_runtime::target::{ClearValue, TargetDeclaration, TargetUsage};
+    let context = create_context(vulkan_options().unwrap()).unwrap();
+    let color = TargetDeclaration::new(
+        "rt-residue",
+        TargetUsage::Color,
+        1.0,
+        1,
+        vec![Format::Rgba8Unorm],
+        ClearValue::Color([0.0, 0.0, 0.0, 0.0]),
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        create_render_target(context, &color, 0, 64),
+        Err(Error::InvalidArgument)
+    );
+    let depth = TargetDeclaration::new(
+        "rt-residue-depth",
+        TargetUsage::Depth,
+        1.0,
+        1,
+        vec![Format::Depth32Float],
+        ClearValue::DepthStencil {
+            depth: 1.0,
+            stencil: 0,
+        },
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        create_render_target(context, &depth, 64, 64),
+        Err(Error::Unsupported)
+    );
+    // A later texture admission takes slot zero, proving the rejections leased
+    // nothing from the shared heap.
+    let texture = load_texture(context, &[1, 2, 3, 4], &texture_config()).unwrap();
+    with_context_mut(context, |context| {
+        let pending = context.texture_pipeline.pending().get(&texture).unwrap();
+        let binding = context
+            .texture_registry
+            .reserved_binding(pending.id)
+            .unwrap();
+        assert_eq!(binding, 0);
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn explicit_selection_rejects_unknown_identity_before_native_calls() {
+    // No surface is created, shown, or activated by this test.
+    let options = vulkan_options().unwrap().with_adapter([0xA5; 16], false);
+    assert_eq!(create_context(options), Err(Error::InvalidArgument));
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn explicit_selection_creates_context_for_enumerated_adapter() {
+    // No surface is created, shown, or activated by this test.
+    let wanted = query_adapter_report(true)
+        .into_iter()
+        .filter(|report| report.adapter().backend() == Backend::Vulkan)
+        .find(ez_gfx_runtime::AdapterReport::admitted)
+        .expect("at least one profile-admitted Vulkan adapter")
+        .adapter()
+        .stable_id();
+    let options = vulkan_options().unwrap().with_adapter(wanted, true);
+    let context = create_context(options).expect("enumerated adapter creates a context");
+    assert_eq!(destroy_context(context), Ok(()));
+}
+
+#[test]
+fn adapter_report_names_every_enumerated_adapter() {
+    // No surface is created, shown, or activated by this test.
+    let adapters = enumerate_adapters();
+    assert!(!adapters.is_empty());
+    let mut identities = HashSet::new();
+    for adapter in &adapters {
+        assert!(identities.insert((adapter.backend(), adapter.stable_id())));
+    }
+    let strict = query_adapter_report(false);
+    let permissive = query_adapter_report(true);
+    assert_eq!(strict.len(), adapters.len());
+    assert_eq!(permissive.len(), adapters.len());
+    for (info, report) in adapters.iter().zip(&strict) {
+        assert_eq!(report.adapter().stable_id(), info.stable_id());
+        assert_eq!(
+            report.admitted(),
+            report.errors().is_empty() && !report.software_rejected()
+        );
+    }
+    // Opting into software never un-admits an adapter.
+    for (strict_report, permissive_report) in strict.iter().zip(&permissive) {
+        if strict_report.admitted() {
+            assert!(permissive_report.admitted());
+        }
     }
 }
 
-include!("render_target_tests.rs");
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn required_prefix_withholds_device_ready_until_published() {
+    let context = create_context(vulkan_options().unwrap()).unwrap();
+    let texture = load_texture(context, &[1, 2, 3, 4], &texture_config()).unwrap();
+    assert_eq!(
+        poll_upload_event(context),
+        Ok(Some(crate::UploadEvent {
+            resource: crate::UploadResource::Texture(texture),
+            status: crate::UploadStatus::SourceStaged,
+        }))
+    );
+    with_context_mut(context, |state| {
+        let id = state
+            .texture_pipeline
+            .pending()
+            .get(&texture)
+            .ok_or(Error::NativeFailure)?
+            .id;
+        state
+            .texture_registry
+            .set_required_mips(id, 2)
+            .map_err(map_texture)?;
+        let token = CompletionToken::new(QueueKind::TextureTransfer, 5)
+            .map_err(|_| Error::NativeFailure)?;
+        state.texture_pipeline.ready_mut().insert(texture, token);
+        // One published mip cannot satisfy two required: the gate holds and
+        // no DeviceReady enters the lossless queue.
+        state.texture_pipeline.published_mut().insert(texture, 1);
+        record_texture_ready(state, texture, 5);
+        assert!(state.texture_pipeline.ready().contains_key(&texture));
+        // The second published level completes the required prefix.
+        state.texture_pipeline.published_mut().insert(texture, 2);
+        record_texture_ready(state, texture, 5);
+        assert!(!state.texture_pipeline.ready().contains_key(&texture));
+        Ok(())
+    })
+    .unwrap();
+    // Only the completed required prefix reports DeviceReady.
+    assert_eq!(
+        poll_upload_event(context),
+        Ok(Some(crate::UploadEvent {
+            resource: crate::UploadResource::Texture(texture),
+            status: crate::UploadStatus::DeviceReady,
+        }))
+    );
+    // Exactly one DeviceReady: the withheld first record queued nothing.
+    assert_eq!(poll_upload_event(context), Ok(None));
+    assert_eq!(destroy_context(context), Ok(()));
+}

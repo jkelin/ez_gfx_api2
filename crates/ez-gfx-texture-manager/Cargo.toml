@@ -1,0 +1,23 @@
+[package]
+name = "ez-gfx-texture-manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+basis = ["dep:basisu"]
+ktx2 = ["dep:ktx2"]
+
+[dependencies]
+crossbeam-channel.workspace = true
+ez-gfx-core.workspace = true
+ez-gfx-hal.workspace = true
+image.workspace = true
+ktx2 = { workspace = true, optional = true }
+basisu = { workspace = true, optional = true }
+rayon.workspace = true
+
+[lints]
+workspace = true

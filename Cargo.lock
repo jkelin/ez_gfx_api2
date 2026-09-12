@@ -753,15 +753,15 @@ dependencies = [
  "blake3",
  "bytemuck",
  "compact_str",
- "crossbeam-channel",
  "ez-gfx-artifact",
- "ez-gfx-assets",
  "ez-gfx-backend-dx12",
  "ez-gfx-backend-metal",
  "ez-gfx-backend-vulkan",
  "ez-gfx-core",
+ "ez-gfx-geometry-manager",
  "ez-gfx-hal",
  "ez-gfx-runtime",
+ "ez-gfx-texture-manager",
  "raw-window-handle",
  "smallvec",
  "static_assertions",
@@ -781,9 +781,7 @@ name = "ez-gfx-assets"
 version = "0.1.0"
 dependencies = [
  "basisu",
- "crossbeam-channel",
  "parking_lot",
- "rayon",
 ]
 
 [[package]]
@@ -796,6 +794,7 @@ dependencies = [
  "ez-gfx-core",
  "ez-gfx-hal",
  "ez-gfx-runtime",
+ "ez-gfx-texture-manager",
  "gpu-allocator",
  "parking_lot",
  "raw-window-handle",
@@ -814,6 +813,7 @@ dependencies = [
  "ez-gfx-core",
  "ez-gfx-hal",
  "ez-gfx-runtime",
+ "ez-gfx-texture-manager",
  "gpu-allocator",
  "objc2 0.6.4",
  "objc2-core-foundation",
@@ -837,6 +837,7 @@ dependencies = [
  "ez-gfx-core",
  "ez-gfx-hal",
  "ez-gfx-runtime",
+ "ez-gfx-texture-manager",
  "gpu-allocator",
  "libloading",
  "parking_lot",
@@ -920,6 +921,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ez-gfx-geometry-manager"
+version = "0.1.0"
+dependencies = [
+ "ez-gfx-core",
+ "ez-gfx-hal",
+]
+
+[[package]]
 name = "ez-gfx-hal"
 version = "0.1.0"
 dependencies = [
@@ -931,18 +940,29 @@ name = "ez-gfx-runtime"
 version = "0.1.0"
 dependencies = [
  "arrayvec",
- "basisu",
  "blake3",
  "bytemuck",
  "compact_str",
  "ez-gfx-artifact",
  "ez-gfx-core",
  "ez-gfx-hal",
- "image",
- "ktx2",
+ "ez-gfx-texture-manager",
  "serde",
  "serde_json",
  "smallvec",
+]
+
+[[package]]
+name = "ez-gfx-texture-manager"
+version = "0.1.0"
+dependencies = [
+ "basisu",
+ "crossbeam-channel",
+ "ez-gfx-core",
+ "ez-gfx-hal",
+ "image",
+ "ktx2",
+ "rayon",
 ]
 
 [[package]]

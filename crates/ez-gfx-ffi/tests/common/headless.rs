@@ -13,6 +13,59 @@ pub struct TestContext {
 }
 
 impl TestContext {
+    /// Worker-param variant for decode-rendezvous tests; the default
+    /// constructor keeps the historical default topology.
+    #[allow(
+        dead_code,
+        reason = "shared per test target; only texture_pixels uses workers"
+    )]
+    pub fn create_with_validation_and_workers(backend: u8, validation: bool, workers: u32) -> Self {
+        // No native window exists, is shown, or is activated.
+        let mut native = Self {
+            context: 0,
+            surface: 0,
+        };
+        let desc = EzGfxBackendContextDesc {
+            enable_debug: u8::from(validation),
+            enable_validation: u8::from(validation),
+            backend,
+            texture_decode_workers: workers,
+            adapter_count: 0,
+            adapter: core::ptr::null(),
+        };
+        assert_eq!(
+            {
+                // SAFETY: descriptor and output storage are live and correctly aligned through the FFI call.
+                unsafe { ez_gfx_context_create_backend(&raw const desc, &raw mut native.context) }
+            },
+            EzGfxResult::Ok
+        );
+
+        let surface_desc = EzGfxHeadlessSurfaceDesc {
+            width: WIDTH,
+            height: HEIGHT,
+            cache_presented_snapshots: 0,
+        };
+        assert_eq!(
+            {
+                // SAFETY: descriptor and output storage live through the call; no native handles are borrowed.
+                unsafe {
+                    ez_gfx_surface_create_headless(
+                        native.context,
+                        &raw const surface_desc,
+                        &raw mut native.surface,
+                    )
+                }
+            },
+            EzGfxResult::Ok
+        );
+        assert_eq!(
+            ez_gfx_context_init_device(native.context, native.surface),
+            EzGfxResult::Ok
+        );
+
+        native
+    }
     // Validation is opt-in so existing fixture callers retain their original device requirements.
     pub fn create_with_validation(backend: u8, validation: bool) -> Self {
         // No native window exists, is shown, or is activated.

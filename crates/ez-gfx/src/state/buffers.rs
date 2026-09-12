@@ -3,9 +3,11 @@ use crate::Result;
 use super::{
     AllocationRequest, BufferHandle, COUNTER_BUFFER_ELEMENT_OFFSET, ContextHandle, ContextState,
     CounterBufferHandle, DrawIndexedCommand, Error, IndexedIndirectBuffer, MemoryClass,
-    NativeAllocation, PackedHandle, ResourceKind, TransientBuffer, TransientUse, allocate_native,
-    completed_native_frame_value, completed_transfer_native, free_native_allocation,
-    map_allocation, map_lifecycle, native_device_initialized, result_status,
+    NativeAllocation, NativeContext, PackedHandle, ReclaimableStaging, ResourceKind,
+    TransientBuffer, TransientUse, allocate_native, completed_native_frame_value,
+    completed_texture_transfer_native, completed_transfer_native, free_native_allocation,
+    largest_native_texture_staging, map_allocation, map_lifecycle, native_device_initialized,
+    pop_largest_native_texture_staging, result_status, retained_native_texture_staging,
     retire_native_allocation, stage_upload, with_context_mut,
 };
 
@@ -200,6 +202,7 @@ pub fn write_counter_commands(
         let ContextState {
             native,
             staging,
+            transfer_pool,
             allocations,
             allocation_ready,
             counter_scratch,
@@ -221,10 +224,24 @@ pub fn write_counter_commands(
         // would pin its capacity for the context lifetime.
         let result = (|| -> Result<()> {
             let (_, allocation) = allocations.get(&handle).ok_or(Error::InvalidContext)?;
-            stage_upload(native, staging, allocation, 0, &visible_count.to_le_bytes())
-                .map_err(map_allocation)?;
-            let token = stage_upload(native, staging, allocation, offset, counter_scratch)
-                .map_err(map_allocation)?;
+            stage_upload(
+                native,
+                staging,
+                transfer_pool,
+                allocation,
+                0,
+                &visible_count.to_le_bytes(),
+            )
+            .map_err(map_allocation)?;
+            let token = stage_upload(
+                native,
+                staging,
+                transfer_pool,
+                allocation,
+                offset,
+                counter_scratch,
+            )
+            .map_err(map_allocation)?;
             allocation_ready.insert(handle, token);
             Ok(())
         })();
@@ -308,6 +325,7 @@ pub fn write_counter_bytes(
         let ContextState {
             native,
             staging,
+            transfer_pool,
             allocations,
             allocation_ready,
             counter_scratch,
@@ -318,8 +336,8 @@ pub fn write_counter_bytes(
         let result = (|| -> Result<()> {
             let payload = counter_payload(counter_scratch, bytes, initial_count)?;
             let (_, allocation) = allocations.get(&handle).ok_or(Error::InvalidContext)?;
-            let token =
-                stage_upload(native, staging, allocation, 0, payload).map_err(map_allocation)?;
+            let token = stage_upload(native, staging, transfer_pool, allocation, 0, payload)
+                .map_err(map_allocation)?;
             allocation_ready.insert(handle, token);
             Ok(())
         })();
@@ -398,13 +416,14 @@ fn write_buffer_raw_impl(
         let ContextState {
             native,
             staging,
+            transfer_pool,
             allocations,
             allocation_ready,
             ..
         } = context;
         let (_, allocation) = allocations.get(&handle).ok_or(Error::InvalidContext)?;
-        let result =
-            stage_upload(native, staging, allocation, offset, bytes).map_err(map_allocation);
+        let result = stage_upload(native, staging, transfer_pool, allocation, offset, bytes)
+            .map_err(map_allocation);
         if let Ok(token) = &result {
             allocation_ready.insert(handle, *token);
         }
@@ -592,6 +611,17 @@ fn staging_completions(context: &mut ContextState) -> Result<StagingCompletions>
     Ok(StagingCompletions { transfer, graphics })
 }
 
+/// Sums retained staging capacity across every transfer cache.
+///
+/// Adds backend texture staging to the legacy three-pool aggregate so the
+/// shared trim loop terminates on texture-only pressure and counts texture
+/// evictions toward its ceiling. Saturating addition keeps the total from
+/// wrapping under pathological retention.
+pub(super) fn all_transfer_cache_retained(context: &ContextState) -> u64 {
+    aggregate_staging_retained(context)
+        .saturating_add(retained_native_texture_staging(&context.native))
+}
+
 /// Sums retained staging capacity across the shared, stride, and counter pools.
 ///
 /// Saturating addition keeps diagnostics honest: the total must never wrap even
@@ -641,67 +671,121 @@ pub(super) fn trim_staging_to_aggregate_budget(
     completed: StagingCompletions,
     stale: &mut Vec<NativeAllocation>,
 ) {
-    while aggregate_staging_retained(context) > ez_gfx_hal::DEFAULT_STAGING_AGGREGATE_BUDGET {
-        let mut best: Option<(u8, u32)> = None;
+    // Completion queries fail pre-device admission; without a texture
+    // timeline the texture cache simply sits out this pass.
+    let texture_completed = completed_texture_transfer_native(&mut context.native).ok();
+    trim_staging_to_aggregate_budget_inner(context, completed, texture_completed, stale);
+}
+
+/// Infallible eviction core shared by the pressure entry points.
+fn trim_staging_to_aggregate_budget_inner(
+    context: &mut ContextState,
+    completed: StagingCompletions,
+    texture_completed: Option<u64>,
+    stale: &mut Vec<NativeAllocation>,
+) {
+    // One uniform eviction order across every cache: the blanket trait impl
+    // covers the three context pools while the texture adapter dispatches to
+    // the backend pool, so global pressure evicts the largest retained cache
+    // first regardless of which manager grew it. Exact ties prefer shared,
+    // then counter, then stride, then texture pools, so evicted byte totals
+    // stay deterministic; in-flight buckets are never candidates.
+    // The ceiling covers every transfer cache, including backend texture
+    // staging: texture-only retention must trigger trimming too, and evicting
+    // a texture bucket must count toward termination. Legacy diagnostics keep
+    // reporting the three context pools via `aggregate_staging_retained`.
+    while all_transfer_cache_retained(context) > ez_gfx_hal::DEFAULT_STAGING_AGGREGATE_BUDGET {
+        let mut texture_cache = TextureStaging(&mut context.native);
+        let mut caches: Vec<EvictionCache<'_>> = Vec::with_capacity(4 + context.buffer_pool.len());
+        caches.push(EvictionCache {
+            staging: &mut context.staging,
+            queue: ez_gfx_hal::QueueKind::Transfer,
+            completed: completed.transfer,
+        });
+        caches.push(EvictionCache {
+            staging: &mut context.counter_pool,
+            queue: ez_gfx_hal::QueueKind::Graphics,
+            completed: completed.graphics,
+        });
+        for pool in context.buffer_pool.values_mut() {
+            caches.push(EvictionCache {
+                staging: pool,
+                queue: ez_gfx_hal::QueueKind::Graphics,
+                completed: completed.graphics,
+            });
+        }
+        if let Some(texture_completed) = texture_completed {
+            caches.push(EvictionCache {
+                staging: &mut texture_cache,
+                queue: ez_gfx_hal::QueueKind::TextureTransfer,
+                completed: texture_completed,
+            });
+        }
+        let mut best: Option<usize> = None;
         let mut best_capacity = 0_u64;
-        {
-            // Scoped so the mutable `best` borrow ends before eviction below.
-            let mut consider = |source: u8, key: u32, capacity: Option<u64>| {
-                if let Some(capacity) = capacity
-                    && (best.is_none() || capacity > best_capacity)
-                {
-                    best = Some((source, key));
-                    best_capacity = capacity;
-                }
-            };
-            consider(
-                0,
-                0,
-                context.staging.largest_completed_capacity(
-                    ez_gfx_hal::QueueKind::Transfer,
-                    completed.transfer,
-                ),
-            );
-            consider(
-                1,
-                0,
-                context.counter_pool.largest_completed_capacity(
-                    ez_gfx_hal::QueueKind::Graphics,
-                    completed.graphics,
-                ),
-            );
-            for (stride, pool) in &context.buffer_pool {
-                consider(
-                    2,
-                    *stride,
-                    pool.largest_completed_capacity(
-                        ez_gfx_hal::QueueKind::Graphics,
-                        completed.graphics,
-                    ),
-                );
+        for (index, entry) in caches.iter().enumerate() {
+            if let Some(capacity) = entry
+                .staging
+                .largest_completed_capacity(entry.queue, entry.completed)
+                && (best.is_none() || capacity > best_capacity)
+            {
+                best = Some(index);
+                best_capacity = capacity;
             }
         }
-        let Some((source, key)) = best else {
+        let Some(index) = best else {
             break;
         };
-        let evicted = match source {
-            0 => context
-                .staging
-                .pop_largest_completed(ez_gfx_hal::QueueKind::Transfer, completed.transfer),
-            1 => context
-                .counter_pool
-                .pop_largest_completed(ez_gfx_hal::QueueKind::Graphics, completed.graphics),
-            _ => context.buffer_pool.get_mut(&key).and_then(|pool| {
-                pool.pop_largest_completed(ez_gfx_hal::QueueKind::Graphics, completed.graphics)
-            }),
-        };
-        if let Some(allocation) = evicted {
-            stale.push(allocation);
-        } else {
+        let entry = &mut caches[index];
+        match entry
+            .staging
+            .pop_largest_completed(entry.queue, entry.completed)
+        {
+            Some(allocation) => stale.push(allocation),
             // Unreachable: the capacity was just observed above, so a bucket
             // must still be there; break anyway to guard against logic drift.
-            break;
+            None => break,
         }
+    }
+}
+
+/// Backend texture-staging adapter for the shared eviction order.
+///
+/// Texture pools live on the transfer timeline only; foreign queues never
+/// match, so a misdirected trim observes and evicts nothing.
+struct EvictionCache<'a> {
+    staging: &'a mut dyn ReclaimableStaging<Staging = NativeAllocation>,
+    queue: ez_gfx_hal::QueueKind,
+    completed: u64,
+}
+
+struct TextureStaging<'a>(&'a mut NativeContext);
+
+impl ReclaimableStaging for TextureStaging<'_> {
+    type Staging = NativeAllocation;
+
+    fn retained_bytes(&self) -> u64 {
+        retained_native_texture_staging(self.0)
+    }
+
+    fn largest_completed_capacity(
+        &self,
+        queue: ez_gfx_hal::QueueKind,
+        completed: u64,
+    ) -> Option<u64> {
+        (queue == ez_gfx_hal::QueueKind::TextureTransfer)
+            .then(|| largest_native_texture_staging(self.0, completed))
+            .flatten()
+    }
+
+    fn pop_largest_completed(
+        &mut self,
+        queue: ez_gfx_hal::QueueKind,
+        completed: u64,
+    ) -> Option<NativeAllocation> {
+        (queue == ez_gfx_hal::QueueKind::TextureTransfer)
+            .then(|| pop_largest_native_texture_staging(self.0, completed))
+            .flatten()
     }
 }
 

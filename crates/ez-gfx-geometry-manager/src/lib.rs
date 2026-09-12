@@ -1,7 +1,17 @@
+//! Backend-neutral geometry heap allocation and upload readiness.
+//!
+//! `GeometryManager` tracks named vertex heaps, the singleton index heap, and
+//! per-allocation upload readiness. Staging reuse lives in the shared HAL
+//! [`ReusableStagingPool`](ez_gfx_hal::ReusableStagingPool); backend adapters
+//! own native allocations and submit transfers. This crate never touches
+//! native handles.
+
+#![forbid(unsafe_code)]
+
 use std::collections::{BTreeMap, HashMap};
 
 use ez_gfx_core::handle::PackedHandle;
-use ez_gfx_hal::{CompletionToken, DEFAULT_STAGING_POLICY, QueueKind, staging_bucket_size};
+use ez_gfx_hal::CompletionToken;
 
 const MAX_HEAP_NAME_BYTES: usize = 255;
 
@@ -488,140 +498,16 @@ fn validate_name(name: &str) -> Result<(), GeometryError> {
     }
     Ok(())
 }
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-/// Identifies a staging allocation by its pool index.
-pub struct StagingSlot(u32);
-
-#[derive(Clone, Copy, Debug)]
-struct StagingEntry {
-    capacity: u64,
-    in_use: bool,
-    retirement: Option<CompletionToken>,
-}
-
-#[derive(Clone, Debug, Default)]
-/// Reuses staging buffers without an artificial slot limit.
-pub struct StagingPool {
-    entries: Vec<StagingEntry>,
-}
-
-impl StagingPool {
-    /// Creates an empty staging pool.
-    pub fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
-    /// A retired slot is reusable only after its transfer value completes and only if it fits.
-    ///
-    /// # Errors
-    ///
-    /// Returns `InvalidCount` if size is zero or `StagingPoolExhausted` only if
-    /// the slot index cannot be represented.
-    ///
-    /// # Panics
-    ///
-    /// Existing slot indices were validated when inserted.
-    pub fn checkout(
-        &mut self,
-        size: u64,
-        completed_transfer: u64,
-    ) -> Result<StagingSlot, GeometryError> {
-        let bucket = staging_bucket_size(size, DEFAULT_STAGING_POLICY)
-            .map_err(|_| GeometryError::InvalidCount)?;
-        if let Some((index, entry)) = self.entries.iter_mut().enumerate().find(|(_, entry)| {
-            !entry.in_use
-                && entry.capacity >= size
-                && entry
-                    .retirement
-                    .is_none_or(|token| token.value <= completed_transfer)
-        }) {
-            entry.in_use = true;
-            entry.retirement = None;
-            return Ok(StagingSlot(
-                u32::try_from(index).expect("validated index fits u32"),
-            ));
-        }
-        self.entries.push(StagingEntry {
-            capacity: bucket,
-            in_use: true,
-            retirement: None,
-        });
-        let slot = u32::try_from(self.entries.len() - 1)
-            .map_err(|_| GeometryError::StagingPoolExhausted)?;
-        Ok(StagingSlot(slot))
-    }
-
-    /// Returns the allocated byte capacity of a staging slot.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`GeometryError::InvalidStagingSlot`] when the slot does not exist.
-    pub fn slot_capacity(&self, slot: StagingSlot) -> Result<u64, GeometryError> {
-        self.entries
-            .get(slot.0 as usize)
-            .map(|entry| entry.capacity)
-            .ok_or(GeometryError::InvalidStagingSlot)
-    }
-
-    /// Releases a submitted slot after associating its transfer completion token.
-    ///
-    /// # Errors
-    ///
-    /// Returns `InvalidStagingSlot` if the slot does not exist or is not currently checked out,
-    /// or `WrongQueue` if the token is not from the transfer timeline consumed by checkout.
-    pub fn retire(
-        &mut self,
-        slot: StagingSlot,
-        token: CompletionToken,
-    ) -> Result<(), GeometryError> {
-        let entry = self
-            .entries
-            .get_mut(slot.0 as usize)
-            .ok_or(GeometryError::InvalidStagingSlot)?;
-        if !entry.in_use {
-            return Err(GeometryError::InvalidStagingSlot);
-        }
-        // `checkout` receives only the transfer timeline value, so other queues cannot gate reuse.
-        if token.queue != QueueKind::Transfer {
-            return Err(GeometryError::WrongQueue);
-        }
-        entry.in_use = false;
-        entry.retirement = Some(token);
-        Ok(())
-    }
-
-    /// Releases a slot immediately when no transfer was submitted.
-    ///
-    /// # Errors
-    ///
-    /// Returns `InvalidStagingSlot` if the slot does not exist or is not currently checked out.
-    pub fn release_unsubmitted(&mut self, slot: StagingSlot) -> Result<(), GeometryError> {
-        let entry = self
-            .entries
-            .get_mut(slot.0 as usize)
-            .ok_or(GeometryError::InvalidStagingSlot)?;
-        if !entry.in_use {
-            return Err(GeometryError::InvalidStagingSlot);
-        }
-        entry.in_use = false;
-        entry.retirement = None;
-        Ok(())
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Reports geometry heap, reservation, readiness, and staging pool failures.
+/// Reports geometry heap, reservation, and readiness failures.
 pub enum GeometryError {
     /// A heap name is empty, too long, or contains unsupported characters.
     InvalidName,
-    /// A heap or staging pool capacity is invalid.
+    /// A heap capacity is invalid.
     InvalidCapacity,
     /// A vertex stride is zero or cannot be represented by supported element indexing.
     InvalidStride,
-    /// A reservation or staging checkout requested zero elements or bytes.
+    /// A reservation requested zero elements.
     InvalidCount,
     /// A heap already exists for the requested name or index storage.
     DuplicateHeap,
@@ -643,10 +529,4 @@ pub enum GeometryError {
     InvalidFree,
     /// A readiness token does not advance its queue timeline.
     TimelineRegression,
-    /// The staging slot index cannot be represented.
-    StagingPoolExhausted,
-    /// The staging slot index is unknown or the slot is not checked out.
-    InvalidStagingSlot,
-    /// A staging retirement token did not belong to the transfer queue.
-    WrongQueue,
 }

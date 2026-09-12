@@ -66,7 +66,7 @@ Manage a large virtual texture atlas where individual textures/glyphs are assign
 #### Tradeoffs and failure modes
 
 - **Tradeoffs:** Highly flexible for huge virtual worlds, but disproportionately complex for an easy-to-use graphics library.
-- **Failure Modes:** Shader sampling across tile borders causes seam clamping artifacts without custom shader border filtering.
+- **Failure Modes:** Shader sampling across tile borders causes edge-clamping artifacts without custom shader border filtering.
 
 #### Sources
 
@@ -97,7 +97,7 @@ Maintain original Odin behavior: every texture upload transfers all mips in a si
 
 | Candidate | Relevant performance dimensions | Constraint fit | Evidence quality | Risks |
 | Progressive mip streamer + subregion updates + atomic telemetry | 1024:1 transfer data reduction for 64x64 sub-regions on 2k atlas; latency dependent on I/O | High | Image arithmetic & source code inspection | Subresource layout barrier complexity |
-| Dynamic atlas virtual suballocator | High flexibility, but requires shader coordinate patching | Low-Moderate | Industry literature | High complexity, texture coordinate seams |
+- | Dynamic atlas virtual suballocator | High flexibility, but requires shader coordinate patching | Low-Moderate | Industry literature | High complexity, texture-coordinate edges |
 | Incumbent full atlas/mip reload | ~16.78 MB transferred per 2k atlas reload, PCIe churn | Low | Direct source code inspection | Violates UI and streaming performance TODOs |
 
 ## Selected solution
@@ -116,7 +116,7 @@ Maintain original Odin behavior: every texture upload transfers all mips in a si
 
 ### Rejected alternatives
 
-- **`S-P-015-dynamic-atlas-virtual-suballocation`**: Rejected due to high architectural complexity and texture coordinate seam artifacts, which would unnecessarily complicate the user-facing graphics API.
+- **`S-P-015-dynamic-atlas-virtual-suballocation`**: Rejected due to high architectural complexity and texture-coordinate edge artifacts, which would unnecessarily complicate the user-facing graphics API.
 - **`S-P-015-full-reload-synchronous-textures`**: Rejected because re-uploading full atlas bitmaps on every UI glyph addition causes significant PCIe staging traffic (~16.78 MB per 2k atlas reload) and frame stuttering.
 
 ### Evidence summary

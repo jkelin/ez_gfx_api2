@@ -10,9 +10,7 @@ default = []
 basis = ["dep:basisu"]
 
 [dependencies]
-crossbeam-channel = "0.5"
 parking_lot = "0.12"
-rayon = "1.10"
 basisu = { workspace = true, optional = true }
 
 [lints]

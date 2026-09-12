@@ -4,8 +4,8 @@ use super::{
     MTLCommandEncoder, MTLCommandQueue, MTLDevice, MTLHeap, MTLOrigin, MTLPixelFormat,
     MTLSamplerAddressMode, MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
     MTLSamplerState, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
-    MTLTextureUsage, MemoryAllocator, MemoryClass, NSRange, NativeContext, NativeTexture,
-    ProtocolObject, QueueKind, Retained, SamplerAddressMode, SamplerFilter,
+    MTLTextureUsage, MemoryAllocator, MemoryClass, NSRange, NativeAllocation, NativeContext,
+    NativeTexture, ProtocolObject, QueueKind, Retained, SamplerAddressMode, SamplerFilter,
     TEXTURE_DESCRIPTOR_CAPACITY, TextureFormat, TextureRegion, TextureSamplerDesc, ThreadBound,
     map_allocator, validate_texture_mips, validate_texture_region,
 };
@@ -121,7 +121,30 @@ impl NativeContext {
         binding: u32,
         sampler_desc: TextureSamplerDesc,
     ) -> Result<(NativeTexture, Vec<CompletionToken>), AllocationError> {
+        let prefix = u32::try_from(mips.len()).map_err(|_| AllocationError::NativeFailure)?;
+        self.create_texture_with_prefix(format, mips, binding, sampler_desc, prefix)
+    }
+
+    /// Creates full sampled storage but submits only the coarsest `prefix` mips.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty or over-long prefix on top of every
+    /// [`Self::create_texture`] failure.
+    pub fn create_texture_with_prefix(
+        &mut self,
+        format: TextureFormat,
+        mips: &[ImageMip<'_>],
+        binding: u32,
+        sampler_desc: TextureSamplerDesc,
+        prefix: u32,
+    ) -> Result<(NativeTexture, Vec<CompletionToken>), AllocationError> {
         validate_texture_mips(format, mips).map_err(|_| AllocationError::ZeroSize)?;
+        // The prefix names submitted coarse levels, never stored ones: zero
+        // would publish nothing and over-length would gate a missing token.
+        if prefix == 0 || prefix as usize > mips.len() {
+            return Err(AllocationError::ZeroSize);
+        }
         if binding >= TEXTURE_DESCRIPTOR_CAPACITY {
             return Err(AllocationError::ZeroSize);
         }
@@ -214,7 +237,7 @@ impl NativeContext {
             let cancellation = std::sync::Arc::new(super::transfer::TransferCancellation::new());
             let first = self.next_texture_value;
             let next = first
-                .checked_add(mips.len() as u64)
+                .checked_add(u64::from(prefix))
                 .ok_or(AllocationError::NativeFailure)?;
             let completions = (first..next)
                 .map(|value| CompletionToken::new(QueueKind::TextureTransfer, value))
@@ -225,7 +248,10 @@ impl NativeContext {
             let mut pending = Vec::with_capacity(mips.len());
             let mut source_offset = 0_usize;
             let [block_width, block_height, block_bytes] = format.block();
-            for (level, mip) in mips.iter().enumerate().rev() {
+            // Coarse-first iteration takes exactly the required prefix, so
+            // finer levels wait for a later upload instead of head-of-line
+            // blocking behind earlier textures.
+            for (level, mip) in mips.iter().enumerate().rev().take(prefix as usize) {
                 let mip_width =
                     usize::try_from(mip.width).map_err(|_| AllocationError::NativeFailure)?;
                 let mip_height =
@@ -371,7 +397,9 @@ impl NativeContext {
             .and_then(|pixels| pixels.checked_mul(bytes_per_texel))
             .and_then(|single| single.checked_mul(u64::from(samples)))
             .ok_or(AllocationError::NativeFailure)?;
-        if bytes > u64::try_from(ez_gfx_runtime::texture::MAX_TEXTURE_BYTES).unwrap_or(u64::MAX) {
+        if bytes
+            > u64::try_from(ez_gfx_texture_manager::texture::MAX_TEXTURE_BYTES).unwrap_or(u64::MAX)
+        {
             return Err(AllocationError::OutOfMemory);
         }
         let texture_width = usize::try_from(width).map_err(|_| AllocationError::NativeFailure)?;
@@ -734,6 +762,48 @@ impl NativeContext {
         {
             return Err(AllocationError::NativeFailure);
         }
+        self.install_prefix_view(texture, resident_mips)
+    }
+
+    /// Installs the required-prefix view before its transfer completes.
+    ///
+    /// Unlike [`Self::publish_texture_mips`], this skips the transfer-completion gate:
+    /// the caller attaches the required completion token as a GPU wait before any draw
+    /// executes, which orders the blit before sampling. Standard Metal command buffers
+    /// retain resources declared by `useResource`, so already-submitted frames keep
+    /// owning the replaced view through completion; the caller must still guarantee no
+    /// submitted frame is in flight (see [`Self::texture_descriptor_update_ready`]) so a
+    /// prior heap import cannot observe the new view mid-copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty/oversized range, unsubmitted levels, or view
+    /// creation failure.
+    pub fn reference_texture_prefix(
+        &mut self,
+        texture: &mut NativeTexture,
+        resident_mips: u32,
+    ) -> Result<(), AllocationError> {
+        if resident_mips == 0 || resident_mips > texture.mip_count {
+            return Err(AllocationError::ZeroSize);
+        }
+        let first_level = (texture.mip_count - resident_mips) as usize;
+        // Only submitted levels may be exposed; the GPU wait attached by the
+        // caller covers their blit before any sampling draw executes.
+        if texture.mip_completions[first_level..]
+            .iter()
+            .any(|value| *value == 0)
+        {
+            return Err(AllocationError::NativeFailure);
+        }
+        self.install_prefix_view(texture, resident_mips)
+    }
+
+    fn install_prefix_view(
+        &mut self,
+        texture: &mut NativeTexture,
+        resident_mips: u32,
+    ) -> Result<(), AllocationError> {
         if resident_mips == texture.resident_mips {
             return Ok(());
         }
@@ -866,5 +936,158 @@ impl NativeContext {
             completed = completed.max(pending.value);
         }
         Ok(completed)
+    }
+}
+
+impl NativeContext {
+    /// Returns retained texture-staging bucket capacity for global eviction.
+    pub fn retained_texture_staging_bytes(&self) -> u64 {
+        self.texture_staging.retained_bytes()
+    }
+
+    /// Returns the largest completed texture-staging bucket for global eviction.
+    pub fn largest_texture_staging_completed(&self, completed: u64) -> Option<u64> {
+        self.texture_staging
+            .largest_completed_capacity(ez_gfx_hal::QueueKind::TextureTransfer, completed)
+    }
+
+    /// Removes the largest completed texture-staging bucket for global eviction.
+    pub fn pop_largest_texture_staging(&mut self, completed: u64) -> Option<NativeAllocation> {
+        self.texture_staging
+            .pop_largest_completed(ez_gfx_hal::QueueKind::TextureTransfer, completed)
+    }
+}
+
+#[path = "texture_backend.rs"]
+mod texture_backend;
+#[cfg(test)]
+mod prefix_tests {
+    use super::*;
+
+    const SAMPLER: TextureSamplerDesc = TextureSamplerDesc {
+        min_filter: SamplerFilter::Nearest,
+        mag_filter: SamplerFilter::Nearest,
+        max_anisotropy: 1.0,
+        address_u: SamplerAddressMode::Clamp,
+        address_v: SamplerAddressMode::Clamp,
+        address_w: SamplerAddressMode::Clamp,
+    };
+
+    fn wait_texture(context: &NativeContext, value: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while context.completed_texture_transfer_value().unwrap() < value {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "texture transfer timed out"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn prefix_submit_publishes_required_first_then_phase_two_fine() {
+        let mut context = NativeContext::create_default().unwrap();
+        let base = [1_u8; 64];
+        let mid = [2_u8; 16];
+        let coarse = [3_u8; 4];
+        // Storage order is largest-first; only the required coarse prefix submits.
+        let (mut texture, completions) = context
+            .create_texture_with_prefix(
+                TextureFormat::Rgba8Unorm,
+                &[
+                    ImageMip {
+                        width: 4,
+                        height: 4,
+                        bytes: &base,
+                    },
+                    ImageMip {
+                        width: 2,
+                        height: 2,
+                        bytes: &mid,
+                    },
+                    ImageMip {
+                        width: 1,
+                        height: 1,
+                        bytes: &coarse,
+                    },
+                ],
+                0,
+                SAMPLER,
+                1,
+            )
+            .unwrap();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(texture.mip_completions.len(), 3);
+        // Fine levels stay zero until phase two submits them.
+        assert_eq!(&texture.mip_completions[..2], &[0, 0]);
+        assert!(texture.mip_completions[2] > 0);
+        wait_texture(&context, completions[0].value);
+        context.publish_texture_mips(&mut texture, 1).unwrap();
+        assert!(context.publish_texture_mips(&mut texture, 2).is_err());
+        // Phase two uploads the coarsest remaining level first.
+        let fine = context
+            .update_texture_region(
+                &mut texture,
+                &TextureRegion {
+                    mip_level: 1,
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                    bytes: &mid,
+                },
+            )
+            .unwrap();
+        wait_texture(&context, fine.value);
+        context.publish_texture_mips(&mut texture, 2).unwrap();
+        let finest = context
+            .update_texture_region(
+                &mut texture,
+                &TextureRegion {
+                    mip_level: 0,
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                    bytes: &base,
+                },
+            )
+            .unwrap();
+        wait_texture(&context, finest.value);
+        context.publish_texture_mips(&mut texture, 3).unwrap();
+        // Empty and over-long prefixes are rejected before touching the device.
+        let single = [9_u8; 4];
+        assert!(
+            context
+                .create_texture_with_prefix(
+                    TextureFormat::Rgba8Unorm,
+                    &[ImageMip {
+                        width: 1,
+                        height: 1,
+                        bytes: &single
+                    }],
+                    0,
+                    SAMPLER,
+                    0,
+                )
+                .is_err()
+        );
+        assert!(
+            context
+                .create_texture_with_prefix(
+                    TextureFormat::Rgba8Unorm,
+                    &[ImageMip {
+                        width: 1,
+                        height: 1,
+                        bytes: &single
+                    }],
+                    0,
+                    SAMPLER,
+                    2,
+                )
+                .is_err()
+        );
+        context.destroy_texture(texture).unwrap();
+        context.wait_idle().unwrap();
     }
 }

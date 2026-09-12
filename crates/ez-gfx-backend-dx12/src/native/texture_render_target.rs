@@ -135,7 +135,9 @@ impl NativeContext {
             .and_then(|pixels| pixels.checked_mul(bytes_per_texel))
             .and_then(|single| single.checked_mul(u64::from(samples)))
             .ok_or(AllocationError::NativeFailure)?;
-        if bytes > u64::try_from(ez_gfx_runtime::texture::MAX_TEXTURE_BYTES).unwrap_or(u64::MAX) {
+        if bytes
+            > u64::try_from(ez_gfx_texture_manager::texture::MAX_TEXTURE_BYTES).unwrap_or(u64::MAX)
+        {
             return Err(AllocationError::OutOfMemory);
         }
         // A single mip bypasses block-alignment validation; dimensions stay logical.

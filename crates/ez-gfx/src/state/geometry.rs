@@ -5,12 +5,12 @@ use crate::Result;
 use super::{
     AllocationRequest, CompletionToken, ContextHandle, ContextState, DEFAULT_STAGING_POLICY, Error,
     GeometryAllocation, GeometryError, IndexAllocationHandle, MemoryClass, NativeAllocation,
-    NativeContext, ResourceKind, RetiredGeometry, RetiredGeometryRange, RetiredRangeGraphics,
-    RetiredRangeKind, RetiredVertexHeap, UploadEvent, UploadResource, UploadStatus,
-    VertexAllocationHandle, VertexHeapHandle, allocate_native, completed_native_frame_value,
-    completed_transfer_native, copy_native, free_native_allocation, last_native_frame_completion,
-    map_allocation, map_geometry, map_lifecycle, result_status, staging_bucket_size,
-    with_context_mut, write_native,
+    NativeContext, QueueKind, ResourceKind, RetiredGeometry, RetiredGeometryRange,
+    RetiredRangeGraphics, RetiredRangeKind, RetiredVertexHeap, SharedTransferPool, UploadEvent,
+    UploadResource, UploadStatus, VertexAllocationHandle, VertexHeapHandle, allocate_native,
+    completed_native_frame_value, completed_transfer_native, copy_native, free_native_allocation,
+    last_native_frame_completion, map_allocation, map_geometry, map_lifecycle, result_status,
+    staging_bucket_size, with_context_mut, write_native,
 };
 
 const INITIAL_GEOMETRY_HEAP_BYTES: u64 = 64 * 1024;
@@ -29,13 +29,13 @@ pub fn create_vertex_heap(
     create_vertex_heap_with_capacity(context, name, capacity, stride)
 }
 
-/// Creates a fixed-initial-capacity heap for the C raw seam.
+/// Creates a fixed-initial-capacity heap for the C raw boundary.
 ///
 /// # Errors
 /// Returns an error when validation, capacity, ownership, or allocation fails.
 #[allow(
     dead_code,
-    reason = "the C raw seam preserves caller-selected initial capacity"
+    reason = "the C raw boundary preserves caller-selected initial capacity"
 )]
 pub fn create_vertex_heap_with_capacity(
     context: ContextHandle,
@@ -150,7 +150,7 @@ pub fn destroy_vertex_heap(context: ContextHandle, handle: VertexHeapHandle) {
 /// Returns an error when validation, handle ownership, readiness, or a backend operation fails.
 #[allow(
     dead_code,
-    reason = "the C raw seam retains explicit index-heap creation while safe Rust creates it lazily"
+    reason = "the C raw boundary retains explicit index-heap creation while safe Rust creates it lazily"
 )]
 pub fn create_index_heap(context: ContextHandle, capacity: u64) -> Result<()> {
     result_status(with_context_mut(context, |context| {
@@ -181,7 +181,7 @@ pub fn create_index_heap(context: ContextHandle, capacity: u64) -> Result<()> {
 /// Destroys the context index heap.
 #[allow(
     dead_code,
-    reason = "the C raw seam explicitly destroys the singleton heap"
+    reason = "the C raw boundary explicitly destroys the singleton heap"
 )]
 pub fn destroy_index_heap(context: ContextHandle) {
     let _ = with_context_mut(context, |context| {
@@ -477,6 +477,7 @@ fn upload_vertices_raw_impl(
         let result = match stage_upload(
             &mut context.native,
             &mut context.staging,
+            &mut context.transfer_pool,
             &heap.allocation,
             upload.byte_offset,
             bytes,
@@ -583,6 +584,7 @@ fn upload_indices_raw_impl(
         let result = match stage_upload(
             &mut context.native,
             &mut context.staging,
+            &mut context.transfer_pool,
             &heap.allocation,
             upload.byte_offset,
             bytes,
@@ -745,16 +747,20 @@ pub fn remove_indices(context: ContextHandle, handle: IndexAllocationHandle) -> 
 }
 
 /// Public uploads copy caller slices here, so no mapped lease exists today. A P-011
-/// zero-copy staging lease hooking in at this seam MUST bind the `ContextIdentity`
+/// zero-copy staging lease hooking in at this boundary MUST bind the `ContextIdentity`
 /// epoch and fail `DeviceLost`/`InvalidContext` on use-after-loss, never fallback bytes.
 pub(super) fn stage_upload(
     context: &mut NativeContext,
     pool: &mut ez_gfx_hal::ReusableStagingPool<NativeAllocation>,
+    budget: &mut SharedTransferPool,
     destination: &NativeAllocation,
     destination_offset: u64,
     bytes: &[u8],
 ) -> std::result::Result<CompletionToken, ez_gfx_hal::AllocationError> {
     let completed = completed_transfer_native(context)?;
+    // Retire transfer-gated budget entries on every upload so transient-heavy
+    // frames cannot pin shared bytes after the GPU already consumed them.
+    budget.reclaim_transfers(QueueKind::Transfer, completed);
     // Idle eviction alone never enforces the finite budget; pressure eviction
     // reclaims completed-but-fresh buckets once retention exceeds the ceiling.
     // In-flight buckets stay regardless, so over-budget retention only means
@@ -767,17 +773,35 @@ pub(super) fn stage_upload(
         free_native_allocation(context, stale)?;
     }
     let requested = bytes.len() as u64;
-    let (capacity, mut allocation) =
+    // Reused buckets carry their own retired lease accounting; only fresh
+    // native growth draws from the shared background budget.
+    let (capacity, mut allocation, grew) =
         if let Some(entry) = pool.take(requested, ez_gfx_hal::QueueKind::Transfer, completed) {
-            entry
+            (entry.0, entry.1, false)
         } else {
             let bucket = staging_bucket_size(requested, DEFAULT_STAGING_POLICY)
                 .map_err(|_| ez_gfx_hal::AllocationError::OutOfMemory)?;
+            // Native staging growth draws from the shared budget, so texture,
+            // geometry, and buffer uploads share one admission domain. Texture
+            // reservations preempt this path; background growth fails fast.
+            budget
+                .acquire_background(bucket)
+                .map_err(|_| ez_gfx_hal::AllocationError::OutOfMemory)?;
             let request = AllocationRequest::new(bucket, 16, MemoryClass::Upload, true, None)?;
-            (bucket, allocate_native(context, request)?)
+            let allocation = match allocate_native(context, request) {
+                Ok(allocation) => allocation,
+                Err(error) => {
+                    budget.release_background(bucket);
+                    return Err(error);
+                }
+            };
+            (bucket, allocation, true)
         };
     if let Err(error) = write_native(context, &mut allocation, bytes) {
         pool.put(capacity, allocation, None);
+        if grew {
+            budget.release_background(capacity);
+        }
         return Err(error);
     }
     let token = match copy_native(
@@ -791,9 +815,19 @@ pub(super) fn stage_upload(
         Ok(token) => token,
         Err(error) => {
             pool.put(capacity, allocation, None);
+            if grew {
+                budget.release_background(capacity);
+            }
             return Err(error);
         }
     };
     pool.put(capacity, allocation, Some(token));
+    // The staging bucket stays cached in the native pool; its bytes move from
+    // a fresh background reservation to a transfer-gated lease until the GPU
+    // consumes them. Reused buckets re-enter the ledger through the new lease.
+    if grew {
+        budget.release_background(capacity);
+    }
+    budget.note_transfer(token, capacity);
     Ok(token)
 }

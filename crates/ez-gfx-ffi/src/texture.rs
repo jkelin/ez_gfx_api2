@@ -261,6 +261,9 @@ pub unsafe extern "C" fn ez_gfx_texture_load(
             _ => return EzGfxResult::InvalidArgument,
         };
         let config = ez_gfx::TextureConfig {
+            source,
+            generate_mips: desc.generate_mips != 0,
+            required_mips: desc.required_mips,
             width: desc.width,
             height: desc.height,
             mip_count: desc.mip_count,
@@ -278,7 +281,7 @@ pub unsafe extern "C" fn ez_gfx_texture_load(
             Ok(context) => context,
             Err(error) => return error,
         };
-        match raw::load_texture(context, source, bytes, desc.generate_mips != 0, &config) {
+        match raw::load_texture(context, bytes, &config) {
             Ok(texture) => {
                 // SAFETY: `out_texture` is non-null and writable for this call.
                 unsafe { out_texture.write(texture.into_raw()) };

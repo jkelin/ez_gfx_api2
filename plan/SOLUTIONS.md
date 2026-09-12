@@ -20,7 +20,7 @@ Migrate the original Odin/Vulkan `ez_gfx_api` into a Rust/Cargo implementation t
 
 ### Assumptions
 
-- ABI 39 is the non-Rust compatibility seam; it does not dictate safe Rust ownership or retain safe compatibility aliases.
+- ABI 39 is the non-Rust compatibility boundary; it does not dictate safe Rust ownership or retain safe compatibility aliases.
 - Supported hardware exposes sufficient modern bindless/indexing features. Devices below the declared capability floor receive an explicit unsupported error.
 - Slang, DXC/signing tools, and Apple Metal tools are available in compiler/build environments, not runtime deployments.
 - No repository-specific performance baseline exists for P-001 through P-020; every selected design carries explicit measurement actions.
@@ -37,7 +37,7 @@ Use a virtual Cargo workspace with `ez-gfx-core` for API/graph/reflection types,
 
 ### Performance and tradeoffs
 
-Runtime throughput is not expected to differ from a feature-gated monolith, but that is unmeasured. Separate packages add manifests and schema seams while making runtime dependencies and native linkage inspectable. Clean/incremental build time and binary size are unknown.
+Runtime throughput is not expected to differ from a feature-gated monolith, but that is unmeasured. Separate packages add manifests and schema boundaries while making runtime dependencies and native linkage inspectable. Clean/incremental build time and binary size are unknown.
 
 ### Rejected alternatives
 
@@ -53,14 +53,14 @@ Runtime throughput is not expected to differ from a feature-gated monolith, but 
 ### Assumptions, risks, and validation
 
 - Risk—compiler dependency leaks into runtime: fail a runtime-only `cargo tree` check if Slang/compiler libraries appear.
-- Risk—package seams slow builds or drift: record clean/incremental times and validate shared artifact schemas.
+- Risk—package boundaries slow builds or drift: record clean/incremental times and validate shared artifact schemas.
 - Validate runtime, compiler, decoder-disabled, and each backend package on its supported target.
 
 ## P-002: Public API and C ABI bindings — Owning Rust facade and raw FFI
 
 ### Problem and required outcome
 
-Provide a safe ownership-based Rust interface while keeping a validated C seam. P-002 supplies lifecycle and identity semantics to graph, geometry, texture, surface, and drawing modules.
+Provide a safe ownership-based Rust interface while keeping a validated C boundary. P-002 supplies lifecycle and identity semantics to graph, geometry, texture, surface, and drawing modules.
 
 ### Decision
 

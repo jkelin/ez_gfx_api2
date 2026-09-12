@@ -99,6 +99,9 @@ struct TextureUpload<'a> {
     image: vk::Image,
     total: u64,
     cancellation: &'a std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Number of coarsest mips to submit now; finer levels stay allocated
+    /// but unsubmitted for a later phase-two upload.
+    prefix: usize,
 }
 
 impl NativeContext {
@@ -125,7 +128,7 @@ impl NativeContext {
 
         let first = self.next_texture_value;
         let next = first
-            .checked_add(request.mips.len() as u64)
+            .checked_add(request.prefix as u64)
             .ok_or(AllocationError::NativeFailure)?;
         let completions = (first..next)
             .map(|value| CompletionToken::new(QueueKind::TextureTransfer, value))
@@ -135,8 +138,15 @@ impl NativeContext {
             .texture_worker
             .as_ref()
             .ok_or(AllocationError::NativeFailure)?;
-        let mut jobs = Vec::with_capacity(request.mips.len());
-        for (resident_index, level) in (0..request.mips.len()).rev().enumerate() {
+        let mut jobs = Vec::with_capacity(request.prefix);
+        // Coarse-first submission: the head of this reversed range covers
+        // the smallest mips, so taking `prefix` submits exactly the required
+        // prefix ahead of finer phase-two work.
+        for (resident_index, level) in (0..request.mips.len())
+            .rev()
+            .enumerate()
+            .take(request.prefix)
+        {
             let mip = &request.mips[level];
             let region = vk::BufferImageCopy::default()
                 .buffer_offset(offsets[level])
@@ -282,7 +292,30 @@ impl NativeContext {
         binding: u32,
         sampler_desc: TextureSamplerDesc,
     ) -> Result<(NativeTexture, Vec<CompletionToken>), AllocationError> {
+        let prefix = u32::try_from(mips.len()).map_err(|_| AllocationError::NativeFailure)?;
+        self.create_texture_with_prefix(format, mips, binding, sampler_desc, prefix)
+    }
+
+    /// Creates full sampled storage but submits only the coarsest `prefix` mips.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty or over-long prefix on top of every
+    /// [`Self::create_texture`] failure.
+    pub fn create_texture_with_prefix(
+        &mut self,
+        format: TextureFormat,
+        mips: &[ImageMip<'_>],
+        binding: u32,
+        sampler_desc: TextureSamplerDesc,
+        prefix: u32,
+    ) -> Result<(NativeTexture, Vec<CompletionToken>), AllocationError> {
         validate_texture_mips(format, mips).map_err(|_| AllocationError::ZeroSize)?;
+        // The prefix names submitted coarse levels, never stored ones: zero
+        // would publish nothing and over-length would gate a missing token.
+        if prefix == 0 || (prefix as usize) > mips.len() {
+            return Err(AllocationError::ZeroSize);
+        }
         if binding >= TEXTURE_DESCRIPTOR_CAPACITY {
             return Err(AllocationError::ZeroSize);
         }
@@ -388,6 +421,7 @@ impl NativeContext {
                 image,
                 total,
                 cancellation: &cancellation,
+                prefix: prefix as usize,
             },
         ) {
             Ok(completions) => completions,
@@ -402,6 +436,12 @@ impl NativeContext {
                 return Err(error);
             }
         };
+        let mut mip_values = vec![0_u64; mips.len()];
+        for (index, token) in completions.iter().rev().enumerate() {
+            // Submitted tokens occupy the coarse tail of largest-first
+            // storage; finer levels keep zero until phase two submits them.
+            mip_values[mips.len() - completions.len() + index] = token.value;
+        }
         let texture = NativeTexture {
             image,
             view,
@@ -412,7 +452,7 @@ impl NativeContext {
             height,
             mip_count,
             resident_mips: 0,
-            mip_completions: completions.iter().rev().map(|token| token.value).collect(),
+            mip_completions: mip_values,
             cancellation,
             binding,
             msaa: None,
@@ -473,7 +513,9 @@ impl NativeContext {
             .and_then(|pixels| pixels.checked_mul(bytes_per_texel))
             .and_then(|single| single.checked_mul(u64::from(samples)))
             .ok_or(AllocationError::NativeFailure)?;
-        if bytes > u64::try_from(ez_gfx_runtime::texture::MAX_TEXTURE_BYTES).unwrap_or(u64::MAX) {
+        if bytes
+            > u64::try_from(ez_gfx_texture_manager::texture::MAX_TEXTURE_BYTES).unwrap_or(u64::MAX)
+        {
             return Err(AllocationError::OutOfMemory);
         }
         if self.allocator.is_none() {
@@ -731,6 +773,11 @@ impl NativeContext {
             return Ok(());
         }
         let first = usize::try_from(base_mip_level).map_err(|_| AllocationError::NativeFailure)?;
+        // Unsubmitted levels stay zero until a later phase-two upload fills
+        // them; exposing them early would sample uninitialized storage.
+        if texture.mip_completions[first..].contains(&0) {
+            return Err(AllocationError::NativeFailure);
+        }
         let required = texture.mip_completions[first..]
             .iter()
             .copied()
@@ -739,6 +786,49 @@ impl NativeContext {
         if self.completed_texture_transfer_value()? < required {
             return Err(AllocationError::NativeFailure);
         }
+        self.install_prefix_view(texture, resident_mips, base_mip_level, level_count)
+    }
+
+    /// Installs the required-prefix view and descriptor before its transfer completes.
+    ///
+    /// Unlike [`Self::publish_texture_mips`], this skips the transfer-completion gate:
+    /// the caller attaches the required completion token as a GPU wait before any draw
+    /// executes, which orders the transfer (content, shader-readable layout, and
+    /// graphics-family ownership) before sampling. The caller must additionally
+    /// guarantee no submitted frame is still in flight (see
+    /// [`Self::texture_descriptor_update_ready`]); rewriting a slot while a prior
+    /// draw may still read it would expose the new view to unsynchronized sampling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the range is invalid, its levels are unsubmitted, or
+    /// creating the replacement native view fails.
+    pub fn reference_texture_prefix(
+        &mut self,
+        texture: &mut NativeTexture,
+        resident_mips: u32,
+    ) -> Result<(), AllocationError> {
+        let (base_mip_level, level_count) = resident_mip_range(texture.mip_count, resident_mips)
+            .ok_or(AllocationError::ZeroSize)?;
+        if resident_mips == texture.resident_mips {
+            return Ok(());
+        }
+        let first = usize::try_from(base_mip_level).map_err(|_| AllocationError::NativeFailure)?;
+        // Only submitted levels may be exposed; the GPU wait attached by the
+        // caller covers their content, layout transition, and queue ownership.
+        if texture.mip_completions[first..].contains(&0) {
+            return Err(AllocationError::NativeFailure);
+        }
+        self.install_prefix_view(texture, resident_mips, base_mip_level, level_count)
+    }
+
+    fn install_prefix_view(
+        &mut self,
+        texture: &mut NativeTexture,
+        resident_mips: u32,
+        base_mip_level: u32,
+        level_count: u32,
+    ) -> Result<(), AllocationError> {
         let device = self
             .device
             .as_ref()
@@ -750,8 +840,10 @@ impl NativeContext {
         let view = if resident_mips == 1 && texture.resident_mips == 0 {
             texture.view
         } else {
-            // SAFETY: the complete image allocation contains every selected level, and transfer
-            // completion above establishes shader-readable layout and graphics-family ownership.
+            // SAFETY: the complete image allocation contains every selected level, and
+            // shader-readable layout plus graphics-family ownership come from the
+            // transfer the caller GPU-waits (reference path) or that already
+            // completed (publish path).
             unsafe {
                 device.create_image_view(
                     &vk::ImageViewCreateInfo::default()
@@ -1086,6 +1178,8 @@ impl NativeContext {
 
 #[path = "texture_msaa.rs"]
 mod msaa;
+#[path = "texture_backend.rs"]
+mod texture_backend;
 #[cfg(test)]
 #[path = "texture_tests.rs"]
 mod texture_tests;

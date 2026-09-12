@@ -9,6 +9,7 @@ license.workspace = true
 ez-gfx-core.workspace = true
 ez-gfx-hal.workspace = true
 ez-gfx-runtime.workspace = true
+ez-gfx-texture-manager.workspace = true
 raw-window-handle.workspace = true
 
 [target.'cfg(target_vendor = "apple")'.dependencies]

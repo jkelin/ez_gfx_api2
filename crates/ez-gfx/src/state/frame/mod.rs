@@ -10,10 +10,9 @@ use super::{
     PackedHandle, PassInfo, PipelineKey, QueueKind, RenderTargetHandle, RenderTargetRecord,
     ResourceAccess, ResourceDesc, ResourceId, ResourceKind, ResourceLifetime, ResourceState,
     RuntimePhase, SURFACE_DEFAULT_CLEAR, ShaderHandle, ShaderRecord, ShaderStage, StoreOp,
-    SurfaceHandle, TextureFormat, TextureHandle, TextureId, last_native_frame_completion,
-    map_frame, map_hal, map_lifecycle, native_layouts, native_mesh_dispatch_limits,
-    pipeline_layout_key, prepare_frame_binding_scratch, published_texture_handles_into,
-    result_status, runtime_record, wait_native_idle, with_context_mut,
+    SubmittedInfo, SurfaceHandle, TextureHandle, last_native_frame_completion, map_frame, map_hal,
+    map_lifecycle, native_layouts, native_mesh_dispatch_limits, pipeline_layout_key,
+    prepare_frame_binding_scratch, result_status, runtime_record, wait_native_idle, with_context_mut,
 };
 
 #[cfg(target_vendor = "apple")]
@@ -27,7 +26,7 @@ use transients::{invalidate_unsafe_transients, recycle_consumed_transients};
 
 #[cfg(test)]
 mod transient_tests;
-type NativeTextureMap = HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>;
+type NativeTextureMap = HashMap<TextureHandle, NativeTexture>;
 
 include!("lowering.rs");
 
@@ -40,7 +39,7 @@ include!("lowering.rs");
     not(any(feature = "ffi", test)),
     allow(
         dead_code,
-        reason = "the C raw seam begins target-less readback frames"
+        reason = "the C raw boundary begins target-less readback frames"
     )
 )]
 pub fn frame_begin(context: ContextHandle) -> Result<()> {
@@ -157,7 +156,309 @@ fn expected_frame_output_count(payloads: &[ExecutableNode], capture: bool) -> us
         .saturating_add(usize::from(capture))
 }
 
-include!("resources.rs");
+fn intern_buffer_resource(context: &mut ContextState, handle: PackedHandle) -> Result<ResourceId> {
+    if let Some(resource) = context.frame_resources.get(&handle) {
+        return Ok(*resource);
+    }
+    let size = context
+        .allocations
+        .get(&handle)
+        .map(|(size, _)| *size)
+        .ok_or(Error::InvalidContext)?;
+    let desc = ResourceDesc::buffer(size, 4, ResourceLifetime::External)
+        .map_err(|_| Error::InvalidArgument)?;
+    let resource = context
+        .frame
+        .add_resource(desc)
+        .map_err(|error| map_frame(&error))?;
+    let initial = ResourceState::new(
+        QueueKind::Transfer,
+        ShaderStage::None,
+        ResourceAccess::TransferWrite,
+    )
+    .map_err(|_| Error::InvalidArgument)?;
+    context
+        .frame
+        .set_resource_initial_state(resource, initial)
+        .map_err(|error| map_frame(&error))?;
+    if let Some(ready) = context.allocation_ready.get(&handle).copied() {
+        context
+            .frame
+            .set_resource_ready(resource, ready)
+            .map_err(|error| map_frame(&error))?;
+    }
+    context.frame_resources.insert(handle, resource);
+    context
+        .frame_native_resources
+        .insert(resource, FrameNativeResource::Buffer(handle));
+    Ok(resource)
+}
+
+fn intern_surface_resource(context: &mut ContextState) -> Result<ResourceId> {
+    if let Some(resource) = context.frame_surface {
+        return Ok(resource);
+    }
+    let surface = context.active_surface.ok_or(Error::NotReady)?;
+    let (width, height) = context
+        .surfaces
+        .get(&surface)
+        .and_then(|surface| surface.state.extent())
+        .ok_or(Error::NotReady)?;
+    let desc = ResourceDesc::image(
+        width,
+        height,
+        1,
+        1,
+        Format::Bgra8Srgb,
+        1,
+        ResourceLifetime::External,
+    )
+    .map_err(|_| Error::InvalidArgument)?;
+    let resource = context
+        .frame
+        .add_resource(desc)
+        .map_err(|error| map_frame(&error))?;
+    let present = ResourceState::new(
+        QueueKind::Graphics,
+        ShaderStage::None,
+        ResourceAccess::Present,
+    )
+    .map_err(|_| Error::InvalidArgument)?;
+    context
+        .frame
+        .set_resource_initial_state(resource, present)
+        .map_err(|error| map_frame(&error))?;
+    context.frame_surface = Some(resource);
+    context
+        .frame_native_resources
+        .insert(resource, FrameNativeResource::Surface(surface));
+    Ok(resource)
+}
+
+fn intern_depth_resource(context: &mut ContextState) -> Result<ResourceId> {
+    if let Some(resource) = context.frame_depth {
+        return Ok(resource);
+    }
+    let surface = context.active_surface.ok_or(Error::NotReady)?;
+    let (width, height) = context
+        .surfaces
+        .get(&surface)
+        .and_then(|surface| surface.state.extent())
+        .ok_or(Error::NotReady)?;
+    let desc = ResourceDesc::image(
+        width,
+        height,
+        1,
+        1,
+        Format::Depth32Float,
+        1,
+        ResourceLifetime::Transient,
+    )
+    .map_err(|_| Error::InvalidArgument)?;
+    let resource = context
+        .frame
+        .add_resource(desc)
+        .map_err(|error| map_frame(&error))?;
+    context.frame_depth = Some(resource);
+    context
+        .frame_native_resources
+        .insert(resource, FrameNativeResource::Depth);
+    Ok(resource)
+}
+
+fn intern_index_resource(context: &mut ContextState) -> Result<ResourceId> {
+    if let Some(resource) = context.frame_index {
+        return Ok(resource);
+    }
+    let heap = context.index_heap.as_ref().ok_or(Error::NotReady)?;
+    let size = heap.size;
+    let desc = ResourceDesc::buffer(size, 4, ResourceLifetime::External)
+        .map_err(|_| Error::InvalidArgument)?;
+    let resource = context
+        .frame
+        .add_resource(desc)
+        .map_err(|error| map_frame(&error))?;
+    let initial = ResourceState::new(
+        QueueKind::Transfer,
+        ShaderStage::None,
+        ResourceAccess::TransferWrite,
+    )
+    .map_err(|_| Error::InvalidArgument)?;
+    context
+        .frame
+        .set_resource_initial_state(resource, initial)
+        .map_err(|error| map_frame(&error))?;
+    if let Some(ready) = heap.ready {
+        context
+            .frame
+            .set_resource_ready(resource, ready)
+            .map_err(|error| map_frame(&error))?;
+    }
+    context.frame_index = Some(resource);
+    context
+        .frame_native_resources
+        .insert(resource, FrameNativeResource::Index);
+    Ok(resource)
+}
+
+fn intern_vertex_heap_resource(
+    context: &mut ContextState,
+    name: &str,
+) -> Result<(ResourceId, u64)> {
+    let heap = context.vertex_heaps.get(name).ok_or(Error::NotReady)?;
+    let heap_id = heap.heap_id.ok_or(Error::NativeFailure)?;
+    if let Some(resource) = context.frame_vertex_heaps.get(&heap_id) {
+        return Ok((*resource, heap.size));
+    }
+    let size = heap.size;
+    let ready = heap.ready;
+    let desc = ResourceDesc::buffer(size, 16, ResourceLifetime::External)
+        .map_err(|_| Error::InvalidArgument)?;
+    let resource = context
+        .frame
+        .add_resource(desc)
+        .map_err(|error| map_frame(&error))?;
+    let initial = ResourceState::new(
+        QueueKind::Transfer,
+        ShaderStage::None,
+        ResourceAccess::TransferWrite,
+    )
+    .map_err(|_| Error::InvalidArgument)?;
+    context
+        .frame
+        .set_resource_initial_state(resource, initial)
+        .map_err(|error| map_frame(&error))?;
+    if let Some(ready) = ready {
+        context
+            .frame
+            .set_resource_ready(resource, ready)
+            .map_err(|error| map_frame(&error))?;
+    }
+    context.frame_vertex_heaps.insert(heap_id, resource);
+    context
+        .frame_native_resources
+        .insert(resource, FrameNativeResource::VertexHeap(heap_id));
+    Ok((resource, size))
+}
+
+fn add_binding_accesses(
+    context: &mut ContextState,
+    mut node: NodeDesc,
+    layout: &ez_gfx_runtime::binding::ReflectedBindings,
+    bindings: binding::BindingProjection<'_>,
+    queue: QueueKind,
+    stage: ShaderStage,
+    combined_indirect: Option<CounterBufferHandle>,
+) -> Result<NodeDesc> {
+    for requirement in layout.requirements() {
+        if requirement.kind == ez_gfx_runtime::binding::BindingKind::VertexHeap {
+            let (resource, size) = intern_vertex_heap_resource(context, &requirement.name)?;
+            let access_state = ResourceState::new(
+                queue,
+                stage,
+                if requirement.writable {
+                    ResourceAccess::StorageReadWrite
+                } else {
+                    ResourceAccess::StorageRead
+                },
+            )
+            .map_err(|_| Error::InvalidArgument)?;
+            node = node.access(Access::buffer(
+                resource,
+                BufferRange::new(0, size).map_err(|_| Error::InvalidArgument)?,
+                access_state,
+            ));
+            continue;
+        }
+        let binding = bindings
+            .iter()
+            .find(|binding| binding.name == requirement.name)
+            .ok_or(Error::InvalidArgument)?;
+        let handle = match binding.resource {
+            ez_gfx_runtime::binding::ResourceIdentity::Buffer(handle) => handle.packed(),
+            ez_gfx_runtime::binding::ResourceIdentity::Counter(handle) => handle.packed(),
+            ez_gfx_runtime::binding::ResourceIdentity::RenderTarget(_) => {
+                return Err(Error::Unsupported);
+            }
+        };
+        if combined_indirect.is_some_and(|indirect| indirect.packed() == handle) {
+            continue;
+        }
+        let size = context
+            .allocations
+            .get(&handle)
+            .map(|(size, _)| *size)
+            .ok_or(Error::InvalidContext)?;
+        let resource = intern_buffer_resource(context, handle)?;
+        let writable = requirement.writable;
+        let access_state = ResourceState::new(
+            queue,
+            stage,
+            if writable {
+                ResourceAccess::StorageReadWrite
+            } else {
+                ResourceAccess::StorageRead
+            },
+        )
+        .map_err(|_| Error::InvalidArgument)?;
+        node = node.access(Access::buffer(
+            resource,
+            BufferRange::new(0, size).map_err(|_| Error::InvalidArgument)?,
+            access_state,
+        ));
+    }
+    Ok(node)
+}
+
+fn intern_texture_resource(
+    context: &mut ContextState,
+    texture: TextureHandle,
+) -> Result<ResourceId> {
+    if let Some(resource) = context.frame_resources.get(&texture.packed()) {
+        return Ok(*resource);
+    }
+    let info = context
+        .texture_pipeline
+        .submitted()
+        .get(&texture)
+        .copied()
+        .ok_or(Error::InvalidContext)?;
+    let desc = ResourceDesc::image(
+        info.width,
+        info.height,
+        1,
+        1,
+        Format::Rgba8Unorm,
+        1,
+        ResourceLifetime::External,
+    )
+    .map_err(|_| Error::InvalidArgument)?;
+    let resource = context
+        .frame
+        .add_resource(desc)
+        .map_err(|error| map_frame(&error))?;
+    let sampled = ResourceState::new(
+        QueueKind::Graphics,
+        ShaderStage::Fragment,
+        ResourceAccess::SampledRead,
+    )
+    .map_err(|_| Error::InvalidArgument)?;
+    context
+        .frame
+        .set_resource_initial_state(resource, sampled)
+        .map_err(|error| map_frame(&error))?;
+    if let Some(ready) = context.texture_pipeline.ready().get(&texture).copied() {
+        context
+            .frame
+            .set_resource_ready(resource, ready)
+            .map_err(|error| map_frame(&error))?;
+    }
+    context.frame_resources.insert(texture.packed(), resource);
+    context
+        .frame_native_resources
+        .insert(resource, FrameNativeResource::Texture(texture));
+    Ok(resource)
+}
 /// Enqueues texture readback in the current frame.
 ///
 /// Readback captures the full stored image as RGBA8. Block-compressed storage has
@@ -177,30 +478,25 @@ pub fn frame_enqueue_readback(context: ContextHandle, texture: TextureHandle) ->
             .resolve(handle, ResourceKind::Texture)
             .map_err(map_lifecycle)?;
         // Compressed blocks cannot fill an RGBA8 capture; demoted views expose a
-        // smaller extent than the request. Both are boundary rejections, applied
-        // identically before any backend records the copy.
-        if context.pending_textures.contains_key(&texture) {
+        if context.texture_pipeline.pending().contains_key(&texture) {
             return Err(Error::NotReady);
         }
-        let format = context
-            .texture_formats
+        let info = context
+            .texture_pipeline
+            .submitted()
             .get(&texture)
             .copied()
-            .unwrap_or(TextureFormat::Rgba8Unorm);
-        if format.is_compressed() {
+            .ok_or(Error::InvalidContext)?;
+        if info.format.is_compressed() {
             return Err(Error::InvalidArgument);
         }
-        let (_, _, _, _, total) = context
-            .textures
-            .get(&texture)
-            .ok_or(Error::InvalidContext)?;
-        let total = *total;
         let resident = context
-            .texture_published_mips
+            .texture_pipeline
+            .published()
             .get(&texture)
             .copied()
             .unwrap_or(0);
-        if resident != total {
+        if resident != info.total {
             return Err(Error::NotReady);
         }
         let resource = intern_texture_resource(context, texture)?;
@@ -479,14 +775,14 @@ fn add_texture_accesses(
     queue: QueueKind,
     stage: ShaderStage,
 ) -> Result<NodeDesc> {
-    // Snapshot into bounded context scratch so mutable resource internment does not
-    // allocate a temporary list for every graphics or mesh node.
-    published_texture_handles_into(
-        &context.texture_published_mips,
-        &mut context.frame_texture_handles,
-    );
-    for index in 0..context.frame_texture_handles.len() {
-        let texture = context.frame_texture_handles[index];
+    // Unpublished textures cannot be sampled yet; unrelated uploads must not stall the heap.
+    let texture_handles: Vec<_> = context
+        .texture_pipeline
+        .published()
+        .iter()
+        .filter_map(|(texture, mips)| (*mips != 0).then_some(*texture))
+        .collect();
+    for texture in texture_handles {
         let resource = intern_texture_resource(context, texture)?;
         let sampled = ResourceState::new(queue, stage, ResourceAccess::SampledRead)
             .map_err(|_| Error::InvalidArgument)?;
@@ -562,6 +858,13 @@ pub fn execute_graphics(
                     .and_then(|fragment_layout| vertex_layout.merge(&fragment_layout))
             })
             .map_err(|_| Error::InvalidArgument)?;
+        // Required-prefix textures cannot sample fallback: drive pending decodes
+        // to referenced descriptors here so heap accesses below attach GPU waits.
+        // Heapless shaders sample no textures and skip driving entirely.
+        super::texture_manager::gate_required_textures_for_submit(
+            context,
+            pipeline_layout.texture_heap().is_some(),
+        )?;
         let node = graphics_node(context, &layout, bindings, counter, pipeline_layout)?;
         let payload_layout = layout.clone();
         context
@@ -774,6 +1077,13 @@ pub fn execute_compute(
         let bindings = binding::BindingProjection::new(&layout, bindings);
         validate_binding_handles(context, bindings)?;
         bindings.validate().map_err(|_| Error::InvalidArgument)?;
+        let heap_demanded = record
+            .runtime
+            .pipeline_layout(ez_gfx_artifact::Stage::Compute)
+            .map(|layout| layout.texture_heap().is_some())
+            .map_err(|_| Error::InvalidArgument)?;
+        // Heapless shaders sample no textures and skip driving entirely.
+        super::texture_manager::gate_required_textures_for_submit(context, heap_demanded)?;
         let node = add_binding_accesses(
             context,
             NodeDesc::new("compute", QueueKind::Compute),
@@ -882,7 +1192,7 @@ pub fn frame_submit(context: ContextHandle) -> Result<()> {
         let result = (|| {
             // Updates admitted after draw recording still precede submission. Refresh their
             // dependencies so a cached resource entry cannot retain an older ready value.
-            for (texture, completion) in &context.texture_ready {
+            for (texture, completion) in context.texture_pipeline.ready() {
                 if let Some(resource) = context.frame_resources.get(&texture.packed()) {
                     context
                         .frame

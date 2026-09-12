@@ -499,7 +499,7 @@ impl Example {
     /// Pumps until host input is ready, or returns `None` after completion.
     pub fn wait_for_next_frame(
         &mut self,
-        context: &Context,
+        _context: &Context,
         surface: &Surface,
     ) -> Result<Option<WindowFrame>> {
         if self.state.closed
@@ -509,11 +509,6 @@ impl Example {
                 .is_some_and(|limit| self.frames >= limit)
         {
             return Ok(None);
-        }
-        // A zero-frame run exits above without waiting. Snapshot errors terminate the run, while
-        // a submitted first frame advances `frames`, so later frames and every ordinary run skip it.
-        if self.frames == 0 && self.snapshot.is_some() {
-            context.wait_idle()?;
         }
 
         let host_wait_started = Instant::now();
@@ -703,6 +698,10 @@ impl Example {
     /// Returns whether the probe must require whole-window zero allocations.
     pub const fn strict_all(&self) -> bool {
         self.strict_all
+    }
+    /// Returns whether this run compares or updates a snapshot.
+    pub const fn snapshot_enabled(&self) -> bool {
+        self.snapshot.is_some()
     }
 
     pub fn backend(&self) -> Backend {

@@ -12,6 +12,8 @@ This repository is a Rust/Cargo migration of `ez_gfx_api`. Preserve the recogniz
 - Treat Vulkan, DX12, and Metal as one synchronized contract. Any backend-facing abstraction, implementation, test, or documented behavior change must be assessed and updated consistently across all three, or explicitly record why a backend is unsupported.
 - Keep backend-native handles, state lowering, and physical shader layouts private. Public Rust resources are owning wrappers; raw handles are doc-hidden and reserved for the stable C ABI, which uses opaque `uint64_t`/`u64` values with generation/owner validation.
 - Keep compiler/runtime dependency isolation absolute: runtime crates and distributions contain no Slang, DXC, compiler crates, native compiler libraries, source compilation, JIT, or shader fallback. The non-distributed Rust examples are development compiler clients that compile adjacent Slang source paths with target lists and development mode, then load owned validated artifact bytes; runtime packages remain compiler-free.
+- Keep texture and geometry policy in their backend-neutral manager crates (`ez-gfx-texture-manager`, `ez-gfx-geometry-manager`) behind manager-defined traits; backend crates implement those traits for their private native types, and `ez-gfx` links the selected implementations with static dispatch (generics), never `dyn`. Manager crates must never depend on backends, the runtime, or `ez-gfx`.
+- Every crate keeps a current `README.md` describing its ownership, interfaces, and trait contracts; keep `docs/textures.md`, `docs/geometry.md`, and each manager README current with every related change.
 
 ## Shader and artifact contracts
 
@@ -28,7 +30,7 @@ This repository is a Rust/Cargo migration of `ez_gfx_api`. Preserve the recogniz
 ## Dependencies and packaging
 
 - Keep Slang/DXC/Apple compiler tooling in compiler packages and explicit development clients only. Audit dependency trees and native imports for runtime packages. Do not add a runtime fallback to make a build pass.
-- Preserve the existing Cargo workspace and backend-local native dependencies. Do not add a new abstraction layer when the existing HAL/API seam is sufficient.
+- Preserve the existing Cargo workspace and backend-local native dependencies. Do not add a new abstraction layer when the existing HAL/API boundary is sufficient.
 
 ## Docs, TODOs, and personal-project discipline
 

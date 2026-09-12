@@ -38,7 +38,7 @@ Use a virtual workspace with `resolver = "2"` (or `3` if the eventual MSRV permi
 
 #### Evidence, tradeoffs, and failure modes
 
-Cargo workspaces share a lockfile/output directory, not features. Features are additive and unioned for a package; resolver v2 only avoids some build/dev/inactive-target unification. Separate packages therefore establish a stronger delivery boundary than features. Costs are more manifests, internal API seams, package selection, and schema compatibility. Failures include a runtime-to-compiler dependency, `--workspace`/`--all-features` being mistaken for a minimal-runtime check, conflicting native `links` packages, or an artifact lacking compiler/schema identity. No controlled build-time, binary-size, or incremental-build measurement exists; those remain unknown. Existing `out/` binaries have uncontrolled build conditions and are not evidence.
+- Cargo workspaces share a lockfile/output directory, not features. Features are additive and unioned for a package; resolver v2 only avoids some build/dev/inactive-target unification. Separate packages therefore establish a stronger delivery boundary than features. Costs are more manifests, internal API boundaries, package selection, and schema compatibility. Failures include a runtime-to-compiler dependency, `--workspace`/`--all-features` being mistaken for a minimal-runtime check, conflicting native `links` packages, or an artifact lacking compiler/schema identity. No controlled build-time, binary-size, or incremental-build measurement exists; those remain unknown. Existing `out/` binaries have uncontrolled build conditions and are not evidence.
 
 #### Sources
 
@@ -70,7 +70,7 @@ No candidate has measured repository-specific build or binary data; runtime thro
 
 | Rank | Candidate | Hard constraints | Startup/runtime | Build, delivery, and reliability | Implementation cost | Evidence status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | Strict workspace boundary | Passes: runtime dependency graph can exclude Slang; platform and decoder packages remain selectable | Runtime effect unknown; no compiler startup path | Strongest protection against feature unification and accidental native linkage | More packages and schema seams | Cargo semantics sourced; project measurements missing |
+- | 1 | Strict workspace boundary | Passes: runtime dependency graph can exclude Slang; platform and decoder packages remain selectable | Runtime effect unknown; no compiler startup path | Strongest protection against feature unification and accidental native linkage | More packages and schema boundaries | Cargo semantics sourced; project measurements missing |
 | 2 | Single-package feature matrix | Conditional failure: an ordinary dependency edge can re-enable compiler/native features | Runtime effect unknown | Smaller manifest surface, but feature union can violate the no-Slang deliverable | Lower initial cost; higher configuration risk | Cargo semantics sourced; project measurements missing |
 
 ## Selected solution

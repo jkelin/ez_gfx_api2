@@ -8,6 +8,8 @@ members = [
     "crates/ez-gfx-artifact",
     "crates/ez-gfx-assets",
     "crates/ez-gfx-ffi",
+    "crates/ez-gfx-geometry-manager",
+    "crates/ez-gfx-texture-manager",
     "crates/ez-gfx-backend-vulkan",
     "crates/ez-gfx-backend-dx12",
     "crates/ez-gfx-backend-metal",
@@ -46,6 +48,8 @@ must_use_candidate = "allow"
 ez-gfx = { path = "crates/ez-gfx" }
 ez-gfx-core = { path = "crates/ez-gfx-core" }
 ez-gfx-hal = { path = "crates/ez-gfx-hal" }
+ez-gfx-geometry-manager = { path = "crates/ez-gfx-geometry-manager" }
+ez-gfx-texture-manager = { path = "crates/ez-gfx-texture-manager" }
 ez-gfx-runtime = { path = "crates/ez-gfx-runtime" }
 ez-gfx-artifact = { path = "crates/ez-gfx-artifact" }
 ez-gfx-compiler = { path = "crates/ez-gfx-compiler" }

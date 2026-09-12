@@ -204,9 +204,9 @@ impl Context {
     /// Returns [`TextureError`] when `source_format` is reserved or already registered.
     pub fn register_texture_decoder(
         source_format: u8,
-        decoder: ez_gfx_runtime::texture::TextureDecodeCallback,
-    ) -> std::result::Result<(), ez_gfx_runtime::texture::TextureError> {
-        ez_gfx_runtime::texture::register_texture_decoder(source_format, decoder)
+        decoder: ez_gfx_texture_manager::texture::TextureDecodeCallback,
+    ) -> std::result::Result<(), ez_gfx_texture_manager::texture::TextureError> {
+        ez_gfx_texture_manager::texture::register_texture_decoder(source_format, decoder)
     }
 
     /// Removes one process-wide custom texture decoder.
@@ -217,8 +217,8 @@ impl Context {
     /// Returns [`TextureError`] when `source_format` is reserved or not registered.
     pub fn unregister_texture_decoder(
         source_format: u8,
-    ) -> std::result::Result<(), ez_gfx_runtime::texture::TextureError> {
-        ez_gfx_runtime::texture::unregister_texture_decoder(source_format)
+    ) -> std::result::Result<(), ez_gfx_texture_manager::texture::TextureError> {
+        ez_gfx_texture_manager::texture::unregister_texture_decoder(source_format)
     }
 }
 
@@ -414,7 +414,7 @@ impl Context {
     /// Returns [`Error`] when the context is stale or unhealthy.
     pub fn texture_upload_telemetry(
         &self,
-    ) -> Result<ez_gfx_runtime::texture::TextureUploadTelemetrySnapshot> {
+    ) -> Result<ez_gfx_texture_manager::texture::TextureUploadTelemetrySnapshot> {
         self.check_entry()?;
         self.complete(state::texture_upload_telemetry(self.raw()))
     }
@@ -432,7 +432,7 @@ impl Context {
     pub fn resource_diagnostics(&self) -> Result<ResourceDiagnostics> {
         self.check_entry()?;
         let snapshot = state::resource_diagnostics(self.raw())?;
-        // The state query tolerates device loss, but the seam still delivers
+        // The state query tolerates device loss, but the boundary still delivers
         // queued events; only a loss-driven dispatch failure keeps the snapshot,
         // so callback panics and reentrancy keep failing fast.
         match self.dispatch_events() {
@@ -906,27 +906,20 @@ impl Texture {
 impl Context {
     /// Queues texture decode and upload while owning the copied input.
     ///
-    /// The texture manager admits natural FIFO submissions under its internal memory budget.
+    /// The texture manager admits natural FIFO submissions under the shared
+    /// transfer budget. Source format, mip generation, and the required
+    /// coarse-prefix mip count all live in `config`.
     ///
     /// # Errors
     /// Returns [`Error`] when input, decode preparation, or ownership validation fails.
-    pub fn load_texture(
-        &self,
-        source: ez_gfx_runtime::texture::TextureSource,
-        bytes: &[u8],
-        generate_mips: bool,
-        config: &state::TextureConfig,
-    ) -> Result<Texture> {
+    pub fn load_texture(&self, bytes: &[u8], config: &state::TextureConfig) -> Result<Texture> {
         self.check_entry()?;
-        let result =
-            state::load_texture(self.raw(), source, bytes, generate_mips, config).map(|handle| {
-                Texture {
-                    inner: Rc::new(TextureInner {
-                        context: Rc::clone(&self.inner),
-                        handle,
-                    }),
-                }
-            });
+        let result = state::load_texture(self.raw(), bytes, config).map(|handle| Texture {
+            inner: Rc::new(TextureInner {
+                context: Rc::clone(&self.inner),
+                handle,
+            }),
+        });
         self.complete(result)
     }
 }

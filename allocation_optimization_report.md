@@ -388,9 +388,9 @@ Owned names in error variants occur on failure paths. Optimize successful frame 
 
 ## Arena and cache placement
 
-An arena-centric design makes sense at one narrow seam: CPU-only frame compilation and lowering. It should not become the repository-wide ownership model.
+An arena-centric design makes sense at one narrow boundary: CPU-only frame compilation and lowering. It should not become the repository-wide ownership model.
 
-### Recommended arena seam
+### Recommended arena boundary
 
 A deep `FrameWorkspace` module should own all temporary CPU memory from graph compilation through native command encoding. Callers should provide frame inputs and receive a borrowed execution view; they should not select allocators or manage individual arena objects.
 

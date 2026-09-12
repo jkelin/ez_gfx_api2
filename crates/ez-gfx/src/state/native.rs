@@ -4,6 +4,7 @@ use super::{
     AllocationRequest, BufferTransfer, COUNTER_BUFFER_ELEMENT_OFFSET, CompletionToken,
     ContextIdentity, Error, GeometryAllocation, GeometryError, HalError, HashMap, LifecycleError,
     MemoryAllocator, NativeAllocation, NativeContext, NativeTexture, PackedHandle,
+    TextureBackendContext,
 };
 
 pub(super) fn map_frame(error: &ez_gfx_runtime::frame::FrameError) -> Error {
@@ -16,8 +17,8 @@ pub(super) fn map_frame(error: &ez_gfx_runtime::frame::FrameError) -> Error {
     }
 }
 
-pub(super) fn map_texture(error: ez_gfx_runtime::texture::TextureError) -> Error {
-    use ez_gfx_runtime::texture::TextureError;
+pub(super) fn map_texture(error: ez_gfx_texture_manager::TextureError) -> Error {
+    use ez_gfx_texture_manager::TextureError;
     match error {
         TextureError::Unsupported => Error::Unsupported,
         TextureError::NotReady => Error::NotReady,
@@ -28,25 +29,21 @@ pub(super) fn map_texture(error: ez_gfx_runtime::texture::TextureError) -> Error
     }
 }
 
+pub(super) fn map_schedule(error: ez_gfx_texture_manager::TextureScheduleError) -> Error {
+    use ez_gfx_texture_manager::TextureScheduleError;
+    match error {
+        // An over-sized requirement is caller misconfiguration, discovered once
+        // the decoded total is known.
+        TextureScheduleError::InvalidMipCount => Error::InvalidArgument,
+        TextureScheduleError::BudgetOverflow => Error::QueueFull,
+    }
+}
+
 pub(super) fn destroy_native_texture(
     context: &mut NativeContext,
     texture: NativeTexture,
 ) -> std::result::Result<(), ez_gfx_hal::AllocationError> {
-    match (context, texture) {
-        (NativeContext::Vulkan(context), NativeTexture::Vulkan(texture)) => {
-            context.destroy_texture(texture)
-        }
-        #[cfg(windows)]
-        (NativeContext::Dx12(context), NativeTexture::Dx12(texture)) => {
-            context.destroy_texture(texture)
-        }
-        #[cfg(target_vendor = "apple")]
-        (NativeContext::Metal(context), NativeTexture::Metal(texture)) => {
-            context.destroy_texture(texture)
-        }
-        #[cfg(any(windows, target_vendor = "apple"))]
-        _ => Err(ez_gfx_hal::AllocationError::NativeFailure),
-    }
+    context.destroy_texture(texture)
 }
 
 /// Reports adapter compression support for capability-gated target selection.
@@ -566,13 +563,7 @@ pub(super) fn completed_transfer_native(
 pub(super) fn completed_texture_transfer_native(
     context: &mut NativeContext,
 ) -> std::result::Result<u64, ez_gfx_hal::AllocationError> {
-    let completed = match context {
-        NativeContext::Vulkan(context) => context.completed_texture_transfer_value()?,
-        #[cfg(windows)]
-        NativeContext::Dx12(context) => context.completed_texture_transfer_value()?,
-        #[cfg(target_vendor = "apple")]
-        NativeContext::Metal(context) => context.completed_texture_transfer_value()?,
-    };
+    let completed = context.completed_texture_transfer_value()?;
     match context {
         NativeContext::Vulkan(context) => {
             context.reclaim(ez_gfx_hal::QueueKind::TextureTransfer, completed)?;
@@ -587,6 +578,54 @@ pub(super) fn completed_texture_transfer_native(
         }
     }
     Ok(completed)
+}
+
+/// Returns retained backend texture-staging capacity for global eviction.
+pub(super) fn retained_native_texture_staging(context: &NativeContext) -> u64 {
+    match context {
+        NativeContext::Vulkan(context) => context.retained_texture_staging_bytes(),
+        #[cfg(windows)]
+        NativeContext::Dx12(context) => context.retained_texture_staging_bytes(),
+        #[cfg(target_vendor = "apple")]
+        NativeContext::Metal(context) => context.retained_texture_staging_bytes(),
+    }
+}
+
+/// Removes the largest completed backend texture-staging bucket, if any.
+///
+/// The returned allocation frees through the shared stale path like every
+/// other evicted bucket.
+pub(super) fn pop_largest_native_texture_staging(
+    context: &mut NativeContext,
+    completed: u64,
+) -> Option<NativeAllocation> {
+    match context {
+        NativeContext::Vulkan(context) => context
+            .pop_largest_texture_staging(completed)
+            .map(NativeAllocation::Vulkan),
+        #[cfg(windows)]
+        NativeContext::Dx12(context) => context
+            .pop_largest_texture_staging(completed)
+            .map(NativeAllocation::Dx12),
+        #[cfg(target_vendor = "apple")]
+        NativeContext::Metal(context) => context
+            .pop_largest_texture_staging(completed)
+            .map(NativeAllocation::Metal),
+    }
+}
+
+/// Returns the largest completed backend texture-staging bucket, if any.
+pub(super) fn largest_native_texture_staging(
+    context: &NativeContext,
+    completed: u64,
+) -> Option<u64> {
+    match context {
+        NativeContext::Vulkan(context) => context.largest_texture_staging_completed(completed),
+        #[cfg(windows)]
+        NativeContext::Dx12(context) => context.largest_texture_staging_completed(completed),
+        #[cfg(target_vendor = "apple")]
+        NativeContext::Metal(context) => context.largest_texture_staging_completed(completed),
+    }
 }
 
 pub(super) fn free_native_allocation(
@@ -645,11 +684,10 @@ pub(super) fn map_allocation(error: ez_gfx_hal::AllocationError) -> Error {
     }
 }
 
-pub(super) fn map_geometry(error: GeometryError) -> Error {
-    match error {
-        GeometryError::StagingPoolExhausted => Error::NotReady,
-        _ => Error::InvalidArgument,
-    }
+pub(super) fn map_geometry(_error: GeometryError) -> Error {
+    // Every geometry failure is a validation or state error; staging reuse
+    // failures surface through the HAL allocation mapping instead.
+    Error::InvalidArgument
 }
 
 pub(super) fn map_lifecycle(error: LifecycleError) -> Error {

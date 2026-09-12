@@ -16,14 +16,15 @@ pub use ez_gfx_hal::{
 };
 pub use ez_gfx_runtime::indirect::DrawIndexedCommand;
 pub use ez_gfx_runtime::target::{ClearValue, Format, TargetDeclaration, TargetError, TargetUsage};
-pub use ez_gfx_runtime::texture::{
-    DecodedMip, DecodedTexture, TextureDecodeCallback, TextureDestination, TextureError,
-    TextureSource, TextureUploadTelemetrySnapshot,
-};
 pub use ez_gfx_runtime::upload::{UploadEvent, UploadResource, UploadStatus};
 pub use ez_gfx_runtime::{
     AdapterReport, AdapterSelection, ContextOptions, HeadlessSurfaceOptions, LifecycleError,
 };
+pub use ez_gfx_texture_manager::texture::{
+    DecodedMip, DecodedTexture, TextureDecodeCallback, TextureDecoder, TextureDestination,
+    TextureError, TextureSource, TextureUploadTelemetrySnapshot,
+};
+pub use ez_gfx_texture_manager::{REQUIRED_MIPS_FULL, resolve_required_mips};
 pub use state::TextureConfig;
 
 /// Raw handle interface reserved for the C boundary.

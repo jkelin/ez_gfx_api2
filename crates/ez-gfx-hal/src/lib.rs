@@ -212,7 +212,7 @@ pub struct TextureSamplerDesc {
     pub address_w: SamplerAddressMode,
 }
 
-/// Backend-owned allocator seam. Native implementations derive physical requirements, while this
+/// Backend-owned allocator boundary. Native implementations derive physical requirements, while this
 /// contract makes mapping, cache visibility, immediate free, and timeline retirement explicit.
 pub trait MemoryAllocator {
     /// Backend-owned memory record passed to mapping, transfer, and release operations.

@@ -111,6 +111,7 @@ fn metal_texture_readback_submits_without_a_surface() {
         height: 1,
         mip_count: 1,
         generate_mips: 0,
+        required_mips: 0,
         min_filter: 0,
         mag_filter: 0,
         max_anisotropy: 1.0,

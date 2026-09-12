@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EZ_GFX_ABI_VERSION 41u
+#define EZ_GFX_ABI_VERSION 42u
 
 #if defined(__clang__)
 #  if __has_attribute(access)
@@ -585,6 +585,7 @@ typedef struct EzGfxHeadlessSurfaceDesc {
  * @address_mode_w: Selects the texture-addressing mode for the W coordinate.
  * @debug_label: Points to exactly `debug_label_length` UTF-8 bytes when present.
  * @debug_label_length: Specifies the debug-label byte length, or zero when absent.
+ * @required_mips: Specifies the coarse-prefix mip count gating initial readiness. Zero means optional: frame recording never waits for the texture and its binding samples fallback until the first real coarse mip publishes. `u32::MAX` requires the full decoded chain. Over-sized values fail the load terminally.
  *
  * Describes texture dimensions, formats, mipmapping, sampling, and labeling.
  */
@@ -603,6 +604,7 @@ typedef struct EzGfxTextureDesc {
     EzGfxTextureAddressMode address_mode_w;
     const char * debug_label;
     size_t debug_label_length;
+    uint32_t required_mips;
 } EzGfxTextureDesc;
 
 /**

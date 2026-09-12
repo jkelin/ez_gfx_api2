@@ -1040,3 +1040,118 @@ mod tests {
         }
     }
 }
+
+#[test]
+fn prefix_submit_publishes_required_first_then_phase_two_fine() {
+    let mut context = context();
+    let sampler = TextureSamplerDesc {
+        min_filter: SamplerFilter::Nearest,
+        mag_filter: SamplerFilter::Nearest,
+        max_anisotropy: 1.0,
+        address_u: SamplerAddressMode::Clamp,
+        address_v: SamplerAddressMode::Clamp,
+        address_w: SamplerAddressMode::Clamp,
+    };
+    let base = [1_u8; 64];
+    let mid = [2_u8; 16];
+    let coarse = [3_u8; 4];
+    // Storage order is largest-first; only the required coarse prefix submits.
+    let (mut texture, completions) = context
+        .create_texture_with_prefix(
+            TextureFormat::Rgba8Unorm,
+            &[
+                ImageMip {
+                    width: 4,
+                    height: 4,
+                    bytes: &base,
+                },
+                ImageMip {
+                    width: 2,
+                    height: 2,
+                    bytes: &mid,
+                },
+                ImageMip {
+                    width: 1,
+                    height: 1,
+                    bytes: &coarse,
+                },
+            ],
+            0,
+            sampler,
+            1,
+        )
+        .unwrap();
+    assert_eq!(completions.len(), 1);
+    assert_eq!(texture.mip_completions.len(), 3);
+    // Fine levels stay zero until phase two submits them.
+    assert_eq!(&texture.mip_completions[..2], &[0, 0]);
+    assert!(texture.mip_completions[2] > 0);
+    wait_texture(&context, completions[0].value);
+    context.publish_texture_mips(&mut texture, 1).unwrap();
+    assert!(context.publish_texture_mips(&mut texture, 2).is_err());
+    // Phase two uploads the coarsest remaining level first.
+    let fine = context
+        .update_texture_region(
+            &mut texture,
+            &TextureRegion {
+                mip_level: 1,
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+                bytes: &mid,
+            },
+        )
+        .unwrap();
+    wait_texture(&context, fine.value);
+    context.publish_texture_mips(&mut texture, 2).unwrap();
+    let finest = context
+        .update_texture_region(
+            &mut texture,
+            &TextureRegion {
+                mip_level: 0,
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+                bytes: &base,
+            },
+        )
+        .unwrap();
+    wait_texture(&context, finest.value);
+    context.publish_texture_mips(&mut texture, 3).unwrap();
+    // Empty and over-long prefixes are rejected before touching the device.
+    let single = [9_u8; 4];
+    assert!(
+        context
+            .create_texture_with_prefix(
+                TextureFormat::Rgba8Unorm,
+                &[ImageMip {
+                    width: 1,
+                    height: 1,
+                    bytes: &single
+                }],
+                0,
+                sampler,
+                0,
+            )
+            .is_err()
+    );
+    assert!(
+        context
+            .create_texture_with_prefix(
+                TextureFormat::Rgba8Unorm,
+                &[ImageMip {
+                    width: 1,
+                    height: 1,
+                    bytes: &single
+                }],
+                0,
+                sampler,
+                2,
+            )
+            .is_err()
+    );
+    context.destroy_texture(texture).unwrap();
+    context.wait_idle().unwrap();
+}

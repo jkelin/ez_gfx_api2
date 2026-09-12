@@ -31,7 +31,7 @@ Source evidence: Original Odin codebase (`src/ctx.odin`, `src/render.odin`, `src
 
 #### Architecture, integration, and applicability
 
-Define a narrow internal backend contract for devices, queues, resources, synchronization, descriptors, render encoders, indirect draws, and presentation. Compile one concrete backend over `ash`, `windows` D3D12, or `objc2-metal`; keep backend-specific feature negotiation and barrier lowering behind that seam. Vulkan timeline semaphores/dynamic rendering/descriptor indexing map conceptually to D3D12 fences/render-target state/descriptor heaps and Metal shared events/render encoders/argument buffers. This gives direct access to the incumbent bindless and MDI requirements.
+Define a narrow internal backend contract for devices, queues, resources, synchronization, descriptors, render encoders, indirect draws, and presentation. Compile one concrete backend over `ash`, `windows` D3D12, or `objc2-metal`; keep backend-specific feature negotiation and barrier lowering behind that boundary. Vulkan timeline semaphores/dynamic rendering/descriptor indexing map conceptually to D3D12 fences/render-target state/descriptor heaps and Metal shared events/render encoders/argument buffers. This gives direct access to the incumbent bindless and MDI requirements.
 
 #### Evidence, tradeoffs, and failure modes
 

@@ -103,7 +103,7 @@ Reliable delivery for hosts without an event loop, but callback thread affinity 
 
 ### Selection rationale
 
-This best fits the lightweight library and host-owned event-loop constraints. Rust receives owned event values whose lifetime ends by `Drop`; C/C# retain explicit payload release at the FFI seam. Frame recording remains context-affine and operates only through `&mut Frame`.
+This best fits the lightweight library and host-owned event-loop constraints. Rust receives owned event values whose lifetime ends by `Drop`; C/C# retain explicit payload release at the FFI boundary. Frame recording remains context-affine and operates only through `&mut Frame`.
 
 ### Rejected alternatives and reversal conditions
 

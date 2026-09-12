@@ -6,11 +6,11 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use ez_gfx::{TextureDecoder, TextureSource};
 use ez_gfx_ffi::{
     EzGfxDecodedTexture, EzGfxDecodedTextureMip, EzGfxResult, ez_gfx_texture_decoder_register,
     ez_gfx_texture_decoder_unregister,
 };
-use ez_gfx_runtime::texture::{TextureDecoder, TextureSource};
 
 unsafe extern "C" fn decode(
     data: *const u8,
@@ -178,7 +178,7 @@ fn registration_rejects_invalid_boundaries_and_releases_invalid_success_output()
     );
     assert_eq!(
         TextureDecoder::decode(TextureSource::Custom(SOURCE), &[1]),
-        Err(ez_gfx_runtime::texture::TextureError::InvalidData)
+        Err(ez_gfx::TextureError::InvalidData)
     );
     assert_eq!(releases.load(Ordering::Relaxed), 1);
     assert_eq!(ez_gfx_texture_decoder_unregister(SOURCE), EzGfxResult::Ok);

@@ -2,14 +2,10 @@
 #![forbid(unsafe_code)]
 
 use parking_lot::Mutex;
-use rayon::ThreadPool;
 use std::{
     collections::VecDeque,
     fmt,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 /// Block-compressed texture formats supported by the asset pipeline.
@@ -307,7 +303,6 @@ pub struct AssetEvent {
 pub struct EventQueue {
     events: Mutex<VecDeque<AssetEvent>>,
     capacity: usize,
-    reserved: AtomicUsize,
     cancelled: AtomicBool,
 }
 impl EventQueue {
@@ -323,7 +318,6 @@ impl EventQueue {
         Ok(Self {
             events: Mutex::new(VecDeque::with_capacity(capacity)),
             capacity,
-            reserved: AtomicUsize::new(0),
             cancelled: AtomicBool::new(false),
         })
     }
@@ -338,182 +332,18 @@ impl EventQueue {
             return Err(AssetError::Cancelled);
         }
         let mut events = self.events.lock();
-        if events.len() + self.reserved.load(Ordering::Acquire) >= self.capacity {
+        if events.len() >= self.capacity {
             return Err(AssetError::QueueFull);
         }
         events.push_back(event);
         Ok(())
-    }
-    fn reserve(&self) -> Result<(), AssetError> {
-        if self.cancelled.load(Ordering::Acquire) {
-            return Err(AssetError::Cancelled);
-        }
-        let events = self.events.lock();
-        let reserved = self.reserved.load(Ordering::Acquire);
-        if events.len() + reserved >= self.capacity {
-            return Err(AssetError::QueueFull);
-        }
-        self.reserved.fetch_add(1, Ordering::AcqRel);
-        Ok(())
-    }
-    fn push_reserved(&self, event: AssetEvent) {
-        let mut events = self.events.lock();
-        self.reserved.fetch_sub(1, Ordering::AcqRel);
-        events.push_back(event);
     }
     /// Removes and returns the oldest queued event.
     pub fn pop(&self) -> Option<AssetEvent> {
         self.events.lock().pop_front()
     }
-    /// Prevents future reservations and pushes.
+    /// Prevents future pushes.
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-    }
-}
-
-struct JobPermit {
-    jobs: Arc<AtomicUsize>,
-}
-impl Drop for JobPermit {
-    fn drop(&mut self) {
-        self.jobs.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-/// Maximum worker threads admitted to one CPU pool.
-///
-/// Rayon spawns one OS thread per worker eagerly at pool construction, so an
-/// unbounded count grinds thread creation (stack reservation, scheduler load)
-/// instead of failing fast. 256 threads already exceed twice the logical CPUs
-/// of large commodity workstations, beyond which extra workers add only
-/// overhead; any larger request is configuration garbage.
-pub const MAX_CPU_POOL_THREADS: usize = 256;
-
-/// CPU worker pool for asset processing with unbounded job admission.
-pub struct CpuPool {
-    pool: ThreadPool,
-    cancelled: Arc<AtomicBool>,
-    jobs: Arc<AtomicUsize>,
-}
-impl CpuPool {
-    /// Creates a worker pool with unbounded job admission.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AssetError::InvalidPool`] when `threads` is zero, exceeds
-    /// [`MAX_CPU_POOL_THREADS`], or the worker pool cannot be created.
-    pub fn new(threads: usize) -> Result<Self, AssetError> {
-        if threads == 0 {
-            return Err(AssetError::InvalidPool);
-        }
-        if threads > MAX_CPU_POOL_THREADS {
-            return Err(AssetError::InvalidPool);
-        }
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .map_err(|_| AssetError::InvalidPool)?;
-        Ok(Self {
-            pool,
-            cancelled: Arc::new(AtomicBool::new(false)),
-            jobs: Arc::new(AtomicUsize::new(0)),
-        })
-    }
-    /// Returns the worker thread count backing this pool.
-    pub fn thread_count(&self) -> usize {
-        self.pool.current_num_threads()
-    }
-    fn permit(&self) -> Result<JobPermit, AssetError> {
-        self.jobs
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |jobs| {
-                jobs.checked_add(1)
-            })
-            .map_err(|_| AssetError::QueueFull)?;
-        Ok(JobPermit {
-            jobs: self.jobs.clone(),
-        })
-    }
-    /// Schedules a CPU job without an artificial count or byte limit.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AssetError::Cancelled`] after shutdown or
-    /// [`AssetError::QueueFull`] only if the in-flight counter overflows.
-    pub fn submit<F>(&self, job: F) -> Result<(), AssetError>
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        if self.cancelled.load(Ordering::Acquire) {
-            return Err(AssetError::Cancelled);
-        }
-        let permit = self.permit()?;
-        let cancelled = self.cancelled.clone();
-        self.pool.spawn(move || {
-            let _permit = permit;
-            if !cancelled.load(Ordering::Acquire) {
-                job();
-            }
-        });
-        Ok(())
-    }
-
-    /// Returns the number of accepted jobs that have not finished.
-    pub fn in_flight_jobs(&self) -> usize {
-        self.jobs.load(Ordering::Acquire)
-    }
-    /// Runs a job and publishes its result as an asset event.
-    ///
-    /// # Errors
-    ///
-    /// Returns cancellation, event-queue, or counter-overflow errors before scheduling.
-    pub fn submit_event<F>(
-        &self,
-        queue: Arc<EventQueue>,
-        mut event: AssetEvent,
-        job: F,
-    ) -> Result<(), AssetError>
-    where
-        F: FnOnce() -> Result<usize, AssetError> + Send + 'static,
-    {
-        queue.reserve()?;
-        let permit = match self.permit() {
-            Ok(permit) => permit,
-            Err(error) => {
-                queue.reserved.fetch_sub(1, Ordering::AcqRel);
-                return Err(error);
-            }
-        };
-        let cancelled = self.cancelled.clone();
-        self.pool.spawn(move || {
-            let _permit = permit;
-            let result = if cancelled.load(Ordering::Acquire) {
-                Err(AssetError::Cancelled)
-            } else {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
-                    .map_err(|_| AssetError::WorkerPanic)
-                    .and_then(|r| r)
-            };
-            match result {
-                Ok(bytes) => {
-                    event.bytes = bytes;
-                    event.outcome = EventOutcome::Completed;
-                    event.error = None;
-                }
-                Err(error) => {
-                    event.outcome = if error == AssetError::Cancelled {
-                        EventOutcome::Cancelled
-                    } else {
-                        EventOutcome::Failed
-                    };
-                    event.error = Some(error);
-                }
-            }
-            queue.push_reserved(event);
-        });
-        Ok(())
-    }
-    /// Cancels queued and future CPU work.
-    pub fn shutdown(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
 }
@@ -719,14 +549,8 @@ pub enum AssetError {
     Cancelled,
     /// Queue has no free capacity.
     QueueFull,
-    /// Worker pool has shut down.
-    Shutdown,
     /// Queue capacity is invalid.
     InvalidQueue,
-    /// Worker pool limits are invalid.
-    InvalidPool,
-    /// Worker closure panicked.
-    WorkerPanic,
     /// Basis support was not compiled.
     BasisDisabled,
     /// Basis transcoding failed.
@@ -744,61 +568,3 @@ impl fmt::Display for AssetError {
     }
 }
 impl std::error::Error for AssetError {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::mpsc;
-
-    #[test]
-    fn cpu_job_admission_returns_before_the_admitted_work_finishes() {
-        let pool = CpuPool::new(1).unwrap();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-
-        pool.submit(move || {
-            started_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-        })
-        .unwrap();
-        started_rx.recv().unwrap();
-        assert_eq!(pool.in_flight_jobs(), 1);
-        release_tx.send(()).unwrap();
-    }
-
-    #[test]
-    fn cpu_pool_rejects_absurd_thread_counts_without_spawning() {
-        // The admission cap precedes ThreadPoolBuilder, so neither rejected call creates threads.
-        assert_eq!(
-            CpuPool::new(usize::MAX).map(|_| ()),
-            Err(AssetError::InvalidPool)
-        );
-        assert_eq!(
-            CpuPool::new(MAX_CPU_POOL_THREADS + 1).map(|_| ()),
-            Err(AssetError::InvalidPool)
-        );
-        assert_eq!(
-            CpuPool::new(MAX_CPU_POOL_THREADS).map(|pool| pool.thread_count()),
-            Ok(MAX_CPU_POOL_THREADS)
-        );
-    }
-
-    #[test]
-    fn cpu_pool_admits_more_jobs_than_worker_threads() {
-        let pool = CpuPool::new(1).unwrap();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        pool.submit(move || {
-            started_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-        })
-        .unwrap();
-        started_rx.recv().unwrap();
-
-        for _ in 0..1_000 {
-            pool.submit(|| {}).unwrap();
-        }
-        assert_eq!(pool.in_flight_jobs(), 1_001);
-        release_tx.send(()).unwrap();
-    }
-}

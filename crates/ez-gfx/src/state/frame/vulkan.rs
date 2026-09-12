@@ -7,7 +7,8 @@ use super::{
     GeometryAllocation, HashMap, MAX_PIPELINE_CACHE_ENTRIES, MeshPipelineKeyDesc, NativeAllocation,
     NativeContext, NativePipeline, NativeShader, NativeSurface, NativeTexture, NativeTextureMap,
     PackedHandle, PipelineKey, RenderTargetHandle, RenderTargetRecord, ResourceId,
-    SURFACE_DEFAULT_CLEAR, ShaderHandle, ShaderRecord, map_hal, native_layouts,
+    SURFACE_DEFAULT_CLEAR, ShaderHandle, ShaderRecord, SubmittedInfo, TextureHandle, map_hal,
+    native_layouts,
     pipeline_layout_key, prepare_frame_binding_scratch, should_capture_presented,
 };
 
@@ -17,6 +18,7 @@ struct VulkanActionState<'a> {
     allocations: &'a HashMap<PackedHandle, (u64, NativeAllocation)>,
     vertex_heaps: &'a HashMap<String, GeometryAllocation>,
     textures: &'a NativeTextureMap,
+    submitted: &'a HashMap<TextureHandle, SubmittedInfo>,
     render_targets: &'a HashMap<RenderTargetHandle, RenderTargetRecord>,
     resources: &'a HashMap<ResourceId, FrameNativeResource>,
     pipelines: &'a HashMap<PipelineKey, NativePipeline>,
@@ -402,7 +404,7 @@ fn vulkan_barrier_resource<'resources>(
             ez_gfx_backend_vulkan::NativeFrameResource::Buffer(allocation)
         }
         FrameNativeResource::Texture(handle) => {
-            let (_, texture, _, _, _) = state.textures.get(&handle).ok_or(Error::InvalidContext)?;
+            let texture = state.textures.get(&handle).ok_or(Error::InvalidContext)?;
             ez_gfx_backend_vulkan::NativeFrameResource::Texture(texture.vulkan()?)
         }
         FrameNativeResource::Surface(_) => ez_gfx_backend_vulkan::NativeFrameResource::Surface,
@@ -664,17 +666,23 @@ impl ez_gfx_backend_vulkan::NativeFrameActionSource for VulkanActionSource<'_, '
                             )?)
                         }
                         ExecutableNode::TextureReadback { texture } => {
-                            let (_, texture, width, height, _) =
-                                self.state
-                                    .textures
-                                    .get(texture)
-                                    .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
+                            let info = self
+                                .state
+                                .submitted
+                                .get(texture)
+                                .copied()
+                                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
+                            let texture = self
+                                .state
+                                .textures
+                                .get(texture)
+                                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
                             ez_gfx_backend_vulkan::NativeFrameAction::TextureReadback {
                                 texture: texture
                                     .vulkan()
                                     .map_err(|_| ez_gfx_hal::HalError::InvalidArgument)?,
-                                width: *width,
-                                height: *height,
+                                width: info.width,
+                                height: info.height,
                             }
                         }
                         ExecutableNode::RenderTargetReadback { target } => {
@@ -812,6 +820,7 @@ pub(super) fn execute_vulkan_frame_plan(
             allocations: &context.allocations,
             vertex_heaps: &context.vertex_heaps,
             textures: &context.textures,
+            submitted: context.texture_pipeline.submitted(),
             render_targets: &context.render_targets,
             pipelines: &context.pipelines,
             resources: &context.frame_native_resources,

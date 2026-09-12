@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     sync::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -22,6 +22,7 @@ use ez_gfx_core::{
         SurfaceHandle, TextureHandle, VertexAllocationHandle, VertexHeapHandle,
     },
 };
+use ez_gfx_geometry_manager::{GeometryError, GeometryManager};
 use ez_gfx_hal::{
     AllocationRequest, BufferRange, BufferTransfer, COUNTER_BUFFER_ELEMENT_OFFSET, CompletionToken,
     DEFAULT_STAGING_POLICY, DynamicPipelineState, ExecutionAction, ExecutionBarrier, ExecutionPass,
@@ -34,7 +35,6 @@ use ez_gfx_runtime::{
     HeadlessSurfaceOptions, LifecycleError, ResourceKind, RuntimeError, SurfaceState,
     admission_report,
     frame::{ExecutableNode, FrameRecorder},
-    geometry::{GeometryError, GeometryManager},
     graph::{
         Access, ImageRange, LoadOp, NodeDesc, PassInfo, ResourceDesc, ResourceId, ResourceLifetime,
         StoreOp,
@@ -42,12 +42,18 @@ use ez_gfx_runtime::{
     indirect::{DrawIndexedCommand, IndexedIndirectBuffer},
     observability::{DiagnosticLevel, Observability, RuntimePhase, RuntimeRecord, RuntimeStatus},
     target::Format,
-    texture::{
-        DecodedTexture, PreparedTextureDecode, TextureDecoder, TextureDestination, TextureError,
-        TextureId, TextureRegistry, TextureSource, TextureUploadTelemetry,
-        TextureUploadTelemetrySnapshot, generate_mips,
-    },
     upload::{UploadEvent, UploadEventQueue, UploadResource, UploadStatus},
+};
+use ez_gfx_texture_manager::pipeline::{
+    PendingUpload, QueuedDecode, SubmittedInfo, TexturePipeline, UploadFailure,
+};
+use ez_gfx_texture_manager::texture::{
+    MAX_TEXTURE_BYTES, TextureDecoder, TextureUploadTelemetrySnapshot,
+};
+use ez_gfx_texture_manager::{
+    DECODE_RESERVATION_BYTES, DecodeDriver, DecodeDriverError, MipTransferValues,
+    ReclaimableStaging, SharedTransferPool, TextureBackendContext, TextureBackendTexture,
+    TextureId, TextureRegistry, WORKING_SET_BUDGET_BYTES,
 };
 
 use crate::{Error, Result};
@@ -377,145 +383,6 @@ struct RetiredVertexHeap {
     allocation: NativeAllocation,
 }
 
-struct PendingTexture {
-    id: TextureId,
-    cancelled: Arc<AtomicBool>,
-    config: TextureConfig,
-    /// True after this reserved slot aliases the ready context fallback.
-    fallback_published: bool,
-    // Admitted source bytes remain owned by queued manager storage or an active decode closure;
-    // this count tracks either location until decoded/native transfer storage takes over.
-    source_bytes: u64,
-    decoded_bytes: Option<u64>,
-    admitted_at: Instant,
-}
-
-struct QueuedTextureDecode {
-    handle: TextureHandle,
-    prepared: PreparedTextureDecode,
-    bytes: Box<[u8]>,
-    generate: bool,
-    cancelled: Arc<AtomicBool>,
-}
-
-struct DecodedTextureJob {
-    handle: TextureHandle,
-    decoded: std::result::Result<DecodedTexture, TextureError>,
-}
-
-struct TextureTransferWork {
-    completion: CompletionToken,
-    bytes: u64,
-}
-
-struct AsyncTextureState {
-    /// Validated worker policy resolved at creation; the Rayon pool is built on
-    /// first decode so context creation never spawns threads for textureless use.
-    threads: usize,
-    /// Decode pool built lazily by `decode_pool`; `None` until first decode.
-    pool: Option<ez_gfx_assets::CpuPool>,
-    ready_tx: crossbeam_channel::Sender<DecodedTextureJob>,
-    ready_rx: crossbeam_channel::Receiver<DecodedTextureJob>,
-    queued: VecDeque<QueuedTextureDecode>,
-    order: VecDeque<TextureHandle>,
-    decoded: HashMap<TextureHandle, std::result::Result<DecodedTexture, TextureError>>,
-    active: usize,
-    working_bytes: u64,
-    #[cfg(test)]
-    decode_gate: Option<Arc<std::sync::Barrier>>,
-}
-
-impl AsyncTextureState {
-    fn new_with_workers(workers: u32) -> Result<Self> {
-        // Zero preserves the historical default topology; an explicit count is
-        // honored verbatim so embedders can pin decode concurrency. Counts above
-        // the pool admission cap fail here, before any thread exists, so both the
-        // Rust option and the C descriptor fail fast with InvalidArgument instead
-        // of grinding thread creation. Pool construction itself waits for first use.
-        let threads = if workers == 0 {
-            std::thread::available_parallelism()
-                .map_or(2, usize::from)
-                .saturating_sub(1)
-                .max(1)
-        } else {
-            let threads = usize::try_from(workers).map_err(|_| Error::InvalidArgument)?;
-            if threads > ez_gfx_assets::MAX_CPU_POOL_THREADS {
-                return Err(Error::InvalidArgument);
-            }
-            threads
-        };
-        let (ready_tx, ready_rx) = crossbeam_channel::unbounded();
-        Ok(Self {
-            threads,
-            pool: None,
-            ready_tx,
-            ready_rx,
-            queued: VecDeque::new(),
-            order: VecDeque::new(),
-            decoded: HashMap::new(),
-            active: 0,
-            working_bytes: 0,
-            #[cfg(test)]
-            decode_gate: None,
-        })
-    }
-
-    /// Returns the decode pool, constructing it on the first decode.
-    ///
-    /// The count was validated at creation, so late construction only fails when
-    /// the OS refuses threads; that surfaces as `NativeFailure` at admission,
-    /// matching the previous eager-construction failure at the same boundary.
-    fn decode_pool(&mut self) -> Result<&ez_gfx_assets::CpuPool> {
-        if self.pool.is_none() {
-            let pool =
-                ez_gfx_assets::CpuPool::new(self.threads).map_err(|_| Error::NativeFailure)?;
-            self.pool = Some(pool);
-        }
-        // Inserted above when absent, so `None` is unreachable without a borrow break.
-        self.pool.as_ref().ok_or(Error::NativeFailure)
-    }
-
-    /// Builds the lazy decode pool before any admission that would need rollback.
-    ///
-    /// Callers must invoke this before registering registry, identity, or
-    /// pending-texture state: late OS thread refusal then fails with nothing to
-    /// unwind. The creator-thread model means no other thread can drop the pool
-    /// between this call and submission.
-    fn ensure_decode_pool(&mut self) -> Result<()> {
-        self.decode_pool().map(|_| ())
-    }
-    /// Cancels queued and future CPU work when a pool was ever built.
-    fn shutdown(&self) {
-        // An unbuilt pool owns no threads or jobs, so skipping shutdown preserves
-        // the lazy savings instead of constructing a pool only to cancel it.
-        if let Some(pool) = self.pool.as_ref() {
-            pool.shutdown();
-        }
-    }
-
-    /// Configured worker count; reports policy before the first decode builds the pool.
-    fn worker_count(&self) -> usize {
-        self.pool
-            .as_ref()
-            .map_or(self.threads, ez_gfx_assets::CpuPool::thread_count)
-    }
-}
-#[cfg(target_vendor = "apple")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MetalWorkgroupSizes {
-    Compute([u32; 3]),
-    Mesh {
-        task: Option<[u32; 3]>,
-        mesh: [u32; 3],
-    },
-}
-
-impl Drop for AsyncTextureState {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FrameNativeResource {
     Buffer(PackedHandle),
@@ -575,7 +442,7 @@ struct ContextState {
     frame_shaders: HashSet<ShaderHandle>,
     pending_shader_destroys: HashSet<ShaderHandle>,
     indirects: HashMap<CounterBufferHandle, IndexedIndirectBuffer>,
-    textures: HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>,
+    textures: HashMap<TextureHandle, NativeTexture>,
     transient_buffers: HashMap<PackedHandle, TransientBuffer>,
     buffer_pool: HashMap<u32, ez_gfx_hal::ReusableStagingPool<NativeAllocation>>,
     counter_pool: ez_gfx_hal::ReusableStagingPool<NativeAllocation>,
@@ -583,27 +450,24 @@ struct ContextState {
     /// so steady-state uploads reuse capacity instead of allocating per frame.
     counter_scratch: Vec<u8>,
     render_targets: HashMap<RenderTargetHandle, render_target::RenderTargetRecord>,
-    texture_formats: HashMap<TextureHandle, TextureFormat>,
-    texture_published_mips: HashMap<TextureHandle, u32>,
-    texture_residency_targets: HashMap<TextureHandle, u32>,
-    texture_last_transfer: HashMap<TextureHandle, CompletionToken>,
     retired_textures: Vec<RetiredTexture>,
     pipelines: HashMap<PipelineKey, NativePipeline>,
     retired_texture_bindings: Vec<RetiredTextureBinding>,
     graphics_format: Option<u32>,
+    /// Backend-neutral upload pipeline: pending decodes, FIFO order, decoded
+    /// payloads, submitted residency, retained fine mips, publication
+    /// progress, transfer ledgers, and telemetry. Native textures stay in
+    /// [`ContextState::textures`]; transitions run through manager-owned
+    texture_pipeline: TexturePipeline,
     texture_registry: TextureRegistry,
     /// Explicit ownership and publication state for the shared opaque-magenta texture.
     texture_fallback: TextureFallback,
-    texture_ready: HashMap<TextureHandle, CompletionToken>,
-    pending_textures: HashMap<TextureHandle, PendingTexture>,
-    // Decoded staging bytes per transfer-pending texture, kept in lockstep with
-    // `texture_ready`: inserted at native submission, removed at publication, cancel,
-    // loss, or teardown. Region updates overwrite with their latest transfer size.
-    texture_transfer_bytes: HashMap<TextureHandle, u64>,
-    texture_transfer_work: HashMap<TextureHandle, TextureTransferWork>,
-    texture_handoffs: HashMap<TextureHandle, Instant>,
-    texture_telemetry: Arc<TextureUploadTelemetry>,
-    async_textures: AsyncTextureState,
+    /// One byte budget shared by texture decode reservations and geometry and
+    /// buffer uploads, so a single hardware transfer queue sees one admission
+    /// domain. Required reservations retire at prefix completion; fine,
+    /// geometry, and buffer bytes retire at their transfer tokens.
+    transfer_pool: SharedTransferPool,
+    decode_textures: DecodeDriver,
     texture_failures: HashMap<TextureHandle, Error>,
     geometry: GeometryManager,
     vertex_heaps: HashMap<String, GeometryAllocation>,
@@ -759,11 +623,12 @@ mod native;
 use native::{
     FrameBindingSource, FrameBufferBindingRecord, allocate_native, completed_native_frame_value,
     completed_texture_transfer_native, completed_transfer_native, copy_native,
-    destroy_native_texture, free_native_allocation, last_native_frame_completion, map_allocation,
-    map_frame, map_geometry, map_hal, map_lifecycle, map_native_loss, map_texture,
-    native_device_initialized, native_layouts, native_mesh_dispatch_limits,
-    native_texture_compression, pipeline_layout_key, poll_native_frame_completion,
-    prepare_frame_binding_scratch, published_texture_handles_into, result_status,
+    destroy_native_texture, free_native_allocation, largest_native_texture_staging,
+    last_native_frame_completion, map_allocation, map_frame, map_geometry, map_hal, map_lifecycle,
+    map_native_loss, map_schedule, map_texture, native_device_initialized, native_layouts,
+    native_mesh_dispatch_limits, native_texture_compression, pipeline_layout_key,
+    poll_native_frame_completion, pop_largest_native_texture_staging, prepare_frame_binding_scratch,
+    published_texture_handles_into, result_status, retained_native_texture_staging,
     retire_native_allocation, wait_native_idle, write_native,
 };
 mod render_target;

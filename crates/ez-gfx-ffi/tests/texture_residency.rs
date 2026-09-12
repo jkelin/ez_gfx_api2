@@ -9,9 +9,9 @@ mod common;
 
 use common::TestContext;
 #[cfg(all(feature = "ktx2", feature = "basis"))]
-use ez_gfx_core::capability::CompressionSupport;
+use ez_gfx::{TextureDecoder, TextureSource};
 #[cfg(all(feature = "ktx2", feature = "basis"))]
-use ez_gfx_runtime::texture::{TextureDecoder, TextureSource};
+use ez_gfx_core::capability::CompressionSupport;
 
 #[cfg(all(feature = "ktx2", feature = "basis"))]
 use ez_gfx_ffi::{
@@ -129,6 +129,7 @@ fn exercises_async_texture_batches(backend: u8) {
         height: 4,
         mip_count: 0,
         generate_mips: 1,
+        required_mips: 0,
         min_filter: 1,
         mag_filter: 1,
         max_anisotropy: 1.0,
@@ -289,7 +290,8 @@ fn exercises_async_texture_batches(backend: u8) {
     cancel_after_native_admission(context, &bytes, &desc);
     #[cfg(all(feature = "ktx2", feature = "basis"))]
     {
-        let basis = include_bytes!("../../ez-gfx-runtime/tests/fixtures/alpha_simple_basis.ktx2");
+        let basis =
+            include_bytes!("../../ez-gfx-texture-manager/tests/fixtures/alpha_simple_basis.ktx2");
         let decoded =
             TextureDecoder::decode_with_support(TextureSource::Ktx2, basis, CompressionSupport::BC)
                 .unwrap();
@@ -301,6 +303,7 @@ fn exercises_async_texture_batches(backend: u8) {
             height: 0,
             mip_count: 0,
             generate_mips: 0,
+            required_mips: 0,
             ..desc
         };
         let mut compressed = 0;

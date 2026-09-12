@@ -9,19 +9,16 @@ pub(super) fn direct(
     expected: &[u8],
 ) {
     // Raw carries native format metadata; no custom decoder participates in this admission.
-    let texture = load_texture(
-        context,
-        TextureSource::Raw {
+    let raw_config = TextureConfig {
+        source: TextureSource::Raw {
             format,
             width: config.width,
             height: config.height,
             mip_count: 1,
         },
-        bytes,
-        false,
-        config,
-    )
-    .unwrap();
+        ..*config
+    };
+    let texture = load_texture(context, bytes, &raw_config).unwrap();
     await_texture(context, texture);
     quad.draw(texture, true);
     assert_eq!(
@@ -45,7 +42,11 @@ pub(super) fn direct(
         let mut dds = Vec::from(*b"DDS ");
         dds.extend(words.into_iter().flat_map(u32::to_le_bytes));
         dds.extend_from_slice(bytes);
-        let texture = load_texture(context, TextureSource::Dds, &dds, false, config).unwrap();
+        let dds_config = TextureConfig {
+            source: TextureSource::Dds,
+            ..*config
+        };
+        let texture = load_texture(context, &dds, &dds_config).unwrap();
         await_texture(context, texture);
         quad.draw(texture, true);
         assert_eq!(
@@ -61,15 +62,19 @@ pub(super) fn direct(
 pub(super) fn universal(context: ContextHandle, quad: &Quad) {
     // Both standalone payload encodings must reach native sampling through canonical dispatch.
     for bytes in [
-        include_bytes!("../../../ez-gfx-runtime/tests/fixtures/rust-logo-etc.basis").as_slice(),
-        include_bytes!("../../../ez-gfx-runtime/tests/fixtures/cube-uastc-srgb.basis").as_slice(),
+        include_bytes!("../../../ez-gfx-texture-manager/tests/fixtures/rust-logo-etc.basis")
+            .as_slice(),
+        include_bytes!("../../../ez-gfx-texture-manager/tests/fixtures/cube-uastc-srgb.basis")
+            .as_slice(),
     ] {
         universal_case(context, quad, TextureSource::Basis, bytes);
     }
     #[cfg(feature = "ktx2")]
     for bytes in [
-        include_bytes!("../../../ez-gfx-runtime/tests/fixtures/alpha_simple_basis.ktx2").as_slice(),
-        include_bytes!("../../../ez-gfx-runtime/tests/fixtures/cube-uastc-srgb.ktx2").as_slice(),
+        include_bytes!("../../../ez-gfx-texture-manager/tests/fixtures/alpha_simple_basis.ktx2")
+            .as_slice(),
+        include_bytes!("../../../ez-gfx-texture-manager/tests/fixtures/cube-uastc-srgb.ktx2")
+            .as_slice(),
     ] {
         universal_case(context, quad, TextureSource::Ktx2, bytes);
     }
@@ -77,8 +82,8 @@ pub(super) fn universal(context: ContextHandle, quad: &Quad) {
 
 #[cfg(feature = "basis")]
 fn universal_case(context: ContextHandle, quad: &Quad, source: TextureSource, bytes: &[u8]) {
+    use ez_gfx::TextureDecoder;
     use ez_gfx_core::capability::CompressionSupport;
-    use ez_gfx_runtime::texture::TextureDecoder;
 
     for (rgba, destinations) in [
         (
@@ -99,6 +104,9 @@ fn universal_case(context: ContextHandle, quad: &Quad, source: TextureSource, by
             TextureDecoder::decode_for_destination(source, bytes, CompressionSupport::NONE, rgba)
                 .unwrap();
         let mut config = TextureConfig {
+            source,
+            generate_mips: false,
+            required_mips: 1,
             width: decoded.width,
             height: decoded.height,
             mip_count: decoded.mip_count,
@@ -117,19 +125,16 @@ fn universal_case(context: ContextHandle, quad: &Quad, source: TextureSource, by
             .iter()
             .flat_map(|mip| mip.bytes.iter().copied())
             .collect();
-        let reference = load_texture(
-            context,
-            TextureSource::Raw {
+        let reference_config = TextureConfig {
+            source: TextureSource::Raw {
                 format: decoded.format,
                 width: decoded.width,
                 height: decoded.height,
                 mip_count: decoded.mip_count,
             },
-            &rgba_bytes,
-            false,
-            &config,
-        )
-        .unwrap();
+            ..config
+        };
+        let reference = load_texture(context, &rgba_bytes, &reference_config).unwrap();
         await_texture(context, reference);
         // Initial readiness exposes only the coarse tail; image comparison requires every mip.
         assert_eq!(wait_idle(context), EzGfxResult::Ok);
@@ -143,7 +148,7 @@ fn universal_case(context: ContextHandle, quad: &Quad, source: TextureSource, by
 
         for destination in destinations {
             config.destination = destination;
-            let texture = load_texture(context, source, bytes, false, &config).unwrap();
+            let texture = load_texture(context, bytes, &config).unwrap();
             await_texture(context, texture);
             assert_eq!(wait_idle(context), EzGfxResult::Ok);
             assert_eq!(
@@ -197,6 +202,14 @@ fn metal_minified_sampling_selects_published_mips() {
     bytes.extend_from_slice(&black);
     bytes.extend_from_slice(&[0_u8, 0, 0, 255].repeat(64 * 64));
     let config = TextureConfig {
+        source: TextureSource::Raw {
+            format: TextureFormat::Rgba8Unorm,
+            width: 256,
+            height: 256,
+            mip_count: 3,
+        },
+        generate_mips: false,
+        required_mips: 1,
         width: 256,
         height: 256,
         mip_count: 3,
@@ -210,19 +223,7 @@ fn metal_minified_sampling_selects_published_mips() {
             address_w: SamplerAddressMode::Clamp,
         },
     };
-    let texture = load_texture(
-        context,
-        TextureSource::Raw {
-            format: TextureFormat::Rgba8Unorm,
-            width: 256,
-            height: 256,
-            mip_count: 3,
-        },
-        &bytes,
-        false,
-        &config,
-    )
-    .expect("admit minification chain");
+    let texture = load_texture(context, &bytes, &config).expect("admit minification chain");
     await_texture(context, texture);
     // `await` only guarantees the coarse view: force the full chain resident so
     // the draw truly minifies across mip levels instead of sampling one level.
@@ -255,13 +256,14 @@ fn metal_minified_sampling_selects_published_mips() {
     quad.draw(texture, false);
     let pending = load_texture(
         context,
-        TextureSource::Rgba8 {
-            width: 64,
-            height: 64,
-        },
         &[128_u8, 128, 128, 255].repeat(64 * 64),
-        false,
         &TextureConfig {
+            source: TextureSource::Rgba8 {
+                width: 64,
+                height: 64,
+            },
+            generate_mips: false,
+            required_mips: 1,
             width: 64,
             height: 64,
             mip_count: 0,

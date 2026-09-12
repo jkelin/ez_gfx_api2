@@ -5,18 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[features]
-default = []
-basis = ["dep:basisu"]
-ktx2 = ["dep:ktx2"]
-
 [dependencies]
 ez-gfx-core.workspace = true
 ez-gfx-artifact.workspace = true
 ez-gfx-hal.workspace = true
-image.workspace = true
-ktx2 = { workspace = true, optional = true }
-basisu = { workspace = true, optional = true }
+ez-gfx-texture-manager.workspace = true
 blake3.workspace = true
 bytemuck = { workspace = true, features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

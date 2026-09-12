@@ -7,9 +7,9 @@ license.workspace = true
 
 [features]
 default = []
-basis = ["ez-gfx-runtime/basis"]
+basis = ["ez-gfx-texture-manager/basis"]
 ffi = []
-ktx2 = ["ez-gfx-runtime/ktx2"]
+ktx2 = ["ez-gfx-texture-manager/ktx2"]
 
 [dependencies]
 ez-gfx-core.workspace = true
@@ -18,8 +18,8 @@ ez-gfx-runtime.workspace = true
 ez-gfx-artifact.workspace = true
 blake3.workspace = true
 bytemuck.workspace = true
-ez-gfx-assets = { path = "../ez-gfx-assets" }
-crossbeam-channel.workspace = true
+ez-gfx-geometry-manager.workspace = true
+ez-gfx-texture-manager.workspace = true
 ez-gfx-backend-vulkan = { path = "../ez-gfx-backend-vulkan" }
 
 raw-window-handle.workspace = true

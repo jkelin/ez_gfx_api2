@@ -2,7 +2,7 @@
 
 ## Decision
 
-The safe Rust interface is the authoritative ownership seam:
+The safe Rust interface is the authoritative ownership boundary:
 
 - One owning `Context` controls the graphics lifetime. Resource wrappers carry non-owning context access and generation-checked identities; destroying or dropping the context invalidates all descendants and tears down native state.
 - `Surface`, shader, render-target, geometry-heap, and geometry-allocation `Drop` paths may release their individual identity early. Texture wrapper drop is intentionally inert: the context-owned bindless heap retains texture identity and storage until context teardown.
@@ -16,7 +16,7 @@ Every stable string carries an adjacent explicit byte length. Required strings a
 
 ## Interface rationale
 
-The raw explicit lifecycle exists only at the foreign-language seam where deterministic destructors are unavailable. The clean cutover intentionally provides no safe compatibility aliases for the former handle-plus-free interface.
+The raw explicit lifecycle exists only at the foreign-language boundary where deterministic destructors are unavailable. The clean cutover intentionally provides no safe compatibility aliases for the former handle-plus-free interface.
 
 `Rc` records that the facade is context-affine rather than thread-safe. The owning `Context` may invalidate every descendant regardless of outstanding wrappers; those wrappers retain memory safety but no independent native lifetime.
 

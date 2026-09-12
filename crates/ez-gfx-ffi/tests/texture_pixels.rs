@@ -15,6 +15,8 @@ use decoder::Decoder;
 #[cfg(target_vendor = "apple")]
 #[path = "texture_pixels/ingestion.rs"]
 mod ingestion;
+#[path = "texture_pixels/parked_optional.rs"]
+mod parked_optional;
 #[cfg(not(target_vendor = "apple"))]
 #[path = "texture_pixels/validation.rs"]
 mod validation;
@@ -80,6 +82,148 @@ fn dx12_bc_pixels_survive_region_updates_and_unload() {
 #[test]
 fn metal_compressed_pixels_survive_region_updates_and_unload() {
     exercise_backend(3);
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn vulkan_frame_after_load_samples_real_texels() {
+    immediate_frame_samples_real_texels(1);
+}
+
+#[cfg(windows)]
+#[test]
+fn dx12_frame_after_load_samples_real_texels() {
+    immediate_frame_samples_real_texels(2);
+}
+
+fn immediate_frame_samples_real_texels(backend: u8) {
+    // The submission gate must drive decode to a referenced descriptor with no
+    // application waiting: a draw recorded immediately after load samples real
+    // texels through the frame GPU wait, never the fallback binding.
+    let native = TestContext::create_with_validation(backend, backend == 1);
+    let context = ContextHandle::from_raw(native.context).unwrap();
+    let surface = SurfaceHandle::from_raw(native.surface).unwrap();
+    let quad = Quad::create(context, surface, cube_artifact());
+    let config = TextureConfig {
+        source: TextureSource::Rgba8 {
+            width: 8,
+            height: 4,
+        },
+        generate_mips: false,
+        required_mips: 1,
+        width: 8,
+        height: 4,
+        mip_count: 1,
+        destination: TextureDestination::Rgba8Unorm,
+        sampler: TextureSamplerDesc {
+            min_filter: SamplerFilter::Nearest,
+            mag_filter: SamplerFilter::Nearest,
+            max_anisotropy: 1.0,
+            address_u: SamplerAddressMode::Clamp,
+            address_v: SamplerAddressMode::Clamp,
+            address_w: SamplerAddressMode::Clamp,
+        },
+    };
+    let texture = load_texture(
+        context,
+        &adjacent_blocks(TextureFormat::Rgba8Unorm, 0, 8, 4),
+        &config,
+    )
+    .unwrap();
+    let draw_status = quad.draw_status(texture, true);
+    #[cfg(not(any(windows, target_vendor = "apple")))]
+    if draw_status == Err(Error::Unsupported) {
+        // A logical headless surface deliberately exposes missing WSI at the first
+        // presentation-dependent frame. No other error is an accepted capability result.
+        unload_texture(context, texture);
+        return;
+    }
+    assert_eq!(draw_status, Ok(()));
+    assert_halves(
+        &frame_readback(context).unwrap(),
+        TextureFormat::Rgba8Unorm,
+        0,
+        8,
+    );
+    unload_texture(context, texture);
+    assert_eq!(wait_idle(context), Ok(()));
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn vulkan_pipelined_frame_after_load_samples_real_texels() {
+    pipelined_frame_after_load_samples_real_texels(1);
+}
+
+#[cfg(windows)]
+#[test]
+fn dx12_pipelined_frame_after_load_samples_real_texels() {
+    pipelined_frame_after_load_samples_real_texels(2);
+}
+
+fn pipelined_frame_after_load_samples_real_texels(backend: u8) {
+    // A frame recorded while the previous frame may still be in flight must
+    // also sample real texels: the gate drains descriptor slots under a bound
+    // and GPU-waits content instead of falling back.
+    let native = TestContext::create_with_validation(backend, backend == 1);
+    let context = ContextHandle::from_raw(native.context).unwrap();
+    let surface = SurfaceHandle::from_raw(native.surface).unwrap();
+    let quad = Quad::create(context, surface, cube_artifact());
+    let config = TextureConfig {
+        source: TextureSource::Rgba8 {
+            width: 8,
+            height: 4,
+        },
+        generate_mips: false,
+        required_mips: 1,
+        width: 8,
+        height: 4,
+        mip_count: 1,
+        destination: TextureDestination::Rgba8Unorm,
+        sampler: TextureSamplerDesc {
+            min_filter: SamplerFilter::Nearest,
+            mag_filter: SamplerFilter::Nearest,
+            max_anisotropy: 1.0,
+            address_u: SamplerAddressMode::Clamp,
+            address_v: SamplerAddressMode::Clamp,
+            address_w: SamplerAddressMode::Clamp,
+        },
+    };
+    let first = load_texture(
+        context,
+        &adjacent_blocks(TextureFormat::Rgba8Unorm, 0, 8, 4),
+        &config,
+    )
+    .unwrap();
+    // No capture between the frames: the second records while the first may
+    // still occupy descriptor slots, exercising the drain path.
+    let first_status = quad.draw_status(first, false);
+    let second = load_texture(
+        context,
+        &adjacent_blocks(TextureFormat::Rgba8Unorm, 1, 8, 4),
+        &config,
+    )
+    .unwrap();
+    let second_status = quad.draw_status(second, true);
+    #[cfg(not(any(windows, target_vendor = "apple")))]
+    if first_status == Err(Error::Unsupported) || second_status == Err(Error::Unsupported) {
+        // A logical headless surface deliberately exposes missing WSI at the first
+        // presentation-dependent frame. No other error is an accepted capability result.
+        unload_texture(context, first);
+        unload_texture(context, second);
+        return;
+    }
+    assert_eq!(first_status, Ok(()));
+    assert_eq!(second_status, Ok(()));
+    assert_halves(
+        &frame_readback(context).unwrap(),
+        TextureFormat::Rgba8Unorm,
+        1,
+        8,
+    );
+    unload_texture(context, first);
+    unload_texture(context, second);
+    assert_eq!(wait_idle(context), Ok(()));
 }
 
 fn exercise_backend(backend: u8) {
@@ -148,6 +292,9 @@ fn exercise_case(
     // Each concurrently running backend owns a distinct decoder ID; registration is RAII.
     let decoder = Decoder::register(128 + backend, format, width, height);
     let config = TextureConfig {
+        source: decoder.source(),
+        generate_mips: false,
+        required_mips: 1,
         width,
         height,
         mip_count: 1,
@@ -175,7 +322,7 @@ fn exercise_case(
         green,
         updated,
     };
-    let texture = match load_texture(context, decoder.source(), &pixels.initial, false, &config) {
+    let texture = match load_texture(context, &pixels.initial, &config) {
         Ok(texture) => texture,
         Err(status)
             if backend != 3
@@ -261,8 +408,7 @@ fn exercise_case(
         // unblock polling on its own: the shared path reaps completed slots before
         // consulting the gate, so no wait_idle round-trip is required here.
         quad.draw(texture, false);
-        let pending =
-            load_texture(context, decoder.source(), &pixels.initial, false, &config).unwrap();
+        let pending = load_texture(context, &pixels.initial, &config).unwrap();
         // The reap must unblock this with polling alone: `await` never idles.
         await_texture(context, pending);
         assert_eq!(texture_residency(context, pending), Ok((1, 1)));
@@ -401,7 +547,7 @@ fn exercise_retirement(
     context: ContextHandle,
     quad: &Quad,
     texture: TextureHandle,
-    decoder: &Decoder,
+    _decoder: &Decoder,
     config: &TextureConfig,
     pixels: &PixelData,
     after: &[u8],
@@ -424,14 +570,7 @@ fn exercise_retirement(
                 address_w: SamplerAddressMode::Repeat,
             };
         }
-        let replacement = load_texture(
-            context,
-            decoder.source(),
-            &pixels.updated,
-            false,
-            &replacement_config,
-        )
-        .unwrap();
+        let replacement = load_texture(context, &pixels.updated, &replacement_config).unwrap();
         // Unload has already run against submitted work. Draining afterward lets the next
         // upload publish descriptors without depending on frame-slot reclamation timing.
         assert_eq!(wait_idle(context), Ok(()));
@@ -448,7 +587,7 @@ fn exercise_retirement(
         "no retired descriptor binding was reclaimed in 32 cycles"
     );
 
-    let admitted = load_texture(context, decoder.source(), &pixels.updated, false, config).unwrap();
+    let admitted = load_texture(context, &pixels.updated, config).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         // Residency succeeds once native admission exists; do not await full upload first.
@@ -464,8 +603,7 @@ fn exercise_retirement(
     unload_texture(context, admitted);
     assert_stale(context, admitted, &pixels.green);
 
-    let final_texture =
-        load_texture(context, decoder.source(), &pixels.updated, false, config).unwrap();
+    let final_texture = load_texture(context, &pixels.updated, config).unwrap();
     assert_eq!(wait_idle(context), Ok(()));
     await_texture(context, final_texture);
     quad.draw(final_texture, true);
@@ -505,6 +643,7 @@ fn assert_abi_odd_base_unsupported(
         height: 3,
         mip_count: 1,
         generate_mips: 0,
+        required_mips: 0,
         min_filter: 0,
         mag_filter: 0,
         max_anisotropy: 1.0,
@@ -566,11 +705,12 @@ fn exercise_odd_mip(
     config.width = 28;
     config.height = 12;
     config.mip_count = 3;
+    config.source = decoder.source();
     let red = solid_block(format, 0);
     let green = solid_block(format, 1);
     let mut bytes = green.repeat(21 + 8);
     bytes.extend(adjacent_blocks(format, 0, 7, 3));
-    let texture = load_texture(context, decoder.source(), &bytes, false, &config).unwrap();
+    let texture = load_texture(context, &bytes, &config).unwrap();
     await_texture(context, texture);
     assert_eq!(set_texture_residency(context, texture, 1), Ok(()));
     assert_eq!(texture_residency(context, texture), Ok((1, 3)));
@@ -675,7 +815,7 @@ fn exercise_odd_mip(
 
 fn exercise_destroy_fence_retry(
     context: ContextHandle,
-    decoder: &Decoder,
+    _decoder: &Decoder,
     config: &TextureConfig,
     bytes: &[u8],
     texture: TextureHandle,
@@ -687,7 +827,7 @@ fn exercise_destroy_fence_retry(
     // retryable (`NotReady`, eventually `Ok`) and never surface terminal
     // `NativeFailure` for transient fence state.
     for _ in 0..2 {
-        let spare = load_texture(context, decoder.source(), bytes, false, config).unwrap();
+        let spare = load_texture(context, bytes, config).unwrap();
         await_texture(context, spare);
         unload_texture(context, spare);
     }

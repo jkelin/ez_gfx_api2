@@ -1,20 +1,21 @@
 use crate::Result;
 use ez_gfx_core::capability::PresentationMode;
 
+use super::super::map_texture;
 use super::{
     Backend, ContextState, Error, ExecutableNode, ExecutionAction, FrameBindingSource,
     FrameBufferBindingRecord, FrameExecutionPlan, FrameNativeResource, GeometryAllocation, HashMap,
     MAX_PIPELINE_CACHE_ENTRIES, MeshPipelineKeyDesc, MetalWorkgroupSizes, NativeAllocation,
     NativeContext, NativePipeline, NativeShader, NativeSurface, NativeTexture, PipelineKey,
     RenderTargetHandle, RenderTargetRecord, ResourceId, SURFACE_DEFAULT_CLEAR, ShaderRecord,
-    TextureHandle, TextureId, map_hal, map_texture, native_layouts, pipeline_layout_key,
+    SubmittedInfo, TextureHandle, TextureId, map_hal, native_layouts, pipeline_layout_key,
     prepare_frame_binding_scratch, should_capture_presented,
 };
 use arrayvec::ArrayVec;
 use ez_gfx_backend_metal::native::{
     NativeAllocation as MetalAllocation, NativeContext as MetalContext,
     NativeFrameAction as MetalFrameAction, NativeFrameResource as MetalFrameResource,
-    NativeTexture as MetalTexture, PassAttachment as MetalPassAttachment,
+    NativeSampledTexture as MetalSampledTexture, PassAttachment as MetalPassAttachment,
 };
 use ez_gfx_core::{
     capability::MAX_BINDLESS_SAMPLED_TEXTURES,
@@ -39,7 +40,7 @@ type PreparedMeshPipeline = (
     Option<ShaderTextureHeapLayout>,
     MetalWorkgroupSizes,
 );
-type MetalTextureRecords = HashMap<TextureHandle, (TextureId, NativeTexture, u32, u32, u32)>;
+type MetalTextureRecords = HashMap<TextureHandle, NativeTexture>;
 
 fn metal_texture_heap(
     layout: Option<&TextureHeapLayout>,
@@ -445,10 +446,11 @@ struct MetalActionSource<'a, 'resources> {
     allocations: &'resources HashMap<PackedHandle, (u64, NativeAllocation)>,
     vertex_heaps: &'resources HashMap<String, GeometryAllocation>,
     textures: &'resources MetalTextureRecords,
+    submitted: &'resources HashMap<TextureHandle, SubmittedInfo>,
     render_targets: &'resources HashMap<RenderTargetHandle, RenderTargetRecord>,
     pipelines: &'resources HashMap<PipelineKey, NativePipeline>,
     frame_resources: &'resources HashMap<ResourceId, FrameNativeResource>,
-    native_textures: &'a [&'resources MetalTexture],
+    native_textures: &'a [MetalSampledTexture<'resources>],
     index: Option<&'resources MetalAllocation>,
     index_size: u64,
     surface: Option<SurfaceHandle>,
@@ -504,7 +506,7 @@ impl ez_gfx_backend_metal::native::NativeFrameActionSource for MetalActionSource
                         MetalFrameResource::Buffer(allocation)
                     }
                     FrameNativeResource::Texture(handle) => {
-                        let (_, NativeTexture::Metal(texture), _, _, _) = self
+                        let NativeTexture::Metal(texture) = self
                             .textures
                             .get(&handle)
                             .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
@@ -731,7 +733,12 @@ impl ez_gfx_backend_metal::native::NativeFrameActionSource for MetalActionSource
                         )
                     }
                     ExecutableNode::TextureReadback { texture } => {
-                        let (_, NativeTexture::Metal(texture), width, height, _) = self
+                        let info = self
+                            .submitted
+                            .get(texture)
+                            .copied()
+                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
+                        let NativeTexture::Metal(texture) = self
                             .textures
                             .get(texture)
                             .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
@@ -740,8 +747,8 @@ impl ez_gfx_backend_metal::native::NativeFrameActionSource for MetalActionSource
                         };
                         MetalFrameAction::TextureReadback {
                             texture,
-                            width: *width,
-                            height: *height,
+                            width: info.width,
+                            height: info.height,
                         }
                     }
                     ExecutableNode::RenderTargetReadback { target } => {
@@ -806,9 +813,15 @@ pub(super) fn execute_metal_frame_plan(
     let mut native_textures = ArrayVec::<_, { MAX_BINDLESS_SAMPLED_TEXTURES as usize }>::new();
     // Only live and pending handles participate. Failed handles and both retirement queues have
     // ended their documented binding lifetime, so their fallback aliases are intentionally absent.
-    for (handle, (id, texture, _, _, _)) in &context.textures {
+    for (handle, texture) in &context.textures {
+        let id = context
+            .texture_pipeline
+            .submitted()
+            .get(handle)
+            .map(|info| info.id);
         let sampled = if context
-            .texture_published_mips
+            .texture_pipeline
+            .published()
             .get(handle)
             .is_some_and(|mips| *mips != 0)
         {
@@ -819,7 +832,7 @@ pub(super) fn execute_metal_frame_plan(
         } else {
             let binding = context
                 .texture_registry
-                .reserved_binding(*id)
+                .reserved_binding(id.ok_or(Error::InvalidContext)?)
                 .map_err(map_texture)?;
             fallback.fallback_sampled(binding)
         };
@@ -827,7 +840,7 @@ pub(super) fn execute_metal_frame_plan(
             .try_push(sampled)
             .map_err(|_| Error::NativeFailure)?;
     }
-    for pending in context.pending_textures.values() {
+    for pending in context.texture_pipeline.pending().values() {
         let binding = context
             .texture_registry
             .reserved_binding(pending.id)
@@ -898,6 +911,7 @@ pub(super) fn execute_metal_frame_plan(
         allocations: &context.allocations,
         vertex_heaps: &context.vertex_heaps,
         textures: &context.textures,
+        submitted: context.texture_pipeline.submitted(),
         render_targets: &context.render_targets,
         pipelines: &context.pipelines,
         frame_resources: &context.frame_native_resources,

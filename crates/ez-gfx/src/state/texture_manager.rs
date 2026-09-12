@@ -1,253 +1,288 @@
+//! Thin adapters between [`ContextState`] and the manager-owned texture pipeline.
+//!
+//! Every backend-neutral policy lives in `ez_gfx_texture_manager::pipeline`
+//! and runs through the [`TextureBackendContext`](super::TextureBackendContext)
+//! traits with static dispatch. These adapters only extract context state,
+//! translate outcomes into typed errors and upload events, and drive the
+//! frame-submission gate that keeps required prefixes out of fallback.
+
 use super::texture::{
-    TEXTURE_DECODE_RESERVATION, fail_texture_job, reclaim_retired_textures, record_texture_failure,
-    rollback_texture_upload, schedule_texture_decodes,
+    fail_texture_job, map_upload_failure, publish_advance_step, reclaim_retired_textures,
+    record_texture_failure, schedule_texture_decodes, texture_descriptors_ready,
 };
 use super::{
-    ContextState, DecodedTexture, Error, NativeContext, NativeTexture, PendingTexture, Result,
-    RuntimePhase, TextureHandle, TextureTransferWork, completed_texture_transfer_native,
-    map_allocation, map_texture, note_device_lost, runtime_record,
+    ContextState, DECODE_RESERVATION_BYTES, Error, Result, RuntimePhase, TextureHandle,
+    completed_texture_transfer_native, map_allocation, note_device_lost,
+    poll_native_frame_completion, runtime_record,
 };
-use ez_gfx_hal::ImageMip;
-use std::sync::atomic::Ordering;
+use ez_gfx_texture_manager::pipeline::{
+    SubmitOutcome, cancel_all_pending, pump_fine_uploads, reclaim_transfer_work,
+    reference_required_prefix, submit_ready_uploads, unpublished_required,
+};
+use std::collections::HashSet;
 use std::time::Instant;
 
 /// Advances every ready stage; empty stages are no-ops and native failures propagate.
 pub(super) fn pump_async_textures(context: &mut ContextState) -> Result<usize> {
     reclaim_retired_textures(context)?;
-    reclaim_texture_transfer_reservations(context)?;
+    reclaim_completed_work(context)?;
     collect_decode_results(context);
 
-    let completed = submit_decoded_textures(context)?;
+    let completed = submit_ready_uploads_adapter(context);
+    pump_fine_uploads_adapter(context);
     schedule_texture_decodes(context)?;
     reclaim_retired_textures(context)?;
     Ok(completed)
 }
+/// Maximum owner-thread wait for required-prefix CPU decode at frame submission.
+const SUBMIT_GATE_DECODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Maximum owner-thread wait for submitted frames to drain out of descriptor slots.
+const SUBMIT_GATE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Releases credits only after final mip completion; an empty transfer set avoids a native query.
-fn reclaim_texture_transfer_reservations(context: &mut ContextState) -> Result<()> {
-    if context.texture_transfer_work.is_empty() {
+/// Drives every required texture's prefix to a referenced, GPU-waited draw.
+///
+/// Frame submission calls this before recording sampling work so no required
+/// texture can render its fallback binding before its configured prefix.
+/// Optional zero-mip textures never block here: their decodes submit
+/// asynchronously and their bindings keep sampling fallback until real
+/// residency publishes. Pending CPU decodes for required textures are pumped
+/// to native submission (waiting only on decode and admission; transfer
+/// completion is never polled here and stays GPU-gated through the required
+/// tokens the frame graph attaches. Transfer-independent descriptors install
+/// once no submitted frame can still observe the slot; prior frames drain
+/// under a bound that observes graphics completion only. A required texture
+/// therefore never samples fallback in the recorded frame. Failed textures
+/// are skipped for the existing terminal error paths.
+///
+/// # Errors
+///
+/// Returns an error for native submission failures, when required decodes do
+/// not finish within the submission bound, or when prior frames do not drain
+/// within the descriptor bound.
+pub(super) fn gate_required_textures_for_submit(
+    context: &mut ContextState,
+    requires_heap: bool,
+) -> Result<()> {
+    // Shaders without a bindless heap sample no textures; skip driving entirely.
+    if !requires_heap {
         return Ok(());
     }
-
-    let completed =
-        completed_texture_transfer_native(&mut context.native).map_err(map_allocation)?;
-    // Transfer reservations survive initial coarse publication: staging is reusable only after
-    // the final mip token, so releasing on `DeviceReady` would undercount fine uploads.
-    let retired = context
-        .texture_transfer_work
-        .iter()
-        .filter_map(|(handle, work)| (work.completion.value <= completed).then_some(*handle))
-        .collect::<Vec<_>>();
-    for handle in retired {
-        if let Some(work) = context.texture_transfer_work.remove(&handle) {
-            context.async_textures.working_bytes = context
-                .async_textures
-                .working_bytes
-                .saturating_sub(work.bytes);
-            context.texture_transfer_bytes.remove(&handle);
+    // Steady-state frames skip the gate once no required texture is pending
+    // or unpublished. Optional work below gets one bounded nonblocking pump
+    // per frame so zero-only workloads progress without ever waiting.
+    if !has_required_pending(&context.texture_pipeline) && !has_unpublished_required(context) {
+        if !context.texture_pipeline.pending().is_empty() {
+            pump_async_textures(context)?;
+        }
+        return Ok(());
+    }
+    // Native submission is impossible before device admission publishes the
+    // fallback; frames then keep streaming instead of stalling admission.
+    if !context.texture_fallback.is_ready() {
+        return Ok(());
+    }
+    // Decode is finite CPU work on a live pool, so this waits only on
+    // required decode and admission. Optional pending entries never appear
+    // in this condition, so one zero texture cannot stall the frame.
+    // Every terminal path drains its pending entry, and reclaim inside the
+    // pump frees budget as the independently progressing GPU completes work.
+    let deadline = Instant::now() + SUBMIT_GATE_DECODE_TIMEOUT;
+    while has_required_pending(&context.texture_pipeline) {
+        pump_async_textures(context)?;
+        if !has_required_pending(&context.texture_pipeline) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::NotReady);
+        }
+        std::thread::yield_now();
+    }
+    if !has_unpublished_required(context) {
+        return Ok(());
+    }
+    // Descriptor rewrites must avoid submitted frames, so reap them here. This
+    // observes graphics completion only; texture transfer completion stays
+    // GPU-gated through the tokens attached below.
+    let drain_deadline = Instant::now() + SUBMIT_GATE_DRAIN_TIMEOUT;
+    while !texture_descriptors_ready(&context.native)? {
+        poll_native_frame_completion(&mut context.native)?;
+        if texture_descriptors_ready(&context.native)? {
+            break;
+        }
+        if Instant::now() >= drain_deadline {
+            return Err(Error::NotReady);
+        }
+        std::thread::yield_now();
+    }
+    let handles: Vec<TextureHandle> = context.textures.keys().copied().collect();
+    for handle in handles {
+        // Post-drain contention is transient; surface it retryably rather than
+        // recording a frame that samples fallback for a required texture.
+        if !reference_required_prefix_early(context, handle)? {
+            return Err(Error::NotReady);
         }
     }
     Ok(())
 }
 
-/// Collects every ready result; cancelled jobs release their otherwise orphaned credit.
-pub(super) fn collect_decode_results(context: &mut ContextState) {
-    while let Ok(job) = context.async_textures.ready_rx.try_recv() {
-        context.async_textures.active = context.async_textures.active.saturating_sub(1);
-        if let Some(pending) = context.pending_textures.get_mut(&job.handle) {
-            pending.decoded_bytes = job.decoded.as_ref().ok().map(|decoded| {
-                decoded.mips.iter().fold(0_u64, |total, mip| {
-                    total.saturating_add(mip.bytes.len() as u64)
-                })
-            });
-            context
-                .async_textures
-                .decoded
-                .insert(job.handle, job.decoded);
-        } else {
-            // Cancelled/stale jobs still report completion internally so their reservation cannot
-            // strand the FIFO; their public terminal event was emitted by the cancelling path.
-            context.async_textures.working_bytes = context
-                .async_textures
-                .working_bytes
-                .saturating_sub(TEXTURE_DECODE_RESERVATION);
-        }
-    }
+/// Reports whether any pending upload gates frame submission.
+///
+/// Only positive requirements gate; optional zero-mip uploads progress
+/// asynchronously through ordinary pumps and event polling.
+pub(super) fn has_required_pending(
+    pipe: &ez_gfx_texture_manager::pipeline::TexturePipeline,
+) -> bool {
+    pipe.has_required_pending()
 }
 
-/// Preserves FIFO publication by stopping at the first decode that is not ready.
-fn submit_decoded_textures(context: &mut ContextState) -> Result<usize> {
-    // CPU decode may run before device initialization, but no real native upload may displace
-    // a missing or incompletely published fallback descriptor.
-    if !context.texture_fallback.is_ready() {
-        return Ok(0);
-    }
-    let mut completed = 0;
-    loop {
-        let Some(handle) = context.async_textures.order.front().copied() else {
-            break;
-        };
-        let Some(decoded) = context.async_textures.decoded.remove(&handle) else {
-            break;
-        };
-        context.async_textures.order.pop_front();
-        let Some(pending) = context.pending_textures.remove(&handle) else {
-            release_decode_reservation(context);
-            continue;
-        };
-        if pending.cancelled.load(Ordering::Acquire) {
-            release_decode_reservation(context);
-            continue;
-        }
-        let decoded = match decoded {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                release_decode_reservation(context);
-                fail_texture_job(context, handle, pending.id, map_texture(error));
-                completed += 1;
-                continue;
-            }
-        };
-
-        submit_decoded_texture(context, handle, &pending, &decoded)?;
-        completed += 1;
-    }
-    Ok(completed)
+fn has_unpublished_required(context: &ContextState) -> bool {
+    // Terminal failures publish through the error paths, never the prefix gate.
+    let failed: HashSet<TextureHandle> = context.texture_failures.keys().copied().collect();
+    unpublished_required(
+        &context.texture_pipeline,
+        &context.texture_registry,
+        &failed,
+    )
 }
 
-/// Converts one decoded payload to native work; terminal admission failures consume its credit.
-fn submit_decoded_texture(
+/// Installs one submitted texture's required-prefix descriptor ahead of completion.
+///
+/// Returns true when the binding now references the real view (or already did).
+/// A false return is transient descriptor contention the caller surfaces
+/// retryably; it never records a frame sampling fallback for a required texture.
+///
+/// # Errors
+///
+/// Returns an error for descriptor loss or view-creation failure.
+fn reference_required_prefix_early(
     context: &mut ContextState,
     handle: TextureHandle,
-    pending: &PendingTexture,
-    decoded: &DecodedTexture,
-) -> Result<()> {
-    if (pending.config.width != 0 && decoded.width != pending.config.width)
-        || (pending.config.height != 0 && decoded.height != pending.config.height)
-        || (pending.config.mip_count != 0 && decoded.mip_count != pending.config.mip_count)
-    {
-        release_decode_reservation(context);
-        fail_texture_job(context, handle, pending.id, Error::InvalidArgument);
-        return Ok(());
+) -> Result<bool> {
+    if context.texture_failures.contains_key(&handle) {
+        return Ok(true);
     }
-    let mips = decoded
-        .mips
-        .iter()
-        .map(|mip| ImageMip {
-            width: mip.width,
-            height: mip.height,
-            bytes: &mip.bytes,
-        })
-        .collect::<Vec<_>>();
-    let submitted_at = Instant::now();
-    let binding = context
-        .texture_registry
-        .reserved_binding(pending.id)
-        .map_err(map_texture)?;
-    let created = match &mut context.native {
-        NativeContext::Vulkan(native) => native
-            .create_texture(decoded.format, &mips, binding, pending.config.sampler)
-            .map(|(texture, tokens)| (NativeTexture::Vulkan(texture), tokens)),
-        #[cfg(windows)]
-        NativeContext::Dx12(native) => native
-            .create_texture(decoded.format, &mips, binding, pending.config.sampler)
-            .map(|(texture, tokens)| (NativeTexture::Dx12(texture), tokens)),
-        #[cfg(target_vendor = "apple")]
-        NativeContext::Metal(native) => native
-            .create_texture(decoded.format, &mips, binding, pending.config.sampler)
-            .map(|(texture, tokens)| (NativeTexture::Metal(texture), tokens)),
-    };
-    let (native, completions) = match created {
-        Ok(created) => created,
-        Err(error) => {
-            release_decode_reservation(context);
-            let mapped = map_allocation(error);
-            fail_texture_job(context, handle, pending.id, mapped);
-            if mapped == Error::DeviceLost {
-                note_device_lost(context);
-            }
-            return Ok(());
-        }
-    };
-    if completions.len() != decoded.mip_count as usize {
-        release_decode_reservation(context);
-        rollback_texture_upload(context, pending.id, native)?;
-        record_texture_failure(context, handle, Error::NativeFailure);
-        return Ok(());
-    }
-    let last = *completions.last().ok_or(Error::NativeFailure)?;
-    let mut completions = completions.into_iter();
-    let first = completions.next().ok_or(Error::NativeFailure)?;
-    let tracked = context
-        .texture_registry
-        .mark_submitted(pending.id, first)
-        .map_err(map_texture)
-        .and_then(|()| {
-            for (index, completion) in completions.enumerate() {
-                let resident_mips = u32::try_from(index)
-                    .ok()
-                    .and_then(|index| index.checked_add(2))
-                    .ok_or(Error::NativeFailure)?;
-                context
-                    .texture_registry
-                    .mark_mips_submitted(pending.id, resident_mips, completion)
-                    .map_err(map_texture)?;
-            }
-            Ok(())
-        });
-    if let Err(error) = tracked {
-        release_decode_reservation(context);
-        rollback_texture_upload(context, pending.id, native)?;
-        record_texture_failure(context, handle, error);
-        return Ok(());
-    }
-    context.texture_telemetry.record_queue_latency(
-        u64::try_from(submitted_at.duration_since(pending.admitted_at).as_micros())
-            .unwrap_or(u64::MAX),
-    );
-    let staging_bytes = decoded.mips.iter().fold(0_u64, |total, mip| {
-        total.saturating_add(mip.bytes.len() as u64)
-    });
-    context
-        .texture_telemetry
-        .record_staging_bytes(staging_bytes);
-    context.textures.insert(
+    // Transient contention stays retryable like the completion-gated advance;
+    // only allocation, validation, and device errors propagate.
+    match reference_required_prefix(
+        &mut context.texture_pipeline,
+        &context.texture_registry,
+        &mut context.native,
+        &mut context.textures,
         handle,
-        (
-            pending.id,
-            native,
-            decoded.width,
-            decoded.height,
-            decoded.mip_count,
-        ),
-    );
-    context.texture_formats.insert(handle, decoded.format);
-    context.texture_published_mips.insert(handle, 0);
-    context
-        .texture_residency_targets
-        .insert(handle, decoded.mip_count);
-    context.texture_last_transfer.insert(handle, last);
-    context.texture_ready.insert(handle, first);
-    context.texture_transfer_bytes.insert(handle, staging_bytes);
-    context.texture_transfer_work.insert(
-        handle,
-        TextureTransferWork {
-            completion: last,
-            bytes: TEXTURE_DECODE_RESERVATION,
-        },
-    );
-    context.texture_handoffs.insert(handle, submitted_at);
-    let decode = runtime_record(context, handle.into_raw(), RuntimePhase::Decode, Ok(()));
-    context.observability.push_event(decode);
-    let upload = runtime_record(context, handle.into_raw(), RuntimePhase::Upload, Ok(()));
-    context.observability.push_event(upload);
+    ) {
+        // Installed prefixes advance like any publication; contention stays
+        // retryable without recording fallback-sampling work.
+        Ok(true) => publish_advance_step(Ok(())),
+        Ok(false) => Ok(false),
+        Err(error) => publish_advance_step(Err(error)),
+    }
+}
+
+/// Releases required-prefix and fine-upload credits at their own completion tokens.
+fn reclaim_completed_work(context: &mut ContextState) -> Result<()> {
+    if context.texture_pipeline.work().is_empty() {
+        return Ok(());
+    }
+    let completed =
+        completed_texture_transfer_native(&mut context.native).map_err(map_allocation)?;
+    for reclaimed in reclaim_transfer_work(&mut context.texture_pipeline, completed) {
+        context
+            .transfer_pool
+            .release_texture(reclaimed.required_bytes);
+        context
+            .transfer_pool
+            .release_background(reclaimed.fine_bytes);
+    }
     Ok(())
 }
 
-/// Saturation keeps cancellation and asynchronous completion races from underflowing diagnostics.
-fn release_decode_reservation(context: &mut ContextState) {
-    context.async_textures.working_bytes = context
-        .async_textures
-        .working_bytes
-        .saturating_sub(TEXTURE_DECODE_RESERVATION);
+/// Collects every ready result; stale jobs release their reservation credit.
+pub(super) fn collect_decode_results(context: &mut ContextState) {
+    context
+        .decode_textures
+        .collect(&mut context.texture_pipeline, &mut context.transfer_pool);
+}
+
+/// Submits FIFO-ready decodes through the pipeline and translates outcomes.
+fn submit_ready_uploads_adapter(context: &mut ContextState) -> usize {
+    let outcomes = submit_ready_uploads(
+        &mut context.texture_pipeline,
+        &mut context.texture_registry,
+        &mut context.native,
+        &mut context.textures,
+        context.texture_fallback.is_ready(),
+    );
+    let mut completed = 0;
+    for outcome in outcomes {
+        match outcome {
+            SubmitOutcome::Submitted { handle } => {
+                completed += 1;
+                let decode =
+                    runtime_record(context, handle.into_raw(), RuntimePhase::Decode, Ok(()));
+                context.observability.push_event(decode);
+                let upload =
+                    runtime_record(context, handle.into_raw(), RuntimePhase::Upload, Ok(()));
+                context.observability.push_event(upload);
+            }
+            SubmitOutcome::Failed {
+                handle,
+                id,
+                failure,
+                rollback,
+            } => {
+                // The decode reservation releases on every terminal path; only
+                // successful submissions hold it through completion. Storage
+                // accepted before tracking failed still needs its binding
+                // reset and deferred destruction.
+                if let Some(rollback) = rollback {
+                    context.retired_textures.push(super::RetiredTexture {
+                        id: rollback.id,
+                        binding: rollback.binding,
+                        native: rollback.texture,
+                        completion: rollback.completion,
+                    });
+                }
+                let error = map_upload_failure(failure);
+                fail_texture_job(context, handle, id, error);
+                if error == Error::DeviceLost {
+                    note_device_lost(context);
+                }
+                completed += 1;
+                context
+                    .transfer_pool
+                    .release_texture(DECODE_RESERVATION_BYTES);
+            }
+            SubmitOutcome::Dropped { .. } => {
+                context
+                    .transfer_pool
+                    .release_texture(DECODE_RESERVATION_BYTES);
+            }
+        }
+    }
+    completed
+}
+
+/// Pumps retained fine mips and records terminal fine failures.
+fn pump_fine_uploads_adapter(context: &mut ContextState) {
+    let (submitted, failed) = pump_fine_uploads(
+        &mut context.texture_pipeline,
+        &mut context.texture_registry,
+        &mut context.native,
+        &mut context.textures,
+        &mut context.transfer_pool,
+    );
+    let _ = submitted;
+    for failure in failed {
+        record_texture_failure(context, failure.handle, map_upload_failure(failure.failure));
+    }
+}
+
+/// Cancels every pending upload; terminal cancellation drops every texture
+/// reservation at once. The caller emits terminal events for drained handles.
+pub(super) fn cancel_all_pending_textures(context: &mut ContextState) {
+    cancel_all_pending(
+        &mut context.texture_pipeline,
+        &mut context.texture_registry,
+        &mut context.transfer_pool,
+    );
 }

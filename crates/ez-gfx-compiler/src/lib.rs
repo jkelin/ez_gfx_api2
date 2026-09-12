@@ -808,6 +808,43 @@ fn select_texture_heap<T>(
     Ok(selected)
 }
 
+/// Selects one entry point's bindless texture heap from its reflected parameters.
+///
+/// `Metadata::is_parameter_location_used` only reports heap usage on some targets
+/// (Metal); the attribute declaration is the portable signal, so a lone heap
+/// resolves by declaration while several still disambiguate by usage.
+fn select_entry_texture_heap<'a>(
+    parameters: &'a [ReflectedParameter],
+    entry_metadata: &shader_slang::Metadata,
+    entry: &str,
+) -> Result<Option<(&'a ReflectedParameter, u32)>, CompilerError> {
+    let declared_heaps = parameters
+        .iter()
+        .filter_map(|parameter| parameter.9.map(|capacity| (parameter, capacity)))
+        .collect::<Vec<_>>();
+    if declared_heaps.len() <= 1 {
+        return select_texture_heap(
+            declared_heaps
+                .iter()
+                .map(|&(parameter, capacity)| Ok(Some((parameter, capacity)))),
+            entry,
+        );
+    }
+    let used_heaps = declared_heaps.iter().map(|(parameter, capacity)| {
+        entry_metadata
+            .is_parameter_location_used(
+                parameter.11,
+                u64::from(parameter.8),
+                u64::from(parameter.7),
+            )
+            .ok_or_else(|| {
+                CompilerError::Native(format!("texture heap usage reflection failed: {entry}"))
+            })
+            .map(|used| used.then_some((*parameter, *capacity)))
+    });
+    select_texture_heap(used_heaps, entry)
+}
+
 fn descriptor_count(api_kind: Option<&str>) -> u32 {
     if api_kind == Some("counter_buffer") {
         2
@@ -889,35 +926,19 @@ fn compile_targets(
         } else {
             canonical_parameters.insert(key, canonical_view);
         }
-        let used_heaps = parameters
-            .iter()
-            .filter_map(|parameter| parameter.9.map(|capacity| (parameter, capacity)))
-            .map(|(parameter, capacity)| {
-                entry_metadata
-                    .is_parameter_location_used(
-                        parameter.11,
-                        u64::from(parameter.8),
-                        u64::from(parameter.7),
-                    )
-                    .ok_or_else(|| {
-                        CompilerError::Native(format!(
-                            "texture heap usage reflection failed: {}",
-                            target.entry_point
-                        ))
-                    })
-                    .map(|used| used.then_some((parameter, capacity)))
-            });
         let texture_heap =
-            select_texture_heap(used_heaps, &target.entry_point)?.map(|(parameter, capacity)| {
-                serde_json::json!({
-                    "binding_space": parameter.8,
-                    "binding_index": parameter.7,
-                    "capacity": capacity,
-                    "argument_stride": 2,
-                    "texture_argument_offset": 0,
-                    "sampler_argument_offset": 1,
-                })
-            });
+            select_entry_texture_heap(&parameters, &entry_metadata, &target.entry_point)?.map(
+                |(parameter, capacity)| {
+                    serde_json::json!({
+                        "binding_space": parameter.8,
+                        "binding_index": parameter.7,
+                        "capacity": capacity,
+                        "argument_stride": 2,
+                        "texture_argument_offset": 0,
+                        "sampler_argument_offset": 1,
+                    })
+                },
+            );
         let depth_required = parameters.iter().any(|parameter| parameter.10);
         let reflection = serde_json::json!({"entry": target.entry_point, "stage": format!("{:?}", target.stage), "profile": target.profile, "parameters": parameters.iter().map(|(name,kind,category,shape,access,semantic_name,api_kind,binding_index,binding_space,_,_,_)| serde_json::json!({"name":name,"kind":kind,"category":category,"resource_shape":shape,"resource_access":reflected_resource_access(api_kind.as_deref(), access),"semantic_name":semantic_name,"api_kind":api_kind,"binding_index":binding_index,"binding_space":binding_space,"descriptor_count":descriptor_count(api_kind.as_deref())})).collect::<Vec<_>>(), "texture_heap": texture_heap, "depth_required": depth_required, "workgroup_size": workgroup_size});
         reflections.push(serde_json::json!({"target": format!("{:?}", target.target), "entry": target.entry_point, "stage": format!("{:?}", target.stage), "profile": target.profile, "reflection": reflection}));

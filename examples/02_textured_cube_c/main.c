@@ -21,8 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if EZ_GFX_ABI_VERSION != 41u
-#error "textured_cube requires ez-gfx ABI v41"
+#if EZ_GFX_ABI_VERSION != 42u
+#error "textured_cube requires ez-gfx ABI v42"
 #endif
 
 #define WIDTH 640u

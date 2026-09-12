@@ -105,6 +105,26 @@ pub struct TestContext {
 }
 
 impl TestContext {
+    /// Worker-param variant for decode-rendezvous tests; the default
+    /// constructor keeps the historical default topology.
+    #[allow(
+        dead_code,
+        reason = "shared per test target; only texture_pixels uses workers"
+    )]
+    pub fn create_with_validation_and_workers(backend: u8, validation: bool, workers: u32) -> Self {
+        let native = Self::create_uninitialized_with_workers(backend, validation, workers);
+        assert_eq!(
+            ez_gfx_context_init_device(native.context, native.surface),
+            EzGfxResult::Ok
+        );
+        // Undefined Vulkan extents require the host's known client size before frame begin.
+        assert_eq!(
+            ez_gfx_surface_resize(native.context, native.surface, WIDTH, HEIGHT),
+            EzGfxResult::Ok
+        );
+        native
+    }
+
     pub fn create_with_validation(backend: u8, validation: bool) -> Self {
         let native = Self::create_uninitialized(backend, validation);
         assert_eq!(
@@ -121,6 +141,10 @@ impl TestContext {
 
     // Validation is opt-in so existing fixture callers retain their original device requirements.
     pub fn create_uninitialized(backend: u8, validation: bool) -> Self {
+        Self::create_uninitialized_with_workers(backend, validation, 0)
+    }
+
+    fn create_uninitialized_with_workers(backend: u8, validation: bool, workers: u32) -> Self {
         let window = TestWindow::create_hidden();
         let mut native = Self {
             context: 0,
@@ -131,7 +155,7 @@ impl TestContext {
             enable_debug: u8::from(validation),
             enable_validation: u8::from(validation),
             backend,
-            texture_decode_workers: 0,
+            texture_decode_workers: workers,
             adapter_count: 0,
             adapter: core::ptr::null(),
         };

@@ -2,8 +2,8 @@
 #![cfg(any(feature = "basis", feature = "ktx2"))]
 
 #[cfg(feature = "ktx2")]
-use ez_gfx_runtime::texture::TextureError;
-use ez_gfx_runtime::texture::{TextureDecoder, TextureSource};
+use ez_gfx_texture_manager::texture::TextureError;
+use ez_gfx_texture_manager::texture::{TextureDecoder, TextureSource};
 
 #[cfg(all(feature = "ktx2", not(feature = "basis")))]
 #[test]
@@ -33,7 +33,7 @@ fn universal_ktx2_rejects_oversized_dimensions_before_transcoding() {
 fn standalone_explicit_target_does_not_follow_auto_policy() {
     use ez_gfx_core::capability::CompressionSupport;
     use ez_gfx_hal::TextureFormat;
-    use ez_gfx_runtime::texture::TextureDestination;
+    use ez_gfx_texture_manager::texture::TextureDestination;
     let source = include_bytes!("fixtures/rust-logo-etc.basis");
     for (destination, format) in [
         (TextureDestination::Bc1Srgb, TextureFormat::Bc1Srgb),
@@ -65,7 +65,7 @@ fn standalone_explicit_target_does_not_follow_auto_policy() {
 fn uastc_containers_preserve_srgb_and_explicit_linear_override() {
     use ez_gfx_core::capability::CompressionSupport;
     use ez_gfx_hal::TextureFormat;
-    use ez_gfx_runtime::texture::TextureDestination;
+    use ez_gfx_texture_manager::texture::TextureDestination;
     // Generated from examples/02_textured_cube/cube.png, resized to 32x32 with Triangle filtering,
     // as UASTC LDR 4x4 with sRGB metadata and no Zstandard supercompression.
     let ktx = include_bytes!("fixtures/cube-uastc-srgb.ktx2");
@@ -96,7 +96,7 @@ fn uastc_containers_preserve_srgb_and_explicit_linear_override() {
 #[test]
 fn zstd_uastc_matches_unsupercompressed_pixels_and_blocks() {
     use ez_gfx_core::capability::CompressionSupport;
-    use ez_gfx_runtime::texture::TextureDestination;
+    use ez_gfx_texture_manager::texture::TextureDestination;
 
     // Derived from `cube-uastc-srgb.ktx2` with Zstandard CLI 1.5.7:
     // `zstd -q -19 -c` compressed its 1,024-byte level, then the KTX2 scheme and level index
@@ -128,7 +128,7 @@ fn zstd_uastc_matches_unsupercompressed_pixels_and_blocks() {
     oversized_scratch[96..104].copy_from_slice(&(65_u64 * 1024 * 1024).to_le_bytes());
     assert_eq!(
         TextureDecoder::decode(TextureSource::Ktx2, &oversized_scratch),
-        Err(ez_gfx_runtime::texture::TextureError::InvalidData)
+        Err(ez_gfx_texture_manager::texture::TextureError::InvalidData)
     );
 }
 

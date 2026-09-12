@@ -269,6 +269,12 @@ pub struct EzGfxTextureDesc {
     pub debug_label: *const u8,
     /// Specifies the debug-label byte length, or zero when absent.
     pub debug_label_length: usize,
+    /// Specifies the coarse-prefix mip count gating initial readiness. Zero
+    /// means optional: frame recording never waits for the texture and its
+    /// binding samples fallback until the first real coarse mip publishes.
+    /// `u32::MAX` requires the full decoded chain. Over-sized values fail
+    /// the load terminally.
+    pub required_mips: u32,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]

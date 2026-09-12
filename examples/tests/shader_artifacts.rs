@@ -265,3 +265,65 @@ fn sponza_vertex_reflection_preserves_portable_primitive_identity() -> anyhow::R
     }
     Ok(())
 }
+
+#[test]
+fn merged_layout_heap_predicate_matches_heap_declaration() -> anyhow::Result<()> {
+    // The submission gate drives textures only when the merged layout requires
+    // the bindless heap; heapless shaders must skip driving entirely. Heap
+    // detection is declaration-based so every target agrees.
+    let cases = [
+        ("triangle", false, None),
+        ("cube", true, None),
+        ("compute", false, Some(false)),
+        ("imgui", true, None),
+        ("helmet", false, Some(false)),
+        ("sponza", true, Some(true)),
+    ];
+    for (name, heap, compute_heap) in cases {
+        let case = artifacts()?
+            .iter()
+            .find(|case| case.name == name)
+            .ok_or_else(|| anyhow::anyhow!("missing {name} artifact"))?;
+        for backend in [Backend::Vulkan, Backend::Dx12] {
+            let load = |stage, entry| {
+                RuntimeShader::load(
+                    case.bytes.as_slice(),
+                    backend,
+                    SemanticProfile::V1,
+                    stage,
+                    entry,
+                )
+                .map_err(|error| anyhow::anyhow!("{name} {backend:?}: {error:?}"))
+            };
+            let vertex = load(Stage::Vertex, "vertexmain")?;
+            let fragment = load(Stage::Fragment, "fragmentmain")?;
+            let merged = vertex
+                .pipeline_layout(Stage::Vertex)
+                .map_err(|error| anyhow::anyhow!("{name} vertex: {error:?}"))?
+                .merge(
+                    &fragment
+                        .pipeline_layout(Stage::Fragment)
+                        .map_err(|error| anyhow::anyhow!("{name} fragment: {error:?}"))?,
+                )
+                .map_err(|error| anyhow::anyhow!("{name} merge: {error:?}"))?;
+            assert_eq!(
+                merged.texture_heap().is_some(),
+                heap,
+                "{name} {backend:?} graphics heap"
+            );
+            if let Some(expected) = compute_heap {
+                let compute = load(Stage::Compute, "computemain")?;
+                assert_eq!(
+                    compute
+                        .pipeline_layout(Stage::Compute)
+                        .map_err(|error| anyhow::anyhow!("{name} compute: {error:?}"))?
+                        .texture_heap()
+                        .is_some(),
+                    expected,
+                    "{name} {backend:?} compute heap"
+                );
+            }
+        }
+    }
+    Ok(())
+}

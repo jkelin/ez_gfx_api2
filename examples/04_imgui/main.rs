@@ -132,6 +132,12 @@ fn main() -> anyhow::Result<()> {
     let identity = (0..IDENTITY_INDEX_COUNT as u32).collect::<Vec<_>>();
     let atlas = imgui.fonts().build_rgba32_texture();
     let config = TextureConfig {
+        source: TextureSource::Rgba8 {
+            width: atlas.width,
+            height: atlas.height,
+        },
+        generate_mips: false,
+        required_mips: 1,
         width: atlas.width,
         height: atlas.height,
         mip_count: 0,
@@ -146,17 +152,7 @@ fn main() -> anyhow::Result<()> {
         },
     };
     // The atlas slot is immediately stable; it samples fallback until the upload publishes.
-    let texture_id = context
-        .load_texture(
-            TextureSource::Rgba8 {
-                width: atlas.width,
-                height: atlas.height,
-            },
-            atlas.data,
-            false,
-            &config,
-        )?
-        .binding()?;
+    let texture_id = context.load_texture(atlas.data, &config)?.binding()?;
     imgui.fonts().tex_id = TextureId::new(texture_id as usize);
     let identity_indices = context.upload_indices(&identity)?;
     let identity_start = identity_indices.range()?.0;

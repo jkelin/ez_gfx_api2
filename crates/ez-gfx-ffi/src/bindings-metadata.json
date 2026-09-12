@@ -376,7 +376,8 @@
         },
         "debug_label_length": {
           "validation": "zero-or-at-most-boundary-limit"
-        }
+        },
+        "required_mips": {}
       }
     },
     "struct:EzGfxDecodedTextureMip": {

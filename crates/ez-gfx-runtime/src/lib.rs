@@ -11,8 +11,6 @@ pub mod cache;
 pub mod descriptor;
 /// Frame recording and execution APIs.
 pub mod frame;
-/// Geometry buffers and draw layout APIs.
-pub mod geometry;
 /// Render graph construction and scheduling.
 pub mod graph;
 /// Indirect draw and dispatch command APIs.
@@ -26,8 +24,6 @@ pub mod render;
 pub mod shader;
 /// Render-target and surface output APIs.
 pub mod target;
-/// Texture creation, views, and sampling APIs.
-pub mod texture;
 /// Reliable typed upload progress events.
 pub mod upload;
 

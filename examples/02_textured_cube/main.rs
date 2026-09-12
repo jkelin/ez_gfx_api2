@@ -78,6 +78,9 @@ fn main() -> anyhow::Result<()> {
     let positions_heap = context.create_vertex_heap("positions")?;
     let _positions_handle = positions_heap.upload(&positions)?;
     let config = TextureConfig {
+        source: TextureSource::Png,
+        generate_mips: true,
+        required_mips: 1,
         width: 0,
         height: 0,
         mip_count: 0,
@@ -93,12 +96,7 @@ fn main() -> anyhow::Result<()> {
     };
     // Stable bindings remain context-owned and sample the fallback while this load completes.
     let texture_id = context
-        .load_texture(
-            TextureSource::Png,
-            include_bytes!("cube.png"),
-            true,
-            &config,
-        )?
+        .load_texture(include_bytes!("cube.png"), &config)?
         .binding()?;
     let vertex_shader = shader_bytes.load_vertex_shader(&context, "vertexmain")?;
     let fragment_shader = shader_bytes.load_fragment_shader(&context, "fragmentmain")?;
