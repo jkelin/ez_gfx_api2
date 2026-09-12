@@ -110,6 +110,7 @@ pub(super) fn pipeline_layout_key(
     });
     key
 }
+#[cfg(test)]
 pub(super) fn published_texture_handles_into(
     published_mips: &HashMap<ez_gfx_core::handle::TextureHandle, u32>,
     scratch: &mut Vec<ez_gfx_core::handle::TextureHandle>,

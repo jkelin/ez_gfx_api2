@@ -1,7 +1,9 @@
 //! Shader compilation request validation and artifact production.
 
 #![forbid(unsafe_code)]
+mod apple_toolchain;
 mod error;
+use apple_toolchain::{apple_tool_output, host_macos_version, metal_minimum_os};
 
 pub use error::CompilerError;
 
@@ -635,7 +637,9 @@ fn collect_parameters<'a>(
     parameters
 }
 
-fn parse_compatibility_version(value: &str) -> Result<CompatibilityVersion, CompilerError> {
+pub(crate) fn parse_compatibility_version(
+    value: &str,
+) -> Result<CompatibilityVersion, CompilerError> {
     // Profiles may prefix the numeric version (`metal_3_0`); absent minor versions mean `.0`.
     let value = value.trim();
     let mut components = value.split(['.', '_']);
@@ -648,7 +652,7 @@ fn parse_compatibility_version(value: &str) -> Result<CompatibilityVersion, Comp
     Ok(CompatibilityVersion::new(major, minor))
 }
 
-fn parse_deployment_version(value: &str) -> Result<CompatibilityVersion, CompilerError> {
+pub(crate) fn parse_deployment_version(value: &str) -> Result<CompatibilityVersion, CompilerError> {
     // Deployment targets are numeric dotted versions, unlike profile labels that may be prefixed.
     let mut components = value.trim().split('.');
     let major = components
@@ -668,59 +672,6 @@ fn parse_deployment_version(value: &str) -> Result<CompatibilityVersion, Compile
         return Err(CompilerError::InvalidRequest("deployment target"));
     }
     Ok(CompatibilityVersion::new(major, minor))
-}
-
-fn metal_minimum_os(
-    deployment_target: Option<&str>,
-    host_os: CompatibilityVersion,
-    stage: Stage,
-) -> Result<CompatibilityVersion, CompilerError> {
-    // Explicit deployment targets remain authoritative. Task and mesh products
-    // fail closed when either an explicit target or the concrete host provenance is too old.
-    let minimum_os = deployment_target
-        .map(parse_deployment_version)
-        .transpose()?
-        .unwrap_or(host_os);
-    if matches!(stage, Stage::Task | Stage::Mesh) && minimum_os < CompatibilityVersion::new(13, 0) {
-        return Err(CompilerError::InvalidRequest(
-            "task/mesh Metal deployment target",
-        ));
-    }
-    Ok(minimum_os)
-}
-
-fn host_macos_version() -> Result<CompatibilityVersion, CompilerError> {
-    let output = Command::new("sw_vers")
-        .arg("-productVersion")
-        .output()
-        .map_err(CompilerError::Io)?;
-    if !output.status.success() {
-        return Err(CompilerError::ToolFailed(
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        ));
-    }
-    parse_compatibility_version(
-        std::str::from_utf8(&output.stdout)
-            .map_err(|_| CompilerError::InvalidRequest("macOS version"))?,
-    )
-}
-
-fn apple_tool_output(args: &[&str]) -> Result<String, CompilerError> {
-    let output = Command::new("xcrun")
-        .args(args)
-        .output()
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => CompilerError::AppleToolNotFound("xcrun".into()),
-            _ => CompilerError::Io(error),
-        })?;
-    if !output.status.success() {
-        return Err(CompilerError::ToolFailed(
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        ));
-    }
-    String::from_utf8(output.stdout)
-        .map(|value| value.trim().to_owned())
-        .map_err(|_| CompilerError::InvalidRequest("Apple tool output"))
 }
 
 fn target_compatibility(target: &TargetRequest) -> Result<TargetCompatibility, CompilerError> {

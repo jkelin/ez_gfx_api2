@@ -627,8 +627,8 @@ use native::{
     last_native_frame_completion, map_allocation, map_frame, map_geometry, map_hal, map_lifecycle,
     map_native_loss, map_schedule, map_texture, native_device_initialized, native_layouts,
     native_mesh_dispatch_limits, native_texture_compression, pipeline_layout_key,
-    poll_native_frame_completion, pop_largest_native_texture_staging, prepare_frame_binding_scratch,
-    published_texture_handles_into, result_status, retained_native_texture_staging,
+    poll_native_frame_completion, pop_largest_native_texture_staging,
+    prepare_frame_binding_scratch, result_status, retained_native_texture_staging,
     retire_native_allocation, wait_native_idle, write_native,
 };
 mod render_target;

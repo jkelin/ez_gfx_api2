@@ -8,8 +8,7 @@ use super::{
     NativeContext, NativePipeline, NativeShader, NativeSurface, NativeTexture, NativeTextureMap,
     PackedHandle, PipelineKey, RenderTargetHandle, RenderTargetRecord, ResourceId,
     SURFACE_DEFAULT_CLEAR, ShaderHandle, ShaderRecord, SubmittedInfo, TextureHandle, map_hal,
-    native_layouts,
-    pipeline_layout_key, prepare_frame_binding_scratch, should_capture_presented,
+    native_layouts, pipeline_layout_key, prepare_frame_binding_scratch, should_capture_presented,
 };
 
 use arrayvec::ArrayVec;
@@ -368,6 +367,27 @@ fn dx12_pass_colors<'resources>(
     }
     Ok(colors)
 }
+/// Resolves the DX12 pipeline cached for a node, preserving the frame's
+/// invalid-argument/native-failure contract for missing keys and pipelines.
+fn dx12_node_pipeline<'pipelines>(
+    pipelines: &'pipelines HashMap<PipelineKey, NativePipeline>,
+    pipeline_keys: &[Option<PipelineKey>],
+    node: usize,
+) -> std::result::Result<
+    &'pipelines ez_gfx_backend_dx12::native::NativePipeline,
+    ez_gfx_hal::HalError,
+> {
+    let key = pipeline_keys[node]
+        .as_ref()
+        .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
+    let NativePipeline::Dx12(pipeline) = pipelines
+        .get(key)
+        .ok_or(ez_gfx_hal::HalError::NativeFailure)?
+    else {
+        return Err(ez_gfx_hal::HalError::NativeFailure);
+    };
+    Ok(pipeline)
+}
 
 struct DxActionSource<'a, 'resources> {
     state: DxActionState<'resources>,
@@ -410,17 +430,7 @@ impl DxActionSource<'_, '_> {
         ez_gfx_backend_dx12::native::NativeMeshDispatch<'draw>,
         ez_gfx_hal::HalError,
     > {
-        let key = self.pipeline_keys[node]
-            .as_ref()
-            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
-        let NativePipeline::Dx12(pipeline) = self
-            .state
-            .pipelines
-            .get(key)
-            .ok_or(ez_gfx_hal::HalError::NativeFailure)?
-        else {
-            return Err(ez_gfx_hal::HalError::NativeFailure);
-        };
+        let pipeline = dx12_node_pipeline(self.state.pipelines, self.pipeline_keys, node)?;
         let mesh_record = self
             .shaders
             .get(&stages.mesh)
@@ -499,17 +509,8 @@ impl ez_gfx_backend_dx12::native::NativeFrameActionSource for DxActionSource<'_,
                 {
                     ExecutableNode::Compute { groups, .. } => {
                         binding_source = self.binding_source(node)?;
-                        let key = self.pipeline_keys[node]
-                            .as_ref()
-                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
-                        let NativePipeline::Dx12(pipeline) = self
-                            .state
-                            .pipelines
-                            .get(key)
-                            .ok_or(ez_gfx_hal::HalError::NativeFailure)?
-                        else {
-                            return Err(ez_gfx_hal::HalError::NativeFailure);
-                        };
+                        let pipeline =
+                            dx12_node_pipeline(self.state.pipelines, self.pipeline_keys, node)?;
                         ez_gfx_backend_dx12::native::NativeFrameAction::Compute(
                             ez_gfx_backend_dx12::native::NativeComputeDispatch {
                                 pipeline,
@@ -532,17 +533,8 @@ impl ez_gfx_backend_dx12::native::NativeFrameActionSource for DxActionSource<'_,
                         else {
                             return Err(ez_gfx_hal::HalError::InvalidArgument);
                         };
-                        let key = self.pipeline_keys[node]
-                            .as_ref()
-                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
-                        let NativePipeline::Dx12(pipeline) = self
-                            .state
-                            .pipelines
-                            .get(key)
-                            .ok_or(ez_gfx_hal::HalError::NativeFailure)?
-                        else {
-                            return Err(ez_gfx_hal::HalError::NativeFailure);
-                        };
+                        let pipeline =
+                            dx12_node_pipeline(self.state.pipelines, self.pipeline_keys, node)?;
                         ez_gfx_backend_dx12::native::NativeFrameAction::Graphics(
                             ez_gfx_backend_dx12::native::NativeDrawIndexed {
                                 width: self.state.extent.0,

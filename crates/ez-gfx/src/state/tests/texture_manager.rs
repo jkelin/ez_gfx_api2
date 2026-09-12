@@ -735,3 +735,54 @@ fn mixed_optional_and_required_textures_reach_device_ready() {
     destroy_surface(context, surface).unwrap();
     assert_eq!(destroy_context(context), Ok(()));
 }
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn required_prefix_withholds_device_ready_until_published() {
+    let context = create_context(vulkan_options().unwrap()).unwrap();
+    let texture = load_texture(context, &[1, 2, 3, 4], &texture_config()).unwrap();
+    assert_eq!(
+        poll_upload_event(context),
+        Ok(Some(crate::UploadEvent {
+            resource: crate::UploadResource::Texture(texture),
+            status: crate::UploadStatus::SourceStaged,
+        }))
+    );
+    with_context_mut(context, |state| {
+        let id = state
+            .texture_pipeline
+            .pending()
+            .get(&texture)
+            .ok_or(Error::NativeFailure)?
+            .id;
+        state
+            .texture_registry
+            .set_required_mips(id, 2)
+            .map_err(map_texture)?;
+        let token = CompletionToken::new(QueueKind::TextureTransfer, 5)
+            .map_err(|_| Error::NativeFailure)?;
+        state.texture_pipeline.ready_mut().insert(texture, token);
+        // One published mip cannot satisfy two required: the gate holds and
+        // no DeviceReady enters the lossless queue.
+        state.texture_pipeline.published_mut().insert(texture, 1);
+        record_texture_ready(state, texture, 5);
+        assert!(state.texture_pipeline.ready().contains_key(&texture));
+        // The second published level completes the required prefix.
+        state.texture_pipeline.published_mut().insert(texture, 2);
+        record_texture_ready(state, texture, 5);
+        assert!(!state.texture_pipeline.ready().contains_key(&texture));
+        Ok(())
+    })
+    .unwrap();
+    // Only the completed required prefix reports DeviceReady.
+    assert_eq!(
+        poll_upload_event(context),
+        Ok(Some(crate::UploadEvent {
+            resource: crate::UploadResource::Texture(texture),
+            status: crate::UploadStatus::DeviceReady,
+        }))
+    );
+    // Exactly one DeviceReady: the withheld first record queued nothing.
+    assert_eq!(poll_upload_event(context), Ok(None));
+    assert_eq!(destroy_context(context), Ok(()));
+}

@@ -8,8 +8,7 @@ use super::{
     NativeContext, NativePipeline, NativeShader, NativeSurface, NativeTexture, NativeTextureMap,
     PackedHandle, PipelineKey, RenderTargetHandle, RenderTargetRecord, ResourceId,
     SURFACE_DEFAULT_CLEAR, ShaderHandle, ShaderRecord, SubmittedInfo, TextureHandle, map_hal,
-    native_layouts,
-    pipeline_layout_key, prepare_frame_binding_scratch, should_capture_presented,
+    native_layouts, pipeline_layout_key, prepare_frame_binding_scratch, should_capture_presented,
 };
 
 use arrayvec::ArrayVec;

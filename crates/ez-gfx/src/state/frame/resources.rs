@@ -259,13 +259,15 @@ fn intern_texture_resource(
     if let Some(resource) = context.frame_resources.get(&texture.packed()) {
         return Ok(*resource);
     }
-    let (_, _, width, height, _) = context
-        .textures
+    let info = context
+        .texture_pipeline
+        .submitted()
         .get(&texture)
+        .copied()
         .ok_or(Error::InvalidContext)?;
     let desc = ResourceDesc::image(
-        *width,
-        *height,
+        info.width,
+        info.height,
         1,
         1,
         Format::Rgba8Unorm,
@@ -287,7 +289,7 @@ fn intern_texture_resource(
         .frame
         .set_resource_initial_state(resource, sampled)
         .map_err(|error| map_frame(&error))?;
-    if let Some(ready) = context.texture_ready.get(&texture).copied() {
+    if let Some(ready) = context.texture_pipeline.ready().get(&texture).copied() {
         context
             .frame
             .set_resource_ready(resource, ready)
