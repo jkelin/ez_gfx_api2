@@ -25,6 +25,10 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
+homepage = "https://github.com/jkelin/ez_gfx_api2"
+repository = "https://github.com/jkelin/ez_gfx_api2"
+keywords = ["graphics", "gpu", "rendering", "cross-platform"]
+categories = ["graphics", "game-development"]
 
 [workspace.lints.rust]
 missing_docs = "warn"
@@ -45,14 +49,14 @@ undocumented_unsafe_blocks = "warn"
 must_use_candidate = "allow"
 
 [workspace.dependencies]
-ez-gfx = { path = "crates/ez-gfx" }
-ez-gfx-core = { path = "crates/ez-gfx-core" }
-ez-gfx-hal = { path = "crates/ez-gfx-hal" }
-ez-gfx-geometry-manager = { path = "crates/ez-gfx-geometry-manager" }
-ez-gfx-texture-manager = { path = "crates/ez-gfx-texture-manager" }
-ez-gfx-runtime = { path = "crates/ez-gfx-runtime" }
-ez-gfx-artifact = { path = "crates/ez-gfx-artifact" }
-ez-gfx-compiler = { path = "crates/ez-gfx-compiler" }
+ez-gfx = { path = "crates/ez-gfx", version = "0.1.0" }
+ez-gfx-core = { path = "crates/ez-gfx-core", version = "0.1.0" }
+ez-gfx-hal = { path = "crates/ez-gfx-hal", version = "0.1.0" }
+ez-gfx-geometry-manager = { path = "crates/ez-gfx-geometry-manager", version = "0.1.0" }
+ez-gfx-texture-manager = { path = "crates/ez-gfx-texture-manager", version = "0.1.0" }
+ez-gfx-runtime = { path = "crates/ez-gfx-runtime", version = "0.1.0" }
+ez-gfx-artifact = { path = "crates/ez-gfx-artifact", version = "0.1.0" }
+ez-gfx-compiler = { path = "crates/ez-gfx-compiler", version = "0.1.0" }
 blake3 = { version = "1.8.2", default-features = false, features = ["std", "pure"] }
 glam = { version = "0.30.9", features = ["bytemuck"] }
 bytemuck = "1.23"
