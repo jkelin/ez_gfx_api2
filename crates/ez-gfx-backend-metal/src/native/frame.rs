@@ -7,9 +7,8 @@ use super::{
     MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderStages,
     MTLResource, MTLResourceOptions, MTLResourceUsage, MTLSize, MTLStoreAction, MTLTexture,
     MTLWinding, MemoryAllocator, MemoryClass, NativeAllocation, NativeContext, NativeFrameAction,
-    NativeFrameResource, NativeGraphicsDraw, NativePipeline, NativeSurface, NativeTexture,
-    PresentationMode, PrimitiveTopology, ProtocolObject, QueueKind, ThreadBound,
-    map_allocation_hal,
+    NativeFrameResource, NativeGraphicsDraw, NativePipeline, NativeSurface, PresentationMode,
+    PrimitiveTopology, ProtocolObject, QueueKind, ThreadBound, map_allocation_hal,
 };
 use ez_gfx_hal::COUNTER_BUFFER_ELEMENT_OFFSET;
 

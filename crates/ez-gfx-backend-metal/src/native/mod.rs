@@ -301,8 +301,8 @@ pub struct NativeMeshDraw<'a> {
     pub texture_heap: Option<ShaderTextureHeapLayout>,
     /// Reflected public buffer bindings.
     pub bindings: &'a dyn NativeBufferBindingSource,
-    /// Textures referenced by stage argument buffers.
-    pub textures: &'a [&'a NativeTexture],
+    /// Textures and fallback aliases referenced by stage argument buffers.
+    pub textures: &'a [NativeSampledTexture<'a>],
 }
 
 /// Fully resolved compute dispatch consumed by Metal encoding.
