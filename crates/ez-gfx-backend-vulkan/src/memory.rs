@@ -679,7 +679,10 @@ pub(super) fn map_vk(error: vk::Result) -> HalError {
         vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY => {
             HalError::OutOfMemory
         }
-        vk::Result::NOT_READY | vk::Result::TIMEOUT => HalError::NotReady,
+        // Swapchains can become stale between acquire and present during a live resize.
+        vk::Result::NOT_READY | vk::Result::TIMEOUT | vk::Result::ERROR_OUT_OF_DATE_KHR => {
+            HalError::NotReady
+        }
         vk::Result::ERROR_EXTENSION_NOT_PRESENT
         | vk::Result::ERROR_FEATURE_NOT_PRESENT
         | vk::Result::ERROR_INCOMPATIBLE_DRIVER => HalError::Unsupported,
@@ -689,8 +692,11 @@ pub(super) fn map_vk(error: vk::Result) -> HalError {
 
 #[cfg(test)]
 mod descriptor_capacity_tests {
-    use super::{MAX_FRAME_DESCRIPTOR_SETS, MAX_FRAME_DESCRIPTORS, next_descriptor_capacity};
+    use super::{
+        MAX_FRAME_DESCRIPTOR_SETS, MAX_FRAME_DESCRIPTORS, map_vk, next_descriptor_capacity,
+    };
     use crate::HalError;
+    use ash::vk;
 
     #[test]
     fn sufficient_capacity_needs_no_recreation() {
@@ -730,6 +736,14 @@ mod descriptor_capacity_tests {
         assert_eq!(
             next_descriptor_capacity(1024, 4096, 1, MAX_FRAME_DESCRIPTORS + 1).map(|_| ()),
             Err(HalError::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn out_of_date_surface_is_temporarily_not_ready() {
+        assert_eq!(
+            map_vk(vk::Result::ERROR_OUT_OF_DATE_KHR),
+            HalError::NotReady
         );
     }
 
