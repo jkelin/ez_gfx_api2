@@ -19,6 +19,12 @@ ktx2 = ["ez-gfx/ktx2"]
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+[[bin]]
+name = "metal_shader_stages"
+path = "src/bin/metal_shader_stages.rs"
+test = false
+
+
 [dependencies]
 ez-gfx = { workspace = true, features = ["ffi"] }
 bytemuck.workspace = true

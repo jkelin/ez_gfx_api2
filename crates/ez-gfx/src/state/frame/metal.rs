@@ -1,7 +1,7 @@
 use crate::Result;
 use ez_gfx_core::capability::PresentationMode;
 
-use super::super::{TextureId, map_texture};
+use super::super::map_texture;
 use super::{
     Backend, ContextState, Error, ExecutableNode, ExecutionAction, FrameBindingSource,
     FrameBufferBindingRecord, FrameExecutionPlan, FrameNativeResource, GeometryAllocation, HashMap,
