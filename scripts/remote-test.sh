@@ -146,24 +146,24 @@ then
 fi
 remote_env="export EZ_GFX_EXAMPLE_HIDDEN=1 RUST_TEST_THREADS=1 REMOTE_TEST_TIMEOUT_SECONDS=$timeout_seconds PATH=\"\$HOME/.cargo/bin:\$PATH\""
 slang_setup=""
-metadata_command="set -eu; cd $remote_path_q; $remote_env; cargo metadata --no-deps --format-version 1 >/dev/null"
+metadata_command="set -eu; cd $remote_path_q; $remote_env; cargo metadata --no-deps --format-version 1 >/dev/null; cargo nextest --version >/dev/null"
 if [[ "$platform" == macos ]]; then
   printf -v metadata_command_q '%q' "$metadata_command"
   if ! ssh "$host" "zsh -lc $metadata_command_q"; then
-    printf 'remote workspace metadata validation failed; remote tests were not started\n' >&2
+    printf 'remote workspace or nextest validation failed; remote tests were not started\n' >&2
     exit 74
   fi
 elif ! ssh "$host" "$metadata_command"; then
-  printf 'remote workspace metadata validation failed; remote tests were not started\n' >&2
+  printf 'remote workspace or nextest validation failed; remote tests were not started\n' >&2
   exit 74
 fi
 
 case "$platform" in
   windows)
-    tests='bash scripts/remote-cargo-test.sh ez-gfx-hal ez-gfx-backend-vulkan ez-gfx-backend-dx12 ez-gfx'
+    tests='bash scripts/remote-nextest.sh ez-gfx-hal ez-gfx-backend-vulkan ez-gfx-backend-dx12 ez-gfx'
     ;;
   linux)
-    tests='bash scripts/remote-cargo-test.sh ez-gfx-hal ez-gfx-backend-vulkan ez-gfx ez-gfx-ffi'
+    tests='bash scripts/remote-nextest.sh ez-gfx-hal ez-gfx-backend-vulkan ez-gfx ez-gfx-ffi'
     remote_env+=' VK_LOADER_LAYERS_DISABLE=~implicit~'
     if [[ -n "${REMOTE_TEST_LINUX_SLANG_DIR:-}" ]]; then
       printf -v slang_dir_q '%q' "$REMOTE_TEST_LINUX_SLANG_DIR"
@@ -175,7 +175,7 @@ case "$platform" in
     fi
     ;;
   macos)
-    tests='bash scripts/remote-cargo-test.sh ez-gfx-hal ez-gfx-backend-metal ez-gfx'
+    tests='bash scripts/remote-nextest.sh ez-gfx-hal ez-gfx-backend-metal ez-gfx'
     if [[ -n "${REMOTE_TEST_MACOS_SLANG_DIR:-}" ]]; then
       printf -v slang_dir_q '%q' "$REMOTE_TEST_MACOS_SLANG_DIR"
       remote_env+=" SLANG_DIR=$slang_dir_q"
