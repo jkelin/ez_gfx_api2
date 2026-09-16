@@ -1,6 +1,10 @@
 use super::*;
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::cell::Cell;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 #[test]
 fn frame_waits_collapse_to_one_maximum_per_transfer_queue() {
@@ -39,7 +43,8 @@ fn graphics_wait_fails_validation() {
     ));
 }
 
-static ALLOCATION_ENABLED: AtomicBool = AtomicBool::new(false);
+static ALLOCATION_TEST_LOCK: Mutex<()> = Mutex::new(());
+thread_local! { static ALLOCATION_ENABLED: Cell<bool> = const { Cell::new(false) }; }
 static ALLOCATION_CALLS: AtomicUsize = AtomicUsize::new(0);
 static ALLOCATION_BYTES: AtomicUsize = AtomicUsize::new(0);
 
@@ -51,7 +56,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: the unchanged request is delegated to the system allocator.
         let pointer = unsafe { System.alloc(layout) };
-        if ALLOCATION_ENABLED.load(Ordering::Relaxed) && !pointer.is_null() {
+        if ALLOCATION_ENABLED.with(Cell::get) && !pointer.is_null() {
             ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
             ALLOCATION_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
         }
@@ -69,6 +74,7 @@ static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 #[test]
 fn spill_cardinality_plan_validation_performs_no_allocations() {
+    let _lock = ALLOCATION_TEST_LOCK.lock().expect("allocation test lock");
     // Sixty-five actions exceed every former inline action-scratch threshold.
     let actions: [NativeFrameAction<'_>; 65] = std::array::from_fn(|index| {
         NativeFrameAction::Wait(CompletionToken {
@@ -85,11 +91,11 @@ fn spill_cardinality_plan_validation_performs_no_allocations() {
     }
     ALLOCATION_CALLS.store(0, Ordering::Relaxed);
     ALLOCATION_BYTES.store(0, Ordering::Relaxed);
-    ALLOCATION_ENABLED.store(true, Ordering::Relaxed);
+    ALLOCATION_ENABLED.with(|enabled| enabled.set(true));
     for _ in 0..500 {
         validate_frame_plan(&actions, (1, 1), false, false).unwrap();
     }
-    ALLOCATION_ENABLED.store(false, Ordering::Relaxed);
+    ALLOCATION_ENABLED.with(|enabled| enabled.set(false));
     assert_eq!(ALLOCATION_CALLS.load(Ordering::Relaxed), 0);
     assert_eq!(ALLOCATION_BYTES.load(Ordering::Relaxed), 0);
 }

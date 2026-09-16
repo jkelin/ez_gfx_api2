@@ -2,14 +2,15 @@ use super::{
     BlendMode, CullMode, D3D_PRIMITIVE_TOPOLOGY_LINELIST, D3D_PRIMITIVE_TOPOLOGY_LINESTRIP,
     D3D_PRIMITIVE_TOPOLOGY_POINTLIST, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
     D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, D3D_ROOT_SIGNATURE_VERSION_1, D3D12_BLEND_DESC,
-    D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_ONE, D3D12_BLEND_OP_ADD, D3D12_BLEND_SRC_ALPHA,
-    D3D12_BLEND_ZERO, D3D12_COLOR_WRITE_ENABLE_ALL, D3D12_COMMAND_SIGNATURE_DESC,
-    D3D12_COMPARISON_FUNC_ALWAYS, D3D12_COMPARISON_FUNC_LESS, D3D12_COMPUTE_PIPELINE_STATE_DESC,
-    D3D12_CULL_MODE_BACK, D3D12_CULL_MODE_FRONT, D3D12_CULL_MODE_NONE, D3D12_DEPTH_STENCIL_DESC,
+    D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_ONE, D3D12_BLEND_OP_ADD, D3D12_BLEND_ZERO,
+    D3D12_COLOR_WRITE_ENABLE_ALL, D3D12_COMMAND_SIGNATURE_DESC, D3D12_COMPARISON_FUNC_ALWAYS,
+    D3D12_COMPARISON_FUNC_LESS, D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_CULL_MODE_BACK,
+    D3D12_CULL_MODE_FRONT, D3D12_CULL_MODE_NONE, D3D12_DEPTH_STENCIL_DESC,
     D3D12_DEPTH_STENCILOP_DESC, D3D12_DEPTH_WRITE_MASK_ALL, D3D12_DESCRIPTOR_RANGE,
     D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,
     D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_FILL_MODE_SOLID, D3D12_GRAPHICS_PIPELINE_STATE_DESC,
     D3D12_INDIRECT_ARGUMENT_DESC, D3D12_INDIRECT_ARGUMENT_DESC_0,
+    D3D12_INDIRECT_ARGUMENT_DESC_0_1, D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
     D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, D3D12_LOGIC_OP_NOOP, D3D12_MESH_SHADER_TIER_1,
     D3D12_PIPELINE_STATE_STREAM_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE,
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND,
@@ -22,13 +23,15 @@ use super::{
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC,
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE,
     D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-    D3D12_RASTERIZER_DESC, D3D12_RENDER_TARGET_BLEND_DESC, D3D12_ROOT_DESCRIPTOR,
-    D3D12_ROOT_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0,
+    D3D12_RASTERIZER_DESC, D3D12_RENDER_TARGET_BLEND_DESC, D3D12_ROOT_CONSTANTS,
+    D3D12_ROOT_DESCRIPTOR, D3D12_ROOT_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER,
+    D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
     D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER_TYPE_SRV,
     D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_ROOT_SIGNATURE_DESC,
     D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, D3D12_ROOT_SIGNATURE_FLAG_NONE,
     D3D12_RT_FORMAT_ARRAY, D3D12_SHADER_BYTECODE, D3D12_SHADER_VISIBILITY_ALL,
-    D3D12_STENCIL_OP_KEEP, D3D12SerializeRootSignature, DXGI_FORMAT, DXGI_FORMAT_D32_FLOAT,
+    D3D12_SHADER_VISIBILITY_VERTEX, D3D12_STENCIL_OP_KEEP, D3D12SerializeRootSignature, DXGI_FORMAT,
+    DXGI_FORMAT_D32_FLOAT,
     DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC, DeferredResource, DynamicPipelineState, FrontFace,
     HalError, ID3D12Device2, ID3D12PipelineState, ID3D12RootSignature, ID3DBlob, Interface,
     MeshDispatchLimits, MeshPipelineState, NativeContext, NativeMeshPipelineDesc, NativePipeline,
@@ -104,10 +107,9 @@ fn mesh_product(shader: &NativeShader, index: usize) -> Result<&[u8], HalError> 
 ///
 /// # Errors
 ///
-/// Returns [`HalError::NativeFailure`] when the color-write mask does not fit in `u8`.
 fn mesh_render_state(
     state: MeshPipelineState,
-    depth_required: bool,
+    depth: ez_gfx_hal::DepthMode,
 ) -> Result<
     (
         D3D12_BLEND_DESC,
@@ -119,11 +121,7 @@ fn mesh_render_state(
     let target = D3D12_RENDER_TARGET_BLEND_DESC {
         BlendEnable: (state.blend == BlendMode::Alpha).into(),
         LogicOpEnable: false.into(),
-        SrcBlend: if state.blend == BlendMode::Alpha {
-            D3D12_BLEND_SRC_ALPHA
-        } else {
-            D3D12_BLEND_ONE
-        },
+        SrcBlend: D3D12_BLEND_ONE,
         DestBlend: if state.blend == BlendMode::Alpha {
             D3D12_BLEND_INV_SRC_ALPHA
         } else {
@@ -164,8 +162,12 @@ fn mesh_render_state(
         StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS,
     };
     let depth_stencil = D3D12_DEPTH_STENCIL_DESC {
-        DepthEnable: depth_required.into(),
-        DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+        DepthEnable: (!matches!(depth, ez_gfx_hal::DepthMode::Disabled)).into(),
+        DepthWriteMask: if matches!(depth, ez_gfx_hal::DepthMode::Write) {
+            D3D12_DEPTH_WRITE_MASK_ALL
+        } else {
+            windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_WRITE_MASK(0)
+        },
         DepthFunc: D3D12_COMPARISON_FUNC_LESS,
         StencilEnable: false.into(),
         StencilReadMask: u8::MAX,
@@ -218,7 +220,8 @@ impl NativeContext {
         &self,
         layouts: &[ShaderBufferLayout],
         graphics: bool,
-    ) -> Result<(ID3D12RootSignature, Vec<bool>), HalError> {
+        base_constants: bool,
+    ) -> Result<(ID3D12RootSignature, Vec<bool>, u32), HalError> {
         let descriptor_count = layouts
             .iter()
             .try_fold(0usize, |total, layout| {
@@ -239,7 +242,7 @@ impl NativeContext {
             RegisterSpace: 1,
             OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
         };
-        let mut parameters = Vec::with_capacity(descriptor_count + 2);
+        let mut parameters = Vec::with_capacity(descriptor_count + 3);
         let mut writable = Vec::with_capacity(descriptor_count);
         for layout in layouts {
             if layout.descriptor_count == 0 || layout.descriptor_count > 2 {
@@ -286,6 +289,28 @@ impl NativeContext {
             },
             ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         });
+        // The per-draw base instance travels as one vertex-visible 32-bit
+        // constant appended after both descriptor tables, so existing table
+        // indices stay stable. Slang lowers the DXIL entry-point uniform to a
+        // b0-space0 cbuffer, which this constant feeds.
+        let base_instance_root = if base_constants {
+            let index =
+                u32::try_from(parameters.len()).map_err(|_| HalError::InvalidArgument)?;
+            parameters.push(D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 0,
+                        RegisterSpace: 0,
+                        Num32BitValues: 1,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
+            });
+            index
+        } else {
+            u32::MAX
+        };
         let flags = if graphics {
             D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
         } else {
@@ -318,7 +343,7 @@ impl NativeContext {
         let root =
             // SAFETY: `serialized` references the complete serialized root-signature bytes in `blob` for the duration of `ID3D12Device::CreateRootSignature`.
             unsafe { self.device.CreateRootSignature(0, serialized) }.map_err(map_windows)?;
-        Ok((root, writable))
+        Ok((root, writable, base_instance_root))
     }
 
     /// Creates a compute pipeline from one compiled shader entry.
@@ -336,7 +361,7 @@ impl NativeContext {
             .products
             .get(product_index)
             .ok_or(HalError::InvalidArgument)?;
-        let (root, buffer_writable) = self.create_root_signature(layouts, false)?;
+        let (root, buffer_writable, _) = self.create_root_signature(layouts, false, false)?;
         let state_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: core::mem::ManuallyDrop::new(Some(root.clone())),
             CS: D3D12_SHADER_BYTECODE {
@@ -357,6 +382,7 @@ impl NativeContext {
             topology: None,
             signature: None,
             buffer_writable,
+            base_instance_root: u32::MAX,
             mesh: false,
             task_stage: false,
         })
@@ -390,7 +416,8 @@ impl NativeContext {
             .products
             .get(fragment_index)
             .ok_or(HalError::InvalidArgument)?;
-        let (root, buffer_writable) = self.create_root_signature(layouts, true)?;
+        let (root, buffer_writable, base_instance_root) =
+            self.create_root_signature(layouts, true, true)?;
         let (topology, topology_type) = match state.topology {
             PrimitiveTopology::TriangleList => (
                 D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
@@ -417,11 +444,7 @@ impl NativeContext {
         let target = D3D12_RENDER_TARGET_BLEND_DESC {
             BlendEnable: (state.blend == BlendMode::Alpha).into(),
             LogicOpEnable: false.into(),
-            SrcBlend: if state.blend == BlendMode::Alpha {
-                D3D12_BLEND_SRC_ALPHA
-            } else {
-                D3D12_BLEND_ONE
-            },
+            SrcBlend: D3D12_BLEND_ONE,
             DestBlend: if state.blend == BlendMode::Alpha {
                 D3D12_BLEND_INV_SRC_ALPHA
             } else {
@@ -461,9 +484,14 @@ impl NativeContext {
             StencilPassOp: D3D12_STENCIL_OP_KEEP,
             StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS,
         };
+        let depth_mode = state.resolved_depth(depth_required);
         let depth_stencil = D3D12_DEPTH_STENCIL_DESC {
-            DepthEnable: depth_required.into(),
-            DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+            DepthEnable: (!matches!(depth_mode, ez_gfx_hal::DepthMode::Disabled)).into(),
+            DepthWriteMask: if matches!(depth_mode, ez_gfx_hal::DepthMode::Write) {
+                D3D12_DEPTH_WRITE_MASK_ALL
+            } else {
+                windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_WRITE_MASK(0)
+            },
             DepthFunc: D3D12_COMPARISON_FUNC_LESS,
             StencilEnable: false.into(),
             StencilReadMask: u8::MAX,
@@ -504,21 +532,39 @@ impl NativeContext {
         let pipeline =
             // SAFETY: `desc` remains allocated for `CreateGraphicsPipelineState`, and its root-signature clone plus `vertex` and `fragment` shader storage remain available for the duration of the call.
             unsafe { self.device.CreateGraphicsPipelineState(&raw const desc) }.map_err(map_windows)?;
+        // Each native record leads with the draw's base instance: the
+        // signature feeds that dword into the trailing root constant, then
+        // executes the remaining 20 bytes as indexed-draw arguments with a
+        // zeroed start-instance dword. Native stride is 24 bytes per draw.
+        let base_argument = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                    RootParameterIndex: base_instance_root,
+                    DestOffsetIn32BitValues: 0,
+                    Num32BitValuesToSet: 1,
+                },
+            },
+        };
         let argument = D3D12_INDIRECT_ARGUMENT_DESC {
             Type: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED,
             Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0::default(),
         };
+        let arguments = [base_argument, argument];
         let signature_desc = D3D12_COMMAND_SIGNATURE_DESC {
-            ByteStride: 20,
-            NumArgumentDescs: 1,
-            pArgumentDescs: &raw const argument,
+            ByteStride: 24,
+            NumArgumentDescs: 2,
+            pArgumentDescs: arguments.as_ptr(),
             NodeMask: 0,
         };
         let mut signature = None;
-        // SAFETY: `signature_desc` and its single `argument` descriptor remain allocated for `CreateCommandSignature`, and `signature` is initialized output storage for the returned `ID3D12CommandSignature`.
+        // SAFETY: `signature_desc` and its two `arguments` descriptors remain allocated for `CreateCommandSignature`, `root` outlives the compatible-signature lookup, and `signature` is initialized output storage for the returned `ID3D12CommandSignature`.
         unsafe {
-            self.device
-                .CreateCommandSignature(&raw const signature_desc, None, &raw mut signature)
+            self.device.CreateCommandSignature(
+                &raw const signature_desc,
+                Some(&root),
+                &raw mut signature,
+            )
         }
         .map_err(map_windows)?;
         Ok(NativePipeline {
@@ -527,6 +573,7 @@ impl NativeContext {
             topology: Some(topology),
             signature,
             buffer_writable,
+            base_instance_root,
             mesh: false,
             task_stage: false,
         })
@@ -605,12 +652,12 @@ impl NativeContext {
         // Same root layout as the indexed path: reflected buffers plus texture
         // and sampler tables. The input-assembler flag is inert here because the
         // stream carries no input-layout subobject.
-        let (root, buffer_writable) = self.create_root_signature(desc.layouts, true)?;
+        let (root, buffer_writable, _) = self.create_root_signature(desc.layouts, true, false)?;
         let shader = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
         };
-        let (blend, raster, depth_stencil) = mesh_render_state(desc.state, desc.depth_required)?;
+        let (blend, raster, depth_stencil) = mesh_render_state(desc.state, desc.depth)?;
         let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
         formats[0] = Self::render_pipeline_color_format(desc.color_format)?;
         let tail = MeshPipelineTail {
@@ -643,10 +690,10 @@ impl NativeContext {
             },
             depth_stencil_format: StreamSubobject {
                 subobject_type: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
-                payload: if desc.depth_required {
-                    DXGI_FORMAT_D32_FLOAT
-                } else {
+                payload: if matches!(desc.depth, ez_gfx_hal::DepthMode::Disabled) {
                     DXGI_FORMAT_UNKNOWN
+                } else {
+                    DXGI_FORMAT_D32_FLOAT
                 },
             },
             sample_desc: StreamSubobject {
@@ -701,6 +748,7 @@ impl NativeContext {
             topology: None,
             signature: None,
             buffer_writable,
+            base_instance_root: u32::MAX,
             mesh: true,
             task_stage: has_task,
         })

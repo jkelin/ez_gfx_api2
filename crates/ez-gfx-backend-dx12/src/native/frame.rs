@@ -37,24 +37,7 @@ fn validate_frame_plan(
         }
         match action {
             NativeFrameAction::Wait(token) => {
-                if !matches!(
-                    token.queue,
-                    QueueKind::Transfer | QueueKind::TextureTransfer
-                ) {
-                    return Err(HalError::InvalidArgument);
-                }
-                if let Some(existing) = external_waits
-                    .iter_mut()
-                    .find(|existing| existing.queue == token.queue)
-                {
-                    if token.value > existing.value {
-                        *existing = *token;
-                    }
-                } else {
-                    external_waits
-                        .try_push(*token)
-                        .map_err(|_| HalError::InvalidArgument)?;
-                }
+                track_external_wait(&mut external_waits, *token)?;
             }
             NativeFrameAction::Barrier { barrier, resource } => {
                 if let Some(before) = barrier.before {
@@ -67,43 +50,7 @@ fn validate_frame_plan(
                 );
             }
             NativeFrameAction::BeginPass { pass, colors } => {
-                uses_surface |= colors
-                    .iter()
-                    .any(|attachment| matches!(attachment.resource, NativeFrameResource::Surface));
-                let mut target_extent = None;
-                let mut valid = !pass_active
-                    && pass.colors.len() == 1
-                    && colors.len() == 1
-                    && matches!(pass.samples, 1 | 2 | 4 | 8);
-                if let Some(attachment) = colors.first() {
-                    target_extent = match attachment.resource {
-                        NativeFrameResource::Surface => {
-                            valid &= pass.samples == 1;
-                            Some(extent)
-                        }
-                        NativeFrameResource::RenderTarget(texture) => {
-                            valid &= pass.depth.is_none();
-                            valid &= texture.msaa.as_ref().map_or(1, |msaa| msaa.samples)
-                                == pass.samples;
-                            Some((texture.width, texture.height))
-                        }
-                        _ => None,
-                    };
-                }
-                let Some((target_width, target_height)) = target_extent else {
-                    return Err(HalError::InvalidArgument);
-                };
-                if !valid
-                    || pass.area[0]
-                        .checked_add(pass.area[2])
-                        .is_none_or(|end| end > target_width)
-                    || pass.area[1]
-                        .checked_add(pass.area[3])
-                        .is_none_or(|end| end > target_height)
-                {
-                    return Err(HalError::InvalidArgument);
-                }
-                pass_active = true;
+                validate_begin_pass(pass, colors, extent, &mut uses_surface, &mut pass_active)?;
             }
             NativeFrameAction::Compute(dispatch) => {
                 if pass_active
@@ -117,22 +64,27 @@ fn validate_frame_plan(
                 }
             }
             NativeFrameAction::Graphics(draw) => {
-                let indirect_size = indirect_command_bytes(draw.draw_count)
-                    .checked_add(COUNTER_BUFFER_ELEMENT_OFFSET)
-                    .ok_or(HalError::InvalidArgument)?;
-                if !pass_active
-                    || draw.draw_count == 0
-                    || !bindings_match_pipeline(draw.bindings, &draw.pipeline.buffer_writable)?
-                    || draw.pipeline.topology.is_none()
-                    || draw.pipeline.signature.is_none()
-                    || draw.index_size == 0
-                    || draw.index_size > u64::from(u32::MAX)
-                    || draw.indirect_size < indirect_size
-                {
-                    return Err(HalError::InvalidArgument);
-                }
+                validate_graphics_draw(draw, pass_active)?;
             }
             NativeFrameAction::Mesh(dispatch) => validate_mesh_plan(dispatch, pass_active)?,
+            NativeFrameAction::CopyTexture {
+                source,
+                destination,
+                region,
+            } => {
+                if pass_active {
+                    return Err(HalError::InvalidArgument);
+                }
+                ez_gfx_hal::validate_texture_copy(
+                    source.format,
+                    destination.format,
+                    (source.width, source.height),
+                    (destination.width, destination.height),
+                    core::ptr::eq(*source, *destination),
+                    *region,
+                )
+                .map_err(|_| HalError::InvalidArgument)?;
+            }
             NativeFrameAction::TextureReadback { width, height, .. } => {
                 if pass_active || *width == 0 || *height == 0 {
                     return Err(HalError::InvalidArgument);
@@ -368,7 +320,7 @@ impl NativeContext {
                 return Ok(());
             }
             let request = AllocationRequest::new(
-                indirect_command_bytes(draw.draw_count) + COUNTER_BUFFER_ELEMENT_OFFSET,
+                native_indirect_command_bytes(draw.draw_count) + COUNTER_BUFFER_ELEMENT_OFFSET,
                 16,
                 MemoryClass::Device,
                 false,
@@ -439,10 +391,11 @@ impl NativeContext {
         }
         let mut requires_depth = false;
         actions.visit(&mut |_, action| {
-            requires_depth |= matches!(
-                action,
-                NativeFrameAction::BeginPass { pass, .. } if pass.depth.is_some()
-            );
+            requires_depth |= uses_surface
+                && matches!(
+                    action,
+                    NativeFrameAction::BeginPass { pass, .. } if pass.depth.is_some()
+                );
             Ok(())
         })?;
         if requires_depth {
@@ -585,6 +538,11 @@ impl DxFrameEncoder<'_> {
                     1
                 }
             }
+            NativeFrameResource::RenderTargetDepth(texture) => {
+                let depth = texture.depth.as_ref().ok_or(HalError::NotReady)?;
+                natives[0] = Some(depth.resource.clone());
+                1
+            }
             NativeFrameResource::Surface => {
                 natives[0] = Some(self.back_buffer.cloned().ok_or(HalError::InvalidArgument)?);
                 1
@@ -637,28 +595,28 @@ impl DxFrameEncoder<'_> {
         // Textures, buffers, and depth images are never color attachments. A
         // multisampled target renders into its MSAA storage; the resolve into
         // the sampled resource is stashed for end of pass.
-        let (rtv, target, target_extent, resolve) = match attachment.resource {
+        let (rtv, dsv, target, target_extent, resolve) = match attachment.resource {
             super::NativeFrameResource::Surface => {
                 if pass.samples != 1 {
                     return Err(HalError::InvalidArgument);
                 }
                 (
                     self.rtv.ok_or(HalError::InvalidArgument)?,
+                    self.dsv,
                     self.back_buffer.cloned().ok_or(HalError::InvalidArgument)?,
                     self.extent,
                     None,
                 )
             }
             super::NativeFrameResource::RenderTarget(texture) => {
-                if pass.depth.is_some() {
-                    return Err(HalError::InvalidArgument);
-                }
+                let dsv = texture.depth.as_ref().map(|depth| depth.dsv);
                 if let Some(msaa) = texture.msaa.as_ref() {
                     if msaa.samples != pass.samples {
                         return Err(HalError::InvalidArgument);
                     }
                     (
                         msaa.rtv,
+                        dsv,
                         msaa.resource.clone(),
                         (texture.width, texture.height),
                         Some((msaa.resource.clone(), texture.resource.clone(), msaa.format)),
@@ -670,6 +628,7 @@ impl DxFrameEncoder<'_> {
                     let (_, rtv) = texture.rtv.as_ref().ok_or(HalError::InvalidArgument)?;
                     (
                         *rtv,
+                        dsv,
                         texture.resource.clone(),
                         (texture.width, texture.height),
                         None,
@@ -712,7 +671,7 @@ impl DxFrameEncoder<'_> {
                 1,
                 Some(&raw const rtv),
                 false,
-                pass.depth.and(self.dsv).as_ref().map(std::ptr::from_ref),
+                dsv.as_ref().map(std::ptr::from_ref),
             );
             self.list.RSSetViewports(core::slice::from_ref(&viewport));
             self.list.RSSetScissorRects(core::slice::from_ref(&scissor));
@@ -721,7 +680,7 @@ impl DxFrameEncoder<'_> {
                 AttachmentLoadOp::Clear => {
                     self.list
                         .ClearRenderTargetView(rtv, &attachment.clear, None);
-                    if let Some(dsv) = pass.depth.and(self.dsv) {
+                    if let Some(dsv) = dsv {
                         self.list
                             .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
                     }
@@ -812,7 +771,7 @@ impl DxFrameEncoder<'_> {
                 0,
                 &draw.indirect_buffer.resource,
                 0,
-                indirect_command_bytes(draw.draw_count) + COUNTER_BUFFER_ELEMENT_OFFSET,
+                native_indirect_command_bytes(draw.draw_count) + COUNTER_BUFFER_ELEMENT_OFFSET,
             );
             record_resource_barriers(
                 self.list,
@@ -924,6 +883,61 @@ impl DxFrameEncoder<'_> {
             list.DispatchMesh(dispatch.groups[0], dispatch.groups[1], dispatch.groups[2]);
         }
 
+        Ok(())
+    }
+
+    fn copy_texture(
+        &mut self,
+        source: &super::NativeTexture,
+        destination: &super::NativeTexture,
+        region: ez_gfx_hal::TextureCopyRegion,
+    ) -> Result<(), HalError> {
+        if self.pass_active || source.format != destination.format {
+            return Err(HalError::InvalidArgument);
+        }
+        let source_subresource = region.source_mip;
+        let destination_subresource = region.destination_mip;
+        let source_location = windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_COPY_LOCATION {
+            pResource: core::mem::ManuallyDrop::new(Some(source.resource.clone())),
+            Type: windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: source_subresource,
+            },
+        };
+        let destination_location =
+            windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_COPY_LOCATION {
+                pResource: core::mem::ManuallyDrop::new(Some(destination.resource.clone())),
+                Type:
+                    windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: destination_subresource,
+                },
+            };
+        let source_box = windows::Win32::Graphics::Direct3D12::D3D12_BOX {
+            left: region.source_origin[0],
+            top: region.source_origin[1],
+            front: 0,
+            right: region.source_origin[0]
+                .checked_add(region.extent[0])
+                .ok_or(HalError::InvalidArgument)?,
+            bottom: region.source_origin[1]
+                .checked_add(region.extent[1])
+                .ok_or(HalError::InvalidArgument)?,
+            back: 1,
+        };
+        // Graph barriers place resources in COPY_SOURCE/COPY_DEST before this node.
+        // SAFETY: graph validation established bounds and format compatibility; both COM
+        // resources remain retained by the action until command recording completes.
+        unsafe {
+            self.list.CopyTextureRegion(
+                &raw const destination_location,
+                region.destination_origin[0],
+                region.destination_origin[1],
+                0,
+                &raw const source_location,
+                Some(&raw const source_box),
+            );
+        }
         Ok(())
     }
 
@@ -1153,12 +1167,14 @@ mod tests {
 
     #[test]
     fn compute_written_indirect_copy_uses_logical_extent_before_render_pass() {
-        assert_eq!(indirect_command_bytes(1), 20);
-        assert_eq!(indirect_command_bytes(3), 60);
+        assert_eq!(source_indirect_command_bytes(1), 20);
+        assert_eq!(source_indirect_command_bytes(3), 60);
         assert_eq!(
-            indirect_command_bytes(3) + COUNTER_BUFFER_ELEMENT_OFFSET,
+            source_indirect_command_bytes(3) + COUNTER_BUFFER_ELEMENT_OFFSET,
             316
         );
+        assert_eq!(native_indirect_command_bytes(1), 24);
+        assert_eq!(native_indirect_command_bytes(3), 72);
         assert_eq!(validate_indirect_copy_phase(false), Ok(()));
         assert_eq!(
             validate_indirect_copy_phase(true),
