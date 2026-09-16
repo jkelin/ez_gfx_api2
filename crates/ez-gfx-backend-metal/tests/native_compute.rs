@@ -190,7 +190,7 @@ void computemain(uint3 id : SV_DispatchThreadID) {
         offset: 0,
         index: binding_index,
     };
-    let textures = [&texture];
+    let textures = [texture.sampled()];
     let native_bindings = [native_binding];
     let action = NativeFrameAction::Compute(NativeComputeDispatch {
         pipeline: &pipeline,
