@@ -68,14 +68,17 @@ pub(super) fn record_graphics(
             &[public, texture_set],
             &[],
         );
+        // Edge case local to Vulkan orientation: a positive viewport maps the
+        // shared upper-left NDC convention to the bottom row. A negative
+        // viewport keeps y=0 at the top on every backend; scissor stays put.
         encoding.device.cmd_set_viewport(
             encoding.command,
             0,
             &[vk::Viewport {
                 x: 0.0,
-                y: 0.0,
+                y: f32::from(u16::try_from(draw.height).map_err(|_| HalError::InvalidArgument)?),
                 width: f32::from(u16::try_from(draw.width).map_err(|_| HalError::InvalidArgument)?),
-                height: f32::from(
+                height: -f32::from(
                     u16::try_from(draw.height).map_err(|_| HalError::InvalidArgument)?,
                 ),
                 min_depth: 0.0,
@@ -160,14 +163,16 @@ pub(super) fn record_mesh(
             &[public, texture_set],
             &[],
         );
+        // Edge case local to Vulkan orientation: match the graphics path so
+        // mesh draws share the upper-left origin; scissor stays put.
         encoding.device.cmd_set_viewport(
             encoding.command,
             0,
             &[vk::Viewport {
                 x: 0.0,
-                y: 0.0,
+                y: f32::from(u16::try_from(draw.height).map_err(|_| HalError::InvalidArgument)?),
                 width: f32::from(u16::try_from(draw.width).map_err(|_| HalError::InvalidArgument)?),
-                height: f32::from(
+                height: -f32::from(
                     u16::try_from(draw.height).map_err(|_| HalError::InvalidArgument)?,
                 ),
                 min_depth: 0.0,
