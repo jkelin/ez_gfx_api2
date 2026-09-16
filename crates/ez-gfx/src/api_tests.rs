@@ -183,6 +183,7 @@ fn safe_mesh_failure_poison_aborts_the_transaction() -> Result<()> {
         cull: ez_gfx_hal::CullMode::None,
         front_face: ez_gfx_hal::FrontFace::CounterClockwise,
         blend: ez_gfx_hal::BlendMode::None,
+        depth: ez_gfx_hal::DepthMode::Disabled,
     };
 
     assert_eq!(

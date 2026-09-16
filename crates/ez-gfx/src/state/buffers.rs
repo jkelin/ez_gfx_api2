@@ -88,6 +88,23 @@ fn acquire_buffer_raw_impl(
     })
 }
 
+/// Native indirect-record stride for the context backend.
+///
+/// Vulkan and Metal consume the 20-byte `DrawIndexedCommand` directly.
+/// DirectX 12 executes a 24-byte record instead: the source `first_instance`
+/// becomes a leading root-constant dword (D3D12 has no start-instance field
+/// in `D3D12_DRAW_INDEXED_ARGUMENTS`), followed by the four draw dwords and
+/// a zeroed start-instance dword.
+fn counter_record_stride(native: &NativeContext) -> u64 {
+    match native {
+        #[cfg(windows)]
+        NativeContext::Dx12(_) => 24,
+        #[cfg(not(windows))]
+        NativeContext::Dx12(_) => 20,
+        _ => 20,
+    }
+}
+
 /// Allocates a per-frame counter and indexed-command buffer.
 ///
 /// The count occupies the first four bytes; commands begin at the shared aligned element offset.
@@ -100,7 +117,9 @@ pub fn acquire_counter(context: ContextHandle, capacity: u32) -> Result<CounterB
     with_context_mut(context, |context| {
         require_recording(context)?;
         let buffer = IndexedIndirectBuffer::new(capacity).map_err(|_| Error::InvalidArgument)?;
-        let (_, command_size) = checked_element_range(20, capacity, 0, capacity)?;
+        let stride = counter_record_stride(&context.native);
+        let stride32 = u32::try_from(stride).map_err(|_| Error::InvalidArgument)?;
+        let (_, command_size) = checked_element_range(stride32, capacity, 0, capacity)?;
         let size = command_size
             .checked_add(COUNTER_BUFFER_ELEMENT_OFFSET)
             .ok_or(Error::InvalidArgument)?;
@@ -188,12 +207,16 @@ pub fn write_counter_commands(
         if commands.is_empty() {
             return Ok(());
         }
+        let stride = counter_record_stride(&context.native);
+        // Wide records carry the source base instance as a leading root-constant
+        // dword, then the four draw dwords, then a zeroed start-instance dword.
+        let wide = stride == 24;
         let offset = u64::from(start_index)
-            .checked_mul(20)
+            .checked_mul(stride)
             .and_then(|offset| offset.checked_add(COUNTER_BUFFER_ELEMENT_OFFSET))
             .ok_or(Error::InvalidArgument)?;
         let byte_size = u64::from(count)
-            .checked_mul(20)
+            .checked_mul(stride)
             .ok_or(Error::InvalidArgument)?;
         if byte_size == 0 {
             return Ok(());
@@ -213,11 +236,18 @@ pub fn write_counter_commands(
         counter_scratch.clear();
         counter_scratch.reserve(byte_size);
         for command in commands {
+            if wide {
+                counter_scratch.extend_from_slice(&command.first_instance.to_le_bytes());
+            }
             counter_scratch.extend_from_slice(&command.index_count.to_le_bytes());
             counter_scratch.extend_from_slice(&command.instance_count.to_le_bytes());
             counter_scratch.extend_from_slice(&command.first_index.to_le_bytes());
             counter_scratch.extend_from_slice(&command.vertex_offset.to_le_bytes());
-            counter_scratch.extend_from_slice(&command.first_instance.to_le_bytes());
+            if wide {
+                counter_scratch.extend_from_slice(&0_u32.to_le_bytes());
+            } else {
+                counter_scratch.extend_from_slice(&command.first_instance.to_le_bytes());
+            }
         }
         // The fallible tail runs inside a closure so a failed upload still
         // trims below: without the guard, one failed multi-megabyte write
@@ -273,12 +303,21 @@ fn counter_payload<'scratch>(
     scratch: &'scratch mut Vec<u8>,
     bytes: &[u8],
     initial_count: u32,
+    wide: bool,
 ) -> Result<&'scratch [u8]> {
     // Padding is explicitly zeroed so no stale pooled bytes exist between the count and elements.
     let element_offset =
         usize::try_from(COUNTER_BUFFER_ELEMENT_OFFSET).map_err(|_| Error::InvalidArgument)?;
-    let payload_size = bytes
-        .len()
+    let record_bytes = if wide {
+        bytes
+            .len()
+            .checked_div(20)
+            .and_then(|count| count.checked_mul(24))
+            .ok_or(Error::InvalidArgument)?
+    } else {
+        bytes.len()
+    };
+    let payload_size = record_bytes
         .checked_add(element_offset)
         .ok_or(Error::InvalidArgument)?;
     // Retained scratch removes the per-call payload Vec; capacity persists across writes.
@@ -286,7 +325,20 @@ fn counter_payload<'scratch>(
     scratch.reserve(payload_size);
     scratch.extend_from_slice(&initial_count.to_le_bytes());
     scratch.resize(element_offset, 0);
-    scratch.extend_from_slice(bytes);
+    if wide {
+        // The caller guarantees 20-byte-aligned input; a ragged tail fails
+        // instead of executing a partially specified draw.
+        if bytes.len() % 20 != 0 {
+            return Err(Error::InvalidArgument);
+        }
+        for record in bytes.chunks_exact(20) {
+            scratch.extend_from_slice(&record[16..20]);
+            scratch.extend_from_slice(&record[0..16]);
+            scratch.extend_from_slice(&0_u32.to_le_bytes());
+        }
+    } else {
+        scratch.extend_from_slice(bytes);
+    }
     Ok(scratch)
 }
 
@@ -322,6 +374,7 @@ pub fn write_counter_bytes(
         {
             return Err(Error::InvalidArgument);
         }
+        let wide = counter_record_stride(&context.native) == 24;
         let ContextState {
             native,
             staging,
@@ -334,7 +387,7 @@ pub fn write_counter_bytes(
         // Same retained scratch as the command path; the guard trims even when
         // payload construction or the upload below fails partway through.
         let result = (|| -> Result<()> {
-            let payload = counter_payload(counter_scratch, bytes, initial_count)?;
+            let payload = counter_payload(counter_scratch, bytes, initial_count, wide)?;
             let (_, allocation) = allocations.get(&handle).ok_or(Error::InvalidContext)?;
             let token = stage_upload(native, staging, transfer_pool, allocation, 0, payload)
                 .map_err(map_allocation)?;
@@ -896,7 +949,7 @@ mod tests {
     fn counter_payload_places_elements_at_shared_aligned_offset() {
         let command = [0x5a; 20];
         let mut scratch = Vec::new();
-        let payload = counter_payload(&mut scratch, &command, 7).unwrap();
+        let payload = counter_payload(&mut scratch, &command, 7, false).unwrap();
         let offset = usize::try_from(COUNTER_BUFFER_ELEMENT_OFFSET).unwrap();
 
         assert_eq!(&payload[..4], &7_u32.to_le_bytes());
@@ -905,8 +958,31 @@ mod tests {
         assert_eq!(payload.len(), offset + command.len());
         // A second equal-size write must reuse capacity without reallocating.
         let capacity = scratch.capacity();
-        let payload = counter_payload(&mut scratch, &command, 3).unwrap();
+        let payload = counter_payload(&mut scratch, &command, 3, false).unwrap();
         assert_eq!(&payload[..4], &3_u32.to_le_bytes());
         assert_eq!(scratch.capacity(), capacity);
+    }
+
+    #[test]
+    fn counter_payload_wide_expands_base_instance_first() {
+        // Distinct dwords catch shifted fields; the negative vertex offset
+        // catches signedness errors through the bit-preserving copy.
+        let mut command = [0_u8; 20];
+        command[0..4].copy_from_slice(&6_u32.to_le_bytes());
+        command[4..8].copy_from_slice(&2_u32.to_le_bytes());
+        command[8..12].copy_from_slice(&9_u32.to_le_bytes());
+        command[12..16].copy_from_slice(&(-7_i32).to_le_bytes());
+        command[16..20].copy_from_slice(&0x0A11_CE00_u32.to_le_bytes());
+        let mut scratch = Vec::new();
+        let payload = counter_payload(&mut scratch, &command, 1, true).unwrap();
+        let offset = usize::try_from(COUNTER_BUFFER_ELEMENT_OFFSET).unwrap();
+        let record = &payload[offset..];
+        assert_eq!(record.len(), 24);
+        assert_eq!(u32::from_le_bytes(record[0..4].try_into().unwrap()), 0x0A11_CE00);
+        assert_eq!(u32::from_le_bytes(record[4..8].try_into().unwrap()), 6);
+        assert_eq!(u32::from_le_bytes(record[8..12].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(record[12..16].try_into().unwrap()), 9);
+        assert_eq!(i32::from_le_bytes(record[16..20].try_into().unwrap()), -7);
+        assert_eq!(u32::from_le_bytes(record[20..24].try_into().unwrap()), 0);
     }
 }

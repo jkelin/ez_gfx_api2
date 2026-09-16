@@ -11,8 +11,9 @@ pub use ez_gfx_core::capability::{
 };
 pub use ez_gfx_core::{Backend, SemanticId};
 pub use ez_gfx_hal::{
-    DynamicPipelineState, MeshPipelineState, MeshStages, SamplerAddressMode, SamplerFilter,
-    TextureFormat, TextureRegion, TextureSamplerDesc,
+    DepthMode, DynamicPipelineState, MeshPipelineState, MeshStages, SamplerAddressMode,
+    SamplerFilter, TextureCopyRegion, TextureFormat, TextureRegion, TextureSamplerDesc,
+    validate_texture_copy,
 };
 pub use ez_gfx_runtime::indirect::DrawIndexedCommand;
 pub use ez_gfx_runtime::target::{ClearValue, Format, TargetDeclaration, TargetError, TargetUsage};

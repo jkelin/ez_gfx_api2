@@ -82,8 +82,10 @@ impl MetalFrameEncoder<'_> {
                     return Err(HalError::InvalidArgument);
                 }
             }
-            NativeFrameResource::Surface | NativeFrameResource::Depth => {
-                if !matches!(barrier.range, ez_gfx_hal::ExecutionRange::Image(_)) {
+            NativeFrameResource::RenderTargetDepth(texture) => {
+                if !matches!(barrier.range, ez_gfx_hal::ExecutionRange::Image(_))
+                    || texture.depth.is_none()
+                {
                     return Err(HalError::InvalidArgument);
                 }
             }
@@ -124,9 +126,6 @@ impl MetalFrameEncoder<'_> {
                 )
             }
             super::NativeFrameResource::RenderTarget(texture) => {
-                if pass.depth.is_some() {
-                    return Err(HalError::InvalidArgument);
-                }
                 // A multisampled texture renders exactly its count and
                 // resolves into the sampled texture; single-sample textures
                 // render directly.
@@ -174,13 +173,23 @@ impl MetalFrameEncoder<'_> {
             alpha: f64::from(attachment.clear[3]),
         });
         if pass.depth.is_some() {
-            let depth = self
-                .surface
-                .as_ref()
-                .and_then(|surface| surface.depth.as_ref())
-                .ok_or(HalError::NotReady)?;
+            let depth_texture = match target {
+                Target::Target(texture) => texture
+                    .depth
+                    .as_ref()
+                    .ok_or(HalError::NotReady)?
+                    .texture
+                    .clone(),
+                Target::Surface(_) => self
+                    .surface
+                    .as_ref()
+                    .and_then(|surface| surface.depth.as_ref())
+                    .ok_or(HalError::NotReady)?
+                    .texture
+                    .clone(),
+            };
             let attachment = descriptor.depthAttachment();
-            attachment.setTexture(Some(&depth.texture));
+            attachment.setTexture(Some(&depth_texture));
             attachment.setLoadAction(match pass.load {
                 AttachmentLoadOp::Load => MTLLoadAction::Load,
                 AttachmentLoadOp::Clear => MTLLoadAction::Clear,
@@ -199,6 +208,48 @@ impl MetalFrameEncoder<'_> {
                 .ok_or(HalError::NativeFailure)?,
         );
 
+        Ok(())
+    }
+    fn copy_texture(
+        &mut self,
+        source: &super::NativeTexture,
+        destination: &super::NativeTexture,
+        region: ez_gfx_hal::TextureCopyRegion,
+    ) -> Result<(), HalError> {
+        if self.render_encoder.is_some() || source.format != destination.format {
+            return Err(HalError::InvalidArgument);
+        }
+        let blit = self
+            .command
+            .blitCommandEncoder()
+            .ok_or(HalError::NativeFailure)?;
+        // SAFETY: the frame retains both textures and validation checked all bounds.
+        unsafe {
+            blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                &source.texture,
+                0,
+                region.source_mip as usize,
+                MTLOrigin {
+                    x: region.source_origin[0] as usize,
+                    y: region.source_origin[1] as usize,
+                    z: 0,
+                },
+                MTLSize {
+                    width: region.extent[0] as usize,
+                    height: region.extent[1] as usize,
+                    depth: 1,
+                },
+                &destination.texture,
+                0,
+                region.destination_mip as usize,
+                MTLOrigin {
+                    x: region.destination_origin[0] as usize,
+                    y: region.destination_origin[1] as usize,
+                    z: 0,
+                },
+            );
+            blit.endEncoding();
+        }
         Ok(())
     }
     fn compute(
@@ -663,6 +714,7 @@ impl NativeContext {
         let mut argument_count = 0;
         let mut readbacks = Vec::new();
         let mut pass_active = false;
+        let mut pass_has_depth = false;
         let mut saw_present = false;
         let preparation = actions.visit(&mut |action_index, action| {
             if saw_present {
@@ -683,6 +735,10 @@ impl NativeContext {
                             matches!(barrier.range, ez_gfx_hal::ExecutionRange::Image(_))
                                 && texture.allocation.size() != 0
                         }
+                        NativeFrameResource::RenderTargetDepth(texture) => {
+                            matches!(barrier.range, ez_gfx_hal::ExecutionRange::Image(_))
+                                && texture.depth.is_some()
+                        }
                         NativeFrameResource::Surface | NativeFrameResource::Depth => {
                             matches!(barrier.range, ez_gfx_hal::ExecutionRange::Image(_))
                         }
@@ -694,9 +750,8 @@ impl NativeContext {
                     }
                 }
                 NativeFrameAction::BeginPass { pass, colors } => {
-                    // Textures, buffers, and depth images are never color
-                    // attachments; depth with a render target stays unsupported.
-                    // A multisampled pass needs a multisampled target and vice
+                    // Textures, buffers, and depth images are never color attachments.
+                    // Managed targets carry depth alongside their color image.
                     // versa; surfaces stay single-sample.
                     let mut target_extent = None;
                     let mut valid = !pass_active
@@ -710,7 +765,7 @@ impl NativeContext {
                                 Some(extent)
                             }
                             NativeFrameResource::RenderTarget(texture) => {
-                                valid &= pass.depth.is_none();
+                                valid &= pass.depth.is_none() || texture.depth.is_some();
                                 valid &= texture.msaa.as_ref().map_or(1, |msaa| msaa.samples)
                                     == pass.samples;
                                 Some((texture.width, texture.height))
@@ -731,6 +786,7 @@ impl NativeContext {
                     if invalid {
                         Err(HalError::InvalidArgument)
                     } else {
+                        pass_has_depth = pass.depth.is_some();
                         pass_active = true;
                         Ok(None)
                     }
@@ -748,10 +804,7 @@ impl NativeContext {
                     }
                 }
                 NativeFrameAction::Graphics(draw) => {
-                    if !pass_active
-                        || draw.depth_required
-                            && surface.is_none_or(|surface| surface.depth.is_none())
-                    {
+                    if !pass_active || draw.depth_required && !pass_has_depth {
                         Err(HalError::InvalidArgument)
                     } else {
                         self.prepare_graphics_argument_buffer(slot_index, draw, argument_count)
@@ -763,7 +816,9 @@ impl NativeContext {
                     }
                 }
                 NativeFrameAction::Mesh(draw) => {
-                    if !pass_active {
+                    if !pass_active
+                        || !matches!(draw.depth, ez_gfx_hal::DepthMode::Disabled) && !pass_has_depth
+                    {
                         Err(HalError::InvalidArgument)
                     } else {
                         self.prepare_mesh_argument_buffer(slot_index, draw, argument_count)
@@ -772,6 +827,27 @@ impl NativeContext {
                                     argument_count += 1;
                                 }
                             })
+                    }
+                }
+                NativeFrameAction::CopyTexture {
+                    source,
+                    destination,
+                    region,
+                } => {
+                    if pass_active
+                        || ez_gfx_hal::validate_texture_copy(
+                            source.format,
+                            destination.format,
+                            (source.width, source.height),
+                            (destination.width, destination.height),
+                            core::ptr::eq(*source, *destination),
+                            *region,
+                        )
+                        .is_err()
+                    {
+                        Err(HalError::InvalidArgument)
+                    } else {
+                        Ok(None)
                     }
                 }
                 NativeFrameAction::TextureReadback { width, height, .. } => {
@@ -788,6 +864,7 @@ impl NativeContext {
                 NativeFrameAction::EndPass => {
                     if pass_active {
                         pass_active = false;
+                        pass_has_depth = false;
                         Ok(None)
                     } else {
                         Err(HalError::InvalidArgument)
@@ -1024,13 +1101,6 @@ impl NativeContext {
             }
         };
         let drawable_texture = drawable.as_ref().map(|drawable| drawable.texture());
-        let Some(command) = self.queue.commandBuffer() else {
-            for (allocation, _, _, _, _) in readbacks {
-                let _ = self.free(allocation);
-            }
-            self.reclaim_prepared_scratch(slot_index, prepared_arguments);
-            return Err(HalError::NativeFailure);
-        };
         // Encode waits before opening any encoder. Updates have already committed their
         // graphics release marker, so this cannot wait ahead of its own producer.
         actions.visit(&mut |_, action| {
@@ -1070,6 +1140,11 @@ impl NativeContext {
                     }
                     NativeFrameAction::Graphics(draw) => encoder.graphics(action_index, draw)?,
                     NativeFrameAction::Mesh(draw) => encoder.mesh(action_index, draw)?,
+                    NativeFrameAction::CopyTexture {
+                        source,
+                        destination,
+                        region,
+                    } => encoder.copy_texture(source, destination, *region)?,
                     NativeFrameAction::TextureReadback {
                         texture,
                         width,

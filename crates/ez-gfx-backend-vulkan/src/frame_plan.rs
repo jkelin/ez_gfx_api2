@@ -64,6 +64,92 @@ const fn pass_area_fits(area: [u32; 4], extent: (u32, u32)) -> bool {
     }
 }
 
+fn track_external_wait(
+    external_wait: &mut ArrayVec<CompletionToken, 2>,
+    token: CompletionToken,
+) -> Result<(), HalError> {
+    if !matches!(
+        token.queue,
+        QueueKind::Transfer | QueueKind::TextureTransfer
+    ) {
+        return Err(HalError::InvalidArgument);
+    }
+    if let Some(existing) = external_wait
+        .iter_mut()
+        .find(|existing| existing.queue == token.queue)
+    {
+        if token.value > existing.value {
+            *existing = token;
+        }
+    } else {
+        external_wait
+            .try_push(token)
+            .map_err(|_| HalError::InvalidArgument)?;
+    }
+    Ok(())
+}
+
+fn validate_begin_pass(
+    pass: &crate::ExecutionPass,
+    colors: &[crate::PassAttachment<'_>],
+    extent: (u32, u32),
+    uses_surface: &mut bool,
+    pass_active: &mut bool,
+    pass_extent: &mut Option<(u32, u32)>,
+) -> Result<(), HalError> {
+    *uses_surface |= colors
+        .iter()
+        .any(|attachment| matches!(attachment.resource, NativeFrameResource::Surface));
+    let mut target_extent = None;
+    let mut valid = !*pass_active
+        && pass.colors.len() == 1
+        && colors.len() == 1
+        && matches!(pass.samples, 1 | 2 | 4 | 8);
+    if let Some(attachment) = colors.first() {
+        valid &= samples_agree(&attachment.resource, pass.samples);
+        target_extent = match attachment.resource {
+            NativeFrameResource::Surface => Some(extent),
+            NativeFrameResource::RenderTarget(texture) => {
+                valid &= pass.depth.is_none() || texture.depth.is_some();
+                Some((texture.width, texture.height))
+            }
+            _ => None,
+        };
+    }
+    let Some((target_width, target_height)) = target_extent else {
+        return Err(HalError::InvalidArgument);
+    };
+    if !valid || !pass_area_fits(pass.area, (target_width, target_height)) {
+        return Err(HalError::InvalidArgument);
+    }
+    *pass_active = true;
+    *pass_extent = target_extent;
+    Ok(())
+}
+
+fn validate_graphics_draw(
+    draw: &crate::NativeDrawIndexed<'_>,
+    pass_active: bool,
+    pass_extent: Option<(u32, u32)>,
+) -> Result<(), HalError> {
+    let indirect_size = u64::from(draw.draw_count)
+        .checked_mul(20)
+        .and_then(|size| size.checked_add(COUNTER_BUFFER_ELEMENT_OFFSET))
+        .ok_or(HalError::InvalidArgument)?;
+    if !pass_active
+        || draw.pipeline.kind != super::super::NativePipelineKind::Graphics
+        || draw.width == 0
+        || draw.height == 0
+        || pass_extent
+            .is_none_or(|pass_extent| draw.width > pass_extent.0 || draw.height > pass_extent.1)
+        || draw.draw_count == 0
+        || draw.indirect_buffer.allocation.size() < indirect_size
+    {
+        return Err(HalError::InvalidArgument);
+    }
+    Ok(())
+}
+
 pub(super) fn validate_frame_plan(
     actions: &(impl NativeFrameActionSource + ?Sized),
     extent: (u32, u32),
@@ -82,24 +168,7 @@ pub(super) fn validate_frame_plan(
         }
         match action {
             NativeFrameAction::Wait(token) => {
-                if !matches!(
-                    token.queue,
-                    QueueKind::Transfer | QueueKind::TextureTransfer
-                ) {
-                    return Err(HalError::InvalidArgument);
-                }
-                if let Some(existing) = external_wait
-                    .iter_mut()
-                    .find(|existing| existing.queue == token.queue)
-                {
-                    if token.value > existing.value {
-                        *existing = *token;
-                    }
-                } else {
-                    external_wait
-                        .try_push(*token)
-                        .map_err(|_| HalError::InvalidArgument)?;
-                }
+                track_external_wait(&mut external_wait, *token)?;
             }
             NativeFrameAction::Barrier { barrier, resource } => {
                 uses_surface |= matches!(
@@ -118,40 +187,22 @@ pub(super) fn validate_frame_plan(
                         NativeFrameResource::Texture(_)
                         | NativeFrameResource::Surface
                         | NativeFrameResource::Depth
-                        | NativeFrameResource::RenderTarget(_),
+                        | NativeFrameResource::RenderTarget(_)
+                        | NativeFrameResource::RenderTargetDepth(_),
                         ez_gfx_hal::ExecutionRange::Image(_),
                     ) => {}
                     _ => return Err(HalError::InvalidArgument),
                 }
             }
             NativeFrameAction::BeginPass { pass, colors } => {
-                uses_surface |= colors
-                    .iter()
-                    .any(|attachment| matches!(attachment.resource, NativeFrameResource::Surface));
-                let mut target_extent = None;
-                let mut valid = !pass_active
-                    && pass.colors.len() == 1
-                    && colors.len() == 1
-                    && matches!(pass.samples, 1 | 2 | 4 | 8);
-                if let Some(attachment) = colors.first() {
-                    valid &= samples_agree(&attachment.resource, pass.samples);
-                    target_extent = match attachment.resource {
-                        NativeFrameResource::Surface => Some(extent),
-                        NativeFrameResource::RenderTarget(texture) => {
-                            valid &= pass.depth.is_none();
-                            Some((texture.width, texture.height))
-                        }
-                        _ => None,
-                    };
-                }
-                let Some((target_width, target_height)) = target_extent else {
-                    return Err(HalError::InvalidArgument);
-                };
-                if !valid || !pass_area_fits(pass.area, (target_width, target_height)) {
-                    return Err(HalError::InvalidArgument);
-                }
-                pass_active = true;
-                pass_extent = target_extent;
+                validate_begin_pass(
+                    pass,
+                    colors,
+                    extent,
+                    &mut uses_surface,
+                    &mut pass_active,
+                    &mut pass_extent,
+                )?;
             }
             NativeFrameAction::Compute(dispatch) => {
                 if pass_active
@@ -162,25 +213,29 @@ pub(super) fn validate_frame_plan(
                 }
             }
             NativeFrameAction::Graphics(draw) => {
-                let indirect_size = u64::from(draw.draw_count)
-                    .checked_mul(20)
-                    .and_then(|size| size.checked_add(COUNTER_BUFFER_ELEMENT_OFFSET))
-                    .ok_or(HalError::InvalidArgument)?;
-                if !pass_active
-                    || draw.pipeline.kind != super::super::NativePipelineKind::Graphics
-                    || draw.width == 0
-                    || draw.height == 0
-                    || pass_extent.is_none_or(|pass_extent| {
-                        draw.width > pass_extent.0 || draw.height > pass_extent.1
-                    })
-                    || draw.draw_count == 0
-                    || draw.indirect_buffer.allocation.size() < indirect_size
-                {
-                    return Err(HalError::InvalidArgument);
-                }
+                validate_graphics_draw(draw, pass_active, pass_extent)?;
             }
             NativeFrameAction::Mesh(draw) => {
                 validate_mesh_plan(draw, pass_extent.unwrap_or_default(), pass_active)?;
+            }
+            NativeFrameAction::CopyTexture {
+                source,
+                destination,
+                region,
+            } => {
+                if pass_active
+                    || ez_gfx_hal::validate_texture_copy(
+                        source.format,
+                        destination.format,
+                        (source.width, source.height),
+                        (destination.width, destination.height),
+                        core::ptr::eq(*source, *destination),
+                        *region,
+                    )
+                    .is_err()
+                {
+                    return Err(HalError::InvalidArgument);
+                }
             }
             NativeFrameAction::TextureReadback { width, height, .. } => {
                 if pass_active || *width == 0 || *height == 0 {
@@ -225,10 +280,11 @@ mod plan_allocation_tests {
     use super::validate_frame_plan;
     use crate::NativeFrameAction;
     use ez_gfx_hal::{CompletionToken, QueueKind};
+    static ALLOCATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-    static ENABLED: AtomicBool = AtomicBool::new(false);
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
     static CALLS: AtomicUsize = AtomicUsize::new(0);
     static BYTES: AtomicUsize = AtomicUsize::new(0);
 
@@ -240,7 +296,7 @@ mod plan_allocation_tests {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             // SAFETY: the unchanged request is delegated to the system allocator.
             let pointer = unsafe { System.alloc(layout) };
-            if ENABLED.load(Ordering::Relaxed) && !pointer.is_null() {
+            if ENABLED.with(Cell::get) && !pointer.is_null() {
                 CALLS.fetch_add(1, Ordering::Relaxed);
                 BYTES.fetch_add(layout.size(), Ordering::Relaxed);
             }
@@ -258,6 +314,7 @@ mod plan_allocation_tests {
 
     #[test]
     fn spill_cardinality_plan_validation_performs_no_allocations() {
+        let _lock = ALLOCATION_TEST_LOCK.lock().expect("allocation test lock");
         // Sixty-five actions exceed every former inline action-scratch threshold.
         let actions: [NativeFrameAction<'_>; 65] = std::array::from_fn(|index| {
             NativeFrameAction::Wait(CompletionToken {
@@ -274,11 +331,11 @@ mod plan_allocation_tests {
         }
         CALLS.store(0, Ordering::Relaxed);
         BYTES.store(0, Ordering::Relaxed);
-        ENABLED.store(true, Ordering::Relaxed);
+        ENABLED.with(|enabled| enabled.set(true));
         for _ in 0..500 {
             validate_frame_plan(&actions, (1, 1), false, false).unwrap();
         }
-        ENABLED.store(false, Ordering::Relaxed);
+        ENABLED.with(|enabled| enabled.set(false));
         assert_eq!(CALLS.load(Ordering::Relaxed), 0);
         assert_eq!(BYTES.load(Ordering::Relaxed), 0);
     }

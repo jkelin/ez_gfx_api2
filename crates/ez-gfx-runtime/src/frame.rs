@@ -76,6 +76,15 @@ pub enum ExecutableNode {
         /// Reflected shader layout.
         layout: ReflectedBindings,
     },
+    /// A validated texture-to-texture copy node.
+    CopyTexture {
+        /// Source texture handle.
+        source: TextureHandle,
+        /// Destination texture handle.
+        destination: TextureHandle,
+        /// Source mip, destination mip, origins, and extent.
+        region: ez_gfx_hal::TextureCopyRegion,
+    },
     /// A texture readback node.
     TextureReadback {
         /// Texture handle.

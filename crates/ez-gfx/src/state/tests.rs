@@ -517,6 +517,59 @@ fn failed_counter_write_still_trims_pathological_scratch() {
 
 #[cfg(not(target_vendor = "apple"))]
 #[test]
+fn counter_write_preserves_fifth_dword_bytes() {
+    // A nonzero first_instance must survive both the runtime command store
+    // and the little-endian staging serialization: the indirect draw's fifth
+    // dword carries the base instance on every backend.
+    let context = create_context(vulkan_options().unwrap()).unwrap();
+    let surface =
+        create_surface_headless(context, HeadlessSurfaceOptions::new(1, 1, 0).unwrap()).unwrap();
+    assert_eq!(init_device(context, surface), Ok(()));
+    frame_begin(context).unwrap();
+    let counter = acquire_counter(context, 2).unwrap();
+    let commands = [
+        DrawIndexedCommand {
+            index_count: 3,
+            instance_count: 1,
+            first_index: 0,
+            vertex_offset: 0,
+            first_instance: 9,
+        },
+        DrawIndexedCommand {
+            index_count: 6,
+            instance_count: 2,
+            first_index: 4,
+            vertex_offset: -1,
+            first_instance: 0x0A11_CE00,
+        },
+    ];
+    write_counter_commands(context, counter, 0, &commands).unwrap();
+    with_context_mut(context, |state| {
+        let stored = state
+            .indirects
+            .get(&counter)
+            .ok_or(Error::InvalidContext)?;
+        assert_eq!(stored.commands(), &commands);
+        // The write path serializes each command field-by-field in struct
+        // order, so pin the Pod layout the serializer assumes: 20 bytes with
+        // the base instance at offset 16.
+        assert_eq!(core::mem::size_of::<DrawIndexedCommand>(), 20);
+        for command in &commands {
+            let bytes = bytemuck::bytes_of(command);
+            assert_eq!(bytes.len(), 20);
+            assert_eq!(
+                u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+                command.first_instance
+            );
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(destroy_context(context), Ok(()));
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
 fn aggregate_staging_budget_bounds_many_distinct_strides() {
     // Ten stride pools plus the shared pool each retain one completed 8 MiB
     // bucket: 88 MiB total against the 64 MiB aggregate ceiling while every
@@ -842,7 +895,7 @@ fn render_target_lifecycle_rejects_misuse_before_native_work() {
     .unwrap();
     // Empty extents fail before leasing allocator state; no device is needed.
     assert_eq!(
-        create_render_target(context, &declaration, 0, 64),
+        create_render_target(context, &declaration, None, 0, 64),
         Err(Error::InvalidArgument)
     );
     // Depth usage is deferred to the pass-attachment slice.
@@ -860,7 +913,7 @@ fn render_target_lifecycle_rejects_misuse_before_native_work() {
     )
     .unwrap();
     assert_eq!(
-        create_render_target(context, &depth, 64, 64),
+        create_render_target(context, &depth, None, 64, 64),
         Err(Error::Unsupported)
     );
     // Unknown handles never reach native code. Live-target creation, format,
@@ -1073,7 +1126,7 @@ fn rejected_render_target_admissions_leave_no_allocator_residue() {
     )
     .unwrap();
     assert_eq!(
-        create_render_target(context, &color, 0, 64),
+        create_render_target(context, &color, None, 0, 64),
         Err(Error::InvalidArgument)
     );
     let depth = TargetDeclaration::new(
@@ -1090,7 +1143,7 @@ fn rejected_render_target_admissions_leave_no_allocator_residue() {
     )
     .unwrap();
     assert_eq!(
-        create_render_target(context, &depth, 64, 64),
+        create_render_target(context, &depth, None, 64, 64),
         Err(Error::Unsupported)
     );
     // A later texture admission takes slot zero, proving the rejections leased

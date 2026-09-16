@@ -82,6 +82,15 @@ impl NativeContext {
                     encoding,
                     barrier,
                     texture,
+                    false,
+                    (src_stage, src_access, old_layout),
+                    (dst_stage, dst_access, new_layout),
+                )?,
+                NativeFrameResource::RenderTargetDepth(texture) => Self::record_texture_barrier(
+                    encoding,
+                    barrier,
+                    texture,
+                    true,
                     (src_stage, src_access, old_layout),
                     (dst_stage, dst_access, new_layout),
                 )?,
@@ -163,6 +172,7 @@ impl NativeContext {
         encoding: &VulkanEncoding<'_>,
         barrier: &ez_gfx_hal::ExecutionBarrier,
         texture: &NativeTexture,
+        depth: bool,
         before: (vk::PipelineStageFlags, vk::AccessFlags, vk::ImageLayout),
         after: (vk::PipelineStageFlags, vk::AccessFlags, vk::ImageLayout),
     ) -> Result<(), HalError> {
@@ -172,18 +182,27 @@ impl NativeContext {
         let (src_stage, src_access, old_layout) = before;
         let (dst_stage, dst_access, new_layout) = after;
         let subresource_range = vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
+            aspect_mask: if depth {
+                vk::ImageAspectFlags::DEPTH
+            } else {
+                vk::ImageAspectFlags::COLOR
+            },
             base_mip_level: range.first_mip,
             level_count: range.mip_count,
             base_array_layer: range.first_layer,
             layer_count: range.layer_count,
+        };
+        let image = if depth {
+            texture.depth.as_ref().ok_or(HalError::NotReady)?.image
+        } else {
+            texture.image
         };
         let sampled_image = vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(dst_access)
             .old_layout(old_layout)
             .new_layout(new_layout)
-            .image(texture.image)
+            .image(image)
             .subresource_range(subresource_range);
         // SAFETY: both images belong to `texture`; the validated range covers
         // their single color layer and only the sampled image exposes mips.
@@ -198,8 +217,8 @@ impl NativeContext {
                 core::slice::from_ref(&sampled_image),
             );
             // MSAA storage is never sampled: it enters color-attachment
-            // layout before rendering and stays there after resolve.
-            if let Some(msaa) = texture.msaa.as_ref()
+            if !depth
+                && let Some(msaa) = texture.msaa.as_ref()
                 && new_layout == vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
             {
                 let first_use = old_layout == vk::ImageLayout::UNDEFINED;
@@ -272,9 +291,6 @@ impl NativeContext {
                     )
                 }
                 super::NativeFrameResource::RenderTarget(texture) => {
-                    if pass.depth.is_some() {
-                        return Err(HalError::InvalidArgument);
-                    }
                     if let Some(msaa) = texture.msaa.as_ref() {
                         if msaa.samples != pass.samples {
                             return Err(HalError::InvalidArgument);
@@ -328,27 +344,42 @@ impl NativeContext {
                     .resolve_image_view(resolve)
                     .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
             }
-            let depth = pass.depth.map(|_| {
-                let target = self.depth_target.as_ref().expect("preflighted depth");
-                vk::RenderingAttachmentInfo::default()
-                    .image_view(target.view)
-                    .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-                    .load_op(match pass.load {
-                        AttachmentLoadOp::Load => vk::AttachmentLoadOp::LOAD,
-                        AttachmentLoadOp::Clear => vk::AttachmentLoadOp::CLEAR,
-                        AttachmentLoadOp::Discard => vk::AttachmentLoadOp::DONT_CARE,
-                    })
-                    .store_op(match pass.store {
-                        AttachmentStoreOp::Store => vk::AttachmentStoreOp::STORE,
-                        AttachmentStoreOp::Discard => vk::AttachmentStoreOp::DONT_CARE,
-                    })
-                    .clear_value(vk::ClearValue {
-                        depth_stencil: vk::ClearDepthStencilValue {
-                            depth: 1.0,
-                            stencil: 0,
-                        },
-                    })
-            });
+            let depth = pass
+                .depth
+                .map(|_| {
+                    let target_view = match attachment.resource {
+                        super::NativeFrameResource::RenderTarget(texture) => texture
+                            .depth
+                            .as_ref()
+                            .ok_or(HalError::NotReady)
+                            .map(|depth| depth.view)?,
+                        super::NativeFrameResource::Surface => self
+                            .depth_target
+                            .as_ref()
+                            .ok_or(HalError::NotReady)
+                            .map(|depth| depth.view)?,
+                        _ => return Err(HalError::InvalidArgument),
+                    };
+                    Ok(vk::RenderingAttachmentInfo::default()
+                        .image_view(target_view)
+                        .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                        .load_op(match pass.load {
+                            AttachmentLoadOp::Load => vk::AttachmentLoadOp::LOAD,
+                            AttachmentLoadOp::Clear => vk::AttachmentLoadOp::CLEAR,
+                            AttachmentLoadOp::Discard => vk::AttachmentLoadOp::DONT_CARE,
+                        })
+                        .store_op(match pass.store {
+                            AttachmentStoreOp::Store => vk::AttachmentStoreOp::STORE,
+                            AttachmentStoreOp::Discard => vk::AttachmentStoreOp::DONT_CARE,
+                        })
+                        .clear_value(vk::ClearValue {
+                            depth_stencil: vk::ClearDepthStencilValue {
+                                depth: 1.0,
+                                stencil: 0,
+                            },
+                        }))
+                })
+                .transpose()?;
             let mut rendering = vk::RenderingInfo::default()
                 .render_area(vk::Rect2D {
                     offset: vk::Offset2D {
@@ -725,6 +756,63 @@ struct FrameRecordRequest<'a> {
     capture_presented: bool,
 }
 
+fn record_copy_texture(
+    encoding: &VulkanEncoding<'_>,
+    source: &NativeTexture,
+    destination: &NativeTexture,
+    region: ez_gfx_hal::TextureCopyRegion,
+    pass_active: bool,
+) -> Result<(), HalError> {
+    if pass_active || source.format != destination.format {
+        return Err(HalError::InvalidArgument);
+    }
+    let extent = vk::Extent3D {
+        width: region.extent[0],
+        height: region.extent[1],
+        depth: 1,
+    };
+    let copy = vk::ImageCopy {
+        src_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: region.source_mip,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        src_offset: vk::Offset3D {
+            x: i32::try_from(region.source_origin[0]).map_err(|_| HalError::InvalidArgument)?,
+            y: i32::try_from(region.source_origin[1]).map_err(|_| HalError::InvalidArgument)?,
+            z: 0,
+        },
+        dst_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: region.destination_mip,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        dst_offset: vk::Offset3D {
+            x: i32::try_from(region.destination_origin[0])
+                .map_err(|_| HalError::InvalidArgument)?,
+            y: i32::try_from(region.destination_origin[1])
+                .map_err(|_| HalError::InvalidArgument)?,
+            z: 0,
+        },
+        extent,
+    };
+    // Graph barriers place both images in transfer layouts before this node.
+    // SAFETY: handles and copy ranges were validated during frame preparation.
+    unsafe {
+        encoding.device.cmd_copy_image(
+            encoding.command,
+            source.image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            destination.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            core::slice::from_ref(&copy),
+        );
+    }
+    Ok(())
+}
+
 impl NativeContext {
     fn submit_recorded_frame(
         &mut self,
@@ -929,6 +1017,13 @@ impl NativeContext {
                             pass_active,
                         )?;
                     }
+                    NativeFrameAction::CopyTexture {
+                        source,
+                        destination,
+                        region,
+                    } => {
+                        record_copy_texture(&encoding, source, destination, *region, pass_active)?;
+                    }
                     NativeFrameAction::TextureReadback { texture, .. } => {
                         record::record_texture_readback(
                             &encoding,
@@ -1031,14 +1126,18 @@ impl NativeContext {
         }
         let mut requires_depth = false;
         actions.visit(&mut |_, action| {
-            requires_depth |= matches!(
-                action,
-                NativeFrameAction::BeginPass { pass, .. } if pass.depth.is_some()
-            );
+            requires_depth |= uses_surface
+                && matches!(
+                    action,
+                    NativeFrameAction::BeginPass { pass, .. } if pass.depth.is_some()
+                );
             Ok(())
         })?;
         if requires_depth {
-            self.ensure_depth_target(self.swapchain_extent)?;
+            self.ensure_depth_target(vk::Extent2D {
+                width: extent.0,
+                height: extent.1,
+            })?;
         }
         let prepared = self.prepare_frame_slot(uses_surface)?;
         let frame_value = self.next_frame_value;

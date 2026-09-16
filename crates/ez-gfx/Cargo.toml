@@ -1,8 +1,8 @@
 [package]
 name = "ez-gfx"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
 license.workspace = true
 description = "Safe cross-platform GPU API with Vulkan, Direct3D 12, and Metal backends"
 homepage.workspace = true

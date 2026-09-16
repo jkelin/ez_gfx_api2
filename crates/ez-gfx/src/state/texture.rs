@@ -873,9 +873,12 @@ pub fn cancel_texture_load(context: ContextHandle, texture: TextureHandle) -> Re
 }
 
 /// Unloads a texture or cancels its queued/native work.
-#[cfg(feature = "ffi")]
-pub fn unload_texture(context: ContextHandle, texture: TextureHandle) {
-    let _ = with_context_mut(context, |context| {
+///
+/// # Errors
+///
+/// Returns an error when validation, handle ownership, readiness, or a backend operation fails.
+pub fn try_unload_texture(context: ContextHandle, texture: TextureHandle) -> Result<()> {
+    super::result_status(with_context_mut(context, |context| {
         pump_async_textures(context)?;
         let pending = context
             .texture_pipeline
@@ -910,7 +913,13 @@ pub fn unload_texture(context: ContextHandle, texture: TextureHandle) {
             return Ok(());
         }
         retire_live_texture(context, texture)
-    });
+    }))
+}
+
+#[cfg(feature = "ffi")]
+/// FFI-compatible unload entry point.
+pub fn unload_texture(context: ContextHandle, texture: TextureHandle) {
+    let _ = try_unload_texture(context, texture);
 }
 
 #[cfg(test)]

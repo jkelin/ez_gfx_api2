@@ -233,8 +233,8 @@ pub struct NativeMeshPipelineDesc<'a> {
     pub color_format: Option<ez_gfx_runtime::target::Format>,
     /// Reflected public buffer layout merged across the selected stages.
     pub layouts: &'a [ShaderBufferLayout],
-    /// Whether the pipeline requires a depth attachment.
-    pub depth_required: bool,
+    /// Explicit depth behavior for the mesh pipeline.
+    pub depth: ez_gfx_hal::DepthMode,
     /// Optional task workgroup size from reflection.
     pub task_workgroup_size: Option<[u32; 3]>,
     /// Mesh workgroup size from reflection.
@@ -317,6 +317,8 @@ pub enum NativeFrameResource<'a> {
     Depth,
     /// Managed single-mip color render target.
     RenderTarget(&'a NativeTexture),
+    /// Managed target depth image.
+    RenderTargetDepth(&'a NativeTexture),
 }
 
 /// One resolved pass color attachment: its native resource plus the clear
@@ -353,7 +355,16 @@ pub enum NativeFrameAction<'a> {
     Graphics(NativeDrawIndexed<'a>),
     /// Encode a mesh workgroup dispatch inside the active render pass.
     Mesh(NativeMeshDraw<'a>),
-    /// Copy a texture into host-readable memory.
+    /// Copy a validated texture region.
+    CopyTexture {
+        /// Source texture.
+        source: &'a NativeTexture,
+        /// Destination texture.
+        destination: &'a NativeTexture,
+        /// Validated copy region.
+        region: ez_gfx_hal::TextureCopyRegion,
+    },
+    /// Copy a texture into a readback allocation.
     TextureReadback {
         /// Texture to copy.
         texture: &'a NativeTexture,
@@ -469,9 +480,8 @@ pub struct NativeTexture {
     cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Slot in the bindless texture descriptor heap.
     pub binding: u32,
-    /// Multisampled render storage plus its view and allocation; `None` for
-    /// uploads and single-sample targets. Only render-target entry points
-    /// touch this; the sampled image above stays the resolve destination.
+    /// Optional target-owned depth attachment.
+    pub(crate) depth: Option<DepthTarget>,
     msaa: Option<MsaaStorage>,
 }
 
@@ -511,7 +521,6 @@ struct DepthTarget {
     allocation: Allocation,
     extent: vk::Extent2D,
 }
-
 struct RetiredAllocation {
     allocation: NativeAllocation,
     completion: CompletionToken,
@@ -521,7 +530,7 @@ enum DeferredResource {
     Allocation(NativeAllocation),
     Pipeline(NativePipeline),
     Shader(NativeShader),
-    Texture(NativeTexture),
+    Texture(Box<NativeTexture>),
     TextureView(vk::ImageView),
 }
 

@@ -57,8 +57,8 @@ use ez_gfx::raw::{
     SurfaceHandle, TextureHandle,
 };
 use ez_gfx::{
-    Backend, ContextOptions, DrawIndexedCommand, DynamicPipelineState, HeadlessSurfaceOptions,
-    MeshPipelineState, MeshStages, PresentationMode, raw,
+    Backend, ContextOptions, DepthMode, DrawIndexedCommand, DynamicPipelineState,
+    HeadlessSurfaceOptions, MeshPipelineState, MeshStages, PresentationMode, raw,
 };
 use raw_window_handle::{
     AppKitDisplayHandle, AppKitWindowHandle, RawDisplayHandle, RawWindowHandle,
@@ -665,6 +665,7 @@ pub unsafe extern "C" fn ez_gfx_frame_execute_mesh(
                 cull: decoded.cull,
                 front_face: decoded.front_face,
                 blend: decoded.blend,
+                depth: DepthMode::Disabled,
             },
         )
         .into_ffi_result()

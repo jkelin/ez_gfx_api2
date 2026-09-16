@@ -143,7 +143,7 @@ enum PipelineKey {
         fragment_entry: String,
         stage_layouts: [Option<ez_gfx_runtime::binding::StageLayoutIdentity>; 3],
         state: ez_gfx_hal::MeshPipelineState,
-        depth_required: bool,
+        depth: ez_gfx_hal::DepthMode,
         color_format: u32,
         depth_format: u32,
         sample_count: u8,
@@ -164,7 +164,7 @@ struct MeshPipelineKeyDesc<'a> {
     fragment_entry: &'a str,
     stage_layouts: &'a ez_gfx_hal::MeshStages<ez_gfx_runtime::binding::StageLayoutIdentity>,
     state: ez_gfx_hal::MeshPipelineState,
-    depth_required: bool,
+    depth: ez_gfx_hal::DepthMode,
     color_format: u32,
     depth_format: u32,
     sample_count: u8,
@@ -190,7 +190,7 @@ impl PipelineKey {
                 fragment_entry: String::new(),
                 stage_layouts: [None; 3],
                 state: desc.state,
-                depth_required: desc.depth_required,
+                depth: desc.depth,
                 color_format: desc.color_format,
                 depth_format: desc.depth_format,
                 sample_count: desc.sample_count,
@@ -210,7 +210,7 @@ impl PipelineKey {
             fragment_entry,
             stage_layouts,
             state,
-            depth_required,
+            depth,
             color_format,
             depth_format,
             sample_count,
@@ -243,7 +243,7 @@ impl PipelineKey {
             Some(desc.stage_layouts.fragment),
         ];
         *state = desc.state;
-        *depth_required = desc.depth_required;
+        *depth = desc.depth;
         *color_format = desc.color_format;
         *depth_format = desc.depth_format;
         *sample_count = desc.sample_count;
@@ -400,6 +400,7 @@ enum FrameNativeResource {
     Texture(TextureHandle),
     Surface(SurfaceHandle),
     Depth,
+    RenderTargetDepth(RenderTargetHandle),
     Index,
     VertexHeap(u32),
     RenderTarget(RenderTargetHandle),

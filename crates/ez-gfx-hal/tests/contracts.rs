@@ -1,9 +1,68 @@
 //! HAL allocation, layout, and synchronization contract tests.
 use ez_gfx_hal::{
     AllocationBlockPolicy, AllocationBlockPolicyError, AllocationError, AllocationRequest,
-    BufferRange, COUNTER_BUFFER_ELEMENT_OFFSET, DEFAULT_ALLOCATION_BLOCK_POLICY, ImageSubresources,
-    MemoryClass, QueueKind, ResourceAccess, ResourceState, ShaderStage,
+    BufferRange, COUNTER_BUFFER_ELEMENT_OFFSET, DEFAULT_ALLOCATION_BLOCK_POLICY, DepthMode,
+    DynamicPipelineState, ImageSubresources, MemoryClass, QueueKind, ResourceAccess, ResourceState,
+    ShaderStage,
 };
+
+#[test]
+fn explicit_depth_modes_preserve_legacy_shader_requirement() {
+    let read_only = DynamicPipelineState::from_abi_with_depth(0, 0, 0, 1, 1).unwrap();
+    assert_eq!(read_only.depth, DepthMode::ReadOnly);
+    assert_eq!(read_only.resolved_depth(false), DepthMode::ReadOnly);
+    let legacy = DynamicPipelineState::from_abi(0, 0, 0, 0).unwrap();
+    assert_eq!(legacy.resolved_depth(true), DepthMode::Write);
+    assert!(DynamicPipelineState::from_abi_with_depth(0, 0, 0, 0, 3).is_err());
+}
+
+#[test]
+fn texture_copy_validates_identity_format_bounds_and_overlap() {
+    use ez_gfx_hal::{TextureCopyRegion, TextureFormat, validate_texture_copy};
+    let overlapping = TextureCopyRegion {
+        source_mip: 0,
+        destination_mip: 0,
+        source_origin: [0, 0],
+        destination_origin: [1, 1],
+        extent: [2, 2],
+    };
+    let validate = |destination_format, same_texture, region| {
+        validate_texture_copy(
+            TextureFormat::Rgba8Unorm,
+            destination_format,
+            (4, 4),
+            (4, 4),
+            same_texture,
+            region,
+        )
+    };
+
+    assert!(validate(TextureFormat::Rgba8Unorm, true, overlapping).is_err());
+    assert!(
+        validate(
+            TextureFormat::Rgba8Unorm,
+            true,
+            TextureCopyRegion {
+                destination_origin: [2, 2],
+                ..overlapping
+            }
+        )
+        .is_ok()
+    );
+    assert!(validate(TextureFormat::Rgba8Unorm, false, overlapping).is_ok());
+    assert!(
+        validate(
+            TextureFormat::Rgba8Unorm,
+            false,
+            TextureCopyRegion {
+                source_origin: [3, 3],
+                ..overlapping
+            }
+        )
+        .is_err()
+    );
+    assert!(validate(TextureFormat::Rgba8Srgb, false, overlapping).is_err());
+}
 
 #[test]
 fn allocation_request_validates_size_alignment_mapping_and_alias_lifetime() {
@@ -385,12 +444,13 @@ fn mesh_dispatch_validation_rejects_zero_overflow_and_native_limits() {
 
 #[test]
 fn mesh_pipeline_state_has_no_vertex_topology() {
-    use ez_gfx_hal::{BlendMode, CullMode, FrontFace, MeshPipelineState};
+    use ez_gfx_hal::{BlendMode, CullMode, DepthMode, FrontFace, MeshPipelineState};
 
     let state = MeshPipelineState {
         cull: CullMode::Back,
         front_face: FrontFace::CounterClockwise,
         blend: BlendMode::Alpha,
+        depth: DepthMode::Disabled,
     };
     assert_eq!(state.cull, CullMode::Back);
     assert_eq!(state.blend, BlendMode::Alpha);

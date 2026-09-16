@@ -125,7 +125,7 @@ pub trait TextureBackendTexture: MipTransferValues {
 /// static and this crate never depends on a backend. All payload types are
 /// HAL or core types. Staging-cache eviction stays behind
 /// [`ReclaimableStaging`], blanket-implemented for every
-/// [`ReusableStagingPool`](ez_gfx_hal::ReusableStagingPool).
+/// [`ReusableStagingPool`].
 pub trait TextureBackendContext {
     /// Private native texture owned by the implementing backend.
     type Texture: TextureBackendTexture;

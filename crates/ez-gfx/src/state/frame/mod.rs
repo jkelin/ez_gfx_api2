@@ -123,6 +123,87 @@ pub fn frame_request_presented_readback(
         Ok(())
     }))
 }
+/// Records a validated texture-to-texture copy.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidContext`] for unknown handles, [`Error::InvalidArgument`]
+/// for incompatible formats or regions, or [`Error::NotReady`] when no frame is recording.
+pub fn copy_texture_regions(
+    context: ContextHandle,
+    source: TextureHandle,
+    destination: TextureHandle,
+    region: ez_gfx_hal::TextureCopyRegion,
+) -> Result<()> {
+    result_status(with_context_mut(context, |context| {
+        context
+            .identity
+            .check_thread_and_health()
+            .map_err(map_lifecycle)?;
+        context
+            .identity
+            .resolve(source.packed(), ResourceKind::Texture)
+            .map_err(map_lifecycle)?;
+        context
+            .identity
+            .resolve(destination.packed(), ResourceKind::Texture)
+            .map_err(map_lifecycle)?;
+        let src = context
+            .texture_pipeline
+            .submitted()
+            .get(&source)
+            .copied()
+            .ok_or(Error::InvalidContext)?;
+        let dst = context
+            .texture_pipeline
+            .submitted()
+            .get(&destination)
+            .copied()
+            .ok_or(Error::InvalidContext)?;
+        ez_gfx_hal::validate_texture_copy(
+            src.format,
+            dst.format,
+            (src.width, src.height),
+            (dst.width, dst.height),
+            source == destination,
+            region,
+        )
+        .map_err(|_| Error::InvalidArgument)?;
+        if context.frame.state() != ez_gfx_runtime::frame::FrameState::Recording {
+            return Err(Error::NotReady);
+        }
+        let source_resource = intern_texture_resource(context, source)?;
+        let destination_resource = intern_texture_resource(context, destination)?;
+        let range = ImageRange::all(1, 1).map_err(|_| Error::InvalidArgument)?;
+        let read = ResourceState::new(
+            QueueKind::Transfer,
+            ShaderStage::None,
+            ResourceAccess::TransferRead,
+        )
+        .map_err(|_| Error::InvalidArgument)?;
+        let write = ResourceState::new(
+            QueueKind::Transfer,
+            ShaderStage::None,
+            ResourceAccess::TransferWrite,
+        )
+        .map_err(|_| Error::InvalidArgument)?;
+        let node = NodeDesc::new("copy-texture", QueueKind::Transfer)
+            .access(Access::image(source_resource, range, read))
+            .access(Access::image(destination_resource, range, write));
+        context
+            .frame
+            .record_node(
+                node,
+                ExecutableNode::CopyTexture {
+                    source,
+                    destination,
+                    region,
+                },
+            )
+            .map_err(|error| map_frame(&error))?;
+        Ok(())
+    }))
+}
 
 const fn should_capture_presented(snapshot_cache: bool, frame_request: bool) -> bool {
     snapshot_cache || frame_request
@@ -301,29 +382,26 @@ fn graphics_pass_node(
     pipeline_layout: ez_gfx_runtime::binding::PipelineLayout,
     name: &'static str,
 ) -> Result<NodeDesc> {
-    // A bound render target replaces the surface color attachment; depth
-    // pipelines stay surface-only. Draws into multisampled targets stay
-    // unsupported until pipelines carry sample counts; clears resolve without
-    // any draw.
+    // A managed target may carry its own backend depth companion; the backend
+    // validates that attachment during pass lowering.
     let (color, depth, width, height, samples) = if let Some(target) = context.frame_render_target {
-        if pipeline_layout.depth_required() {
-            return Err(Error::Unsupported);
-        }
         let resource = intern_render_target_resource(context, target)?;
-        let record = context
-            .render_targets
-            .get(&target)
-            .ok_or(Error::InvalidContext)?;
-        if record.declaration.samples() != 1 {
-            return Err(Error::Unsupported);
-        }
-        (
-            resource,
-            None,
-            record.width,
-            record.height,
-            record.declaration.samples(),
-        )
+        let (width, height, samples) = {
+            let record = context
+                .render_targets
+                .get(&target)
+                .ok_or(Error::InvalidContext)?;
+            if record.declaration.samples() != 1 {
+                return Err(Error::Unsupported);
+            }
+            (record.width, record.height, record.declaration.samples())
+        };
+        let depth = if pipeline_layout.depth_required() {
+            Some(intern_depth_resource(context)?)
+        } else {
+            None
+        };
+        (resource, depth, width, height, samples)
     } else {
         let surface = intern_surface_resource(context)?;
         let depth = if pipeline_layout.depth_required() {
@@ -931,21 +1009,8 @@ pub fn frame_submit(context: ContextHandle) -> Result<()> {
                 };
                 adapter
                     .execute(&submission.plan, &submission.nodes)
-                    .and_then(|()| {
-                        // The raw Windows test executor submits no command list, so
-                        // publish its monotonic observation as the frame completion.
-                        #[cfg(all(test, windows))]
-                        if adapter.context.raw_native_frame_test_probe.enabled {
-                            return ez_gfx_hal::CompletionToken::new(
-                                QueueKind::Graphics,
-                                adapter.context.raw_native_frame_test_probe.submits as u64,
-                            )
-                            .map_err(|_| Error::NativeFailure);
-                        }
-                        last_native_frame_completion(&adapter.context.native)
-                    })
+                    .and_then(|()| last_native_frame_completion(&adapter.context.native))
             };
-            // Even failed native encoding no longer strands the reusable CPU buffers.
             context
                 .frame
                 .finish(submission)

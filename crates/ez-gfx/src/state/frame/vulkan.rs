@@ -197,7 +197,11 @@ fn prepare_vulkan_mesh_pipeline(
             fragment_entry: &fragment.entry,
             stage_layouts,
             state,
-            depth_required,
+            depth: if depth_required {
+                ez_gfx_hal::DepthMode::Write
+            } else {
+                ez_gfx_hal::DepthMode::Disabled
+            },
             color_format: native_color_format,
             depth_format: u32::from(depth_required),
             sample_count: 1,
@@ -216,7 +220,11 @@ fn prepare_vulkan_mesh_pipeline(
                 state,
                 color_format,
                 layouts: &layouts,
-                depth_required,
+                depth: if depth_required {
+                    ez_gfx_hal::DepthMode::Write
+                } else {
+                    ez_gfx_hal::DepthMode::Disabled
+                },
                 task_workgroup_size,
                 mesh_workgroup_size,
             })
@@ -360,7 +368,8 @@ fn prepare_vulkan_pipelines(
                 (key, pipeline)
             }
             ExecutableNode::Mesh { .. } => unreachable!("mesh payload handled above"),
-            ExecutableNode::TextureReadback { .. }
+            ExecutableNode::CopyTexture { .. }
+            | ExecutableNode::TextureReadback { .. }
             | ExecutableNode::RenderTargetReadback { .. }
             | ExecutableNode::Present { .. } => continue,
         };
@@ -413,6 +422,13 @@ fn vulkan_barrier_resource<'resources>(
                 .get(&handle)
                 .ok_or(Error::InvalidContext)?;
             ez_gfx_backend_vulkan::NativeFrameResource::RenderTarget(record.native.vulkan()?)
+        }
+        FrameNativeResource::RenderTargetDepth(handle) => {
+            let record = state
+                .render_targets
+                .get(&handle)
+                .ok_or(Error::InvalidContext)?;
+            ez_gfx_backend_vulkan::NativeFrameResource::RenderTargetDepth(record.native.vulkan()?)
         }
         FrameNativeResource::Depth => ez_gfx_backend_vulkan::NativeFrameResource::Depth,
         FrameNativeResource::Index => {
@@ -496,6 +512,79 @@ impl VulkanActionSource<'_, '_> {
                 .ok_or(ez_gfx_hal::HalError::InvalidArgument)?,
             allocations: self.state.allocations,
             vertex_heaps: self.state.vertex_heaps,
+        })
+    }
+
+    fn texture_readback_action(
+        &self,
+        texture: TextureHandle,
+    ) -> std::result::Result<ez_gfx_backend_vulkan::NativeFrameAction<'_>, ez_gfx_hal::HalError>
+    {
+        let info = self
+            .state
+            .submitted
+            .get(&texture)
+            .copied()
+            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
+        let texture = self
+            .state
+            .textures
+            .get(&texture)
+            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+            .vulkan()
+            .map_err(|_| ez_gfx_hal::HalError::InvalidArgument)?;
+        Ok(ez_gfx_backend_vulkan::NativeFrameAction::TextureReadback {
+            texture,
+            width: info.width,
+            height: info.height,
+        })
+    }
+
+    fn target_readback_action(
+        &self,
+        target: RenderTargetHandle,
+    ) -> std::result::Result<ez_gfx_backend_vulkan::NativeFrameAction<'_>, ez_gfx_hal::HalError>
+    {
+        let record = self
+            .state
+            .render_targets
+            .get(&target)
+            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
+        Ok(ez_gfx_backend_vulkan::NativeFrameAction::TextureReadback {
+            texture: record
+                .native
+                .vulkan()
+                .map_err(|_| ez_gfx_hal::HalError::InvalidArgument)?,
+            width: record.width,
+            height: record.height,
+        })
+    }
+
+    fn copy_texture_action(
+        &self,
+        source: TextureHandle,
+        destination: TextureHandle,
+        region: ez_gfx_hal::TextureCopyRegion,
+    ) -> std::result::Result<ez_gfx_backend_vulkan::NativeFrameAction<'_>, ez_gfx_hal::HalError>
+    {
+        let source = self
+            .state
+            .textures
+            .get(&source)
+            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+            .vulkan()
+            .map_err(|_| ez_gfx_hal::HalError::InvalidArgument)?;
+        let destination = self
+            .state
+            .textures
+            .get(&destination)
+            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+            .vulkan()
+            .map_err(|_| ez_gfx_hal::HalError::InvalidArgument)?;
+        Ok(ez_gfx_backend_vulkan::NativeFrameAction::CopyTexture {
+            source,
+            destination,
+            region,
         })
     }
 
@@ -665,40 +754,16 @@ impl ez_gfx_backend_vulkan::NativeFrameActionSource for VulkanActionSource<'_, '
                             )?)
                         }
                         ExecutableNode::TextureReadback { texture } => {
-                            let info = self
-                                .state
-                                .submitted
-                                .get(texture)
-                                .copied()
-                                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
-                            let texture = self
-                                .state
-                                .textures
-                                .get(texture)
-                                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
-                            ez_gfx_backend_vulkan::NativeFrameAction::TextureReadback {
-                                texture: texture
-                                    .vulkan()
-                                    .map_err(|_| ez_gfx_hal::HalError::InvalidArgument)?,
-                                width: info.width,
-                                height: info.height,
-                            }
+                            self.texture_readback_action(*texture)?
                         }
                         ExecutableNode::RenderTargetReadback { target } => {
-                            let record = self
-                                .state
-                                .render_targets
-                                .get(target)
-                                .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
-                            ez_gfx_backend_vulkan::NativeFrameAction::TextureReadback {
-                                texture: record
-                                    .native
-                                    .vulkan()
-                                    .map_err(|_| ez_gfx_hal::HalError::InvalidArgument)?,
-                                width: record.width,
-                                height: record.height,
-                            }
+                            self.target_readback_action(*target)?
                         }
+                        ExecutableNode::CopyTexture {
+                            source,
+                            destination,
+                            region,
+                        } => self.copy_texture_action(*source, *destination, *region)?,
                         ExecutableNode::Present { .. } => {
                             ez_gfx_backend_vulkan::NativeFrameAction::Present
                         }

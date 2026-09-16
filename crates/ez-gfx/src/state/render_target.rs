@@ -54,6 +54,7 @@ pub(super) struct RenderTargetRecord {
 pub fn create_render_target(
     context: ContextHandle,
     declaration: &TargetDeclaration,
+    depth_format: Option<Format>,
     width: u32,
     height: u32,
 ) -> Result<RenderTargetHandle> {
@@ -62,7 +63,10 @@ pub fn create_render_target(
         // descriptor-table work owned by later slices.
         return Err(Error::Unsupported);
     }
-    if width == 0 || height == 0 {
+    if width == 0
+        || height == 0
+        || depth_format.is_some_and(|format| format != Format::Depth32Float)
+    {
         return Err(Error::InvalidArgument);
     }
     with_context_mut(context, |context| {
@@ -115,17 +119,38 @@ pub fn create_render_target(
         };
         let native = match (&mut context.native, format) {
             (super::NativeContext::Vulkan(native), format) => native
-                .create_render_target(format, width, height, binding, declaration.samples())
+                .create_render_target(
+                    format,
+                    depth_format,
+                    width,
+                    height,
+                    binding,
+                    declaration.samples(),
+                )
                 .map(NativeTexture::Vulkan)
                 .map_err(map_allocation),
             #[cfg(windows)]
             (super::NativeContext::Dx12(native), format) => native
-                .create_render_target(format, width, height, binding, declaration.samples())
+                .create_render_target(
+                    format,
+                    depth_format,
+                    width,
+                    height,
+                    binding,
+                    declaration.samples(),
+                )
                 .map(NativeTexture::Dx12)
                 .map_err(map_allocation),
             #[cfg(target_vendor = "apple")]
             (super::NativeContext::Metal(native), format) => native
-                .create_render_target(format, width, height, binding, declaration.samples())
+                .create_render_target(
+                    format,
+                    depth_format,
+                    width,
+                    height,
+                    binding,
+                    declaration.samples(),
+                )
                 .map(NativeTexture::Metal)
                 .map_err(map_allocation),
         };

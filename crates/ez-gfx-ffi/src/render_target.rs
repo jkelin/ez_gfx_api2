@@ -134,7 +134,7 @@ pub unsafe extern "C" fn ez_gfx_render_target_create(
             Ok(context) => context,
             Err(error) => return error,
         };
-        match raw::create_render_target(context, &declaration, width, height) {
+        match raw::create_render_target(context, &declaration, None, width, height) {
             Ok(target) => {
                 // SAFETY: `out_target` is non-null and writable for this call.
                 unsafe { out_target.write(target.into_raw()) };

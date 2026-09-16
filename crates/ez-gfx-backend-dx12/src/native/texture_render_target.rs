@@ -87,6 +87,65 @@ pub(super) fn max_sample_count(
 }
 
 impl NativeContext {
+    fn create_depth_attachment(
+        &mut self,
+        width: u32,
+        height: u32,
+        samples: u8,
+    ) -> Result<super::super::DepthTarget, AllocationError> {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_DEPTH_STENCIL_VIEW_DESC, D3D12_DESCRIPTOR_HEAP_DESC,
+            D3D12_DESCRIPTOR_HEAP_FLAG_NONE, D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+            D3D12_DSV_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT;
+        let mips = [ImageMip {
+            width,
+            height,
+            bytes: &[],
+        }];
+        let (depth_resource, depth_allocation, _) = self.create_texture_resource(
+            &mips,
+            DXGI_FORMAT_D32_FLOAT,
+            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            u32::from(samples),
+        )?;
+        // SAFETY: the descriptor count is one, the heap type is valid, and
+        // the device outlives the retained heap in the depth target.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            self.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                    NodeMask: 0,
+                })
+        }
+        .map_err(|error| map_allocation_windows(&error))?;
+        // SAFETY: the retained heap owns its single initialized descriptor slot.
+        let dsv = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+        // SAFETY: `dsv` names the retained heap's only slot and the depth
+        // resource has a matching D32 format and outlives the descriptor.
+        unsafe {
+            self.device.CreateDepthStencilView(
+                &depth_resource,
+                Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
+                    Format: DXGI_FORMAT_D32_FLOAT,
+                    ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+                    ..Default::default()
+                }),
+                dsv,
+            );
+        }
+        Ok(super::super::DepthTarget {
+            resource: depth_resource,
+            allocation: depth_allocation,
+            dsv,
+            heap,
+        })
+    }
+}
+impl NativeContext {
     /// Creates an uninitialized single-mip color resource for managed render-target use.
     ///
     /// The allocated DXGI format derives from the runtime format directly. The stored
@@ -102,6 +161,7 @@ impl NativeContext {
     pub fn create_render_target(
         &mut self,
         format: ez_gfx_runtime::target::Format,
+        depth_format: Option<ez_gfx_runtime::target::Format>,
         width: u32,
         height: u32,
         binding: u32,
@@ -119,7 +179,7 @@ impl NativeContext {
             Format::Rgba16Float => (DXGI_FORMAT_R16G16B16A16_FLOAT, TextureFormat::Rgba8Unorm, 8),
             _ => return Err(AllocationError::Unsupported),
         };
-        if !matches!(samples, 1 | 2 | 4 | 8) {
+        if depth_format.is_some_and(|format| format != Format::Depth32Float) {
             return Err(AllocationError::Unsupported);
         }
         if width == 0 || height == 0 {
@@ -234,6 +294,11 @@ impl NativeContext {
                 samples,
             })
         };
+        let depth = if depth_format.is_some() {
+            Some(self.create_depth_attachment(width, height, samples)?)
+        } else {
+            None
+        };
         Ok(NativeTexture {
             resource,
             allocation,
@@ -247,6 +312,7 @@ impl NativeContext {
             cancellation: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             binding,
             rtv: Some((rtv_heap, rtv)),
+            depth,
             msaa,
         })
     }

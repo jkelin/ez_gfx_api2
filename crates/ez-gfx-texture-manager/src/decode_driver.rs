@@ -2,7 +2,7 @@
 //!
 //! [`DecodeDriver`] owns one context's decode execution: the validated worker
 //! policy, the lazily built Rayon pool, the unbounded result channel, the
-//! active-job count, and shutdown. [`TexturePipeline`](super::pipeline::TexturePipeline)
+//! active-job count, and shutdown. [`TexturePipeline`]
 //! keeps owning every queue datum; the driver only pops admitted work,
 //! reserves shared-transfer bytes atomically with the spawn, and collects
 //! terminal results back into the pipeline. Worker closures capture decoded

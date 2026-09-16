@@ -24,6 +24,23 @@ use super::{
     render_target::destroy_all_render_targets, result_status, wait_native_idle, with_context_mut,
 };
 
+/// Returns the graphics backend selected for a context.
+///
+/// # Errors
+///
+/// Returns an error for a stale or foreign handle.
+pub fn context_backend(context: ContextHandle) -> Result<Backend> {
+    with_context_mut(context, |context| {
+        Ok(match &context.native {
+            NativeContext::Vulkan(_) => Backend::Vulkan,
+            #[cfg(windows)]
+            NativeContext::Dx12(_) => Backend::Dx12,
+            #[cfg(target_vendor = "apple")]
+            NativeContext::Metal(_) => Backend::Metal,
+        })
+    })
+}
+
 /// Creates a graphics context.
 ///
 /// # Errors

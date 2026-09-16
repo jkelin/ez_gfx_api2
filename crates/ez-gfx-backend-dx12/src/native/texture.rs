@@ -170,6 +170,7 @@ fn publish_texture(
             binding,
             rtv: None,
             msaa: None,
+            depth: None,
         },
         completions,
     )
@@ -877,7 +878,7 @@ impl NativeContext {
         // queue, so its following signal retires both those transfers and earlier frame uses.
         unsafe { self.queue.Signal(&self.fence, retirement) }
             .map_err(|error| map_allocation_windows(&error))?;
-        self.defer_resource(DeferredResource::Texture(texture))
+        self.defer_resource(DeferredResource::Texture(Box::new(texture)))
     }
 
     /// Copies the shader-readable image through a GPU readback footprint and returns tightly packed RGBA8 rows.

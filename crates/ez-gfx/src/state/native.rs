@@ -265,7 +265,8 @@ pub(super) fn prepare_frame_binding_scratch(
                 vertex_heaps,
                 scratch,
             )?,
-            super::ExecutableNode::TextureReadback { .. }
+            super::ExecutableNode::CopyTexture { .. }
+            | super::ExecutableNode::TextureReadback { .. }
             | super::ExecutableNode::RenderTargetReadback { .. }
             | super::ExecutableNode::Present { .. } => scratch.len()..scratch.len(),
         };
@@ -726,7 +727,7 @@ mod binding_scratch_tests {
         Backend,
         handle::{BufferHandle, LocalHandle, PackedHandle, ShaderHandle, TextureHandle},
     };
-    use ez_gfx_hal::{BlendMode, CullMode, FrontFace, MeshPipelineState, QueueKind};
+    use ez_gfx_hal::{BlendMode, CullMode, DepthMode, FrontFace, MeshPipelineState, QueueKind};
     use ez_gfx_runtime::{
         binding::{PublicBinding, ReflectedBindings, ResourceIdentity},
         frame::{ExecutableNode, FrameRecorder},
@@ -820,6 +821,7 @@ mod binding_scratch_tests {
             cull: CullMode::Back,
             front_face: FrontFace::CounterClockwise,
             blend: BlendMode::Alpha,
+            depth: DepthMode::Disabled,
         };
         let mut slot = None;
         let prepare = |slot: &mut Option<PipelineKey>, has_task: bool| {
@@ -843,7 +845,7 @@ mod binding_scratch_tests {
                     fragment_entry: "fragmentmain",
                     stage_layouts: &selected_stage_layouts,
                     state,
-                    depth_required: true,
+                    depth: DepthMode::Write,
                     color_format: 43,
                     depth_format: 126,
                     sample_count: 1,

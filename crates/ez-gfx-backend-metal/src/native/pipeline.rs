@@ -187,7 +187,7 @@ impl NativeContext {
         }
         if state.blend == BlendMode::Alpha {
             color.setBlendingEnabled(true);
-            color.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
+            color.setSourceRGBBlendFactor(MTLBlendFactor::One);
             color.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
             color.setSourceAlphaBlendFactor(MTLBlendFactor::One);
             color.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
@@ -229,7 +229,7 @@ impl NativeContext {
         fragment: &(usize, String),
         state: ez_gfx_hal::MeshPipelineState,
         color_format: Option<ez_gfx_runtime::target::Format>,
-        depth_required: bool,
+        depth: ez_gfx_hal::DepthMode,
         task_texture_heap: Option<ShaderTextureHeapLayout>,
         mesh_texture_heap: Option<ShaderTextureHeapLayout>,
         fragment_texture_heap: Option<ShaderTextureHeapLayout>,
@@ -307,12 +307,12 @@ impl NativeContext {
         // SAFETY: Metal defines color attachment slot zero for mesh render descriptors.
         let color = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
         color.setPixelFormat(Self::render_pipeline_color_format(color_format)?);
-        if depth_required {
+        if !matches!(depth, ez_gfx_hal::DepthMode::Disabled) {
             descriptor.setDepthAttachmentPixelFormat(MTLPixelFormat::Depth32Float);
         }
         if state.blend == BlendMode::Alpha {
             color.setBlendingEnabled(true);
-            color.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
+            color.setSourceRGBBlendFactor(MTLBlendFactor::One);
             color.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
             color.setSourceAlphaBlendFactor(MTLBlendFactor::One);
             color.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);

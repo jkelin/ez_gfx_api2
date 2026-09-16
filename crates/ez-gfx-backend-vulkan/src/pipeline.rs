@@ -316,7 +316,7 @@ impl NativeContext {
                 .color_write_mask(vk::ColorComponentFlags::RGBA),
             BlendMode::Alpha => vk::PipelineColorBlendAttachmentState::default()
                 .blend_enable(true)
-                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                .src_color_blend_factor(vk::BlendFactor::ONE)
                 .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
                 .color_blend_op(vk::BlendOp::ADD)
                 .src_alpha_blend_factor(vk::BlendFactor::ONE)
@@ -340,15 +340,18 @@ impl NativeContext {
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let color = vk::PipelineColorBlendStateCreateInfo::default()
             .attachments(core::slice::from_ref(&blend));
+        let depth_mode = state.resolved_depth(depth_required);
+        let depth_enabled = !matches!(depth_mode, ez_gfx_hal::DepthMode::Disabled);
+        let depth_write = matches!(depth_mode, ez_gfx_hal::DepthMode::Write);
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-            .depth_test_enable(depth_required)
-            .depth_write_enable(depth_required)
+            .depth_test_enable(depth_enabled)
+            .depth_write_enable(depth_write)
             .depth_compare_op(vk::CompareOp::LESS);
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         let mut rendering = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(core::slice::from_ref(&color_format))
-            .depth_attachment_format(if depth_required {
+            .depth_attachment_format(if depth_enabled {
                 vk::Format::D32_SFLOAT
             } else {
                 vk::Format::UNDEFINED
@@ -494,7 +497,7 @@ impl NativeContext {
                 .color_write_mask(vk::ColorComponentFlags::RGBA),
             BlendMode::Alpha => vk::PipelineColorBlendAttachmentState::default()
                 .blend_enable(true)
-                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                .src_color_blend_factor(vk::BlendFactor::ONE)
                 .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
                 .color_blend_op(vk::BlendOp::ADD)
                 .src_alpha_blend_factor(vk::BlendFactor::ONE)
@@ -523,15 +526,17 @@ impl NativeContext {
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let color = vk::PipelineColorBlendStateCreateInfo::default()
             .attachments(core::slice::from_ref(&blend));
+        let depth_enabled = !matches!(desc.depth, ez_gfx_hal::DepthMode::Disabled);
+        let depth_write = matches!(desc.depth, ez_gfx_hal::DepthMode::Write);
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-            .depth_test_enable(desc.depth_required)
-            .depth_write_enable(desc.depth_required)
+            .depth_test_enable(depth_enabled)
+            .depth_write_enable(depth_write)
             .depth_compare_op(vk::CompareOp::LESS);
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         let mut rendering = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(core::slice::from_ref(&color_format))
-            .depth_attachment_format(if desc.depth_required {
+            .depth_attachment_format(if depth_enabled {
                 vk::Format::D32_SFLOAT
             } else {
                 vk::Format::UNDEFINED

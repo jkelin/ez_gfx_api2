@@ -719,6 +719,7 @@ impl NativeContext {
                 Ok(())
             }
             DeferredResource::Texture(texture) => {
+                let texture = *texture;
                 // The MSAA render storage retires with the sampled image; its
                 // RTV handle needs no destroy, dying with the shared heap.
                 if let Some(msaa) = texture.msaa {
@@ -744,7 +745,7 @@ impl NativeContext {
 mod adapter_tests {
     use super::super::{NativeMeshPipelineDesc, NativeShader};
     use super::*;
-    use ez_gfx_hal::{BlendMode, CullMode, FrontFace, MeshPipelineState};
+    use ez_gfx_hal::{BlendMode, CullMode, DepthMode, FrontFace, MeshPipelineState};
     use std::collections::BTreeSet;
 
     #[test]
@@ -892,6 +893,7 @@ mod adapter_tests {
             cull: CullMode::None,
             front_face: FrontFace::CounterClockwise,
             blend: BlendMode::None,
+            depth: DepthMode::Disabled,
         }
     }
 
@@ -906,7 +908,7 @@ mod adapter_tests {
             state: mesh_raster(),
             color_format: None,
             layouts: &[],
-            depth_required: false,
+            depth: DepthMode::Disabled,
             task_workgroup_size: task.map(|_| [1, 1, 1]),
             mesh_workgroup_size: [32, 1, 1],
         }

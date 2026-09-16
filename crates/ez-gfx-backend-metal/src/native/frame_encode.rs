@@ -192,13 +192,20 @@ impl MetalFrameEncoder<'_> {
         let argument_buffer = super::prepared_argument(self.prepared_arguments, action_index)
             .map(|index| &self.frame_slot.argument_buffers[index]);
         encoder.setRenderPipelineState(state);
-        if draw.depth_required {
+        if !matches!(draw.depth, ez_gfx_hal::DepthMode::Disabled) {
             let depth = self
                 .surface
                 .as_ref()
                 .and_then(|surface| surface.depth.as_ref())
                 .ok_or(HalError::InvalidArgument)?;
-            encoder.setDepthStencilState(Some(&depth.state));
+            let state = if matches!(draw.depth, ez_gfx_hal::DepthMode::ReadOnly) {
+                &depth.read_only_state
+            } else {
+                &depth.state
+            };
+            encoder.setDepthStencilState(Some(state));
+        } else {
+            encoder.setDepthStencilState(None);
         }
         encoder.setCullMode(match draw.state.cull {
             CullMode::None => MTLCullMode::None,

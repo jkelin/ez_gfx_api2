@@ -293,8 +293,8 @@ pub struct NativeMeshDraw<'a> {
     pub task_threads_per_group: Option<[u32; 3]>,
     /// Reflected mesh threads.
     pub mesh_threads_per_group: [u32; 3],
-    /// Whether the active pass must enable depth testing.
-    pub depth_required: bool,
+    /// Explicit depth behavior for this mesh draw.
+    pub depth: ez_gfx_hal::DepthMode,
     /// Mesh rasterization and blend state.
     pub state: MeshPipelineState,
     /// Merged bindless texture heap.
@@ -333,6 +333,8 @@ pub enum NativeFrameResource<'a> {
     Depth,
     /// Managed single-mip color render target.
     RenderTarget(&'a NativeTexture),
+    /// Managed target depth texture.
+    RenderTargetDepth(&'a NativeTexture),
 }
 
 /// One resolved pass color attachment: its native resource plus the clear
@@ -369,7 +371,16 @@ pub enum NativeFrameAction<'a> {
     Graphics(NativeGraphicsDraw<'a>),
     /// Encode direct mesh graphics work.
     Mesh(NativeMeshDraw<'a>),
-    /// Copy a texture into shared host-readable storage.
+    /// Copy a validated texture region.
+    CopyTexture {
+        /// Source texture.
+        source: &'a NativeTexture,
+        /// Destination texture.
+        destination: &'a NativeTexture,
+        /// Validated copy region.
+        region: ez_gfx_hal::TextureCopyRegion,
+    },
+    /// Copy a texture into a readback allocation.
     TextureReadback {
         /// Texture to copy.
         texture: &'a NativeTexture,
@@ -459,7 +470,6 @@ impl<const N: usize> NativeFrameActionSource for [NativeFrameAction<'_>; N] {
 pub struct NativeShader {
     libraries: ThreadBound<Vec<Retained<ProtocolObject<dyn objc2_metal::MTLLibrary>>>>,
 }
-/// Texture, sampler, and allocation published as one resource.
 pub struct NativeTexture {
     texture: ThreadBound<Retained<ProtocolObject<dyn MTLTexture>>>,
     allocation: ThreadBound<Allocation>,
@@ -471,12 +481,15 @@ pub struct NativeTexture {
     resident_mips: u32,
     mip_completions: Vec<u64>,
     cancellation: std::sync::Arc<transfer::TransferCancellation>,
-    /// Slot in the bindless texture argument buffer.
     pub binding: u32,
-    /// Multisampled render storage plus its allocation; `None` for uploads
-    /// and single-sample targets. Only render-target entry points touch this;
-    /// the texture above stays the resolve destination.
+    /// Optional target-owned depth attachment.
+    pub(crate) depth: Option<DepthTarget>,
     msaa: Option<MsaaStorage>,
+}
+
+pub(crate) struct DepthTarget {
+    pub(crate) texture: ThreadBound<Retained<ProtocolObject<dyn MTLTexture>>>,
+    pub(crate) allocation: ThreadBound<Allocation>,
 }
 
 /// Private multisampled storage resolved into a render target's sampled texture.
@@ -602,6 +615,7 @@ struct PendingTransfer {
 struct SurfaceDepth {
     texture: ThreadBound<Retained<ProtocolObject<dyn MTLTexture>>>,
     state: ThreadBound<Retained<ProtocolObject<dyn MTLDepthStencilState>>>,
+    read_only_state: ThreadBound<Retained<ProtocolObject<dyn MTLDepthStencilState>>>,
     extent: (u32, u32),
 }
 

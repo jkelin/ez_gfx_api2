@@ -229,6 +229,7 @@ fn empty_texture(context: &mut NativeContext, binding: u32) -> NativeTexture {
         cancellation: Arc::new(AtomicBool::new(false)),
         binding,
         msaa: None,
+        depth: None,
     }
 }
 
@@ -706,7 +707,7 @@ fn render_target_allocation_creates_sampled_color_images() {
         (9, Format::Rgba16Float, 32, 16),
     ] {
         let target = context
-            .create_render_target(format, width, height, binding, 1)
+            .create_render_target(format, None, width, height, binding, 1)
             .unwrap();
         assert_eq!((target.width, target.height), (width, height));
         assert_eq!(target.mip_count, 1);
@@ -717,13 +718,13 @@ fn render_target_allocation_creates_sampled_color_images() {
     // Depth usage and empty extents fail before native allocation.
     assert_eq!(
         context
-            .create_render_target(Format::Depth32Float, 64, 64, 0, 1)
+            .create_render_target(Format::Depth32Float, None, 64, 64, 0, 1)
             .map(|_| ()),
         Err(AllocationError::Unsupported)
     );
     assert_eq!(
         context
-            .create_render_target(Format::Rgba8Unorm, 0, 64, 0, 1)
+            .create_render_target(Format::Rgba8Unorm, None, 0, 64, 0, 1)
             .map(|_| ()),
         Err(AllocationError::ZeroSize)
     );
@@ -739,7 +740,14 @@ fn render_target_clear_applies_attachment_color_on_begin() {
     use ez_gfx_runtime::target::Format;
     let mut context = context();
     let target = context
-        .create_render_target(Format::Rgba8Unorm, 64, 64, 11, 1)
+        .create_render_target(
+            Format::Rgba8Unorm,
+            Some(Format::Depth32Float),
+            64,
+            64,
+            11,
+            1,
+        )
         .unwrap();
     let attach = ResourceState::new(
         QueueKind::Graphics,
@@ -801,7 +809,7 @@ fn render_target_clear_applies_attachment_color_on_begin() {
     for pixel in bytes.chunks_exact(4) {
         assert_eq!(pixel, [255, 0, 0, 255]);
     }
-    // Sampled textures and depth pairings stay rejected as color attachments.
+    // Sampled textures stay rejected as color attachments.
     let probe = empty_texture(&mut context, 13);
     let textured = NativeFrameAction::BeginPass {
         pass: &pass,
@@ -812,19 +820,51 @@ fn render_target_clear_applies_attachment_color_on_begin() {
         .into(),
     };
     assert!(context.execute_frame(None, &[textured], false).is_err());
+
+    // Managed targets bind and transition their paired D32 attachment.
+    let depth_attach = ResourceState::new(
+        QueueKind::Graphics,
+        ShaderStage::Fragment,
+        ResourceAccess::DepthStencilWrite,
+    )
+    .unwrap();
     let depth_pass = ExecutionPass {
-        depth: Some(0),
+        depth: Some(1),
         ..pass.clone()
     };
-    let depth = NativeFrameAction::BeginPass {
-        pass: &depth_pass,
-        colors: [PassAttachment {
+    let depth_actions = vec![
+        NativeFrameAction::Barrier {
+            barrier: ExecutionBarrier {
+                node: 0,
+                resource: 0,
+                range,
+                before: Some(sampled),
+                after: attach,
+            },
             resource: NativeFrameResource::RenderTarget(&target),
-            clear: [0.0, 0.0, 0.0, 1.0],
-        }]
-        .into(),
-    };
-    assert!(context.execute_frame(None, &[depth], false).is_err());
+        },
+        NativeFrameAction::Barrier {
+            barrier: ExecutionBarrier {
+                node: 0,
+                resource: 1,
+                range,
+                before: None,
+                after: depth_attach,
+            },
+            resource: NativeFrameResource::RenderTargetDepth(&target),
+        },
+        NativeFrameAction::BeginPass {
+            pass: &depth_pass,
+            colors: [PassAttachment {
+                resource: NativeFrameResource::RenderTarget(&target),
+                clear: [0.0, 0.0, 0.0, 1.0],
+            }]
+            .into(),
+        },
+        NativeFrameAction::EndPass,
+    ];
+    context.execute_frame(None, &depth_actions, false).unwrap();
+    drop(depth_actions);
     context.destroy_texture(target).unwrap();
     context.destroy_texture(probe).unwrap();
     context.wait_idle().unwrap();
@@ -859,7 +899,7 @@ fn render_target_msaa_clear_resolves_into_sampled_image() {
         return;
     };
     let target = context
-        .create_render_target(Format::Rgba8Unorm, 64, 64, 17, msaa_samples)
+        .create_render_target(Format::Rgba8Unorm, None, 64, 64, 17, msaa_samples)
         .unwrap();
     assert!(target.msaa.is_some());
     let attach = ResourceState::new(
@@ -926,7 +966,7 @@ fn render_target_msaa_clear_resolves_into_sampled_image() {
     }
     // A 4-sample pass against a single-sample target (and vice versa) is rejected.
     let single = context
-        .create_render_target(Format::Rgba8Unorm, 64, 64, 19, 1)
+        .create_render_target(Format::Rgba8Unorm, None, 64, 64, 19, 1)
         .unwrap();
     let mismatch = NativeFrameAction::BeginPass {
         pass: &pass,

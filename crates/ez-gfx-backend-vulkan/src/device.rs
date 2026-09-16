@@ -959,6 +959,7 @@ impl NativeContext {
                 Ok(())
             }
             DeferredResource::Texture(texture) => {
+                let texture = *texture;
                 // The MSAA render storage is never sampled or described, so
                 // only its view and image retire alongside the sampled image.
                 let msaa = texture.msaa;

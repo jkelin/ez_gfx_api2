@@ -115,7 +115,7 @@ fn mesh_test_render_target(context: ContextHandle, name: &str) -> RenderTargetHa
         true,
     )
     .unwrap();
-    create_render_target(context, &declaration, 16, 16).unwrap()
+    create_render_target(context, &declaration, None, 16, 16).unwrap()
 }
 
 #[cfg(windows)]
@@ -169,6 +169,7 @@ fn retained_mesh_stage_natives_destroy_once_after_submit_and_abort() {
                 cull: ez_gfx_hal::CullMode::None,
                 front_face: ez_gfx_hal::FrontFace::CounterClockwise,
                 blend: ez_gfx_hal::BlendMode::None,
+                depth: ez_gfx_hal::DepthMode::Disabled,
             },
         )
         .unwrap();
@@ -241,6 +242,7 @@ fn raw_submit_probe_rejects_missing_retained_mesh_shader() {
             cull: ez_gfx_hal::CullMode::None,
             front_face: ez_gfx_hal::FrontFace::CounterClockwise,
             blend: ez_gfx_hal::BlendMode::None,
+                depth: ez_gfx_hal::DepthMode::Disabled,
         },
     )
     .unwrap();
@@ -320,6 +322,7 @@ fn mesh_only_profile_submits_mesh_then_graphics_after_task_rejection() {
             cull: ez_gfx_hal::CullMode::None,
             front_face: ez_gfx_hal::FrontFace::CounterClockwise,
             blend: ez_gfx_hal::BlendMode::None,
+                depth: ez_gfx_hal::DepthMode::Disabled,
         },
     )
     .unwrap();
@@ -348,6 +351,7 @@ fn mesh_only_profile_submits_mesh_then_graphics_after_task_rejection() {
                 cull: ez_gfx_hal::CullMode::None,
                 front_face: ez_gfx_hal::FrontFace::CounterClockwise,
                 blend: ez_gfx_hal::BlendMode::None,
+                depth: ez_gfx_hal::DepthMode::Disabled,
             },
         ),
         Err(Error::Unsupported)
@@ -416,6 +420,7 @@ fn raw_mesh_prevalidation_failure_aborts_prior_recording() {
                 cull: ez_gfx_hal::CullMode::None,
                 front_face: ez_gfx_hal::FrontFace::CounterClockwise,
                 blend: ez_gfx_hal::BlendMode::None,
+                depth: ez_gfx_hal::DepthMode::Disabled,
             },
         )
         .is_err()
@@ -544,8 +549,9 @@ fn mesh_pipeline_keys_distinguish_per_stage_physical_layouts() {
                     cull: ez_gfx_hal::CullMode::Back,
                     front_face: ez_gfx_hal::FrontFace::CounterClockwise,
                     blend: ez_gfx_hal::BlendMode::None,
+                depth: ez_gfx_hal::DepthMode::Disabled,
                 },
-                depth_required: false,
+                depth: ez_gfx_hal::DepthMode::Disabled,
                 color_format: 44,
                 depth_format: 0,
                 sample_count: 1,
@@ -611,8 +617,9 @@ fn pipeline_keys_track_every_owning_shader_identity() {
             cull: ez_gfx_hal::CullMode::Back,
             front_face: ez_gfx_hal::FrontFace::CounterClockwise,
             blend: ez_gfx_hal::BlendMode::None,
+                depth: ez_gfx_hal::DepthMode::Disabled,
         },
-        depth_required: false,
+        depth: ez_gfx_hal::DepthMode::Disabled,
         color_format: 44,
         depth_format: 0,
         sample_count: 1,

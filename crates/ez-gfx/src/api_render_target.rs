@@ -1,3 +1,35 @@
+/// Formats used by a cached managed render target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderTargetDescriptor {
+    /// Color attachment and readback format.
+    pub color_format: ez_gfx_runtime::target::Format,
+    /// Optional depth attachment format.
+    pub depth_format: Option<ez_gfx_runtime::target::Format>,
+}
+
+impl RenderTargetDescriptor {
+    /// Creates a color-only target descriptor.
+    #[must_use]
+    pub const fn color(color_format: ez_gfx_runtime::target::Format) -> Self {
+        Self { color_format, depth_format: None }
+    }
+
+    /// Creates a color target with a depth companion.
+    #[must_use]
+    pub const fn color_depth(color_format: ez_gfx_runtime::target::Format) -> Self {
+        Self {
+            color_format,
+            depth_format: Some(ez_gfx_runtime::target::Format::Depth32Float),
+        }
+    }
+}
+
+impl From<ez_gfx_runtime::target::Format> for RenderTargetDescriptor {
+    fn from(color_format: ez_gfx_runtime::target::Format) -> Self {
+        Self::color(color_format)
+    }
+}
+
 enum RenderTargetBacking {
     Managed(String),
     Surface {
@@ -53,6 +85,34 @@ impl RenderTarget {
             RenderTargetBacking::Surface { format, .. } => Ok(*format),
         }
     }
+    /// Returns the optional managed depth format.
+    ///
+    /// Surface targets expose `Depth32Float`, matching the depth attachment
+    /// created on demand by every backend.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when the target is stale.
+    pub fn depth_format(&self) -> Result<Option<ez_gfx_runtime::target::Format>> {
+        let context = Context {
+            inner: Rc::clone(&self.inner.context),
+            owner: false,
+        };
+        context.check_entry()?;
+        match &self.inner.backing {
+            RenderTargetBacking::Managed(name) => self
+                .inner
+                .context
+                .render_targets
+                .borrow()
+                .get(name)
+                .map(|target| target.depth_format)
+                .ok_or(Error::InvalidContext),
+            RenderTargetBacking::Surface { .. } => {
+                Ok(Some(ez_gfx_runtime::target::Format::Depth32Float))
+            }
+        }
+    }
+
 
     /// Returns the target extent.
     ///

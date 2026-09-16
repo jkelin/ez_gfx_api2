@@ -29,10 +29,10 @@ use windows::Win32::Graphics::Direct3D::{
 };
 use windows::Win32::Graphics::Direct3D12::{
     D3D_ROOT_SIGNATURE_VERSION_1, D3D_SHADER_MODEL_6_5, D3D12_BLEND_DESC,
-    D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_ONE, D3D12_BLEND_OP_ADD, D3D12_BLEND_SRC_ALPHA,
-    D3D12_BLEND_ZERO, D3D12_CLEAR_FLAG_DEPTH, D3D12_CLEAR_VALUE, D3D12_CLEAR_VALUE_0,
-    D3D12_COLOR_WRITE_ENABLE_ALL, D3D12_COMMAND_SIGNATURE_DESC, D3D12_COMPARISON_FUNC_ALWAYS,
-    D3D12_COMPARISON_FUNC_LESS, D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_CPU_DESCRIPTOR_HANDLE,
+    D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_ONE, D3D12_BLEND_OP_ADD, D3D12_BLEND_ZERO,
+    D3D12_CLEAR_FLAG_DEPTH, D3D12_CLEAR_VALUE, D3D12_CLEAR_VALUE_0, D3D12_COLOR_WRITE_ENABLE_ALL,
+    D3D12_COMMAND_SIGNATURE_DESC, D3D12_COMPARISON_FUNC_ALWAYS, D3D12_COMPARISON_FUNC_LESS,
+    D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_CPU_DESCRIPTOR_HANDLE,
     D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION, D3D12_CULL_MODE_BACK, D3D12_CULL_MODE_FRONT,
     D3D12_CULL_MODE_NONE, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, D3D12_DEPTH_STENCIL_DESC,
     D3D12_DEPTH_STENCIL_VALUE, D3D12_DEPTH_STENCILOP_DESC, D3D12_DEPTH_WRITE_MASK_ALL,
@@ -47,6 +47,7 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_FILTER_MIN_MAG_MIP_POINT,
     D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT, D3D12_GRAPHICS_PIPELINE_STATE_DESC,
     D3D12_INDEX_BUFFER_VIEW, D3D12_INDIRECT_ARGUMENT_DESC, D3D12_INDIRECT_ARGUMENT_DESC_0,
+    D3D12_INDIRECT_ARGUMENT_DESC_0_1, D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
     D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, D3D12_LOGIC_OP_NOOP, D3D12_MESH_SHADER_TIER,
     D3D12_MESH_SHADER_TIER_1, D3D12_MESH_SHADER_TIER_NOT_SUPPORTED,
     D3D12_PIPELINE_STATE_STREAM_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE,
@@ -70,13 +71,14 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT,
     D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
     D3D12_RESOURCE_STATES, D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_RESOURCE_UAV_BARRIER,
-    D3D12_ROOT_DESCRIPTOR, D3D12_ROOT_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER,
-    D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-    D3D12_ROOT_PARAMETER_TYPE_SRV, D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_ROOT_SIGNATURE_DESC,
+    D3D12_ROOT_DESCRIPTOR, D3D12_ROOT_DESCRIPTOR_TABLE, D3D12_ROOT_CONSTANTS, D3D12_ROOT_PARAMETER,
+    D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+    D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER_TYPE_SRV,
+    D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_ROOT_SIGNATURE_DESC,
     D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, D3D12_ROOT_SIGNATURE_FLAG_NONE,
     D3D12_RT_FORMAT_ARRAY, D3D12_SAMPLER_DESC, D3D12_SHADER_BYTECODE,
     D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC_0,
-    D3D12_SHADER_VISIBILITY_ALL, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_STENCIL_OP_KEEP,
+    D3D12_SHADER_VISIBILITY_ALL, D3D12_SHADER_VISIBILITY_VERTEX, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_STENCIL_OP_KEEP,
     D3D12_TEX2D_SRV, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_WRAP,
     D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
     D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
@@ -275,8 +277,8 @@ pub struct NativeMeshPipelineDesc<'a> {
     pub color_format: Option<ez_gfx_runtime::target::Format>,
     /// Reflected root buffer layout merged across the selected stages.
     pub layouts: &'a [ShaderBufferLayout],
-    /// Whether the pipeline requires a depth attachment.
-    pub depth_required: bool,
+    /// Explicit depth behavior for the mesh pipeline.
+    pub depth: ez_gfx_hal::DepthMode,
     /// Optional task workgroup size from reflection.
     pub task_workgroup_size: Option<[u32; 3]>,
     /// Mesh workgroup size from reflection.
@@ -354,8 +356,10 @@ pub enum NativeFrameResource<'a> {
     Surface,
     /// Current depth resource.
     Depth,
-    /// Managed single-mip color render target.
+    /// Managed target color resource.
     RenderTarget(&'a NativeTexture),
+    /// Managed target depth resource.
+    RenderTargetDepth(&'a NativeTexture),
 }
 
 /// One resolved pass color attachment: its native resource plus the clear
@@ -392,6 +396,15 @@ pub enum NativeFrameAction<'a> {
     Graphics(NativeDrawIndexed<'a>),
     /// Encode a mesh workgroup dispatch inside the active render pass.
     Mesh(NativeMeshDispatch<'a>),
+    /// Copy a validated texture region into another texture.
+    CopyTexture {
+        /// Source texture.
+        source: &'a NativeTexture,
+        /// Destination texture.
+        destination: &'a NativeTexture,
+        /// Validated region.
+        region: ez_gfx_hal::TextureCopyRegion,
+    },
     /// Copy a texture into a readback allocation.
     TextureReadback {
         /// Texture to copy.
@@ -510,6 +523,13 @@ pub struct NativePipeline {
     topology: Option<D3D_PRIMITIVE_TOPOLOGY>,
     signature: Option<ID3D12CommandSignature>,
     buffer_writable: Vec<bool>,
+    /// Root parameter index of the per-draw base-instance constant.
+    ///
+    /// Graphics pipelines append one vertex-visible 32-bit constant after the
+    /// descriptor tables; the indirect signature feeds each record's leading
+    /// dword into it. `u32::MAX` marks pipelines without an indirect
+    /// signature (compute, mesh), which never execute indexed draws.
+    base_instance_root: u32,
     /// Whether this state object is a mesh pipeline; mesh dispatches reject any
     /// other pipeline instead of misrecording through it.
     mesh: bool,
@@ -532,12 +552,15 @@ pub struct MsaaStorage {
     samples: u8,
 }
 
-/// Texture resource and allocator ownership record.
+/// Texture resource, descriptors, optional depth companion, and allocator ownership.
+#[allow(
+    dead_code,
+    reason = "retained native handles settle only on teardown paths"
+)]
 pub struct NativeTexture {
     resource: ID3D12Resource,
     allocation: Allocation,
     format: TextureFormat,
-    /// Sampler installed with the first sampled-view publication; absent for render targets.
     sampler_desc: Option<TextureSamplerDesc>,
     width: u32,
     height: u32,
@@ -545,15 +568,24 @@ pub struct NativeTexture {
     resident_mips: u32,
     mip_completions: Vec<u64>,
     cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Slot in the shader-visible texture descriptor heap.
+    /// Shared bindless descriptor slot.
     pub binding: u32,
-    /// Render-target view for managed color targets; `None` for uploads.
-    /// The retaining heap keeps the CPU handle valid until destruction.
+    /// Optional color render-target view and retaining heap.
     pub rtv: Option<(ID3D12DescriptorHeap, D3D12_CPU_DESCRIPTOR_HANDLE)>,
-    /// Multisampled render storage plus its view and allocation; `None` for
-    /// uploads and single-sample targets. Only render-target entry points
-    /// touch this; the resource above stays the resolve destination.
+    /// Optional target-owned depth view/resource.
+    pub(crate) depth: Option<DepthTarget>,
     msaa: Option<MsaaStorage>,
+}
+
+#[allow(
+    dead_code,
+    reason = "depth companion lives with its render target record"
+)]
+pub(crate) struct DepthTarget {
+    pub(crate) resource: ID3D12Resource,
+    pub(crate) allocation: Allocation,
+    pub(crate) dsv: D3D12_CPU_DESCRIPTOR_HANDLE,
+    pub(crate) heap: ID3D12DescriptorHeap,
 }
 
 impl NativeTexture {
@@ -589,7 +621,7 @@ struct FrameSlot {
 enum DeferredResource {
     Allocation(NativeAllocation),
     Pipeline(NativePipeline),
-    Texture(NativeTexture),
+    Texture(Box<NativeTexture>),
 }
 
 struct DeferredNativeResource {

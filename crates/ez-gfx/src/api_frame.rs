@@ -552,8 +552,8 @@ impl Frame {
 
     /// Configures a cached named render target for this frame.
     ///
-    /// A format or extent change atomically replaces the cached native image;
-    /// unchanged configurations reuse it.
+    /// A descriptor change atomically replaces the cached color/depth images;
+    /// unchanged configurations reuse both attachments.
     ///
     /// # Errors
     /// Returns [`Error`] when the frame is already configured or target creation fails.
@@ -561,26 +561,31 @@ impl Frame {
         &mut self,
         name: impl Into<String>,
         size: [u32; 2],
-        format: ez_gfx_runtime::target::Format,
+        descriptor: impl Into<crate::RenderTargetDescriptor>,
     ) -> Result<RenderTarget> {
+        let descriptor = descriptor.into();
         // A surface-backed frame and a second target attachment are never interchangeable.
         if self.target != FrameTarget::Unconfigured || self.surface.is_some() {
             return self.fail(Error::NotReady);
         }
         let name = name.into();
         let [width, height] = size;
-        // Zero cannot name a physical image and must not evict an existing cached target.
         if width == 0 || height == 0 {
             return self.fail(Error::InvalidArgument);
         }
-        // Cache identity is the stable name; size or format changes replace only its image.
+        // Cache identity is the stable name; descriptor or extent changes replace
+        // both logical attachments as one cache entry.
         let cached = self
             .context
             .render_targets
             .borrow()
             .get(&name)
             .copied()
-            .filter(|target| target.extent == (width, height) && target.format == format);
+            .filter(|target| {
+                target.extent == (width, height)
+                    && target.format == descriptor.color_format
+                    && target.depth_format == descriptor.depth_format
+            });
         let handle = if let Some(target) = cached {
             target.handle
         } else {
@@ -589,30 +594,35 @@ impl Frame {
                 ez_gfx_runtime::target::TargetUsage::Color,
                 1.0,
                 1,
-                vec![format],
+                vec![descriptor.color_format],
                 ez_gfx_runtime::target::ClearValue::Color([0.1, 0.1, 0.1, 1.0]),
                 true,
             ) else {
                 return self.fail(Error::InvalidArgument);
             };
-            let handle =
-                match state::create_render_target(self.context.handle, &declaration, width, height)
-                {
-                    Ok(handle) => handle,
-                    Err(error) => return self.fail(error),
-                };
-            // Publish the replacement before retiring the old native image.
+            let handle = match state::create_render_target(
+                self.context.handle,
+                &declaration,
+                descriptor.depth_format,
+                width,
+                height,
+            ) {
+                Ok(handle) => handle,
+                Err(error) => return self.fail(error),
+            };
+            // Publish the replacement before retiring the old native images.
             let previous = self.context.render_targets.borrow_mut().insert(
                 name.clone(),
                 CachedRenderTarget {
                     handle,
-                    format,
+                    format: descriptor.color_format,
                     extent: (width, height),
+                    depth_format: descriptor.depth_format,
                 },
             );
-            if let Some(previous) = previous {
-                state::destroy_render_target(self.context.handle, previous.handle);
-            }
+        if let Some(previous) = previous {
+            state::destroy_render_target(self.context.handle, previous.handle);
+        }
             handle
         };
         if let Err(error) = state::configure_render_target(self.context.handle, handle) {
@@ -703,6 +713,25 @@ impl Frame {
         Ok(RenderTarget {
             inner,
             surface_lease: Some(surface),
+        })
+    }
+
+    /// Records a validated GPU texture-to-texture region copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for mismatched texture contexts, unknown or incompatible
+    /// textures, invalid copy regions, or when no frame is recording.
+    pub fn copy_texture_regions(
+        &mut self,
+        source: &crate::Texture,
+        destination: &crate::Texture,
+        region: ez_gfx_hal::TextureCopyRegion,
+    ) -> Result<()> {
+        self.ensure_context(&source.inner.context)?;
+        self.ensure_context(&destination.inner.context)?;
+        self.record(|context| {
+            state::copy_texture_regions(context, source.inner.handle, destination.inner.handle, region)
         })
     }
 

@@ -455,6 +455,7 @@ impl NativeContext {
             mip_completions: mip_values,
             cancellation,
             binding,
+            depth: None,
             msaa: None,
         };
         Ok((texture, completions))
@@ -484,6 +485,7 @@ impl NativeContext {
     pub fn create_render_target(
         &mut self,
         format: ez_gfx_runtime::target::Format,
+        depth_format: Option<ez_gfx_runtime::target::Format>,
         width: u32,
         height: u32,
         binding: u32,
@@ -621,6 +623,16 @@ impl NativeContext {
             sample_flags,
             (image, view, resolve_sampler, allocation),
         )?;
+        let depth = if depth_format.is_some() {
+            self.ensure_depth_target(vk::Extent2D { width, height })
+                .map_err(|error| match error {
+                    ez_gfx_hal::HalError::NativeFailure => AllocationError::NativeFailure,
+                    _ => AllocationError::Unsupported,
+                })?;
+            self.depth_target.take()
+        } else {
+            None
+        };
         Ok(NativeTexture {
             image,
             view,
@@ -634,6 +646,7 @@ impl NativeContext {
             mip_completions: vec![0],
             cancellation: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             binding,
+            depth,
             msaa,
         })
     }
@@ -972,7 +985,7 @@ impl NativeContext {
     ///
     /// Returns an error if the texture cannot be queued for deferred destruction.
     pub fn destroy_texture(&mut self, texture: NativeTexture) -> Result<(), AllocationError> {
-        self.defer_resource(DeferredResource::Texture(texture))
+        self.defer_resource(DeferredResource::Texture(Box::new(texture)))
     }
 
     /// Copies a shader-readable image to host-visible memory and returns tightly packed RGBA8 pixels.

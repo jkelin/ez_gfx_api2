@@ -40,9 +40,17 @@ impl NativeContext {
             .device
             .newDepthStencilStateWithDescriptor(&state_descriptor)
             .ok_or(HalError::NativeFailure)?;
+        let read_only_descriptor = MTLDepthStencilDescriptor::new();
+        read_only_descriptor.setDepthCompareFunction(MTLCompareFunction::Less);
+        read_only_descriptor.setDepthWriteEnabled(false);
+        let read_only_state = self
+            .device
+            .newDepthStencilStateWithDescriptor(&read_only_descriptor)
+            .ok_or(HalError::NativeFailure)?;
         let depth = SurfaceDepth {
             texture: ThreadBound::new(texture),
             state: ThreadBound::new(state),
+            read_only_state: ThreadBound::new(read_only_state),
             extent,
         };
         if let Some(stale) = surface.depth.replace(depth) {

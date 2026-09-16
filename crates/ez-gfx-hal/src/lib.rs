@@ -539,6 +539,88 @@ pub fn validate_texture_mips(
     Ok(())
 }
 
+/// A validated texture-to-texture copy rectangle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TextureCopyRegion {
+    /// Source mip level and origin.
+    pub source_mip: u32,
+    /// Destination mip level and origin.
+    pub destination_mip: u32,
+    /// Source origin in texels.
+    pub source_origin: [u32; 2],
+    /// Destination origin in texels.
+    pub destination_origin: [u32; 2],
+    /// Copied extent in texels.
+    pub extent: [u32; 2],
+}
+
+/// Validates a texture-to-texture copy before backend recording.
+///
+/// Source and destination must use the same format and dimensions. Overlapping
+/// regions are rejected for self-copies because native APIs do not guarantee
+/// memmove semantics.
+///
+/// # Errors
+/// Returns [`ContractError::InvalidImage`] for incompatible or overlapping
+/// regions and [`ContractError::RangeOverflow`] for checked arithmetic overflow.
+pub fn validate_texture_copy(
+    format: TextureFormat,
+    destination_format: TextureFormat,
+    source_extent: (u32, u32),
+    destination_extent: (u32, u32),
+    same_texture: bool,
+    copy: TextureCopyRegion,
+) -> Result<(), ContractError> {
+    if format != destination_format {
+        return Err(ContractError::InvalidImage);
+    }
+    let [width, height] = copy.extent;
+    let [block_width, block_height, block_bytes] = format.block();
+    let byte_count = usize::try_from(
+        u64::from(width.div_ceil(block_width))
+            .checked_mul(u64::from(height.div_ceil(block_height)))
+            .and_then(|blocks| blocks.checked_mul(u64::from(block_bytes)))
+            .ok_or(ContractError::RangeOverflow)?,
+    )
+    .map_err(|_| ContractError::RangeOverflow)?;
+    let bytes = vec![0_u8; byte_count];
+    let source = TextureRegion {
+        mip_level: copy.source_mip,
+        x: copy.source_origin[0],
+        y: copy.source_origin[1],
+        width,
+        height,
+        bytes: &bytes,
+    };
+    let destination = TextureRegion {
+        mip_level: copy.destination_mip,
+        x: copy.destination_origin[0],
+        y: copy.destination_origin[1],
+        width,
+        height,
+        bytes: &bytes,
+    };
+    validate_texture_region(format, source_extent.0, source_extent.1, 1, source)?;
+    validate_texture_region(
+        destination_format,
+        destination_extent.0,
+        destination_extent.1,
+        1,
+        destination,
+    )?;
+    if same_texture
+        && copy.source_mip == copy.destination_mip
+        && source_extent == destination_extent
+        && copy.source_origin[0] < copy.destination_origin[0].saturating_add(width)
+        && copy.destination_origin[0] < copy.source_origin[0].saturating_add(width)
+        && copy.source_origin[1] < copy.destination_origin[1].saturating_add(height)
+        && copy.destination_origin[1] < copy.source_origin[1].saturating_add(height)
+    {
+        return Err(ContractError::InvalidImage);
+    }
+    Ok(())
+}
+
 /// Validates one mip-region update, including compressed-block edge rules.
 ///
 /// # Errors
@@ -650,6 +732,17 @@ pub enum BlendMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// Depth-test and depth-write behavior selected for a graphics pipeline.
+pub enum DepthMode {
+    /// Disables depth testing and writes.
+    Disabled,
+    /// Tests against the depth attachment without modifying it.
+    ReadOnly,
+    /// Tests against and writes the depth attachment.
+    Write,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 /// Shader stages selected for a mesh graphics pipeline.
 pub struct MeshStages<T> {
     /// Optional task shader.
@@ -659,7 +752,6 @@ pub struct MeshStages<T> {
     /// Required fragment shader.
     pub fragment: T,
 }
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 /// Rasterization and blending choices supplied for a mesh graphics pipeline.
 pub struct MeshPipelineState {
@@ -669,6 +761,20 @@ pub struct MeshPipelineState {
     pub front_face: FrontFace,
     /// Color blending mode.
     pub blend: BlendMode,
+    /// Depth test/write mode.
+    pub depth: DepthMode,
+}
+
+impl MeshPipelineState {
+    /// Resolves explicit state with a shader-declared depth attachment requirement.
+    #[must_use]
+    pub const fn resolved_depth(self, shader_requires_depth: bool) -> DepthMode {
+        if shader_requires_depth && matches!(self.depth, DepthMode::Disabled) {
+            DepthMode::Write
+        } else {
+            self.depth
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -749,7 +855,7 @@ pub fn validate_mesh_dispatch(
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-/// Rasterization, topology, and blending choices supplied at pipeline creation.
+/// Rasterization, topology, blending, and depth choices supplied at pipeline creation.
 pub struct DynamicPipelineState {
     /// Face-culling mode for rasterization.
     pub cull: CullMode,
@@ -759,11 +865,12 @@ pub struct DynamicPipelineState {
     pub topology: PrimitiveTopology,
     /// Color blending mode.
     pub blend: BlendMode,
+    /// Depth test/write mode.
+    pub depth: DepthMode,
 }
 
 impl DynamicPipelineState {
-    /// Every C discriminant is checked; unknown future values fail instead of changing pipeline state.
-    /// Decodes dynamic pipeline state from checked C ABI discriminants.
+    /// Decodes the legacy render state. Depth stays disabled.
     ///
     /// # Errors
     ///
@@ -773,6 +880,21 @@ impl DynamicPipelineState {
         front_face: u8,
         topology: u8,
         blend: u8,
+    ) -> Result<Self, RenderStateError> {
+        Self::from_abi_with_depth(cull, front_face, topology, blend, 0)
+    }
+
+    /// Decodes render state including explicit depth behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderStateError::InvalidDiscriminant`] when any ABI byte has no defined encoding.
+    pub fn from_abi_with_depth(
+        cull: u8,
+        front_face: u8,
+        topology: u8,
+        blend: u8,
+        depth: u8,
     ) -> Result<Self, RenderStateError> {
         Ok(Self {
             cull: match cull {
@@ -800,7 +922,23 @@ impl DynamicPipelineState {
                 1 => BlendMode::Alpha,
                 _ => return Err(RenderStateError::InvalidDiscriminant),
             },
+            depth: match depth {
+                0 => DepthMode::Disabled,
+                1 => DepthMode::ReadOnly,
+                2 => DepthMode::Write,
+                _ => return Err(RenderStateError::InvalidDiscriminant),
+            },
         })
+    }
+
+    /// Resolves explicit state with the legacy shader depth requirement.
+    #[must_use]
+    pub const fn resolved_depth(self, shader_requires_depth: bool) -> DepthMode {
+        if shader_requires_depth && matches!(self.depth, DepthMode::Disabled) {
+            DepthMode::Write
+        } else {
+            self.depth
+        }
     }
 }
 

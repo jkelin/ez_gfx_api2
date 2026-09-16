@@ -95,6 +95,7 @@ struct CachedRenderTarget {
     handle: RenderTargetHandle,
     format: ez_gfx_runtime::target::Format,
     extent: (u32, u32),
+    depth_format: Option<ez_gfx_runtime::target::Format>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -201,7 +202,7 @@ impl Context {
     /// Registers one process-wide custom texture decoder.
     ///
     /// # Errors
-    /// Returns [`TextureError`] when `source_format` is reserved or already registered.
+    /// Returns [`crate::TextureError`] when `source_format` is reserved or already registered.
     pub fn register_texture_decoder(
         source_format: u8,
         decoder: ez_gfx_texture_manager::texture::TextureDecodeCallback,
@@ -214,7 +215,7 @@ impl Context {
     /// Already-admitted texture loads retain their decoder.
     ///
     /// # Errors
-    /// Returns [`TextureError`] when `source_format` is reserved or not registered.
+    /// Returns [`crate::TextureError`] when `source_format` is reserved or not registered.
     pub fn unregister_texture_decoder(
         source_format: u8,
     ) -> std::result::Result<(), ez_gfx_texture_manager::texture::TextureError> {
@@ -388,6 +389,15 @@ impl Context {
     pub fn wait_idle(&self) -> Result<()> {
         self.check_entry()?;
         self.complete(state::wait_idle(self.raw()))
+    }
+
+    /// Returns the graphics backend selected for this context.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when the context is stale.
+    pub fn backend(&self) -> Result<ez_gfx_core::Backend> {
+        self.check_entry()?;
+        self.complete(state::context_backend(self.raw()))
     }
 
     /// Returns the configured asynchronous texture worker count.
@@ -886,6 +896,22 @@ impl Texture {
         ))
     }
 
+    /// Unloads this texture and retires its descriptor/resource after GPU completion.
+    ///
+    /// # Errors
+    /// Returns [`Error`] if this texture is stale or cannot be retired.
+    pub fn unload(self) -> Result<()> {
+        let context = Context {
+            inner: Rc::clone(&self.inner.context),
+            owner: false,
+        };
+        context.check_entry()?;
+        context.complete(state::try_unload_texture(
+            self.inner.context.handle,
+            self.inner.handle,
+        ))
+    }
+
     /// Cancels an asynchronous texture load.
     ///
     /// # Errors
@@ -902,7 +928,6 @@ impl Texture {
         ))
     }
 }
-
 impl Context {
     /// Queues texture decode and upload while owning the copied input.
     ///

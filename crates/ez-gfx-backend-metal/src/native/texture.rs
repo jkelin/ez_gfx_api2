@@ -333,6 +333,7 @@ impl NativeContext {
                         cancellation,
                         binding,
                         msaa: None,
+                        depth: None,
                     },
                     completions,
                 ))
@@ -368,6 +369,7 @@ impl NativeContext {
     pub fn create_render_target(
         &mut self,
         format: ez_gfx_runtime::target::Format,
+        _depth_format: Option<ez_gfx_runtime::target::Format>,
         width: u32,
         height: u32,
         binding: u32,
@@ -497,6 +499,48 @@ impl NativeContext {
                 return Err(AllocationError::NativeFailure);
             }
         };
+        let depth = if _depth_format.is_some() {
+            let depth_desc = unsafe {
+                MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                    MTLPixelFormat::Depth32Float,
+                    texture_width,
+                    texture_height,
+                    false,
+                )
+            };
+            depth_desc.setUsage(MTLTextureUsage::RenderTarget);
+            depth_desc.setStorageMode(MTLStorageMode::Private);
+            let depth_allocation = self
+                .allocator
+                .as_mut()
+                .ok_or(AllocationError::NativeFailure)?
+                .allocate(&AllocationCreateDesc::texture(
+                    &self.device,
+                    "ez-gfx-render-target-depth",
+                    &depth_desc,
+                ))
+                .map_err(map_allocator)?;
+            let depth_offset = usize::try_from(depth_allocation.offset())
+                .map_err(|_| AllocationError::NativeFailure)?;
+            let Some(depth_texture) = (unsafe {
+                depth_allocation
+                    .heap()
+                    .newTextureWithDescriptor_offset(&depth_desc, depth_offset)
+            }) else {
+                self.allocator
+                    .as_mut()
+                    .ok_or(AllocationError::NativeFailure)?
+                    .free(&depth_allocation)
+                    .map_err(map_allocator)?;
+                return Err(AllocationError::OutOfMemory);
+            };
+            Some(super::DepthTarget {
+                texture: ThreadBound::new(depth_texture),
+                allocation: ThreadBound::new(depth_allocation),
+            })
+        } else {
+            None
+        };
         // Single-sample targets render directly into the sampled texture; the
         // multisampled texture below stays absent.
         let msaa = if samples == 1 {
@@ -574,6 +618,7 @@ impl NativeContext {
             mip_completions: vec![0],
             cancellation: std::sync::Arc::new(super::transfer::TransferCancellation::new()),
             binding,
+            depth,
             msaa,
         })
     }

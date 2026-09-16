@@ -257,7 +257,11 @@ fn prepare_mesh_pipeline(
             fragment_entry: &fragment.entry,
             stage_layouts,
             state,
-            depth_required,
+            depth: if depth_required {
+                ez_gfx_hal::DepthMode::Write
+            } else {
+                ez_gfx_hal::DepthMode::Disabled
+            },
             color_format: metal_color_format_key(color_format),
             depth_format: if depth_required { 252 } else { 0 },
             sample_count: 1,
@@ -302,7 +306,11 @@ fn prepare_mesh_pipeline(
                     &(fragment.product, fragment.entry.clone()),
                     state,
                     color_format,
-                    depth_required,
+                    if depth_required {
+                        ez_gfx_hal::DepthMode::Write
+                    } else {
+                        ez_gfx_hal::DepthMode::Disabled
+                    },
                     task_texture_heap,
                     mesh_texture_heap,
                     fragment_texture_heap,
@@ -516,7 +524,6 @@ impl ez_gfx_backend_metal::native::NativeFrameActionSource for MetalActionSource
                         MetalFrameResource::Texture(texture)
                     }
                     FrameNativeResource::Surface(_) => MetalFrameResource::Surface,
-                    FrameNativeResource::Depth => MetalFrameResource::Depth,
                     FrameNativeResource::RenderTarget(handle) => {
                         let record = self
                             .render_targets
@@ -526,6 +533,16 @@ impl ez_gfx_backend_metal::native::NativeFrameActionSource for MetalActionSource
                             return Err(ez_gfx_hal::HalError::InvalidArgument);
                         };
                         MetalFrameResource::RenderTarget(texture)
+                    }
+                    FrameNativeResource::RenderTargetDepth(handle) => {
+                        let record = self
+                            .render_targets
+                            .get(&handle)
+                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
+                        let NativeTexture::Metal(texture) = &record.native else {
+                            return Err(ez_gfx_hal::HalError::InvalidArgument);
+                        };
+                        MetalFrameResource::RenderTargetDepth(texture)
                     }
                     FrameNativeResource::Index => MetalFrameResource::Buffer(
                         self.index.ok_or(ez_gfx_hal::HalError::NotReady)?,
@@ -683,7 +700,11 @@ impl ez_gfx_backend_metal::native::NativeFrameActionSource for MetalActionSource
                             groups: *groups,
                             task_threads_per_group: task,
                             mesh_threads_per_group: mesh,
-                            depth_required: pipeline_layout.depth_required(),
+                            depth: if pipeline_layout.depth_required() {
+                                ez_gfx_hal::DepthMode::Write
+                            } else {
+                                ez_gfx_hal::DepthMode::Disabled
+                            },
                             state: *state,
                             texture_heap: self.texture_heaps[node],
                             bindings: &binding_source,
@@ -763,6 +784,31 @@ impl ez_gfx_backend_metal::native::NativeFrameActionSource for MetalActionSource
                             texture,
                             width: record.width,
                             height: record.height,
+                        }
+                    }
+                    ExecutableNode::CopyTexture {
+                        source,
+                        destination,
+                        region,
+                    } => {
+                        let NativeTexture::Metal(source) = self
+                            .textures
+                            .get(source)
+                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+                        else {
+                            return Err(ez_gfx_hal::HalError::InvalidArgument);
+                        };
+                        let NativeTexture::Metal(destination) = self
+                            .textures
+                            .get(destination)
+                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+                        else {
+                            return Err(ez_gfx_hal::HalError::InvalidArgument);
+                        };
+                        MetalFrameAction::CopyTexture {
+                            source,
+                            destination,
+                            region: *region,
                         }
                     }
                     ExecutableNode::Present { surface } => {

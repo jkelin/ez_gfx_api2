@@ -128,7 +128,7 @@ mod mesh_dispatch_tests {
         MeshShaderLimits, NativeContext, NativeMeshPipelineDesc, NativeShader, check_mesh_groups,
     };
     use ash::vk;
-    use ez_gfx_hal::{BlendMode, CullMode, FrontFace, HalError, MeshPipelineState};
+    use ez_gfx_hal::{BlendMode, CullMode, DepthMode, FrontFace, HalError, MeshPipelineState};
 
     fn limits() -> MeshShaderLimits {
         MeshShaderLimits {
@@ -149,6 +149,7 @@ mod mesh_dispatch_tests {
             cull: CullMode::None,
             front_face: FrontFace::CounterClockwise,
             blend: BlendMode::None,
+            depth: DepthMode::Disabled,
         }
     }
     fn describe<'a>(
@@ -162,7 +163,7 @@ mod mesh_dispatch_tests {
             state: raster(),
             color_format: None,
             layouts: &[],
-            depth_required: false,
+            depth: ez_gfx_hal::DepthMode::Disabled,
             task_workgroup_size: task.map(|_| [1, 1, 1]),
             mesh_workgroup_size: [32, 1, 1],
         }

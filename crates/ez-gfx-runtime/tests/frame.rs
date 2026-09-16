@@ -6,8 +6,8 @@ use ez_gfx_core::{
     handle::{CounterBufferHandle, LocalHandle, PackedHandle, ShaderHandle, TextureHandle},
 };
 use ez_gfx_hal::{
-    BufferRange, CompletionToken, DynamicPipelineState, ExecutionAction, MeshPipelineState,
-    MeshStages, QueueKind, ResourceAccess, ResourceState, ShaderStage,
+    BufferRange, CompletionToken, DepthMode, DynamicPipelineState, ExecutionAction,
+    MeshPipelineState, MeshStages, QueueKind, ResourceAccess, ResourceState, ShaderStage,
 };
 use ez_gfx_runtime::{
     binding::{PipelineLayout, ReflectedBindings},
@@ -515,6 +515,7 @@ fn graph_template_hit_keeps_current_mesh_group_payload() {
                         cull: ez_gfx_hal::CullMode::None,
                         front_face: ez_gfx_hal::FrontFace::CounterClockwise,
                         blend: ez_gfx_hal::BlendMode::None,
+                        depth: DepthMode::Disabled,
                     },
                 },
             )
@@ -610,6 +611,7 @@ fn traditional_mesh_traditional_nodes_share_attachment_load_store_pass() {
                     cull: ez_gfx_hal::CullMode::None,
                     front_face: ez_gfx_hal::FrontFace::CounterClockwise,
                     blend: ez_gfx_hal::BlendMode::None,
+                    depth: DepthMode::Disabled,
                 },
             },
         )

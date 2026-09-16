@@ -81,11 +81,16 @@ fn intern_depth_resource(context: &mut ContextState) -> Result<ResourceId> {
     if let Some(resource) = context.frame_depth {
         return Ok(resource);
     }
-    let surface = context.active_surface.ok_or(Error::NotReady)?;
     let (width, height) = context
-        .surfaces
-        .get(&surface)
-        .and_then(|surface| surface.state.extent())
+        .frame_render_target
+        .and_then(|target| context.render_targets.get(&target))
+        .map(|record| (record.width, record.height))
+        .or_else(|| {
+            context
+                .active_surface
+                .and_then(|surface| context.surfaces.get(&surface))
+                .and_then(|surface| surface.state.extent())
+        })
         .ok_or(Error::NotReady)?;
     let desc = ResourceDesc::image(
         width,
@@ -94,17 +99,20 @@ fn intern_depth_resource(context: &mut ContextState) -> Result<ResourceId> {
         1,
         Format::Depth32Float,
         1,
-        ResourceLifetime::Transient,
+        ResourceLifetime::External,
     )
     .map_err(|_| Error::InvalidArgument)?;
     let resource = context
         .frame
         .add_resource(desc)
         .map_err(|error| map_frame(&error))?;
+    let native_depth = context
+        .frame_render_target
+        .map_or(FrameNativeResource::Depth, FrameNativeResource::RenderTargetDepth);
     context.frame_depth = Some(resource);
     context
         .frame_native_resources
-        .insert(resource, FrameNativeResource::Depth);
+        .insert(resource, native_depth);
     Ok(resource)
 }
 
