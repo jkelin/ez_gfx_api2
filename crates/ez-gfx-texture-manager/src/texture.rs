@@ -327,7 +327,7 @@ impl PreparedTextureDecode {
                 }
                 let mut rgba8 =
                     Vec::with_capacity(pixel_count.checked_mul(4).ok_or(TextureError::TooLarge)?);
-                for rgb in data.chunks_exact(3) {
+                for rgb in data.as_chunks::<3>().0 {
                     rgba8.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
                 }
                 decoded(

@@ -77,11 +77,10 @@ impl NativeContext {
                 return Err(HalError::InvalidArgument);
             }
             let words = product
-                .chunks_exact(4)
-                .map(<[u8; 4]>::try_from)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| HalError::InvalidArgument)?
-                .into_iter()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
                 .map(u32::from_le_bytes)
                 .collect::<Vec<_>>();
             // SAFETY: `device.create_shader_module` reads nonempty whole words from `words`' contiguous `u32` storage, which remains allocated and unmodified for the call.

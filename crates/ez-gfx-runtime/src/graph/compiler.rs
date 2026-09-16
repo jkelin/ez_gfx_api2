@@ -322,16 +322,14 @@ impl FrameGraph {
         {
             return Err(GraphError::CapacityExhausted);
         }
-        if !cache_hit {
-            if let Some(cache) = cache {
-                cache.insert(
-                    &workspace.structure,
-                    digest,
-                    output,
-                    &workspace.edges,
-                    &workspace.positions,
-                );
-            }
+        if !cache_hit && let Some(cache) = cache {
+            cache.insert(
+                &workspace.structure,
+                digest,
+                output,
+                &workspace.edges,
+                &workspace.positions,
+            );
         }
         Ok(())
     }

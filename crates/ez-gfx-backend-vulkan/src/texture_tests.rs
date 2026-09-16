@@ -252,7 +252,7 @@ fn upload(
         .chunks_exact_mut(usize::try_from(bytes_per_image).unwrap())
         .zip(colors)
     {
-        for pixel in bytes.chunks_exact_mut(4) {
+        for pixel in bytes.as_chunks_mut::<4>().0 {
             pixel.copy_from_slice(color);
         }
     }
@@ -806,8 +806,8 @@ fn render_target_clear_applies_attachment_color_on_begin() {
     drop(actions);
     let bytes = context.readback_texture_rgba8(&target, 64, 64).unwrap();
     assert_eq!(bytes.len(), 64 * 64 * 4);
-    for pixel in bytes.chunks_exact(4) {
-        assert_eq!(pixel, [255, 0, 0, 255]);
+    for pixel in bytes.as_chunks::<4>().0 {
+        assert_eq!(*pixel, [255, 0, 0, 255]);
     }
     // Sampled textures stay rejected as color attachments.
     let probe = empty_texture(&mut context, 13);
@@ -961,8 +961,8 @@ fn render_target_msaa_clear_resolves_into_sampled_image() {
     // color into the sampled image that readback copies.
     let bytes = context.readback_texture_rgba8(&target, 64, 64).unwrap();
     assert_eq!(bytes.len(), 64 * 64 * 4);
-    for pixel in bytes.chunks_exact(4) {
-        assert_eq!(pixel, [0, 255, 0, 255]);
+    for pixel in bytes.as_chunks::<4>().0 {
+        assert_eq!(*pixel, [0, 255, 0, 255]);
     }
     // A 4-sample pass against a single-sample target (and vice versa) is rejected.
     let single = context
