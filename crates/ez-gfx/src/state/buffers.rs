@@ -978,7 +978,10 @@ mod tests {
         let offset = usize::try_from(COUNTER_BUFFER_ELEMENT_OFFSET).unwrap();
         let record = &payload[offset..];
         assert_eq!(record.len(), 24);
-        assert_eq!(u32::from_le_bytes(record[0..4].try_into().unwrap()), 0x0A11_CE00);
+        assert_eq!(
+            u32::from_le_bytes(record[0..4].try_into().unwrap()),
+            0x0A11_CE00
+        );
         assert_eq!(u32::from_le_bytes(record[4..8].try_into().unwrap()), 6);
         assert_eq!(u32::from_le_bytes(record[8..12].try_into().unwrap()), 2);
         assert_eq!(u32::from_le_bytes(record[12..16].try_into().unwrap()), 9);

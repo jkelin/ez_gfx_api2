@@ -545,10 +545,7 @@ fn counter_write_preserves_fifth_dword_bytes() {
     ];
     write_counter_commands(context, counter, 0, &commands).unwrap();
     with_context_mut(context, |state| {
-        let stored = state
-            .indirects
-            .get(&counter)
-            .ok_or(Error::InvalidContext)?;
+        let stored = state.indirects.get(&counter).ok_or(Error::InvalidContext)?;
         assert_eq!(stored.commands(), &commands);
         // The write path serializes each command field-by-field in struct
         // order, so pin the Pod layout the serializer assumes: 20 bytes with

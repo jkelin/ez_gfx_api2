@@ -96,7 +96,11 @@ fn prepare_dx12_mesh_pipeline(
             fragment_entry: &fragment.entry,
             stage_layouts,
             state,
-            depth_required,
+            depth: if depth_required {
+                ez_gfx_hal::DepthMode::Write
+            } else {
+                ez_gfx_hal::DepthMode::Disabled
+            },
             color_format: dx12_color_format(color_format)?,
             depth_format: if depth_required { 40 } else { 0 },
             sample_count: 1,
@@ -115,7 +119,11 @@ fn prepare_dx12_mesh_pipeline(
                 state,
                 color_format,
                 layouts: &layouts,
-                depth_required,
+                depth: if depth_required {
+                    ez_gfx_hal::DepthMode::Write
+                } else {
+                    ez_gfx_hal::DepthMode::Disabled
+                },
                 task_workgroup_size,
                 mesh_workgroup_size,
             })
@@ -250,7 +258,8 @@ fn prepare_dx12_pipelines(
                 (key, pipeline)
             }
             ExecutableNode::Mesh { .. } => unreachable!("mesh payload handled above"),
-            ExecutableNode::TextureReadback { .. }
+            ExecutableNode::CopyTexture { .. }
+            | ExecutableNode::TextureReadback { .. }
             | ExecutableNode::RenderTargetReadback { .. }
             | ExecutableNode::Present { .. } => continue,
         };
@@ -309,6 +318,16 @@ fn dx12_barrier_resource<'resources>(
                 return Err(Error::NativeFailure);
             };
             ez_gfx_backend_dx12::native::NativeFrameResource::RenderTarget(texture)
+        }
+        FrameNativeResource::RenderTargetDepth(handle) => {
+            let record = state
+                .render_targets
+                .get(&handle)
+                .ok_or(Error::InvalidContext)?;
+            let NativeTexture::Dx12(texture) = &record.native else {
+                return Err(Error::NativeFailure);
+            };
+            ez_gfx_backend_dx12::native::NativeFrameResource::RenderTargetDepth(texture)
         }
         FrameNativeResource::Index => ez_gfx_backend_dx12::native::NativeFrameResource::Buffer(
             state.index.ok_or(Error::NotReady)?,
@@ -418,6 +437,88 @@ impl DxActionSource<'_, '_> {
             allocations: self.state.allocations,
             vertex_heaps: self.state.vertex_heaps,
         })
+    }
+
+    fn texture_readback_action(
+        &self,
+        texture: TextureHandle,
+    ) -> std::result::Result<ez_gfx_backend_dx12::native::NativeFrameAction<'_>, ez_gfx_hal::HalError>
+    {
+        let info = self
+            .state
+            .submitted
+            .get(&texture)
+            .copied()
+            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
+        let NativeTexture::Dx12(native) = self
+            .state
+            .textures
+            .get(&texture)
+            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+        else {
+            return Err(ez_gfx_hal::HalError::InvalidArgument);
+        };
+        Ok(
+            ez_gfx_backend_dx12::native::NativeFrameAction::TextureReadback {
+                texture: native,
+                width: info.width,
+                height: info.height,
+            },
+        )
+    }
+
+    fn target_readback_action(
+        &self,
+        target: RenderTargetHandle,
+    ) -> std::result::Result<ez_gfx_backend_dx12::native::NativeFrameAction<'_>, ez_gfx_hal::HalError>
+    {
+        let record = self
+            .state
+            .render_targets
+            .get(&target)
+            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
+        let NativeTexture::Dx12(native) = &record.native else {
+            return Err(ez_gfx_hal::HalError::InvalidArgument);
+        };
+        Ok(
+            ez_gfx_backend_dx12::native::NativeFrameAction::TextureReadback {
+                texture: native,
+                width: record.width,
+                height: record.height,
+            },
+        )
+    }
+
+    fn copy_texture_action(
+        &self,
+        source: TextureHandle,
+        destination: TextureHandle,
+        region: ez_gfx_hal::TextureCopyRegion,
+    ) -> std::result::Result<ez_gfx_backend_dx12::native::NativeFrameAction<'_>, ez_gfx_hal::HalError>
+    {
+        let NativeTexture::Dx12(native_source) = self
+            .state
+            .textures
+            .get(&source)
+            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+        else {
+            return Err(ez_gfx_hal::HalError::InvalidArgument);
+        };
+        let NativeTexture::Dx12(native_destination) = self
+            .state
+            .textures
+            .get(&destination)
+            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+        else {
+            return Err(ez_gfx_hal::HalError::InvalidArgument);
+        };
+        Ok(
+            ez_gfx_backend_dx12::native::NativeFrameAction::CopyTexture {
+                source: native_source,
+                destination: native_destination,
+                region,
+            },
+        )
     }
 
     fn mesh_dispatch<'draw>(
@@ -562,41 +663,16 @@ impl ez_gfx_backend_dx12::native::NativeFrameActionSource for DxActionSource<'_,
                         )?)
                     }
                     ExecutableNode::TextureReadback { texture } => {
-                        let info = self
-                            .state
-                            .submitted
-                            .get(texture)
-                            .copied()
-                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
-                        let NativeTexture::Dx12(texture) = self
-                            .state
-                            .textures
-                            .get(texture)
-                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
-                        else {
-                            return Err(ez_gfx_hal::HalError::InvalidArgument);
-                        };
-                        ez_gfx_backend_dx12::native::NativeFrameAction::TextureReadback {
-                            texture,
-                            width: info.width,
-                            height: info.height,
-                        }
+                        self.texture_readback_action(*texture)?
                     }
                     ExecutableNode::RenderTargetReadback { target } => {
-                        let record = self
-                            .state
-                            .render_targets
-                            .get(target)
-                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?;
-                        let NativeTexture::Dx12(texture) = &record.native else {
-                            return Err(ez_gfx_hal::HalError::InvalidArgument);
-                        };
-                        ez_gfx_backend_dx12::native::NativeFrameAction::TextureReadback {
-                            texture,
-                            width: record.width,
-                            height: record.height,
-                        }
+                        self.target_readback_action(*target)?
                     }
+                    ExecutableNode::CopyTexture {
+                        source,
+                        destination,
+                        region,
+                    } => self.copy_texture_action(*source, *destination, *region)?,
                     ExecutableNode::Present { .. } => {
                         ez_gfx_backend_dx12::native::NativeFrameAction::Present
                     }
