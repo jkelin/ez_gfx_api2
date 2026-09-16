@@ -417,6 +417,7 @@ impl NativeContext {
             let enabled_core = vk::PhysicalDeviceFeatures::default()
                 .vertex_pipeline_stores_and_atomics(vertex_storage)
                 .multi_draw_indirect(multi_draw)
+                .draw_indirect_first_instance(core_features.draw_indirect_first_instance != 0)
                 .sampler_anisotropy(core_features.sampler_anisotropy != 0);
             let shader_stages =
                 normalized_mesh_shader_capabilities(mesh_extension_available, &mesh_features);
