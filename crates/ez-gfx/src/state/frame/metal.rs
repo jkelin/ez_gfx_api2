@@ -1,14 +1,14 @@
 use crate::Result;
 use ez_gfx_core::capability::PresentationMode;
 
-use super::super::map_texture;
+use super::super::{TextureId, map_texture};
 use super::{
     Backend, ContextState, Error, ExecutableNode, ExecutionAction, FrameBindingSource,
     FrameBufferBindingRecord, FrameExecutionPlan, FrameNativeResource, GeometryAllocation, HashMap,
     MAX_PIPELINE_CACHE_ENTRIES, MeshPipelineKeyDesc, MetalWorkgroupSizes, NativeAllocation,
     NativeContext, NativePipeline, NativeShader, NativeSurface, NativeTexture, PipelineKey,
     RenderTargetHandle, RenderTargetRecord, ResourceId, SURFACE_DEFAULT_CLEAR, ShaderRecord,
-    SubmittedInfo, TextureHandle, TextureId, map_hal, native_layouts, pipeline_layout_key,
+    SubmittedInfo, TextureHandle, map_hal, native_layouts, pipeline_layout_key,
     prepare_frame_binding_scratch, should_capture_presented,
 };
 use arrayvec::ArrayVec;

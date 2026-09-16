@@ -311,6 +311,17 @@ impl PipelineKey {
 
 const MAX_PIPELINE_CACHE_ENTRIES: usize = 1024;
 
+#[cfg(target_vendor = "apple")]
+#[derive(Clone, Copy)]
+enum MetalWorkgroupSizes {
+    Compute([u32; 3]),
+    // Metal mesh pipelines may omit the task/object stage.
+    Mesh {
+        task: Option<[u32; 3]>,
+        mesh: [u32; 3],
+    },
+}
+
 struct ShaderRecord {
     native: NativeShader,
     digest: [u8; 32],
