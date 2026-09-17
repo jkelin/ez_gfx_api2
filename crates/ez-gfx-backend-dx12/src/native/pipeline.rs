@@ -405,7 +405,11 @@ impl NativeContext {
         depth_required: bool,
         color_format: Option<ez_gfx_runtime::target::Format>,
         layouts: &[ShaderBufferLayout],
+        samples: u8,
     ) -> Result<NativePipeline, HalError> {
+        if !matches!(samples, 1 | 2 | 4 | 8) {
+            return Err(HalError::InvalidArgument);
+        }
         let vertex = vertex_shader
             .products
             .get(vertex_index)
@@ -522,7 +526,7 @@ impl NativeContext {
                 DXGI_FORMAT_UNKNOWN
             },
             SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
+                Count: u32::from(samples),
                 Quality: 0,
             },
             ..Default::default()
@@ -626,6 +630,9 @@ impl NativeContext {
         if desc.task_workgroup_size.is_some() != has_task {
             return Err(HalError::InvalidArgument);
         }
+        if !matches!(desc.samples, 1 | 2 | 4 | 8) {
+            return Err(HalError::InvalidArgument);
+        }
         let task_bytes = desc
             .task
             .map(|(shader, index)| mesh_product(shader, index))
@@ -697,7 +704,7 @@ impl NativeContext {
             sample_desc: StreamSubobject {
                 subobject_type: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC,
                 payload: DXGI_SAMPLE_DESC {
-                    Count: 1,
+                    Count: u32::from(desc.samples),
                     Quality: 0,
                 },
             },

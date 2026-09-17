@@ -579,7 +579,10 @@ impl Frame {
         }
         let name = name.into();
         let [width, height] = size;
-        if width == 0 || height == 0 {
+        if width == 0
+            || height == 0
+            || !matches!(descriptor.maximum_samples, 1 | 2 | 4 | 8)
+        {
             return self.fail(Error::InvalidArgument);
         }
         // Cache identity is the stable name; descriptor or extent changes replace
@@ -595,6 +598,7 @@ impl Frame {
                     && target.format == descriptor.color_format
                     && target.depth_format == descriptor.depth_format
                     && target.clear_color == descriptor.clear_color
+                    && target.maximum_samples == descriptor.maximum_samples
             });
         let handle = if let Some(target) = cached {
             target.handle
@@ -603,7 +607,7 @@ impl Frame {
                 name.clone(),
                 ez_gfx_runtime::target::TargetUsage::Color,
                 1.0,
-                1,
+                descriptor.maximum_samples,
                 vec![descriptor.color_format],
                 ez_gfx_runtime::target::ClearValue::Color(descriptor.clear_color),
                 true,
@@ -629,6 +633,7 @@ impl Frame {
                     extent: (width, height),
                     depth_format: descriptor.depth_format,
                     clear_color: descriptor.clear_color,
+                    maximum_samples: descriptor.maximum_samples,
                 },
             );
         if let Some(previous) = previous {

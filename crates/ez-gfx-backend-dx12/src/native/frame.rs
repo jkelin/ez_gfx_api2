@@ -4,13 +4,13 @@ use super::{
     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
     D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT,
-    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_VIEWPORT, DXGI_FORMAT_R32_UINT, FRAMES_IN_FLIGHT,
-    HalError, ID3D12CommandList, ID3D12PipelineState, INFINITE, Interface, MemoryAllocator,
-    MemoryClass, NativeAllocation, NativeContext, NativeFrameAction, NativeFrameActionSource,
-    NativeFrameResource, NativeSurface, PresentationMode, QueueKind, RECT, WaitForSingleObject,
-    bind_dx12_compute_buffers, bind_dx12_graphics_buffers, copy_texture_to_readback,
-    dx12_resource_state, map_windows, presentation_parameters, record_resource_barriers,
-    transition_barrier, uav_barrier,
+    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_VIEWPORT,
+    DXGI_FORMAT_R32_UINT, FRAMES_IN_FLIGHT, HalError, ID3D12CommandList, ID3D12PipelineState,
+    INFINITE, Interface, MemoryAllocator, MemoryClass, NativeAllocation, NativeContext,
+    NativeFrameAction, NativeFrameActionSource, NativeFrameResource, NativeSurface,
+    PresentationMode, QueueKind, RECT, WaitForSingleObject, bind_dx12_compute_buffers,
+    bind_dx12_graphics_buffers, copy_texture_to_readback, dx12_resource_state, map_windows,
+    presentation_parameters, record_resource_barriers, transition_barrier, uav_barrier,
 };
 use arrayvec::ArrayVec;
 use ez_gfx_hal::COUNTER_BUFFER_ELEMENT_OFFSET;
@@ -525,44 +525,42 @@ impl DxFrameEncoder<'_> {
         barrier: &super::ExecutionBarrier,
         resource: &super::NativeFrameResource<'_>,
     ) -> Result<(), HalError> {
-        // A multisampled target transitions its render storage alongside the
-        // sampled resolve image so both stay in the compiler-derived states;
-        // the MSAA image is never sampled.
-        let mut natives = [None, None];
-        let native_count = match resource {
-            NativeFrameResource::Buffer(allocation) => {
-                natives[0] = Some(allocation.resource.clone());
-                1
-            }
-            NativeFrameResource::Texture(texture) | NativeFrameResource::RenderTarget(texture) => {
-                natives[0] = Some(texture.resource.clone());
-                if let Some(msaa) = texture.msaa.as_ref() {
-                    natives[1] = Some(msaa.resource.clone());
-                    2
-                } else {
-                    1
-                }
-            }
-            NativeFrameResource::RenderTargetDepth(texture) => {
-                let depth = texture.depth.as_ref().ok_or(HalError::NotReady)?;
-                natives[0] = Some(depth.resource.clone());
-                1
-            }
-            NativeFrameResource::Surface => {
-                natives[0] = Some(self.back_buffer.cloned().ok_or(HalError::InvalidArgument)?);
-                1
-            }
-            NativeFrameResource::Depth => {
-                natives[0] = Some(
-                    self.surface
-                        .as_ref()
-                        .and_then(|surface| surface.depth.as_ref())
-                        .ok_or(HalError::NotReady)?
-                        .resource
-                        .clone(),
-                );
-                1
-            }
+        // The resolve image follows the graph state. Multisampled storage stays
+        // in render-target state between passes because it is never sampled,
+        // copied, or exposed through a descriptor.
+        let (native, first_msaa_attachment) = match resource {
+            NativeFrameResource::Buffer(allocation) => (allocation.resource.clone(), None),
+            NativeFrameResource::Texture(texture) => (texture.resource.clone(), None),
+            NativeFrameResource::RenderTarget(texture) => (
+                texture.resource.clone(),
+                texture
+                    .msaa
+                    .as_ref()
+                    .filter(|_| barrier.before.is_none())
+                    .map(|msaa| msaa.resource.clone()),
+            ),
+            NativeFrameResource::RenderTargetDepth(texture) => (
+                texture
+                    .depth
+                    .as_ref()
+                    .ok_or(HalError::NotReady)?
+                    .resource
+                    .clone(),
+                None,
+            ),
+            NativeFrameResource::Surface => (
+                self.back_buffer.cloned().ok_or(HalError::InvalidArgument)?,
+                None,
+            ),
+            NativeFrameResource::Depth => (
+                self.surface
+                    .as_ref()
+                    .and_then(|surface| surface.depth.as_ref())
+                    .ok_or(HalError::NotReady)?
+                    .resource
+                    .clone(),
+                None,
+            ),
         };
         let before = match barrier.before {
             Some(state) => dx12_resource_state(state)?,
@@ -570,16 +568,21 @@ impl DxFrameEncoder<'_> {
         };
         let after = dx12_resource_state(barrier.after)?;
         if before == after && after == D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
-            for native in natives.iter().take(native_count).flatten() {
-                record_resource_barriers(self.list, [uav_barrier(native.clone())]);
-            }
+            record_resource_barriers(self.list, [uav_barrier(native)]);
         } else if before != after {
-            for native in natives.iter().take(native_count).flatten() {
-                record_resource_barriers(
-                    self.list,
-                    [transition_barrier(native.clone(), before, after)],
-                );
-            }
+            record_resource_barriers(self.list, [transition_barrier(native, before, after)]);
+        }
+        if after == D3D12_RESOURCE_STATE_RENDER_TARGET
+            && let Some(msaa) = first_msaa_attachment
+        {
+            record_resource_barriers(
+                self.list,
+                [transition_barrier(
+                    msaa,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                )],
+            );
         }
 
         Ok(())

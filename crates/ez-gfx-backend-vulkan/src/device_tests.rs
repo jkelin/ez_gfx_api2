@@ -164,6 +164,7 @@ mod mesh_dispatch_tests {
             color_format: None,
             layouts: &[],
             depth: ez_gfx_hal::DepthMode::Disabled,
+            samples: 1,
             task_workgroup_size: task.map(|_| [1, 1, 1]),
             mesh_workgroup_size: [32, 1, 1],
         }

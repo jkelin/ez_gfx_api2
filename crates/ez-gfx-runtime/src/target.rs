@@ -148,6 +148,20 @@ impl TargetDeclaration {
     pub const fn samples(&self) -> u8 {
         self.samples
     }
+    /// Returns this declaration with its negotiated sample count.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `samples` is not one of `1`, `2`, `4`, or `8`.
+    pub fn with_samples(mut self, samples: u8) -> Result<Self, TargetError> {
+        // Target negotiation may only reduce the already-validated request to
+        // another hardware sample count; arbitrary values remain invalid.
+        if !matches!(samples, 1 | 2 | 4 | 8) {
+            return Err(TargetError::InvalidSamples);
+        }
+        self.samples = samples;
+        Ok(self)
+    }
     /// Returns acceptable formats in preference order.
     pub fn candidates(&self) -> &[Format] {
         &self.candidates
@@ -264,6 +278,55 @@ impl FormatCapabilities {
             declaration,
             CompressionSupport::BC.union(CompressionSupport::ASTC),
         )
+    }
+
+    /// Selects the first compatible format and the highest supported sample
+    /// count not exceeding the declaration's request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no candidate supports the requested usage,
+    /// sampling role, or compression family.
+    pub fn resolve_with_sample_fallback(
+        &self,
+        declaration: &TargetDeclaration,
+    ) -> Result<(Format, u8), TargetError> {
+        self.resolve_with_sample_fallback_and_compression(
+            declaration,
+            CompressionSupport::BC.union(CompressionSupport::ASTC),
+        )
+    }
+
+    /// Resolves a format and automatically reduces MSAA to the device ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no candidate supports the requested usage,
+    /// sampling role, or admitted compression family.
+    pub fn resolve_with_sample_fallback_and_compression(
+        &self,
+        declaration: &TargetDeclaration,
+        compression: CompressionSupport,
+    ) -> Result<(Format, u8), TargetError> {
+        declaration
+            .candidates
+            .iter()
+            .copied()
+            .find_map(|candidate| {
+                let support = self.formats.get(&candidate)?;
+                let usage = match declaration.usage {
+                    TargetUsage::Color => support.color,
+                    TargetUsage::Depth => candidate == Format::Depth32Float,
+                    TargetUsage::Storage => support.storage,
+                    TargetUsage::Sampled => support.sampled,
+                };
+                let sampleable = !declaration.sampleable || support.sampled;
+                let compressed = support.compression == CompressionSupport::NONE
+                    || support.compression.intersects(compression);
+                (usage && sampleable && compressed)
+                    .then_some((candidate, declaration.samples.min(support.max_samples)))
+            })
+            .ok_or(TargetError::UnsupportedFormat)
     }
 
     /// Candidate order is authoritative; compressed candidates also require the admitted device family.

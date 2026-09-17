@@ -90,8 +90,12 @@ pub fn create_render_target(
                 .probe_target_formats()
                 .map_err(|_| Error::NativeFailure)?,
         };
-        let format = capabilities
-            .resolve_with_compression(declaration, compression)
+        let (format, samples) = capabilities
+            .resolve_with_sample_fallback_and_compression(declaration, compression)
+            .map_err(map_target_error)?;
+        let declaration = declaration
+            .clone()
+            .with_samples(samples)
             .map_err(map_target_error)?;
         // The native constructor repeats these checks; fail before leasing a
         // binding so rejected requests leave no allocator residue.
@@ -100,10 +104,24 @@ pub fn create_render_target(
             Format::Rgba16Float => 8,
             _ => return Err(Error::Unsupported),
         };
-        let bytes = u64::from(width)
+        let pixels = u64::from(width)
             .checked_mul(u64::from(height))
-            .and_then(|pixels| pixels.checked_mul(bytes_per_texel))
-            .and_then(|single| single.checked_mul(u64::from(declaration.samples())))
+            .ok_or(Error::NativeFailure)?;
+        let color_samples = u64::from(samples) + u64::from(samples > 1);
+        let color_bytes = pixels
+            .checked_mul(bytes_per_texel)
+            .and_then(|single| single.checked_mul(color_samples))
+            .ok_or(Error::NativeFailure)?;
+        let depth_bytes = if depth_format.is_some() {
+            pixels
+                .checked_mul(4)
+                .and_then(|single| single.checked_mul(u64::from(samples)))
+                .ok_or(Error::NativeFailure)?
+        } else {
+            0
+        };
+        let bytes = color_bytes
+            .checked_add(depth_bytes)
             .ok_or(Error::NativeFailure)?;
         if bytes > super::MAX_TEXTURE_BYTES as u64 {
             return Err(Error::NativeFailure);
@@ -198,7 +216,7 @@ pub fn create_render_target(
             typed,
             RenderTargetRecord {
                 native,
-                declaration: declaration.clone(),
+                declaration,
                 format,
                 width,
                 height,
@@ -253,6 +271,25 @@ pub fn render_target_format(context: ContextHandle, target: RenderTargetHandle) 
             .render_targets
             .get(&target)
             .map(|record| record.format)
+            .ok_or(Error::InvalidArgument)
+    })
+}
+
+/// Reports the negotiated sample count of a live render target.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] for an unknown or destroyed handle.
+pub fn render_target_samples(context: ContextHandle, target: RenderTargetHandle) -> Result<u8> {
+    with_context_mut(context, |context| {
+        context
+            .identity
+            .check_thread_and_health()
+            .map_err(map_lifecycle)?;
+        context
+            .render_targets
+            .get(&target)
+            .map(|record| record.declaration.samples())
             .ok_or(Error::InvalidArgument)
     })
 }

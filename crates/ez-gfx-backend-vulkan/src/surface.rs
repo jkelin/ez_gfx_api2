@@ -521,11 +521,15 @@ impl NativeContext {
     /// # Errors
     ///
     /// Returns an error if required device or allocator state is absent, depth-target cleanup or allocation fails, or a Vulkan wait, image-creation, memory-binding, or image-view operation fails.
-    pub(super) fn ensure_depth_target(&mut self, extent: vk::Extent2D) -> Result<(), HalError> {
+    pub(super) fn ensure_depth_target(
+        &mut self,
+        extent: vk::Extent2D,
+        samples: vk::SampleCountFlags,
+    ) -> Result<(), HalError> {
         if self
             .depth_target
             .as_ref()
-            .is_some_and(|target| target.extent == extent)
+            .is_some_and(|target| target.extent == extent && target.samples == samples)
         {
             return Ok(());
         }
@@ -542,7 +546,7 @@ impl NativeContext {
             })
             .mip_levels(1)
             .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
+            .samples(samples)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
@@ -616,6 +620,7 @@ impl NativeContext {
             view,
             allocation,
             extent,
+            samples,
         });
         Ok(())
     }

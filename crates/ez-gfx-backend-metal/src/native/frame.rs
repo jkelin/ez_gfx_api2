@@ -158,11 +158,11 @@ impl MetalFrameEncoder<'_> {
             AttachmentLoadOp::Clear => MTLLoadAction::Clear,
             AttachmentLoadOp::Discard => MTLLoadAction::DontCare,
         });
-        // A multisampled target resolves into the sampled texture instead of
-        // storing its storage.
+        // Preserve multisampled storage for a later load while also resolving
+        // the sampled texture at this pass boundary.
         let resolving = matches!(target, Target::Target(texture) if texture.msaa.is_some());
         color.setStoreAction(match pass.store {
-            AttachmentStoreOp::Store if resolving => MTLStoreAction::MultisampleResolve,
+            AttachmentStoreOp::Store if resolving => MTLStoreAction::StoreAndMultisampleResolve,
             AttachmentStoreOp::Store => MTLStoreAction::Store,
             AttachmentStoreOp::Discard => MTLStoreAction::DontCare,
         });

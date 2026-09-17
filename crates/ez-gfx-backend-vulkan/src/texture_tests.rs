@@ -899,13 +899,30 @@ fn render_target_msaa_clear_resolves_into_sampled_image() {
         return;
     };
     let target = context
-        .create_render_target(Format::Rgba8Unorm, None, 64, 64, 17, msaa_samples)
+        .create_render_target(
+            Format::Rgba8Unorm,
+            Some(Format::Depth32Float),
+            64,
+            64,
+            17,
+            msaa_samples,
+        )
         .unwrap();
     assert!(target.msaa.is_some());
+    assert_eq!(
+        target.depth.as_ref().map(|depth| depth.samples),
+        super::msaa::sample_count_flags(msaa_samples)
+    );
     let attach = ResourceState::new(
         QueueKind::Graphics,
         ShaderStage::AllGraphics,
         ResourceAccess::ColorAttachmentWrite,
+    )
+    .unwrap();
+    let depth_attach = ResourceState::new(
+        QueueKind::Graphics,
+        ShaderStage::Fragment,
+        ResourceAccess::DepthStencilWrite,
     )
     .unwrap();
     let sampled_state = ResourceState::new(
@@ -918,7 +935,7 @@ fn render_target_msaa_clear_resolves_into_sampled_image() {
     let pass = ExecutionPass {
         nodes: vec![],
         colors: vec![0],
-        depth: None,
+        depth: Some(1),
         area: [0, 0, 64, 64],
         samples: msaa_samples,
         load: AttachmentLoadOp::Clear,
@@ -934,6 +951,16 @@ fn render_target_msaa_clear_resolves_into_sampled_image() {
                 after: attach,
             },
             resource: NativeFrameResource::RenderTarget(&target),
+        },
+        NativeFrameAction::Barrier {
+            barrier: ExecutionBarrier {
+                node: 0,
+                resource: 1,
+                range,
+                before: None,
+                after: depth_attach,
+            },
+            resource: NativeFrameResource::RenderTargetDepth(&target),
         },
         NativeFrameAction::BeginPass {
             pass: &pass,

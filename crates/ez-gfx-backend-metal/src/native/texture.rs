@@ -508,6 +508,11 @@ impl NativeContext {
                     false,
                 )
             };
+            if samples > 1 {
+                depth_desc.setTextureType(MTLTextureType::Type2DMultisample);
+                // SAFETY: 2 and 4 are valid Metal sample counts, checked above.
+                unsafe { depth_desc.setSampleCount(usize::from(samples)) };
+            }
             depth_desc.setUsage(MTLTextureUsage::RenderTarget);
             depth_desc.setStorageMode(MTLStorageMode::Private);
             let depth_allocation = self

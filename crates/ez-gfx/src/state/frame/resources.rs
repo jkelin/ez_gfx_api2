@@ -81,15 +81,22 @@ fn intern_depth_resource(context: &mut ContextState) -> Result<ResourceId> {
     if let Some(resource) = context.frame_depth {
         return Ok(resource);
     }
-    let (width, height) = context
+    let (width, height, samples) = context
         .frame_render_target
         .and_then(|target| context.render_targets.get(&target))
-        .map(|record| (record.width, record.height))
+        .map(|record| {
+            (
+                record.width,
+                record.height,
+                record.declaration.samples(),
+            )
+        })
         .or_else(|| {
             context
                 .active_surface
                 .and_then(|surface| context.surfaces.get(&surface))
                 .and_then(|surface| surface.state.extent())
+                .map(|(width, height)| (width, height, 1))
         })
         .ok_or(Error::NotReady)?;
     let desc = ResourceDesc::image(
@@ -98,7 +105,7 @@ fn intern_depth_resource(context: &mut ContextState) -> Result<ResourceId> {
         1,
         1,
         Format::Depth32Float,
-        1,
+        samples,
         ResourceLifetime::External,
     )
     .map_err(|_| Error::InvalidArgument)?;

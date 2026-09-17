@@ -279,6 +279,8 @@ pub struct NativeMeshPipelineDesc<'a> {
     pub layouts: &'a [ShaderBufferLayout],
     /// Explicit depth behavior for the mesh pipeline.
     pub depth: ez_gfx_hal::DepthMode,
+    /// Rasterization sample count selected for the active target.
+    pub samples: u8,
     /// Optional task workgroup size from reflection.
     pub task_workgroup_size: Option<[u32; 3]>,
     /// Mesh workgroup size from reflection.

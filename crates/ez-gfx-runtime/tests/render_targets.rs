@@ -92,6 +92,37 @@ fn format_resolution_follows_candidate_order_and_required_usage() {
 }
 
 #[test]
+fn format_resolution_degrades_to_the_supported_sample_count() {
+    let declaration = TargetDeclaration::new(
+        "adaptive-msaa",
+        TargetUsage::Color,
+        1.0,
+        8,
+        vec![Format::Rgba8Unorm],
+        ClearValue::Color([0.0; 4]),
+        true,
+    )
+    .unwrap();
+    let formats = FormatCapabilities::new(vec![
+        FormatSupport::new(
+            Format::Rgba8Unorm,
+            true,
+            true,
+            false,
+            4,
+            CompressionSupport::NONE,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+
+    assert_eq!(
+        formats.resolve_with_sample_fallback(&declaration),
+        Ok((Format::Rgba8Unorm, 4))
+    );
+}
+
+#[test]
 fn compressed_formats_require_device_family_support() {
     let declaration = TargetDeclaration::new(
         "texture",

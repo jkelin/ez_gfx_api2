@@ -13,6 +13,16 @@ use super::{
     validate_mesh_dispatch, vk,
 };
 
+fn rasterization_samples(samples: u8) -> Result<vk::SampleCountFlags, HalError> {
+    match samples {
+        1 => Ok(vk::SampleCountFlags::TYPE_1),
+        2 => Ok(vk::SampleCountFlags::TYPE_2),
+        4 => Ok(vk::SampleCountFlags::TYPE_4),
+        8 => Ok(vk::SampleCountFlags::TYPE_8),
+        _ => Err(HalError::InvalidArgument),
+    }
+}
+
 use ez_gfx_hal::MeshDispatchError;
 
 /// Resolves the exact task/mesh/fragment modules named by a mesh pipeline request.
@@ -271,6 +281,7 @@ impl NativeContext {
             layouts,
             depth_required,
             color_format,
+            samples,
         } = desc;
         let device = self.device.as_ref().ok_or(HalError::NotReady)?;
         let color_format = pipeline_color_format(self.swapchain_format, color_format)?;
@@ -336,7 +347,7 @@ impl NativeContext {
             .front_face(front)
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            .rasterization_samples(rasterization_samples(samples)?);
         let color = vk::PipelineColorBlendStateCreateInfo::default()
             .attachments(core::slice::from_ref(&blend));
         let depth_mode = state.resolved_depth(depth_required);
@@ -522,7 +533,7 @@ impl NativeContext {
             .front_face(front)
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            .rasterization_samples(rasterization_samples(desc.samples)?);
         let color = vk::PipelineColorBlendStateCreateInfo::default()
             .attachments(core::slice::from_ref(&blend));
         let depth_enabled = !matches!(desc.depth, ez_gfx_hal::DepthMode::Disabled);

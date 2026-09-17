@@ -909,6 +909,7 @@ mod adapter_tests {
             color_format: None,
             layouts: &[],
             depth: DepthMode::Disabled,
+            samples: 1,
             task_workgroup_size: task.map(|_| [1, 1, 1]),
             mesh_workgroup_size: [32, 1, 1],
         }

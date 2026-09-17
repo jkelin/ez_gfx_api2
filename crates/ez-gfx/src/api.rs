@@ -97,6 +97,7 @@ struct CachedRenderTarget {
     extent: (u32, u32),
     depth_format: Option<ez_gfx_runtime::target::Format>,
     clear_color: [f32; 4],
+    maximum_samples: u8,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

@@ -1139,10 +1139,13 @@ impl NativeContext {
             Ok(())
         })?;
         if requires_depth {
-            self.ensure_depth_target(vk::Extent2D {
-                width: extent.0,
-                height: extent.1,
-            })?;
+            self.ensure_depth_target(
+                vk::Extent2D {
+                    width: extent.0,
+                    height: extent.1,
+                },
+                vk::SampleCountFlags::TYPE_1,
+            )?;
         }
         let prepared = self.prepare_frame_slot(uses_surface)?;
         let frame_value = self.next_frame_value;

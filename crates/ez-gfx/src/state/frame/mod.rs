@@ -443,9 +443,6 @@ fn graphics_pass_node(
                 .render_targets
                 .get(&target)
                 .ok_or(Error::InvalidContext)?;
-            if record.declaration.samples() != 1 {
-                return Err(Error::Unsupported);
-            }
             (record.width, record.height, record.declaration.samples())
         };
         let depth = if pipeline_layout.depth_required() {

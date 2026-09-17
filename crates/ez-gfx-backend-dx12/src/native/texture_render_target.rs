@@ -96,7 +96,8 @@ impl NativeContext {
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_DEPTH_STENCIL_VIEW_DESC, D3D12_DESCRIPTOR_HEAP_DESC,
             D3D12_DESCRIPTOR_HEAP_FLAG_NONE, D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
-            D3D12_DSV_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            D3D12_DSV_DIMENSION_TEXTURE2D, D3D12_DSV_DIMENSION_TEXTURE2DMS,
+            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
         };
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT;
         let mips = [ImageMip {
@@ -131,7 +132,11 @@ impl NativeContext {
                 &depth_resource,
                 Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
                     Format: DXGI_FORMAT_D32_FLOAT,
-                    ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+                    ViewDimension: if samples == 1 {
+                        D3D12_DSV_DIMENSION_TEXTURE2D
+                    } else {
+                        D3D12_DSV_DIMENSION_TEXTURE2DMS
+                    },
                     ..Default::default()
                 }),
                 dsv,

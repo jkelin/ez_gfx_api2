@@ -624,7 +624,7 @@ impl NativeContext {
             (image, view, resolve_sampler, allocation),
         )?;
         let depth = if depth_format.is_some() {
-            self.ensure_depth_target(vk::Extent2D { width, height })
+            self.ensure_depth_target(vk::Extent2D { width, height }, sample_flags)
                 .map_err(|error| match error {
                     ez_gfx_hal::HalError::NativeFailure => AllocationError::NativeFailure,
                     _ => AllocationError::Unsupported,

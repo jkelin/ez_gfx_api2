@@ -153,6 +153,7 @@ impl NativeContext {
         depth_required: bool,
         vertex_texture_heap: Option<ShaderTextureHeapLayout>,
         fragment_texture_heap: Option<ShaderTextureHeapLayout>,
+        samples: u8,
     ) -> Result<NativePipeline, HalError> {
         if vertex.1.is_empty()
             || vertex.1.as_bytes().contains(&0)
@@ -161,6 +162,9 @@ impl NativeContext {
             || state.topology == PrimitiveTopology::TriangleFan
         {
             return Err(HalError::InvalidArgument);
+        }
+        if !matches!(samples, 1 | 2 | 4) {
+            return Err(HalError::Unsupported);
         }
         let vertex_library = vertex_shader
             .libraries
@@ -179,6 +183,7 @@ impl NativeContext {
         let descriptor = MTLRenderPipelineDescriptor::new();
         descriptor.setVertexFunction(Some(&vertex));
         descriptor.setFragmentFunction(Some(&fragment));
+        descriptor.setRasterSampleCount(usize::from(samples));
         // SAFETY: Metal defines eight color-attachment slots, so index 0 is valid, and `descriptor` keeps the attachment-array storage allocated through `objectAtIndexedSubscript:`.
         let color = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
         color.setPixelFormat(Self::render_pipeline_color_format(color_format)?);
@@ -238,6 +243,7 @@ impl NativeContext {
         fragment_buffer_layouts: &[ez_gfx_hal::ShaderBufferLayout],
         task_threads: Option<[u32; 3]>,
         mesh_threads: [u32; 3],
+        samples: u8,
     ) -> Result<NativePipeline, HalError> {
         validate_mesh_capabilities(
             self.adapter.capabilities().shader_stages,
@@ -252,6 +258,9 @@ impl NativeContext {
             || task.is_some_and(|entry| entry.1.is_empty() || entry.1.as_bytes().contains(&0))
         {
             return Err(HalError::InvalidArgument);
+        }
+        if !matches!(samples, 1 | 2 | 4) {
+            return Err(HalError::Unsupported);
         }
         let shared_limits = self.mesh_dispatch_limits(task_shader.is_some())?;
         let coarse = self.max_threads_per_threadgroup;
@@ -290,6 +299,7 @@ impl NativeContext {
             descriptor.setMeshFunction(Some(&mesh_function));
             descriptor.setFragmentFunction(Some(&fragment_function));
         }
+        descriptor.setRasterSampleCount(usize::from(samples));
         let mesh_total = mesh_threads
             .into_iter()
             .try_fold(1_u32, u32::checked_mul)

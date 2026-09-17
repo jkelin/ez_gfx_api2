@@ -7,6 +7,9 @@ pub struct RenderTargetDescriptor {
     pub depth_format: Option<ez_gfx_runtime::target::Format>,
     /// Color applied when the attachment begins with a clear load operation.
     pub clear_color: [f32; 4],
+    /// Preferred MSAA count; allocation automatically degrades to the highest
+    /// hardware-supported count not exceeding this value.
+    pub maximum_samples: u8,
 }
 
 impl RenderTargetDescriptor {
@@ -17,6 +20,7 @@ impl RenderTargetDescriptor {
             color_format,
             depth_format: None,
             clear_color: [0.1, 0.1, 0.1, 1.0],
+            maximum_samples: 1,
         }
     }
 
@@ -27,12 +31,22 @@ impl RenderTargetDescriptor {
             color_format,
             depth_format: Some(ez_gfx_runtime::target::Format::Depth32Float),
             clear_color: [0.1, 0.1, 0.1, 1.0],
+            maximum_samples: 1,
         }
     }
     /// Overrides the clear color used by the attachment pass.
     #[must_use]
     pub const fn with_clear_color(mut self, clear_color: [f32; 4]) -> Self {
         self.clear_color = clear_color;
+        self
+    }
+    /// Requests up to `maximum_samples` samples per pixel.
+    ///
+    /// Values other than `1`, `2`, `4`, or `8` are rejected when the target
+    /// is configured.
+    #[must_use]
+    pub const fn with_maximum_samples(mut self, maximum_samples: u8) -> Self {
+        self.maximum_samples = maximum_samples;
         self
     }
 }
@@ -124,6 +138,28 @@ impl RenderTarget {
             RenderTargetBacking::Surface { .. } => {
                 Ok(Some(ez_gfx_runtime::target::Format::Depth32Float))
             }
+        }
+    }
+
+    /// Returns the negotiated sample count.
+    ///
+    /// Managed targets may report fewer samples than requested when hardware
+    /// support is lower. Surface targets are currently single-sampled.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when the target is stale.
+    pub fn samples(&self) -> Result<u8> {
+        let context = Context {
+            inner: Rc::clone(&self.inner.context),
+            owner: false,
+        };
+        context.check_entry()?;
+        match &self.inner.backing {
+            RenderTargetBacking::Managed(_) => state::render_target_samples(
+                self.inner.context.handle,
+                self.inner.managed_handle()?,
+            ),
+            RenderTargetBacking::Surface { .. } => Ok(1),
         }
     }
 

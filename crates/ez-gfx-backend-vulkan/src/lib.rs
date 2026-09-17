@@ -235,6 +235,8 @@ pub struct NativeMeshPipelineDesc<'a> {
     pub layouts: &'a [ShaderBufferLayout],
     /// Explicit depth behavior for the mesh pipeline.
     pub depth: ez_gfx_hal::DepthMode,
+    /// Rasterization sample count selected for the active target.
+    pub samples: u8,
     /// Optional task workgroup size from reflection.
     pub task_workgroup_size: Option<[u32; 3]>,
     /// Mesh workgroup size from reflection.
@@ -255,6 +257,8 @@ pub struct NativeGraphicsPipelineDesc<'a> {
     pub layouts: &'a [ShaderBufferLayout],
     /// Whether the pipeline requires a depth attachment.
     pub depth_required: bool,
+    /// Rasterization sample count selected for the active target.
+    pub samples: u8,
 }
 
 /// Fully resolved indexed draw consumed by frame recording.
@@ -522,6 +526,7 @@ struct DepthTarget {
     view: vk::ImageView,
     allocation: Allocation,
     extent: vk::Extent2D,
+    samples: vk::SampleCountFlags,
 }
 struct RetiredAllocation {
     allocation: NativeAllocation,

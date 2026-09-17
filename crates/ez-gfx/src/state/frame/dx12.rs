@@ -52,6 +52,7 @@ fn prepare_dx12_mesh_pipeline(
     pipeline_layout: &ez_gfx_runtime::binding::PipelineLayout,
     state: ez_gfx_hal::MeshPipelineState,
     color_format: Option<ez_gfx_runtime::target::Format>,
+    sample_count: u8,
 ) -> Result<Option<NativePipeline>> {
     let task = stages
         .task
@@ -103,7 +104,7 @@ fn prepare_dx12_mesh_pipeline(
             },
             color_format: dx12_color_format(color_format)?,
             depth_format: if depth_required { 40 } else { 0 },
-            sample_count: 1,
+            sample_count,
         },
     );
     if pipelines.contains_key(key) {
@@ -126,6 +127,7 @@ fn prepare_dx12_mesh_pipeline(
                 },
                 task_workgroup_size,
                 mesh_workgroup_size,
+                samples: sample_count,
             })
             .map_err(map_hal)?,
     );
@@ -140,6 +142,7 @@ fn prepare_dx12_pipelines(
     payloads: &[ExecutableNode],
     pipeline_keys: &mut Vec<Option<PipelineKey>>,
     color_format: Option<ez_gfx_runtime::target::Format>,
+    sample_count: u8,
 ) -> Result<()> {
     pipeline_keys.truncate(payloads.len());
     pipeline_keys.resize_with(payloads.len(), || None);
@@ -164,6 +167,7 @@ fn prepare_dx12_pipelines(
                 pipeline_layout,
                 *state,
                 color_format,
+                sample_count,
             )?;
             if let Some(pipeline) = pipeline {
                 if pipelines.len() == MAX_PIPELINE_CACHE_ENTRIES {
@@ -235,7 +239,7 @@ fn prepare_dx12_pipelines(
                     depth_required,
                     color_format: dx12_color_format(color_format)?,
                     depth_format: if depth_required { 40 } else { 0 },
-                    sample_count: 1,
+                    sample_count,
                 };
                 let pipeline = if pipelines.contains_key(&key) {
                     None
@@ -251,6 +255,7 @@ fn prepare_dx12_pipelines(
                                 depth_required,
                                 color_format,
                                 &layouts,
+                                sample_count,
                             )
                             .map_err(map_hal)?,
                     ))
@@ -838,10 +843,12 @@ pub(super) fn execute_dx12_frame_plan(
                         .then_some(index)
                 }),
         );
-    let color_format = context
+    let (color_format, sample_count) = context
         .frame_render_target
         .and_then(|target| context.render_targets.get(&target))
-        .map(|record| record.format);
+        .map_or((None, 1), |record| {
+            (Some(record.format), record.declaration.samples())
+        });
     {
         let NativeContext::Dx12(native) = &mut context.native else {
             return Err(Error::NativeFailure);
@@ -853,6 +860,7 @@ pub(super) fn execute_dx12_frame_plan(
             payloads,
             &mut context.frame_pipeline_keys,
             color_format,
+            sample_count,
         )?;
     }
     prepare_frame_binding_scratch(

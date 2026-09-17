@@ -118,6 +118,7 @@ fn prepare_graphics_pipeline(
     pipeline_layout: &PipelineLayout,
     state: DynamicPipelineState,
     color_format: Option<ez_gfx_runtime::target::Format>,
+    sample_count: u8,
 ) -> Result<PreparedGraphicsPipeline> {
     let vertex = shaders.get(&vertex_shader).ok_or(Error::InvalidContext)?;
     let fragment = shaders.get(&fragment_shader).ok_or(Error::InvalidContext)?;
@@ -154,7 +155,7 @@ fn prepare_graphics_pipeline(
         depth_required,
         color_format: metal_color_format_key(color_format),
         depth_format: if depth_required { 252 } else { 0 },
-        sample_count: 1,
+        sample_count,
     };
     let pipeline = if pipelines.contains_key(&key) {
         None
@@ -171,6 +172,7 @@ fn prepare_graphics_pipeline(
                     depth_required,
                     vertex_texture_heap,
                     fragment_texture_heap,
+                    sample_count,
                 )
                 .map_err(map_hal)?,
         ))
@@ -189,6 +191,7 @@ fn prepare_mesh_pipeline(
     pipeline_layout: &PipelineLayout,
     state: ez_gfx_hal::MeshPipelineState,
     color_format: Option<ez_gfx_runtime::target::Format>,
+    sample_count: u8,
 ) -> Result<PreparedMeshPipeline> {
     let mesh = shaders.get(&stages.mesh).ok_or(Error::InvalidContext)?;
     let fragment = shaders.get(&stages.fragment).ok_or(Error::InvalidContext)?;
@@ -264,7 +267,7 @@ fn prepare_mesh_pipeline(
             },
             color_format: metal_color_format_key(color_format),
             depth_format: if depth_required { 252 } else { 0 },
-            sample_count: 1,
+            sample_count,
         },
     );
     let pipeline = if pipelines.contains_key(key) {
@@ -319,6 +322,7 @@ fn prepare_mesh_pipeline(
                     &fragment_buffer_layouts,
                     task_threads,
                     mesh_threads,
+                    sample_count,
                 )
                 .map_err(map_hal)?,
         ))
@@ -368,6 +372,7 @@ fn prepare_metal_pipelines(
     texture_heaps: &mut Vec<Option<ShaderTextureHeapLayout>>,
     workgroup_sizes: &mut Vec<Option<MetalWorkgroupSizes>>,
     color_format: Option<ez_gfx_runtime::target::Format>,
+    sample_count: u8,
 ) -> Result<()> {
     keys.truncate(payloads.len());
     keys.resize_with(payloads.len(), || None);
@@ -394,6 +399,7 @@ fn prepare_metal_pipelines(
                 pipeline_layout,
                 *state,
                 color_format,
+                sample_count,
             )?;
             texture_heaps[node_index] = texture_heap;
             workgroup_sizes[node_index] = Some(workgroups);
@@ -432,6 +438,7 @@ fn prepare_metal_pipelines(
                     pipeline_layout,
                     *state,
                     color_format,
+                    sample_count,
                 )?;
                 texture_heaps[node_index] = texture_heap;
                 (key, pipeline)
@@ -924,10 +931,12 @@ pub(super) fn execute_metal_frame_plan(
     let NativeContext::Metal(native) = &mut context.native else {
         return Err(Error::NativeFailure);
     };
-    let color_format = context
+    let (color_format, sample_count) = context
         .frame_render_target
         .and_then(|target| context.render_targets.get(&target))
-        .map(|record| record.format);
+        .map_or((None, 1), |record| {
+            (Some(record.format), record.declaration.samples())
+        });
     prepare_metal_pipelines(
         &context.shaders,
         &mut context.pipelines,
@@ -937,6 +946,7 @@ pub(super) fn execute_metal_frame_plan(
         &mut context.frame_texture_heaps,
         &mut context.frame_workgroup_sizes,
         color_format,
+        sample_count,
     )?;
     context.frame_action_indices.clear();
     context
