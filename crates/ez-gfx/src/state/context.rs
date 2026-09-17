@@ -139,6 +139,7 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         frame_depth: None,
         frame_has_graphics: false,
         frame_render_target: None,
+        frame_sample_targets: Vec::new(),
         last_readbacks: Vec::new(),
         active_surface: None,
         frame_presented: false,

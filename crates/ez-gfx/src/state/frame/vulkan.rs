@@ -371,6 +371,7 @@ fn prepare_vulkan_pipelines(
             ExecutableNode::CopyTexture { .. }
             | ExecutableNode::TextureReadback { .. }
             | ExecutableNode::RenderTargetReadback { .. }
+            | ExecutableNode::RenderTargetSample { .. }
             | ExecutableNode::Present { .. } => continue,
         };
         if let Some(pipeline) = pipeline {
@@ -758,6 +759,9 @@ impl ez_gfx_backend_vulkan::NativeFrameActionSource for VulkanActionSource<'_, '
                         }
                         ExecutableNode::RenderTargetReadback { target } => {
                             self.target_readback_action(*target)?
+                        }
+                        ExecutableNode::RenderTargetSample { .. } => {
+                            ez_gfx_backend_vulkan::NativeFrameAction::Noop
                         }
                         ExecutableNode::CopyTexture {
                             source,

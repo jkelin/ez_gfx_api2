@@ -658,6 +658,43 @@ impl NativeContext {
         self.texture_fallback_bindings[index] = true;
         Ok(())
     }
+    /// Publishes a managed render target in its leased sampled-image heap slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the sampled-image heap slot cannot be published.
+    pub fn publish_render_target(
+        &mut self,
+        texture: &NativeTexture,
+    ) -> Result<(), AllocationError> {
+        write_texture_view(
+            self,
+            &texture.resource,
+            texture.format,
+            texture.binding,
+            1,
+            1,
+        );
+        write_texture_sampler(
+            self,
+            texture.binding,
+            TextureSamplerDesc {
+                min_filter: SamplerFilter::Nearest,
+                mag_filter: SamplerFilter::Nearest,
+                max_anisotropy: 1.0,
+                address_u: SamplerAddressMode::Clamp,
+                address_v: SamplerAddressMode::Clamp,
+                address_w: SamplerAddressMode::Clamp,
+            },
+        );
+        if let Some(alias) = self
+            .texture_fallback_bindings
+            .get_mut(texture.binding as usize)
+        {
+            *alias = false;
+        }
+        Ok(())
+    }
 
     /// Rewrites the stable binding to expose exactly the requested contiguous coarse mip range.
     ///

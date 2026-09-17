@@ -414,6 +414,8 @@ pub enum NativeFrameAction<'a> {
         /// Readback height in pixels.
         height: u32,
     },
+    /// Barrier-only graph node; records no commands itself.
+    Noop,
     /// End the active render pass.
     EndPass,
     /// Present the active swapchain buffer.

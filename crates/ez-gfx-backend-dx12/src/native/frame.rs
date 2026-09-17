@@ -90,6 +90,11 @@ fn validate_frame_plan(
                     return Err(HalError::InvalidArgument);
                 }
             }
+            NativeFrameAction::Noop => {
+                if pass_active {
+                    return Err(HalError::InvalidArgument);
+                }
+            }
             NativeFrameAction::EndPass => {
                 if !pass_active {
                     return Err(HalError::InvalidArgument);

@@ -1,17 +1,23 @@
 /// Formats used by a cached managed render target.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RenderTargetDescriptor {
     /// Color attachment and readback format.
     pub color_format: ez_gfx_runtime::target::Format,
     /// Optional depth attachment format.
     pub depth_format: Option<ez_gfx_runtime::target::Format>,
+    /// Color applied when the attachment begins with a clear load operation.
+    pub clear_color: [f32; 4],
 }
 
 impl RenderTargetDescriptor {
     /// Creates a color-only target descriptor.
     #[must_use]
     pub const fn color(color_format: ez_gfx_runtime::target::Format) -> Self {
-        Self { color_format, depth_format: None }
+        Self {
+            color_format,
+            depth_format: None,
+            clear_color: [0.1, 0.1, 0.1, 1.0],
+        }
     }
 
     /// Creates a color target with a depth companion.
@@ -20,9 +26,17 @@ impl RenderTargetDescriptor {
         Self {
             color_format,
             depth_format: Some(ez_gfx_runtime::target::Format::Depth32Float),
+            clear_color: [0.1, 0.1, 0.1, 1.0],
         }
     }
+    /// Overrides the clear color used by the attachment pass.
+    #[must_use]
+    pub const fn with_clear_color(mut self, clear_color: [f32; 4]) -> Self {
+        self.clear_color = clear_color;
+        self
+    }
 }
+
 
 impl From<ez_gfx_runtime::target::Format> for RenderTargetDescriptor {
     fn from(color_format: ez_gfx_runtime::target::Format) -> Self {
@@ -136,6 +150,23 @@ impl RenderTarget {
             RenderTargetBacking::Surface { extent, .. } => Ok(*extent),
         }
     }
+    /// Returns the stable bindless sampled-image slot for a managed target.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] when the target is a surface or is stale.
+    pub fn binding(&self) -> Result<u32> {
+        state::render_target_binding(self.inner.context.handle, self.inner.managed_handle()?)
+    }
+
+    /// Transitions this managed target for bindless sampling after its render pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] when the target is foreign, stale, or not attached to `frame`.
+    pub fn prepare_sampling(&self, frame: &mut Frame) -> Result<()> {
+        frame.prepare_target_sampling(self)
+    }
 
     /// Returns the target clear value.
     ///
@@ -148,11 +179,13 @@ impl RenderTarget {
         };
         context.check_entry()?;
         match &self.inner.backing {
-            RenderTargetBacking::Managed(_) | RenderTargetBacking::Surface { .. } => {
-                Ok(ez_gfx_runtime::target::ClearValue::Color([
-                    0.1, 0.1, 0.1, 1.0,
-                ]))
-            }
+            RenderTargetBacking::Managed(_) => state::render_target_clear(
+                self.inner.context.handle,
+                self.inner.managed_handle()?,
+            ),
+            RenderTargetBacking::Surface { .. } => Ok(ez_gfx_runtime::target::ClearValue::Color([
+                0.1, 0.1, 0.1, 1.0,
+            ])),
         }
     }
 

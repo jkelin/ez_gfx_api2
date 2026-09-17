@@ -37,6 +37,8 @@ pub(super) struct RenderTargetRecord {
     /// descriptor binding, so textures and targets draw from one free-list
     /// and can never collide.
     pub(super) id: TextureId,
+    /// Whether the last submitted use transitioned the sampled image for heap reads.
+    pub(super) sample_ready: bool,
 }
 
 /// Creates a sampled color render target from a declaration and explicit extents.
@@ -161,6 +163,24 @@ pub fn create_render_target(
                 return Err(error);
             }
         };
+        let published = match (&mut context.native, &native) {
+            (super::NativeContext::Vulkan(context), NativeTexture::Vulkan(texture)) => context
+                .publish_render_target(texture)
+                .map_err(map_allocation),
+            #[cfg(windows)]
+            (super::NativeContext::Dx12(context), NativeTexture::Dx12(texture)) => context
+                .publish_render_target(texture)
+                .map_err(map_allocation),
+            #[cfg(target_vendor = "apple")]
+            (super::NativeContext::Metal(_), NativeTexture::Metal(_)) => Ok(()),
+            #[allow(unreachable_patterns)]
+            _ => Err(Error::NativeFailure),
+        };
+        if let Err(error) = published {
+            release_heap_slot(context, id);
+            let _ = destroy_native_texture(&mut context.native, native);
+            return Err(error);
+        }
         let handle = match context.identity.insert(ResourceKind::RenderTarget) {
             Ok(handle) => handle,
             Err(error) => {
@@ -183,6 +203,7 @@ pub fn create_render_target(
                 width,
                 height,
                 id,
+                sample_ready: false,
             },
         );
         Ok(typed)
@@ -259,6 +280,27 @@ pub fn render_target_extent(
             .get(&target)
             .map(|record| (record.width, record.height))
             .ok_or(Error::InvalidArgument)
+    })
+}
+/// Reports the bindless sampled-image slot of a live render target.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] for an unknown or destroyed handle.
+pub fn render_target_binding(context: ContextHandle, target: RenderTargetHandle) -> Result<u32> {
+    with_context_mut(context, |context| {
+        context
+            .identity
+            .check_thread_and_health()
+            .map_err(map_lifecycle)?;
+        let record = context
+            .render_targets
+            .get(&target)
+            .ok_or(Error::InvalidArgument)?;
+        context
+            .texture_registry
+            .reserved_binding(record.id)
+            .map_err(map_texture)
     })
 }
 

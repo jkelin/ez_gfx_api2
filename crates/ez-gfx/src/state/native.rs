@@ -268,6 +268,7 @@ pub(super) fn prepare_frame_binding_scratch(
             super::ExecutableNode::CopyTexture { .. }
             | super::ExecutableNode::TextureReadback { .. }
             | super::ExecutableNode::RenderTargetReadback { .. }
+            | super::ExecutableNode::RenderTargetSample { .. }
             | super::ExecutableNode::Present { .. } => scratch.len()..scratch.len(),
         };
         ranges.push(range);

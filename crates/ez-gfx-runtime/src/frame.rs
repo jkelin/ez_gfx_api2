@@ -95,6 +95,11 @@ pub enum ExecutableNode {
         /// Render-target handle.
         target: RenderTargetHandle,
     },
+    /// A barrier-only node that leaves a managed target ready for bindless sampling.
+    RenderTargetSample {
+        /// Render-target handle.
+        target: RenderTargetHandle,
+    },
     /// A presentation node.
     Present {
         /// Surface handle.

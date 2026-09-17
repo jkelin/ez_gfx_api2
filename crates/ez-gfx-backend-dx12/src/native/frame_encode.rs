@@ -169,6 +169,7 @@ impl DxFrameEncoder<'_> {
                 NativeFrameAction::TextureReadback { texture, .. } => {
                     self.texture_readback(texture)?;
                 }
+                NativeFrameAction::Noop => {}
                 NativeFrameAction::EndPass => {
                     self.finish_pass()?;
                 }

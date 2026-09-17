@@ -69,6 +69,7 @@ pub(super) fn start_recording(context: &mut ContextState) -> Result<()> {
     context.active_surface = None;
     context.frame_surface = None;
     context.frame_render_target = None;
+    context.frame_sample_targets.clear();
     context.frame_depth = None;
     context.frame_has_graphics = false;
     context.last_readbacks.clear();
@@ -318,6 +319,7 @@ fn intern_render_target_resource(
         .render_targets
         .get(&target)
         .ok_or(Error::InvalidContext)?;
+    let sample_ready = record.sample_ready;
     let desc = ResourceDesc::image(
         record.width,
         record.height,
@@ -332,6 +334,18 @@ fn intern_render_target_resource(
         .frame
         .add_resource(desc)
         .map_err(|error| map_frame(&error))?;
+    if sample_ready {
+        let sampled = ResourceState::new(
+            QueueKind::Graphics,
+            ShaderStage::AllGraphics,
+            ResourceAccess::SampledRead,
+        )
+        .map_err(|_| Error::InvalidArgument)?;
+        context
+            .frame
+            .set_resource_initial_state(resource, sampled)
+            .map_err(|error| map_frame(&error))?;
+    }
     context.frame_resources.insert(target.packed(), resource);
     context
         .frame_native_resources
@@ -372,6 +386,44 @@ pub fn frame_enqueue_render_target_readback(
                 ExecutableNode::RenderTargetReadback { target },
             )
             .map_err(|error| map_frame(&error))?;
+        Ok(())
+    }))
+}
+
+/// Enqueues a barrier-only sampled read after rendering the active managed target.
+///
+/// # Errors
+///
+/// Returns an error when the target is stale or is not the active frame attachment.
+pub fn frame_enqueue_render_target_sample(
+    context: ContextHandle,
+    target: RenderTargetHandle,
+) -> Result<()> {
+    result_status(with_context_mut(context, |context| {
+        if context.frame_render_target != Some(target) {
+            return Err(Error::InvalidContext);
+        }
+        let resource = intern_render_target_resource(context, target)?;
+        let sampled = ResourceState::new(
+            QueueKind::Graphics,
+            ShaderStage::AllGraphics,
+            ResourceAccess::SampledRead,
+        )
+        .map_err(|_| Error::InvalidArgument)?;
+        context
+            .frame
+            .record_node(
+                NodeDesc::new("render-target-sample", QueueKind::Graphics).access(Access::image(
+                    resource,
+                    ImageRange::all(1, 1).map_err(|_| Error::InvalidArgument)?,
+                    sampled,
+                )),
+                ExecutableNode::RenderTargetSample { target },
+            )
+            .map_err(|error| map_frame(&error))?;
+        if !context.frame_sample_targets.contains(&target) {
+            context.frame_sample_targets.push(target);
+        }
         Ok(())
     }))
 }
@@ -1023,6 +1075,11 @@ pub fn frame_submit(context: ContextHandle) -> Result<()> {
             )?;
             recycle_consumed_transients(context, completion)?;
             super::buffers::reclaim_available_transients(context)?;
+            for target in context.frame_sample_targets.drain(..) {
+                if let Some(record) = context.render_targets.get_mut(&target) {
+                    record.sample_ready = true;
+                }
+            }
             let record = runtime_record(context, 0, RuntimePhase::Submit, Ok(()));
             context.observability.push_event(record);
             Ok(())
@@ -1066,6 +1123,7 @@ fn abort_recording_state(context: &mut ContextState) -> Result<()> {
     context.frame_index = None;
     context.frame_surface = None;
     context.frame_render_target = None;
+    context.frame_sample_targets.clear();
     context.frame_depth = None;
     context.frame_has_graphics = false;
     context.frame_presented = false;

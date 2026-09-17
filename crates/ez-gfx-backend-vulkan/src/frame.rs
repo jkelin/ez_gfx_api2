@@ -1033,6 +1033,11 @@ impl NativeContext {
                             pass_active,
                         )?;
                     }
+                    NativeFrameAction::Noop => {
+                        if pass_active {
+                            return Err(HalError::InvalidArgument);
+                        }
+                    }
                     NativeFrameAction::EndPass => {
                         if !pass_active {
                             return Err(HalError::InvalidArgument);

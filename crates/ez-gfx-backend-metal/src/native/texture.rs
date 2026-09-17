@@ -623,6 +623,21 @@ impl NativeContext {
         })
     }
 
+    /// Admits a managed render target to per-frame argument-buffer assembly.
+    ///
+    /// Metal has no persistent descriptor heap to mutate; the facade's
+    /// sampled-ready state controls whether later frames publish this view.
+    ///
+    /// # Errors
+    ///
+    /// Reserved for publication failures on future Metal heap implementations.
+    pub fn publish_render_target(
+        &mut self,
+        _texture: &NativeTexture,
+    ) -> Result<(), AllocationError> {
+        Ok(())
+    }
+
     /// Replaces one validated mip subregion through the dedicated texture-transfer queue.
     ///
     /// # Errors

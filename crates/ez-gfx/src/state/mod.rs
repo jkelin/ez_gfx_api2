@@ -527,6 +527,8 @@ struct ContextState {
     frame_capture_surface: Option<SurfaceHandle>,
     active_surface: Option<SurfaceHandle>,
     frame_render_target: Option<RenderTargetHandle>,
+    /// Targets whose successful submission leaves them ready for bindless sampling.
+    frame_sample_targets: Vec<RenderTargetHandle>,
     last_readbacks: Vec<Vec<u8>>,
     observability: Observability,
     #[cfg(test)]

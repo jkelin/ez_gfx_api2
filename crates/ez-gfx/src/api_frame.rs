@@ -497,6 +497,15 @@ impl Frame {
         result
     }
 
+    fn prepare_target_sampling(&mut self, target: &RenderTarget) -> Result<()> {
+        self.ensure_context(&target.inner.context)?;
+        let handle = match target.inner.managed_handle() {
+            Ok(handle) => handle,
+            Err(error) => return self.fail(error),
+        };
+        self.record(|context| state::frame_enqueue_render_target_sample(context, handle))
+    }
+
     fn prepare_target_readback(&mut self, target: &RenderTarget) -> Result<Readback> {
         self.ensure_context(&target.inner.context)?;
         let (width, height) = match target.extent() {
@@ -585,6 +594,7 @@ impl Frame {
                 target.extent == (width, height)
                     && target.format == descriptor.color_format
                     && target.depth_format == descriptor.depth_format
+                    && target.clear_color == descriptor.clear_color
             });
         let handle = if let Some(target) = cached {
             target.handle
@@ -595,7 +605,7 @@ impl Frame {
                 1.0,
                 1,
                 vec![descriptor.color_format],
-                ez_gfx_runtime::target::ClearValue::Color([0.1, 0.1, 0.1, 1.0]),
+                ez_gfx_runtime::target::ClearValue::Color(descriptor.clear_color),
                 true,
             ) else {
                 return self.fail(Error::InvalidArgument);
@@ -618,6 +628,7 @@ impl Frame {
                     format: descriptor.color_format,
                     extent: (width, height),
                     depth_format: descriptor.depth_format,
+                    clear_color: descriptor.clear_color,
                 },
             );
         if let Some(previous) = previous {

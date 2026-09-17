@@ -861,6 +861,13 @@ impl NativeContext {
                             })
                     }
                 }
+                NativeFrameAction::Noop => {
+                    if pass_active {
+                        Err(HalError::InvalidArgument)
+                    } else {
+                        Ok(None)
+                    }
+                }
                 NativeFrameAction::EndPass => {
                     if pass_active {
                         pass_active = false;
@@ -1190,6 +1197,7 @@ impl NativeContext {
                         }
                         encoder.readback_index += 1;
                     }
+                    NativeFrameAction::Noop => {}
                     NativeFrameAction::EndPass => {
                         let encoder = encoder
                             .render_encoder

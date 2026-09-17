@@ -261,6 +261,7 @@ fn prepare_dx12_pipelines(
             ExecutableNode::CopyTexture { .. }
             | ExecutableNode::TextureReadback { .. }
             | ExecutableNode::RenderTargetReadback { .. }
+            | ExecutableNode::RenderTargetSample { .. }
             | ExecutableNode::Present { .. } => continue,
         };
         if let Some(pipeline) = pipeline {
@@ -667,6 +668,9 @@ impl ez_gfx_backend_dx12::native::NativeFrameActionSource for DxActionSource<'_,
                     }
                     ExecutableNode::RenderTargetReadback { target } => {
                         self.target_readback_action(*target)?
+                    }
+                    ExecutableNode::RenderTargetSample { .. } => {
+                        ez_gfx_backend_dx12::native::NativeFrameAction::Noop
                     }
                     ExecutableNode::CopyTexture {
                         source,

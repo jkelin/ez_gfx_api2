@@ -650,6 +650,37 @@ impl NativeContext {
             msaa,
         })
     }
+    /// Publishes a managed render target in its leased sampled-image heap slot.
+    ///
+    /// The frame graph must transition the image to sampled-read before a shader
+    /// dereferences this descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the logical device or sampled-image heap is unavailable.
+    pub fn publish_render_target(
+        &mut self,
+        texture: &NativeTexture,
+    ) -> Result<(), AllocationError> {
+        let device = self.device.as_ref().ok_or(AllocationError::NativeFailure)?;
+        let descriptor_set = self
+            .texture_descriptor_set
+            .ok_or(AllocationError::NativeFailure)?;
+        write_texture_descriptor(
+            device,
+            descriptor_set,
+            texture.binding,
+            texture.view,
+            texture.sampler,
+        );
+        if let Some(alias) = self
+            .texture_fallback_bindings
+            .get_mut(texture.binding as usize)
+        {
+            *alias = false;
+        }
+        Ok(())
+    }
     /// Copies one validated tightly packed region into its native mip.
     ///
     /// # Errors

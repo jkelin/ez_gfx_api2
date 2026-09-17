@@ -439,6 +439,7 @@ fn prepare_metal_pipelines(
             ExecutableNode::Mesh { .. } => unreachable!("mesh payload handled above"),
             ExecutableNode::TextureReadback { .. }
             | ExecutableNode::RenderTargetReadback { .. }
+            | ExecutableNode::RenderTargetSample { .. }
             | ExecutableNode::Present { .. } => continue,
         };
         cache_metal_pipeline(pipelines, native, key.clone(), pipeline)?;
@@ -786,6 +787,7 @@ impl ez_gfx_backend_metal::native::NativeFrameActionSource for MetalActionSource
                             height: record.height,
                         }
                     }
+                    ExecutableNode::RenderTargetSample { .. } => MetalFrameAction::Noop,
                     ExecutableNode::CopyTexture {
                         source,
                         destination,
@@ -893,6 +895,23 @@ pub(super) fn execute_metal_frame_plan(
             .map_err(map_texture)?;
         native_textures
             .try_push(fallback.fallback_sampled(binding))
+            .map_err(|_| Error::NativeFailure)?;
+    }
+    for record in context.render_targets.values() {
+        let binding = context
+            .texture_registry
+            .reserved_binding(record.id)
+            .map_err(map_texture)?;
+        let sampled = if record.sample_ready {
+            let NativeTexture::Metal(texture) = &record.native else {
+                return Err(Error::NativeFailure);
+            };
+            texture.sampled()
+        } else {
+            fallback.fallback_sampled(binding)
+        };
+        native_textures
+            .try_push(sampled)
             .map_err(|_| Error::NativeFailure)?;
     }
     let (index, index_size) = match context.index_heap.as_ref() {
