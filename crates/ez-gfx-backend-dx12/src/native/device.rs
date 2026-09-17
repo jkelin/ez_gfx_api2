@@ -275,8 +275,7 @@ fn describe_adapter(
         },
         max_indirect_draw_count: u32::MAX,
         shader_model: u32::try_from(shader_model.HighestShaderModel.0)
-            .map(|value| ((value >> 4) << 8) | (value & 0x0f))
-            .unwrap_or(0),
+            .map_or(0, |value| ((value >> 4) << 8) | (value & 0x0f)),
         shader_stages,
         timeline_synchronization: true,
         resource_aliasing: true,

@@ -53,6 +53,10 @@ pub(super) struct RenderTargetRecord {
 /// declaration, [`Error::Unsupported`] for non-color usage or an
 /// unresolvable format, [`Error::NativeFailure`] for oversized targets,
 /// an exhausted binding range, or native allocation failure.
+#[allow(
+    clippy::too_many_lines,
+    reason = "target creation keeps allocation rollback adjacent to every fallible native publication step"
+)]
 pub fn create_render_target(
     context: ContextHandle,
     declaration: &TargetDeclaration,
@@ -191,7 +195,10 @@ pub fn create_render_target(
                 .map_err(map_allocation),
             #[cfg(target_vendor = "apple")]
             (super::NativeContext::Metal(_), NativeTexture::Metal(_)) => Ok(()),
-            #[allow(unreachable_patterns)]
+            #[allow(
+                unreachable_patterns,
+                reason = "platform cfgs can make the exhaustive native/texture pairing compiler-dependent"
+            )]
             _ => Err(Error::NativeFailure),
         };
         if let Err(error) = published {

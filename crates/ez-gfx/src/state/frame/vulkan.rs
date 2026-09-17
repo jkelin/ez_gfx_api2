@@ -791,6 +791,10 @@ fn presentation_mode(surface: Option<&SurfaceRecord>) -> PresentationMode {
     surface.map_or(PresentationMode::Fifo, |surface| surface.presentation_mode)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "frame execution keeps surface removal, native borrowing, submission, and restoration in one transaction"
+)]
 pub(super) fn execute_vulkan_frame_plan(
     context: &mut ContextState,
     plan: &FrameExecutionPlan,

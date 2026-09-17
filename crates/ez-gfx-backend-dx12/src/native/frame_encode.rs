@@ -137,7 +137,7 @@ impl DxFrameEncoder<'_> {
         }
         actions.visit(&mut |action_index, action| {
             match action {
-                NativeFrameAction::Wait(_) => {}
+                NativeFrameAction::Wait(_) | NativeFrameAction::Noop => {}
                 NativeFrameAction::Barrier { barrier, resource } => {
                     self.encode_barrier(barrier, resource)?;
                 }
@@ -169,7 +169,6 @@ impl DxFrameEncoder<'_> {
                 NativeFrameAction::TextureReadback { texture, .. } => {
                     self.texture_readback(texture)?;
                 }
-                NativeFrameAction::Noop => {}
                 NativeFrameAction::EndPass => {
                     self.finish_pass()?;
                 }

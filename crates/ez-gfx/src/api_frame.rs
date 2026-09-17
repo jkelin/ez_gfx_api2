@@ -597,7 +597,8 @@ impl Frame {
                 target.extent == (width, height)
                     && target.format == descriptor.color_format
                     && target.depth_format == descriptor.depth_format
-                    && target.clear_color == descriptor.clear_color
+                    && target.clear_color.map(f32::to_bits)
+                        == descriptor.clear_color.map(f32::to_bits)
                     && target.maximum_samples == descriptor.maximum_samples
             });
         let handle = if let Some(target) = cached {

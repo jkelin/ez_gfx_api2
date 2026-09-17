@@ -328,10 +328,11 @@ fn counter_payload<'scratch>(
     if wide {
         // The caller guarantees 20-byte-aligned input; a ragged tail fails
         // instead of executing a partially specified draw.
-        if bytes.len() % 20 != 0 {
+        let (records, remainder) = bytes.as_chunks::<20>();
+        if !remainder.is_empty() {
             return Err(Error::InvalidArgument);
         }
-        for record in bytes.chunks_exact(20) {
+        for record in records {
             scratch.extend_from_slice(&record[16..20]);
             scratch.extend_from_slice(&record[0..16]);
             scratch.extend_from_slice(&0_u32.to_le_bytes());

@@ -368,11 +368,10 @@ fn sampled_pixel(context: &mut NativeContext, mut sample: SampleReadback) -> [u8
     wait_fence(&context.fence, sample.completion);
     context.invalidate(&mut sample.readback, 0, 16).unwrap();
     let mut pixel = [0; 4];
-    for (channel, bytes) in pixel
-        .iter_mut()
-        .zip(context.mapped_slice(&sample.readback).unwrap()[..16].chunks_exact(4))
-    {
-        *channel = u8::try_from(u32::from_ne_bytes(bytes.try_into().unwrap())).unwrap();
+    let (words, remainder) = context.mapped_slice(&sample.readback).unwrap()[..16].as_chunks::<4>();
+    assert!(remainder.is_empty());
+    for (channel, bytes) in pixel.iter_mut().zip(words) {
+        *channel = u8::try_from(u32::from_ne_bytes(*bytes)).unwrap();
     }
     context.free(sample.output).unwrap();
     context.free(sample.readback).unwrap();
@@ -916,8 +915,8 @@ fn render_target_clear_applies_attachment_color_on_begin() {
     drop(actions);
     let bytes = context.readback_texture_rgba8(&target, 64, 64).unwrap();
     assert_eq!(bytes.len(), 64 * 64 * 4);
-    for pixel in bytes.chunks_exact(4) {
-        assert_eq!(pixel, [0, 255, 0, 255]);
+    for pixel in bytes.as_chunks::<4>().0 {
+        assert_eq!(*pixel, [0, 255, 0, 255]);
     }
     // Managed targets bind and transition their paired D32 attachment.
     let depth_attach = ResourceState::new(
@@ -1058,8 +1057,8 @@ fn render_target_msaa_clear_resolves_into_sampled_resource() {
     // exact clear color into the sampled resource that readback copies.
     let bytes = context.readback_texture_rgba8(&target, 64, 64).unwrap();
     assert_eq!(bytes.len(), 64 * 64 * 4);
-    for pixel in bytes.chunks_exact(4) {
-        assert_eq!(pixel, [0, 0, 255, 255]);
+    for pixel in bytes.as_chunks::<4>().0 {
+        assert_eq!(*pixel, [0, 0, 255, 255]);
     }
     // A 4-sample pass against a single-sample target is rejected.
     let single = context

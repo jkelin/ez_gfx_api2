@@ -31,11 +31,11 @@ use super::{
     D3D12_RT_FORMAT_ARRAY, D3D12_SHADER_BYTECODE, D3D12_SHADER_VISIBILITY_ALL,
     D3D12_SHADER_VISIBILITY_VERTEX, D3D12_STENCIL_OP_KEEP, D3D12SerializeRootSignature,
     DXGI_FORMAT, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC, DeferredResource,
-    DynamicPipelineState, FrontFace, HalError, ID3D12Device2, ID3D12PipelineState,
-    ID3D12RootSignature, ID3DBlob, Interface, MeshDispatchLimits, MeshPipelineState, NativeContext,
-    NativeMeshPipelineDesc, NativePipeline, NativeShader, PrimitiveTopology, ShaderBufferLayout,
-    TEXTURE_DESCRIPTOR_CAPACITY, map_windows, ptr, retained_mesh_dispatch_limits,
-    validate_mesh_dispatch,
+    DynamicPipelineState, FrontFace, HalError, ID3D12CommandSignature, ID3D12Device2,
+    ID3D12PipelineState, ID3D12RootSignature, ID3DBlob, Interface, MeshDispatchLimits,
+    MeshPipelineState, NativeContext, NativeMeshPipelineDesc, NativePipeline, NativeShader,
+    PrimitiveTopology, ShaderBufferLayout, TEXTURE_DESCRIPTOR_CAPACITY, map_windows, ptr,
+    retained_mesh_dispatch_limits, validate_mesh_dispatch,
 };
 
 use ez_gfx_hal::MeshDispatchError;
@@ -386,6 +386,46 @@ impl NativeContext {
         })
     }
 
+    fn create_indexed_command_signature(
+        &self,
+        root: &ID3D12RootSignature,
+        base_instance_root: u32,
+    ) -> Result<ID3D12CommandSignature, HalError> {
+        // Each native record leads with the draw's base instance. The remaining
+        // 20 bytes are indexed-draw arguments with a zero start-instance value.
+        let arguments = [
+            D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+                Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                    Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                        RootParameterIndex: base_instance_root,
+                        DestOffsetIn32BitValues: 0,
+                        Num32BitValuesToSet: 1,
+                    },
+                },
+            },
+            D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED,
+                Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0::default(),
+            },
+        ];
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: 24,
+            NumArgumentDescs: 2,
+            pArgumentDescs: arguments.as_ptr(),
+            NodeMask: 0,
+        };
+        let mut signature = None;
+        // SAFETY: `desc` and `arguments` remain live for the call, `root`
+        // matches the pipeline signature, and `signature` is writable output.
+        unsafe {
+            self.device
+                .CreateCommandSignature(&raw const desc, Some(root), &raw mut signature)
+        }
+        .map_err(map_windows)?;
+        signature.ok_or(HalError::NativeFailure)
+    }
+
     /// Creates a graphics pipeline from the requested shader entries and render state.
     ///
     /// # Errors
@@ -534,46 +574,12 @@ impl NativeContext {
         let pipeline =
             // SAFETY: `desc` remains allocated for `CreateGraphicsPipelineState`, and its root-signature clone plus `vertex` and `fragment` shader storage remain available for the duration of the call.
             unsafe { self.device.CreateGraphicsPipelineState(&raw const desc) }.map_err(map_windows)?;
-        // Each native record leads with the draw's base instance: the
-        // signature feeds that dword into the trailing root constant, then
-        // executes the remaining 20 bytes as indexed-draw arguments with a
-        // zeroed start-instance dword. Native stride is 24 bytes per draw.
-        let base_argument = D3D12_INDIRECT_ARGUMENT_DESC {
-            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
-            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
-                Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
-                    RootParameterIndex: base_instance_root,
-                    DestOffsetIn32BitValues: 0,
-                    Num32BitValuesToSet: 1,
-                },
-            },
-        };
-        let argument = D3D12_INDIRECT_ARGUMENT_DESC {
-            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED,
-            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0::default(),
-        };
-        let arguments = [base_argument, argument];
-        let signature_desc = D3D12_COMMAND_SIGNATURE_DESC {
-            ByteStride: 24,
-            NumArgumentDescs: 2,
-            pArgumentDescs: arguments.as_ptr(),
-            NodeMask: 0,
-        };
-        let mut signature = None;
-        // SAFETY: `signature_desc` and its two `arguments` descriptors remain allocated for `CreateCommandSignature`, `root` outlives the compatible-signature lookup, and `signature` is initialized output storage for the returned `ID3D12CommandSignature`.
-        unsafe {
-            self.device.CreateCommandSignature(
-                &raw const signature_desc,
-                Some(&root),
-                &raw mut signature,
-            )
-        }
-        .map_err(map_windows)?;
+        let signature = self.create_indexed_command_signature(&root, base_instance_root)?;
         Ok(NativePipeline {
             state: pipeline,
             root,
             topology: Some(topology),
-            signature,
+            signature: Some(signature),
             buffer_writable,
             base_instance_root,
             mesh: false,
