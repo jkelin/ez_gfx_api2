@@ -1209,3 +1209,47 @@ fn adapter_report_names_every_enumerated_adapter() {
         }
     }
 }
+
+#[test]
+fn render_target_copy_validation_rejects_scaling_and_out_of_bounds_regions() {
+    let valid = ez_gfx_hal::TextureCopyRegion {
+        source_mip: 0,
+        destination_mip: 0,
+        source_origin: [2, 3],
+        destination_origin: [4, 5],
+        extent: [6, 7],
+    };
+    assert_eq!(
+        frame::validate_render_target_copy(
+            Format::Rgba8Unorm,
+            Format::Rgba8Unorm,
+            (16, 16),
+            (16, 16),
+            false,
+            valid,
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        frame::validate_render_target_copy(
+            Format::Rgba8Unorm,
+            Format::Rgba8Unorm,
+            (8, 8),
+            (16, 16),
+            false,
+            valid,
+        ),
+        Err(Error::InvalidArgument)
+    );
+    assert_eq!(
+        frame::validate_render_target_copy(
+            Format::Rgba8Unorm,
+            Format::Rgba16Float,
+            (16, 16),
+            (16, 16),
+            false,
+            valid,
+        ),
+        Err(Error::InvalidArgument)
+    );
+}

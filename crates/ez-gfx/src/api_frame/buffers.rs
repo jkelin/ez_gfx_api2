@@ -105,6 +105,24 @@ impl Drop for TransientInner {
 /// Caps reusable facade storage without rejecting valid one-frame acquisitions.
 const MAX_FACADE_BUFFER_POOL_ENTRIES: usize = 64;
 const MAX_FACADE_BUFFER_POOL_BYTES: usize = 32 * 1024 * 1024;
+const MAX_FACADE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+
+fn next_buffer_capacity(current: usize, required: usize) -> usize {
+    if required <= current {
+        return current;
+    }
+    let required_power = match required.checked_next_power_of_two() {
+        Some(value) => value,
+        None => usize::MAX,
+    };
+    let doubled = current.saturating_mul(2);
+    if doubled > required_power {
+        doubled
+    } else {
+        required_power
+    }
+}
+
 
 const fn facade_pool_can_retain(
     entry_count: usize,
@@ -118,7 +136,7 @@ const fn facade_pool_can_retain(
 struct BufferInner {
     context: Weak<ContextInner>,
     element_size: u32,
-    element_count: u32,
+    element_count: Cell<u32>,
     bytes: RefCell<Vec<u8>>,
     published_count: Cell<u32>,
     usage: Cell<BufferUse>,
@@ -135,7 +153,7 @@ impl BufferInner {
         }
         let end = start_index
             .checked_add(values.len())
-            .filter(|end| *end <= self.element_count as usize)
+            .filter(|end| *end <= self.element_count.get() as usize)
             .ok_or(Error::InvalidArgument)?;
         let start_byte = start_index
             .checked_mul(self.element_size as usize)
@@ -192,6 +210,62 @@ impl<T: bytemuck::Pod> CounterBuffer<T> {
         self.inner.published_count.set(self.inner.published_count.get().max(end));
         Ok(())
     }
+
+    /// Appends one element and returns its buffer index.
+    ///
+    /// Capacity grows geometrically before the buffer is claimed by a frame.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when the context is dispatching a callback, the buffer
+    /// is already claimed, or the enlarged buffer would exceed facade limits.
+    pub fn add(&self, value: T) -> Result<usize> {
+        let context = Context {
+            inner: Rc::clone(&self.context),
+            owner: false,
+        };
+        context.check_entry()?;
+        if self.inner.usage.get() != BufferUse::Available {
+            return Err(Error::NotReady);
+        }
+
+        let index = self.inner.published_count.get() as usize;
+        let required = index.checked_add(1).ok_or(Error::InvalidArgument)?;
+        let capacity = self.inner.element_count.get() as usize;
+        if required > capacity {
+            let grown = next_buffer_capacity(capacity, required);
+            let byte_count = grown
+                .checked_mul(self.inner.element_size as usize)
+                .filter(|bytes| *bytes <= MAX_FACADE_BUFFER_BYTES)
+                .ok_or(Error::InvalidArgument)?;
+            let grown = u32::try_from(grown).map_err(|_| Error::InvalidArgument)?;
+            self.inner.bytes.borrow_mut().resize(byte_count, 0);
+            self.inner.element_count.set(grown);
+        }
+
+        self.inner.write(index, core::slice::from_ref(&value))?;
+        self.inner
+            .published_count
+            .set(u32::try_from(required).map_err(|_| Error::InvalidArgument)?);
+        Ok(index)
+    }
+
+    /// Returns the published element count.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.published_count.get() as usize
+    }
+
+    /// Returns whether no elements are published.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.published_count.get() == 0
+    }
+
+    /// Returns the allocated element capacity.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.inner.element_count.get() as usize
+    }
 }
 
 /// Context-acquired one-frame buffer containing exactly one POD value.
@@ -216,7 +290,9 @@ impl Context {
         let element_count = u32::try_from(element_count).map_err(|_| Error::InvalidArgument)?;
         let byte_count = (element_size as usize)
             .checked_mul(element_count as usize)
-            .filter(|size| element_size != 0 && element_count != 0 && *size <= 16 * 1024 * 1024)
+            .filter(|size| {
+                element_size != 0 && element_count != 0 && *size <= MAX_FACADE_BUFFER_BYTES
+            })
             .ok_or(Error::InvalidArgument)?;
         if initial.is_some_and(|values| values.len() != element_count as usize) {
             return Err(Error::InvalidArgument);
@@ -225,7 +301,7 @@ impl Context {
         if let Some(inner) = pool.iter().find(|inner| {
             Rc::strong_count(inner) == 1
                 && inner.element_size == element_size
-                && inner.element_count == element_count
+                && inner.element_count.get() == element_count
         }) {
             let mut bytes = inner.bytes.borrow_mut();
             bytes.resize(byte_count, 0);
@@ -235,6 +311,7 @@ impl Context {
                 bytes.fill(0);
             }
             inner.published_count.set(published_count);
+            inner.element_count.set(element_count);
             inner.usage.set(BufferUse::Available);
             return Ok(Rc::clone(inner));
         }
@@ -245,7 +322,7 @@ impl Context {
         let inner = Rc::new(BufferInner {
             context: Rc::downgrade(&self.inner),
             element_size,
-            element_count,
+            element_count: Cell::new(element_count),
             bytes: RefCell::new(bytes),
             published_count: Cell::new(published_count),
             usage: Cell::new(BufferUse::Available),

@@ -419,6 +419,13 @@ struct TransientBuffer {
     usage: TransientUse,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GpuArenaBuffer {
+    element_size: u32,
+    element_capacity: u32,
+    last_use: Option<CompletionToken>,
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CleanupTestOutcome {
@@ -456,6 +463,7 @@ struct ContextState {
     indirects: HashMap<CounterBufferHandle, IndexedIndirectBuffer>,
     textures: HashMap<TextureHandle, NativeTexture>,
     transient_buffers: HashMap<PackedHandle, TransientBuffer>,
+    gpu_arenas: HashMap<BufferHandle, GpuArenaBuffer>,
     buffer_pool: HashMap<u32, ez_gfx_hal::ReusableStagingPool<NativeAllocation>>,
     counter_pool: ez_gfx_hal::ReusableStagingPool<NativeAllocation>,
     /// Retained command/payload serialization buffer; cleared per counter write
@@ -517,6 +525,8 @@ struct ContextState {
     frame_workgroup_sizes: Vec<Option<MetalWorkgroupSizes>>,
     frame_resources: HashMap<PackedHandle, ResourceId>,
     frame_vertex_heaps: HashMap<u32, ResourceId>,
+    /// Transient buffer handles materialized from read-only arenas this frame.
+    frame_arena_buffers: HashSet<PackedHandle>,
     frame_serial: u64,
     frame_native_resources: HashMap<ResourceId, FrameNativeResource>,
     frame_index: Option<ResourceId>,
@@ -527,8 +537,9 @@ struct ContextState {
     frame_capture_surface: Option<SurfaceHandle>,
     active_surface: Option<SurfaceHandle>,
     frame_render_target: Option<RenderTargetHandle>,
-    /// Targets whose successful submission leaves them ready for bindless sampling.
-    frame_sample_targets: Vec<RenderTargetHandle>,
+    frame_preserve_render_target: bool,
+    /// Last recorded state for each managed target used by this frame.
+    frame_render_target_states: HashMap<RenderTargetHandle, ez_gfx_hal::ResourceState>,
     last_readbacks: Vec<Vec<u8>>,
     observability: Observability,
     #[cfg(test)]
@@ -643,7 +654,7 @@ use native::{
     native_mesh_dispatch_limits, native_texture_compression, pipeline_layout_key,
     poll_native_frame_completion, pop_largest_native_texture_staging,
     prepare_frame_binding_scratch, result_status, retained_native_texture_staging,
-    retire_native_allocation, wait_native_idle, write_native,
+    retire_native_allocation, wait_native_idle, write_native, write_native_region,
 };
 mod render_target;
 mod shader;

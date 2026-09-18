@@ -1,9 +1,16 @@
 include!("api_frame/buffers.rs");
 
 #[derive(Clone)]
+struct GpuArenaBinding {
+    handle: ez_gfx_core::handle::BufferHandle,
+    _owner: Arc<dyn Any + Send + Sync>,
+}
+
+#[derive(Clone)]
 enum DraftBinding {
     Buffer(Rc<BufferInner>),
     Counter(Rc<BufferInner>),
+    GpuArena(GpuArenaBinding),
 }
 
 mod bindable_buffer {
@@ -230,8 +237,11 @@ impl Frame {
         if inner.usage.get() != BufferUse::Available {
             return Err(Error::NotReady);
         }
-        let handle =
-            state::acquire_buffer_sized(context.handle, inner.element_size, inner.element_count)?;
+        let handle = state::acquire_buffer_sized(
+            context.handle,
+            inner.element_size,
+            inner.element_count.get(),
+        )?;
         if let Err(error) = state::write_buffer_bytes(
             context.handle,
             handle,
@@ -279,7 +289,7 @@ impl Frame {
         if inner.usage.get() != BufferUse::Available {
             return Err(Error::NotReady);
         }
-        let handle = state::acquire_counter(context.handle, inner.element_count)?;
+        let handle = state::acquire_counter(context.handle, inner.element_count.get())?;
         if let Err(error) = state::write_counter_bytes(
             context.handle,
             handle,
@@ -320,6 +330,9 @@ impl Frame {
                             Self::materialize_buffer_state(context, transients, inner)
                                 .map(ResourceIdentity::Buffer)?
                         }
+                        DraftBinding::GpuArena(arena) => {
+                            ResourceIdentity::Buffer(arena.handle)
+                        }
                         DraftBinding::Counter(inner) => {
                             Self::materialize_counter_state(context, transients, inner)
                                 .map(ResourceIdentity::Counter)?
@@ -359,27 +372,69 @@ impl Frame {
         buffer.bind_to_frame(self, name.into())
     }
 
+    /// Binds a context-scoped GPU arena to one reflected read-only buffer name.
+    ///
+    /// Synchronization starts here: the arena lock excludes concurrent CPU
+    /// mutations while dirty regions are flushed to its persistent GPU buffer.
+    /// Binding never consumes the arena; later frames may bind it again.
+    ///
+    /// # Errors
+    /// Returns [`Error`] for a foreign or empty arena, an invalid name, an
+    /// oversized buffer, or failed GPU synchronization.
+    pub fn bind_gpu_arena<T>(
+        &mut self,
+        arena: &GpuArena<T>,
+        name: impl Into<CompactString>,
+    ) -> Result<()>
+    where
+        T: bytemuck::Pod + bytemuck::Zeroable + Send + Sync,
+    {
+        if arena.inner.owner != self.context.handle {
+            return self.fail(Error::InvalidContext);
+        }
+        let synchronized = arena.inner.synchronize(|values, dirty| {
+            if values.is_empty() {
+                return Err(Error::InvalidArgument);
+            }
+            state::sync_gpu_arena_buffer(
+                self.context.handle,
+                arena.inner.handle,
+                bytemuck::cast_slice(values),
+                dirty,
+            )
+        });
+        if let Err(error) = synchronized {
+            return self.fail(error);
+        }
+        self.bind_draft(
+            name.into(),
+            DraftBinding::GpuArena(GpuArenaBinding {
+                handle: arena.inner.handle,
+                _owner: arena.inner.clone(),
+            }),
+        )
+    }
+
     fn bind_draft(&mut self, name: CompactString, binding: DraftBinding) -> Result<()> {
         if name.is_empty() || name.len() > 255 || name.as_bytes().contains(&0) {
             return self.fail(Error::InvalidArgument);
         }
-        let inner = match &binding {
-            DraftBinding::Buffer(inner) | DraftBinding::Counter(inner) => inner,
-        };
-        let Some(owner) = inner.context.upgrade() else {
-            return self.fail(Error::InvalidContext);
-        };
-        self.ensure_context(&owner)?;
-        let valid_state = match inner.usage.get() {
-            BufferUse::Available => true,
-            BufferUse::Claimed => self.transients.iter().any(|transient| {
-                transient.state.get() == TransientState::Live
-                    && Rc::ptr_eq(&transient.buffer, inner)
-            }),
-            BufferUse::Consumed => false,
-        };
-        if !valid_state {
-            return self.fail(Error::NotReady);
+        if let DraftBinding::Buffer(inner) | DraftBinding::Counter(inner) = &binding {
+            let Some(owner) = inner.context.upgrade() else {
+                return self.fail(Error::InvalidContext);
+            };
+            self.ensure_context(&owner)?;
+            let valid_state = match inner.usage.get() {
+                BufferUse::Available => true,
+                BufferUse::Claimed => self.transients.iter().any(|transient| {
+                    transient.state.get() == TransientState::Live
+                        && Rc::ptr_eq(&transient.buffer, inner)
+                }),
+                BufferUse::Consumed => false,
+            };
+            if !valid_state {
+                return self.fail(Error::NotReady);
+            }
         }
         if let Some((_, current)) = self
             .bindings
@@ -506,6 +561,18 @@ impl Frame {
         self.record(|context| state::frame_enqueue_render_target_sample(context, handle))
     }
 
+    fn prepare_persistent_target_sampling(
+        &mut self,
+        target: &RenderTargetHandle,
+    ) -> Result<()> {
+        self.ensure_context(&target.inner.context)?;
+        let handle = match target.inner.managed_handle() {
+            Ok(handle) => handle,
+            Err(error) => return self.fail(error),
+        };
+        self.record(|context| state::frame_enqueue_render_target_sample(context, handle))
+    }
+
     fn prepare_target_readback(&mut self, target: &RenderTarget) -> Result<Readback> {
         self.ensure_context(&target.inner.context)?;
         let (width, height) = match target.extent() {
@@ -559,101 +626,99 @@ impl Frame {
         Ok(Readback { inner: request })
     }
 
-    /// Configures a cached named render target for this frame.
-    ///
-    /// A descriptor change atomically replaces the cached color/depth images;
-    /// unchanged configurations reuse both attachments.
+    /// Attaches a persistent managed render target to this frame.
     ///
     /// # Errors
-    /// Returns [`Error`] when the frame is already configured or target creation fails.
-    pub fn configure_render_target(
+    /// Returns [`Error`] when the frame is already configured or the target is foreign or released.
+    pub fn attach_render_target(
         &mut self,
-        name: impl Into<String>,
-        size: [u32; 2],
-        descriptor: impl Into<crate::RenderTargetDescriptor>,
+        target: &RenderTargetHandle,
+        load: RenderTargetLoad,
     ) -> Result<RenderTarget> {
-        let descriptor = descriptor.into();
-        // A surface-backed frame and a second target attachment are never interchangeable.
         if self.target != FrameTarget::Unconfigured || self.surface.is_some() {
             return self.fail(Error::NotReady);
         }
-        let name = name.into();
-        let [width, height] = size;
-        if width == 0
-            || height == 0
-            || !matches!(descriptor.maximum_samples, 1 | 2 | 4 | 8)
-        {
-            return self.fail(Error::InvalidArgument);
-        }
-        // Cache identity is the stable name; descriptor or extent changes replace
-        // both logical attachments as one cache entry.
-        let cached = self
-            .context
-            .render_targets
-            .borrow()
-            .get(&name)
-            .copied()
-            .filter(|target| {
-                target.extent == (width, height)
-                    && target.format == descriptor.color_format
-                    && target.depth_format == descriptor.depth_format
-                    && target.clear_color.map(f32::to_bits)
-                        == descriptor.clear_color.map(f32::to_bits)
-                    && target.maximum_samples == descriptor.maximum_samples
-            });
-        let handle = if let Some(target) = cached {
-            target.handle
-        } else {
-            let Ok(declaration) = ez_gfx_runtime::target::TargetDeclaration::new(
-                name.clone(),
-                ez_gfx_runtime::target::TargetUsage::Color,
-                1.0,
-                descriptor.maximum_samples,
-                vec![descriptor.color_format],
-                ez_gfx_runtime::target::ClearValue::Color(descriptor.clear_color),
-                true,
-            ) else {
-                return self.fail(Error::InvalidArgument);
-            };
-            let handle = match state::create_render_target(
-                self.context.handle,
-                &declaration,
-                descriptor.depth_format,
-                width,
-                height,
-            ) {
-                Ok(handle) => handle,
-                Err(error) => return self.fail(error),
-            };
-            // Publish the replacement before retiring the old native images.
-            let previous = self.context.render_targets.borrow_mut().insert(
-                name.clone(),
-                CachedRenderTarget {
-                    handle,
-                    format: descriptor.color_format,
-                    extent: (width, height),
-                    depth_format: descriptor.depth_format,
-                    clear_color: descriptor.clear_color,
-                    maximum_samples: descriptor.maximum_samples,
-                },
-            );
-        if let Some(previous) = previous {
-            state::destroy_render_target(self.context.handle, previous.handle);
-        }
-            handle
+        self.ensure_context(&target.inner.context)?;
+        let handle = match target.inner.managed_handle() {
+            Ok(handle) => handle,
+            Err(error) => return self.fail(error),
         };
-        if let Err(error) = state::configure_render_target(self.context.handle, handle) {
+        if let Err(error) = state::configure_render_target(
+            self.context.handle,
+            handle,
+            load == RenderTargetLoad::Preserve,
+        ) {
             return self.fail(error);
         }
         self.target = FrameTarget::RenderTarget;
-        let inner = Rc::new(RenderTargetInner {
-            context: Rc::clone(&self.context),
-            backing: RenderTargetBacking::Managed(name),
-        });
-        self.retain(&inner);
+        self.retain(&target.inner);
         Ok(RenderTarget {
-            inner,
+            inner: Rc::clone(&target.inner),
             surface_lease: None,
+        })
+    }
+
+    /// Copies the complete source target into the complete destination target.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when ownership, extents, formats, or frame state are invalid.
+    pub fn blit_render_target(
+        &mut self,
+        source: &RenderTargetHandle,
+        destination: &RenderTargetHandle,
+        blending: Blending,
+    ) -> Result<()> {
+        let (width, height) = match source.extent() {
+            Ok(extent) => extent,
+            Err(error) => return self.fail(error),
+        };
+        if destination.extent() != Ok((width, height)) {
+            return self.fail(Error::InvalidArgument);
+        }
+        let rect = RenderTargetRect::new(0, 0, width, height);
+        self.blit_render_target_rect(source, destination, blending, rect, rect)
+    }
+
+    /// Copies one source rectangle into an equally sized destination rectangle.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when ownership, rectangles, formats, or frame state are invalid.
+    pub fn blit_render_target_rect(
+        &mut self,
+        source: &RenderTargetHandle,
+        destination: &RenderTargetHandle,
+        _blending: Blending,
+        source_rect: RenderTargetRect,
+        destination_rect: RenderTargetRect,
+    ) -> Result<()> {
+        self.ensure_context(&source.inner.context)?;
+        self.ensure_context(&destination.inner.context)?;
+        if source_rect.width != destination_rect.width
+            || source_rect.height != destination_rect.height
+        {
+            return self.fail(Error::InvalidArgument);
+        }
+        let source_handle = match source.inner.managed_handle() {
+            Ok(handle) => handle,
+            Err(error) => return self.fail(error),
+        };
+        let destination_handle = match destination.inner.managed_handle() {
+            Ok(handle) => handle,
+            Err(error) => return self.fail(error),
+        };
+        self.record(|context| {
+            state::copy_render_target_regions(
+                context,
+                source_handle,
+                destination_handle,
+                ez_gfx_hal::TextureCopyRegion {
+                    source_mip: 0,
+                    destination_mip: 0,
+                    source_origin: [source_rect.x, source_rect.y],
+                    destination_origin: [destination_rect.x, destination_rect.y],
+                    extent: [source_rect.width, source_rect.height],
+                },
+            )
         })
     }
 
@@ -1048,6 +1113,19 @@ mod inline_storage_tests {
                 facade_pool_can_retain(entries, retained, candidate),
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn counted_buffer_growth_doubles_and_covers_requested_length() {
+        for (capacity, required, expected) in [
+            (1, 2, 2),
+            (2, 3, 4),
+            (4, 9, 16),
+            (8, 8, 8),
+            (usize::MAX, usize::MAX, usize::MAX),
+        ] {
+            assert_eq!(super::next_buffer_capacity(capacity, required), expected);
         }
     }
 

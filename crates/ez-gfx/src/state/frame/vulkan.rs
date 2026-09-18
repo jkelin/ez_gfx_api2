@@ -235,6 +235,20 @@ fn prepare_vulkan_mesh_pipeline(
     Ok(Some(pipeline))
 }
 
+fn evict_vulkan_pipelines_if_full(
+    native: &mut ez_gfx_backend_vulkan::NativeContext,
+    pipelines: &mut HashMap<PipelineKey, NativePipeline>,
+) -> Result<()> {
+    if pipelines.len() != MAX_PIPELINE_CACHE_ENTRIES {
+        return Ok(());
+    }
+    native.wait_idle().map_err(map_hal)?;
+    for pipeline in pipelines.drain().map(|(_, value)| value) {
+        native.destroy_pipeline(pipeline.into_vulkan()?);
+    }
+    Ok(())
+}
+
 // Unsupported shader variants fail without inserting a partial pipeline-cache entry.
 fn prepare_vulkan_pipelines(
     native: &mut ez_gfx_backend_vulkan::NativeContext,
@@ -271,16 +285,7 @@ fn prepare_vulkan_pipelines(
                 sample_count,
             )?;
             if let Some(pipeline) = pipeline {
-                if pipelines.len() == MAX_PIPELINE_CACHE_ENTRIES {
-                    native.wait_idle().map_err(map_hal)?;
-                    let stale = pipelines
-                        .drain()
-                        .map(|(_, value)| value)
-                        .collect::<Vec<_>>();
-                    for stale_pipeline in stale {
-                        native.destroy_pipeline(stale_pipeline.into_vulkan()?);
-                    }
-                }
+                evict_vulkan_pipelines_if_full(native, pipelines)?;
                 let key = pipeline_keys[node_index]
                     .as_ref()
                     .ok_or(Error::InvalidArgument)?
@@ -374,22 +379,14 @@ fn prepare_vulkan_pipelines(
             }
             ExecutableNode::Mesh { .. } => unreachable!("mesh payload handled above"),
             ExecutableNode::CopyTexture { .. }
+            | ExecutableNode::CopyRenderTarget { .. }
             | ExecutableNode::TextureReadback { .. }
             | ExecutableNode::RenderTargetReadback { .. }
             | ExecutableNode::RenderTargetSample { .. }
             | ExecutableNode::Present { .. } => continue,
         };
         if let Some(pipeline) = pipeline {
-            if pipelines.len() == MAX_PIPELINE_CACHE_ENTRIES {
-                native.wait_idle().map_err(map_hal)?;
-                let stale = pipelines
-                    .drain()
-                    .map(|(_, value)| value)
-                    .collect::<Vec<_>>();
-                for stale_pipeline in stale {
-                    native.destroy_pipeline(stale_pipeline.into_vulkan()?);
-                }
-            }
+            evict_vulkan_pipelines_if_full(native, pipelines)?;
             pipelines.insert(key.clone(), pipeline);
         }
         pipeline_keys[node_index] = Some(key);
@@ -594,6 +591,36 @@ impl VulkanActionSource<'_, '_> {
         })
     }
 
+    fn copy_render_target_action(
+        &self,
+        source: RenderTargetHandle,
+        destination: RenderTargetHandle,
+        region: ez_gfx_hal::TextureCopyRegion,
+    ) -> std::result::Result<ez_gfx_backend_vulkan::NativeFrameAction<'_>, ez_gfx_hal::HalError>
+    {
+        let source = self
+            .state
+            .render_targets
+            .get(&source)
+            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+            .native
+            .vulkan()
+            .map_err(|_| ez_gfx_hal::HalError::InvalidArgument)?;
+        let destination = self
+            .state
+            .render_targets
+            .get(&destination)
+            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+            .native
+            .vulkan()
+            .map_err(|_| ez_gfx_hal::HalError::InvalidArgument)?;
+        Ok(ez_gfx_backend_vulkan::NativeFrameAction::CopyTexture {
+            source,
+            destination,
+            region,
+        })
+    }
+
     fn mesh_draw<'draw>(
         &'draw self,
         node: usize,
@@ -773,6 +800,11 @@ impl ez_gfx_backend_vulkan::NativeFrameActionSource for VulkanActionSource<'_, '
                             destination,
                             region,
                         } => self.copy_texture_action(*source, *destination, *region)?,
+                        ExecutableNode::CopyRenderTarget {
+                            source,
+                            destination,
+                            region,
+                        } => self.copy_render_target_action(*source, *destination, *region)?,
                         ExecutableNode::Present { .. } => {
                             ez_gfx_backend_vulkan::NativeFrameAction::Present
                         }

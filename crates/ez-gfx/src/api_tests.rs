@@ -401,7 +401,7 @@ fn value_buffer_stores_exactly_one_pod_value() -> Result<()> {
 
     let buffer = context.acquire_value_buffer(value)?;
 
-    assert_eq!(buffer.inner.element_count, 1);
+    assert_eq!(buffer.inner.element_count.get(), 1);
     assert_eq!(
         buffer.inner.bytes.borrow().as_slice(),
         bytemuck::bytes_of(&value)
@@ -505,14 +505,19 @@ fn headless_surface_rejects_presentation_configuration() -> Result<()> {
 #[test]
 fn poisoned_frame_finish_returns_exact_record_error_without_submit() -> Result<()> {
     let (context, surface) = headless()?;
+    let (foreign_context, _foreign_surface) = headless()?;
+    let foreign = foreign_context.acquire_render_target(
+        "foreign",
+        [1, 1],
+        ez_gfx_runtime::target::Format::Rgba8Unorm,
+    )?;
     let mut frame = context.begin_frame()?;
     assert!(matches!(
-        frame
-            .configure_render_target("invalid", [0, 1], ez_gfx_runtime::target::Format::Bgra8Srgb,),
-        Err(Error::InvalidArgument)
+        frame.attach_render_target(&foreign, RenderTargetLoad::Clear),
+        Err(Error::InvalidContext)
     ));
 
-    assert_eq!(frame.finish(), Err(Error::InvalidArgument));
+    assert_eq!(frame.finish(), Err(Error::InvalidContext));
     drop(surface.begin_frame()?);
     Ok(())
 }
@@ -551,38 +556,73 @@ fn allocation_drop_during_recording_does_not_reuse_its_range() -> Result<()> {
 
 #[cfg(not(target_vendor = "apple"))]
 #[test]
-fn named_render_target_reuses_then_recreates_cached_image() -> Result<()> {
+fn persistent_render_target_reuses_until_explicit_release() -> Result<()> {
     let (context, _surface) = headless()?;
-    let mut first = context.begin_frame()?;
-    let first_target = first.configure_render_target(
+    let target = context.acquire_render_target(
         "history",
         [2, 2],
         ez_gfx_runtime::target::Format::Rgba8Unorm,
     )?;
-    let first_handle = first_target.inner.managed_handle()?;
+    let first_handle = target.inner.managed_handle()?;
+
+    let mut first = context.begin_frame()?;
+    let first_target = first.attach_render_target(&target, RenderTargetLoad::Clear)?;
+    assert_eq!(first_target.inner.managed_handle()?, first_handle);
     drop(first);
 
     let mut second = context.begin_frame()?;
-    let second_target = second.configure_render_target(
-        "history",
-        [2, 2],
-        ez_gfx_runtime::target::Format::Rgba8Unorm,
-    )?;
+    let second_target = second.attach_render_target(&target, RenderTargetLoad::Clear)?;
     assert_eq!(second_target.inner.managed_handle()?, first_handle);
     drop(second);
 
-    let mut resized = context.begin_frame()?;
-    let resized_target = resized.configure_render_target(
+    context.release_render_target(target)?;
+    let resized = context.acquire_render_target(
         "history",
         [4, 3],
         ez_gfx_runtime::target::Format::Rgba8Unorm,
     )?;
-    assert_ne!(resized_target.inner.managed_handle()?, first_handle);
-    assert_eq!(first_target.extent(), Ok((4, 3)));
-    drop(resized);
+    assert_ne!(resized.inner.managed_handle()?, first_handle);
+    assert_eq!(resized.extent(), Ok((4, 3)));
+    context.release_render_target(resized)?;
     Ok(())
 }
 
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn recording_frame_prevents_persistent_target_release() -> Result<()> {
+    let (context, _surface) = headless()?;
+    let target = context.acquire_render_target(
+        "recording-release",
+        [2, 2],
+        ez_gfx_runtime::target::Format::Rgba8Unorm,
+    )?;
+    let mut frame = context.begin_frame()?;
+    let _attached = frame.attach_render_target(&target, RenderTargetLoad::Clear)?;
+
+    assert_eq!(context.release_render_target(target), Err(Error::NotReady));
+    drop(frame);
+    Ok(())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn render_target_blit_requires_an_attached_target_to_submit() -> Result<()> {
+    let (context, _surface) = headless()?;
+    let source = context.acquire_render_target(
+        "blit-source",
+        [2, 2],
+        ez_gfx_runtime::target::Format::Rgba8Unorm,
+    )?;
+    let destination = context.acquire_render_target(
+        "blit-destination",
+        [2, 2],
+        ez_gfx_runtime::target::Format::Rgba8Unorm,
+    )?;
+    let mut frame = context.begin_frame()?;
+    frame.blit_render_target(&source, &destination, Blending::Copy)?;
+    assert_eq!(frame.finish(), Err(Error::NotReady));
+    Ok(())
+}
 #[cfg(not(target_vendor = "apple"))]
 #[test]
 fn repeated_render_target_readbacks_keep_distinct_callback_identities() -> Result<()> {
@@ -594,12 +634,13 @@ fn repeated_render_target_readbacks_keep_distinct_callback_identities() -> Resul
             callback_observed.borrow_mut().push((request, bytes.len()));
         }
     })?;
-    let mut frame = context.begin_frame()?;
-    let target = frame.configure_render_target(
+    let target_handle = context.acquire_render_target(
         "capture",
         [2, 2],
         ez_gfx_runtime::target::Format::Rgba8Unorm,
     )?;
+    let mut frame = context.begin_frame()?;
+    let target = frame.attach_render_target(&target_handle, RenderTargetLoad::Clear)?;
     let first = target.prepare_readback(&mut frame)?;
     let second = target.prepare_readback(&mut frame)?;
     assert_ne!(first.id(), second.id());
@@ -622,9 +663,9 @@ fn managed_render_target_readback_rejects_non_rgba8_formats() -> Result<()> {
         ),
     ] {
         let (context, _surface) = headless()?;
+        let target_handle = context.acquire_render_target(name, [2, 2], format)?;
         let mut frame = context.begin_frame()?;
-        let target = frame.configure_render_target(name, [2, 2], format)?;
-
+        let target = frame.attach_render_target(&target_handle, RenderTargetLoad::Clear)?;
         assert_eq!(
             target.prepare_readback(&mut frame).map(|_| ()),
             Err(Error::InvalidArgument)
@@ -646,9 +687,9 @@ fn buffer_sources_infer_scalar_slice_and_vec_elements() -> Result<()> {
     let slice_buffer = context.acquire_buffer_from(slice)?;
     let vec_buffer = context.acquire_buffer_from(&values)?;
 
-    assert_eq!(scalar_buffer.inner.element_count, 1);
-    assert_eq!(slice_buffer.inner.element_count, 2);
-    assert_eq!(vec_buffer.inner.element_count, 2);
+    assert_eq!(scalar_buffer.inner.element_count.get(), 1);
+    assert_eq!(slice_buffer.inner.element_count.get(), 2);
+    assert_eq!(vec_buffer.inner.element_count.get(), 2);
     assert_eq!(
         scalar_buffer.inner.bytes.borrow().as_slice(),
         bytemuck::bytes_of(&scalar)

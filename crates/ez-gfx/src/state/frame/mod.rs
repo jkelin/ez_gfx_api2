@@ -1,7 +1,7 @@
 use crate::Result;
 
 use super::{
-    Access, Backend, BufferRange, ContextHandle, ContextState, CounterBufferHandle,
+    Access, Backend, BufferHandle, BufferRange, ContextHandle, ContextState, CounterBufferHandle,
     DiagnosticLevel, DynamicPipelineState, Error, ExecutableNode, ExecutionAction,
     ExecutionBarrier, ExecutionPass, Format, FrameBindingSource, FrameBufferBindingRecord,
     FrameExecutionBackend, FrameExecutionPlan, FrameNativeResource, GeometryAllocation, HashMap,
@@ -65,11 +65,13 @@ pub(super) fn start_recording(context: &mut ContextState) -> Result<()> {
     context.frame_resources.clear();
     context.frame_native_resources.clear();
     context.frame_vertex_heaps.clear();
+    context.frame_arena_buffers.clear();
     context.frame_index = None;
     context.active_surface = None;
     context.frame_surface = None;
     context.frame_render_target = None;
-    context.frame_sample_targets.clear();
+    context.frame_preserve_render_target = false;
+    context.frame_render_target_states.clear();
     context.frame_depth = None;
     context.frame_has_graphics = false;
     context.last_readbacks.clear();
@@ -206,6 +208,134 @@ pub fn copy_texture_regions(
     }))
 }
 
+pub(super) fn validate_render_target_copy(
+    source_format: Format,
+    destination_format: Format,
+    source_extent: (u32, u32),
+    destination_extent: (u32, u32),
+    same_target: bool,
+    region: ez_gfx_hal::TextureCopyRegion,
+) -> Result<()> {
+    let [width, height] = region.extent;
+    if source_format != destination_format
+        || region.source_mip != 0
+        || region.destination_mip != 0
+        || width == 0
+        || height == 0
+    {
+        return Err(Error::InvalidArgument);
+    }
+    let source_end = (
+        region.source_origin[0].checked_add(width),
+        region.source_origin[1].checked_add(height),
+    );
+    let destination_end = (
+        region.destination_origin[0].checked_add(width),
+        region.destination_origin[1].checked_add(height),
+    );
+    let (Some(source_right), Some(source_bottom)) = source_end else {
+        return Err(Error::InvalidArgument);
+    };
+    let (Some(destination_right), Some(destination_bottom)) = destination_end else {
+        return Err(Error::InvalidArgument);
+    };
+    if source_right > source_extent.0
+        || source_bottom > source_extent.1
+        || destination_right > destination_extent.0
+        || destination_bottom > destination_extent.1
+    {
+        return Err(Error::InvalidArgument);
+    }
+    let overlaps = region.source_origin[0] < destination_right
+        && region.destination_origin[0] < source_right
+        && region.source_origin[1] < destination_bottom
+        && region.destination_origin[1] < source_bottom;
+    if same_target && overlaps {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(())
+}
+
+/// Records a validated copy between persistent managed render targets.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] for incompatible targets or regions and
+/// [`Error::NotReady`] when no frame is recording.
+pub fn copy_render_target_regions(
+    context: ContextHandle,
+    source: RenderTargetHandle,
+    destination: RenderTargetHandle,
+    region: ez_gfx_hal::TextureCopyRegion,
+) -> Result<()> {
+    result_status(with_context_mut(context, |context| {
+        context
+            .identity
+            .resolve(source.packed(), ResourceKind::RenderTarget)
+            .map_err(map_lifecycle)?;
+        context
+            .identity
+            .resolve(destination.packed(), ResourceKind::RenderTarget)
+            .map_err(map_lifecycle)?;
+        let source_record = context
+            .render_targets
+            .get(&source)
+            .ok_or(Error::InvalidContext)?;
+        let destination_record = context
+            .render_targets
+            .get(&destination)
+            .ok_or(Error::InvalidContext)?;
+        if source_record.declaration.samples() != 1 || destination_record.declaration.samples() != 1
+        {
+            return Err(Error::InvalidArgument);
+        }
+        validate_render_target_copy(
+            source_record.format,
+            destination_record.format,
+            (source_record.width, source_record.height),
+            (destination_record.width, destination_record.height),
+            source == destination,
+            region,
+        )?;
+        if context.frame.state() != ez_gfx_runtime::frame::FrameState::Recording {
+            return Err(Error::NotReady);
+        }
+        let source_resource = intern_render_target_resource(context, source)?;
+        let destination_resource = intern_render_target_resource(context, destination)?;
+        let range = ImageRange::all(1, 1).map_err(|_| Error::InvalidArgument)?;
+        let read = ResourceState::new(
+            QueueKind::Transfer,
+            ShaderStage::None,
+            ResourceAccess::TransferRead,
+        )
+        .map_err(|_| Error::InvalidArgument)?;
+        let write = ResourceState::new(
+            QueueKind::Transfer,
+            ShaderStage::None,
+            ResourceAccess::TransferWrite,
+        )
+        .map_err(|_| Error::InvalidArgument)?;
+        context
+            .frame
+            .record_node(
+                NodeDesc::new("copy-render-target", QueueKind::Transfer)
+                    .access(Access::image(source_resource, range, read))
+                    .access(Access::image(destination_resource, range, write)),
+                ExecutableNode::CopyRenderTarget {
+                    source,
+                    destination,
+                    region,
+                },
+            )
+            .map_err(|error| map_frame(&error))?;
+        context.frame_render_target_states.insert(source, read);
+        context
+            .frame_render_target_states
+            .insert(destination, write);
+        Ok(())
+    }))
+}
+
 const fn should_capture_presented(snapshot_cache: bool, frame_request: bool) -> bool {
     snapshot_cache || frame_request
 }
@@ -319,7 +449,7 @@ fn intern_render_target_resource(
         .render_targets
         .get(&target)
         .ok_or(Error::InvalidContext)?;
-    let sample_ready = record.sample_ready;
+    let last_state = record.last_state;
     let desc = ResourceDesc::image(
         record.width,
         record.height,
@@ -334,16 +464,10 @@ fn intern_render_target_resource(
         .frame
         .add_resource(desc)
         .map_err(|error| map_frame(&error))?;
-    if sample_ready {
-        let sampled = ResourceState::new(
-            QueueKind::Graphics,
-            ShaderStage::AllGraphics,
-            ResourceAccess::SampledRead,
-        )
-        .map_err(|_| Error::InvalidArgument)?;
+    if let Some(state) = last_state {
         context
             .frame
-            .set_resource_initial_state(resource, sampled)
+            .set_resource_initial_state(resource, state)
             .map_err(|error| map_frame(&error))?;
     }
     context.frame_resources.insert(target.packed(), resource);
@@ -386,21 +510,24 @@ pub fn frame_enqueue_render_target_readback(
                 ExecutableNode::RenderTargetReadback { target },
             )
             .map_err(|error| map_frame(&error))?;
+        context.frame_render_target_states.insert(target, state);
         Ok(())
     }))
 }
 
-/// Enqueues a barrier-only sampled read after rendering the active managed target.
+/// Enqueues a barrier-only sampled read after rendering or copying a managed target.
 ///
 /// # Errors
 ///
-/// Returns an error when the target is stale or is not the active frame attachment.
+/// Returns an error when the target is stale or has not participated in this frame.
 pub fn frame_enqueue_render_target_sample(
     context: ContextHandle,
     target: RenderTargetHandle,
 ) -> Result<()> {
     result_status(with_context_mut(context, |context| {
-        if context.frame_render_target != Some(target) {
+        if context.frame_render_target != Some(target)
+            && !context.frame_resources.contains_key(&target.packed())
+        {
             return Err(Error::InvalidContext);
         }
         let resource = intern_render_target_resource(context, target)?;
@@ -421,14 +548,26 @@ pub fn frame_enqueue_render_target_sample(
                 ExecutableNode::RenderTargetSample { target },
             )
             .map_err(|error| map_frame(&error))?;
-        if !context.frame_sample_targets.contains(&target) {
-            context.frame_sample_targets.push(target);
-        }
+        context.frame_render_target_states.insert(target, sampled);
         Ok(())
     }))
 }
 
 // Attachment readiness is checked before any indexed-only resource is interned.
+fn mark_attached_target_written(context: &mut ContextState) -> Result<()> {
+    let Some(target) = context.frame_render_target else {
+        return Ok(());
+    };
+    let state = ResourceState::new(
+        QueueKind::Graphics,
+        ShaderStage::Fragment,
+        ResourceAccess::ColorAttachmentWrite,
+    )
+    .map_err(|_| Error::InvalidArgument)?;
+    context.frame_render_target_states.insert(target, state);
+    Ok(())
+}
+
 fn graphics_pass_node(
     context: &mut ContextState,
     pipeline_layout: ez_gfx_runtime::binding::PipelineLayout,
@@ -436,6 +575,9 @@ fn graphics_pass_node(
 ) -> Result<NodeDesc> {
     // A managed target may carry its own backend depth companion; the backend
     // validates that attachment during pass lowering.
+    let target_had_prior_access = context
+        .frame_render_target
+        .is_some_and(|target| context.frame_resources.contains_key(&target.packed()));
     let (color, depth, width, height, samples) = if let Some(target) = context.frame_render_target {
         let resource = intern_render_target_resource(context, target)?;
         let (width, height, samples) = {
@@ -465,7 +607,10 @@ fn graphics_pass_node(
             .ok_or(Error::NotReady)?;
         (surface, depth, width, height, 1)
     };
-    let load = if context.frame_has_graphics {
+    let load = if context.frame_has_graphics
+        || context.frame_preserve_render_target
+        || target_had_prior_access
+    {
         LoadOp::Load
     } else {
         LoadOp::Clear
@@ -712,6 +857,7 @@ pub fn execute_graphics(
         context.frame_shaders.insert(fragment_shader);
         mark_transient_bindings_interned(context, bindings)?;
         mark_transient_interned(context, counter_handle)?;
+        mark_attached_target_written(context)?;
         context.frame_has_graphics = true;
         Ok(())
     }))
@@ -861,6 +1007,7 @@ pub fn execute_mesh(
             context.frame_shaders.insert(stages.mesh);
             context.frame_shaders.insert(stages.fragment);
             mark_transient_bindings_interned(context, projected)?;
+            mark_attached_target_written(context)?;
             context.frame_has_graphics = true;
             Ok(())
         })();
@@ -942,6 +1089,9 @@ fn validate_binding_handles(
     context: &ContextState,
     bindings: binding::BindingProjection<'_>,
 ) -> Result<()> {
+    if !bindings.arenas_are_read_only(&context.frame_arena_buffers) {
+        return Err(Error::Unsupported);
+    }
     for binding in bindings.iter() {
         let (packed, kind) = match binding.resource {
             ez_gfx_runtime::binding::ResourceIdentity::Buffer(handle) => {
@@ -962,6 +1112,12 @@ fn validate_binding_handles(
             .identity
             .resolve(packed, kind)
             .map_err(map_lifecycle)?;
+        if kind == ResourceKind::Buffer
+            && BufferHandle::from_packed(packed)
+                .is_ok_and(|handle| context.gpu_arenas.contains_key(&handle))
+        {
+            continue;
+        }
         let usage = context
             .transient_buffers
             .get(&packed)
@@ -986,6 +1142,9 @@ fn mark_transient_bindings_interned(
             ez_gfx_runtime::binding::ResourceIdentity::Counter(handle) => handle.packed(),
             ez_gfx_runtime::binding::ResourceIdentity::RenderTarget(_) => continue,
         };
+        if context.frame_arena_buffers.contains(&handle) {
+            continue;
+        }
         mark_transient_interned(context, handle)?;
     }
     Ok(())
@@ -1072,9 +1231,16 @@ pub fn frame_submit(context: ContextHandle) -> Result<()> {
             )?;
             recycle_consumed_transients(context, completion)?;
             super::buffers::reclaim_available_transients(context)?;
-            for target in context.frame_sample_targets.drain(..) {
+            for packed in &context.frame_arena_buffers {
+                if let Ok(handle) = BufferHandle::from_packed(*packed)
+                    && let Some(arena) = context.gpu_arenas.get_mut(&handle)
+                {
+                    arena.last_use = Some(completion);
+                }
+            }
+            for (target, state) in context.frame_render_target_states.drain() {
                 if let Some(record) = context.render_targets.get_mut(&target) {
-                    record.sample_ready = true;
+                    record.last_state = Some(state);
                 }
             }
             let record = runtime_record(context, 0, RuntimePhase::Submit, Ok(()));
@@ -1117,10 +1283,12 @@ fn abort_recording_state(context: &mut ContextState) -> Result<()> {
     super::geometry::finalize_recording_range_drops(context, frame_serial, completion)?;
     context.frame_native_resources.clear();
     context.frame_vertex_heaps.clear();
+    context.frame_arena_buffers.clear();
     context.frame_index = None;
     context.frame_surface = None;
     context.frame_render_target = None;
-    context.frame_sample_targets.clear();
+    context.frame_preserve_render_target = false;
+    context.frame_render_target_states.clear();
     context.frame_depth = None;
     context.frame_has_graphics = false;
     context.frame_presented = false;

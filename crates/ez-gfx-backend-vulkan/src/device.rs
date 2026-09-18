@@ -964,6 +964,7 @@ impl NativeContext {
                 // The MSAA render storage is never sampled or described, so
                 // only its view and image retire alongside the sampled image.
                 let msaa = texture.msaa;
+                let depth = texture.depth;
                 // SAFETY: the deferred texture is consumed after its pending frame-slot mask clears; its view and sampler are destroyed before its image and allocation storage.
                 unsafe {
                     device.destroy_image_view(texture.view, None);
@@ -972,6 +973,10 @@ impl NativeContext {
                     if let Some(storage) = msaa.as_ref() {
                         device.destroy_image_view(storage.view, None);
                         device.destroy_image(storage.image, None);
+                    }
+                    if let Some(depth) = depth.as_ref() {
+                        device.destroy_image_view(depth.view, None);
+                        device.destroy_image(depth.image, None);
                     }
                 }
                 self.allocator
@@ -984,6 +989,13 @@ impl NativeContext {
                         .as_mut()
                         .ok_or(AllocationError::NativeFailure)?
                         .free(storage.allocation)
+                        .map_err(|error| map_allocator(&error))?;
+                }
+                if let Some(depth) = depth {
+                    self.allocator
+                        .as_mut()
+                        .ok_or(AllocationError::NativeFailure)?
+                        .free(depth.allocation)
                         .map_err(|error| map_allocator(&error))?;
                 }
                 Ok(())

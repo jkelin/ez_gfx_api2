@@ -762,6 +762,7 @@ dependencies = [
  "ez-gfx-hal",
  "ez-gfx-runtime",
  "ez-gfx-texture-manager",
+ "parking_lot",
  "raw-window-handle",
  "smallvec",
  "static_assertions",

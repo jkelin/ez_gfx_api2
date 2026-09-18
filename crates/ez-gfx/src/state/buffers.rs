@@ -2,13 +2,14 @@ use crate::Result;
 
 use super::{
     AllocationRequest, BufferHandle, COUNTER_BUFFER_ELEMENT_OFFSET, ContextHandle, ContextState,
-    CounterBufferHandle, DrawIndexedCommand, Error, IndexedIndirectBuffer, MemoryClass,
-    NativeAllocation, NativeContext, PackedHandle, ReclaimableStaging, ResourceKind,
+    CounterBufferHandle, DrawIndexedCommand, Error, GpuArenaBuffer, IndexedIndirectBuffer,
+    MemoryClass, NativeAllocation, NativeContext, PackedHandle, ReclaimableStaging, ResourceKind,
     TransientBuffer, TransientUse, allocate_native, completed_native_frame_value,
     completed_texture_transfer_native, completed_transfer_native, free_native_allocation,
-    largest_native_texture_staging, map_allocation, map_lifecycle, native_device_initialized,
-    pop_largest_native_texture_staging, result_status, retained_native_texture_staging,
-    retire_native_allocation, stage_upload, with_context_mut,
+    largest_native_texture_staging, map_allocation, map_hal, map_lifecycle,
+    native_device_initialized, pop_largest_native_texture_staging, result_status,
+    retained_native_texture_staging, retire_native_allocation, stage_upload, wait_native_idle,
+    with_context_mut, write_native, write_native_region,
 };
 
 /// Acquires a runtime-typed structured buffer for the C ABI.
@@ -28,6 +29,161 @@ pub(crate) fn acquire_buffer_sized(
     element_count: u32,
 ) -> Result<BufferHandle> {
     acquire_buffer_raw_impl(context, element_size, element_count)
+}
+
+const MAX_GPU_ARENA_BYTES: usize = 16 * 1024 * 1024;
+
+/// Creates a context-scoped GPU arena identity without frame-scoped storage.
+pub(crate) fn create_gpu_arena_buffer(
+    context: ContextHandle,
+    element_size: u32,
+) -> Result<BufferHandle> {
+    with_context_mut(context, |context| {
+        context
+            .identity
+            .check_thread_and_health()
+            .map_err(map_lifecycle)?;
+        if element_size == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let packed = context
+            .identity
+            .insert(ResourceKind::Buffer)
+            .map_err(map_lifecycle)?;
+        let handle = BufferHandle::from_packed(packed).map_err(|_| Error::NativeFailure)?;
+        context.gpu_arenas.insert(
+            handle,
+            GpuArenaBuffer {
+                element_size,
+                element_capacity: 0,
+                last_use: None,
+            },
+        );
+        Ok(handle)
+    })
+}
+
+pub(crate) fn release_gpu_arena_buffer(context_handle: ContextHandle, handle: BufferHandle) {
+    let _ = with_context_mut(context_handle, |context| {
+        context
+            .identity
+            .resolve(handle.packed(), ResourceKind::Buffer)
+            .map_err(map_lifecycle)?;
+        let metadata = context
+            .gpu_arenas
+            .remove(&handle)
+            .ok_or(Error::InvalidContext)?;
+        context
+            .identity
+            .remove(handle.packed(), ResourceKind::Buffer)
+            .map_err(map_lifecycle)?;
+        let Some((_, allocation)) = context.allocations.remove(&handle.packed()) else {
+            return Ok(());
+        };
+        match metadata.last_use {
+            Some(completion) => {
+                retire_native_allocation(&mut context.native, allocation, completion)
+            }
+            None => free_native_allocation(&mut context.native, allocation),
+        }
+        .map_err(map_allocation)
+    });
+}
+
+/// Synchronizes dirty CPU regions into a context-scoped host-visible buffer.
+pub(crate) fn sync_gpu_arena_buffer(
+    context: ContextHandle,
+    handle: BufferHandle,
+    bytes: &[u8],
+    dirty: &[core::ops::Range<usize>],
+) -> Result<()> {
+    result_status(with_context_mut(context, |context| {
+        context
+            .identity
+            .check_thread_and_health()
+            .map_err(map_lifecycle)?;
+        context
+            .identity
+            .resolve(handle.packed(), ResourceKind::Buffer)
+            .map_err(map_lifecycle)?;
+        if context.frame.state() != ez_gfx_runtime::frame::FrameState::Recording || bytes.is_empty()
+        {
+            return Err(Error::NotReady);
+        }
+        let metadata = *context
+            .gpu_arenas
+            .get(&handle)
+            .ok_or(Error::InvalidContext)?;
+        let element_size = metadata.element_size as usize;
+        if bytes.len() > MAX_GPU_ARENA_BYTES || !bytes.len().is_multiple_of(element_size) {
+            return Err(Error::InvalidArgument);
+        }
+        let element_count = bytes.len() / element_size;
+        let required = u32::try_from(element_count).map_err(|_| Error::InvalidArgument)?;
+        let needs_resize = required > metadata.element_capacity;
+
+        if (!dirty.is_empty() || needs_resize)
+            && let Some(last) = metadata.last_use
+        {
+            let completed = completed_native_frame_value(&mut context.native)?;
+            if completed < last.value {
+                wait_native_idle(&mut context.native).map_err(map_hal)?;
+            }
+        }
+
+        if needs_resize {
+            let capacity = required
+                .checked_next_power_of_two()
+                .ok_or(Error::InvalidArgument)?;
+            let size = u64::from(capacity)
+                .checked_mul(u64::from(metadata.element_size))
+                .filter(|size| *size <= MAX_GPU_ARENA_BYTES as u64)
+                .ok_or(Error::InvalidArgument)?;
+            let request = AllocationRequest::new(size, 16, MemoryClass::Upload, true, None)
+                .map_err(map_allocation)?;
+            let mut allocation =
+                allocate_native(&mut context.native, request).map_err(map_allocation)?;
+            write_native(&mut context.native, &mut allocation, bytes).map_err(map_allocation)?;
+            if let Some((_, previous)) = context
+                .allocations
+                .insert(handle.packed(), (size, allocation))
+            {
+                free_native_allocation(&mut context.native, previous).map_err(map_allocation)?;
+            }
+            context
+                .gpu_arenas
+                .get_mut(&handle)
+                .ok_or(Error::InvalidContext)?
+                .element_capacity = capacity;
+        } else if !dirty.is_empty() {
+            let (_, allocation) = context
+                .allocations
+                .get_mut(&handle.packed())
+                .ok_or(Error::InvalidContext)?;
+            for region in dirty {
+                if region.start >= region.end || region.end > element_count {
+                    return Err(Error::InvalidArgument);
+                }
+                let start = region
+                    .start
+                    .checked_mul(element_size)
+                    .ok_or(Error::InvalidArgument)?;
+                let end = region
+                    .end
+                    .checked_mul(element_size)
+                    .ok_or(Error::InvalidArgument)?;
+                write_native_region(
+                    &mut context.native,
+                    allocation,
+                    u64::try_from(start).map_err(|_| Error::InvalidArgument)?,
+                    bytes.get(start..end).ok_or(Error::InvalidArgument)?,
+                )
+                .map_err(map_allocation)?;
+            }
+        }
+        context.frame_arena_buffers.insert(handle.packed());
+        Ok(())
+    }))
 }
 
 fn acquire_buffer_raw_impl(
@@ -99,8 +255,6 @@ fn counter_record_stride(native: &NativeContext) -> u64 {
     match native {
         #[cfg(windows)]
         NativeContext::Dx12(_) => 24,
-        #[cfg(not(windows))]
-        NativeContext::Dx12(_) => 20,
         _ => 20,
     }
 }

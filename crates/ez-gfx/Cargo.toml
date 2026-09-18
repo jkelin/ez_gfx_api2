@@ -33,6 +33,7 @@ thiserror.workspace = true
 smallvec.workspace = true
 arrayvec.workspace = true
 compact_str.workspace = true
+parking_lot.workspace = true
 
 [dev-dependencies]
 static_assertions.workspace = true

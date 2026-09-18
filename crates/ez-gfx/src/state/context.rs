@@ -12,10 +12,10 @@ use super::{
     AdapterCatalog, AdapterInfo, AdapterReport, AdapterSelection, Backend, CONTEXT_HANDLES,
     CONTEXTS, ContextHandle, ContextIdentity, ContextOptions, ContextState, DecodeDriver,
     DecodeDriverError, DiagnosticLevel, Error, FrameRecorder, GeometryManager, HalError, HashMap,
-    IndexAllocationHandle, LocalHandle, NativeContext, NativeSurface, Observability, Ordering,
-    PresentationMode, RenderTargetHandle, ResourceKind, RuntimeError, RuntimePhase, RuntimeRecord,
-    RuntimeStatus, ShaderCapabilities, SharedTransferPool, SurfaceHandle, TextureFallback,
-    TexturePipeline, TextureRegistry, UploadEvent, UploadResource, UploadStatus,
+    HashSet, IndexAllocationHandle, LocalHandle, NativeContext, NativeSurface, Observability,
+    Ordering, PresentationMode, RenderTargetHandle, ResourceKind, RuntimeError, RuntimePhase,
+    RuntimeRecord, RuntimeStatus, ShaderCapabilities, SharedTransferPool, SurfaceHandle,
+    TextureFallback, TexturePipeline, TextureRegistry, UploadEvent, UploadResource, UploadStatus,
     VertexAllocationHandle, VulkanContext, WORKING_SET_BUDGET_BYTES, admission_report,
     completed_transfer_native, context_local, destroy_native_pipeline, destroy_native_shader,
     destroy_native_surface, destroy_native_texture, free_native_allocation,
@@ -98,6 +98,7 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         graphics_format: None,
         indirects: HashMap::new(),
         transient_buffers: HashMap::new(),
+        gpu_arenas: HashMap::new(),
         buffer_pool: HashMap::new(),
         counter_pool,
         counter_scratch: Vec::new(),
@@ -121,6 +122,7 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         staging,
         staging_high_water_bytes: 0,
         frame_vertex_heaps: HashMap::new(),
+        frame_arena_buffers: HashSet::new(),
         frame_serial: 0,
         frame,
         frame_pipeline_keys: Vec::new(),
@@ -139,7 +141,8 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         frame_depth: None,
         frame_has_graphics: false,
         frame_render_target: None,
-        frame_sample_targets: Vec::new(),
+        frame_preserve_render_target: false,
+        frame_render_target_states: HashMap::new(),
         last_readbacks: Vec::new(),
         active_surface: None,
         frame_presented: false,
@@ -919,7 +922,7 @@ fn configure_surface_recording(
 pub fn begin_render_target(context: ContextHandle, target: RenderTargetHandle) -> Result<()> {
     result_status(with_context_mut(context, |context| {
         super::frame::start_recording(context)?;
-        if let Err(error) = configure_render_target_recording(context, target) {
+        if let Err(error) = configure_render_target_recording(context, target, false) {
             context.frame.abort();
             return Err(error);
         }
@@ -934,15 +937,17 @@ pub fn begin_render_target(context: ContextHandle, target: RenderTargetHandle) -
 pub(crate) fn configure_render_target(
     context: ContextHandle,
     target: RenderTargetHandle,
+    preserve: bool,
 ) -> Result<()> {
     result_status(with_context_mut(context, |context| {
-        configure_render_target_recording(context, target)
+        configure_render_target_recording(context, target, preserve)
     }))
 }
 
 fn configure_render_target_recording(
     context: &mut ContextState,
     target: RenderTargetHandle,
+    preserve: bool,
 ) -> Result<()> {
     context
         .identity
@@ -970,6 +975,7 @@ fn configure_render_target_recording(
     }
     context.active_surface = None;
     context.frame_render_target = Some(target);
+    context.frame_preserve_render_target = preserve;
     Ok(())
 }
 

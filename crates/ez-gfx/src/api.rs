@@ -13,8 +13,8 @@ use ez_gfx_core::{
     capability::{CapabilityError, PresentationMode, PresentationModes, ShaderCapabilities},
     handle::{
         BufferHandle, ContextHandle, CounterBufferHandle, IndexAllocationHandle,
-        RenderTargetHandle, ShaderHandle, SurfaceHandle, TextureHandle, VertexAllocationHandle,
-        VertexHeapHandle,
+        RenderTargetHandle as RawRenderTargetHandle, ShaderHandle, SurfaceHandle, TextureHandle,
+        VertexAllocationHandle, VertexHeapHandle,
     },
 };
 use ez_gfx_runtime::{
@@ -27,6 +27,67 @@ use smallvec::SmallVec;
 trait SurfaceHost: HasWindowHandle + HasDisplayHandle {}
 
 impl<T> SurfaceHost for T where T: HasWindowHandle + HasDisplayHandle {}
+
+/// Window owner whose raw handles were captured for transfer to a Windows render thread.
+#[cfg(windows)]
+pub struct ThreadSurfaceHost {
+    _owner: std::sync::Arc<dyn Any + Send + Sync>,
+    display: raw_window_handle::RawDisplayHandle,
+    window: raw_window_handle::RawWindowHandle,
+}
+
+#[cfg(windows)]
+// SAFETY: Windows HWND and HINSTANCE values remain process-valid while `_owner`
+// retains the native window. Handle queries happen in `capture`, before transfer.
+unsafe impl Send for ThreadSurfaceHost {}
+
+#[cfg(windows)]
+impl ThreadSurfaceHost {
+    /// Captures a live Windows host on its event-loop thread.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidArgument`] when either raw handle is unavailable.
+    pub fn capture<W>(owner: std::sync::Arc<W>) -> Result<Self>
+    where
+        W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
+    {
+        let display = owner
+            .display_handle()
+            .map_err(|_| Error::InvalidArgument)?
+            .as_raw();
+        let window = owner
+            .window_handle()
+            .map_err(|_| Error::InvalidArgument)?
+            .as_raw();
+        Ok(Self {
+            _owner: owner,
+            display,
+            window,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl HasWindowHandle for ThreadSurfaceHost {
+    fn window_handle(
+        &self,
+    ) -> std::result::Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError>
+    {
+        // SAFETY: `_owner` keeps the captured native window alive for this borrow.
+        Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(self.window) })
+    }
+}
+
+#[cfg(windows)]
+impl HasDisplayHandle for ThreadSurfaceHost {
+    fn display_handle(
+        &self,
+    ) -> std::result::Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError>
+    {
+        // SAFETY: `_owner` keeps the captured native display alive for this borrow.
+        Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(self.display) })
+    }
+}
 
 use crate::state;
 
@@ -92,12 +153,10 @@ pub use api_telemetry::{Event, MemoryTelemetryReport, ResourceDiagnostics};
 type EventCallback = dyn for<'a> FnMut(Event<'a>);
 #[derive(Clone, Copy)]
 struct CachedRenderTarget {
-    handle: RenderTargetHandle,
+    handle: RawRenderTargetHandle,
     format: ez_gfx_runtime::target::Format,
     extent: (u32, u32),
     depth_format: Option<ez_gfx_runtime::target::Format>,
-    clear_color: [f32; 4],
-    maximum_samples: u8,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1098,6 +1157,8 @@ impl IndexAllocation {
         ))
     }
 }
+
+include!("api_arena.rs");
 
 include!("api_frame.rs");
 

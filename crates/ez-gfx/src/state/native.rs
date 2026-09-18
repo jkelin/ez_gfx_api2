@@ -266,6 +266,7 @@ pub(super) fn prepare_frame_binding_scratch(
                 scratch,
             )?,
             super::ExecutableNode::CopyTexture { .. }
+            | super::ExecutableNode::CopyRenderTarget { .. }
             | super::ExecutableNode::TextureReadback { .. }
             | super::ExecutableNode::RenderTargetReadback { .. }
             | super::ExecutableNode::RenderTargetSample { .. }
@@ -500,6 +501,48 @@ pub(super) fn write_native(
             }
             target[..bytes.len()].copy_from_slice(bytes);
             context.flush(allocation, 0, bytes.len() as u64)
+        }
+        #[cfg(any(windows, target_vendor = "apple"))]
+        _ => Err(ez_gfx_hal::AllocationError::NativeFailure),
+    }
+}
+
+pub(super) fn write_native_region(
+    context: &mut NativeContext,
+    allocation: &mut NativeAllocation,
+    offset: u64,
+    bytes: &[u8],
+) -> std::result::Result<(), ez_gfx_hal::AllocationError> {
+    let offset = usize::try_from(offset).map_err(|_| ez_gfx_hal::AllocationError::NativeFailure)?;
+    let end = offset
+        .checked_add(bytes.len())
+        .ok_or(ez_gfx_hal::AllocationError::NativeFailure)?;
+    match (context, allocation) {
+        (NativeContext::Vulkan(context), NativeAllocation::Vulkan(allocation)) => {
+            let target = context.mapped_slice_mut(allocation)?;
+            let destination = target
+                .get_mut(offset..end)
+                .ok_or(ez_gfx_hal::AllocationError::NativeFailure)?;
+            destination.copy_from_slice(bytes);
+            context.flush(allocation, offset as u64, bytes.len() as u64)
+        }
+        #[cfg(windows)]
+        (NativeContext::Dx12(context), NativeAllocation::Dx12(allocation)) => {
+            let target = context.mapped_slice_mut(allocation)?;
+            let destination = target
+                .get_mut(offset..end)
+                .ok_or(ez_gfx_hal::AllocationError::NativeFailure)?;
+            destination.copy_from_slice(bytes);
+            context.flush(allocation, offset as u64, bytes.len() as u64)
+        }
+        #[cfg(target_vendor = "apple")]
+        (NativeContext::Metal(context), NativeAllocation::Metal(allocation)) => {
+            let target = context.mapped_slice_mut(allocation)?;
+            let destination = target
+                .get_mut(offset..end)
+                .ok_or(ez_gfx_hal::AllocationError::NativeFailure)?;
+            destination.copy_from_slice(bytes);
+            context.flush(allocation, offset as u64, bytes.len() as u64)
         }
         #[cfg(any(windows, target_vendor = "apple"))]
         _ => Err(ez_gfx_hal::AllocationError::NativeFailure),

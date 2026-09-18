@@ -444,7 +444,9 @@ fn prepare_metal_pipelines(
                 (key, pipeline)
             }
             ExecutableNode::Mesh { .. } => unreachable!("mesh payload handled above"),
-            ExecutableNode::TextureReadback { .. }
+            ExecutableNode::CopyTexture { .. }
+            | ExecutableNode::CopyRenderTarget { .. }
+            | ExecutableNode::TextureReadback { .. }
             | ExecutableNode::RenderTargetReadback { .. }
             | ExecutableNode::RenderTargetSample { .. }
             | ExecutableNode::Present { .. } => continue,
@@ -820,6 +822,33 @@ impl ez_gfx_backend_metal::native::NativeFrameActionSource for MetalActionSource
                             region: *region,
                         }
                     }
+                    ExecutableNode::CopyRenderTarget {
+                        source,
+                        destination,
+                        region,
+                    } => {
+                        let NativeTexture::Metal(source) = &self
+                            .render_targets
+                            .get(source)
+                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+                            .native
+                        else {
+                            return Err(ez_gfx_hal::HalError::InvalidArgument);
+                        };
+                        let NativeTexture::Metal(destination) = &self
+                            .render_targets
+                            .get(destination)
+                            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+                            .native
+                        else {
+                            return Err(ez_gfx_hal::HalError::InvalidArgument);
+                        };
+                        MetalFrameAction::CopyTexture {
+                            source,
+                            destination,
+                            region: *region,
+                        }
+                    }
                     ExecutableNode::Present { surface } => {
                         if Some(*surface) != self.surface {
                             return Err(ez_gfx_hal::HalError::InvalidArgument);
@@ -909,7 +938,10 @@ pub(super) fn execute_metal_frame_plan(
             .texture_registry
             .reserved_binding(record.id)
             .map_err(map_texture)?;
-        let sampled = if record.sample_ready {
+        let sampled = if record
+            .last_state
+            .is_some_and(|state| state.access == ez_gfx_hal::ResourceAccess::SampledRead)
+        {
             let NativeTexture::Metal(texture) = &record.native else {
                 return Err(Error::NativeFailure);
             };

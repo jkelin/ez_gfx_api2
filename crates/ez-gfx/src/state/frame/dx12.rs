@@ -264,6 +264,7 @@ fn prepare_dx12_pipelines(
             }
             ExecutableNode::Mesh { .. } => unreachable!("mesh payload handled above"),
             ExecutableNode::CopyTexture { .. }
+            | ExecutableNode::CopyRenderTarget { .. }
             | ExecutableNode::TextureReadback { .. }
             | ExecutableNode::RenderTargetReadback { .. }
             | ExecutableNode::RenderTargetSample { .. }
@@ -527,6 +528,40 @@ impl DxActionSource<'_, '_> {
         )
     }
 
+    fn copy_render_target_action(
+        &self,
+        source: RenderTargetHandle,
+        destination: RenderTargetHandle,
+        region: ez_gfx_hal::TextureCopyRegion,
+    ) -> std::result::Result<ez_gfx_backend_dx12::native::NativeFrameAction<'_>, ez_gfx_hal::HalError>
+    {
+        let NativeTexture::Dx12(source) = &self
+            .state
+            .render_targets
+            .get(&source)
+            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+            .native
+        else {
+            return Err(ez_gfx_hal::HalError::InvalidArgument);
+        };
+        let NativeTexture::Dx12(destination) = &self
+            .state
+            .render_targets
+            .get(&destination)
+            .ok_or(ez_gfx_hal::HalError::InvalidArgument)?
+            .native
+        else {
+            return Err(ez_gfx_hal::HalError::InvalidArgument);
+        };
+        Ok(
+            ez_gfx_backend_dx12::native::NativeFrameAction::CopyTexture {
+                source,
+                destination,
+                region,
+            },
+        )
+    }
+
     fn mesh_dispatch<'draw>(
         &'draw self,
         node: usize,
@@ -682,6 +717,11 @@ impl ez_gfx_backend_dx12::native::NativeFrameActionSource for DxActionSource<'_,
                         destination,
                         region,
                     } => self.copy_texture_action(*source, *destination, *region)?,
+                    ExecutableNode::CopyRenderTarget {
+                        source,
+                        destination,
+                        region,
+                    } => self.copy_render_target_action(*source, *destination, *region)?,
                     ExecutableNode::Present { .. } => {
                         ez_gfx_backend_dx12::native::NativeFrameAction::Present
                     }

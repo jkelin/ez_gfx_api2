@@ -94,6 +94,24 @@ impl<'a> BindingProjection<'a> {
         }
         Ok(())
     }
+
+    pub(in crate::state) fn arenas_are_read_only(
+        self,
+        arenas: &std::collections::HashSet<ez_gfx_core::handle::PackedHandle>,
+    ) -> bool {
+        self.layout.requirements().iter().all(|requirement| {
+            if !requirement.writable || requirement.kind != BindingKind::Buffer {
+                return true;
+            }
+            self.bindings
+                .iter()
+                .find(|binding| binding.name == requirement.name)
+                .is_none_or(|binding| match binding.resource {
+                    ResourceIdentity::Buffer(handle) => !arenas.contains(&handle.packed()),
+                    ResourceIdentity::Counter(_) | ResourceIdentity::RenderTarget(_) => true,
+                })
+        })
+    }
 }
 
 #[cfg(test)]
@@ -200,5 +218,19 @@ mod tests {
             projection.validate(),
             Err(BindingError::Duplicate("instances".into()))
         );
+    }
+
+    #[test]
+    fn arena_buffers_must_target_read_only_requirements() {
+        let read = br#"{"reflections":[{"target":"Spirv","entry":"main","stage":"Compute","reflection":{"parameters":[{"semantic_name":"arena","api_kind":"buffer","binding_index":0,"binding_space":0,"resource_access":"Read"}]}}]}"#;
+        let write = br#"{"reflections":[{"target":"Spirv","entry":"main","stage":"Compute","reflection":{"parameters":[{"semantic_name":"arena","api_kind":"buffer","binding_index":0,"binding_space":0,"resource_access":"ReadWrite"}]}}]}"#;
+        let read = ReflectedBindings::parse(read, Backend::Vulkan, "main", Stage::Compute).unwrap();
+        let write =
+            ReflectedBindings::parse(write, Backend::Vulkan, "main", Stage::Compute).unwrap();
+        let bindings = [buffer("arena", 7)];
+        let arenas = std::collections::HashSet::from([packed(7)]);
+
+        assert!(BindingProjection::new(&read, &bindings).arenas_are_read_only(&arenas));
+        assert!(!BindingProjection::new(&write, &bindings).arenas_are_read_only(&arenas));
     }
 }

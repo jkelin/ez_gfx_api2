@@ -71,7 +71,7 @@ struct RenderTargetInner {
     backing: RenderTargetBacking,
 }
 impl RenderTargetInner {
-    fn managed_handle(&self) -> Result<RenderTargetHandle> {
+    fn managed_handle(&self) -> Result<RawRenderTargetHandle> {
         let RenderTargetBacking::Managed(name) = &self.backing else {
             return Err(Error::Unsupported);
         };
@@ -82,6 +82,106 @@ impl RenderTargetInner {
             .map(|target| target.handle)
             .ok_or(Error::InvalidContext)
     }
+}
+
+/// Persistent context-owned managed render target.
+pub struct RenderTargetHandle {
+    inner: Rc<RenderTargetInner>,
+}
+
+impl RenderTargetHandle {
+    /// Returns the resolved target format.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when the target was released.
+    pub fn format(&self) -> Result<ez_gfx_runtime::target::Format> {
+        self.inner
+            .context
+            .render_targets
+            .borrow()
+            .get(self.name()?)
+            .map(|target| target.format)
+            .ok_or(Error::InvalidContext)
+    }
+
+    /// Returns the target extent.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when the target was released.
+    pub fn extent(&self) -> Result<(u32, u32)> {
+        self.inner
+            .context
+            .render_targets
+            .borrow()
+            .get(self.name()?)
+            .map(|target| target.extent)
+            .ok_or(Error::InvalidContext)
+    }
+
+    /// Returns the stable bindless sampled-image slot.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when the target was released.
+    pub fn binding(&self) -> Result<u32> {
+        state::render_target_binding(self.inner.context.handle, self.inner.managed_handle()?)
+    }
+
+    /// Transitions this target for bindless sampling after rendering or copying.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when the target is foreign, released, or unused by `frame`.
+    pub fn prepare_sampling(&self, frame: &mut Frame) -> Result<()> {
+        frame.prepare_persistent_target_sampling(self)
+    }
+
+    fn name(&self) -> Result<&str> {
+        let RenderTargetBacking::Managed(name) = &self.inner.backing else {
+            return Err(Error::Unsupported);
+        };
+        Ok(name)
+    }
+}
+
+/// Pixel rectangle used by render-target blits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderTargetRect {
+    /// Horizontal origin in pixels.
+    pub x: u32,
+    /// Vertical origin in pixels.
+    pub y: u32,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
+impl RenderTargetRect {
+    /// Creates a rectangle.
+    #[must_use]
+    pub const fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+}
+
+/// Pixel combination used by a render-target blit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Blending {
+    /// Replaces destination pixels exactly.
+    Copy,
+}
+
+/// Existing color contents policy for an attached persistent target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderTargetLoad {
+    /// Clears the target before the first graphics pass.
+    Clear,
+    /// Preserves the target before the first graphics pass.
+    Preserve,
 }
 
 /// Owning logical render target.
@@ -280,5 +380,84 @@ impl Context {
             format,
             samples,
         ))
+    }
+}
+
+impl Context {
+    /// Acquires one persistent named managed render target.
+    ///
+    /// Names are unique for the context until [`Self::release_render_target`] is called.
+    ///
+    /// # Errors
+    /// Returns [`Error`] for an invalid descriptor, duplicate name, or allocation failure.
+    pub fn acquire_render_target(
+        &self,
+        name: impl Into<String>,
+        size: [u32; 2],
+        descriptor: impl Into<RenderTargetDescriptor>,
+    ) -> Result<RenderTargetHandle> {
+        self.check_entry()?;
+        let name = name.into();
+        let descriptor = descriptor.into();
+        let [width, height] = size;
+        if name.is_empty()
+            || self.inner.render_targets.borrow().contains_key(&name)
+            || width == 0
+            || height == 0
+            || !matches!(descriptor.maximum_samples, 1 | 2 | 4 | 8)
+        {
+            return Err(Error::InvalidArgument);
+        }
+        let declaration = ez_gfx_runtime::target::TargetDeclaration::new(
+            name.clone(),
+            ez_gfx_runtime::target::TargetUsage::Color,
+            1.0,
+            descriptor.maximum_samples,
+            vec![descriptor.color_format],
+            ez_gfx_runtime::target::ClearValue::Color(descriptor.clear_color),
+            true,
+        )
+        .map_err(|_| Error::InvalidArgument)?;
+        let raw = self.complete(state::create_render_target(
+            self.raw(),
+            &declaration,
+            descriptor.depth_format,
+            width,
+            height,
+        ))?;
+        self.inner.render_targets.borrow_mut().insert(
+            name.clone(),
+            CachedRenderTarget {
+                handle: raw,
+                format: descriptor.color_format,
+                extent: (width, height),
+                depth_format: descriptor.depth_format,
+            },
+        );
+        Ok(RenderTargetHandle {
+            inner: Rc::new(RenderTargetInner {
+                context: Rc::clone(&self.inner),
+                backing: RenderTargetBacking::Managed(name),
+            }),
+        })
+    }
+
+    /// Releases one persistent managed render target.
+    ///
+    /// # Errors
+    /// Returns [`Error`] when the target is foreign, stale, or referenced by a recording frame.
+    pub fn release_render_target(&self, target: RenderTargetHandle) -> Result<()> {
+        self.check_entry()?;
+        if !Rc::ptr_eq(&self.inner, &target.inner.context) {
+            return Err(Error::InvalidContext);
+        }
+        let name = target.name()?.to_owned();
+        state::validate_render_target_release(self.raw(), target.inner.managed_handle()?)?;
+        let Some(cached) = self.inner.render_targets.borrow_mut().remove(&name) else {
+            return Err(Error::InvalidContext);
+        };
+        state::destroy_render_target(self.raw(), cached.handle);
+        drop(target);
+        Ok(())
     }
 }

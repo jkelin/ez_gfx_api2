@@ -37,8 +37,8 @@ pub(super) struct RenderTargetRecord {
     /// descriptor binding, so textures and targets draw from one free-list
     /// and can never collide.
     pub(super) id: TextureId,
-    /// Whether the last submitted use transitioned the sampled image for heap reads.
-    pub(super) sample_ready: bool,
+    /// Last submitted access state, reused as the next frame's initial image state.
+    pub(super) last_state: Option<ez_gfx_hal::ResourceState>,
 }
 
 /// Creates a sampled color render target from a declaration and explicit extents.
@@ -228,10 +228,34 @@ pub fn create_render_target(
                 width,
                 height,
                 id,
-                sample_ready: false,
+                last_state: None,
             },
         );
         Ok(typed)
+    })
+}
+
+/// Validates that a persistent target can be released without invalidating a recording frame.
+///
+/// # Errors
+/// Returns [`Error::InvalidContext`] for a stale or foreign target and
+/// [`Error::NotReady`] when the recording frame references it.
+pub fn validate_render_target_release(
+    context: ContextHandle,
+    target: RenderTargetHandle,
+) -> Result<()> {
+    with_context_mut(context, |context| {
+        context
+            .identity
+            .resolve(target.packed(), ResourceKind::RenderTarget)
+            .map_err(map_lifecycle)?;
+        if context.frame.state() == ez_gfx_runtime::frame::FrameState::Recording
+            && (context.frame_render_target == Some(target)
+                || context.frame_resources.contains_key(&target.packed()))
+        {
+            return Err(Error::NotReady);
+        }
+        Ok(())
     })
 }
 

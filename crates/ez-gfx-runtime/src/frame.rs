@@ -85,6 +85,15 @@ pub enum ExecutableNode {
         /// Source mip, destination mip, origins, and extent.
         region: ez_gfx_hal::TextureCopyRegion,
     },
+    /// A validated copy between persistent managed render targets.
+    CopyRenderTarget {
+        /// Source render-target handle.
+        source: RenderTargetHandle,
+        /// Destination render-target handle.
+        destination: RenderTargetHandle,
+        /// Source and destination origins plus copied extent.
+        region: ez_gfx_hal::TextureCopyRegion,
+    },
     /// A texture readback node.
     TextureReadback {
         /// Texture handle.
