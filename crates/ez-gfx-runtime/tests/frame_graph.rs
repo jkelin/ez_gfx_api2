@@ -99,6 +99,20 @@ fn image_subresources_feedback_and_cycles_fail_closed() {
             .unwrap(),
         )
         .unwrap();
+    let unrelated = graph
+        .add_resource(
+            ResourceDesc::image(
+                64,
+                64,
+                4,
+                2,
+                Format::Rgba8Unorm,
+                1,
+                ResourceLifetime::Transient,
+            )
+            .unwrap(),
+        )
+        .unwrap();
     let read = state(
         QueueKind::Graphics,
         ShaderStage::Fragment,
@@ -114,6 +128,7 @@ fn image_subresources_feedback_and_cycles_fail_closed() {
         graph.add_node(
             NodeDesc::new("feedback", QueueKind::Graphics)
                 .access(Access::image(image, access, read))
+                .access(Access::image(unrelated, access, read))
                 .access(Access::image(image, access, write))
         ),
         Err(GraphError::Feedback { resource: image })

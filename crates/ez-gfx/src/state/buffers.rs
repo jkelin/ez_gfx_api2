@@ -437,9 +437,9 @@ pub fn write_counter_commands(
 
 /// Maximum counter serialization capacity retained across writes.
 ///
-/// Steady-state counter payloads are a few kilobytes; one pathological
-/// multi-megabyte write must not pin that capacity for the context lifetime.
-const COUNTER_SCRATCH_RETAIN_LIMIT: usize = 64 * 1024;
+/// Steady-state indirect payloads can exceed 100 KiB for dense UI scenes;
+/// only exceptional multi-megabyte writes should discard the warm allocation.
+const COUNTER_SCRATCH_RETAIN_LIMIT: usize = 1024 * 1024;
 
 /// Releases retained serialization capacity above the retention limit.
 ///
@@ -486,10 +486,14 @@ fn counter_payload<'scratch>(
         if !remainder.is_empty() {
             return Err(Error::InvalidArgument);
         }
-        for record in records {
-            scratch.extend_from_slice(&record[16..20]);
-            scratch.extend_from_slice(&record[0..16]);
-            scratch.extend_from_slice(&0_u32.to_le_bytes());
+        let records_start = scratch.len();
+        scratch.resize(payload_size, 0);
+        for (record, destination) in records
+            .iter()
+            .zip(scratch[records_start..].as_chunks_mut::<24>().0)
+        {
+            destination[..4].copy_from_slice(&record[16..20]);
+            destination[4..20].copy_from_slice(&record[..16]);
         }
     } else {
         scratch.extend_from_slice(bytes);

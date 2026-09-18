@@ -474,19 +474,28 @@ impl FrameGraph {
             }
             validate_access(self.resource(access.resource)?, access)?;
         }
-        for left in 0..node.accesses.len() {
-            for right in left + 1..node.accesses.len() {
-                let a = node.accesses[left];
-                let b = node.accesses[right];
-                if a.resource == b.resource
-                    && overlaps(a.range, b.range)
-                    && (is_write(a.state.access) || is_write(b.state.access))
-                {
-                    return Err(GraphError::Feedback {
-                        resource: a.resource,
-                    });
+        // Grouping by resource avoids an all-pairs scan for nodes that bind
+        // thousands of distinct textures. Only accesses to one resource can conflict.
+        node.accesses.sort_unstable_by_key(|access| access.resource);
+        let mut first = 0;
+        while first < node.accesses.len() {
+            let resource = node.accesses[first].resource;
+            let end = node.accesses[first + 1..]
+                .iter()
+                .position(|access| access.resource != resource)
+                .map_or(node.accesses.len(), |offset| first + 1 + offset);
+            for left in first..end {
+                for right in left + 1..end {
+                    let a = node.accesses[left];
+                    let b = node.accesses[right];
+                    if overlaps(a.range, b.range)
+                        && (is_write(a.state.access) || is_write(b.state.access))
+                    {
+                        return Err(GraphError::Feedback { resource });
+                    }
                 }
             }
+            first = end;
         }
         if let Some(pass) = &node.pass {
             validate_pass(self, &node, pass)?;
