@@ -557,13 +557,21 @@ impl NativeContext {
                     .map_err(map_allocator)
             }
             DeferredResource::Texture(texture) => {
-                // The MSAA render storage retires with the sampled texture.
+                // MSAA and depth render storage retire with the sampled texture.
                 if let Some(msaa) = texture.msaa {
                     drop(msaa.texture);
                     self.allocator
                         .as_mut()
                         .ok_or(AllocationError::NativeFailure)?
                         .free(&msaa.allocation)
+                        .map_err(map_allocator)?;
+                }
+                if let Some(depth) = texture.depth {
+                    drop(depth.texture);
+                    self.allocator
+                        .as_mut()
+                        .ok_or(AllocationError::NativeFailure)?
+                        .free(&depth.allocation)
                         .map_err(map_allocator)?;
                 }
                 drop(texture.texture);

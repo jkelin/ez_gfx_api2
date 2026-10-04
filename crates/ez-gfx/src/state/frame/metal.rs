@@ -544,6 +544,7 @@ impl ez_gfx_backend_metal::native::NativeFrameActionSource for MetalActionSource
                         };
                         MetalFrameResource::RenderTarget(texture)
                     }
+                    FrameNativeResource::Depth => MetalFrameResource::Depth,
                     FrameNativeResource::RenderTargetDepth(handle) => {
                         let record = self
                             .render_targets

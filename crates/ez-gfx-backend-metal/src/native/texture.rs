@@ -82,22 +82,31 @@ fn create_sampler(
         .ok_or(AllocationError::NativeFailure)
 }
 
-/// Releases the published resolve-texture parts when multisampled setup fails.
+/// Releases the published resolve-texture parts when render-target setup fails.
 ///
-/// The resolve storage, view, and sampler never published, so they drop
-/// immediately; the allocation frees through the context allocator.
+/// The resolve storage, view, sampler, and optional depth attachment never
+/// published, so they drop immediately; allocations free through the context
+/// allocator.
 fn release_resolve_parts(
     context: &mut NativeContext,
     view: Retained<ProtocolObject<dyn MTLTexture>>,
     storage: Retained<ProtocolObject<dyn MTLTexture>>,
     sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
     allocation: Allocation,
+    depth: Option<super::DepthTarget>,
 ) {
     drop(view);
     drop(storage);
     drop(sampler);
+    let depth_allocation = depth.map(|depth| {
+        drop(depth.texture);
+        depth.allocation
+    });
     if let Some(allocator) = context.allocator.as_mut() {
         let _ = allocator.free(&allocation);
+        if let Some(depth_allocation) = depth_allocation {
+            let _ = allocator.free(&depth_allocation);
+        }
     }
 }
 
@@ -369,7 +378,7 @@ impl NativeContext {
     pub fn create_render_target(
         &mut self,
         format: ez_gfx_runtime::target::Format,
-        _depth_format: Option<ez_gfx_runtime::target::Format>,
+        depth_format: Option<ez_gfx_runtime::target::Format>,
         width: u32,
         height: u32,
         binding: u32,
@@ -463,11 +472,11 @@ impl NativeContext {
         sampler_descriptor.setRAddressMode(MTLSamplerAddressMode::ClampToEdge);
         sampler_descriptor.setMaxAnisotropy(1);
         sampler_descriptor.setSupportArgumentBuffers(true);
-        let sampler = match self
+        let sampler_state = match self
             .device
             .newSamplerStateWithDescriptor(&sampler_descriptor)
         {
-            Some(sampler) => sampler,
+            Some(sampler_state) => sampler_state,
             None => {
                 drop(storage);
                 self.allocator
@@ -499,7 +508,10 @@ impl NativeContext {
                 return Err(AllocationError::NativeFailure);
             }
         };
-        let depth = if _depth_format.is_some() {
+        // Managed-target depth always uses Depth32Float, matching the pass's
+        // sample count so depth and color attachments agree.
+        let depth = if depth_format.is_some() {
+            // SAFETY: validated dimensions and a single mip level are consumed during this send.
             let depth_desc = unsafe {
                 MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
                     MTLPixelFormat::Depth32Float,
@@ -515,7 +527,7 @@ impl NativeContext {
             }
             depth_desc.setUsage(MTLTextureUsage::RenderTarget);
             depth_desc.setStorageMode(MTLStorageMode::Private);
-            let depth_allocation = self
+            let depth_allocation = match self
                 .allocator
                 .as_mut()
                 .ok_or(AllocationError::NativeFailure)?
@@ -523,20 +535,26 @@ impl NativeContext {
                     &self.device,
                     "ez-gfx-render-target-depth",
                     &depth_desc,
-                ))
-                .map_err(map_allocator)?;
-            let depth_offset = usize::try_from(depth_allocation.offset())
-                .map_err(|_| AllocationError::NativeFailure)?;
-            let Some(depth_texture) = (unsafe {
-                depth_allocation
-                    .heap()
-                    .newTextureWithDescriptor_offset(&depth_desc, depth_offset)
-            }) else {
-                self.allocator
-                    .as_mut()
-                    .ok_or(AllocationError::NativeFailure)?
-                    .free(&depth_allocation)
-                    .map_err(map_allocator)?;
+                )) {
+                Ok(depth_allocation) => depth_allocation,
+                Err(error) => {
+                    release_resolve_parts(self, view, storage, sampler_state, allocation, None);
+                    return Err(map_allocator(error));
+                }
+            };
+            let depth_texture = usize::try_from(depth_allocation.offset())
+                .ok()
+                // SAFETY: the allocation belongs to this heap and the checked offset describes it.
+                .and_then(|offset| unsafe {
+                    depth_allocation
+                        .heap()
+                        .newTextureWithDescriptor_offset(&depth_desc, offset)
+                });
+            let Some(depth_texture) = depth_texture else {
+                if let Some(allocator) = self.allocator.as_mut() {
+                    let _ = allocator.free(&depth_allocation);
+                }
+                release_resolve_parts(self, view, storage, sampler_state, allocation, None);
                 return Err(AllocationError::OutOfMemory);
             };
             Some(super::DepthTarget {
@@ -578,7 +596,7 @@ impl NativeContext {
                 )) {
                 Ok(allocation) => allocation,
                 Err(error) => {
-                    release_resolve_parts(self, view, storage, sampler, allocation);
+                    release_resolve_parts(self, view, storage, sampler_state, allocation, depth);
                     return Err(map_allocator(error));
                 }
             };
@@ -588,7 +606,7 @@ impl NativeContext {
                     .ok_or(AllocationError::NativeFailure)?
                     .free(&msaa_allocation)
                     .map_err(map_allocator)?;
-                release_resolve_parts(self, view, storage, sampler, allocation);
+                release_resolve_parts(self, view, storage, sampler_state, allocation, depth);
                 return Err(AllocationError::NativeFailure);
             };
             // SAFETY: the allocation belongs to this heap and the checked offset describes it.
@@ -602,7 +620,7 @@ impl NativeContext {
                     .ok_or(AllocationError::NativeFailure)?
                     .free(&msaa_allocation)
                     .map_err(map_allocator)?;
-                release_resolve_parts(self, view, storage, sampler, allocation);
+                release_resolve_parts(self, view, storage, sampler_state, allocation, depth);
                 return Err(AllocationError::OutOfMemory);
             };
             Some(super::MsaaStorage {
@@ -614,7 +632,7 @@ impl NativeContext {
         Ok(NativeTexture {
             texture: ThreadBound::new(view),
             allocation: ThreadBound::new(allocation),
-            sampler: ThreadBound::new(sampler),
+            sampler: ThreadBound::new(sampler_state),
             format: hal_format,
             width,
             height,

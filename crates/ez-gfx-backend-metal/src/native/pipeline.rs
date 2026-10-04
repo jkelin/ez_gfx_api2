@@ -299,7 +299,8 @@ impl NativeContext {
             descriptor.setMeshFunction(Some(&mesh_function));
             descriptor.setFragmentFunction(Some(&fragment_function));
         }
-        descriptor.setRasterSampleCount(usize::from(samples));
+        // SAFETY: `samples` was checked against Metal's supported 1, 2, or 4 counts above.
+        unsafe { descriptor.setRasterSampleCount(usize::from(samples)) };
         let mesh_total = mesh_threads
             .into_iter()
             .try_fold(1_u32, u32::checked_mul)

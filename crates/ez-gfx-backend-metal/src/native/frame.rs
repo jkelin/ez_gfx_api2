@@ -89,6 +89,11 @@ impl MetalFrameEncoder<'_> {
                     return Err(HalError::InvalidArgument);
                 }
             }
+            NativeFrameResource::Surface | NativeFrameResource::Depth => {
+                if !matches!(barrier.range, ez_gfx_hal::ExecutionRange::Image(_)) {
+                    return Err(HalError::InvalidArgument);
+                }
+            }
         }
         // Separate encoders in one self.command buffer are ordered Metal hazard
         // boundaries. Every transition action is therefore lowered by requiring
@@ -751,8 +756,9 @@ impl NativeContext {
                 }
                 NativeFrameAction::BeginPass { pass, colors } => {
                     // Textures, buffers, and depth images are never color attachments.
-                    // Managed targets carry depth alongside their color image.
-                    // versa; surfaces stay single-sample.
+                    // Depth comes from the surface or the managed target's own
+                    // attachment. A multisampled pass needs a multisampled target
+                    // and vice versa; surfaces stay single-sample.
                     let mut target_extent = None;
                     let mut valid = !pass_active
                         && pass.colors.len() == 1
@@ -762,6 +768,8 @@ impl NativeContext {
                         target_extent = match attachment.resource {
                             NativeFrameResource::Surface => {
                                 valid &= pass.samples == 1;
+                                valid &= pass.depth.is_none()
+                                    || surface.is_some_and(|surface| surface.depth.is_some());
                                 Some(extent)
                             }
                             NativeFrameResource::RenderTarget(texture) => {
@@ -1108,6 +1116,13 @@ impl NativeContext {
             }
         };
         let drawable_texture = drawable.as_ref().map(|drawable| drawable.texture());
+        let Some(command) = self.queue.commandBuffer() else {
+            for (allocation, _, _, _, _) in readbacks {
+                let _ = self.free(allocation);
+            }
+            self.reclaim_prepared_scratch(slot_index, prepared_arguments);
+            return Err(HalError::NativeFailure);
+        };
         // Encode waits before opening any encoder. Updates have already committed their
         // graphics release marker, so this cannot wait ahead of its own producer.
         actions.visit(&mut |_, action| {

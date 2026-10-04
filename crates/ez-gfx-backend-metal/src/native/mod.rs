@@ -472,6 +472,7 @@ impl<const N: usize> NativeFrameActionSource for [NativeFrameAction<'_>; N] {
 pub struct NativeShader {
     libraries: ThreadBound<Vec<Retained<ProtocolObject<dyn objc2_metal::MTLLibrary>>>>,
 }
+/// Texture, sampler, and allocation published as one resource.
 pub struct NativeTexture {
     texture: ThreadBound<Retained<ProtocolObject<dyn MTLTexture>>>,
     allocation: ThreadBound<Allocation>,
@@ -483,12 +484,17 @@ pub struct NativeTexture {
     resident_mips: u32,
     mip_completions: Vec<u64>,
     cancellation: std::sync::Arc<transfer::TransferCancellation>,
+    /// Slot in the bindless texture argument buffer.
     pub binding: u32,
     /// Optional target-owned depth attachment.
     pub(crate) depth: Option<DepthTarget>,
+    /// Multisampled render storage plus its allocation; `None` for uploads
+    /// and single-sample targets. Only render-target entry points touch this;
+    /// the texture above stays the resolve destination.
     msaa: Option<MsaaStorage>,
 }
 
+/// Depth attachment owned by a managed render target.
 pub(crate) struct DepthTarget {
     pub(crate) texture: ThreadBound<Retained<ProtocolObject<dyn MTLTexture>>>,
     pub(crate) allocation: ThreadBound<Allocation>,
