@@ -56,15 +56,17 @@ struct TextureHeap {
     TextureEntry entries[EZ_GFX_MAX_TEXTURES];
 };
 
-// Instance-index inputs consumed only through `ez_gfx_instance_index`.
+// SPIR-V instance input consumed only through `ez_gfx_instance_index`.
 // Slang drops unreferenced global varyings, so importing shaders that never
-// call it gain no extra inputs.
-in uint ez_gfx_instance_id : SV_InstanceID;
+// call it gain no extra inputs. Metal and DXIL take `SV_InstanceID` as an
+// argument instead: Slang's Metal output leaves global system-value varyings
+// inside the `[[stage_in]]` struct when the vertex entry returns a struct,
+// which the Metal compiler rejects.
 in uint ez_gfx_vulkan_instance_index : SV_VulkanInstanceID;
 
 // DX12 per-draw root constant holding the indirect record's first_instance.
 // Emitted as raw HLSL so it never appears in reflection; the DX12 backend
-// appends this b0/space0 constant to every graphics root signature.
+// appends this b0/space0 constant to every vertex-pipeline root signature.
 uint ez_gfx_dx12_base_instance() {
     __target_switch {
     case hlsl:
@@ -75,18 +77,21 @@ uint ez_gfx_dx12_base_instance() {
 
 /// Absolute instance index with Vulkan `gl_InstanceIndex` semantics: the
 /// draw's first_instance plus the instance within the draw, on every backend.
-/// Vertex stage only; use instead of `SV_InstanceID`, whose base-instance
+/// Vertex stage only. Pass the vertex entry's `SV_InstanceID` parameter as
+/// `instance_id`; never index with it directly, because its base-instance
 /// handling differs per target (Slang subtracts it on SPIR-V and D3D omits
 /// it, while Metal's `[[instance_id]]` includes it).
-uint ez_gfx_instance_index() {
+uint ez_gfx_instance_index(uint instance_id) {
     __target_switch {
     case spirv:
+        // `instance_id` excludes the base here; Slang then drops the unused
+        // parameter, so the shader needs no DrawParameters capability.
         return ez_gfx_vulkan_instance_index;
     case metal:
-        return ez_gfx_instance_id;
+        return instance_id;
     case hlsl:
         // SM 6.5 lacks SV_StartInstanceLocation (SM 6.8).
-        return ez_gfx_instance_id + ez_gfx_dx12_base_instance();
+        return instance_id + ez_gfx_dx12_base_instance();
     }
 }
 

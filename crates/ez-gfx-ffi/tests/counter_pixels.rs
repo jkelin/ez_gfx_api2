@@ -1,4 +1,4 @@
-//! Observable indexed-indirect count and zero-tail rendering contracts.
+//! Observable indexed-indirect count, zero-tail, and instance-index rendering contracts.
 #![cfg(not(target_vendor = "apple"))]
 
 #[cfg(windows)]
@@ -64,7 +64,32 @@ fn dx12_gpu_count_limits_nonzero_commands_and_uses_aligned_command_offset() {
     let counted = counted.unwrap();
 
     assert_eq!(counted, baseline);
-    assert_red(&counted);
+    assert_center(&counted, RED);
+}
+
+#[test]
+fn vulkan_instance_index_includes_first_instance() {
+    exercise_first_instance(1);
+}
+
+#[cfg(windows)]
+#[test]
+fn dx12_instance_index_includes_first_instance() {
+    exercise_first_instance(2);
+}
+
+fn exercise_first_instance(backend: u8) {
+    let mut fixture = Fixture::new(backend);
+    let (status, pixels) = fixture.render(1, &[command(1)], None);
+    if status == EzGfxResult::Unsupported && !cfg!(windows) {
+        eprintln!("Vulkan headless presentation is unsupported by the selected ICD");
+        return;
+    }
+    assert_eq!(status, EzGfxResult::Ok);
+
+    // Instance zero shades red; green proves the draw's first_instance reached
+    // `ez_gfx_instance_index` (DX12 root constant, Vulkan InstanceIndex).
+    assert_center(&pixels.unwrap(), GREEN);
 }
 
 fn exercise_zero_tail(backend: u8) {
@@ -81,7 +106,7 @@ fn exercise_zero_tail(backend: u8) {
     let padded = padded.unwrap();
 
     assert_eq!(padded, baseline);
-    assert_red(&padded);
+    assert_center(&padded, RED);
 }
 
 fn command(first_instance: u32) -> EzGfxDrawIndexedCommand {
@@ -94,11 +119,22 @@ fn command(first_instance: u32) -> EzGfxDrawIndexedCommand {
     }
 }
 
-fn assert_red(bytes: &[u8]) {
+const RED: [u8; 3] = [255, 0, 0];
+const GREEN: [u8; 3] = [0, 255, 0];
+
+/// Checks the center RGBA8 pixel against `rgb` with a tolerance for
+/// rasterization rounding; alpha must be fully opaque.
+fn assert_center(bytes: &[u8], rgb: [u8; 3]) {
     assert_eq!(bytes.len(), WIDTH as usize * HEIGHT as usize * 4);
     let center = ((HEIGHT / 2 * WIDTH + WIDTH / 2) * 4) as usize;
     let pixel = &bytes[center..center + 4];
-    assert!(pixel[0] > 200 && pixel[1] < 40 && pixel[2] < 40 && pixel[3] == 255);
+    for (actual, expected) in pixel[..3].iter().zip(rgb) {
+        assert!(
+            actual.abs_diff(expected) < 56,
+            "center pixel {pixel:?}, expected {rgb:?}"
+        );
+    }
+    assert_eq!(pixel[3], 255);
 }
 
 struct Fixture {
@@ -318,7 +354,7 @@ VertexOutput vertexmain(uint vertex_id : SV_VertexID, uint instance_id : SV_Inst
     float2 positions[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
     VertexOutput output;
     output.position = float4(positions[vertex_id], 0.5, 1.0);
-    output.color = instance_id == 0 ? float4(1.0, 0.0, 0.0, 1.0) : float4(0.0, 1.0, 0.0, 1.0);
+    output.color = ez_gfx_instance_index(instance_id) == 0 ? float4(1.0, 0.0, 0.0, 1.0) : float4(0.0, 1.0, 0.0, 1.0);
     return output;
 }
 

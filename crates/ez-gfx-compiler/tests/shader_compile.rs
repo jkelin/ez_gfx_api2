@@ -408,6 +408,44 @@ fn apple_development_metal_compilation_emits_runtime_loadable_metallib() {
     ));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn instance_index_compiles_to_metallib_for_struct_returning_vertex_entries() {
+    if shader_slang::GlobalSession::new().is_none() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    write_shared_root(root.path());
+    let source = root.path().join("shader.slang");
+    // A struct return is the shape where Slang packed a global SV_InstanceID
+    // into `[[stage_in]]`, which the Metal compiler rejects.
+    fs::write(
+        &source,
+        r#"
+            import ez_gfx_api;
+            [Buffer("positions")] StructuredBuffer<float4> positions;
+            struct VertexOutput { float4 position : SV_Position; nointerpolation uint instance : INSTANCE; };
+            [shader("vertex")]
+            VertexOutput vertexmain(uint vertex_id : SV_VertexID, uint instance_id : SV_InstanceID) {
+                VertexOutput output;
+                output.instance = ez_gfx_instance_index(instance_id);
+                output.position = positions[output.instance + vertex_id];
+                return output;
+            }
+        "#,
+    )
+    .unwrap();
+
+    let compiled = EasyGraphicsCompiler::compile_shader(&source, &[Target::Metal], true).unwrap();
+    let artifact = Artifact::decode(&compiled).unwrap();
+
+    assert_eq!(artifact.variants.len(), 1);
+    assert_eq!(
+        artifact.variants[0].target,
+        ez_gfx_artifact::Target::Metallib
+    );
+}
+
 #[test]
 fn shared_buffer_semantics_compile_for_every_target_when_slang_is_available() {
     if shader_slang::GlobalSession::new().is_none() {
