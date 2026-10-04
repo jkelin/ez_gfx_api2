@@ -290,8 +290,8 @@ impl NativeContext {
         });
         // The per-draw base instance travels as one vertex-visible 32-bit
         // constant appended after both descriptor tables, so existing table
-        // indices stay stable. Slang lowers the DXIL entry-point uniform to a
-        // b0-space0 cbuffer, which this constant feeds.
+        // indices stay stable. `ez_gfx_instance_index` in ez_gfx_api.slang
+        // declares the matching b0-space0 cbuffer.
         let base_instance_root = if base_constants {
             let index = u32::try_from(parameters.len()).map_err(|_| HalError::InvalidArgument)?;
             parameters.push(D3D12_ROOT_PARAMETER {
