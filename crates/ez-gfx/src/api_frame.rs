@@ -646,7 +646,7 @@ impl Frame {
         if let Err(error) = state::configure_render_target(
             self.context.handle,
             handle,
-            load == RenderTargetLoad::Preserve,
+            load,
         ) {
             return self.fail(error);
         }

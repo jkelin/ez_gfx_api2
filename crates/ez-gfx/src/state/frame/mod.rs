@@ -1,3 +1,4 @@
+use crate::RenderTargetLoad;
 use crate::Result;
 
 use super::{
@@ -70,7 +71,7 @@ pub(super) fn start_recording(context: &mut ContextState) -> Result<()> {
     context.active_surface = None;
     context.frame_surface = None;
     context.frame_render_target = None;
-    context.frame_preserve_render_target = false;
+    context.frame_render_target_load = RenderTargetLoad::Clear;
     context.frame_render_target_states.clear();
     context.frame_depth = None;
     context.frame_has_graphics = false;
@@ -608,7 +609,7 @@ fn graphics_pass_node(
         (surface, depth, width, height, 1)
     };
     let load = if context.frame_has_graphics
-        || context.frame_preserve_render_target
+        || context.frame_render_target_load == RenderTargetLoad::Preserve
         || target_had_prior_access
     {
         LoadOp::Load
@@ -1287,7 +1288,7 @@ fn abort_recording_state(context: &mut ContextState) -> Result<()> {
     context.frame_index = None;
     context.frame_surface = None;
     context.frame_render_target = None;
-    context.frame_preserve_render_target = false;
+    context.frame_render_target_load = RenderTargetLoad::Clear;
     context.frame_render_target_states.clear();
     context.frame_depth = None;
     context.frame_has_graphics = false;

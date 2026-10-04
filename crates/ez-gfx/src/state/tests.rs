@@ -482,14 +482,16 @@ fn memory_telemetry_reports_slots_workers_and_empty_staging() {
 #[test]
 fn failed_counter_write_still_trims_pathological_scratch() {
     // A failed upload must not pin multi-megabyte serialization capacity:
-    // sabotage the allocation after validation so the write fails after the
-    // 80 KiB scratch fill, then prove the guard trimmed back to the bound.
+    // sabotage the allocation after validation so the write fails after a
+    // scratch fill just past the retain limit, then prove the guard trimmed it.
     let context = create_context(vulkan_options().unwrap()).unwrap();
     let surface =
         create_surface_headless(context, HeadlessSurfaceOptions::new(1, 1, 0).unwrap()).unwrap();
     assert_eq!(init_device(context, surface), Ok(()));
     frame_begin(context).unwrap();
-    let counter = acquire_counter(context, 4096).unwrap();
+    // 20 bytes per narrow command; the wide DX12 layout only adds more.
+    let command_count = u32::try_from(buffers::COUNTER_SCRATCH_RETAIN_LIMIT / 20 + 1).unwrap();
+    let counter = acquire_counter(context, command_count).unwrap();
     with_context_mut(context, |state| {
         state.allocations.remove(&counter.packed());
         Ok(())
@@ -503,12 +505,11 @@ fn failed_counter_write_still_trims_pathological_scratch() {
             vertex_offset: 0,
             first_instance: 0,
         };
-        4096
+        usize::try_from(command_count).unwrap()
     ];
     assert!(write_counter_commands(context, counter, 0, &commands).is_err());
     with_context_mut(context, |state| {
-        // The 64 KiB bound mirrors the write-path retain limit in `buffers.rs`.
-        assert!(state.counter_scratch.capacity() <= 64 * 1024);
+        assert!(state.counter_scratch.capacity() <= buffers::COUNTER_SCRATCH_RETAIN_LIMIT);
         Ok(())
     })
     .unwrap();

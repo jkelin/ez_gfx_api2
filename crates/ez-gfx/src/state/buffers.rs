@@ -439,7 +439,7 @@ pub fn write_counter_commands(
 ///
 /// Steady-state indirect payloads can exceed 100 KiB for dense UI scenes;
 /// only exceptional multi-megabyte writes should discard the warm allocation.
-const COUNTER_SCRATCH_RETAIN_LIMIT: usize = 1024 * 1024;
+pub(super) const COUNTER_SCRATCH_RETAIN_LIMIT: usize = 1024 * 1024;
 
 /// Releases retained serialization capacity above the retention limit.
 ///

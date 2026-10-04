@@ -518,6 +518,7 @@ float4 fragmentmain() : SV_Target {
                 false,
                 Some(heap),
                 Some(heap),
+                1,
             )
             .unwrap();
         let NativePipeline::Graphics {

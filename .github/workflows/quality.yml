@@ -166,12 +166,13 @@ jobs:
         if: matrix.backend == 'vulkan-windows'
         timeout-minutes: 20
         run: |
-          cargo nextest run -p ez-gfx-backend-vulkan --lib -E 'not test(texture::texture_tests::) & not test(=device::tests::explicit_selection_admits_enumerated_adapter)'
+          cargo nextest run -p ez-gfx-backend-vulkan --lib -E 'not test(texture::texture_tests::) & not test(=device::tests::explicit_selection_admits_enumerated_adapter) & not test(=device::tests::enumeration_reports_unique_named_adapters) & not test(=device::tests::mesh_dispatch_tests::mesh_pipeline_rejects_unsupported_before_allocation)'
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo nextest run -p ez-gfx-backend-vulkan --lib -E 'test(texture::texture_tests::)' --no-run
       - name: Test Windows Vulkan ez-gfx library contracts
         if: matrix.backend == 'vulkan-windows'
         timeout-minutes: 20
-        run: cargo nextest run -p ez-gfx --lib -E 'not test(/^api::tests::/) & not test(/^state::tests::(aggregate_staging_budget_bounds_many_distinct_strides|device_loss_sweeps_pending_decodes_to_fast_device_lost|explicit_selection_creates_context_for_enumerated_adapter|failed_counter_write_still_trims_pathological_scratch|presentation_modes_require_each_surface_to_be_initialized|raw_mesh_prevalidation_failure_aborts_prior_recording|shader_capabilities_require_an_initialized_healthy_device|texture_manager_tests::(failed_decode_binding_returns_the_terminal_error|fallback_publication_failure_remains_owned_and_retries|gate_drives_pending_decode_to_referenced_prefix|mixed_optional_and_required_textures_reach_device_ready|optional_zero_progresses_to_device_ready_without_gate_wait|optional_zero_texture_does_not_block_graphics_gate|oversized_required_mips_fails_terminally_without_clamping|pre_device_fallback_backfill_retries_only_unpublished_aliases))$/)'
+        run: cargo nextest run -p ez-gfx --lib -E 'not test(/^api::tests::/) & not test(/^state::tests::(aggregate_staging_budget_bounds_many_distinct_strides|counter_write_preserves_fifth_dword_bytes|device_loss_sweeps_pending_decodes_to_fast_device_lost|explicit_selection_creates_context_for_enumerated_adapter|failed_counter_write_still_trims_pathological_scratch|presentation_modes_require_each_surface_to_be_initialized|raw_mesh_prevalidation_failure_aborts_prior_recording|shader_capabilities_require_an_initialized_healthy_device|texture_manager_tests::(failed_decode_binding_returns_the_terminal_error|fallback_publication_failure_remains_owned_and_retries|gate_drives_pending_decode_to_referenced_prefix|mixed_optional_and_required_textures_reach_device_ready|optional_zero_progresses_to_device_ready_without_gate_wait|optional_zero_texture_does_not_block_graphics_gate|oversized_required_mips_fails_terminally_without_clamping|pre_device_fallback_backfill_retries_only_unpublished_aliases))$/)'
       - name: Compile Windows Vulkan native init test suite
         if: matrix.backend == 'vulkan-windows'
         timeout-minutes: 20

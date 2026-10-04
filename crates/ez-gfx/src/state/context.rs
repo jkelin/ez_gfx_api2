@@ -1,3 +1,4 @@
+use crate::RenderTargetLoad;
 use crate::Result;
 
 #[cfg(test)]
@@ -141,7 +142,7 @@ pub fn create_context(options: ContextOptions) -> Result<ContextHandle> {
         frame_depth: None,
         frame_has_graphics: false,
         frame_render_target: None,
-        frame_preserve_render_target: false,
+        frame_render_target_load: RenderTargetLoad::Clear,
         frame_render_target_states: HashMap::new(),
         last_readbacks: Vec::new(),
         active_surface: None,
@@ -922,7 +923,9 @@ fn configure_surface_recording(
 pub fn begin_render_target(context: ContextHandle, target: RenderTargetHandle) -> Result<()> {
     result_status(with_context_mut(context, |context| {
         super::frame::start_recording(context)?;
-        if let Err(error) = configure_render_target_recording(context, target, false) {
+        if let Err(error) =
+            configure_render_target_recording(context, target, RenderTargetLoad::Clear)
+        {
             context.frame.abort();
             return Err(error);
         }
@@ -937,17 +940,17 @@ pub fn begin_render_target(context: ContextHandle, target: RenderTargetHandle) -
 pub(crate) fn configure_render_target(
     context: ContextHandle,
     target: RenderTargetHandle,
-    preserve: bool,
+    load: RenderTargetLoad,
 ) -> Result<()> {
     result_status(with_context_mut(context, |context| {
-        configure_render_target_recording(context, target, preserve)
+        configure_render_target_recording(context, target, load)
     }))
 }
 
 fn configure_render_target_recording(
     context: &mut ContextState,
     target: RenderTargetHandle,
-    preserve: bool,
+    load: RenderTargetLoad,
 ) -> Result<()> {
     context
         .identity
@@ -975,7 +978,7 @@ fn configure_render_target_recording(
     }
     context.active_surface = None;
     context.frame_render_target = Some(target);
-    context.frame_preserve_render_target = preserve;
+    context.frame_render_target_load = load;
     Ok(())
 }
 

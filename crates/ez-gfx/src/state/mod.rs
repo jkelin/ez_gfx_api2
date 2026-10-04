@@ -56,6 +56,7 @@ use ez_gfx_texture_manager::{
     TextureId, TextureRegistry, WORKING_SET_BUDGET_BYTES,
 };
 
+use crate::RenderTargetLoad;
 use crate::{Error, Result};
 
 enum NativeContext {
@@ -537,7 +538,7 @@ struct ContextState {
     frame_capture_surface: Option<SurfaceHandle>,
     active_surface: Option<SurfaceHandle>,
     frame_render_target: Option<RenderTargetHandle>,
-    frame_preserve_render_target: bool,
+    frame_render_target_load: RenderTargetLoad,
     /// Last recorded state for each managed target used by this frame.
     frame_render_target_states: HashMap<RenderTargetHandle, ez_gfx_hal::ResourceState>,
     last_readbacks: Vec<Vec<u8>>,

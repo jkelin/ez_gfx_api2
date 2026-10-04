@@ -1010,6 +1010,7 @@ float4 fragmentmain() : SV_Target {
             false,
             None,
             None,
+            1,
         )
         .unwrap();
     let target = context
