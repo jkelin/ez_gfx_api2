@@ -68,13 +68,13 @@ fn dx12_gpu_count_limits_nonzero_commands_and_uses_aligned_command_offset() {
 }
 
 #[test]
-fn vulkan_instance_index_includes_first_instance() {
+fn vulkan_instance_index_pixels_include_first_instance() {
     exercise_first_instance(1);
 }
 
 #[cfg(windows)]
 #[test]
-fn dx12_instance_index_includes_first_instance() {
+fn dx12_instance_index_pixels_include_first_instance() {
     exercise_first_instance(2);
 }
 
