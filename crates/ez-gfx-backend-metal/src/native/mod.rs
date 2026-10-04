@@ -823,6 +823,7 @@ pub struct NativeContext {
 
 mod device;
 mod frame;
+mod frame_output;
 mod memory;
 use memory::{map_allocation_hal, map_allocator, map_allocator_hal};
 mod pipeline;

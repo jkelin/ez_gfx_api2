@@ -824,7 +824,9 @@ pub struct NativeContext {
 }
 
 mod device;
+mod device_lifecycle;
 mod frame;
+mod frame_barrier;
 mod memory;
 use memory::{
     create_frame_slots, map_allocation_hal, map_allocation_vk, map_allocator, map_allocator_hal,
